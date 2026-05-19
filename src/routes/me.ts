@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, preHandlerHookHandler } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
@@ -108,9 +108,20 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
  * `audit_capture` trigger records actor `owner:<id>` and the Idempotency-Key
  * dedupes retries through the Day-3 wrapper. Staff self-edit is the Day-19
  * portal's concern, not modeled here.
+ *
+ * The auth preHandler is injectable so an integration test can pin the
+ * principal without standing up the full Supabase JWKS verifier. Production
+ * (`server.ts`) calls this with no opts and gets the real `authenticate`. This
+ * matches `registerAuthWebhook(app, verify)`'s Day-2 dependency-injection seam.
  */
-export function registerMeRoute(app: FastifyInstance): void {
-  app.get('/me', { preHandler: [authenticate] }, async (request) => {
+export interface MeRouteOptions {
+  authenticate?: preHandlerHookHandler;
+}
+
+export function registerMeRoute(app: FastifyInstance, opts: MeRouteOptions = {}): void {
+  const authHook = opts.authenticate ?? authenticate;
+
+  app.get('/me', { preHandler: [authHook] }, async (request) => {
     const principal = requirePrincipal(request);
 
     if (principal.kind === 'owner') {
@@ -130,7 +141,7 @@ export function registerMeRoute(app: FastifyInstance): void {
     return staffProfile(row);
   });
 
-  app.patch('/me', { preHandler: [authenticate] }, async (request, reply) => {
+  app.patch('/me', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
     if (principal.kind !== 'owner') {
       throw new AuthError('forbidden', 'staff profile editing is not supported here');

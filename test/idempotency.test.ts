@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import Fastify from 'fastify';
 import { eq, sql } from 'drizzle-orm';
 import { AuthError } from '../src/auth/errors.js';
+import { registerAuth } from '../src/auth/plugin.js';
+import type { Principal } from '../src/auth/principal.js';
 import { db } from '../src/db/client.js';
 import { withIdempotency } from '../src/db/idempotency.js';
 import {
@@ -10,7 +13,9 @@ import {
   hashRequestBody,
   requireIdempotencyKey,
 } from '../src/db/mutation.js';
-import { idempotencyKeys } from '../src/db/schema/schema.js';
+import { idempotencyKeys, owners } from '../src/db/schema/schema.js';
+import { withActor } from '../src/db/tx.js';
+import { registerMeRoute } from '../src/routes/me.js';
 
 // --- hashRequestBody: canonical-JSON SHA so a key reused with the same logical
 // body — even with reordered object keys — collides correctly, but any real
@@ -241,5 +246,145 @@ test(
       }),
       Rollback,
     );
+  },
+);
+
+// --- Error-rollback property: when `fn` throws inside `withIdempotency`, the
+// throw propagates out, the surrounding transaction aborts, and the
+// `idempotency_keys` row that the wrapper INSERTed as part of its atomic claim
+// rolls back with everything else. This is the "errors are retry-friendly"
+// guarantee documented in `idempotency.ts` — a retry from the client sees a
+// clean slate, not a poisoned in-flight key. The post-rollback SELECT runs on
+// the live DB (the failed tx is gone), so its result reflects committed state
+// only — zero net writes if the property holds. ---
+
+test(
+  'withIdempotency: when fn throws, the idempotency_keys row rolls back with the transaction',
+  { skip: dbConfigured ? false : 'DATABASE_URL not set' },
+  async () => {
+    class FnError extends Error {}
+    const key = `test-rollback-${randomUUID()}`;
+
+    await assert.rejects(
+      db.transaction(async (tx) => {
+        await tx.execute(sql`select set_config('app.actor', 'system:test', true)`);
+        await withIdempotency(
+          tx,
+          { key, ownerId: null, endpoint: 'POST /rollback-test', requestHash: 'h' },
+          async () => {
+            throw new FnError('simulated mutation failure');
+          },
+        );
+        // unreachable — the throw above aborts the transaction.
+      }),
+      FnError,
+    );
+
+    const [row] = await db
+      .select()
+      .from(idempotencyKeys)
+      .where(eq(idempotencyKeys.key, key))
+      .limit(1);
+    assert.equal(
+      row,
+      undefined,
+      'a thrown fn must roll the idempotency_keys INSERT back so a retry is unblocked',
+    );
+  },
+);
+
+// --- End-to-end "proves the wire": Fastify inject through PATCH /me. Exercises
+// the full request path — header parsing → body validation → withMutation →
+// audited DB write → response shape — that the unit tests don't reach. Cannot
+// use the rollback-sentinel pattern: Fastify inject runs on a separate pool
+// connection from any outer test transaction (uncommitted writes are
+// invisible across connections), so the test owner is committed and torn down
+// with a soft-expire — correct per the never-delete contract. The cleanup
+// leaves 2 audit_log rows behind (the PATCH + the cleanup soft-expire),
+// which is the designed behavior of audit_log (append-only historical record).
+// The idempotency_keys row IS deletable (transport-layer, exempt from
+// never-delete) and is cleaned up. ---
+
+test(
+  'PATCH /me end-to-end: Fastify inject → withMutation → audited write → response shape',
+  { skip: dbConfigured ? false : 'DATABASE_URL not set' },
+  async () => {
+    const supabaseUid = randomUUID();
+    const [created] = await db
+      .insert(owners)
+      .values({
+        supabaseUid,
+        name: 'E2E Test',
+        email: `e2e-${supabaseUid}@example.com`,
+        phone: '000',
+        location: 'Fayetteville, AR',
+      })
+      .returning();
+    assert.ok(created);
+
+    const idemKey = `e2e-${randomUUID()}`;
+    const principal: Principal = {
+      kind: 'owner',
+      ownerId: created.id,
+      supabaseUid,
+    };
+
+    try {
+      const app = Fastify();
+      registerAuth(app);
+      registerMeRoute(app, {
+        authenticate: async (request) => {
+          request.principal = principal;
+        },
+      });
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/me',
+        headers: { 'idempotency-key': idemKey },
+        payload: { phone: '555-1234' },
+      });
+
+      assert.equal(res.statusCode, 200);
+      const body = res.json() as {
+        id: string;
+        name: string;
+        phone: string;
+        email: string;
+      };
+      assert.equal(body.id, created.id);
+      assert.equal(body.name, 'E2E Test');
+      assert.equal(body.phone, '555-1234');
+
+      const [idemRow] = await db
+        .select()
+        .from(idempotencyKeys)
+        .where(eq(idempotencyKeys.key, idemKey))
+        .limit(1);
+      assert.ok(idemRow, 'idempotency_keys row must be persisted on success');
+      assert.equal(idemRow.endpoint, 'PATCH /me');
+      assert.equal(idemRow.responseStatus, 200);
+      assert.equal(idemRow.ownerId, created.id);
+      assert.ok(idemRow.completedAt, 'completedAt must be set after success');
+      assert.equal((idemRow.responseBody as { phone: string }).phone, '555-1234');
+
+      const log = await db.execute(
+        sql`select op, actor from audit_log
+            where table_name = 'owners' and row_pk = ${created.id}
+            order by at desc limit 1`,
+      );
+      const auditRow = log.rows[0];
+      assert.ok(auditRow, 'PATCH must produce an audit_log row');
+      assert.equal(String(auditRow.op), 'UPDATE');
+      assert.equal(String(auditRow.actor), `owner:${created.id}`);
+    } finally {
+      await withActor('system:e2e-cleanup', async (tx) => {
+        await tx
+          .update(owners)
+          .set({ expiredAt: sql`now()` })
+          .where(eq(owners.id, created.id));
+      });
+      await db.delete(idempotencyKeys).where(eq(idempotencyKeys.key, idemKey));
+    }
   },
 );
