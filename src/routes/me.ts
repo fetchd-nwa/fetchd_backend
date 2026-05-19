@@ -4,8 +4,7 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { appLocation, owners, staff } from '../db/schema/schema.js';
 import { authenticate, requirePrincipal } from '../auth/plugin.js';
-import { actorOf } from '../auth/principal.js';
-import { withActor } from '../db/tx.js';
+import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { AuthError } from '../auth/errors.js';
 
 /**
@@ -105,11 +104,10 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
 /**
  * `GET /me` `[auth]` — the authenticated principal's own profile + mirror row.
  * `PATCH /me` `[auth]` — owner self-edit (profile / emergency contact /
- * notification prefs). The audited write: it runs through `withActor`, so the
- * `audit_capture` trigger records actor `owner:<id>` for the prior row.
- * `Idempotency-Key` is accepted but not yet enforced — the dedupe wrapper is
- * Day 3 (`idempotency_keys`); faking it here would be worse than not having it.
- * Staff self-edit is the Day-19 portal's concern, not modeled here.
+ * notification prefs). The audited write runs through `withMutation`, so the
+ * `audit_capture` trigger records actor `owner:<id>` and the Idempotency-Key
+ * dedupes retries through the Day-3 wrapper. Staff self-edit is the Day-19
+ * portal's concern, not modeled here.
  */
 export function registerMeRoute(app: FastifyInstance): void {
   app.get('/me', { preHandler: [authenticate] }, async (request) => {
@@ -132,11 +130,13 @@ export function registerMeRoute(app: FastifyInstance): void {
     return staffProfile(row);
   });
 
-  app.patch('/me', { preHandler: [authenticate] }, async (request) => {
+  app.patch('/me', { preHandler: [authenticate] }, async (request, reply) => {
     const principal = requirePrincipal(request);
     if (principal.kind !== 'owner') {
       throw new AuthError('forbidden', 'staff profile editing is not supported here');
     }
+
+    const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const parsed = patchMeSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -151,17 +151,27 @@ export function registerMeRoute(app: FastifyInstance): void {
       throw new AuthError('bad_request', 'no updatable fields in request body');
     }
 
-    const updated = await withActor(actorOf(principal), async (tx) => {
-      const [row] = await tx
-        .update(owners)
-        .set(set)
-        .where(eq(owners.id, principal.ownerId))
-        .returning();
-      return row;
-    });
-    if (!updated) {
-      throw new AuthError('not_provisioned', 'owner record no longer available');
-    }
-    return ownerProfile(updated);
+    const outcome = await withMutation(
+      {
+        principal,
+        idempotencyKey,
+        endpoint: 'PATCH /me',
+        requestHash: hashRequestBody(parsed.data),
+      },
+      async (tx) => {
+        const [row] = await tx
+          .update(owners)
+          .set(set)
+          .where(eq(owners.id, principal.ownerId))
+          .returning();
+        if (!row) {
+          throw new AuthError('not_provisioned', 'owner record no longer available');
+        }
+        return { status: 200, body: ownerProfile(row) };
+      },
+    );
+
+    reply.code(outcome.status);
+    return outcome.body;
   });
 }

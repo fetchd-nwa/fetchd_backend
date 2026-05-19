@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { withActor } from '../db/tx.js';
+import { RELINK } from '../db/softExpire.js';
 import { appLocation, owners, staff, staffRole } from '../db/schema/schema.js';
 import { AuthError } from './errors.js';
 
@@ -140,11 +141,11 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
         .onConflictDoUpdate({
           target: owners.supabaseUid,
           set: {
+            ...RELINK,
             name: target.name,
             email: target.email,
             phone: target.phone,
             location: target.location,
-            expiredAt: null,
           },
         })
         .returning({ id: owners.id });
@@ -163,10 +164,10 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
       .onConflictDoUpdate({
         target: staff.supabaseUid,
         set: {
+          ...RELINK,
           name: target.name,
           role: target.role,
           location: target.location,
-          expiredAt: null,
         },
       })
       .returning({ id: staff.id });
