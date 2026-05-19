@@ -1,0 +1,121 @@
+import type {
+  FastifyError,
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+  preHandlerHookHandler,
+} from 'fastify';
+import type { Principal } from './principal.js';
+import { AuthError } from './errors.js';
+import { verifyAccessToken, type VerifiedToken } from './jwks.js';
+import { resolvePrincipal } from './mirror.js';
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    /** Set by the `authenticate` preHandler; `null` on `[public]` routes. */
+    principal: Principal | null;
+  }
+}
+
+const BEARER_PREFIX = 'Bearer ';
+
+function extractBearer(request: FastifyRequest): string {
+  const header = request.headers.authorization;
+  if (!header || !header.startsWith(BEARER_PREFIX)) {
+    throw new AuthError('unauthenticated', 'missing or malformed Authorization header');
+  }
+  const token = header.slice(BEARER_PREFIX.length).trim();
+  if (token.length === 0) {
+    throw new AuthError('unauthenticated', 'empty bearer token');
+  }
+  return token;
+}
+
+interface AuthDeps {
+  verify: (token: string) => Promise<VerifiedToken>;
+  resolve: (supabaseUid: string) => Promise<Principal | null>;
+}
+
+/**
+ * `[auth]` guard. Verify the bearer JWT, resolve it to a live mirror row,
+ * attach the principal. A verified-but-unprovisioned token is a deliberate
+ * 403 `not_provisioned` (invite-only model, Day 2b owns creation) — distinct
+ * from a 401 for a bad/absent token.
+ *
+ * Factory-injected deps keep the route guards testable without a live Supabase
+ * project or DB (the dependency rule: the guard knows the *shape* of verify +
+ * resolve, not their concrete implementations).
+ */
+export function makeAuthenticate(deps: AuthDeps): preHandlerHookHandler {
+  return async function authenticate(request: FastifyRequest): Promise<void> {
+    const token = extractBearer(request);
+    const { sub } = await deps.verify(token);
+    const principal = await deps.resolve(sub);
+    if (!principal) {
+      throw new AuthError(
+        'not_provisioned',
+        'authenticated, but no account is provisioned for this user',
+      );
+    }
+    request.principal = principal;
+  };
+}
+
+/** Production `[auth]` guard, bound to the real verifier + mirror resolver. */
+export const authenticate = makeAuthenticate({
+  verify: verifyAccessToken,
+  resolve: resolvePrincipal,
+});
+
+/**
+ * `[staff]` guard. Composes *after* `authenticate`
+ * (`preHandler: [authenticate, requireStaff]`) — the access-control layer is
+ * explicit app code, route by route. There is no RLS (BACKEND-ARCHITECTURE
+ * §2.5: this middleware *is* the access-control layer).
+ */
+export const requireStaff: preHandlerHookHandler = async function requireStaff(
+  request: FastifyRequest,
+): Promise<void> {
+  if (!request.principal) {
+    throw new AuthError('unauthenticated', 'requireStaff used without authenticate');
+  }
+  if (request.principal.kind !== 'staff') {
+    throw new AuthError('forbidden', 'staff role required');
+  }
+};
+
+/**
+ * Narrow `request.principal` to non-null inside an `[auth]` handler. It is a
+ * programming error (not a user-reachable state) to call this on a route that
+ * did not run `authenticate`; failing loud beats a null-deref three calls deep.
+ */
+export function requirePrincipal(request: FastifyRequest): Principal {
+  if (!request.principal) {
+    throw new AuthError('unauthenticated', 'route handler ran without authenticate');
+  }
+  return request.principal;
+}
+
+/**
+ * Wire auth into the app: declare the `principal` request slot and route
+ * every `AuthError` through one mapper. Centralizing the error→HTTP mapping
+ * here (not per-route) is the cross-cutting-concern rule — the day the error
+ * envelope is frozen, it changes in exactly one place.
+ */
+export function registerAuth(app: FastifyInstance): void {
+  app.decorateRequest('principal', null);
+
+  app.setErrorHandler((err: FastifyError, request, reply: FastifyReply) => {
+    if (err instanceof AuthError) {
+      if (err.status >= 500) {
+        request.log.error({ err }, 'auth integrity fault');
+      }
+      return reply.code(err.status).send({ error: { code: err.code, message: err.message } });
+    }
+    request.log.error({ err }, 'unhandled error');
+    const status = typeof err.statusCode === 'number' ? err.statusCode : 500;
+    return reply
+      .code(status)
+      .send({ error: { code: 'internal', message: 'Internal Server Error' } });
+  });
+}

@@ -23,10 +23,14 @@ const envSchema = z.object({
   // Redis — server-side cache + rate limit + sessions.
   REDIS_URL: z.string().url(),
 
-  // Supabase Auth — JWKS verify (Day-0 lock #2). Reserved; wired Day 2.
+  // Supabase Auth — JWKS verify (Day-0 lock #2). Wired Day 2a.
   SUPABASE_JWKS_URL: z.string().url(),
   SUPABASE_JWT_AUD: z.string().min(1),
   SUPABASE_JWT_ISS: z.string().url(),
+  // Standard Webhooks signing secret for the Supabase "user created" auth
+  // hook (`POST /auth/webhook` [public, signed]). `whsec_<base64>` form.
+  // Wired Day 2b.
+  SUPABASE_AUTH_WEBHOOK_SECRET: z.string().min(1),
 
   // Stripe — test keys in dev/staging. Reserved; wired Day 14/15.
   STRIPE_SECRET_KEY: z.string().min(1),

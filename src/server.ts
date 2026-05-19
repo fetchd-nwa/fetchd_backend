@@ -1,6 +1,9 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { env } from './env.js';
+import { registerAuth } from './auth/plugin.js';
+import { registerAuthWebhook } from './routes/authWebhook.js';
 import { registerHealthRoute } from './routes/health.js';
+import { registerMeRoute } from './routes/me.js';
 
 /**
  * Builds the Fastify app and registers routes. Kept separate from the boot
@@ -13,7 +16,12 @@ export function buildApp(): FastifyInstance {
     disableRequestLogging: false,
   });
 
-  registerHealthRoute(app);
+  // Auth first: it decorates `request.principal` and installs the one
+  // AuthError→HTTP mapper every route relies on.
+  registerAuth(app);
+  registerHealthRoute(app); // [public] — no auth guard
+  registerAuthWebhook(app); // [public, signed] — own raw-body scope
+  registerMeRoute(app); // [auth]
 
   return app;
 }
