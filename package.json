@@ -14,7 +14,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "db:introspect": "drizzle-kit pull"
+    "db:introspect": "drizzle-kit pull && node scripts/fix-introspection.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

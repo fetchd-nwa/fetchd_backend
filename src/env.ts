@@ -14,6 +14,11 @@ const envSchema = z.object({
 
   // Postgres — Supabase's bundled Postgres, app-owned access (Day-0 lock #3).
   DATABASE_URL: z.string().url(),
+  // Path to the CA cert that signed the Postgres server cert. Supabase's
+  // direct connection uses Supabase's own CA (not in Node's trust store), so
+  // this is required there for verified TLS. Optional: unset = no explicit CA
+  // (a plaintext/locally-trusted Postgres, e.g. a bare local dev container).
+  DATABASE_SSL_CA: z.string().min(1).optional(),
 
   // Redis — server-side cache + rate limit + sessions.
   REDIS_URL: z.string().url(),
