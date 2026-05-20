@@ -7,6 +7,7 @@ import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
+import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 
 /**
  * Owner `/me` is a **frozen wire shape** — the exact keys the FE `toUser`
@@ -56,10 +57,7 @@ function staffProfile(row: typeof staff.$inferSelect) {
 // silently no-op); `.partial()` makes every field optional (PATCH semantics);
 // `email` is intentionally absent — identity is not self-editable here.
 // `emergency_contact` is whole-object replace (matches the FE's submit shape).
-type AppLocation = (typeof appLocation.enumValues)[number];
-// Spread loses the tuple shape; the cast restores it preserving the literal
-// union (a pgEnum always has ≥1 value) so `location` stays the column's type.
-const LOCATIONS = [...appLocation.enumValues] as [AppLocation, ...AppLocation[]];
+const LOCATIONS = pgEnumTuple(appLocation);
 
 const patchMeSchema = z
   .object({

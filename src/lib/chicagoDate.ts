@@ -50,6 +50,20 @@ export function bucketToChicagoDate(instant: Date | string | number): string {
 }
 
 /**
+ * Today's Chicago calendar date (YYYY-MM-DD). Convenience wrapper over
+ * `bucketToChicagoDate(now)` — the route can pass its `nowFactory()`
+ * directly and stay timezone-correct without spelling out the bucket
+ * step. Day-5b consumers: `/rates` (effective-window lookup); future
+ * consumers: `/availability` default-date hints, scheduler boundaries.
+ *
+ *   const today = bucketChicagoToday(nowFactory());  // route DI pattern
+ *   const today = bucketChicagoToday();              // production default
+ */
+export function bucketChicagoToday(now: Date = new Date()): string {
+  return CHICAGO_DATE_FORMATTER.format(now);
+}
+
+/**
  * The wall-clock formatter we use to read back an instant in Chicago time.
  * `hourCycle: 'h23'` pins the hour to 0..23 (midnight = 00, not 24) so the
  * round-trip arithmetic in `chicagoOffsetMinutesAt` is unambiguous.

@@ -3,10 +3,14 @@ import { env } from './env.js';
 import { registerAuth } from './auth/plugin.js';
 import { registerAuthWebhook } from './routes/authWebhook.js';
 import { registerAgreementsRoute } from './routes/agreements.js';
+import { registerAvailabilityRoute } from './routes/availability.js';
 import { registerBookingsRoute } from './routes/bookings.js';
+import { registerCreditPackagesRoute } from './routes/creditPackages.js';
+import { registerCreditsRoute } from './routes/credits.js';
 import { registerDogsRoute } from './routes/dogs.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
+import { registerRatesRoute } from './routes/rates.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerVetsRoute } from './routes/vets.js';
 
@@ -32,6 +36,10 @@ export function buildApp(): FastifyInstance {
   registerRequiredVaccinesRoute(app); // [auth]
   registerAgreementsRoute(app); // [auth]
   registerBookingsRoute(app); // [auth]
+  registerAvailabilityRoute(app); // [auth] — catalog (owner + staff)
+  registerCreditsRoute(app); // [auth] — owner-only (per-dog)
+  registerCreditPackagesRoute(app); // [auth] — catalog (owner + staff)
+  registerRatesRoute(app); // [auth] — catalog (owner + staff)
 
   return app;
 }

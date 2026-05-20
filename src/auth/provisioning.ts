@@ -4,6 +4,7 @@ import { RELINK } from '../db/softExpire.js';
 import { appLocation, owners, staff, staffRole } from '../db/schema/schema.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
+import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 
 /**
  * The mirror row is provisioned ONLY here, from the Supabase "user created"
@@ -20,15 +21,10 @@ import { ApiError } from '../lib/errors.js';
  */
 const WEBHOOK_ACTOR = 'system:auth-webhook';
 
-type AppLocation = (typeof appLocation.enumValues)[number];
-type StaffRoleName = (typeof staffRole.enumValues)[number];
-
-// z.enum needs a mutable non-empty tuple; spreading a pgEnum's values loses
-// the tuple shape but the cast restores it preserving the literal union
-// (provably safe — a pgEnum always has ≥1 value). This keeps `location`/
-// `role` typed as the column's literals, not widened `string`.
-const LOCATIONS = [...appLocation.enumValues] as [AppLocation, ...AppLocation[]];
-const STAFF_ROLES = [...staffRole.enumValues] as [StaffRoleName, ...StaffRoleName[]];
+const LOCATIONS = pgEnumTuple(appLocation);
+const STAFF_ROLES = pgEnumTuple(staffRole);
+type AppLocation = (typeof LOCATIONS)[number];
+type StaffRoleName = (typeof STAFF_ROLES)[number];
 
 const envelopeSchema = z.object({
   record: z.object({

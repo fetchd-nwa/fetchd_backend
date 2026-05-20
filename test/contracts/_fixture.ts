@@ -1,10 +1,13 @@
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   agreementDocuments,
   agreementSignatures,
   bookingDogs,
   bookings,
+  creditLedger,
+  creditPackages,
+  dayCapacity,
   dogCompletedClasses,
   dogFeeding,
   dogMedications,
@@ -13,6 +16,7 @@ import {
   owners,
   paymentMethods,
   requiredVaccines,
+  serviceRates,
   staff,
   vets,
 } from '../../src/db/schema/schema.js';
@@ -72,6 +76,25 @@ export const FIXTURE_IDS = {
   booking8Id: '77777777-7777-4777-8777-777777777778',
   booking9Id: '77777777-7777-4777-8777-777777777779',
   bookingDstId: '77777777-7777-4777-8777-77777777777a',
+  // Day-5b: credit_packages catalog keys + credit_ledger ids + service_rates
+  // ids. Packages use `test-*` text prefixes for the same reason as the
+  // catalog rows above (no collision with a future production seed).
+  creditPackageSchool5Key: 'test-school-5',
+  creditPackageSchool10Key: 'test-school-10',
+  creditPackageDaycare8Key: 'test-daycare-8',
+  creditPackageRetiredKey: 'test-retired-pack',
+  creditLedgerPurchaseId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1',
+  creditLedgerDebitId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc2',
+  serviceRateSchoolFayId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd1',
+  serviceRateSchoolNullLocId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd2',
+  serviceRateDaycareCurrentId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd3',
+  serviceRateDaycareFutureId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd4',
+  // Day-5b edge-case rows: soft-expired day_capacity override (live() must
+  // skip it), closed-window day-care @ bentonville (effective-date filter
+  // must skip it so the null-location row wins), boarding rate with empty-
+  // string note (optional-omit must drop it from the wire).
+  serviceRateDaycareBentonClosedId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd5',
+  serviceRateBoardingEmptyNoteId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd6',
 } as const;
 
 /**
@@ -464,6 +487,158 @@ export async function seedFixture(): Promise<void> {
     },
   ]);
 
+  // Day-5b catalog: credit_packages. Two active school packs (5/10), one
+  // active daycare pack (8), one retired (active=false — verifies the
+  // server-side active=true filter). Snapshot covers Postgres enum order
+  // (booking_mode declared 'school','daycare' → school packs emit first).
+  await db.insert(creditPackages).values([
+    {
+      key: FIXTURE_IDS.creditPackageSchool5Key,
+      mode: 'school',
+      credits: 5,
+      priceCents: 25_000,
+      label: '5 School Credits (fixture)',
+      isPopular: false,
+      active: true,
+    },
+    {
+      key: FIXTURE_IDS.creditPackageSchool10Key,
+      mode: 'school',
+      credits: 10,
+      priceCents: 45_000,
+      label: '10 School Credits (fixture)',
+      isPopular: true,
+      active: true,
+    },
+    {
+      key: FIXTURE_IDS.creditPackageDaycare8Key,
+      mode: 'daycare',
+      credits: 8,
+      priceCents: 30_000,
+      label: '8 Daycare Credits (fixture)',
+      isPopular: false,
+      active: true,
+    },
+    {
+      key: FIXTURE_IDS.creditPackageRetiredKey,
+      mode: 'school',
+      credits: 3,
+      priceCents: 15_000,
+      label: 'Retired Test Pack',
+      isPopular: false,
+      active: false,
+    },
+  ]);
+
+  // Day-5b: per-location day_capacity overrides. Default rule (weekend
+  // closed, weekday 3/3) lives in `lib/availability.ts` — these two rows
+  // exercise the two override branches:
+  //   - 2026-05-17 (Sun) OPEN as a special-event day (school 2 + daycare 1)
+  //   - 2026-05-19 (Tue) CLOSED for a staff offsite (0/0)
+  // Bentonville has no overrides so its snapshot exercises pure defaults.
+  await db.insert(dayCapacity).values([
+    {
+      location: 'fayetteville',
+      date: '2026-05-17',
+      schoolOpenings: 2,
+      daycareOpenings: 1,
+    },
+    {
+      location: 'fayetteville',
+      date: '2026-05-19',
+      schoolOpenings: 0,
+      daycareOpenings: 0,
+    },
+    // Soft-expired override: a "closed-Fri" override that was withdrawn.
+    // `live(dayCapacity)` filters it out → /availability for 2026-05-22
+    // emits the default (3/3 weekday) instead of the expired override (0/0).
+    {
+      location: 'fayetteville',
+      date: '2026-05-22',
+      schoolOpenings: 0,
+      daycareOpenings: 0,
+      expiredAt: '2026-05-01T12:00:00Z',
+    },
+  ]);
+
+  // Day-5b: service_rates. Two key behaviors:
+  //   - location-specific row beats null-location row at the same category
+  //     (day-school @ fayetteville $75 vs day-school @ null-location $70 →
+  //     fayetteville query returns $75; bentonville query returns $70 via
+  //     the null-location fallback)
+  //   - effective-dated lookup: day-care @ null-location $45 (active
+  //     [2025-12-01, 2026-06-01)) covers FIXTURE_TODAY=2026-05-19; the
+  //     $50 row opens 2026-06-01 and must NOT be returned today
+  await db.insert(serviceRates).values([
+    {
+      id: FIXTURE_IDS.serviceRateSchoolFayId,
+      category: 'day-school',
+      location: 'fayetteville',
+      amountCents: 7500,
+      unit: 'per-day',
+      effectiveFrom: '2026-01-01',
+      effectiveTo: null,
+      note: 'Standard day-school rate, Fayetteville (fixture)',
+    },
+    {
+      id: FIXTURE_IDS.serviceRateSchoolNullLocId,
+      category: 'day-school',
+      location: null,
+      amountCents: 7000,
+      unit: 'per-day',
+      effectiveFrom: '2026-01-01',
+      effectiveTo: null,
+      note: null,
+    },
+    {
+      id: FIXTURE_IDS.serviceRateDaycareCurrentId,
+      category: 'day-care',
+      location: null,
+      amountCents: 4500,
+      unit: 'per-day',
+      effectiveFrom: '2025-12-01',
+      effectiveTo: '2026-06-01',
+      note: null,
+    },
+    {
+      id: FIXTURE_IDS.serviceRateDaycareFutureId,
+      category: 'day-care',
+      location: null,
+      amountCents: 5000,
+      unit: 'per-day',
+      effectiveFrom: '2026-06-01',
+      effectiveTo: null,
+      note: 'Mid-year increase (fixture)',
+    },
+    // Day-care @ bentonville $40 — CLOSED window [2025-12-01, 2026-04-01).
+    // FIXTURE_TODAY=2026-05-19 is past effective_to → the effective-date
+    // filter drops this row, and the null-location $45 wins. Exercises
+    // "closed-specific-window falls back to null-location."
+    {
+      id: FIXTURE_IDS.serviceRateDaycareBentonClosedId,
+      category: 'day-care',
+      location: 'bentonville',
+      amountCents: 4000,
+      unit: 'per-day',
+      effectiveFrom: '2025-12-01',
+      effectiveTo: '2026-04-01',
+      note: 'Bentonville intro pricing (expired)',
+    },
+    // Boarding @ fayetteville with explicit empty-string note. The wire
+    // emit logic omits `note` when null OR empty — this row exercises
+    // the empty-string branch (the other rows test null + populated).
+    {
+      id: FIXTURE_IDS.serviceRateBoardingEmptyNoteId,
+      category: 'boarding',
+      location: 'fayetteville',
+      amountCents: 8500,
+      unit: 'per-night',
+      effectiveFrom: '2026-01-01',
+      effectiveTo: null,
+      note: '',
+    },
+  ]);
+
   // One booking_dogs row per booking_dog pair. Lead is always present;
   // booking 3 is the only multi-dog row (Waffles lead + Lola additional).
   await db.insert(bookingDogs).values([
@@ -479,6 +654,33 @@ export async function seedFixture(): Promise<void> {
     { bookingId: FIXTURE_IDS.booking9Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.bookingDstId, dogId: FIXTURE_IDS.dog1Id, isLead: true },
   ]);
+
+  // Day-5b: credit_ledger entries for Waffles only (Lola has zero ledger
+  // rows → exercises the zero-sentinel branch of GET /dogs/:id/credits via
+  // the LEFT JOIN through dogs in creditsRepository).
+  //   +5 school purchase (references credit_packages.test-school-5)
+  //   -1 school debit  (references booking1 — Waffles' upcoming day-school)
+  // Resulting balance: { school: 4, daycare: 0 }
+  await db.insert(creditLedger).values([
+    {
+      id: FIXTURE_IDS.creditLedgerPurchaseId,
+      dogId: FIXTURE_IDS.dog1Id,
+      mode: 'school',
+      delta: 5,
+      reason: 'purchase',
+      packageKey: FIXTURE_IDS.creditPackageSchool5Key,
+      note: 'Fixture purchase of 5-pack',
+    },
+    {
+      id: FIXTURE_IDS.creditLedgerDebitId,
+      dogId: FIXTURE_IDS.dog1Id,
+      mode: 'school',
+      delta: -1,
+      reason: 'booking-debit',
+      bookingId: FIXTURE_IDS.booking1Id,
+      note: 'Fixture debit for booking1',
+    },
+  ]);
 }
 
 export async function teardownFixture(): Promise<void> {
@@ -486,8 +688,37 @@ export async function teardownFixture(): Promise<void> {
   // booking_dogs cascades on booking delete; payment_methods restricts owner
   // delete; signatures restrict owner + agreement_documents. dogs is first
   // because it cascades children (vaccines/meds/feeding/completed). Bookings
-  // delete drops the booking_dogs rows via ON DELETE CASCADE.
+  // delete drops the booking_dogs rows via ON DELETE CASCADE. Day-5b adds
+  // credit_ledger (RESTRICT on dogs.id, references bookings.id) → drop
+  // before bookings + dogs; credit_packages (RESTRICTed by credit_ledger);
+  // service_rates + day_capacity (independent).
+  await db
+    .delete(creditLedger)
+    .where(inArray(creditLedger.dogId, [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]));
   await db.delete(bookings).where(eq(bookings.ownerId, FIXTURE_IDS.ownerId));
+  await db
+    .delete(creditPackages)
+    .where(
+      inArray(creditPackages.key, [
+        FIXTURE_IDS.creditPackageSchool5Key,
+        FIXTURE_IDS.creditPackageSchool10Key,
+        FIXTURE_IDS.creditPackageDaycare8Key,
+        FIXTURE_IDS.creditPackageRetiredKey,
+      ]),
+    );
+  await db
+    .delete(serviceRates)
+    .where(
+      inArray(serviceRates.id, [
+        FIXTURE_IDS.serviceRateSchoolFayId,
+        FIXTURE_IDS.serviceRateSchoolNullLocId,
+        FIXTURE_IDS.serviceRateDaycareCurrentId,
+        FIXTURE_IDS.serviceRateDaycareFutureId,
+        FIXTURE_IDS.serviceRateDaycareBentonClosedId,
+        FIXTURE_IDS.serviceRateBoardingEmptyNoteId,
+      ]),
+    );
+  await db.delete(dayCapacity).where(eq(dayCapacity.location, 'fayetteville'));
   await db.delete(paymentMethods).where(eq(paymentMethods.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(dogs).where(eq(dogs.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(agreementSignatures).where(eq(agreementSignatures.ownerId, FIXTURE_IDS.ownerId));

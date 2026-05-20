@@ -1,0 +1,5 @@
+[
+  { "location": "bentonville", "date": "2026-05-15", "school_openings": 3, "daycare_openings": 3 },
+  { "location": "bentonville", "date": "2026-05-16", "school_openings": 0, "daycare_openings": 0 },
+  { "location": "bentonville", "date": "2026-05-17", "school_openings": 0, "daycare_openings": 0 }
+]

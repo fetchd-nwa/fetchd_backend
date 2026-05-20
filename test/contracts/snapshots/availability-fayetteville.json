@@ -1,0 +1,9 @@
+[
+  { "location": "fayetteville", "date": "2026-05-15", "school_openings": 3, "daycare_openings": 3 },
+  { "location": "fayetteville", "date": "2026-05-16", "school_openings": 0, "daycare_openings": 0 },
+  { "location": "fayetteville", "date": "2026-05-17", "school_openings": 2, "daycare_openings": 1 },
+  { "location": "fayetteville", "date": "2026-05-18", "school_openings": 3, "daycare_openings": 3 },
+  { "location": "fayetteville", "date": "2026-05-19", "school_openings": 0, "daycare_openings": 0 },
+  { "location": "fayetteville", "date": "2026-05-20", "school_openings": 3, "daycare_openings": 3 },
+  { "location": "fayetteville", "date": "2026-05-21", "school_openings": 3, "daycare_openings": 3 }
+]

@@ -1,0 +1,8 @@
+{
+  "category": "day-school",
+  "location": "fayetteville",
+  "amount_cents": 7500,
+  "unit": "per-day",
+  "effective_from": "2026-01-01",
+  "note": "Standard day-school rate, Fayetteville (fixture)"
+}

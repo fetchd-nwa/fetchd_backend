@@ -1,0 +1,26 @@
+[
+  {
+    "key": "test-school-5",
+    "mode": "school",
+    "credits": 5,
+    "price_cents": 25000,
+    "label": "5 School Credits (fixture)",
+    "is_popular": false
+  },
+  {
+    "key": "test-school-10",
+    "mode": "school",
+    "credits": 10,
+    "price_cents": 45000,
+    "label": "10 School Credits (fixture)",
+    "is_popular": true
+  },
+  {
+    "key": "test-daycare-8",
+    "mode": "daycare",
+    "credits": 8,
+    "price_cents": 30000,
+    "label": "8 Daycare Credits (fixture)",
+    "is_popular": false
+  }
+]
