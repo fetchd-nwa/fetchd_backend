@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { env } from './env.js';
 import { registerAuth } from './auth/plugin.js';
 import { registerAuthWebhook } from './routes/authWebhook.js';
+import { registerDogsRoute } from './routes/dogs.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
 
@@ -22,6 +23,7 @@ export function buildApp(): FastifyInstance {
   registerHealthRoute(app); // [public] — no auth guard
   registerAuthWebhook(app); // [public, signed] — own raw-body scope
   registerMeRoute(app); // [auth]
+  registerDogsRoute(app); // [auth]
 
   return app;
 }

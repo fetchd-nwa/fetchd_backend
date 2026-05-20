@@ -97,6 +97,26 @@ export function requirePrincipal(request: FastifyRequest): Principal {
 }
 
 /**
+ * The optional-`authenticate` injection seam every `[auth]` route registrar
+ * accepts (`registerXxx(app, opts?)`). Production wires nothing and gets the
+ * real JWKS-verifier preHandler; a contract test stubs in a preHandler that
+ * pins `request.principal` to a fixture owner — no live Supabase needed.
+ *
+ * The DI shape is extracted at the third use (me + dogs), the rule-of-two
+ * point. `registerAuthWebhook(app, verify)` takes a `verify` function — a body
+ * verifier, not a preHandler — so it deliberately does not collapse into this
+ * shape; a unified `registerRoute` wrapper would force unrelated DI seams
+ * through one type and obscure the route signature.
+ */
+export interface AuthRouteOptions {
+  authenticate?: preHandlerHookHandler;
+}
+
+export function resolveAuthHook(opts: AuthRouteOptions = {}): preHandlerHookHandler {
+  return opts.authenticate ?? authenticate;
+}
+
+/**
  * Wire auth into the app: declare the `principal` request slot and route
  * every `AuthError` through one mapper. Centralizing the error→HTTP mapping
  * here (not per-route) is the cross-cutting-concern rule — the day the error

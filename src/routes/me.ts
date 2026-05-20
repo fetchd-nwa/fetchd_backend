@@ -1,9 +1,9 @@
-import type { FastifyInstance, preHandlerHookHandler } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { appLocation, owners, staff } from '../db/schema/schema.js';
-import { authenticate, requirePrincipal } from '../auth/plugin.js';
+import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { AuthError } from '../auth/errors.js';
 
@@ -109,17 +109,12 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
  * dedupes retries through the Day-3 wrapper. Staff self-edit is the Day-19
  * portal's concern, not modeled here.
  *
- * The auth preHandler is injectable so an integration test can pin the
- * principal without standing up the full Supabase JWKS verifier. Production
- * (`server.ts`) calls this with no opts and gets the real `authenticate`. This
- * matches `registerAuthWebhook(app, verify)`'s Day-2 dependency-injection seam.
+ * The auth preHandler is injectable via `AuthRouteOptions` so an integration
+ * test can pin the principal without standing up the full Supabase JWKS
+ * verifier; production calls with no opts and gets the real `authenticate`.
  */
-export interface MeRouteOptions {
-  authenticate?: preHandlerHookHandler;
-}
-
-export function registerMeRoute(app: FastifyInstance, opts: MeRouteOptions = {}): void {
-  const authHook = opts.authenticate ?? authenticate;
+export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
+  const authHook = resolveAuthHook(opts);
 
   app.get('/me', { preHandler: [authHook] }, async (request) => {
     const principal = requirePrincipal(request);

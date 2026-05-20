@@ -1,0 +1,17 @@
+{
+  "id": "11111111-1111-4111-8111-111111111111",
+  "name": "Allison Fixture",
+  "email": "fixture@example.com",
+  "phone": "555-0001",
+  "location": "Fayetteville, AR",
+  "avatar_image_path": "",
+  "emergency_contact": {
+    "name": "Sam Fixture",
+    "relationship": "spouse",
+    "phone": "555-0002"
+  },
+  "push_notifications_enabled": true,
+  "push_notification_categories": { "booking": true, "message": true },
+  "email_notifications_enabled": true,
+  "email_notification_categories": { "booking": true, "message": true }
+}

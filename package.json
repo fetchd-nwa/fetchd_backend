@@ -14,7 +14,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts test/contracts/*.test.ts",
     "db:introspect": "drizzle-kit pull && node scripts/fix-introspection.mjs"
   },
   "dependencies": {
