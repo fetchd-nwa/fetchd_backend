@@ -1,5 +1,17 @@
-import 'dotenv/config';
+import { config as dotenvConfig } from 'dotenv';
 import { z } from 'zod';
+
+// Env-selection (locked Day 4b, deferred from Day 1): host-injected env is
+// the source of truth in staging/prod; `dotenv` is dev/test convenience only.
+// Loading `.env` in staging/prod would let a stray file in a deployed
+// container shadow host config — defense in depth against a real ops mistake.
+// `dotenv` already won't override an existing `process.env`, but skipping the
+// load entirely is the lean rule. NODE_ENV is read straight off `process.env`
+// because Zod hasn't validated it yet; that's fine — this gate is too narrow
+// to fail noisily, and an unset NODE_ENV (treated as dev) loads `.env`.
+if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'staging') {
+  dotenvConfig();
+}
 
 /**
  * The full Day-1 environment contract. Every var is required: the contract is

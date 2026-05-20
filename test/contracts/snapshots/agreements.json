@@ -1,0 +1,20 @@
+[
+  {
+    "key": "test-boarding-policy",
+    "label": "Boarding Policy (fixture)",
+    "current_version": 2,
+    "required": true,
+    "applies_to": ["boarding", "board-and-train"],
+    "signed_version": null,
+    "signed_at": null
+  },
+  {
+    "key": "test-general-waiver",
+    "label": "General Liability Waiver (fixture)",
+    "current_version": 1,
+    "required": true,
+    "applies_to": [],
+    "signed_version": 1,
+    "signed_at": "2026-04-01T15:00:00.000Z"
+  }
+]

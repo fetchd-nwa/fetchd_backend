@@ -2,9 +2,12 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { env } from './env.js';
 import { registerAuth } from './auth/plugin.js';
 import { registerAuthWebhook } from './routes/authWebhook.js';
+import { registerAgreementsRoute } from './routes/agreements.js';
 import { registerDogsRoute } from './routes/dogs.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
+import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
+import { registerVetsRoute } from './routes/vets.js';
 
 /**
  * Builds the Fastify app and registers routes. Kept separate from the boot
@@ -24,6 +27,9 @@ export function buildApp(): FastifyInstance {
   registerAuthWebhook(app); // [public, signed] — own raw-body scope
   registerMeRoute(app); // [auth]
   registerDogsRoute(app); // [auth]
+  registerVetsRoute(app); // [auth]
+  registerRequiredVaccinesRoute(app); // [auth]
+  registerAgreementsRoute(app); // [auth]
 
   return app;
 }

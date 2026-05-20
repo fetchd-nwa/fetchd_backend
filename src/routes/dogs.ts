@@ -14,6 +14,8 @@ import {
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { live } from '../db/softExpire.js';
 import { ageInMonths } from '../lib/ageMonths.js';
+import { pgTimestampToIso } from '../lib/pgTimestamp.js';
+import { toVetWire, type VetWire } from '../lib/vetWire.js';
 
 /**
  * `GET /dogs` `[auth]` — every live dog the authenticated owner owns,
@@ -39,15 +41,6 @@ import { ageInMonths } from '../lib/ageMonths.js';
 
 type EvaluationStatus = (typeof evaluationStatus.enumValues)[number];
 type GroupClassKey = (typeof groupClassKey.enumValues)[number];
-
-interface VetWire {
-  id: string;
-  name: string;
-  phone?: string;
-  email?: string;
-  address?: string;
-  notes?: string;
-}
 
 interface VaccineWire {
   name: string;
@@ -170,19 +163,10 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
       if (dog.evaluationDate !== null) wire.evaluation_date = pgTimestampToIso(dog.evaluationDate);
       const keys = (completedByDog.get(dog.id) ?? []).map((c) => c.classKey);
       if (keys.length > 0) wire.completed_class_keys = keys;
-      if (vet !== null) wire.vet = vetWireFor(vet);
+      if (vet !== null) wire.vet = toVetWire(vet);
       return wire;
     });
   });
-}
-
-function vetWireFor(row: typeof vets.$inferSelect): VetWire {
-  const wire: VetWire = { id: row.id, name: row.name };
-  if (row.phone !== null) wire.phone = row.phone;
-  if (row.email !== null) wire.email = row.email;
-  if (row.address !== null) wire.address = row.address;
-  if (row.notes !== null) wire.notes = row.notes;
-  return wire;
 }
 
 function feedingWireFor(row: typeof dogFeeding.$inferSelect | undefined): FeedingWire {
@@ -198,18 +182,6 @@ function feedingWireFor(row: typeof dogFeeding.$inferSelect | undefined): Feedin
     frequency: row.frequency,
     notes: row.notes,
   };
-}
-
-function pgTimestampToIso(pgString: string): string {
-  // Drizzle pg with `mode: 'string'` returns timestamptz in PG's default ISO
-  // DateStyle: `'YYYY-MM-DD HH:MM:SS[.uuu]+TZ'` — space-separated date/time
-  // and a single-pair `+TZ` (no colon, e.g. `+00`). V8's `Date` parser rejects
-  // both. Rewrite the space → 'T' and pad the offset to `+HH:MM` so we can
-  // round-trip through `Date.toISOString()` for the on-wire ISO-8601 emit
-  // (per DATA-CONTRACT R5). Already-`Z` or `+HH:MM` strings pass untouched.
-  const withT = pgString.replace(' ', 'T');
-  const withTz = withT.replace(/([+-]\d{2})$/, '$1:00');
-  return new Date(withTz).toISOString();
 }
 
 function bucketBy<T, K>(items: T[], key: (item: T) => K): Map<K, T[]> {

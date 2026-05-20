@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { withActor } from '../db/tx.js';
 import { RELINK } from '../db/softExpire.js';
 import { appLocation, owners, staff, staffRole } from '../db/schema/schema.js';
+import { formatZodIssues } from '../lib/zodIssues.js';
 import { AuthError } from './errors.js';
 
 /**
@@ -84,7 +85,10 @@ export function parseInvite(body: unknown): ProvisionTarget {
   if ('app_role' in meta) {
     const parsed = staffMeta.safeParse(meta);
     if (!parsed.success) {
-      throw new AuthError('invalid_payload', `staff invite metadata invalid: ${issues(parsed)}`);
+      throw new AuthError(
+        'invalid_payload',
+        `staff invite metadata invalid: ${formatZodIssues(parsed.error)}`,
+      );
     }
     return {
       kind: 'staff',
@@ -97,7 +101,10 @@ export function parseInvite(body: unknown): ProvisionTarget {
 
   const parsed = ownerMeta.safeParse(meta);
   if (!parsed.success) {
-    throw new AuthError('invalid_payload', `owner invite metadata invalid: ${issues(parsed)}`);
+    throw new AuthError(
+      'invalid_payload',
+      `owner invite metadata invalid: ${formatZodIssues(parsed.error)}`,
+    );
   }
   return {
     kind: 'owner',
@@ -107,10 +114,6 @@ export function parseInvite(body: unknown): ProvisionTarget {
     phone: parsed.data.phone,
     location: parsed.data.location,
   };
-}
-
-function issues(result: { error: z.ZodError }): string {
-  return result.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ');
 }
 
 export interface ProvisionResult {

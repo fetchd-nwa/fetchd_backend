@@ -5,6 +5,7 @@ import { db } from '../db/client.js';
 import { appLocation, owners, staff } from '../db/schema/schema.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { formatZodIssues } from '../lib/zodIssues.js';
 import { AuthError } from '../auth/errors.js';
 
 /**
@@ -146,10 +147,7 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
 
     const parsed = patchMeSchema.safeParse(request.body);
     if (!parsed.success) {
-      const detail = parsed.error.issues
-        .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
-        .join('; ');
-      throw new AuthError('bad_request', `invalid profile patch: ${detail}`);
+      throw new AuthError('bad_request', `invalid profile patch: ${formatZodIssues(parsed.error)}`);
     }
 
     const set = toOwnerUpdate(parsed.data);
