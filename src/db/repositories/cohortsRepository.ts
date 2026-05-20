@@ -36,19 +36,14 @@ const COHORT_PROJECTION = {
   filled: cohorts.filled,
 } as const;
 
-function asCohortRows(rows: unknown[]): CohortRow[] {
-  return rows as CohortRow[];
-}
-
 export const cohortsRepository = {
   /** Live cohorts for one class, ordered by start_date ASC (next first). */
   async findByClassKey(classKey: GroupClassKey): Promise<CohortRow[]> {
-    const rows = await db
+    return db
       .select(COHORT_PROJECTION)
       .from(cohorts)
       .where(and(eq(cohorts.classKey, classKey), live(cohorts)))
       .orderBy(asc(cohorts.startDate));
-    return asCohortRows(rows);
   },
 
   /** Single live cohort by id, or undefined. */
@@ -58,6 +53,6 @@ export const cohortsRepository = {
       .from(cohorts)
       .where(and(eq(cohorts.id, id), live(cohorts)))
       .limit(1);
-    return asCohortRows(rows)[0];
+    return rows[0];
   },
 };

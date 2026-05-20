@@ -38,19 +38,14 @@ const GROUP_CLASS_PROJECTION = {
   enrollmentType: groupClasses.enrollmentType,
 } as const;
 
-function asGroupClassRows(rows: unknown[]): GroupClassRow[] {
-  return rows as GroupClassRow[];
-}
-
 export const groupClassesRepository = {
   /** All live group classes, enum-natural order. */
   async findAll(): Promise<GroupClassRow[]> {
-    const rows = await db
+    return db
       .select(GROUP_CLASS_PROJECTION)
       .from(groupClasses)
       .where(live(groupClasses))
       .orderBy(asc(groupClasses.key));
-    return asGroupClassRows(rows);
   },
 
   /** Single live group class by key, or undefined. */
@@ -60,7 +55,7 @@ export const groupClassesRepository = {
       .from(groupClasses)
       .where(and(eq(groupClasses.key, key), live(groupClasses)))
       .limit(1);
-    return asGroupClassRows(rows)[0];
+    return rows[0];
   },
 
   /**
@@ -75,6 +70,6 @@ export const groupClassesRepository = {
       .from(classPrereqOptions)
       .where(and(eq(classPrereqOptions.classKey, classKey), live(classPrereqOptions)))
       .orderBy(asc(classPrereqOptions.prereqClassKey));
-    return rows.map((r) => r.prereqClassKey as GroupClassKey);
+    return rows.map((r) => r.prereqClassKey);
   },
 };

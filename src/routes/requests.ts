@@ -4,7 +4,7 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
-import { pgTimestampToIso } from '../lib/pgTimestamp.js';
+import { pgTimestampToDate, pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { groupRequestDogs, toRequestWire, type PendingRequestWire } from '../lib/requestWire.js';
 import {
   requestsRepository,
@@ -103,13 +103,19 @@ function parseUuidParam(params: unknown): { id: string } {
 
 // ---- sort + denormalize ----------------------------------------------
 
-/** Sort by submitted_at — DESC (newest first) for the list view. */
+/**
+ * Sort by submitted_at — DESC (newest first) for the list view. Uses
+ * `pgTimestampToDate` (not `new Date`) so the PG default timestamptz
+ * format (single-pair `+TZ`, V8-incompatible) round-trips correctly —
+ * same parser as `routes/bookings.ts:sortByScheduledAt`.
+ */
 function sortBySubmittedAt(
   rows: PendingRequestRow[],
   direction: 'asc' | 'desc',
 ): PendingRequestRow[] {
   const sorted = [...rows].sort(
-    (a, b) => new Date(a.submittedAt).getTime() - new Date(b.submittedAt).getTime(),
+    (a, b) =>
+      pgTimestampToDate(a.submittedAt).getTime() - pgTimestampToDate(b.submittedAt).getTime(),
   );
   return direction === 'desc' ? sorted.reverse() : sorted;
 }

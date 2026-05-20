@@ -6,9 +6,7 @@ import {
   pendingRequests,
 } from '../schema/schema.js';
 import { live } from '../softExpire.js';
-import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type {
-  ComfortLevel,
   PendingRequestDogRow,
   PendingRequestRowForWire,
   RequestStatus,
@@ -40,17 +38,6 @@ const PENDING_REQUEST_PROJECTION = {
   convertedBookingId: pendingRequests.convertedBookingId,
 } as const;
 
-/**
- * Type-cast wrapper for the projected rows. Drizzle infers the column
- * types but loses the named-enum narrowing on `category` / `status` /
- * `comfortLevel` — the structural cast restores them so the wire helper's
- * `PendingRequestRowForWire` shape is satisfied without a runtime check.
- * Safe because the columns are the same physical pg enums.
- */
-function asRows(rows: unknown[]): PendingRequestRow[] {
-  return rows as PendingRequestRow[];
-}
-
 export const requestsRepository = {
   /**
    * Every live pending request for one owner, newest-submitted first.
@@ -69,11 +56,7 @@ export const requestsRepository = {
             live(pendingRequests),
           )
         : and(eq(pendingRequests.ownerId, ownerId), live(pendingRequests));
-    const rows = await db
-      .select(PENDING_REQUEST_PROJECTION)
-      .from(pendingRequests)
-      .where(conditions);
-    return asRows(rows);
+    return db.select(PENDING_REQUEST_PROJECTION).from(pendingRequests).where(conditions);
   },
 
   /**
@@ -92,7 +75,7 @@ export const requestsRepository = {
         ),
       )
       .limit(1);
-    return asRows(rows)[0];
+    return rows[0];
   },
 
   /**
@@ -137,7 +120,3 @@ export const requestsRepository = {
       .orderBy(asc(pendingRequestPreferredDates.ordinal));
   },
 };
-
-// Re-export ServiceCategory so route can narrow the request-status enum
-// against it without a second import path. Pure typing convenience.
-export type { ComfortLevel, RequestStatus, ServiceCategory };
