@@ -86,16 +86,16 @@ export const dogs = pgTable("dogs", {
 			foreignColumns: [owners.id],
 			name: "dogs_owner_id_fkey"
 		}).onDelete("restrict"),
-		dogsPrimaryVetFk: foreignKey({
-			columns: [table.primaryVetId],
-			foreignColumns: [vets.id],
-			name: "dogs_primary_vet_fk"
-		}).onDelete("set null"),
 		dogsStaffOwnerIdFkey: foreignKey({
 			columns: [table.staffOwnerId],
 			foreignColumns: [staff.id],
 			name: "dogs_staff_owner_id_fkey"
 		}).onDelete("restrict"),
+		dogsPrimaryVetFk: foreignKey({
+			columns: [table.primaryVetId],
+			foreignColumns: [vets.id],
+			name: "dogs_primary_vet_fk"
+		}).onDelete("set null"),
 		dogsCheck: check("dogs_check", sql`(birthdate IS NOT NULL) OR (age_months_override IS NOT NULL)`),
 		dogsCheck1: check("dogs_check1", sql`(owner_id IS NOT NULL) <> (staff_owner_id IS NOT NULL)`),
 	}
@@ -114,24 +114,6 @@ export const staff = pgTable("staff", {
 }, (table) => {
 	return {
 		staffSupabaseUidKey: unique("staff_supabase_uid_key").on(table.supabaseUid),
-	}
-});
-
-export const vets = pgTable("vets", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	name: text().notNull(),
-	phone: text(),
-	email: text(),
-	address: text(),
-	notes: text(),
-	externalRef: text("external_ref"),
-	source: recordSource().default('app').notNull(),
-	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
-}, (table) => {
-	return {
-		sourceRefUidx: uniqueIndex("vets_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("text_ops"), table.externalRef.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
 	}
 });
 
@@ -156,6 +138,24 @@ export const dogVaccines = pgTable("dog_vaccines", {
 			foreignColumns: [requiredVaccines.key],
 			name: "dog_vaccines_requirement_key_fkey"
 		}),
+	}
+});
+
+export const vets = pgTable("vets", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	name: text().notNull(),
+	phone: text(),
+	email: text(),
+	address: text(),
+	notes: text(),
+	externalRef: text("external_ref"),
+	source: recordSource().default('app').notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		sourceRefUidx: uniqueIndex("vets_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("text_ops"), table.externalRef.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
 	}
 });
 
@@ -227,19 +227,36 @@ export const groupClasses = pgTable("group_classes", {
 	ageRange: text("age_range"),
 	description: text().notNull(),
 	enrollmentType: text("enrollment_type").notNull(),
-	prereqClassKey: groupClassKey("prereq_class_key"),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
-		groupClassesPrereqClassKeyFkey: foreignKey({
-			columns: [table.prereqClassKey],
-			foreignColumns: [table.key],
-			name: "group_classes_prereq_class_key_fkey"
-		}),
+		groupClassesWeeksCheck: check("group_classes_weeks_check", sql`weeks > 0`),
+		groupClassesPricePerDogCentsCheck: check("group_classes_price_per_dog_cents_check", sql`price_per_dog_cents >= 0`),
 		groupClassesCapacityCheck: check("group_classes_capacity_check", sql`capacity > 0`),
 		groupClassesEnrollmentTypeCheck: check("group_classes_enrollment_type_check", sql`enrollment_type = ANY (ARRAY['open'::text, 'cohort'::text])`),
-		groupClassesPricePerDogCentsCheck: check("group_classes_price_per_dog_cents_check", sql`price_per_dog_cents >= 0`),
-		groupClassesWeeksCheck: check("group_classes_weeks_check", sql`weeks > 0`),
+	}
+});
+
+export const classPrereqOptions = pgTable("class_prereq_options", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	classKey: groupClassKey("class_key").notNull(),
+	prereqClassKey: groupClassKey("prereq_class_key").notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		classIdx: index("class_prereq_options_class_idx").using("btree", table.classKey.asc().nullsLast().op("enum_ops")),
+		uidx: uniqueIndex("class_prereq_options_uidx").using("btree", table.classKey.asc().nullsLast().op("enum_ops"), table.prereqClassKey.asc().nullsLast().op("enum_ops")).where(sql`(expired_at IS NULL)`),
+		classPrereqOptionsClassKeyFkey: foreignKey({
+			columns: [table.classKey],
+			foreignColumns: [groupClasses.key],
+			name: "class_prereq_options_class_key_fkey"
+		}).onDelete("cascade"),
+		classPrereqOptionsPrereqClassKeyFkey: foreignKey({
+			columns: [table.prereqClassKey],
+			foreignColumns: [groupClasses.key],
+			name: "class_prereq_options_prereq_class_key_fkey"
+		}),
 	}
 });
 
@@ -263,10 +280,10 @@ export const cohorts = pgTable("cohorts", {
 			foreignColumns: [groupClasses.key],
 			name: "cohorts_class_key_fkey"
 		}),
-		cohortsCapacityCheck: check("cohorts_capacity_check", sql`capacity > 0`),
-		cohortsCheck: check("cohorts_check", sql`filled <= capacity`),
-		cohortsFilledCheck: check("cohorts_filled_check", sql`filled >= 0`),
 		cohortsWeeksCheck: check("cohorts_weeks_check", sql`weeks > 0`),
+		cohortsCapacityCheck: check("cohorts_capacity_check", sql`capacity > 0`),
+		cohortsFilledCheck: check("cohorts_filled_check", sql`filled >= 0`),
+		cohortsCheck: check("cohorts_check", sql`filled <= capacity`),
 	}
 });
 
@@ -333,15 +350,15 @@ export const mediaAssets = pgTable("media_assets", {
 		ownerIdx: index("media_assets_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
 		reportIdx: index("media_assets_report_idx").using("btree", table.reportId.asc().nullsLast().op("uuid_ops")),
 		sourceRefUidx: uniqueIndex("media_assets_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("enum_ops"), table.externalRef.asc().nullsLast().op("enum_ops")).where(sql`(expired_at IS NULL)`),
-		mediaAssetsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "media_assets_dog_id_fkey"
-		}).onDelete("cascade"),
 		mediaAssetsOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
 			name: "media_assets_owner_id_fkey"
+		}).onDelete("cascade"),
+		mediaAssetsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "media_assets_dog_id_fkey"
 		}).onDelete("cascade"),
 		mediaAssetsReportIdFkey: foreignKey({
 			columns: [table.reportId],
@@ -381,26 +398,31 @@ export const bookings = pgTable("bookings", {
 	return {
 		cohortIdx: index("bookings_cohort_idx").using("btree", table.cohortId.asc().nullsLast().op("uuid_ops")),
 		dropoffIdx: index("bookings_dropoff_idx").using("btree", table.dropoffAt.asc().nullsLast().op("timestamptz_ops")).where(sql`(dropoff_at IS NOT NULL)`),
-		leadDogIdx: index("bookings_lead_dog_idx").using("btree", table.leadDogId.asc().nullsLast().op("timestamptz_ops"), table.scheduledAt.asc().nullsLast().op("timestamptz_ops")),
+		leadDogIdx: index("bookings_lead_dog_idx").using("btree", table.leadDogId.asc().nullsLast().op("uuid_ops"), table.scheduledAt.asc().nullsLast().op("uuid_ops")),
 		locationTimeIdx: index("bookings_location_time_idx").using("btree", table.location.asc().nullsLast().op("timestamptz_ops"), table.scheduledAt.asc().nullsLast().op("timestamptz_ops")),
 		ownerIdx: index("bookings_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
-		sourceRefUidx: uniqueIndex("bookings_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("text_ops"), table.externalRef.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
+		sourceRefUidx: uniqueIndex("bookings_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("enum_ops"), table.externalRef.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
 		statusTimeIdx: index("bookings_status_time_idx").using("btree", table.status.asc().nullsLast().op("enum_ops"), table.scheduledAt.asc().nullsLast().op("timestamptz_ops")),
-		bookingsCohortIdFkey: foreignKey({
-			columns: [table.cohortId],
-			foreignColumns: [cohorts.id],
-			name: "bookings_cohort_id_fkey"
-		}),
-		bookingsLeadDogIdFkey: foreignKey({
-			columns: [table.leadDogId],
-			foreignColumns: [dogs.id],
-			name: "bookings_lead_dog_id_fkey"
-		}),
 		bookingsOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
 			name: "bookings_owner_id_fkey"
 		}).onDelete("restrict"),
+		bookingsLeadDogIdFkey: foreignKey({
+			columns: [table.leadDogId],
+			foreignColumns: [dogs.id],
+			name: "bookings_lead_dog_id_fkey"
+		}),
+		bookingsTrainerStaffIdFkey: foreignKey({
+			columns: [table.trainerStaffId],
+			foreignColumns: [staff.id],
+			name: "bookings_trainer_staff_id_fkey"
+		}),
+		bookingsCohortIdFkey: foreignKey({
+			columns: [table.cohortId],
+			foreignColumns: [cohorts.id],
+			name: "bookings_cohort_id_fkey"
+		}),
 		bookingsReportIdFkey: foreignKey({
 			columns: [table.reportId],
 			foreignColumns: [reports.id],
@@ -410,11 +432,6 @@ export const bookings = pgTable("bookings", {
 			columns: [table.sessionReportId],
 			foreignColumns: [reports.id],
 			name: "bookings_session_report_id_fkey"
-		}),
-		bookingsTrainerStaffIdFkey: foreignKey({
-			columns: [table.trainerStaffId],
-			foreignColumns: [staff.id],
-			name: "bookings_trainer_staff_id_fkey"
 		}),
 		bookingsCheck: check("bookings_check", sql`(category = 'group-class'::service_category) = (cohort_id IS NOT NULL)`),
 		bookingsCheck1: check("bookings_check1", sql`(dropoff_at IS NULL) OR (category = ANY (ARRAY['boarding'::service_category, 'board-and-train'::service_category]))`),
@@ -438,11 +455,6 @@ export const afterSchoolOptins = pgTable("after_school_optins", {
 		ownerIdx: index("after_school_optins_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
 		sourceRefUidx: uniqueIndex("after_school_optins_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("text_ops"), table.externalRef.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
 		uidx: uniqueIndex("after_school_optins_uidx").using("btree", table.bookingId.asc().nullsLast().op("uuid_ops"), table.dogId.asc().nullsLast().op("uuid_ops")).where(sql`(expired_at IS NULL)`),
-		afterSchoolOptinsBookingIdBookingCategoryFkey: foreignKey({
-			columns: [table.bookingId, table.bookingCategory],
-			foreignColumns: [bookings.id, bookings.category],
-			name: "after_school_optins_booking_id_booking_category_fkey"
-		}).onDelete("cascade"),
 		afterSchoolOptinsDogIdFkey: foreignKey({
 			columns: [table.dogId],
 			foreignColumns: [dogs.id],
@@ -453,8 +465,13 @@ export const afterSchoolOptins = pgTable("after_school_optins", {
 			foreignColumns: [owners.id],
 			name: "after_school_optins_owner_id_fkey"
 		}).onDelete("cascade"),
-		afterSchoolOptinsBookingCategoryCheck: check("after_school_optins_booking_category_check", sql`booking_category = 'day-school'::service_category`),
+		afterSchoolOptinsBookingIdBookingCategoryFkey: foreignKey({
+			columns: [table.bookingId, table.bookingCategory],
+			foreignColumns: [bookings.id, bookings.category],
+			name: "after_school_optins_booking_id_booking_category_fkey"
+		}).onDelete("cascade"),
 		afterSchoolOptinsSchoolDayCountCheck: check("after_school_optins_school_day_count_check", sql`school_day_count > 0`),
+		afterSchoolOptinsBookingCategoryCheck: check("after_school_optins_booking_category_check", sql`booking_category = 'day-school'::service_category`),
 	}
 });
 
@@ -481,8 +498,18 @@ export const pendingRequests = pgTable("pending_requests", {
 }, (table) => {
 	return {
 		ownerIdx: index("pending_requests_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
-		sourceRefUidx: uniqueIndex("pending_requests_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("text_ops"), table.externalRef.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
+		sourceRefUidx: uniqueIndex("pending_requests_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("enum_ops"), table.externalRef.asc().nullsLast().op("enum_ops")).where(sql`(expired_at IS NULL)`),
 		statusIdx: index("pending_requests_status_idx").using("btree", table.status.asc().nullsLast().op("enum_ops")),
+		pendingRequestsOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "pending_requests_owner_id_fkey"
+		}).onDelete("restrict"),
+		pendingRequestsLeadDogIdFkey: foreignKey({
+			columns: [table.leadDogId],
+			foreignColumns: [dogs.id],
+			name: "pending_requests_lead_dog_id_fkey"
+		}),
 		pendingRequestsApprovedByStaffIdFkey: foreignKey({
 			columns: [table.approvedByStaffId],
 			foreignColumns: [staff.id],
@@ -493,16 +520,6 @@ export const pendingRequests = pgTable("pending_requests", {
 			foreignColumns: [bookings.id],
 			name: "pending_requests_converted_booking_id_fkey"
 		}),
-		pendingRequestsLeadDogIdFkey: foreignKey({
-			columns: [table.leadDogId],
-			foreignColumns: [dogs.id],
-			name: "pending_requests_lead_dog_id_fkey"
-		}),
-		pendingRequestsOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "pending_requests_owner_id_fkey"
-		}).onDelete("restrict"),
 	}
 });
 
@@ -520,25 +537,25 @@ export const creditLedger = pgTable("credit_ledger", {
 }, (table) => {
 	return {
 		dogModeIdx: index("credit_ledger_dog_mode_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.mode.asc().nullsLast().op("uuid_ops")),
-		creditLedgerBookingIdFkey: foreignKey({
-			columns: [table.bookingId],
-			foreignColumns: [bookings.id],
-			name: "credit_ledger_booking_id_fkey"
-		}),
-		creditLedgerChargeFk: foreignKey({
-			columns: [table.chargeId],
-			foreignColumns: [charges.id],
-			name: "credit_ledger_charge_fk"
-		}),
 		creditLedgerDogIdFkey: foreignKey({
 			columns: [table.dogId],
 			foreignColumns: [dogs.id],
 			name: "credit_ledger_dog_id_fkey"
 		}).onDelete("restrict"),
+		creditLedgerBookingIdFkey: foreignKey({
+			columns: [table.bookingId],
+			foreignColumns: [bookings.id],
+			name: "credit_ledger_booking_id_fkey"
+		}),
 		creditLedgerPackageKeyFkey: foreignKey({
 			columns: [table.packageKey],
 			foreignColumns: [creditPackages.key],
 			name: "credit_ledger_package_key_fkey"
+		}),
+		creditLedgerChargeFk: foreignKey({
+			columns: [table.chargeId],
+			foreignColumns: [charges.id],
+			name: "credit_ledger_charge_fk"
 		}),
 	}
 });
@@ -613,16 +630,16 @@ export const charges = pgTable("charges", {
 }, (table) => {
 	return {
 		ownerIdx: index("charges_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
-		chargesBookingIdFkey: foreignKey({
-			columns: [table.bookingId],
-			foreignColumns: [bookings.id],
-			name: "charges_booking_id_fkey"
-		}),
 		chargesOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
 			name: "charges_owner_id_fkey"
 		}).onDelete("restrict"),
+		chargesBookingIdFkey: foreignKey({
+			columns: [table.bookingId],
+			foreignColumns: [bookings.id],
+			name: "charges_booking_id_fkey"
+		}),
 		chargesStripePaymentIntentIdKey: unique("charges_stripe_payment_intent_id_key").on(table.stripePaymentIntentId),
 		chargesAmountCentsCheck: check("charges_amount_cents_check", sql`amount_cents >= 0`),
 	}
@@ -651,6 +668,11 @@ export const invoices = pgTable("invoices", {
 	return {
 		openIdx: index("invoices_open_idx").using("btree", table.status.asc().nullsLast().op("enum_ops")).where(sql`(status = 'open'::invoice_status)`),
 		ownerIdx: index("invoices_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
+		invoicesOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "invoices_owner_id_fkey"
+		}).onDelete("restrict"),
 		invoicesBookingIdFkey: foreignKey({
 			columns: [table.bookingId],
 			foreignColumns: [bookings.id],
@@ -661,26 +683,21 @@ export const invoices = pgTable("invoices", {
 			foreignColumns: [cohorts.id],
 			name: "invoices_cohort_id_fkey"
 		}).onDelete("set null"),
-		invoicesOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "invoices_owner_id_fkey"
+		invoicesRequestIdFkey: foreignKey({
+			columns: [table.requestId],
+			foreignColumns: [pendingRequests.id],
+			name: "invoices_request_id_fkey"
+		}).onDelete("set null"),
+		invoicesPaymentMethodIdFkey: foreignKey({
+			columns: [table.paymentMethodId],
+			foreignColumns: [paymentMethods.id],
+			name: "invoices_payment_method_id_fkey"
 		}).onDelete("restrict"),
 		invoicesPaidChargeIdFkey: foreignKey({
 			columns: [table.paidChargeId],
 			foreignColumns: [charges.id],
 			name: "invoices_paid_charge_id_fkey"
 		}),
-		invoicesPaymentMethodIdFkey: foreignKey({
-			columns: [table.paymentMethodId],
-			foreignColumns: [paymentMethods.id],
-			name: "invoices_payment_method_id_fkey"
-		}).onDelete("restrict"),
-		invoicesRequestIdFkey: foreignKey({
-			columns: [table.requestId],
-			foreignColumns: [pendingRequests.id],
-			name: "invoices_request_id_fkey"
-		}).onDelete("set null"),
 		invoicesSourceExternalRefKey: unique("invoices_source_external_ref_key").on(table.externalRef, table.source),
 		invoicesAmountCentsCheck: check("invoices_amount_cents_check", sql`amount_cents >= 0`),
 		invoicesCheck: check("invoices_check", sql`(status <> 'paid'::invoice_status) OR (paid_at IS NOT NULL)`),
@@ -699,52 +716,17 @@ export const memberships = pgTable("memberships", {
 }, (table) => {
 	return {
 		ownerIdx: index("memberships_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
-		membershipsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "memberships_dog_id_fkey"
-		}).onDelete("restrict"),
 		membershipsOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
 			name: "memberships_owner_id_fkey"
 		}).onDelete("restrict"),
+		membershipsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "memberships_dog_id_fkey"
+		}).onDelete("restrict"),
 		membershipsStripeSubscriptionIdKey: unique("memberships_stripe_subscription_id_key").on(table.stripeSubscriptionId),
-	}
-});
-
-export const refunds = pgTable("refunds", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	ownerId: uuid("owner_id").notNull(),
-	chargeId: uuid("charge_id").notNull(),
-	bookingId: uuid("booking_id"),
-	stripeRefundId: text("stripe_refund_id"),
-	amountCents: integer("amount_cents").notNull(),
-	reason: text(),
-	status: refundStatus().default('pending').notNull(),
-	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-}, (table) => {
-	return {
-		chargeIdx: index("refunds_charge_idx").using("btree", table.chargeId.asc().nullsLast().op("uuid_ops")),
-		ownerIdx: index("refunds_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
-		refundsBookingIdFkey: foreignKey({
-			columns: [table.bookingId],
-			foreignColumns: [bookings.id],
-			name: "refunds_booking_id_fkey"
-		}),
-		refundsChargeIdFkey: foreignKey({
-			columns: [table.chargeId],
-			foreignColumns: [charges.id],
-			name: "refunds_charge_id_fkey"
-		}).onDelete("restrict"),
-		refundsOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "refunds_owner_id_fkey"
-		}).onDelete("restrict"),
-		refundsStripeRefundIdKey: unique("refunds_stripe_refund_id_key").on(table.stripeRefundId),
-		refundsAmountCentsCheck: check("refunds_amount_cents_check", sql`amount_cents > 0`),
 	}
 });
 
@@ -760,17 +742,17 @@ export const agreementSignatures = pgTable("agreement_signatures", {
 	source: recordSource().default('app').notNull(),
 }, (table) => {
 	return {
-		ownerIdx: index("agreement_signatures_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("text_ops"), table.documentKey.asc().nullsLast().op("uuid_ops")),
-		agreementSignaturesDocumentKeyFkey: foreignKey({
-			columns: [table.documentKey],
-			foreignColumns: [agreementDocuments.key],
-			name: "agreement_signatures_document_key_fkey"
-		}),
+		ownerIdx: index("agreement_signatures_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops"), table.documentKey.asc().nullsLast().op("uuid_ops")),
 		agreementSignaturesOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
 			name: "agreement_signatures_owner_id_fkey"
 		}).onDelete("restrict"),
+		agreementSignaturesDocumentKeyFkey: foreignKey({
+			columns: [table.documentKey],
+			foreignColumns: [agreementDocuments.key],
+			name: "agreement_signatures_document_key_fkey"
+		}),
 		agreementSignaturesOwnerIdDocumentKeyVersionKey: unique("agreement_signatures_owner_id_document_key_version_key").on(table.ownerId, table.documentKey, table.version),
 		agreementSignaturesVersionCheck: check("agreement_signatures_version_check", sql`version > 0`),
 	}
@@ -790,21 +772,38 @@ export const agreementDocuments = pgTable("agreement_documents", {
 	}
 });
 
-export const serviceRates = pgTable("service_rates", {
+export const refunds = pgTable("refunds", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
-	category: serviceCategory().notNull(),
-	location: locationKey(),
+	ownerId: uuid("owner_id").notNull(),
+	chargeId: uuid("charge_id").notNull(),
+	bookingId: uuid("booking_id"),
+	stripeRefundId: text("stripe_refund_id"),
 	amountCents: integer("amount_cents").notNull(),
-	unit: rateUnit().notNull(),
-	effectiveFrom: date("effective_from").notNull(),
-	effectiveTo: date("effective_to"),
-	note: text(),
+	reason: text(),
+	status: refundStatus().default('pending').notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 }, (table) => {
 	return {
-		lookupIdx: index("service_rates_lookup_idx").using("btree", table.category.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("date_ops"), table.effectiveFrom.desc().nullsFirst().op("enum_ops")),
-		serviceRatesAmountCentsCheck: check("service_rates_amount_cents_check", sql`amount_cents >= 0`),
-		serviceRatesCheck: check("service_rates_check", sql`(effective_to IS NULL) OR (effective_to > effective_from)`),
+		chargeIdx: index("refunds_charge_idx").using("btree", table.chargeId.asc().nullsLast().op("uuid_ops")),
+		ownerIdx: index("refunds_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
+		refundsOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "refunds_owner_id_fkey"
+		}).onDelete("restrict"),
+		refundsChargeIdFkey: foreignKey({
+			columns: [table.chargeId],
+			foreignColumns: [charges.id],
+			name: "refunds_charge_id_fkey"
+		}).onDelete("restrict"),
+		refundsBookingIdFkey: foreignKey({
+			columns: [table.bookingId],
+			foreignColumns: [bookings.id],
+			name: "refunds_booking_id_fkey"
+		}),
+		refundsStripeRefundIdKey: unique("refunds_stripe_refund_id_key").on(table.stripeRefundId),
+		refundsAmountCentsCheck: check("refunds_amount_cents_check", sql`amount_cents > 0`),
 	}
 });
 
@@ -825,6 +824,24 @@ export const idempotencyKeys = pgTable("idempotency_keys", {
 			foreignColumns: [owners.id],
 			name: "idempotency_keys_owner_id_fkey"
 		}).onDelete("cascade"),
+	}
+});
+
+export const serviceRates = pgTable("service_rates", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	category: serviceCategory().notNull(),
+	location: locationKey(),
+	amountCents: integer("amount_cents").notNull(),
+	unit: rateUnit().notNull(),
+	effectiveFrom: date("effective_from").notNull(),
+	effectiveTo: date("effective_to"),
+	note: text(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		lookupIdx: index("service_rates_lookup_idx").using("btree", table.category.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("date_ops"), table.effectiveFrom.desc().nullsFirst().op("date_ops")),
+		serviceRatesAmountCentsCheck: check("service_rates_amount_cents_check", sql`amount_cents >= 0`),
+		serviceRatesCheck: check("service_rates_check", sql`(effective_to IS NULL) OR (effective_to > effective_from)`),
 	}
 });
 
@@ -858,87 +875,6 @@ export const threads = pgTable("threads", {
 	}
 });
 
-export const scheduledNotifications = pgTable("scheduled_notifications", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	ownerId: uuid("owner_id").notNull(),
-	type: notificationType().notNull(),
-	trigger: text().notNull(),
-	dedupeKey: text("dedupe_key"),
-	scheduledFor: timestamp("scheduled_for", { withTimezone: true, mode: 'string' }).notNull(),
-	status: scheduledStatus().default('pending').notNull(),
-	title: text().notNull(),
-	body: text().notNull(),
-	deepLinkPath: text("deep_link_path"),
-	bookingId: uuid("booking_id"),
-	reportId: uuid("report_id"),
-	dogId: uuid("dog_id"),
-	emittedNotificationId: uuid("emitted_notification_id"),
-	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	sentAt: timestamp("sent_at", { withTimezone: true, mode: 'string' }),
-}, (table) => {
-	return {
-		dueIdx: index("scheduled_notifications_due_idx").using("btree", table.scheduledFor.asc().nullsLast().op("timestamptz_ops")).where(sql`(status = 'pending'::scheduled_status)`),
-		scheduledNotificationsBookingIdFkey: foreignKey({
-			columns: [table.bookingId],
-			foreignColumns: [bookings.id],
-			name: "scheduled_notifications_booking_id_fkey"
-		}).onDelete("cascade"),
-		scheduledNotificationsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "scheduled_notifications_dog_id_fkey"
-		}).onDelete("cascade"),
-		scheduledNotificationsEmittedNotificationIdFkey: foreignKey({
-			columns: [table.emittedNotificationId],
-			foreignColumns: [notifications.id],
-			name: "scheduled_notifications_emitted_notification_id_fkey"
-		}),
-		scheduledNotificationsOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "scheduled_notifications_owner_id_fkey"
-		}).onDelete("cascade"),
-		scheduledNotificationsReportIdFkey: foreignKey({
-			columns: [table.reportId],
-			foreignColumns: [reports.id],
-			name: "scheduled_notifications_report_id_fkey"
-		}).onDelete("cascade"),
-		scheduledNotificationsDedupeKeyKey: unique("scheduled_notifications_dedupe_key_key").on(table.dedupeKey),
-	}
-});
-
-export const messages = pgTable("messages", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	threadId: uuid("thread_id").notNull(),
-	senderKind: senderKind("sender_kind").notNull(),
-	senderOwnerId: uuid("sender_owner_id"),
-	senderStaffId: uuid("sender_staff_id"),
-	text: text().notNull(),
-	sentAt: timestamp("sent_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	readAt: timestamp("read_at", { withTimezone: true, mode: 'string' }),
-	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
-}, (table) => {
-	return {
-		threadIdx: index("messages_thread_idx").using("btree", table.threadId.asc().nullsLast().op("timestamptz_ops"), table.sentAt.asc().nullsLast().op("timestamptz_ops")),
-		messagesSenderOwnerIdFkey: foreignKey({
-			columns: [table.senderOwnerId],
-			foreignColumns: [owners.id],
-			name: "messages_sender_owner_id_fkey"
-		}),
-		messagesSenderStaffIdFkey: foreignKey({
-			columns: [table.senderStaffId],
-			foreignColumns: [staff.id],
-			name: "messages_sender_staff_id_fkey"
-		}),
-		messagesThreadIdFkey: foreignKey({
-			columns: [table.threadId],
-			foreignColumns: [threads.id],
-			name: "messages_thread_id_fkey"
-		}).onDelete("cascade"),
-		messagesCheck: check("messages_check", sql`((sender_kind = 'owner'::sender_kind) AND (sender_owner_id IS NOT NULL) AND (sender_staff_id IS NULL)) OR ((sender_kind = 'staff'::sender_kind) AND (sender_staff_id IS NOT NULL) AND (sender_owner_id IS NULL))`),
-	}
-});
-
 export const notifications = pgTable("notifications", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	ownerId: uuid("owner_id").notNull(),
@@ -963,6 +899,38 @@ export const notifications = pgTable("notifications", {
 			foreignColumns: [staff.id],
 			name: "notifications_sender_staff_id_fkey"
 		}),
+	}
+});
+
+export const messages = pgTable("messages", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	threadId: uuid("thread_id").notNull(),
+	senderKind: senderKind("sender_kind").notNull(),
+	senderOwnerId: uuid("sender_owner_id"),
+	senderStaffId: uuid("sender_staff_id"),
+	text: text().notNull(),
+	sentAt: timestamp("sent_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	readAt: timestamp("read_at", { withTimezone: true, mode: 'string' }),
+	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		threadIdx: index("messages_thread_idx").using("btree", table.threadId.asc().nullsLast().op("timestamptz_ops"), table.sentAt.asc().nullsLast().op("timestamptz_ops")),
+		messagesThreadIdFkey: foreignKey({
+			columns: [table.threadId],
+			foreignColumns: [threads.id],
+			name: "messages_thread_id_fkey"
+		}).onDelete("cascade"),
+		messagesSenderOwnerIdFkey: foreignKey({
+			columns: [table.senderOwnerId],
+			foreignColumns: [owners.id],
+			name: "messages_sender_owner_id_fkey"
+		}),
+		messagesSenderStaffIdFkey: foreignKey({
+			columns: [table.senderStaffId],
+			foreignColumns: [staff.id],
+			name: "messages_sender_staff_id_fkey"
+		}),
+		messagesCheck: check("messages_check", sql`((sender_kind = 'owner'::sender_kind) AND (sender_owner_id IS NOT NULL) AND (sender_staff_id IS NULL)) OR ((sender_kind = 'staff'::sender_kind) AND (sender_staff_id IS NOT NULL) AND (sender_owner_id IS NULL))`),
 	}
 });
 
@@ -1024,6 +992,55 @@ export const eventRsvps = pgTable("event_rsvps", {
 	}
 });
 
+export const scheduledNotifications = pgTable("scheduled_notifications", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	ownerId: uuid("owner_id").notNull(),
+	type: notificationType().notNull(),
+	trigger: text().notNull(),
+	dedupeKey: text("dedupe_key"),
+	scheduledFor: timestamp("scheduled_for", { withTimezone: true, mode: 'string' }).notNull(),
+	status: scheduledStatus().default('pending').notNull(),
+	title: text().notNull(),
+	body: text().notNull(),
+	deepLinkPath: text("deep_link_path"),
+	bookingId: uuid("booking_id"),
+	reportId: uuid("report_id"),
+	dogId: uuid("dog_id"),
+	emittedNotificationId: uuid("emitted_notification_id"),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	sentAt: timestamp("sent_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		dueIdx: index("scheduled_notifications_due_idx").using("btree", table.scheduledFor.asc().nullsLast().op("timestamptz_ops")).where(sql`(status = 'pending'::scheduled_status)`),
+		scheduledNotificationsOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "scheduled_notifications_owner_id_fkey"
+		}).onDelete("cascade"),
+		scheduledNotificationsBookingIdFkey: foreignKey({
+			columns: [table.bookingId],
+			foreignColumns: [bookings.id],
+			name: "scheduled_notifications_booking_id_fkey"
+		}).onDelete("cascade"),
+		scheduledNotificationsReportIdFkey: foreignKey({
+			columns: [table.reportId],
+			foreignColumns: [reports.id],
+			name: "scheduled_notifications_report_id_fkey"
+		}).onDelete("cascade"),
+		scheduledNotificationsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "scheduled_notifications_dog_id_fkey"
+		}).onDelete("cascade"),
+		scheduledNotificationsEmittedNotificationIdFkey: foreignKey({
+			columns: [table.emittedNotificationId],
+			foreignColumns: [notifications.id],
+			name: "scheduled_notifications_emitted_notification_id_fkey"
+		}),
+		scheduledNotificationsDedupeKeyKey: unique("scheduled_notifications_dedupe_key_key").on(table.dedupeKey),
+	}
+});
+
 export const announcements = pgTable("announcements", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	category: announcementCategory().notNull(),
@@ -1069,7 +1086,7 @@ export const auditLog = pgTable("audit_log", {
 	at: timestamp({ withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 }, (table) => {
 	return {
-		tableRowIdx: index("audit_log_table_row_idx").using("btree", table.tableName.asc().nullsLast().op("text_ops"), table.rowPk.asc().nullsLast().op("text_ops"), table.at.desc().nullsFirst().op("text_ops")),
+		tableRowIdx: index("audit_log_table_row_idx").using("btree", table.tableName.asc().nullsLast().op("text_ops"), table.rowPk.asc().nullsLast().op("timestamptz_ops"), table.at.desc().nullsFirst().op("text_ops")),
 	}
 });
 
@@ -1078,15 +1095,15 @@ export const notificationDogs = pgTable("notification_dogs", {
 	dogId: uuid("dog_id").notNull(),
 }, (table) => {
 	return {
-		notificationDogsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "notification_dogs_dog_id_fkey"
-		}).onDelete("cascade"),
 		notificationDogsNotificationIdFkey: foreignKey({
 			columns: [table.notificationId],
 			foreignColumns: [notifications.id],
 			name: "notification_dogs_notification_id_fkey"
+		}).onDelete("cascade"),
+		notificationDogsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "notification_dogs_dog_id_fkey"
 		}).onDelete("cascade"),
 		notificationDogsPkey: primaryKey({ columns: [table.notificationId, table.dogId], name: "notification_dogs_pkey"}),
 	}
@@ -1098,15 +1115,15 @@ export const threadDogs = pgTable("thread_dogs", {
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
-		threadDogsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "thread_dogs_dog_id_fkey"
-		}).onDelete("cascade"),
 		threadDogsThreadIdFkey: foreignKey({
 			columns: [table.threadId],
 			foreignColumns: [threads.id],
 			name: "thread_dogs_thread_id_fkey"
+		}).onDelete("cascade"),
+		threadDogsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "thread_dogs_dog_id_fkey"
 		}).onDelete("cascade"),
 		threadDogsPkey: primaryKey({ columns: [table.threadId, table.dogId], name: "thread_dogs_pkey"}),
 	}
@@ -1118,15 +1135,15 @@ export const eventRsvpDogs = pgTable("event_rsvp_dogs", {
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
-		eventRsvpDogsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "event_rsvp_dogs_dog_id_fkey"
-		}).onDelete("cascade"),
 		eventRsvpDogsRsvpIdFkey: foreignKey({
 			columns: [table.rsvpId],
 			foreignColumns: [eventRsvps.id],
 			name: "event_rsvp_dogs_rsvp_id_fkey"
+		}).onDelete("cascade"),
+		eventRsvpDogsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "event_rsvp_dogs_dog_id_fkey"
 		}).onDelete("cascade"),
 		eventRsvpDogsPkey: primaryKey({ columns: [table.rsvpId, table.dogId], name: "event_rsvp_dogs_pkey"}),
 	}
@@ -1139,15 +1156,15 @@ export const pendingRequestDogs = pgTable("pending_request_dogs", {
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
-		pendingRequestDogsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "pending_request_dogs_dog_id_fkey"
-		}).onDelete("cascade"),
 		pendingRequestDogsRequestIdFkey: foreignKey({
 			columns: [table.requestId],
 			foreignColumns: [pendingRequests.id],
 			name: "pending_request_dogs_request_id_fkey"
+		}).onDelete("cascade"),
+		pendingRequestDogsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "pending_request_dogs_dog_id_fkey"
 		}).onDelete("cascade"),
 		pendingRequestDogsPkey: primaryKey({ columns: [table.requestId, table.dogId], name: "pending_request_dogs_pkey"}),
 	}
@@ -1178,8 +1195,8 @@ export const dayCapacity = pgTable("day_capacity", {
 }, (table) => {
 	return {
 		dayCapacityPkey: primaryKey({ columns: [table.location, table.date], name: "day_capacity_pkey"}),
-		dayCapacityDaycareOpeningsCheck: check("day_capacity_daycare_openings_check", sql`daycare_openings >= 0`),
 		dayCapacitySchoolOpeningsCheck: check("day_capacity_school_openings_check", sql`school_openings >= 0`),
+		dayCapacityDaycareOpeningsCheck: check("day_capacity_daycare_openings_check", sql`daycare_openings >= 0`),
 	}
 });
 
@@ -1199,16 +1216,16 @@ export const bookingDogs = pgTable("booking_dogs", {
 			foreignColumns: [bookings.id],
 			name: "booking_dogs_booking_id_fkey"
 		}).onDelete("cascade"),
-		bookingDogsCheckedInByStaffIdFkey: foreignKey({
-			columns: [table.checkedInByStaffId],
-			foreignColumns: [staff.id],
-			name: "booking_dogs_checked_in_by_staff_id_fkey"
-		}),
 		bookingDogsDogIdFkey: foreignKey({
 			columns: [table.dogId],
 			foreignColumns: [dogs.id],
 			name: "booking_dogs_dog_id_fkey"
 		}).onDelete("cascade"),
+		bookingDogsCheckedInByStaffIdFkey: foreignKey({
+			columns: [table.checkedInByStaffId],
+			foreignColumns: [staff.id],
+			name: "booking_dogs_checked_in_by_staff_id_fkey"
+		}),
 		bookingDogsPkey: primaryKey({ columns: [table.bookingId, table.dogId], name: "booking_dogs_pkey"}),
 	}
 });

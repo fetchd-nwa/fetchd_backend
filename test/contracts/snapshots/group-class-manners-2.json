@@ -1,0 +1,9 @@
+{
+  "key": "manners-2",
+  "name": "Group Manners 2 (fixture)",
+  "weeks": 4,
+  "price_per_dog_cents": 20000,
+  "capacity": 8,
+  "description": "Builds on Group Manners 1; manners-1 prereq required.",
+  "enrollment_type": "cohort"
+}

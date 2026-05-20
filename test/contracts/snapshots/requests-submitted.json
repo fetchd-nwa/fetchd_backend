@@ -1,0 +1,23 @@
+[
+  {
+    "id": "88888888-8888-4888-8888-888888888881",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "additional_dog_ids": ["33333333-3333-4333-8333-333333333332"],
+    "category": "private-lesson",
+    "submitted_at": "2026-05-15T19:00:00.000Z",
+    "preferred_dates": [
+      "2026-06-05T15:00:00.000Z",
+      "2026-06-12T15:00:00.000Z",
+      "2026-06-19T15:00:00.000Z"
+    ],
+    "notes": {
+      "per_dog": "Waffles needs leash polish; Lola is reactive to bikes.",
+      "joint": "They walk best on a coupler — keep them together if possible."
+    },
+    "focus": {
+      "staff_preference": "rachel",
+      "comfort_level": "high"
+    },
+    "status": "submitted"
+  }
+]

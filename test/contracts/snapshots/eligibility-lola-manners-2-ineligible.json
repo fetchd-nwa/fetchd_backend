@@ -1,0 +1,5 @@
+{
+  "class_key": "manners-2",
+  "eligible": false,
+  "missing_prereq_options": ["manners-1"]
+}

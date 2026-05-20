@@ -1,0 +1,30 @@
+[
+  {
+    "key": "puppy",
+    "name": "Puppy Class (fixture)",
+    "weeks": 4,
+    "price_per_dog_cents": 12000,
+    "capacity": 6,
+    "age_range": "8-16 weeks",
+    "description": "Foundation skills for puppies under 4 months.",
+    "enrollment_type": "open"
+  },
+  {
+    "key": "manners-1",
+    "name": "Group Manners 1 (fixture)",
+    "weeks": 4,
+    "price_per_dog_cents": 18000,
+    "capacity": 8,
+    "description": "4-week beginner manners cohort.",
+    "enrollment_type": "cohort"
+  },
+  {
+    "key": "manners-2",
+    "name": "Group Manners 2 (fixture)",
+    "weeks": 4,
+    "price_per_dog_cents": 20000,
+    "capacity": 8,
+    "description": "Builds on Group Manners 1; manners-1 prereq required.",
+    "enrollment_type": "cohort"
+  }
+]

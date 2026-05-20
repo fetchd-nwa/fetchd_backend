@@ -8,9 +8,11 @@ import { registerBookingsRoute } from './routes/bookings.js';
 import { registerCreditPackagesRoute } from './routes/creditPackages.js';
 import { registerCreditsRoute } from './routes/credits.js';
 import { registerDogsRoute } from './routes/dogs.js';
+import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
 import { registerRatesRoute } from './routes/rates.js';
+import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerVetsRoute } from './routes/vets.js';
 
@@ -40,6 +42,8 @@ export function buildApp(): FastifyInstance {
   registerCreditsRoute(app); // [auth] — owner-only (per-dog)
   registerCreditPackagesRoute(app); // [auth] — catalog (owner + staff)
   registerRatesRoute(app); // [auth] — catalog (owner + staff)
+  registerRequestsRoute(app); // [auth] — owner-only
+  registerGroupClassesRoute(app); // [auth] — catalogs (owner+staff); eligibility owner-only
 
   return app;
 }

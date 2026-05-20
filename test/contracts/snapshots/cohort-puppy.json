@@ -1,0 +1,10 @@
+{
+  "id": "ffffffff-ffff-4fff-8fff-fffffffffff1",
+  "class_key": "puppy",
+  "location": "fayetteville",
+  "start_date": "2026-05-26T15:00:00.000Z",
+  "weekly_time": "10:00 AM",
+  "weeks": 4,
+  "capacity": 6,
+  "filled": 1
+}

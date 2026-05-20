@@ -1,0 +1,164 @@
+import { pgTimestampToIso } from './pgTimestamp.js';
+import type { ServiceCategory } from './bookingBucket.js';
+import { comfortLevel, requestStatus } from '../db/schema/schema.js';
+
+/**
+ * Wire shape for `PendingRequest` per DATA-CONTRACT §B (R1, R8). The DB
+ * stores notes as two separate `text` columns (`notes_per_dog`,
+ * `notes_joint`) and focus as two separate scalar columns
+ * (`staff_preference text`, `comfort_level` enum); the wire composes them
+ * into structured sub-objects. Optional-omit follows the Day-4a
+ * convention: omit a key when its source is null/empty.
+ *
+ *   - `additional_dog_ids?` — omit when there's only a lead dog.
+ *   - `notes?` (whole object) — omit when BOTH notes_per_dog AND notes_joint
+ *     are null/empty. Inner keys are individually optional-omit.
+ *   - `focus` — REQUIRED outer key per §B (R8); always emit an object,
+ *     even if it's `{}`. Inner keys are individually optional-omit so
+ *     `{ comfort_level: 'high' }` and `{}` are both valid shapes.
+ *   - `length_weeks?` — board-and-train-only on the FE; omit when null.
+ *   - `approved_at?`, `converted_booking_id?` — emit only after the
+ *     staff portal converts the request.
+ */
+export type ComfortLevel = (typeof comfortLevel.enumValues)[number];
+export type RequestStatus = (typeof requestStatus.enumValues)[number];
+
+export interface PendingRequestNotesWire {
+  per_dog?: string;
+  joint?: string;
+}
+
+export interface PendingRequestFocusWire {
+  staff_preference?: string;
+  comfort_level?: ComfortLevel;
+}
+
+export interface PendingRequestWire {
+  id: string;
+  dog_id: string;
+  additional_dog_ids?: string[];
+  category: ServiceCategory;
+  submitted_at: string;
+  preferred_dates: string[];
+  notes?: PendingRequestNotesWire;
+  focus: PendingRequestFocusWire;
+  length_weeks?: number;
+  status: RequestStatus;
+  approved_at?: string;
+  converted_booking_id?: string;
+}
+
+/**
+ * The subset of `pending_requests` columns the wire helper consumes.
+ * Structural type — keeps the helper decoupled from full Drizzle row
+ * inference. Matches the projection the repo emits.
+ */
+export interface PendingRequestRowForWire {
+  id: string;
+  category: ServiceCategory;
+  status: RequestStatus;
+  submittedAt: string;
+  notesPerDog: string | null;
+  notesJoint: string | null;
+  staffPreference: string | null;
+  comfortLevel: ComfortLevel | null;
+  lengthWeeks: number | null;
+  approvedAt: string | null;
+  convertedBookingId: string | null;
+}
+
+/** Lead + additional dog ids for one request, sorted for snapshot stability. */
+export interface PendingRequestDogIds {
+  lead: string;
+  additional: string[];
+}
+
+/** A `pending_request_dogs` join row passed in by the repo. */
+export interface PendingRequestDogRow {
+  requestId: string;
+  dogId: string;
+  isLead: boolean;
+}
+
+/**
+ * Pre-resolved preferred dates for one request, ordered by `ordinal` ASC
+ * upstream of this helper (the repo does the sort + emits ISO strings).
+ */
+export interface PreferredDatesForRequest {
+  requestId: string;
+  preferredAt: string[]; // ISO-8601 strings, ordinal-ordered
+}
+
+/**
+ * Emit the wire shape. Lead + additional dog ids come pre-resolved
+ * (same pattern as `toBookingWire`); preferred dates come pre-resolved
+ * + ordinal-ordered upstream.
+ */
+export function toRequestWire(
+  row: PendingRequestRowForWire,
+  dogIds: PendingRequestDogIds,
+  preferredDates: string[],
+): PendingRequestWire {
+  const wire: PendingRequestWire = {
+    id: row.id,
+    dog_id: dogIds.lead,
+    category: row.category,
+    submitted_at: pgTimestampToIso(row.submittedAt),
+    preferred_dates: preferredDates,
+    focus: buildFocus(row),
+    status: row.status,
+  };
+  if (dogIds.additional.length > 0) wire.additional_dog_ids = dogIds.additional;
+  const notes = buildNotes(row);
+  if (notes !== undefined) wire.notes = notes;
+  if (row.lengthWeeks !== null) wire.length_weeks = row.lengthWeeks;
+  if (row.approvedAt !== null) wire.approved_at = pgTimestampToIso(row.approvedAt);
+  if (row.convertedBookingId !== null) wire.converted_booking_id = row.convertedBookingId;
+  return wire;
+}
+
+function buildNotes(row: PendingRequestRowForWire): PendingRequestNotesWire | undefined {
+  const perDog = row.notesPerDog ?? '';
+  const joint = row.notesJoint ?? '';
+  if (perDog === '' && joint === '') return undefined;
+  const notes: PendingRequestNotesWire = {};
+  if (perDog !== '') notes.per_dog = perDog;
+  if (joint !== '') notes.joint = joint;
+  return notes;
+}
+
+function buildFocus(row: PendingRequestRowForWire): PendingRequestFocusWire {
+  const focus: PendingRequestFocusWire = {};
+  if (row.staffPreference !== null && row.staffPreference !== '') {
+    focus.staff_preference = row.staffPreference;
+  }
+  if (row.comfortLevel !== null) focus.comfort_level = row.comfortLevel;
+  return focus;
+}
+
+/**
+ * Group `pending_request_dogs` rows into a per-request
+ * `{ lead, additional[] }`. Mirrors `groupBookingDogs` exactly — throws
+ * on the structural invariant that every request has a lead row, and
+ * sorts additional ids for snapshot stability.
+ */
+export function groupRequestDogs(rows: PendingRequestDogRow[]): Map<string, PendingRequestDogIds> {
+  const accumulator = new Map<string, { lead: string | null; additional: string[] }>();
+  for (const row of rows) {
+    let entry = accumulator.get(row.requestId);
+    if (entry === undefined) {
+      entry = { lead: null, additional: [] };
+      accumulator.set(row.requestId, entry);
+    }
+    if (row.isLead) entry.lead = row.dogId;
+    else entry.additional.push(row.dogId);
+  }
+  const result = new Map<string, PendingRequestDogIds>();
+  for (const [requestId, { lead, additional }] of accumulator) {
+    if (lead === null) {
+      throw new Error(`pending_request ${requestId}: no pending_request_dogs row marked is_lead`);
+    }
+    result.set(requestId, { lead, additional: [...additional].sort() });
+  }
+  return result;
+}

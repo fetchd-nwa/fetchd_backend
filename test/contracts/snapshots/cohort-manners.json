@@ -1,0 +1,11 @@
+{
+  "id": "ffffffff-ffff-4fff-8fff-fffffffffff2",
+  "class_key": "manners-2",
+  "location": "bentonville",
+  "start_date": "2026-06-01T23:00:00.000Z",
+  "end_date": "2026-06-22T23:00:00.000Z",
+  "weekly_time": "6:00 PM",
+  "weeks": 4,
+  "capacity": 8,
+  "filled": 2
+}

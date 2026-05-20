@@ -5,6 +5,8 @@ import {
   agreementSignatures,
   bookingDogs,
   bookings,
+  classPrereqOptions,
+  cohorts,
   creditLedger,
   creditPackages,
   dayCapacity,
@@ -13,8 +15,12 @@ import {
   dogMedications,
   dogVaccines,
   dogs,
+  groupClasses,
   owners,
   paymentMethods,
+  pendingRequestDogs,
+  pendingRequestPreferredDates,
+  pendingRequests,
   requiredVaccines,
   serviceRates,
   staff,
@@ -95,6 +101,16 @@ export const FIXTURE_IDS = {
   // string note (optional-omit must drop it from the wire).
   serviceRateDaycareBentonClosedId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd5',
   serviceRateBoardingEmptyNoteId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd6',
+  // Day-6a: requests + group classes + cohorts + prereq option.
+  // group_class keys are NOT prefixed with `test-` because they ARE the
+  // canonical `group_class_key` enum values; production seed coexists via
+  // ON CONFLICT. UUIDs follow the existing entity-nibble layout —
+  // 8 = pending_request, 0 = class_prereq_option, f = cohort.
+  pendingRequest1Id: '88888888-8888-4888-8888-888888888881',
+  pendingRequest2Id: '88888888-8888-4888-8888-888888888882',
+  classPrereqMannersOptionId: '00000000-0000-4000-8000-000000000001',
+  cohortPuppyId: 'ffffffff-ffff-4fff-8fff-fffffffffff1',
+  cohortMannersId: 'ffffffff-ffff-4fff-8fff-fffffffffff2',
 } as const;
 
 /**
@@ -681,6 +697,142 @@ export async function seedFixture(): Promise<void> {
       note: 'Fixture debit for booking1',
     },
   ]);
+
+  // Day-6a catalog: group_classes (3 keys covering both enrollment types) +
+  // class_prereq_options (the single existing prereq: manners-2 needs
+  // manners-1). Inserted as canonical enum values, not test-prefixed —
+  // production catalog seed coexists via ON CONFLICT (key) DO UPDATE. The
+  // catalog is the read source for GET /group-classes; the eligibility
+  // endpoint reads class_prereq_options against the dog's
+  // dog_completed_classes rows.
+  await db.insert(groupClasses).values([
+    {
+      key: 'puppy',
+      name: 'Puppy Class (fixture)',
+      weeks: 4,
+      pricePerDogCents: 12_000,
+      capacity: 6,
+      ageRange: '8-16 weeks',
+      description: 'Foundation skills for puppies under 4 months.',
+      enrollmentType: 'open',
+    },
+    {
+      key: 'manners-1',
+      name: 'Group Manners 1 (fixture)',
+      weeks: 4,
+      pricePerDogCents: 18_000,
+      capacity: 8,
+      ageRange: null,
+      description: '4-week beginner manners cohort.',
+      enrollmentType: 'cohort',
+    },
+    {
+      key: 'manners-2',
+      name: 'Group Manners 2 (fixture)',
+      weeks: 4,
+      pricePerDogCents: 20_000,
+      capacity: 8,
+      ageRange: null,
+      description: 'Builds on Group Manners 1; manners-1 prereq required.',
+      enrollmentType: 'cohort',
+    },
+  ]);
+
+  // OR-prereq join: one row today (manners-2 → manners-1). The model
+  // supports multiple rows per class_key as OR alternatives — the planned
+  // public-manners class will have two rows (manners-1, manners-2), and
+  // the eligibility endpoint passes the dog if she's completed ANY ONE.
+  // Day-6a fixture exercises the singleton-OR case + the no-prereq case
+  // (puppy, manners-1).
+  await db.insert(classPrereqOptions).values({
+    id: FIXTURE_IDS.classPrereqMannersOptionId,
+    classKey: 'manners-2',
+    prereqClassKey: 'manners-1',
+  });
+
+  // Two cohorts:
+  //   - puppy @ fayetteville (open enrollment, no end_date)
+  //   - manners-2 @ bentonville (cohort enrollment, end_date set,
+  //     partially filled — 2/8)
+  // Combined they exercise list-by-class + by-id + the location enum
+  // breadth + nullable end_date branch.
+  await db.insert(cohorts).values([
+    {
+      id: FIXTURE_IDS.cohortPuppyId,
+      classKey: 'puppy',
+      location: 'fayetteville',
+      startDate: '2026-05-26T15:00:00Z',
+      endDate: null,
+      weeklyTime: '10:00 AM',
+      weeks: 4,
+      capacity: 6,
+      filled: 1,
+    },
+    {
+      id: FIXTURE_IDS.cohortMannersId,
+      classKey: 'manners-2',
+      location: 'bentonville',
+      startDate: '2026-06-01T23:00:00Z',
+      endDate: '2026-06-22T23:00:00Z',
+      weeklyTime: '6:00 PM',
+      weeks: 4,
+      capacity: 8,
+      filled: 2,
+    },
+  ]);
+
+  // Two pending requests:
+  //   - request1: submitted private-lesson, MULTI-DOG (Waffles lead +
+  //     Lola), full notes (per_dog + joint), full focus (staff_preference
+  //     + comfort_level), 3 preferred dates → exercises every required +
+  //     optional key on the PendingRequest wire shape.
+  //   - request2: converted board-and-train, single dog (Waffles),
+  //     length_weeks=2, approved_at + approved_by_staff_id +
+  //     converted_booking_id set, NO notes, NO focus inner keys →
+  //     exercises optional-omit on the wire (notes omitted entirely,
+  //     focus emits `{}`). `converted_booking_id` points at booking1 to
+  //     satisfy the FK; the category mismatch (B&T request → day-school
+  //     booking) is fixture coincidence, not on the wire.
+  await db.insert(pendingRequests).values([
+    {
+      id: FIXTURE_IDS.pendingRequest1Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: FIXTURE_IDS.dog1Id,
+      category: 'private-lesson',
+      status: 'submitted',
+      submittedAt: '2026-05-15T19:00:00Z',
+      notesPerDog: 'Waffles needs leash polish; Lola is reactive to bikes.',
+      notesJoint: 'They walk best on a coupler — keep them together if possible.',
+      staffPreference: 'rachel',
+      comfortLevel: 'high',
+    },
+    {
+      id: FIXTURE_IDS.pendingRequest2Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: FIXTURE_IDS.dog1Id,
+      category: 'board-and-train',
+      status: 'converted',
+      submittedAt: '2026-04-10T16:00:00Z',
+      lengthWeeks: 2,
+      approvedAt: '2026-04-12T17:00:00Z',
+      approvedByStaffId: FIXTURE_IDS.staffRachelId,
+      convertedBookingId: FIXTURE_IDS.booking1Id,
+    },
+  ]);
+
+  await db.insert(pendingRequestDogs).values([
+    { requestId: FIXTURE_IDS.pendingRequest1Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
+    { requestId: FIXTURE_IDS.pendingRequest1Id, dogId: FIXTURE_IDS.dog2Id, isLead: false },
+    { requestId: FIXTURE_IDS.pendingRequest2Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
+  ]);
+
+  await db.insert(pendingRequestPreferredDates).values([
+    { requestId: FIXTURE_IDS.pendingRequest1Id, ordinal: 1, preferredAt: '2026-06-05T15:00:00Z' },
+    { requestId: FIXTURE_IDS.pendingRequest1Id, ordinal: 2, preferredAt: '2026-06-12T15:00:00Z' },
+    { requestId: FIXTURE_IDS.pendingRequest1Id, ordinal: 3, preferredAt: '2026-06-19T15:00:00Z' },
+    { requestId: FIXTURE_IDS.pendingRequest2Id, ordinal: 1, preferredAt: '2026-05-01T13:00:00Z' },
+    { requestId: FIXTURE_IDS.pendingRequest2Id, ordinal: 2, preferredAt: '2026-05-08T13:00:00Z' },
+  ]);
 }
 
 export async function teardownFixture(): Promise<void> {
@@ -691,7 +843,22 @@ export async function teardownFixture(): Promise<void> {
   // delete drops the booking_dogs rows via ON DELETE CASCADE. Day-5b adds
   // credit_ledger (RESTRICT on dogs.id, references bookings.id) → drop
   // before bookings + dogs; credit_packages (RESTRICTed by credit_ledger);
-  // service_rates + day_capacity (independent).
+  // service_rates + day_capacity (independent). Day-6a adds pending_requests
+  // (RESTRICT on owners, RESTRICT on bookings via converted_booking_id) →
+  // drop FIRST so the bookings delete below isn't blocked; pending_request_*
+  // children cascade. Group-classes catalog (group_classes + cohorts +
+  // class_prereq_options) is independent of owner/dog state — drop after
+  // pending_requests but before nothing in particular.
+  await db.delete(pendingRequests).where(eq(pendingRequests.ownerId, FIXTURE_IDS.ownerId));
+  await db
+    .delete(cohorts)
+    .where(inArray(cohorts.id, [FIXTURE_IDS.cohortPuppyId, FIXTURE_IDS.cohortMannersId]));
+  await db
+    .delete(classPrereqOptions)
+    .where(eq(classPrereqOptions.id, FIXTURE_IDS.classPrereqMannersOptionId));
+  await db
+    .delete(groupClasses)
+    .where(inArray(groupClasses.key, ['puppy', 'manners-1', 'manners-2']));
   await db
     .delete(creditLedger)
     .where(inArray(creditLedger.dogId, [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]));
