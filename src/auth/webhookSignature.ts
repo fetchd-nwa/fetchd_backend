@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { env } from '../env.js';
-import { AuthError } from './errors.js';
+import { ApiError } from '../lib/errors.js';
 
 /**
  * Standard Webhooks signature verification (the scheme Supabase Auth Hooks
@@ -46,15 +46,15 @@ export function makeVerifyWebhook(
   return (headers, rawBody) => {
     const { id, timestamp, signature } = headers;
     if (!id || !timestamp || !signature) {
-      throw new AuthError('unauthenticated', 'missing webhook signature headers');
+      throw new ApiError('unauthenticated', 'missing webhook signature headers');
     }
 
     const ts = Number(timestamp);
     if (!Number.isFinite(ts)) {
-      throw new AuthError('unauthenticated', 'malformed webhook timestamp');
+      throw new ApiError('unauthenticated', 'malformed webhook timestamp');
     }
     if (Math.abs(Math.floor(now() / 1000) - ts) > TOLERANCE_SECONDS) {
-      throw new AuthError('unauthenticated', 'webhook timestamp outside tolerance (replay?)');
+      throw new ApiError('unauthenticated', 'webhook timestamp outside tolerance (replay?)');
     }
 
     const expected = Buffer.from(
@@ -67,7 +67,7 @@ export function makeVerifyWebhook(
       return provided.length === expected.length && timingSafeEqual(provided, expected);
     });
     if (!matches) {
-      throw new AuthError('unauthenticated', 'webhook signature mismatch');
+      throw new ApiError('unauthenticated', 'webhook signature mismatch');
     }
   };
 }

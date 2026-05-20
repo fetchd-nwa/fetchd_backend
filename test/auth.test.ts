@@ -10,7 +10,7 @@ import {
   type JWK,
 } from 'jose';
 import { env } from '../src/env.js';
-import { AuthError } from '../src/auth/errors.js';
+import { ApiError } from '../src/lib/errors.js';
 import { makeVerifyAccessToken } from '../src/auth/jwks.js';
 import { makeAuthenticate, registerAuth, requireStaff } from '../src/auth/plugin.js';
 import type { Principal } from '../src/auth/principal.js';
@@ -47,20 +47,17 @@ test('verifies a well-formed Supabase token and extracts sub', async () => {
 test('rejects an expired token', async () => {
   const now = Math.floor(Date.now() / 1000);
   const token = await sign({ expSeconds: now - 60 });
-  await assert.rejects(verify(token), (e) => e instanceof AuthError && e.status === 401);
+  await assert.rejects(verify(token), (e) => e instanceof ApiError && e.status === 401);
 });
 
 test('rejects a wrong-audience token', async () => {
   const token = await sign({ aud: 'not-this-api' });
-  await assert.rejects(
-    verify(token),
-    (e) => e instanceof AuthError && e.code === 'unauthenticated',
-  );
+  await assert.rejects(verify(token), (e) => e instanceof ApiError && e.code === 'unauthenticated');
 });
 
 test('rejects a wrong-issuer token', async () => {
   const token = await sign({ iss: 'https://evil.example.com/auth/v1' });
-  await assert.rejects(verify(token), (e) => e instanceof AuthError);
+  await assert.rejects(verify(token), (e) => e instanceof ApiError);
 });
 
 test('rejects an HS256 token (algorithm-confusion defense)', async () => {
@@ -73,7 +70,7 @@ test('rejects an HS256 token (algorithm-confusion defense)', async () => {
     .setIssuer(env.SUPABASE_JWT_ISS)
     .setExpirationTime(now + 300)
     .sign(secret);
-  await assert.rejects(verify(hsToken), (e) => e instanceof AuthError);
+  await assert.rejects(verify(hsToken), (e) => e instanceof ApiError);
 });
 
 // --- Route guards: deps are injected, so the staff/owner gate is proven with

@@ -2,7 +2,7 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { owners, staff } from '../db/schema/schema.js';
 import type { Principal } from './principal.js';
-import { AuthError } from './errors.js';
+import { ApiError } from '../lib/errors.js';
 
 /**
  * Resolve a verified Supabase uid to its live mirror row.
@@ -34,7 +34,7 @@ export async function resolvePrincipal(supabaseUid: string): Promise<Principal |
     .limit(1);
 
   if (ownerRow && staffRow) {
-    throw new AuthError(
+    throw new ApiError(
       'ambiguous_principal',
       `supabase_uid ${supabaseUid} resolves to both an owner and a staff row`,
     );

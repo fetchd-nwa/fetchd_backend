@@ -3,7 +3,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import Fastify from 'fastify';
 import { eq, sql } from 'drizzle-orm';
-import { AuthError } from '../src/auth/errors.js';
+import { ApiError } from '../src/lib/errors.js';
 import { makeVerifyWebhook } from '../src/auth/webhookSignature.js';
 import { parseInvite } from '../src/auth/provisioning.js';
 import { registerAuth } from '../src/auth/plugin.js';
@@ -34,7 +34,7 @@ test('rejects a tampered body', () => {
   const sig = sign('msg_1', ts, '{"hello":"world"}');
   assert.throws(
     () => verify({ id: 'msg_1', timestamp: ts, signature: sig }, '{"hello":"evil"}'),
-    (e) => e instanceof AuthError && e.status === 401,
+    (e) => e instanceof ApiError && e.status === 401,
   );
 });
 
@@ -43,14 +43,14 @@ test('rejects a stale timestamp (replay)', () => {
   const ts = '1699990000'; // ~2.8h before the fixed clock
   assert.throws(
     () => verify({ id: 'm', timestamp: ts, signature: sign('m', ts, body) }, body),
-    (e) => e instanceof AuthError && /tolerance/.test((e as Error).message),
+    (e) => e instanceof ApiError && /tolerance/.test((e as Error).message),
   );
 });
 
 test('rejects missing signature headers', () => {
   assert.throws(
     () => verify({ id: undefined, timestamp: undefined, signature: undefined }, '{}'),
-    (e) => e instanceof AuthError && e.code === 'unauthenticated',
+    (e) => e instanceof ApiError && e.code === 'unauthenticated',
   );
 });
 
@@ -69,7 +69,7 @@ test('parses a valid owner invite', () => {
 test('owner invite missing phone → 422 naming the field', () => {
   assert.throws(
     () => parseInvite(envelope({ name: 'Jane', location: 'Fayetteville, AR' })),
-    (e) => e instanceof AuthError && e.status === 422 && /phone/.test((e as Error).message),
+    (e) => e instanceof ApiError && e.status === 422 && /phone/.test((e as Error).message),
   );
 });
 
@@ -82,7 +82,7 @@ test('app_role present → provisioned as staff', () => {
 test('unrecognized envelope → 422', () => {
   assert.throws(
     () => parseInvite({ not: 'a supabase record' }),
-    (e) => e instanceof AuthError && e.code === 'invalid_payload',
+    (e) => e instanceof ApiError && e.code === 'invalid_payload',
   );
 });
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { AuthError } from '../auth/errors.js';
+import { ApiError } from '../lib/errors.js';
 import { actorOf, type Principal } from '../auth/principal.js';
 import { withIdempotency, type IdempotencyOutcome, type MutationResponse } from './idempotency.js';
 import { withActor, type Tx } from './tx.js';
@@ -22,10 +22,10 @@ export const IDEMPOTENCY_KEY_MAX_LEN = 255;
 export function requireIdempotencyKey(raw: string | string[] | undefined): string {
   const key = Array.isArray(raw) ? raw[0] : raw;
   if (typeof key !== 'string' || key.length === 0) {
-    throw new AuthError('bad_request', 'Idempotency-Key header is required for mutations');
+    throw new ApiError('bad_request', 'Idempotency-Key header is required for mutations');
   }
   if (key.length > IDEMPOTENCY_KEY_MAX_LEN) {
-    throw new AuthError(
+    throw new ApiError(
       'bad_request',
       `Idempotency-Key exceeds ${IDEMPOTENCY_KEY_MAX_LEN} characters`,
     );

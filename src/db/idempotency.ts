@@ -1,5 +1,5 @@
 import { eq, sql } from 'drizzle-orm';
-import { AuthError } from '../auth/errors.js';
+import { ApiError } from '../lib/errors.js';
 import { idempotencyKeys } from './schema/schema.js';
 import type { Tx } from './tx.js';
 
@@ -92,19 +92,16 @@ export async function withIdempotency<T>(
       // The TTL sweep is the only thing that deletes; the window is the slice
       // between two statements in this transaction. Vanishingly rare, and a
       // retry from the client resolves it cleanly.
-      throw new AuthError(
+      throw new ApiError(
         'ambiguous_principal',
         'idempotency row vanished mid-resolve (retry the request)',
       );
     }
     if (existing.endpoint !== claim.endpoint || existing.requestHash !== claim.requestHash) {
-      throw new AuthError(
-        'idempotency_mismatch',
-        'Idempotency-Key reused with a different request',
-      );
+      throw new ApiError('idempotency_mismatch', 'Idempotency-Key reused with a different request');
     }
     if (existing.completedAt === null) {
-      throw new AuthError(
+      throw new ApiError(
         'idempotency_inflight',
         'a request with this Idempotency-Key is still in progress',
       );

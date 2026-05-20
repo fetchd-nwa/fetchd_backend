@@ -1,0 +1,13 @@
+{
+  "id": "77777777-7777-4777-8777-777777777779",
+  "dog_id": "33333333-3333-4333-8333-333333333331",
+  "category": "day-school",
+  "status": "cancelled",
+  "date": "2026-05-22T13:00:00.000Z",
+  "trainer": "Donavan",
+  "duration_minutes": 540,
+  "notes": "Owner cancelled — family emergency",
+  "location": "fayetteville",
+  "cancelled_at": "2026-05-18T20:00:00.000Z",
+  "cancel_forfeited": false
+}

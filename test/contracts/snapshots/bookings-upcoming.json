@@ -1,0 +1,60 @@
+[
+  {
+    "id": "77777777-7777-4777-8777-777777777771",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "category": "day-school",
+    "status": "upcoming",
+    "date": "2026-05-20T13:00:00.000Z",
+    "trainer": "Donavan",
+    "duration_minutes": 540,
+    "location": "fayetteville"
+  },
+  {
+    "id": "77777777-7777-4777-8777-777777777772",
+    "dog_id": "33333333-3333-4333-8333-333333333332",
+    "category": "day-care",
+    "status": "upcoming",
+    "date": "2026-05-21T13:00:00.000Z",
+    "duration_minutes": 540,
+    "location": "bentonville"
+  },
+  {
+    "id": "77777777-7777-4777-8777-777777777773",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "additional_dog_ids": ["33333333-3333-4333-8333-333333333332"],
+    "category": "private-lesson",
+    "status": "upcoming",
+    "date": "2026-05-26T15:00:00.000Z",
+    "trainer": "Rachel",
+    "duration_minutes": 60,
+    "notes": "Joint household session — leash skills with both dogs"
+  },
+  {
+    "id": "77777777-7777-4777-8777-777777777774",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "category": "boarding",
+    "status": "upcoming",
+    "date": "2026-06-15T15:00:00.000Z",
+    "trainer": "Donavan",
+    "notes": "5-night stay; includes a few day-school refreshers",
+    "location": "fayetteville"
+  },
+  {
+    "id": "77777777-7777-4777-8777-777777777775",
+    "dog_id": "33333333-3333-4333-8333-333333333332",
+    "category": "boarding",
+    "status": "upcoming",
+    "date": "2026-07-01T13:00:00.000Z",
+    "location": "fayetteville"
+  },
+  {
+    "id": "77777777-7777-4777-8777-77777777777a",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "category": "day-school",
+    "status": "upcoming",
+    "date": "2026-11-04T14:00:00.000Z",
+    "trainer": "Donavan",
+    "duration_minutes": 540,
+    "location": "fayetteville"
+  }
+]

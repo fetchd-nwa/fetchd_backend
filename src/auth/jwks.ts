@@ -1,6 +1,6 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import { env } from '../env.js';
-import { AuthError } from './errors.js';
+import { ApiError } from '../lib/errors.js';
 
 /**
  * Supabase signs access tokens with an asymmetric key (Day-0 lock #2: JWKS,
@@ -43,11 +43,11 @@ export function makeVerifyAccessToken(
       // is not acceptable. The specific cause stays in the message for logs,
       // never leaks to the caller.
       const detail = err instanceof Error ? err.message : 'unknown';
-      throw new AuthError('unauthenticated', `token verification failed: ${detail}`);
+      throw new ApiError('unauthenticated', `token verification failed: ${detail}`);
     }
 
     if (typeof sub !== 'string' || sub.length === 0) {
-      throw new AuthError('unauthenticated', 'token has no subject');
+      throw new ApiError('unauthenticated', 'token has no subject');
     }
     return { sub };
   };

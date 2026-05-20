@@ -3,6 +3,7 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.local.example
 
 # drizzle-kit pull regenerates these migration-tooling byproducts every run.
 # Day-0 locks #1/#5: Drizzle is query-only, schema.sql is the canonical DDL —

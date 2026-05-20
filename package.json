@@ -14,8 +14,15 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts test/contracts/*.test.ts",
-    "db:introspect": "drizzle-kit pull && node scripts/fix-introspection.mjs"
+    "pretest": "docker compose -f ../docker-compose.yml --profile test up -d db-test --wait",
+    "test": "DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres node --import tsx --test --test-concurrency=1 test/*.test.ts test/contracts/*.test.ts",
+    "db:introspect": "drizzle-kit pull && node scripts/fix-introspection.mjs",
+    "db:up": "docker compose -f ../docker-compose.yml up -d --wait",
+    "db:down": "docker compose -f ../docker-compose.yml down",
+    "db:nuke": "docker compose -f ../docker-compose.yml down -v",
+    "db:test:up": "docker compose -f ../docker-compose.yml --profile test up -d db-test --wait",
+    "db:test:down": "docker compose -f ../docker-compose.yml --profile test down",
+    "db:test:nuke": "docker compose -f ../docker-compose.yml --profile test rm -sf db-test && docker volume rm -f fetchd-pg-test-data"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

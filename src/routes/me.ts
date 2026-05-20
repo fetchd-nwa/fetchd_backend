@@ -6,7 +6,7 @@ import { appLocation, owners, staff } from '../db/schema/schema.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
-import { AuthError } from '../auth/errors.js';
+import { ApiError } from '../lib/errors.js';
 
 /**
  * Owner `/me` is a **frozen wire shape** — the exact keys the FE `toUser`
@@ -125,14 +125,14 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
       if (!row) {
         // Resolved a live row, then it vanished before the read — account
         // expired mid-request. Treat as the account being gone.
-        throw new AuthError('not_provisioned', 'owner record no longer available');
+        throw new ApiError('not_provisioned', 'owner record no longer available');
       }
       return ownerProfile(row);
     }
 
     const [row] = await db.select().from(staff).where(eq(staff.id, principal.staffId)).limit(1);
     if (!row) {
-      throw new AuthError('not_provisioned', 'staff record no longer available');
+      throw new ApiError('not_provisioned', 'staff record no longer available');
     }
     return staffProfile(row);
   });
@@ -140,19 +140,19 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
   app.patch('/me', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
     if (principal.kind !== 'owner') {
-      throw new AuthError('forbidden', 'staff profile editing is not supported here');
+      throw new ApiError('forbidden', 'staff profile editing is not supported here');
     }
 
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const parsed = patchMeSchema.safeParse(request.body);
     if (!parsed.success) {
-      throw new AuthError('bad_request', `invalid profile patch: ${formatZodIssues(parsed.error)}`);
+      throw new ApiError('bad_request', `invalid profile patch: ${formatZodIssues(parsed.error)}`);
     }
 
     const set = toOwnerUpdate(parsed.data);
     if (Object.keys(set).length === 0) {
-      throw new AuthError('bad_request', 'no updatable fields in request body');
+      throw new ApiError('bad_request', 'no updatable fields in request body');
     }
 
     const outcome = await withMutation(
@@ -169,7 +169,7 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
           .where(eq(owners.id, principal.ownerId))
           .returning();
         if (!row) {
-          throw new AuthError('not_provisioned', 'owner record no longer available');
+          throw new ApiError('not_provisioned', 'owner record no longer available');
         }
         return { status: 200, body: ownerProfile(row) };
       },

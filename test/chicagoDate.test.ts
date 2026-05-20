@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { bucketToChicagoDate } from '../src/lib/chicagoDate.js';
+import { bucketToChicagoDate, chicagoWallTimeToUtc } from '../src/lib/chicagoDate.js';
 
 // Day 3b Exit check #4: `bucketToChicagoDate` returns the right calendar
 // day across America/Chicago's two DST boundaries. Spring-forward removes
@@ -56,4 +56,89 @@ test('bucketToChicagoDate output is strictly YYYY-MM-DD (matches Postgres `date`
   const result = bucketToChicagoDate(new Date('2025-01-05T15:00:00Z'));
   assert.match(result, /^\d{4}-\d{2}-\d{2}$/);
   assert.equal(result, '2025-01-05');
+});
+
+// Day 5a: `chicagoWallTimeToUtc` is the day-program bucketing primitive —
+// `17:30 in Chicago on date X` becomes the absolute UTC instant the bucket
+// helper compares to `now()`. DST must work both ways: CDT (UTC-5) in
+// summer, CST (UTC-6) in winter. Off by an hour and a day-school session
+// flips from Upcoming to Past at the wrong moment.
+
+test('chicagoWallTimeToUtc: CDT (summer) — 17:30 Chicago on 2026-06-15 is 22:30 UTC', () => {
+  const utc = chicagoWallTimeToUtc('2026-06-15', 17, 30);
+  assert.equal(utc.toISOString(), '2026-06-15T22:30:00.000Z');
+});
+
+test('chicagoWallTimeToUtc: CST (winter) — 17:30 Chicago on 2026-01-15 is 23:30 UTC', () => {
+  const utc = chicagoWallTimeToUtc('2026-01-15', 17, 30);
+  assert.equal(utc.toISOString(), '2026-01-15T23:30:00.000Z');
+});
+
+test('chicagoWallTimeToUtc: spring-forward day (2026-03-08), wall time AFTER the jump uses CDT', () => {
+  // 17:30 Chicago on March 8 is well past the 2am→3am skip → CDT (UTC-5).
+  const utc = chicagoWallTimeToUtc('2026-03-08', 17, 30);
+  assert.equal(utc.toISOString(), '2026-03-08T22:30:00.000Z');
+});
+
+test('chicagoWallTimeToUtc: fall-back day (2026-11-01), wall time AFTER the unfold uses CST', () => {
+  // 17:30 Chicago on November 1 is well past the 1am→1am repeat → CST (UTC-6).
+  const utc = chicagoWallTimeToUtc('2026-11-01', 17, 30);
+  assert.equal(utc.toISOString(), '2026-11-01T23:30:00.000Z');
+});
+
+test('chicagoWallTimeToUtc: day-program window endpoints (07:30, 09:00, 16:30, 17:30) in CDT', () => {
+  // Sanity-check all four window endpoints in summer (CDT, UTC-5).
+  assert.equal(chicagoWallTimeToUtc('2026-06-15', 7, 30).toISOString(), '2026-06-15T12:30:00.000Z');
+  assert.equal(chicagoWallTimeToUtc('2026-06-15', 9, 0).toISOString(), '2026-06-15T14:00:00.000Z');
+  assert.equal(
+    chicagoWallTimeToUtc('2026-06-15', 16, 30).toISOString(),
+    '2026-06-15T21:30:00.000Z',
+  );
+  assert.equal(
+    chicagoWallTimeToUtc('2026-06-15', 17, 30).toISOString(),
+    '2026-06-15T22:30:00.000Z',
+  );
+});
+
+test('chicagoWallTimeToUtc: round-trip — wall → UTC → wall lands on same date', () => {
+  const utc = chicagoWallTimeToUtc('2026-06-15', 17, 30);
+  assert.equal(bucketToChicagoDate(utc), '2026-06-15');
+});
+
+test('chicagoWallTimeToUtc: invalid date string throws', () => {
+  assert.throws(() => chicagoWallTimeToUtc('not-a-date', 17, 30), /invalid date string/);
+});
+
+// DST edge cases: wall times that don't exist (spring-forward gap) or
+// exist twice (fall-back overlap). Day-program windows never reach these
+// hours, but the helper is general-purpose and its behavior must be
+// deterministic + documented per the IANA / Java / Python convention.
+
+test('chicagoWallTimeToUtc: spring-forward GAP (2026-03-08, 02:30) skips to 03:30 CDT', () => {
+  // March 8, 2026 in Chicago: 02:00 CST jumps to 03:00 CDT. The 02:00-
+  // 03:00 hour does not exist. Asking for 02:30 returns the
+  // post-transition wall time (03:30 CDT = 08:30 UTC), matching IANA
+  // `fold=0`. Roundtripping through bucketToChicagoDate keeps the day.
+  const utc = chicagoWallTimeToUtc('2026-03-08', 2, 30);
+  assert.equal(utc.toISOString(), '2026-03-08T08:30:00.000Z');
+  assert.equal(bucketToChicagoDate(utc), '2026-03-08');
+});
+
+test('chicagoWallTimeToUtc: fall-back OVERLAP (2026-11-01, 01:30) picks first occurrence (CDT)', () => {
+  // November 1, 2026 in Chicago: 02:00 CDT falls back to 01:00 CST. The
+  // 01:00-02:00 wall hour happens twice — once in CDT (06:00-07:00 UTC),
+  // once in CST (07:00-08:00 UTC). 01:30 returns the FIRST occurrence
+  // (CDT, 06:30 UTC) per the IANA first-occurrence convention. A future
+  // caller that needs the second occurrence (CST, 07:30 UTC) would need
+  // an explicit "fold" / "afterTransition" param — out of scope today.
+  const utc = chicagoWallTimeToUtc('2026-11-01', 1, 30);
+  assert.equal(utc.toISOString(), '2026-11-01T06:30:00.000Z');
+  assert.equal(bucketToChicagoDate(utc), '2026-11-01');
+});
+
+test('chicagoWallTimeToUtc: spring-forward boundary (02:00 itself) resolves to 03:00 CDT', () => {
+  // The exact transition moment: 02:00 CST → 03:00 CDT. Asking for 02:00
+  // returns 03:00 CDT (08:00 UTC) — gap-skip behavior at the boundary.
+  const utc = chicagoWallTimeToUtc('2026-03-08', 2, 0);
+  assert.equal(utc.toISOString(), '2026-03-08T08:00:00.000Z');
 });

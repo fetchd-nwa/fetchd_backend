@@ -6,7 +6,7 @@ import type {
   preHandlerHookHandler,
 } from 'fastify';
 import type { Principal } from './principal.js';
-import { AuthError } from './errors.js';
+import { ApiError } from '../lib/errors.js';
 import { verifyAccessToken, type VerifiedToken } from './jwks.js';
 import { resolvePrincipal } from './mirror.js';
 
@@ -22,11 +22,11 @@ const BEARER_PREFIX = 'Bearer ';
 function extractBearer(request: FastifyRequest): string {
   const header = request.headers.authorization;
   if (!header || !header.startsWith(BEARER_PREFIX)) {
-    throw new AuthError('unauthenticated', 'missing or malformed Authorization header');
+    throw new ApiError('unauthenticated', 'missing or malformed Authorization header');
   }
   const token = header.slice(BEARER_PREFIX.length).trim();
   if (token.length === 0) {
-    throw new AuthError('unauthenticated', 'empty bearer token');
+    throw new ApiError('unauthenticated', 'empty bearer token');
   }
   return token;
 }
@@ -52,7 +52,7 @@ export function makeAuthenticate(deps: AuthDeps): preHandlerHookHandler {
     const { sub } = await deps.verify(token);
     const principal = await deps.resolve(sub);
     if (!principal) {
-      throw new AuthError(
+      throw new ApiError(
         'not_provisioned',
         'authenticated, but no account is provisioned for this user',
       );
@@ -77,10 +77,10 @@ export const requireStaff: preHandlerHookHandler = async function requireStaff(
   request: FastifyRequest,
 ): Promise<void> {
   if (!request.principal) {
-    throw new AuthError('unauthenticated', 'requireStaff used without authenticate');
+    throw new ApiError('unauthenticated', 'requireStaff used without authenticate');
   }
   if (request.principal.kind !== 'staff') {
-    throw new AuthError('forbidden', 'staff role required');
+    throw new ApiError('forbidden', 'staff role required');
   }
 };
 
@@ -91,7 +91,7 @@ export const requireStaff: preHandlerHookHandler = async function requireStaff(
  */
 export function requirePrincipal(request: FastifyRequest): Principal {
   if (!request.principal) {
-    throw new AuthError('unauthenticated', 'route handler ran without authenticate');
+    throw new ApiError('unauthenticated', 'route handler ran without authenticate');
   }
   return request.principal;
 }
@@ -118,7 +118,7 @@ export function resolveAuthHook(opts: AuthRouteOptions = {}): preHandlerHookHand
 
 /**
  * Wire auth into the app: declare the `principal` request slot and route
- * every `AuthError` through one mapper. Centralizing the error→HTTP mapping
+ * every `ApiError` through one mapper. Centralizing the error→HTTP mapping
  * here (not per-route) is the cross-cutting-concern rule — the day the error
  * envelope is frozen, it changes in exactly one place.
  */
@@ -126,7 +126,7 @@ export function registerAuth(app: FastifyInstance): void {
   app.decorateRequest('principal', null);
 
   app.setErrorHandler((err: FastifyError, request, reply: FastifyReply) => {
-    if (err instanceof AuthError) {
+    if (err instanceof ApiError) {
       if (err.status >= 500) {
         request.log.error({ err }, 'auth integrity fault');
       }

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { vets } from '../db/schema/schema.js';
 import { resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
-import { AuthError } from '../auth/errors.js';
+import { ApiError } from '../lib/errors.js';
 import { live } from '../db/softExpire.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { toVetWire, type VetWire } from '../lib/vetWire.js';
@@ -37,7 +37,7 @@ export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions =
   app.get('/vets', { preHandler: [authHook] }, async (request): Promise<VetWire[]> => {
     const parsed = querySchema.safeParse(request.query);
     if (!parsed.success) {
-      throw new AuthError('bad_request', `invalid query: ${formatZodIssues(parsed.error)}`);
+      throw new ApiError('bad_request', `invalid query: ${formatZodIssues(parsed.error)}`);
     }
     const { q } = parsed.data;
 

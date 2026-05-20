@@ -9,9 +9,44 @@ import { z } from 'zod';
 // load entirely is the lean rule. NODE_ENV is read straight off `process.env`
 // because Zod hasn't validated it yet; that's fine — this gate is too narrow
 // to fail noisily, and an unset NODE_ENV (treated as dev) loads `.env`.
-if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'staging') {
-  dotenvConfig();
+//
+// Day 5a addition: `.env.local` layers OVER `.env`. The intended workflow —
+// `.env` holds the canonical dev config (Supabase staging URL, etc.) and
+// `.env.local` holds the developer's per-machine overrides (e.g., a local
+// Postgres URL pointing at the docker-compose stack). `.env.local` is loaded
+// FIRST, then `.env` — because `dotenv` never overrides existing process.env
+// values, the first-loaded file wins per-key. Process.env (host/CLI) still
+// trumps both.
+interface EnvFileLoad {
+  path: string;
+  loaded: boolean;
+  keyCount: number;
 }
+
+const envFileLoads: EnvFileLoad[] = [];
+if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'staging') {
+  const localResult = dotenvConfig({ path: '.env.local' });
+  envFileLoads.push({
+    path: '.env.local',
+    loaded: localResult.parsed !== undefined,
+    keyCount: localResult.parsed ? Object.keys(localResult.parsed).length : 0,
+  });
+  const envResult = dotenvConfig();
+  envFileLoads.push({
+    path: '.env',
+    loaded: envResult.parsed !== undefined,
+    keyCount: envResult.parsed ? Object.keys(envResult.parsed).length : 0,
+  });
+}
+
+/**
+ * Snapshot of which `.env*` files loaded at boot, in load order. Empty
+ * when running in production/staging (host-injected env only). The boot
+ * banner in `index.ts` logs a summary so it's obvious which config layer
+ * the server actually picked up — answers the "what env am I running?"
+ * question at every `npm run dev` / pod start.
+ */
+export const envSources: ReadonlyArray<EnvFileLoad> = envFileLoads;
 
 /**
  * The full Day-1 environment contract. Every var is required: the contract is
@@ -28,9 +63,14 @@ const envSchema = z.object({
   DATABASE_URL: z.string().url(),
   // Path to the CA cert that signed the Postgres server cert. Supabase's
   // direct connection uses Supabase's own CA (not in Node's trust store), so
-  // this is required there for verified TLS. Optional: unset = no explicit CA
-  // (a plaintext/locally-trusted Postgres, e.g. a bare local dev container).
-  DATABASE_SSL_CA: z.string().min(1).optional(),
+  // this is required there for verified TLS. Optional: unset OR empty string
+  // = no explicit CA (a plaintext/locally-trusted Postgres, e.g. the
+  // docker-compose dev container). The empty-string branch is the lever
+  // `.env.local` uses to disable TLS for local dev without editing `.env`.
+  DATABASE_SSL_CA: z
+    .string()
+    .optional()
+    .transform((v) => (v !== undefined && v.length > 0 ? v : undefined)),
 
   // Redis — server-side cache + rate limit + sessions.
   REDIS_URL: z.string().url(),

@@ -5,8 +5,8 @@
     "current_version": 2,
     "required": true,
     "applies_to": ["boarding", "board-and-train"],
-    "signed_version": null,
-    "signed_at": null
+    "signed_version": 2,
+    "signed_at": "2026-04-01T15:00:00.000Z"
   },
   {
     "key": "test-general-waiver",
@@ -16,5 +16,14 @@
     "applies_to": [],
     "signed_version": 1,
     "signed_at": "2026-04-01T15:00:00.000Z"
+  },
+  {
+    "key": "test-marketing-consent",
+    "label": "Marketing Consent (fixture)",
+    "current_version": 1,
+    "required": false,
+    "applies_to": [],
+    "signed_version": null,
+    "signed_at": null
   }
 ]

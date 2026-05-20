@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import Fastify from 'fastify';
 import { eq, sql } from 'drizzle-orm';
-import { AuthError } from '../src/auth/errors.js';
+import { ApiError } from '../src/lib/errors.js';
 import { registerAuth } from '../src/auth/plugin.js';
 import type { Principal } from '../src/auth/principal.js';
 import { db } from '../src/db/client.js';
@@ -52,21 +52,21 @@ test('requireIdempotencyKey accepts a non-empty string', () => {
 test('requireIdempotencyKey rejects undefined as 400 bad_request', () => {
   assert.throws(
     () => requireIdempotencyKey(undefined),
-    (e) => e instanceof AuthError && e.code === 'bad_request' && e.status === 400,
+    (e) => e instanceof ApiError && e.code === 'bad_request' && e.status === 400,
   );
 });
 
 test('requireIdempotencyKey rejects empty string as 400', () => {
   assert.throws(
     () => requireIdempotencyKey(''),
-    (e) => e instanceof AuthError && e.code === 'bad_request',
+    (e) => e instanceof ApiError && e.code === 'bad_request',
   );
 });
 
 test('requireIdempotencyKey rejects over-length keys as 400', () => {
   assert.throws(
     () => requireIdempotencyKey('x'.repeat(IDEMPOTENCY_KEY_MAX_LEN + 1)),
-    (e) => e instanceof AuthError && e.code === 'bad_request' && /exceeds/.test(e.message),
+    (e) => e instanceof ApiError && e.code === 'bad_request' && /exceeds/.test(e.message),
   );
 });
 
@@ -163,7 +163,7 @@ test(
             { key, ownerId: null, endpoint: 'POST /b', requestHash: 'rh' },
             async () => ({ status: 200, body: { ok: 'b' } }),
           ),
-          (e) => e instanceof AuthError && e.code === 'idempotency_mismatch' && e.status === 422,
+          (e) => e instanceof ApiError && e.code === 'idempotency_mismatch' && e.status === 422,
         );
 
         throw new Rollback();
@@ -196,7 +196,7 @@ test(
             { key, ownerId: null, endpoint: 'POST /x', requestHash: 'hash-B' },
             async () => ({ status: 200, body: { ok: true } }),
           ),
-          (e) => e instanceof AuthError && e.code === 'idempotency_mismatch',
+          (e) => e instanceof ApiError && e.code === 'idempotency_mismatch',
         );
 
         throw new Rollback();
@@ -238,7 +238,7 @@ test(
               return { status: 200, body: {} };
             },
           ),
-          (e) => e instanceof AuthError && e.code === 'idempotency_inflight' && e.status === 409,
+          (e) => e instanceof ApiError && e.code === 'idempotency_inflight' && e.status === 409,
         );
         assert.equal(fnRan, false, 'fn must not run when an in-flight conflict is detected');
 

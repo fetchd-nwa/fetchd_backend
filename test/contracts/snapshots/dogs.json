@@ -42,7 +42,10 @@
     "breed": "Golden Retriever",
     "age_months": 84,
     "profile_image_path": "",
-    "vaccines": [],
+    "vaccines": [
+      { "name": "Bordetella", "expires_at": "2026-08-15" },
+      { "name": "Rabies", "expires_at": "2027-05-19" }
+    ],
     "medications": [],
     "feeding": {
       "brand": "",

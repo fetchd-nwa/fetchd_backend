@@ -3,6 +3,7 @@ import { env } from './env.js';
 import { registerAuth } from './auth/plugin.js';
 import { registerAuthWebhook } from './routes/authWebhook.js';
 import { registerAgreementsRoute } from './routes/agreements.js';
+import { registerBookingsRoute } from './routes/bookings.js';
 import { registerDogsRoute } from './routes/dogs.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
@@ -21,7 +22,7 @@ export function buildApp(): FastifyInstance {
   });
 
   // Auth first: it decorates `request.principal` and installs the one
-  // AuthError→HTTP mapper every route relies on.
+  // ApiError→HTTP mapper every route relies on.
   registerAuth(app);
   registerHealthRoute(app); // [public] — no auth guard
   registerAuthWebhook(app); // [public, signed] — own raw-body scope
@@ -30,6 +31,7 @@ export function buildApp(): FastifyInstance {
   registerVetsRoute(app); // [auth]
   registerRequiredVaccinesRoute(app); // [auth]
   registerAgreementsRoute(app); // [auth]
+  registerBookingsRoute(app); // [auth]
 
   return app;
 }

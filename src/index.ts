@@ -1,4 +1,4 @@
-import { env } from './env.js';
+import { env, envSources } from './env.js';
 import { buildApp } from './server.js';
 import { closeDb } from './db/pool.js';
 import { closeRedis } from './redis.js';
@@ -10,6 +10,8 @@ import { closeRedis } from './redis.js';
  * Redis so a redeploy/restart never leaks connections.
  */
 const app = buildApp();
+
+logBootEnvBanner();
 
 async function shutdown(signal: string): Promise<void> {
   app.log.info({ signal }, 'shutting down');
@@ -33,4 +35,48 @@ try {
 } catch (err) {
   app.log.error({ err }, 'failed to bind server');
   process.exit(1);
+}
+
+/**
+ * Boot banner: shows what env layer + connection targets are actually in
+ * effect on this start. Answers "which DATABASE_URL did I just load?"
+ * without grepping. Secrets redacted; only host/port/db on the wire.
+ */
+function logBootEnvBanner(): void {
+  const dbTarget = redactConnectionString(env.DATABASE_URL);
+  const redisTarget = redactConnectionString(env.REDIS_URL);
+  const dbTls = env.DATABASE_SSL_CA !== undefined ? 'on' : 'off';
+
+  if (envSources.length === 0) {
+    app.log.info('env: host-injected only (no .env files loaded)');
+  } else {
+    for (const source of envSources) {
+      if (source.loaded) {
+        app.log.info(`env: loaded ${source.path} (${source.keyCount} keys)`);
+      } else {
+        app.log.info(`env: ${source.path} not present (skipped)`);
+      }
+    }
+  }
+  app.log.info(
+    { db: dbTarget, redis: redisTarget, db_tls: dbTls, node_env: env.NODE_ENV },
+    'env: active config',
+  );
+}
+
+/**
+ * Strip the user:password portion of a `scheme://user:pass@host:port/db`
+ * URL for safe logging. Returns the original string on parse failure
+ * (a malformed URL would have already failed Zod env validation, but
+ * never break the boot banner on a defensive edge).
+ */
+function redactConnectionString(raw: string): string {
+  try {
+    const url = new URL(raw);
+    url.username = '';
+    url.password = '';
+    return url.toString();
+  } catch {
+    return raw;
+  }
 }

@@ -3,7 +3,7 @@ import { withActor } from '../db/tx.js';
 import { RELINK } from '../db/softExpire.js';
 import { appLocation, owners, staff, staffRole } from '../db/schema/schema.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
-import { AuthError } from './errors.js';
+import { ApiError } from '../lib/errors.js';
 
 /**
  * The mirror row is provisioned ONLY here, from the Supabase "user created"
@@ -75,7 +75,7 @@ export type ProvisionTarget =
 export function parseInvite(body: unknown): ProvisionTarget {
   const envelope = envelopeSchema.safeParse(body);
   if (!envelope.success) {
-    throw new AuthError(
+    throw new ApiError(
       'invalid_payload',
       'unexpected webhook payload (expected a Supabase auth.users record)',
     );
@@ -85,7 +85,7 @@ export function parseInvite(body: unknown): ProvisionTarget {
   if ('app_role' in meta) {
     const parsed = staffMeta.safeParse(meta);
     if (!parsed.success) {
-      throw new AuthError(
+      throw new ApiError(
         'invalid_payload',
         `staff invite metadata invalid: ${formatZodIssues(parsed.error)}`,
       );
@@ -101,7 +101,7 @@ export function parseInvite(body: unknown): ProvisionTarget {
 
   const parsed = ownerMeta.safeParse(meta);
   if (!parsed.success) {
-    throw new AuthError(
+    throw new ApiError(
       'invalid_payload',
       `owner invite metadata invalid: ${formatZodIssues(parsed.error)}`,
     );
@@ -152,7 +152,7 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
           },
         })
         .returning({ id: owners.id });
-      if (!row) throw new AuthError('ambiguous_principal', 'owner upsert returned no row');
+      if (!row) throw new ApiError('ambiguous_principal', 'owner upsert returned no row');
       return { kind: 'owner', id: row.id };
     }
 
@@ -174,7 +174,7 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
         },
       })
       .returning({ id: staff.id });
-    if (!row) throw new AuthError('ambiguous_principal', 'staff upsert returned no row');
+    if (!row) throw new ApiError('ambiguous_principal', 'staff upsert returned no row');
     return { kind: 'staff', id: row.id };
   });
 }
