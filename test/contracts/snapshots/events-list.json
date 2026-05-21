@@ -1,0 +1,43 @@
+[
+  {
+    "id": "55555555-5555-4555-8555-aaaaaaaaaaa3",
+    "name": "Public Pups (last week)",
+    "date": "2026-05-16T19:00:00.000Z",
+    "duration_minutes": 60,
+    "location": {
+      "label": "Fayetteville yard",
+      "address": "123 Main St, Fayetteville, AR",
+      "latitude": 36.0822,
+      "longitude": -94.1719
+    },
+    "is_recurring": true,
+    "description": "Past event — included in /events response per FE contract."
+  },
+  {
+    "id": "55555555-5555-4555-8555-aaaaaaaaaaa1",
+    "name": "Public Pups",
+    "date": "2026-05-23T19:00:00.000Z",
+    "duration_minutes": 60,
+    "location": {
+      "label": "Fayetteville yard",
+      "address": "123 Main St, Fayetteville, AR",
+      "latitude": 36.0822,
+      "longitude": -94.1719
+    },
+    "is_recurring": true,
+    "description": "Bring your favorite ball."
+  },
+  {
+    "id": "55555555-5555-4555-8555-aaaaaaaaaaa2",
+    "name": "Yappy Hour",
+    "date": "2026-06-15T22:00:00.000Z",
+    "duration_minutes": 90,
+    "location": {
+      "label": "Bentonville patio",
+      "address": "456 Beer St, Bentonville, AR",
+      "latitude": 36.3729,
+      "longitude": -94.2088
+    },
+    "is_recurring": false
+  }
+]

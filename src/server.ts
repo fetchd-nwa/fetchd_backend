@@ -8,6 +8,7 @@ import { registerBookingsRoute } from './routes/bookings.js';
 import { registerCreditPackagesRoute } from './routes/creditPackages.js';
 import { registerCreditsRoute } from './routes/credits.js';
 import { registerDogsRoute } from './routes/dogs.js';
+import { registerEventsRoute } from './routes/events.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
@@ -15,6 +16,7 @@ import { registerRatesRoute } from './routes/rates.js';
 import { registerReportsRoute } from './routes/reports.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
+import { registerThreadsRoute } from './routes/threads.js';
 import { registerVetsRoute } from './routes/vets.js';
 
 /**
@@ -46,6 +48,8 @@ export function buildApp(): FastifyInstance {
   registerRequestsRoute(app); // [auth] — owner-only
   registerGroupClassesRoute(app); // [auth] — catalogs (owner+staff); eligibility owner-only
   registerReportsRoute(app); // [auth] — owner-only (scoped via dog FK)
+  registerThreadsRoute(app); // [auth] — owner-only
+  registerEventsRoute(app); // [auth] — catalog reads (owner+staff); rsvps owner-only
 
   return app;
 }

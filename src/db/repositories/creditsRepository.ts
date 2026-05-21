@@ -2,6 +2,7 @@ import { and, eq } from 'drizzle-orm';
 import { db } from '../client.js';
 import { dogCreditBalance, dogs } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import { assertNever } from '../../lib/assertNever.js';
 
 /**
  * Per-dog credit balance, owner-scoped. Combines ownership check + balance
@@ -61,7 +62,3 @@ export const creditsRepository = {
     return { school, daycare };
   },
 };
-
-function assertNever(x: never): never {
-  throw new Error(`creditsRepository: unhandled booking_mode value: ${String(x)}`);
-}

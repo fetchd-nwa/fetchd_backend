@@ -2,6 +2,7 @@ import { and, inArray } from 'drizzle-orm';
 import { db } from '../client.js';
 import { staff } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import type { StaffRoleValue } from '../../lib/threadWire.js';
 
 /**
  * Data-access seam for the `staff` table. Day-5a uses one method
@@ -49,5 +50,30 @@ export const staffRepository = {
     const staffRows = await staffRepository.findNamesByIds(ids);
     const namesById = new Map(staffRows.map((s) => [s.id, s.name] as const));
     return (id) => (id === null ? null : (namesById.get(id) ?? null));
+  },
+
+  /**
+   * Resolve a batch of staff ids to full participant rows (id + name + role
+   * + image_path) for thread-participant emission. Day-7a addition for
+   * Thread.participant per DATA-CONTRACT §B (the participant key needs
+   * role + image_path beyond the trainer-name shape). Soft-expired staff
+   * are excluded — a thread referencing a departed staffer returns
+   * `undefined` for that id, which the route maps to a Reception sentinel
+   * (TBD when that case first appears; today every fixture thread has a
+   * live participant).
+   */
+  async findParticipantsByIds(
+    ids: string[],
+  ): Promise<{ id: string; name: string; role: StaffRoleValue; imagePath: string | null }[]> {
+    if (ids.length === 0) return [];
+    return db
+      .select({
+        id: staff.id,
+        name: staff.name,
+        role: staff.role,
+        imagePath: staff.imagePath,
+      })
+      .from(staff)
+      .where(and(inArray(staff.id, ids), live(staff)));
   },
 };

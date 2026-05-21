@@ -128,6 +128,100 @@ test('a missing Authorization header is 401', async () => {
   assert.equal(res.json().error.code, 'unauthenticated');
 });
 
+// --- X-Dev-Principal bypass (Day-7a): dev-only header that constructs the
+// Principal directly so curl/Bruno/Postman can hit any [auth] route without
+// minting a real Supabase JWT. The hard production gate lives in
+// env.ts:resolveBypassHeaderEnabled — these tests stub `bypassEnabled`
+// explicitly so the behavior is proven independent of the live env. ---
+
+function bypassApp(opts: { bypassEnabled: boolean }) {
+  const app = Fastify();
+  registerAuth(app);
+  const authenticate = makeAuthenticate({
+    verify: async () => {
+      throw new ApiError('unauthenticated', 'JWT path should not run when bypass succeeds');
+    },
+    resolve: async () => null,
+    bypassEnabled: opts.bypassEnabled,
+  });
+  app.get('/whoami', { preHandler: [authenticate] }, async (request) => request.principal);
+  return app;
+}
+
+const FIXTURE_OWNER_ID = '11111111-1111-4111-8111-111111111111';
+const FIXTURE_STAFF_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1';
+
+test('X-Dev-Principal bypass constructs an owner Principal in dev', async () => {
+  const res = await bypassApp({ bypassEnabled: true }).inject({
+    method: 'GET',
+    url: '/whoami',
+    headers: { 'x-dev-principal': `owner:${FIXTURE_OWNER_ID}` },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), {
+    kind: 'owner',
+    ownerId: FIXTURE_OWNER_ID,
+    supabaseUid: 'dev-bypass',
+  });
+});
+
+test('X-Dev-Principal bypass constructs a staff Principal with role', async () => {
+  const res = await bypassApp({ bypassEnabled: true }).inject({
+    method: 'GET',
+    url: '/whoami',
+    headers: { 'x-dev-principal': `staff:${FIXTURE_STAFF_ID}:trainer` },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), {
+    kind: 'staff',
+    staffId: FIXTURE_STAFF_ID,
+    role: 'trainer',
+    supabaseUid: 'dev-bypass',
+  });
+});
+
+test('X-Dev-Principal bypass IGNORES the header when disabled (prod gate)', async () => {
+  // bypassEnabled=false simulates NODE_ENV=production. The header MUST be
+  // ignored — the JWT path runs, finds no Bearer token, and returns 401.
+  const res = await bypassApp({ bypassEnabled: false }).inject({
+    method: 'GET',
+    url: '/whoami',
+    headers: { 'x-dev-principal': `owner:${FIXTURE_OWNER_ID}` },
+  });
+  assert.equal(res.statusCode, 401);
+  assert.equal(res.json().error.code, 'unauthenticated');
+});
+
+test('X-Dev-Principal bypass rejects a malformed header value as 400', async () => {
+  const res = await bypassApp({ bypassEnabled: true }).inject({
+    method: 'GET',
+    url: '/whoami',
+    headers: { 'x-dev-principal': 'not-a-valid-shape' },
+  });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error.code, 'bad_request');
+});
+
+test('X-Dev-Principal bypass rejects an unknown staff role as 400', async () => {
+  const res = await bypassApp({ bypassEnabled: true }).inject({
+    method: 'GET',
+    url: '/whoami',
+    headers: { 'x-dev-principal': `staff:${FIXTURE_STAFF_ID}:hacker` },
+  });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().error.code, 'bad_request');
+});
+
+test('X-Dev-Principal bypass falls through to JWT when header is absent', async () => {
+  // bypass ON but no header → standard JWT path. No bearer token → 401.
+  const res = await bypassApp({ bypassEnabled: true }).inject({
+    method: 'GET',
+    url: '/whoami',
+  });
+  assert.equal(res.statusCode, 401);
+  assert.equal(res.json().error.code, 'unauthenticated');
+});
+
 // --- app.actor primitive: requires a real DB. Skipped when DATABASE_URL is
 // absent (keeps the CI `check` job, which has no DB, green). The round-trip is
 // fully rolled back via a sentinel throw — zero writes to the live database. ---

@@ -1,0 +1,14 @@
+{
+  "id": "55555555-5555-4555-8555-aaaaaaaaaaa1",
+  "name": "Public Pups",
+  "date": "2026-05-23T19:00:00.000Z",
+  "duration_minutes": 60,
+  "location": {
+    "label": "Fayetteville yard",
+    "address": "123 Main St, Fayetteville, AR",
+    "latitude": 36.0822,
+    "longitude": -94.1719
+  },
+  "is_recurring": true,
+  "description": "Bring your favorite ball."
+}

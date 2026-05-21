@@ -5,10 +5,12 @@ import type {
   FastifyRequest,
   preHandlerHookHandler,
 } from 'fastify';
-import type { Principal } from './principal.js';
+import type { Principal, StaffRole } from './principal.js';
+import { bypassHeaderEnabled } from '../env.js';
 import { ApiError } from '../lib/errors.js';
 import { verifyAccessToken, type VerifiedToken } from './jwks.js';
 import { resolvePrincipal } from './mirror.js';
+import { staffRole } from '../db/schema/schema.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -31,9 +33,61 @@ function extractBearer(request: FastifyRequest): string {
   return token;
 }
 
+// ---- Day-7a `X-Dev-Principal` bypass --------------------------------------
+//
+// Dev/test escape hatch from the JWT-setup tax: `curl -H 'X-Dev-Principal:
+// owner:<uuid>'` constructs a Principal directly, no Supabase round-trip.
+// Two layers guard it from leaking into prod:
+//   1. `env.bypassHeaderEnabled` — false by default in staging/prod, hard-
+//      forced false when NODE_ENV=production (see `env.ts:resolveBypassHeader
+//      Enabled`).
+//   2. `makeAuthenticate` closes over the resolved flag at module load, so
+//      `request.headers['x-dev-principal']` is *only ever inspected* when (1)
+//      says yes.
+//
+// Header shape: `owner:<uuid>` | `staff:<uuid>:<role>` where <role> is a
+// `staff_role` enum value. UUID is the mirror-row id (not the supabase uid)
+// — same shape as `actorOf(principal)` so the audit_log gets a familiar
+// actor string. `supabaseUid` is the literal `'dev-bypass'` (never read for
+// reads, but the Principal field is required).
+const DEV_PRINCIPAL_HEADER = 'x-dev-principal' as const;
+const DEV_BYPASS_SUPABASE_UID = 'dev-bypass';
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const DEV_OWNER_RE = new RegExp(`^owner:(${UUID_RE.source})$`, 'i');
+const DEV_STAFF_RE = new RegExp(`^staff:(${UUID_RE.source}):([a-z-]+)$`, 'i');
+
+function parseDevPrincipal(headerValue: string): Principal {
+  const ownerMatch = DEV_OWNER_RE.exec(headerValue);
+  if (ownerMatch) {
+    return { kind: 'owner', ownerId: ownerMatch[1]!, supabaseUid: DEV_BYPASS_SUPABASE_UID };
+  }
+  const staffMatch = DEV_STAFF_RE.exec(headerValue);
+  if (staffMatch) {
+    const role = staffMatch[2]! as StaffRole;
+    if (!(staffRole.enumValues as readonly string[]).includes(role)) {
+      throw new ApiError(
+        'bad_request',
+        `X-Dev-Principal: invalid staff role '${role}' (allowed: ${staffRole.enumValues.join('|')})`,
+      );
+    }
+    return { kind: 'staff', staffId: staffMatch[1]!, role, supabaseUid: DEV_BYPASS_SUPABASE_UID };
+  }
+  throw new ApiError(
+    'bad_request',
+    `X-Dev-Principal: expected 'owner:<uuid>' or 'staff:<uuid>:<role>'`,
+  );
+}
+
 interface AuthDeps {
   verify: (token: string) => Promise<VerifiedToken>;
   resolve: (supabaseUid: string) => Promise<Principal | null>;
+  /**
+   * Day-7a addition: when true, `X-Dev-Principal: owner:<uuid>` (or
+   * `staff:<uuid>:<role>`) constructs the Principal directly and skips the
+   * JWT verify+resolve path. Default false. Tests inject explicitly; the
+   * real `authenticate` reads `bypassHeaderEnabled` from `env.ts`.
+   */
+  bypassEnabled?: boolean;
 }
 
 /**
@@ -47,7 +101,15 @@ interface AuthDeps {
  * resolve, not their concrete implementations).
  */
 export function makeAuthenticate(deps: AuthDeps): preHandlerHookHandler {
+  const bypassEnabled = deps.bypassEnabled ?? false;
   return async function authenticate(request: FastifyRequest): Promise<void> {
+    if (bypassEnabled) {
+      const headerValue = request.headers[DEV_PRINCIPAL_HEADER];
+      if (typeof headerValue === 'string' && headerValue.length > 0) {
+        request.principal = parseDevPrincipal(headerValue);
+        return;
+      }
+    }
     const token = extractBearer(request);
     const { sub } = await deps.verify(token);
     const principal = await deps.resolve(sub);
@@ -65,6 +127,7 @@ export function makeAuthenticate(deps: AuthDeps): preHandlerHookHandler {
 export const authenticate = makeAuthenticate({
   verify: verifyAccessToken,
   resolve: resolvePrincipal,
+  bypassEnabled: bypassHeaderEnabled,
 });
 
 /**

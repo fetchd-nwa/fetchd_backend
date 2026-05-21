@@ -1,3 +1,4 @@
+import { assertNever } from './assertNever.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { reportProgram } from '../db/schema/schema.js';
 import type { ServiceCategory } from './bookingBucket.js';
@@ -188,8 +189,4 @@ function attachVariantContent(program: ReportProgram, content: unknown, wire: Re
     default:
       assertNever(program);
   }
-}
-
-function assertNever(x: never): never {
-  throw new Error(`reportWire: unhandled report_program value: ${String(x)}`);
 }

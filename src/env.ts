@@ -93,6 +93,16 @@ const envSchema = z.object({
   R2_ACCESS_KEY_ID: z.string().min(1),
   R2_SECRET_ACCESS_KEY: z.string().min(1),
   R2_BUCKET: z.string().min(1),
+
+  // Day-7a: `X-Dev-Principal` header bypass. Lets dev/test curl any [auth]
+  // route by passing a header like `owner:<uuid>` — no Supabase JWT setup
+  // needed. The hard gate is in `bypassHeaderEnabled` below (forced off when
+  // NODE_ENV=production regardless of this setting). The raw env var
+  // defaults UNSET; the resolved boolean defaults true for dev/test.
+  BYPASS_HEADER_ENABLED: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => (v === undefined ? undefined : v === 'true')),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -112,3 +122,24 @@ function loadEnv(): Env {
 }
 
 export const env = loadEnv();
+
+/**
+ * The resolved `X-Dev-Principal` bypass gate (Day-7a). Two layers:
+ *
+ *   1. `env.BYPASS_HEADER_ENABLED` — explicit env var (`'true'` / `'false'` /
+ *      unset). Unset defaults to ON for `development` / `test`, OFF for
+ *      `staging` / `production`.
+ *   2. **Hard production override** — when `NODE_ENV === 'production'` the
+ *      bypass is always OFF, regardless of (1). Belt-and-suspenders so a
+ *      misconfigured prod env can never accidentally honor the header.
+ *
+ * Exported as a boolean so callers don't redo the logic. The `authenticate`
+ * preHandler closes over this at module load via `makeAuthenticate`.
+ */
+function resolveBypassHeaderEnabled(): boolean {
+  if (env.NODE_ENV === 'production') return false;
+  if (env.BYPASS_HEADER_ENABLED !== undefined) return env.BYPASS_HEADER_ENABLED;
+  return env.NODE_ENV === 'development' || env.NODE_ENV === 'test';
+}
+
+export const bypassHeaderEnabled = resolveBypassHeaderEnabled();

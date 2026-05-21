@@ -15,7 +15,12 @@ import {
   dogMedications,
   dogVaccines,
   dogs,
+  eventRsvpDogs,
+  eventRsvps,
+  eventSeries,
+  events,
   groupClasses,
+  messages,
   owners,
   paymentMethods,
   pendingRequestDogs,
@@ -25,6 +30,8 @@ import {
   requiredVaccines,
   serviceRates,
   staff,
+  threadDogs,
+  threads,
   vets,
 } from '../../src/db/schema/schema.js';
 
@@ -129,6 +136,40 @@ export const FIXTURE_IDS = {
   // (not just compile-time exhaustive via the helper switch).
   reportBoardTrainId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee4',
   reportGroupClassId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5',
+  // Day-7a: messaging fixture. Threads use the `1` nibble for the id-space
+  // (one nibble shared with owners; thread ids are PK-fresh UUIDs so no
+  // collision, just a memorable convention) and messages use `2`.
+  //   thread1 = `sessions` category, with Donavan (Fayetteville trainer),
+  //     thread_dogs links Waffles + Lola, 5 messages (mixed sender,
+  //     2 unread from staff).
+  //   thread2 = `billing` category, with Rachel (Fayetteville trainer),
+  //     no thread_dogs, 2 messages (all read).
+  thread1Id: '11111111-1111-4111-8111-aaaaaaaaaaa1',
+  thread2Id: '11111111-1111-4111-8111-aaaaaaaaaaa2',
+  message1Id: '22222222-2222-4222-8222-aaaaaaaaaaa1',
+  message2Id: '22222222-2222-4222-8222-aaaaaaaaaaa2',
+  message3Id: '22222222-2222-4222-8222-aaaaaaaaaaa3',
+  message4Id: '22222222-2222-4222-8222-aaaaaaaaaaa4',
+  message5Id: '22222222-2222-4222-8222-aaaaaaaaaaa5',
+  message6Id: '22222222-2222-4222-8222-aaaaaaaaaaa6',
+  message7Id: '22222222-2222-4222-8222-aaaaaaaaaaa7',
+  // Day-7a: events fixture. `event_series` carries the recurring "Public
+  // Pups" definition; `events` carries one row per dated occurrence.
+  //   eventPublicPups = future occurrence (series_id set, is_recurring,
+  //     no capacity, description set) — exercises the series + recurring
+  //     branch.
+  //   eventYappyHour  = one-off future event (series_id null, capacity
+  //     20) — exercises the soft-cap + non-recurring branch. NOT emitted
+  //     in this Day-7a wire shape (capacity/series_id deferred until FE
+  //     consumes) but the row exists.
+  //   eventPast = a past event so the snapshot covers "API returns past
+  //     events too; FE filters" (FE listEvents returns all).
+  // `4` and `5` nibbles for event/series ids; `6` for rsvp ids.
+  eventSeriesPublicPupsId: '44444444-4444-4444-8444-aaaaaaaaaaa1',
+  eventPublicPupsId: '55555555-5555-4555-8555-aaaaaaaaaaa1',
+  eventYappyHourId: '55555555-5555-4555-8555-aaaaaaaaaaa2',
+  eventPastId: '55555555-5555-4555-8555-aaaaaaaaaaa3',
+  eventRsvp1Id: '66666666-6666-4666-8666-aaaaaaaaaaa1',
 } as const;
 
 /**
@@ -1035,6 +1076,187 @@ export async function seedFixture(): Promise<void> {
     { requestId: FIXTURE_IDS.pendingRequest2Id, ordinal: 1, preferredAt: '2026-05-01T13:00:00Z' },
     { requestId: FIXTURE_IDS.pendingRequest2Id, ordinal: 2, preferredAt: '2026-05-08T13:00:00Z' },
   ]);
+
+  // Day-7a: messaging fixture. Two threads, seven messages.
+  //   thread1 (`sessions`, with Donavan): related to Waffles + Lola via
+  //     thread_dogs. Five messages alternating owner/staff sender, the
+  //     last two from staff are UNREAD (read_at NULL). → unread_count = 2.
+  //   thread2 (`billing`, with Rachel): no thread_dogs (related_dog_ids
+  //     emits as `[]`). Two messages — owner Q, Rachel A, both READ.
+  //     → unread_count = 0.
+  await db.insert(threads).values([
+    {
+      id: FIXTURE_IDS.thread1Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      participantStaffId: FIXTURE_IDS.staffDonavanId,
+      category: 'sessions',
+      title: 'Waffles + Lola — leash work',
+      subText: 'with Donavan',
+      lastMessage: 'Sounds good — Friday at 9am.',
+      lastMessageAt: '2026-05-19T14:30:00Z',
+    },
+    {
+      id: FIXTURE_IDS.thread2Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      participantStaffId: FIXTURE_IDS.staffRachelId,
+      category: 'billing',
+      title: 'Group Manners 1 invoice',
+      subText: 'with Rachel',
+      lastMessage: 'Got it, thanks!',
+      lastMessageAt: '2026-05-10T17:00:00Z',
+    },
+  ]);
+
+  await db.insert(threadDogs).values([
+    { threadId: FIXTURE_IDS.thread1Id, dogId: FIXTURE_IDS.dog1Id },
+    { threadId: FIXTURE_IDS.thread1Id, dogId: FIXTURE_IDS.dog2Id },
+  ]);
+
+  await db.insert(messages).values([
+    // thread1 timeline — owner asks, staff replies, owner follows up,
+    // staff replies twice (both unread → unread_count = 2).
+    {
+      id: FIXTURE_IDS.message1Id,
+      threadId: FIXTURE_IDS.thread1Id,
+      senderKind: 'owner',
+      senderOwnerId: FIXTURE_IDS.ownerId,
+      senderStaffId: null,
+      text: 'Hey — wanted to follow up on Waffles & Lola from Tuesday. Is Friday morning open?',
+      sentAt: '2026-05-19T13:00:00Z',
+      readAt: '2026-05-19T13:05:00Z',
+    },
+    {
+      id: FIXTURE_IDS.message2Id,
+      threadId: FIXTURE_IDS.thread1Id,
+      senderKind: 'staff',
+      senderOwnerId: null,
+      senderStaffId: FIXTURE_IDS.staffDonavanId,
+      text: 'Friday at 9am works. Bringing both?',
+      sentAt: '2026-05-19T13:10:00Z',
+      readAt: '2026-05-19T13:15:00Z',
+    },
+    {
+      id: FIXTURE_IDS.message3Id,
+      threadId: FIXTURE_IDS.thread1Id,
+      senderKind: 'owner',
+      senderOwnerId: FIXTURE_IDS.ownerId,
+      senderStaffId: null,
+      text: 'Yes — both. Lola is the bigger leash-reactivity question right now.',
+      sentAt: '2026-05-19T13:20:00Z',
+      readAt: '2026-05-19T13:21:00Z',
+    },
+    {
+      id: FIXTURE_IDS.message4Id,
+      threadId: FIXTURE_IDS.thread1Id,
+      senderKind: 'staff',
+      senderOwnerId: null,
+      senderStaffId: FIXTURE_IDS.staffDonavanId,
+      text: 'Perfect — I have a couple of new tools for that. Bring her flat collar.',
+      sentAt: '2026-05-19T14:25:00Z',
+      readAt: null,
+    },
+    {
+      id: FIXTURE_IDS.message5Id,
+      threadId: FIXTURE_IDS.thread1Id,
+      senderKind: 'staff',
+      senderOwnerId: null,
+      senderStaffId: FIXTURE_IDS.staffDonavanId,
+      text: 'Sounds good — Friday at 9am.',
+      sentAt: '2026-05-19T14:30:00Z',
+      readAt: null,
+    },
+    // thread2 — invoice Q + A, both read.
+    {
+      id: FIXTURE_IDS.message6Id,
+      threadId: FIXTURE_IDS.thread2Id,
+      senderKind: 'owner',
+      senderOwnerId: FIXTURE_IDS.ownerId,
+      senderStaffId: null,
+      text: 'Hi — was the Group Manners 1 charge for both dogs or just Waffles?',
+      sentAt: '2026-05-10T16:30:00Z',
+      readAt: '2026-05-10T16:45:00Z',
+    },
+    {
+      id: FIXTURE_IDS.message7Id,
+      threadId: FIXTURE_IDS.thread2Id,
+      senderKind: 'staff',
+      senderOwnerId: null,
+      senderStaffId: FIXTURE_IDS.staffRachelId,
+      text: 'Just Waffles — Lola never enrolled in this one. Got it, thanks!',
+      sentAt: '2026-05-10T17:00:00Z',
+      readAt: '2026-05-10T17:15:00Z',
+    },
+  ]);
+
+  // Day-7a: events fixture. One series (Public Pups), three event rows
+  // (one series-recurring, one one-off w/ capacity, one past), one RSVP
+  // from the fixture owner attached to the recurring event with both
+  // dogs in event_rsvp_dogs.
+  await db.insert(eventSeries).values({
+    id: FIXTURE_IDS.eventSeriesPublicPupsId,
+    name: 'Public Pups',
+    cadence: 'weekly-saturday',
+    defaultDurationMinutes: 60,
+    description: 'Weekly social hour for vaccinated, well-socialized dogs.',
+    isActive: true,
+  });
+
+  await db.insert(events).values([
+    {
+      id: FIXTURE_IDS.eventPublicPupsId,
+      name: 'Public Pups',
+      startsAt: '2026-05-23T19:00:00Z', // Saturday 2pm CDT
+      durationMinutes: 60,
+      locLabel: 'Fayetteville yard',
+      locAddress: '123 Main St, Fayetteville, AR',
+      locLatitude: 36.0822,
+      locLongitude: -94.1719,
+      description: 'Bring your favorite ball.',
+      isRecurring: true,
+      seriesId: FIXTURE_IDS.eventSeriesPublicPupsId,
+      capacity: null,
+    },
+    {
+      id: FIXTURE_IDS.eventYappyHourId,
+      name: 'Yappy Hour',
+      startsAt: '2026-06-15T22:00:00Z', // Monday 5pm CDT
+      durationMinutes: 90,
+      locLabel: 'Bentonville patio',
+      locAddress: '456 Beer St, Bentonville, AR',
+      locLatitude: 36.3729,
+      locLongitude: -94.2088,
+      description: null, // exercises optional-omit on description
+      isRecurring: false,
+      seriesId: null,
+      capacity: 20,
+    },
+    {
+      id: FIXTURE_IDS.eventPastId,
+      name: 'Public Pups (last week)',
+      startsAt: '2026-05-16T19:00:00Z',
+      durationMinutes: 60,
+      locLabel: 'Fayetteville yard',
+      locAddress: '123 Main St, Fayetteville, AR',
+      locLatitude: 36.0822,
+      locLongitude: -94.1719,
+      description: 'Past event — included in /events response per FE contract.',
+      isRecurring: true,
+      seriesId: FIXTURE_IDS.eventSeriesPublicPupsId,
+      capacity: null,
+    },
+  ]);
+
+  await db.insert(eventRsvps).values({
+    id: FIXTURE_IDS.eventRsvp1Id,
+    eventId: FIXTURE_IDS.eventPublicPupsId,
+    ownerId: FIXTURE_IDS.ownerId,
+    rsvpdAt: '2026-05-18T16:00:00Z',
+  });
+
+  await db.insert(eventRsvpDogs).values([
+    { rsvpId: FIXTURE_IDS.eventRsvp1Id, dogId: FIXTURE_IDS.dog1Id },
+    { rsvpId: FIXTURE_IDS.eventRsvp1Id, dogId: FIXTURE_IDS.dog2Id },
+  ]);
 }
 
 export async function teardownFixture(): Promise<void> {
@@ -1051,6 +1273,26 @@ export async function teardownFixture(): Promise<void> {
   // children cascade. Group-classes catalog (group_classes + cohorts +
   // class_prereq_options) is independent of owner/dog state — drop after
   // pending_requests but before nothing in particular.
+  // Day-7a: threads + messages. messages cascades on thread delete; we
+  // delete threads by owner_id (cascade pulls down thread_dogs + messages
+  // implicitly), but doing it explicitly here keeps the teardown
+  // independent of the ON DELETE CASCADE FKs in case those move later.
+  await db.delete(threads).where(eq(threads.ownerId, FIXTURE_IDS.ownerId));
+  // Day-7a: event_rsvps + events. event_rsvp_dogs cascades on rsvp delete;
+  // events cascade rsvps; event_series is independent and shared across
+  // events so drop AFTER events. Order: rsvps (owner-keyed) → events (id-
+  // keyed) → series.
+  await db.delete(eventRsvps).where(eq(eventRsvps.ownerId, FIXTURE_IDS.ownerId));
+  await db
+    .delete(events)
+    .where(
+      inArray(events.id, [
+        FIXTURE_IDS.eventPublicPupsId,
+        FIXTURE_IDS.eventYappyHourId,
+        FIXTURE_IDS.eventPastId,
+      ]),
+    );
+  await db.delete(eventSeries).where(eq(eventSeries.id, FIXTURE_IDS.eventSeriesPublicPupsId));
   await db.delete(pendingRequests).where(eq(pendingRequests.ownerId, FIXTURE_IDS.ownerId));
   await db
     .delete(cohorts)

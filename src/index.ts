@@ -1,4 +1,4 @@
-import { env, envSources } from './env.js';
+import { bypassHeaderEnabled, env, envSources } from './env.js';
 import { buildApp } from './server.js';
 import { closeDb } from './db/pool.js';
 import { closeRedis } from './redis.js';
@@ -62,6 +62,12 @@ function logBootEnvBanner(): void {
     { db: dbTarget, redis: redisTarget, db_tls: dbTls, node_env: env.NODE_ENV },
     'env: active config',
   );
+  if (bypassHeaderEnabled) {
+    app.log.warn(
+      { node_env: env.NODE_ENV },
+      'X-Dev-Principal bypass is ON — any request with `X-Dev-Principal: owner:<uuid>` (or staff:<uuid>:<role>) skips JWT verify. Dev-only; force-disabled in production.',
+    );
+  }
 }
 
 /**

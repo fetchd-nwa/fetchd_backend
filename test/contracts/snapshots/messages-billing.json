@@ -1,0 +1,19 @@
+[
+  {
+    "id": "22222222-2222-4222-8222-aaaaaaaaaaa6",
+    "thread_id": "11111111-1111-4111-8111-aaaaaaaaaaa2",
+    "sender_id": "11111111-1111-4111-8111-111111111111",
+    "text": "Hi — was the Group Manners 1 charge for both dogs or just Waffles?",
+    "sent_at": "2026-05-10T16:30:00.000Z",
+    "is_read": true
+  },
+  {
+    "id": "22222222-2222-4222-8222-aaaaaaaaaaa7",
+    "thread_id": "11111111-1111-4111-8111-aaaaaaaaaaa2",
+    "sender_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+    "sender_name": "Rachel",
+    "text": "Just Waffles — Lola never enrolled in this one. Got it, thanks!",
+    "sent_at": "2026-05-10T17:00:00.000Z",
+    "is_read": true
+  }
+]

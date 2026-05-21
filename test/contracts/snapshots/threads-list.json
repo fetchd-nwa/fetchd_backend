@@ -1,0 +1,35 @@
+[
+  {
+    "id": "11111111-1111-4111-8111-aaaaaaaaaaa1",
+    "category": "sessions",
+    "title": "Waffles + Lola — leash work",
+    "sub_text": "with Donavan",
+    "participant": {
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "name": "Donavan",
+      "role": "trainer"
+    },
+    "related_dog_ids": [
+      "33333333-3333-4333-8333-333333333331",
+      "33333333-3333-4333-8333-333333333332"
+    ],
+    "last_message": "Sounds good — Friday at 9am.",
+    "last_message_at": "2026-05-19T14:30:00.000Z",
+    "unread_count": 2
+  },
+  {
+    "id": "11111111-1111-4111-8111-aaaaaaaaaaa2",
+    "category": "billing",
+    "title": "Group Manners 1 invoice",
+    "sub_text": "with Rachel",
+    "participant": {
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+      "name": "Rachel",
+      "role": "trainer"
+    },
+    "related_dog_ids": [],
+    "last_message": "Got it, thanks!",
+    "last_message_at": "2026-05-10T17:00:00.000Z",
+    "unread_count": 0
+  }
+]

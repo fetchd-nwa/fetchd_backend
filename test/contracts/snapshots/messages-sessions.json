@@ -1,0 +1,45 @@
+[
+  {
+    "id": "22222222-2222-4222-8222-aaaaaaaaaaa1",
+    "thread_id": "11111111-1111-4111-8111-aaaaaaaaaaa1",
+    "sender_id": "11111111-1111-4111-8111-111111111111",
+    "text": "Hey — wanted to follow up on Waffles & Lola from Tuesday. Is Friday morning open?",
+    "sent_at": "2026-05-19T13:00:00.000Z",
+    "is_read": true
+  },
+  {
+    "id": "22222222-2222-4222-8222-aaaaaaaaaaa2",
+    "thread_id": "11111111-1111-4111-8111-aaaaaaaaaaa1",
+    "sender_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "sender_name": "Donavan",
+    "text": "Friday at 9am works. Bringing both?",
+    "sent_at": "2026-05-19T13:10:00.000Z",
+    "is_read": true
+  },
+  {
+    "id": "22222222-2222-4222-8222-aaaaaaaaaaa3",
+    "thread_id": "11111111-1111-4111-8111-aaaaaaaaaaa1",
+    "sender_id": "11111111-1111-4111-8111-111111111111",
+    "text": "Yes — both. Lola is the bigger leash-reactivity question right now.",
+    "sent_at": "2026-05-19T13:20:00.000Z",
+    "is_read": true
+  },
+  {
+    "id": "22222222-2222-4222-8222-aaaaaaaaaaa4",
+    "thread_id": "11111111-1111-4111-8111-aaaaaaaaaaa1",
+    "sender_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "sender_name": "Donavan",
+    "text": "Perfect — I have a couple of new tools for that. Bring her flat collar.",
+    "sent_at": "2026-05-19T14:25:00.000Z",
+    "is_read": false
+  },
+  {
+    "id": "22222222-2222-4222-8222-aaaaaaaaaaa5",
+    "thread_id": "11111111-1111-4111-8111-aaaaaaaaaaa1",
+    "sender_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "sender_name": "Donavan",
+    "text": "Sounds good — Friday at 9am.",
+    "sent_at": "2026-05-19T14:30:00.000Z",
+    "is_read": false
+  }
+]
