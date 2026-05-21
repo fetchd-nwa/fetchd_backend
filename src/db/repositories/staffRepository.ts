@@ -27,4 +27,27 @@ export const staffRepository = {
       .from(staff)
       .where(and(inArray(staff.id, ids), live(staff)));
   },
+
+  /**
+   * Build a null-aware trainer-name lookup for a batch of rows. Dedupes
+   * the unique `trainerStaffId` values, fetches all in one query via
+   * `findNamesByIds`, returns a closure callers use per-row.
+   *
+   * Rule-of-two extraction (Day 6b): `wireBookings` and `wireReports`
+   * both did this dance inline. Day-7 events (organizer staff) and
+   * Day-12 report mutations (author staff) will reuse. Returns `null`
+   * for unknown ids (soft-expired staff, structurally missing rows) —
+   * matches the optional-omit `trainer?` convention.
+   */
+  async resolveTrainerNames<T extends { trainerStaffId: string | null }>(
+    rows: readonly T[],
+  ): Promise<(id: string | null) => string | null> {
+    const ids = [
+      ...new Set(rows.map((r) => r.trainerStaffId).filter((v): v is string => v !== null)),
+    ];
+    if (ids.length === 0) return () => null;
+    const staffRows = await staffRepository.findNamesByIds(ids);
+    const namesById = new Map(staffRows.map((s) => [s.id, s.name] as const));
+    return (id) => (id === null ? null : (namesById.get(id) ?? null));
+  },
 };

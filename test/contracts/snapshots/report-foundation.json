@@ -1,0 +1,23 @@
+{
+  "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",
+  "dog_id": "33333333-3333-4333-8333-333333333331",
+  "date": "2026-05-08T13:00:00.000Z",
+  "category": "day-school",
+  "program": "foundation",
+  "excerpt": "Waffles had a great session — really locked in her sit-stay today up to 15 feet.",
+  "full_text": "Waffles came in with a ton of energy today but channeled it really well once we got into structured work. We focused on duration and distance with her sit-stay.",
+  "trainer": "Donavan",
+  "visit_count": 8,
+  "verdict_headline": "Great Start!",
+  "results": {
+    "sit.l1": { "status": "pass" },
+    "sit.l2": { "status": "pass", "score": "4/5" },
+    "down.l1": { "status": "learning", "score": "3/5" }
+  },
+  "practice_at_home": [
+    { "text": "Build *Down duration* — start with 3 seconds, work up to 15." },
+    { "text": "Practice *Place* on her cot in the kitchen during dinner prep." }
+  ],
+  "friends_today": ["33333333-3333-4333-8333-333333333332"],
+  "additional_skills_completed": ["name-recognition"]
+}

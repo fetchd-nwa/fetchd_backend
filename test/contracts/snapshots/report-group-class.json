@@ -1,0 +1,32 @@
+{
+  "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5",
+  "dog_id": "33333333-3333-4333-8333-333333333331",
+  "date": "2026-03-01T20:00:00.000Z",
+  "category": "group-class",
+  "program": "group-class-session",
+  "excerpt": "4-week Group Manners 1 cohort — solid recall + place + leash review.",
+  "full_text": "Group Manners 1 ran over four Saturdays. Below is the recap from each week with handouts, practice items, and the concepts we covered.",
+  "trainer": "Rachel",
+  "visit_count": 1,
+  "verdict_headline": "Cohort complete",
+  "group_class_session_content": {
+    "class_name": "Group Manners 1",
+    "cohort_label": "Spring '26 cohort",
+    "week_count": 4,
+    "weeks": [
+      {
+        "week_number": 1,
+        "date": "2026-02-08T20:00:00.000Z",
+        "title": "Foundations: engagement + name recognition",
+        "location": "In house",
+        "intro": "Welcome to Group Manners 1.",
+        "topics": [
+          { "label": "Engagement", "isLinked": true },
+          { "label": "Name recognition", "description": "Build the muscle of looking at you." }
+        ],
+        "practice_items": ["Daily engagement drills", "Name game at meals"],
+        "closing_note": "Great first week."
+      }
+    ]
+  }
+}

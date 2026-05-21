@@ -176,22 +176,16 @@ function sortByScheduledAt(rows: BookingRow[], direction: 'asc' | 'desc'): Booki
 async function wireBookings(rows: BookingRow[]): Promise<BookingWire[]> {
   if (rows.length === 0) return [];
   const ids = rows.map((r) => r.id);
-  const trainerIds = [
-    ...new Set(rows.map((r) => r.trainerStaffId).filter((v): v is string => v !== null)),
-  ];
-  const [bookingDogRows, staffRows] = await Promise.all([
+  const [bookingDogRows, trainerName] = await Promise.all([
     bookingsRepository.findDogsByBookingIds(ids),
-    staffRepository.findNamesByIds(trainerIds),
+    staffRepository.resolveTrainerNames(rows),
   ]);
   const dogsByBooking = groupBookingDogs(bookingDogRows);
-  const staffById = new Map(staffRows.map((s) => [s.id, s.name] as const));
   return rows.map((row) => {
     const dogIds = dogsByBooking.get(row.id);
     if (dogIds === undefined) {
       throw new Error(`booking ${row.id}: no booking_dogs rows found`);
     }
-    const trainerName =
-      row.trainerStaffId !== null ? (staffById.get(row.trainerStaffId) ?? null) : null;
-    return toBookingWire(row, dogIds, trainerName);
+    return toBookingWire(row, dogIds, trainerName(row.trainerStaffId));
   });
 }

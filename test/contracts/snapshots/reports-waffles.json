@@ -1,0 +1,122 @@
+[
+  {
+    "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "date": "2026-05-08T13:00:00.000Z",
+    "category": "day-school",
+    "program": "foundation",
+    "excerpt": "Waffles had a great session — really locked in her sit-stay today up to 15 feet.",
+    "full_text": "Waffles came in with a ton of energy today but channeled it really well once we got into structured work. We focused on duration and distance with her sit-stay.",
+    "trainer": "Donavan",
+    "visit_count": 8,
+    "verdict_headline": "Great Start!",
+    "results": {
+      "sit.l1": { "status": "pass" },
+      "sit.l2": { "status": "pass", "score": "4/5" },
+      "down.l1": { "status": "learning", "score": "3/5" }
+    },
+    "practice_at_home": [
+      { "text": "Build *Down duration* — start with 3 seconds, work up to 15." },
+      { "text": "Practice *Place* on her cot in the kitchen during dinner prep." }
+    ],
+    "friends_today": ["33333333-3333-4333-8333-333333333332"],
+    "additional_skills_completed": ["name-recognition"]
+  },
+  {
+    "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "date": "2026-04-25T20:00:00.000Z",
+    "category": "private-lesson",
+    "program": "private-lesson",
+    "excerpt": "Worked through leash protocols, transitions, and managing distractions.",
+    "full_text": "Great session today — Waffles is showing real progress on leash, but transitions and unexpected dogs are still her biggest moments.",
+    "trainer": "Rachel",
+    "visit_count": 3,
+    "verdict_headline": "On the right track",
+    "practice_at_home": [
+      { "text": "Run the leash protocol *indoors first*, every day, before you head out." },
+      { "text": "Drill *up-down* anywhere — even when she's calm." }
+    ],
+    "private_lesson_content": {
+      "session_focus": "Leash skills + transitions + managing distractions",
+      "topics": [
+        {
+          "id": "leash",
+          "title": "Leash",
+          "sections": [
+            {
+              "kind": "steps",
+              "items": [
+                "Start her inside before the walk — pay for standing beside you.",
+                "Once outside, claim the space in front of the house."
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "Transitions are tough for her — going around corners and into new areas."
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee4",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "date": "2026-03-15T20:00:00.000Z",
+    "category": "board-and-train",
+    "program": "board-train-session",
+    "excerpt": "2-week foundations residential — solid cue set + leash skills.",
+    "full_text": "Two-week board & train. We built engagement, then the core cues (sit, down, place, stay), then leash skills. Reliable cue set by handoff; daily reps from you keep it cemented.",
+    "trainer": "Donavan",
+    "visit_count": 1,
+    "verdict_headline": "Two solid weeks",
+    "board_train_session_content": {
+      "check_in_date": "2026-03-01T16:00:00.000Z",
+      "check_out_date": "2026-03-15T11:00:00.000Z",
+      "nights": 14,
+      "summary": "Engagement → cues → leash → distractions. Foundation built.",
+      "days": [
+        {
+          "date": "2026-03-01T16:00:00.000Z",
+          "label": "Day 1 · Arrival",
+          "activities": ["Intake walk", "Crate intro", "Quiet evening"],
+          "sleep_note": "Settled by 10 PM.",
+          "trainer_note": "Easy intake. Reads routine quickly."
+        }
+      ]
+    }
+  },
+  {
+    "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5",
+    "dog_id": "33333333-3333-4333-8333-333333333331",
+    "date": "2026-03-01T20:00:00.000Z",
+    "category": "group-class",
+    "program": "group-class-session",
+    "excerpt": "4-week Group Manners 1 cohort — solid recall + place + leash review.",
+    "full_text": "Group Manners 1 ran over four Saturdays. Below is the recap from each week with handouts, practice items, and the concepts we covered.",
+    "trainer": "Rachel",
+    "visit_count": 1,
+    "verdict_headline": "Cohort complete",
+    "group_class_session_content": {
+      "class_name": "Group Manners 1",
+      "cohort_label": "Spring '26 cohort",
+      "week_count": 4,
+      "weeks": [
+        {
+          "week_number": 1,
+          "date": "2026-02-08T20:00:00.000Z",
+          "title": "Foundations: engagement + name recognition",
+          "location": "In house",
+          "intro": "Welcome to Group Manners 1.",
+          "topics": [
+            { "label": "Engagement", "isLinked": true },
+            { "label": "Name recognition", "description": "Build the muscle of looking at you." }
+          ],
+          "practice_items": ["Daily engagement drills", "Name game at meals"],
+          "closing_note": "Great first week."
+        }
+      ]
+    }
+  }
+]

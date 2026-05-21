@@ -21,6 +21,7 @@ import {
   pendingRequestDogs,
   pendingRequestPreferredDates,
   pendingRequests,
+  reports,
   requiredVaccines,
   serviceRates,
   staff,
@@ -111,6 +112,23 @@ export const FIXTURE_IDS = {
   classPrereqMannersOptionId: '00000000-0000-4000-8000-000000000001',
   cohortPuppyId: 'ffffffff-ffff-4fff-8fff-fffffffffff1',
   cohortMannersId: 'ffffffff-ffff-4fff-8fff-fffffffffff2',
+  // Day-6b: reports. `e` nibble is the report id-space.
+  //   foundation = Waffles' curriculum-day report (full envelope, all 4
+  //     curriculum keys), Donavan as trainer.
+  //   privateLesson = Waffles' private-lesson with `private_lesson_content`
+  //     variant doc + sparse curriculum envelope (only practice_at_home),
+  //     Rachel as trainer.
+  //   boarding = Lola's `boarding_session_content` variant doc, NO
+  //     trainer (day-care/boarding default), NO curriculum envelope,
+  //     NO visit_count, NO verdict_headline (the all-omit branch).
+  reportFoundationId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1',
+  reportPrivateLessonId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2',
+  reportBoardingId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee3',
+  // Day-6b score-push (2026-05-20): add coverage for the remaining 2
+  // variant programs so the R2 variant-key emission is runtime-tested
+  // (not just compile-time exhaustive via the helper switch).
+  reportBoardTrainId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee4',
+  reportGroupClassId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5',
 } as const;
 
 /**
@@ -778,6 +796,190 @@ export async function seedFixture(): Promise<void> {
       weeks: 4,
       capacity: 8,
       filled: 2,
+    },
+  ]);
+
+  // Day-6b: reports. Three rows covering R2 rehydration:
+  //   foundation — Waffles, curriculum program, `results` envelope holds
+  //     all FOUR sibling curriculum keys (skills grid `results` + practice
+  //     + friends + additional_skills_completed). `content` NULL per the
+  //     CHECK constraint (curriculum programs carry no variant doc).
+  //   private-lesson — Waffles, variant program. `content` holds the
+  //     `private_lesson_content` doc; `results` envelope holds only
+  //     `practice_at_home` (variant rows often carry sparse curriculum).
+  //     Exercises the optional-omit branch on individual envelope keys.
+  //   boarding-session — Lola, variant program. `content` holds the
+  //     `boarding_session_content` doc; `results` NULL (no curriculum
+  //     data at all). NULL trainer (day-care/boarding default — no
+  //     trainer name on the wire). visit_count + verdict_headline NULL
+  //     (exercises the both-omit branch).
+  await db.insert(reports).values([
+    {
+      id: FIXTURE_IDS.reportFoundationId,
+      dogId: FIXTURE_IDS.dog1Id,
+      // 2026-05-08 13:00 UTC = 08:00 CDT (mid-May, DST active).
+      date: '2026-05-08T13:00:00Z',
+      trainerStaffId: FIXTURE_IDS.staffDonavanId,
+      category: 'day-school',
+      program: 'foundation',
+      excerpt: 'Waffles had a great session — really locked in her sit-stay today up to 15 feet.',
+      fullText:
+        'Waffles came in with a ton of energy today but channeled it really well once we got into structured work. We focused on duration and distance with her sit-stay.',
+      visitCount: 8,
+      verdictHeadline: 'Great Start!',
+      results: {
+        results: {
+          'sit.l1': { status: 'pass' },
+          'sit.l2': { status: 'pass', score: '4/5' },
+          'down.l1': { status: 'learning', score: '3/5' },
+        },
+        practice_at_home: [
+          { text: 'Build *Down duration* — start with 3 seconds, work up to 15.' },
+          { text: 'Practice *Place* on her cot in the kitchen during dinner prep.' },
+        ],
+        friends_today: [FIXTURE_IDS.dog2Id],
+        additional_skills_completed: ['name-recognition'],
+      },
+      content: null,
+    },
+    {
+      id: FIXTURE_IDS.reportPrivateLessonId,
+      dogId: FIXTURE_IDS.dog1Id,
+      date: '2026-04-25T20:00:00Z',
+      trainerStaffId: FIXTURE_IDS.staffRachelId,
+      category: 'private-lesson',
+      program: 'private-lesson',
+      excerpt: 'Worked through leash protocols, transitions, and managing distractions.',
+      fullText:
+        'Great session today — Waffles is showing real progress on leash, but transitions and unexpected dogs are still her biggest moments.',
+      visitCount: 3,
+      verdictHeadline: 'On the right track',
+      results: {
+        practice_at_home: [
+          { text: 'Run the leash protocol *indoors first*, every day, before you head out.' },
+          { text: "Drill *up-down* anywhere — even when she's calm." },
+        ],
+      },
+      content: {
+        session_focus: 'Leash skills + transitions + managing distractions',
+        topics: [
+          {
+            id: 'leash',
+            title: 'Leash',
+            sections: [
+              {
+                kind: 'steps',
+                items: [
+                  'Start her inside before the walk — pay for standing beside you.',
+                  'Once outside, claim the space in front of the house.',
+                ],
+              },
+              {
+                kind: 'note',
+                text: 'Transitions are tough for her — going around corners and into new areas.',
+              },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      id: FIXTURE_IDS.reportBoardingId,
+      dogId: FIXTURE_IDS.dog2Id,
+      date: '2026-04-12T20:00:00Z',
+      trainerStaffId: null,
+      category: 'boarding',
+      program: 'boarding-session',
+      excerpt: '3-night stay — settled fast, slept through by night 2.',
+      fullText:
+        'Lola had a wonderful three nights with us. She settled in faster than most dogs do — sleeping through the night by the second day.',
+      visitCount: null,
+      verdictHeadline: null,
+      results: null,
+      content: {
+        check_in_date: '2026-04-12T16:00:00.000Z',
+        check_out_date: '2026-04-15T11:00:00.000Z',
+        nights: 3,
+        summary: 'Settled in quickly. Slept through by night 2.',
+        days: [
+          {
+            date: '2026-04-12T16:00:00.000Z',
+            label: 'Day 1 · Arrival',
+            activities: ['Check-in at 4 PM', 'Yard time with Brodie'],
+            sleep_note: 'Slept through after dinner.',
+          },
+        ],
+      },
+    },
+    {
+      // board-train-session variant — exercises board_train_session_content
+      // wire key. Reuses the boarding-day-journal content shape (same as
+      // boarding) per the FE's `to*Content` translators.
+      id: FIXTURE_IDS.reportBoardTrainId,
+      dogId: FIXTURE_IDS.dog1Id,
+      date: '2026-03-15T20:00:00Z',
+      trainerStaffId: FIXTURE_IDS.staffDonavanId,
+      category: 'board-and-train',
+      program: 'board-train-session',
+      excerpt: '2-week foundations residential — solid cue set + leash skills.',
+      fullText:
+        'Two-week board & train. We built engagement, then the core cues (sit, down, place, stay), then leash skills. Reliable cue set by handoff; daily reps from you keep it cemented.',
+      visitCount: 1,
+      verdictHeadline: 'Two solid weeks',
+      results: null,
+      content: {
+        check_in_date: '2026-03-01T16:00:00.000Z',
+        check_out_date: '2026-03-15T11:00:00.000Z',
+        nights: 14,
+        summary: 'Engagement → cues → leash → distractions. Foundation built.',
+        days: [
+          {
+            date: '2026-03-01T16:00:00.000Z',
+            label: 'Day 1 · Arrival',
+            activities: ['Intake walk', 'Crate intro', 'Quiet evening'],
+            sleep_note: 'Settled by 10 PM.',
+            trainer_note: 'Easy intake. Reads routine quickly.',
+          },
+        ],
+      },
+    },
+    {
+      // group-class-session variant — exercises group_class_session_content
+      // wire key. Distinct content shape (class_name + cohort_label +
+      // week_count + weeks[]); each week has its own topics array of
+      // {label, description?, isLinked?} entries.
+      id: FIXTURE_IDS.reportGroupClassId,
+      dogId: FIXTURE_IDS.dog1Id,
+      date: '2026-03-01T20:00:00Z',
+      trainerStaffId: FIXTURE_IDS.staffRachelId,
+      category: 'group-class',
+      program: 'group-class-session',
+      excerpt: '4-week Group Manners 1 cohort — solid recall + place + leash review.',
+      fullText:
+        'Group Manners 1 ran over four Saturdays. Below is the recap from each week with handouts, practice items, and the concepts we covered.',
+      visitCount: 1,
+      verdictHeadline: 'Cohort complete',
+      results: null,
+      content: {
+        class_name: 'Group Manners 1',
+        cohort_label: "Spring '26 cohort",
+        week_count: 4,
+        weeks: [
+          {
+            week_number: 1,
+            date: '2026-02-08T20:00:00.000Z',
+            title: 'Foundations: engagement + name recognition',
+            location: 'In house',
+            intro: 'Welcome to Group Manners 1.',
+            topics: [
+              { label: 'Engagement', isLinked: true },
+              { label: 'Name recognition', description: 'Build the muscle of looking at you.' },
+            ],
+            practice_items: ['Daily engagement drills', 'Name game at meals'],
+            closing_note: 'Great first week.',
+          },
+        ],
+      },
     },
   ]);
 

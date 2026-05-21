@@ -1,0 +1,38 @@
+{
+  "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2",
+  "dog_id": "33333333-3333-4333-8333-333333333331",
+  "date": "2026-04-25T20:00:00.000Z",
+  "category": "private-lesson",
+  "program": "private-lesson",
+  "excerpt": "Worked through leash protocols, transitions, and managing distractions.",
+  "full_text": "Great session today — Waffles is showing real progress on leash, but transitions and unexpected dogs are still her biggest moments.",
+  "trainer": "Rachel",
+  "visit_count": 3,
+  "verdict_headline": "On the right track",
+  "practice_at_home": [
+    { "text": "Run the leash protocol *indoors first*, every day, before you head out." },
+    { "text": "Drill *up-down* anywhere — even when she's calm." }
+  ],
+  "private_lesson_content": {
+    "session_focus": "Leash skills + transitions + managing distractions",
+    "topics": [
+      {
+        "id": "leash",
+        "title": "Leash",
+        "sections": [
+          {
+            "kind": "steps",
+            "items": [
+              "Start her inside before the walk — pay for standing beside you.",
+              "Once outside, claim the space in front of the house."
+            ]
+          },
+          {
+            "kind": "note",
+            "text": "Transitions are tough for her — going around corners and into new areas."
+          }
+        ]
+      }
+    ]
+  }
+}

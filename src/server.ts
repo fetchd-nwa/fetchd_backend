@@ -12,6 +12,7 @@ import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
 import { registerRatesRoute } from './routes/rates.js';
+import { registerReportsRoute } from './routes/reports.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerVetsRoute } from './routes/vets.js';
@@ -44,6 +45,7 @@ export function buildApp(): FastifyInstance {
   registerRatesRoute(app); // [auth] — catalog (owner + staff)
   registerRequestsRoute(app); // [auth] — owner-only
   registerGroupClassesRoute(app); // [auth] — catalogs (owner+staff); eligibility owner-only
+  registerReportsRoute(app); // [auth] — owner-only (scoped via dog FK)
 
   return app;
 }

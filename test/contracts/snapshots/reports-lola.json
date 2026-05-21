@@ -1,0 +1,25 @@
+[
+  {
+    "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee3",
+    "dog_id": "33333333-3333-4333-8333-333333333332",
+    "date": "2026-04-12T20:00:00.000Z",
+    "category": "boarding",
+    "program": "boarding-session",
+    "excerpt": "3-night stay — settled fast, slept through by night 2.",
+    "full_text": "Lola had a wonderful three nights with us. She settled in faster than most dogs do — sleeping through the night by the second day.",
+    "boarding_session_content": {
+      "check_in_date": "2026-04-12T16:00:00.000Z",
+      "check_out_date": "2026-04-15T11:00:00.000Z",
+      "nights": 3,
+      "summary": "Settled in quickly. Slept through by night 2.",
+      "days": [
+        {
+          "date": "2026-04-12T16:00:00.000Z",
+          "label": "Day 1 · Arrival",
+          "activities": ["Check-in at 4 PM", "Yard time with Brodie"],
+          "sleep_note": "Slept through after dinner."
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,27 @@
+{
+  "id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee4",
+  "dog_id": "33333333-3333-4333-8333-333333333331",
+  "date": "2026-03-15T20:00:00.000Z",
+  "category": "board-and-train",
+  "program": "board-train-session",
+  "excerpt": "2-week foundations residential — solid cue set + leash skills.",
+  "full_text": "Two-week board & train. We built engagement, then the core cues (sit, down, place, stay), then leash skills. Reliable cue set by handoff; daily reps from you keep it cemented.",
+  "trainer": "Donavan",
+  "visit_count": 1,
+  "verdict_headline": "Two solid weeks",
+  "board_train_session_content": {
+    "check_in_date": "2026-03-01T16:00:00.000Z",
+    "check_out_date": "2026-03-15T11:00:00.000Z",
+    "nights": 14,
+    "summary": "Engagement → cues → leash → distractions. Foundation built.",
+    "days": [
+      {
+        "date": "2026-03-01T16:00:00.000Z",
+        "label": "Day 1 · Arrival",
+        "activities": ["Intake walk", "Crate intro", "Quiet evening"],
+        "sleep_note": "Settled by 10 PM.",
+        "trainer_note": "Easy intake. Reads routine quickly."
+      }
+    ]
+  }
+}
