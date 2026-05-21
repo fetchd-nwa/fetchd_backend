@@ -1,0 +1,11 @@
+[
+  {
+    "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1",
+    "brand": "visa",
+    "last4": "4242",
+    "exp_month": 12,
+    "exp_year": 2030,
+    "cardholder_name": "Allison Fixture",
+    "is_default": true
+  }
+]

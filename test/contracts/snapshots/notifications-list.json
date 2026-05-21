@@ -1,0 +1,52 @@
+{
+  "items": [
+    {
+      "id": "77777777-7777-4777-8777-bbbbbbbbbbb5",
+      "type": "message-received",
+      "title": "New message from Donavan",
+      "body": "Perfect — I have a couple of new tools for that. Bring her flat collar.",
+      "received_at": "2026-05-19T16:00:00.000Z",
+      "is_read": false,
+      "deep_link_path": "/messages/11111111-1111-4111-8111-aaaaaaaaaaa1",
+      "dog_ids": ["33333333-3333-4333-8333-333333333331"],
+      "sender_staff_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+    },
+    {
+      "id": "77777777-7777-4777-8777-bbbbbbbbbbb4",
+      "type": "report-published",
+      "title": "Waffles' new report card is ready",
+      "body": "Great session today — really locked in her sit-stay.",
+      "received_at": "2026-05-19T12:00:00.000Z",
+      "is_read": true,
+      "deep_link_path": "/reports/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",
+      "dog_ids": ["33333333-3333-4333-8333-333333333331"]
+    },
+    {
+      "id": "77777777-7777-4777-8777-bbbbbbbbbbb3",
+      "type": "booking-confirmed",
+      "title": "Private lesson confirmed",
+      "body": "Joint household session with Waffles + Lola — May 26 at 10am.",
+      "received_at": "2026-05-18T15:00:00.000Z",
+      "is_read": true,
+      "deep_link_path": "/bookings/77777777-7777-4777-8777-777777777773",
+      "dog_ids": ["33333333-3333-4333-8333-333333333331", "33333333-3333-4333-8333-333333333332"]
+    },
+    {
+      "id": "77777777-7777-4777-8777-bbbbbbbbbbb2",
+      "type": "announcement",
+      "title": "School closed Memorial Day",
+      "body": "NWA will be closed Monday May 25 for Memorial Day. Normal hours resume Tuesday.",
+      "received_at": "2026-05-17T10:00:00.000Z",
+      "is_read": false
+    },
+    {
+      "id": "77777777-7777-4777-8777-bbbbbbbbbbb1",
+      "type": "booking-cancelled",
+      "title": "Day school cancelled",
+      "body": "Your May 22 day school booking was cancelled.",
+      "received_at": "2026-05-16T09:00:00.000Z",
+      "is_read": true,
+      "deep_link_path": "/bookings/77777777-7777-4777-8777-777777777779"
+    }
+  ]
+}

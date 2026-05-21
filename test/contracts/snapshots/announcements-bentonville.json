@@ -1,0 +1,16 @@
+[
+  {
+    "id": "77777777-7777-4777-8777-ccccccccccc1",
+    "category": "team",
+    "title": "Meet our new trainer Fed",
+    "body": "Fed joins us at Bentonville starting June 1 — sport dog + reactive specialist.",
+    "published_at": "2026-05-15T15:00:00.000Z",
+    "deep_link_path": "/team/fed"
+  },
+  {
+    "id": "77777777-7777-4777-8777-ccccccccccc2",
+    "category": "event",
+    "title": "Yappy Hour @ Bentonville",
+    "published_at": "2026-05-18T17:00:00.000Z"
+  }
+]

@@ -1,0 +1,19 @@
+[
+  {
+    "id": "77777777-7777-4777-8777-bbbbbbbbbbb2",
+    "type": "announcement",
+    "title": "School closed Memorial Day",
+    "body": "NWA will be closed Monday May 25 for Memorial Day. Normal hours resume Tuesday.",
+    "received_at": "2026-05-17T10:00:00.000Z",
+    "is_read": false
+  },
+  {
+    "id": "77777777-7777-4777-8777-bbbbbbbbbbb1",
+    "type": "booking-cancelled",
+    "title": "Day school cancelled",
+    "body": "Your May 22 day school booking was cancelled.",
+    "received_at": "2026-05-16T09:00:00.000Z",
+    "is_read": true,
+    "deep_link_path": "/bookings/77777777-7777-4777-8777-777777777779"
+  }
+]

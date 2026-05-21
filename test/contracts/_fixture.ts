@@ -3,6 +3,7 @@ import { db } from '../../src/db/client.js';
 import {
   agreementDocuments,
   agreementSignatures,
+  announcements,
   bookingDogs,
   bookings,
   classPrereqOptions,
@@ -21,6 +22,8 @@ import {
   events,
   groupClasses,
   messages,
+  notificationDogs,
+  notifications,
   owners,
   paymentMethods,
   pendingRequestDogs,
@@ -170,6 +173,46 @@ export const FIXTURE_IDS = {
   eventYappyHourId: '55555555-5555-4555-8555-aaaaaaaaaaa2',
   eventPastId: '55555555-5555-4555-8555-aaaaaaaaaaa3',
   eventRsvp1Id: '66666666-6666-4666-8666-aaaaaaaaaaa1',
+  // Day-7b: notifications + announcements fixture. Following Day-7a's
+  // "reuse first-octet + unique last-octet" idiom — first-octet `7` (booking
+  // id-space, weakly associated since most notifications are booking-
+  // triggered), last-octet `b`-pattern for notifications and `c`-pattern for
+  // announcements. PK-fresh against bookings (`7...n`), payment-method
+  // (`b...` with first-octet b), and credit-ledger (`c...` with first-
+  // octet c).
+  //
+  // Five notifications cover (DESC by received_at = order returned):
+  //   notif5 (newest) — message-received, UNREAD, sender_staff_id=Donavan,
+  //     deep_link_path, dog_ids=[Waffles]. Exercises sender + read-state.
+  //   notif4 — report-published, READ, deep_link_path, dog_ids=[Waffles].
+  //   notif3 — booking-confirmed, READ, deep_link_path, dog_ids=[Waffles,
+  //     Lola]. Multi-dog denorm branch.
+  //   notif2 — announcement, UNREAD, NO deep_link_path, NO dog_ids, NO
+  //     sender. The all-optional-omitted branch.
+  //   notif1 (oldest) — booking-cancelled, READ, deep_link_path, NO dog_ids.
+  //
+  // Unread count = 2 (notif5, notif2). With limit=3 + cursor pagination
+  // the first page emits notif5/4/3 + next_cursor pointing past notif3,
+  // and the second page emits notif2/1 with no next_cursor.
+  notification1Id: '77777777-7777-4777-8777-bbbbbbbbbbb1',
+  notification2Id: '77777777-7777-4777-8777-bbbbbbbbbbb2',
+  notification3Id: '77777777-7777-4777-8777-bbbbbbbbbbb3',
+  notification4Id: '77777777-7777-4777-8777-bbbbbbbbbbb4',
+  notification5Id: '77777777-7777-4777-8777-bbbbbbbbbbb5',
+  // Three live announcements + one soft-expired. Exercise: pinned-first
+  // ordering, NULL target_location = all-locations match, specific
+  // target_location filter, live() filter on expired row.
+  //   ann1 — pinned, target=NULL (all), category=team, body + deep_link.
+  //   ann2 — not pinned, target='Bentonville, AR', category=event, NO
+  //     body, NO deep_link.
+  //   ann3 — not pinned, target='Fayetteville, AR', category=class, body
+  //     + deep_link.
+  //   annExpired — pinned, target=NULL, expired_at set. Must NOT appear
+  //     in any response.
+  announcement1Id: '77777777-7777-4777-8777-ccccccccccc1',
+  announcement2Id: '77777777-7777-4777-8777-ccccccccccc2',
+  announcement3Id: '77777777-7777-4777-8777-ccccccccccc3',
+  announcementExpiredId: '77777777-7777-4777-8777-ccccccccccc4',
 } as const;
 
 /**
@@ -1257,9 +1300,143 @@ export async function seedFixture(): Promise<void> {
     { rsvpId: FIXTURE_IDS.eventRsvp1Id, dogId: FIXTURE_IDS.dog1Id },
     { rsvpId: FIXTURE_IDS.eventRsvp1Id, dogId: FIXTURE_IDS.dog2Id },
   ]);
+
+  // Day-7b: notifications + notification_dogs. Append-only feed (no
+  // expired_at). Pin received_at timestamps so the snapshot is stable and
+  // the cursor-pagination keyset has deterministic ordering. notif5 is
+  // newest, notif1 is oldest; see FIXTURE_IDS docblock for branch coverage.
+  await db.insert(notifications).values([
+    {
+      id: FIXTURE_IDS.notification5Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      type: 'message-received',
+      title: 'New message from Donavan',
+      body: 'Perfect — I have a couple of new tools for that. Bring her flat collar.',
+      receivedAt: '2026-05-19T16:00:00Z',
+      readAt: null,
+      deepLinkPath: '/messages/' + FIXTURE_IDS.thread1Id,
+      senderStaffId: FIXTURE_IDS.staffDonavanId,
+    },
+    {
+      id: FIXTURE_IDS.notification4Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      type: 'report-published',
+      title: "Waffles' new report card is ready",
+      body: 'Great session today — really locked in her sit-stay.',
+      receivedAt: '2026-05-19T12:00:00Z',
+      readAt: '2026-05-19T12:30:00Z',
+      deepLinkPath: '/reports/' + FIXTURE_IDS.reportFoundationId,
+      senderStaffId: null,
+    },
+    {
+      id: FIXTURE_IDS.notification3Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      type: 'booking-confirmed',
+      title: 'Private lesson confirmed',
+      body: 'Joint household session with Waffles + Lola — May 26 at 10am.',
+      receivedAt: '2026-05-18T15:00:00Z',
+      readAt: '2026-05-18T15:10:00Z',
+      deepLinkPath: '/bookings/' + FIXTURE_IDS.booking3Id,
+      senderStaffId: null,
+    },
+    {
+      id: FIXTURE_IDS.notification2Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      type: 'announcement',
+      title: 'School closed Memorial Day',
+      body: 'NWA will be closed Monday May 25 for Memorial Day. Normal hours resume Tuesday.',
+      receivedAt: '2026-05-17T10:00:00Z',
+      readAt: null,
+      deepLinkPath: null,
+      senderStaffId: null,
+    },
+    {
+      id: FIXTURE_IDS.notification1Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      type: 'booking-cancelled',
+      title: 'Day school cancelled',
+      body: 'Your May 22 day school booking was cancelled.',
+      receivedAt: '2026-05-16T09:00:00Z',
+      readAt: '2026-05-16T09:05:00Z',
+      deepLinkPath: '/bookings/' + FIXTURE_IDS.booking9Id,
+      senderStaffId: null,
+    },
+  ]);
+
+  // notification_dogs M:N (no expired_at). notif3 multi-dog, notif4/5
+  // single-dog (Waffles), notif1/2 none.
+  await db.insert(notificationDogs).values([
+    { notificationId: FIXTURE_IDS.notification5Id, dogId: FIXTURE_IDS.dog1Id },
+    { notificationId: FIXTURE_IDS.notification4Id, dogId: FIXTURE_IDS.dog1Id },
+    { notificationId: FIXTURE_IDS.notification3Id, dogId: FIXTURE_IDS.dog1Id },
+    { notificationId: FIXTURE_IDS.notification3Id, dogId: FIXTURE_IDS.dog2Id },
+  ]);
+
+  // Day-7b: announcements. Three live + one soft-expired. Pinned-first
+  // ordering means ann1 (pinned, oldest published) emits before ann2/ann3
+  // even though ann2 is newer.
+  await db.insert(announcements).values([
+    {
+      id: FIXTURE_IDS.announcement1Id,
+      category: 'team',
+      title: 'Meet our new trainer Fed',
+      body: 'Fed joins us at Bentonville starting June 1 — sport dog + reactive specialist.',
+      publishedAt: '2026-05-15T15:00:00Z',
+      deepLinkPath: '/team/fed',
+      targetLocation: null, // all locations
+      isPinned: true,
+    },
+    {
+      id: FIXTURE_IDS.announcement2Id,
+      category: 'event',
+      title: 'Yappy Hour @ Bentonville',
+      body: null, // optional-omit branch
+      publishedAt: '2026-05-18T17:00:00Z',
+      deepLinkPath: null, // optional-omit branch
+      targetLocation: 'Bentonville, AR',
+      isPinned: false,
+    },
+    {
+      id: FIXTURE_IDS.announcement3Id,
+      category: 'class',
+      title: 'Group Manners 1 starting in June',
+      body: 'Saturdays at 10am, 4 weeks. Fayetteville only.',
+      publishedAt: '2026-05-10T18:00:00Z',
+      deepLinkPath: '/classes/manners-1',
+      targetLocation: 'Fayetteville, AR',
+      isPinned: false,
+    },
+    {
+      id: FIXTURE_IDS.announcementExpiredId,
+      category: 'urgent',
+      title: 'EXPIRED — should not appear',
+      body: 'This announcement was withdrawn; live() filter must skip it.',
+      publishedAt: '2026-05-05T12:00:00Z',
+      deepLinkPath: null,
+      targetLocation: null,
+      isPinned: true,
+      expiredAt: '2026-05-12T12:00:00Z',
+    },
+  ]);
 }
 
 export async function teardownFixture(): Promise<void> {
+  // Day-7b: notifications + announcements. notification_dogs cascades on
+  // notifications delete (ON DELETE CASCADE FK). notifications cascades on
+  // owners delete (also CASCADE) but we drop by owner_id explicitly so the
+  // teardown is order-independent of when owners is deleted below.
+  // Announcements are NOT owner-scoped — delete by id list.
+  await db.delete(notifications).where(eq(notifications.ownerId, FIXTURE_IDS.ownerId));
+  await db
+    .delete(announcements)
+    .where(
+      inArray(announcements.id, [
+        FIXTURE_IDS.announcement1Id,
+        FIXTURE_IDS.announcement2Id,
+        FIXTURE_IDS.announcement3Id,
+        FIXTURE_IDS.announcementExpiredId,
+      ]),
+    );
   // FK order matters: bookings reference dogs/owner/staff (RESTRICT on owner),
   // booking_dogs cascades on booking delete; payment_methods restricts owner
   // delete; signatures restrict owner + agreement_documents. dogs is first

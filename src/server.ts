@@ -3,6 +3,7 @@ import { env } from './env.js';
 import { registerAuth } from './auth/plugin.js';
 import { registerAuthWebhook } from './routes/authWebhook.js';
 import { registerAgreementsRoute } from './routes/agreements.js';
+import { registerAnnouncementsRoute } from './routes/announcements.js';
 import { registerAvailabilityRoute } from './routes/availability.js';
 import { registerBookingsRoute } from './routes/bookings.js';
 import { registerCreditPackagesRoute } from './routes/creditPackages.js';
@@ -12,6 +13,8 @@ import { registerEventsRoute } from './routes/events.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerMeRoute } from './routes/me.js';
+import { registerNotificationsRoute } from './routes/notifications.js';
+import { registerPaymentMethodsRoute } from './routes/paymentMethods.js';
 import { registerRatesRoute } from './routes/rates.js';
 import { registerReportsRoute } from './routes/reports.js';
 import { registerRequestsRoute } from './routes/requests.js';
@@ -50,6 +53,9 @@ export function buildApp(): FastifyInstance {
   registerReportsRoute(app); // [auth] — owner-only (scoped via dog FK)
   registerThreadsRoute(app); // [auth] — owner-only
   registerEventsRoute(app); // [auth] — catalog reads (owner+staff); rsvps owner-only
+  registerNotificationsRoute(app); // [auth] — owner-only
+  registerAnnouncementsRoute(app); // [auth] — catalog (owner + staff)
+  registerPaymentMethodsRoute(app); // [auth] — owner-only
 
   return app;
 }
