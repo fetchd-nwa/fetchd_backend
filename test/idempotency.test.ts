@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import Fastify from 'fastify';
 import { eq, sql } from 'drizzle-orm';
 import { ApiError } from '../src/lib/errors.js';
@@ -15,7 +15,15 @@ import {
 } from '../src/db/mutation.js';
 import { idempotencyKeys, owners } from '../src/db/schema/schema.js';
 import { withActor } from '../src/db/tx.js';
+import { closeRedis } from '../src/redis.js';
 import { registerMeRoute } from '../src/routes/me.js';
+
+// mutation.ts indirectly opens a redis socket (via lib/cache.ts) so this
+// subprocess's event loop needs an explicit close to drain — see the matching
+// hook in test/contracts/_harness.ts for the contract test files.
+after(async () => {
+  await closeRedis();
+});
 
 // --- hashRequestBody: canonical-JSON SHA so a key reused with the same logical
 // body — even with reordered object keys — collides correctly, but any real

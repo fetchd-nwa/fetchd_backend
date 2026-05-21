@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance, type preHandlerHookHandler } from 'fastify';
 import { registerAuth } from '../../src/auth/plugin.js';
 import type { Principal } from '../../src/auth/principal.js';
+import { closeRedis, redis } from '../../src/redis.js';
 import { FIXTURE_IDS, seedFixture, teardownFixture } from './_fixture.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,15 +58,27 @@ export const SKIP_WHEN_NO_DB: { skip: false | string } = DB_CONFIGURED
  * test runtime tracks the active test by execution stack, not by import
  * site. Each contract test file calls this exactly once at module load.
  *
+ * Day-8 addition: each `seedFixture` flushes the test Redis DB so a
+ * stale cache entry from a prior run can't survive a fixture re-seed
+ * (the FE cache validator catches shape drift, not value drift).
+ * `npm test` points REDIS_URL at DB 1, so this only ever wipes the
+ * test partition.
+ *
  * No-ops when no DB is configured (the tests skip individually).
  */
 export function registerFixtureHooks(): void {
   if (!DB_CONFIGURED) return;
   before(async () => {
+    await redis.flushdb();
     await seedFixture();
   });
   after(async () => {
     await teardownFixture();
+    // Node 25's `--test-isolation=process` default spawns one subprocess
+    // per test file. The ioredis socket keeps THIS subprocess's event
+    // loop alive after the tests finish, so node:test can't exit
+    // cleanly. Closing here is local to this subprocess.
+    await closeRedis();
   });
 }
 

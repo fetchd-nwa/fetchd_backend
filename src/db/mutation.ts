@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { invalidate as invalidateCacheKeys } from '../lib/cache.js';
 import { ApiError } from '../lib/errors.js';
 import { actorOf, type Principal } from '../auth/principal.js';
 import { withIdempotency, type IdempotencyOutcome, type MutationResponse } from './idempotency.js';
@@ -56,7 +57,7 @@ export function hashRequestBody(body: unknown): string {
     .digest('hex');
 }
 
-export interface MutationParams {
+export interface MutationParams<T = unknown> {
   principal: Principal;
   /** Client-supplied `Idempotency-Key` header value. */
   idempotencyKey: string;
@@ -64,6 +65,31 @@ export interface MutationParams {
   endpoint: string;
   /** Hash of the request body — usually `hashRequestBody(parsedBody)`. */
   requestHash: string;
+  /**
+   * Day-8: optional post-commit cache invalidation. Fires **once**, after
+   * the transaction has committed, **only** for new (non-replayed)
+   * outcomes — a replay returned the stored response so the cache state
+   * doesn't need re-invalidating.
+   *
+   * Receives the response body so keys can depend on server-generated
+   * values (a newly-minted booking id, the location the mutation
+   * touched). Returns the list of exact-match cache keys to drop.
+   * For range/pattern wipes (e.g. every `avail:{location}:*` entry on
+   * a `day_capacity` write), call `invalidatePattern` from
+   * `lib/cache.ts` directly in the route — the static-keys callback
+   * here is the load-bearing common case, not the only one.
+   *
+   * Failure mode (Day-8 decision): errors from the callback or from
+   * `cache.invalidate` are **logged and swallowed** — the mutation
+   * already committed honestly, and propagating a 5xx for a
+   * successful write would lie to the client AND leave them stuck
+   * (their retry hits the `replayed` path which skips this callback,
+   * so the cache stays stale either way). The cache self-heals via
+   * TTL; the log line is the operator's signal. Day-20 routes this
+   * through the observability seam so the signal reaches Sentry
+   * rather than just stderr.
+   */
+  keysToInvalidate?: (body: T) => string[] | Promise<string[]>;
 }
 
 /**
@@ -74,6 +100,7 @@ export interface MutationParams {
  *   withActor(actorOf(principal),         // stamps app.actor for audit_capture
  *     withIdempotency(claim,              // dedupes on Idempotency-Key
  *       fn))                              // your business logic
+ *   → on success + !replayed: keysToInvalidate(body) → cache.invalidate(keys)
  *
  * `app.actor` is set first (transaction-locally, Day-2 lock), then the
  * idempotency claim runs on the same connection so the `INSERT INTO
@@ -86,10 +113,10 @@ export interface MutationParams {
  * principals don't fit the FK shape and stay NULL on the owner column.
  */
 export async function withMutation<T>(
-  params: MutationParams,
+  params: MutationParams<T>,
   fn: (tx: Tx) => Promise<MutationResponse<T>>,
 ): Promise<IdempotencyOutcome<T>> {
-  return withActor(actorOf(params.principal), (tx) =>
+  const outcome = await withActor(actorOf(params.principal), (tx) =>
     withIdempotency(
       tx,
       {
@@ -101,4 +128,22 @@ export async function withMutation<T>(
       () => fn(tx),
     ),
   );
+
+  if (!outcome.replayed && params.keysToInvalidate !== undefined) {
+    try {
+      const keys = await params.keysToInvalidate(outcome.body);
+      await invalidateCacheKeys(keys);
+    } catch (err) {
+      // Mutation already committed — we do NOT propagate. See the
+      // `keysToInvalidate` doc on MutationParams for the full rationale.
+      // The log line is the only signal an operator gets until Day-20
+      // wires the observability seam; keep it loud + contextual.
+      process.stderr.write(
+        `[withMutation] post-commit invalidate failed for ${params.endpoint} ` +
+          `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+      );
+    }
+  }
+
+  return outcome;
 }

@@ -15,7 +15,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "pretest": "docker compose -f ../docker-compose.yml --profile test up -d db-test --wait",
-    "test": "DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres node --import tsx --test --test-concurrency=1 test/*.test.ts test/contracts/*.test.ts",
+    "test": "DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres REDIS_URL=redis://localhost:6379/1 node --import tsx --test --test-concurrency=1 test/*.test.ts test/contracts/*.test.ts",
     "db:introspect": "drizzle-kit pull && node scripts/fix-introspection.mjs",
     "db:up": "docker compose -f ../docker-compose.yml up -d --wait",
     "db:down": "docker compose -f ../docker-compose.yml down",
