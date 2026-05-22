@@ -6,10 +6,12 @@
  * different user situations with different recovery paths.
  *
  * Started life as `AuthError` in `src/auth/` (Day 2, auth-only). Day 3a
- * added idempotency_* codes; Day 5a added not_found; at that 9th non-auth
- * code the class graduated from "auth thing" to "API thing" and moved to
- * `src/lib/` so non-auth layers (`db/`, `routes/*`) don't have to import
- * across the auth seam to throw a typed error. Behavior unchanged.
+ * added idempotency_* codes; Day 5a added not_found; Day 9b added conflict
+ * (DELETE blocked by referential state — e.g., expiring a vet referenced
+ * by live dogs); at the 9th non-auth code the class graduated from "auth
+ * thing" to "API thing" and moved to `src/lib/` so non-auth layers (`db/`,
+ * `routes/*`) don't have to import across the auth seam to throw a typed
+ * error. Behavior unchanged.
  *
  * Not a frozen-contract shape: there is no error envelope in DATA-CONTRACT
  * yet, so `{ error: { code, message } }` is a Day-2 design choice (same
@@ -22,6 +24,7 @@ export type ApiErrorCode =
   | 'not_found' // resource exists or doesn't, but not visible to this principal
   | 'bad_request' // client sent a malformed/unaccepted request body
   | 'invalid_payload' // signature OK, but the payload is semantically unusable
+  | 'conflict' // request conflicts with current state (e.g. DELETE referenced)
   | 'idempotency_mismatch' // Idempotency-Key reused on a different endpoint+body
   | 'idempotency_inflight' // duplicate Idempotency-Key request still in progress
   | 'ambiguous_principal'; // integrity: uid in BOTH owners and staff
@@ -33,6 +36,7 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   not_found: 404,
   bad_request: 400,
   invalid_payload: 422,
+  conflict: 409,
   idempotency_mismatch: 422,
   idempotency_inflight: 409,
   ambiguous_principal: 500,
