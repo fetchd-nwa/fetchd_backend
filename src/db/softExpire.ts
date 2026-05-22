@@ -21,9 +21,12 @@ export function live<T extends { expiredAt: AnyColumn }>(table: T): SQL<unknown>
  * Re-link sentinel. Spread into the `set` clause of an `onConflictDoUpdate`
  * to resurrect a previously soft-expired row by clearing `expired_at` —
  * never a second INSERT (`schema.sql` Transaction contract notes, GLOBAL).
- * The provisioning webhook's owner/staff upsert is canonical use #1; the
- * second use lands with the first Day-9 mutation that re-creates something
- * the API soft-expired (vet, dog, payment-method).
+ *
+ * Canonical uses:
+ *   1. Day-2 provisioning webhook — owner/staff upsert by `supabase_uid`.
+ *   2. Day-9d `PUT /dogs/:id/feeding` — 1:1 upsert by `dog_feeding.dog_id`
+ *      (the PK). A previously soft-expired feeding row resurrects in the
+ *      same statement, preserving the row's `created_at` + audit chain.
  *
  *   .onConflictDoUpdate({ target: owners.supabaseUid, set: { ...RELINK, name, phone } })
  *

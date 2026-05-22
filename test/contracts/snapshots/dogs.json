@@ -6,8 +6,18 @@
     "age_months": 36,
     "profile_image_path": "dogs/waffles/waffles-pfp.jpg",
     "vaccines": [
-      { "name": "Bordetella", "expires_at": "2026-08-15" },
-      { "name": "Rabies", "expires_at": "2027-05-19" }
+      {
+        "id": "44444444-4444-4444-8444-444444444442",
+        "name": "Bordetella",
+        "expires_at": "2026-08-15",
+        "requirement_key": "test-bordetella"
+      },
+      {
+        "id": "44444444-4444-4444-8444-444444444441",
+        "name": "Rabies",
+        "expires_at": "2027-05-19",
+        "requirement_key": "test-rabies"
+      }
     ],
     "medications": [
       {
@@ -43,8 +53,18 @@
     "age_months": 84,
     "profile_image_path": "",
     "vaccines": [
-      { "name": "Bordetella", "expires_at": "2026-08-15" },
-      { "name": "Rabies", "expires_at": "2027-05-19" }
+      {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "name": "Bordetella",
+        "expires_at": "2026-08-15",
+        "requirement_key": "test-bordetella"
+      },
+      {
+        "id": "44444444-4444-4444-8444-444444444443",
+        "name": "Rabies",
+        "expires_at": "2027-05-19",
+        "requirement_key": "test-rabies"
+      }
     ],
     "medications": [],
     "feeding": {

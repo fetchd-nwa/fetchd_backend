@@ -1,9 +1,7 @@
 import type { FastifyInstance } from 'fastify';
-import { asc } from 'drizzle-orm';
-import { db } from '../db/client.js';
-import { requiredVaccines, type serviceCategory } from '../db/schema/schema.js';
 import { resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
-import { live } from '../db/softExpire.js';
+import { requiredVaccinesRepository } from '../db/repositories/requiredVaccinesRepository.js';
+import type { serviceCategory } from '../db/schema/schema.js';
 
 /**
  * `GET /required-vaccines` `[auth]` — the gating-vaccine catalog the FE reads
@@ -15,6 +13,10 @@ import { live } from '../db/softExpire.js';
  * Wire per §C: `{ key, label, gates_categories: ServiceCategory[] }`. Ordered
  * by key for snapshot stability; no pagination (catalog is small — a handful
  * of rows).
+ *
+ * Day-9d: data access moved to `requiredVaccinesRepository.findAllLive`
+ * so this file no longer reads Drizzle directly. The same repo's
+ * `keyIsLive` powers the Day-9d vaccine `requirement_key` FK guard.
  */
 
 type ServiceCategory = (typeof serviceCategory.enumValues)[number];
@@ -35,12 +37,7 @@ export function registerRequiredVaccinesRoute(
     '/required-vaccines',
     { preHandler: [authHook] },
     async (): Promise<RequiredVaccineWire[]> => {
-      const rows = await db
-        .select()
-        .from(requiredVaccines)
-        .where(live(requiredVaccines))
-        .orderBy(asc(requiredVaccines.key));
-
+      const rows = await requiredVaccinesRepository.findAllLive();
       return rows.map((row) => ({
         key: row.key,
         label: row.label,
