@@ -4,6 +4,7 @@ import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { vetsRepository } from '../db/repositories/vetsRepository.js';
 import { ApiError } from '../lib/errors.js';
+import { normalizeOptional } from '../lib/normalize.js';
 import { toVetWire, type VetWire } from '../lib/vetWire.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
@@ -71,14 +72,6 @@ const patchBodySchema = z
   })
   .strict()
   .partial();
-
-/** Empty/whitespace strings collapse to `null` so `toVetWire`'s omit-on-null convention round-trips. */
-function normalizeOptional(value: string | null | undefined): string | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  const trimmed = value.trim();
-  return trimmed.length === 0 ? null : trimmed;
-}
 
 function requireStaff(
   principal: ReturnType<typeof requirePrincipal>,

@@ -107,6 +107,36 @@ async function findByIdForUpdate(id: string, tx: Tx): Promise<Vet | undefined> {
 }
 
 /**
+ * The matching half of `findByIdForUpdate` — `SELECT ... FOR SHARE` on the
+ * live vet row. Day-9c's PATCH /dogs (and POST /dogs when the body sets
+ * `primary_vet_id`) calls this inside the withMutation tx so a concurrent
+ * `DELETE /vets/:id` (which holds `FOR UPDATE` via `findByIdForUpdate`)
+ * blocks the reassign until one of them commits.
+ *
+ * `FOR SHARE` is the read-lock complement to `FOR UPDATE`: multiple
+ * `FOR SHARE` callers can hold the lock simultaneously (so two concurrent
+ * PATCH /dogs reassigning to the same vet don't serialize against each
+ * other), but ANY `FOR UPDATE` request on the same row blocks until
+ * every `FOR SHARE` holder commits. This is exactly the semantic we need:
+ * vet-reassigns coexist freely; a vet-DELETE waits for them, and any
+ * PATCH/POST queued behind a DELETE re-reads after DELETE commits and
+ * sees `live() = false`, falling through the live() filter to undefined
+ * → 422 invalid_payload at the route.
+ *
+ * Lock-acquisition order: vets row first, dogs row second — see the
+ * `findByIdForUpdate` doc for the deadlock-avoidance rationale.
+ */
+async function findByIdForShare(id: string, tx: Tx): Promise<Vet | undefined> {
+  const [row] = await tx
+    .select()
+    .from(vets)
+    .where(and(eq(vets.id, id), live(vets)))
+    .for('share')
+    .limit(1);
+  return row;
+}
+
+/**
  * The §A amendment's API-block guard: a vet may not be soft-expired while
  * any live dog still names it as `primary_vet_id`. Owners must reassign
  * first. Returns `true` if at least one live `dogs.primary_vet_id = $1`
@@ -192,6 +222,7 @@ export const vetsRepository = {
   search,
   findById,
   findByIdForUpdate,
+  findByIdForShare,
   hasLiveDogReferences,
   create,
   update,
