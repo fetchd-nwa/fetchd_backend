@@ -80,7 +80,10 @@ function normalizeOptional(value: string | null | undefined): string | null | un
   return trimmed.length === 0 ? null : trimmed;
 }
 
-function requireStaff(principal: ReturnType<typeof requirePrincipal>, action: string): void {
+function requireStaff(
+  principal: ReturnType<typeof requirePrincipal>,
+  action: 'edit' | 'delete',
+): void {
   if (principal.kind !== 'staff') {
     throw new ApiError('forbidden', `only staff may ${action} vets`);
   }
@@ -120,7 +123,8 @@ export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions =
     }
 
     const values = {
-      name: parsed.data.name.trim(),
+      // Zod's `.trim().min(1)` already produced a non-empty trimmed name.
+      name: parsed.data.name,
       phone: normalizeOptional(parsed.data.phone) ?? null,
       email: normalizeOptional(parsed.data.email) ?? null,
       address: normalizeOptional(parsed.data.address) ?? null,
@@ -162,7 +166,8 @@ export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions =
     }
 
     const set: Parameters<typeof vetsRepository.update>[2] = {};
-    if (parsed.data.name !== undefined) set.name = parsed.data.name.trim();
+    // Zod's `.trim().min(1)` produced a non-empty trimmed name when present.
+    if (parsed.data.name !== undefined) set.name = parsed.data.name;
     if (parsed.data.phone !== undefined) set.phone = normalizeOptional(parsed.data.phone) ?? null;
     if (parsed.data.email !== undefined) set.email = normalizeOptional(parsed.data.email) ?? null;
     if (parsed.data.address !== undefined)
@@ -214,7 +219,11 @@ export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions =
         keysToInvalidate: () => [],
       },
       async (tx) => {
-        const existing = await vetsRepository.findById(parsedParams.data.id, tx);
+        // `FOR UPDATE` on the vet row at the top of the txn — Day-9b's
+        // half of the prophylactic race closure. Day-9c's PATCH/POST
+        // /dogs `FOR SHARE` on the same row to participate; see the
+        // `findByIdForUpdate` doc for the full lock semantics.
+        const existing = await vetsRepository.findByIdForUpdate(parsedParams.data.id, tx);
         if (!existing) {
           throw new ApiError('not_found', 'vet not found');
         }

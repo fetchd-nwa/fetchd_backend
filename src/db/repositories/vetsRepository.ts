@@ -69,6 +69,44 @@ async function findById(id: string, runner: Runner = db): Promise<Vet | undefine
 }
 
 /**
+ * Same row-by-id lookup as `findById` but takes a `FOR UPDATE` row lock —
+ * the half-fix that lets the DELETE transaction race-safely soft-expire a
+ * vet (Day-9b prophylactic; Day-9c's matching `FOR SHARE` on the dogs
+ * side completes the pair).
+ *
+ * Why: under read-committed (Postgres default), the read-then-modify
+ * sequence in the DELETE handler — findById → hasLiveDogReferences →
+ * softExpire — leaves a race window in which a concurrent `PATCH /dogs`
+ * or `POST /dogs` could SET `primary_vet_id` to this vet between the
+ * "no live refs" check and the soft-expire UPDATE, ending with a live
+ * dog → soft-expired vet (violates the §A "API-blocked" guarantee).
+ * `FOR UPDATE` on the vet row at the top of the transaction blocks any
+ * concurrent `FOR SHARE` SELECT on that row, so the matching Day-9c
+ * `PATCH /dogs` and `POST /dogs` handlers (which will `FOR SHARE` the
+ * target vet on the reassign branch) serialize against this DELETE.
+ *
+ * Lock semantics: `FOR UPDATE` is the strongest row lock — blocks both
+ * concurrent FOR UPDATE and FOR SHARE on the same row. Postgres
+ * releases it at the enclosing transaction's commit or rollback. No
+ * deadlock risk on the dogs ↔ vets pair so long as every cross-table
+ * mutation acquires locks in the same order (vets row first, dogs row
+ * second — Day-9c enforces this on the dogs-write side).
+ *
+ * Returns `undefined` for the same reasons `findById` does (not found or
+ * already soft-expired). Returning `undefined` rather than throwing
+ * keeps the not-found mapping at the route layer (one place).
+ */
+async function findByIdForUpdate(id: string, tx: Tx): Promise<Vet | undefined> {
+  const [row] = await tx
+    .select()
+    .from(vets)
+    .where(and(eq(vets.id, id), live(vets)))
+    .for('update')
+    .limit(1);
+  return row;
+}
+
+/**
  * The §A amendment's API-block guard: a vet may not be soft-expired while
  * any live dog still names it as `primary_vet_id`. Owners must reassign
  * first. Returns `true` if at least one live `dogs.primary_vet_id = $1`
@@ -153,6 +191,7 @@ async function softExpire(tx: Tx, id: string): Promise<Vet | undefined> {
 export const vetsRepository = {
   search,
   findById,
+  findByIdForUpdate,
   hasLiveDogReferences,
   create,
   update,

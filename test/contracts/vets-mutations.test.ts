@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { vets } from '../../src/db/schema/schema.js';
+import { vetsRepository } from '../../src/db/repositories/vetsRepository.js';
 import { registerVetsRoute } from '../../src/routes/vets.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -412,3 +413,66 @@ test('DELETE /vets/:id — non-existent id returns 404 not_found', SKIP_WHEN_NO_
   });
   assert.equal(res.statusCode, 404);
 });
+
+/**
+ * Half-fix proof for the documented DELETE-vs-Day-9c-PATCH-/dogs race
+ * (see `vetsRepository.findByIdForUpdate` doc + HANDOFF §4.4). Inside a
+ * transaction that holds `FOR UPDATE` on a vet row, a concurrent
+ * `SELECT ... FOR SHARE NOWAIT` from a second pool connection MUST fail
+ * with Postgres' `55P03` (lock_not_available). That's the lock-semantics
+ * proof the Day-9c PATCH /dogs `FOR SHARE` will rely on to serialize
+ * against a concurrent DELETE.
+ *
+ * Two pool connections: Tx-A is `db.transaction(...)` (reserves one
+ * connection); the inner `db.execute(...)` against the bare `db` pool
+ * grabs a separate connection (Drizzle's `db` is the node-pg pool;
+ * default pool size > 1). The `NOWAIT` clause makes the outer SELECT
+ * fail immediately rather than wait, so the test is deterministic — no
+ * timer races.
+ */
+class TxRollback extends Error {}
+
+test(
+  'vetsRepository.findByIdForUpdate holds FOR UPDATE; concurrent FOR SHARE NOWAIT fails with 55P03',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { id } = await createTestVet({ name: `Lock Test ${randomUUID()}` });
+
+    let lockBlocked = false;
+    let lockErrorCode: string | undefined;
+
+    try {
+      await db.transaction(async (txA) => {
+        await txA.execute(sql`select set_config('app.actor', 'system:lock-test', true)`);
+        const locked = await vetsRepository.findByIdForUpdate(id, txA);
+        assert.ok(locked, 'findByIdForUpdate must return the live vet row');
+
+        // Separate pool connection — db.execute(...) outside the txA
+        // handle grabs a different pg connection from the pool.
+        try {
+          await db.execute(sql`select id from vets where id = ${id} for share nowait`);
+        } catch (err) {
+          lockBlocked = true;
+          lockErrorCode = (err as { code?: string }).code;
+        }
+
+        // Rollback Tx-A — don't leave the vet row write-locked beyond
+        // this test (also avoids any incidental writes).
+        throw new TxRollback();
+      });
+    } catch (err) {
+      if (!(err instanceof TxRollback)) throw err;
+    }
+
+    assert.equal(
+      lockBlocked,
+      true,
+      'concurrent FOR SHARE NOWAIT must fail while FOR UPDATE is held',
+    );
+    assert.equal(
+      lockErrorCode,
+      '55P03',
+      `expected lock_not_available (55P03), got: ${lockErrorCode}`,
+    );
+  },
+);
