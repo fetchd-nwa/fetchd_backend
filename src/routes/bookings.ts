@@ -410,13 +410,12 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                   });
                 }
 
-                const row = await bookingsRepository.findByIdInTx(tx, inserted.id);
-                if (row === undefined) {
-                  throw new Error(`bookings.create: row ${inserted.id} missing after insert`);
-                }
+                // `inserted` IS the BookingRow projection (`bookingsRepository.create`
+                // RETURNING ...BOOKING_PROJECTION). No re-fetch needed — the route
+                // assembles the wire shape directly off the inserted row.
                 wires.push(
                   toBookingWire(
-                    row,
+                    inserted,
                     {
                       lead: parsed.leadDogId,
                       additional: [...parsed.additionalDogIds].sort(),
@@ -643,7 +642,7 @@ function parseDateUtcMs(dateStr: string): number {
 async function insertBookingWithGateMapping(
   tx: Parameters<typeof bookingsRepository.create>[0],
   values: Parameters<typeof bookingsRepository.create>[1],
-): Promise<{ id: string }> {
+): Promise<Awaited<ReturnType<typeof bookingsRepository.create>>> {
   try {
     return await bookingsRepository.create(tx, values);
   } catch (err) {

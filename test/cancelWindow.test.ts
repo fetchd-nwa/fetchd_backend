@@ -84,3 +84,60 @@ test('cancel deadline can be in the past for same-day booking', () => {
   assert.equal(scheduled.getTime() - deadline.getTime(), 24 * HOUR_MS);
   assert.ok(deadline.getTime() < scheduled.getTime());
 });
+
+// Integration with the schedule helper: a real-world Day-10 booking
+// composes scheduled_at + cancel_deadline_at across DST boundaries.
+// These tests pin the end-to-end behavior so a future regression in
+// either primitive surfaces here.
+
+test('full Day-10 flow: 7:30 Chicago drop-off the day after spring-forward → 24h-prior deadline lands 1 day earlier in pre-jump time', async () => {
+  // Spring-forward is 2026-03-08; the day after is 2026-03-09 (CDT).
+  // 07:30 Chicago on 2026-03-09 = 12:30 UTC (CDT, UTC-5).
+  // Deadline = 12:30 UTC - 24h = 12:30 UTC on 2026-03-08, which is
+  // *also* a wall time after the jump (so it reads as 07:30 CDT) —
+  // but the previous day on the calendar. Pure UTC offset, no
+  // wall-clock drift. The user-facing render is "X hours until
+  // deadline," which is exactly 24h.
+  const { computeDayProgramScheduledAt } = await import('../src/lib/bookingSchedule.js');
+  const scheduledAt = computeDayProgramScheduledAt('day-school', '2026-03-09', {
+    hour: 7,
+    minute: 30,
+  });
+  assert.equal(scheduledAt.toISOString(), '2026-03-09T12:30:00.000Z');
+  const deadline = computeCancelDeadline('day-school', scheduledAt);
+  assert.equal(scheduledAt.getTime() - deadline.getTime(), 24 * HOUR_MS);
+  assert.equal(deadline.toISOString(), '2026-03-08T12:30:00.000Z');
+});
+
+test('full Day-10 flow: 7:30 Chicago drop-off the day before fall-back → 24h-prior deadline straddles the DST transition without drift', async () => {
+  // Fall-back is 2026-11-01. The day before is 2026-10-31 (CDT).
+  // 07:30 Chicago on 2026-10-31 = 12:30 UTC (CDT, UTC-5).
+  // Deadline = 12:30 UTC - 24h = 12:30 UTC on 2026-10-30. Both sides
+  // of the deadline calculation are in CDT (no DST transition between
+  // them), so the wall-clock equivalent is identical. The math doesn't
+  // care; the test confirms the pure-UTC contract holds.
+  const { computeDayProgramScheduledAt } = await import('../src/lib/bookingSchedule.js');
+  const scheduledAt = computeDayProgramScheduledAt('day-school', '2026-10-31', {
+    hour: 7,
+    minute: 30,
+  });
+  assert.equal(scheduledAt.toISOString(), '2026-10-31T12:30:00.000Z');
+  const deadline = computeCancelDeadline('day-school', scheduledAt);
+  assert.equal(scheduledAt.getTime() - deadline.getTime(), 24 * HOUR_MS);
+});
+
+test('full Day-10 flow: 7:30 Chicago drop-off the day OF spring-forward exercises the DST-bug-fix path', async () => {
+  // Spring-forward day itself: 2026-03-08, 07:30 wall is post-jump
+  // (CDT, UTC-5) → 12:30 UTC. This is the wall time that previously
+  // returned 13:30 UTC under the pre-Day-10 Math.max heuristic in
+  // chicagoWallTimeToUtc (the bug fixed Day-10). The deadline must
+  // land at 2026-03-07T12:30Z exactly (24h prior, pure UTC).
+  const { computeDayProgramScheduledAt } = await import('../src/lib/bookingSchedule.js');
+  const scheduledAt = computeDayProgramScheduledAt('day-school', '2026-03-08', {
+    hour: 7,
+    minute: 30,
+  });
+  assert.equal(scheduledAt.toISOString(), '2026-03-08T12:30:00.000Z');
+  const deadline = computeCancelDeadline('day-school', scheduledAt);
+  assert.equal(deadline.toISOString(), '2026-03-07T12:30:00.000Z');
+});

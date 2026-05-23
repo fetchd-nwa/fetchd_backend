@@ -154,12 +154,12 @@ export const bookingsRepository = {
    * two writes (the failure modes — partial insert, FK violation between
    * the two — are contained here, not exposed to the route).
    *
-   * Returns the inserted booking row. The route uses `findByIdInTx` to
-   * pull the wire-shape projection after this completes; we don't return
-   * the wire shape directly because the `wireBookings` helper needs the
-   * trainer-name resolution + the joined dog ids it already does for the
-   * read path, and duplicating that here would split the wire-shape
-   * assembly across two files.
+   * Returns the full `BookingRow` projection — the same shape every read
+   * endpoint uses (`BOOKING_PROJECTION`). The route consumes this
+   * directly via `toBookingWire` and skips a second round-trip through
+   * `findByIdInTx`. This is the same projection because the wire-shape
+   * helper is structurally typed on it; the create operation's
+   * return-value IS its read-by-id projection, no drift between the two.
    *
    * Lead-dog invariant: exactly one `is_lead=true` row, matching
    * `bookings.lead_dog_id`. Schema enforces this implicitly via the
@@ -178,7 +178,7 @@ export const bookingsRepository = {
       cancelDeadlineAt: Date;
       additionalDogIds: readonly string[];
     },
-  ): Promise<{ id: string }> {
+  ): Promise<BookingRow> {
     const [bookingRow] = await tx
       .insert(bookings)
       .values({
@@ -193,7 +193,7 @@ export const bookingsRepository = {
         // cohort*/report*/confirmed*/dropoff*/pickup*/cancelled*/source all
         // remain at their schema defaults (NULL / 'app' / false).
       })
-      .returning({ id: bookings.id });
+      .returning(BOOKING_PROJECTION);
     if (!bookingRow) {
       throw new Error('bookingsRepository.create: bookings INSERT returned no row');
     }
@@ -206,22 +206,6 @@ export const bookingsRepository = {
       })),
     ];
     await tx.insert(bookingDogs).values(dogRows);
-    return { id: bookingRow.id };
-  },
-
-  /**
-   * Read a freshly-inserted booking row inside the same transaction —
-   * used by the route to assemble the wire response from the row that
-   * `create` just inserted. Same projection as `findByIdForOwner` minus
-   * the ownership filter (the caller already enforced ownership via the
-   * dog ownership gate on the way in).
-   */
-  async findByIdInTx(tx: Tx, id: string): Promise<BookingRow | undefined> {
-    const rows = await tx
-      .select(BOOKING_PROJECTION)
-      .from(bookings)
-      .where(and(eq(bookings.id, id), live(bookings)))
-      .limit(1);
-    return rows[0];
+    return bookingRow;
   },
 };
