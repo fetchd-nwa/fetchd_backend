@@ -159,6 +159,10 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
         idempotencyKey,
         endpoint: 'PATCH /me',
         requestHash: hashRequestBody(parsed.data),
+        // No `owners:*` cache key exists today (§3 map, lib/cache.ts).
+        // Day-18 may add one when the FE polls /me per session;
+        // wire the wipe here at that time.
+        keysToInvalidate: () => [],
       },
       async (tx) => {
         const [row] = await tx
