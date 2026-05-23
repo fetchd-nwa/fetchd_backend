@@ -4,6 +4,7 @@ import { bookingDogs, bookings } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { BookingStatus, LocationKey } from '../../lib/bookingWire.js';
+import type { Tx } from '../tx.js';
 
 /**
  * Data-access seam for `bookings` + the tightly-coupled `booking_dogs`
@@ -137,5 +138,90 @@ export const bookingsRepository = {
       })
       .from(bookingDogs)
       .where(and(inArray(bookingDogs.bookingId, bookingIds), live(bookingDogs)));
+  },
+
+  // -------------------------------------------------------------------
+  // Day 10 — write path. Tx-only methods compose inside `withMutation`'s
+  // body. The route's request hash + idempotency check happen one level
+  // up (`db/mutation.ts`); this layer trusts its inputs (the route is
+  // the validation boundary) and returns the inserted rows for the wire
+  // assembly step.
+  // -------------------------------------------------------------------
+
+  /**
+   * INSERT one bookings row + the `booking_dogs` rows for lead +
+   * additionals. Single repo call so the route doesn't have to interleave
+   * two writes (the failure modes — partial insert, FK violation between
+   * the two — are contained here, not exposed to the route).
+   *
+   * Returns the inserted booking row. The route uses `findByIdInTx` to
+   * pull the wire-shape projection after this completes; we don't return
+   * the wire shape directly because the `wireBookings` helper needs the
+   * trainer-name resolution + the joined dog ids it already does for the
+   * read path, and duplicating that here would split the wire-shape
+   * assembly across two files.
+   *
+   * Lead-dog invariant: exactly one `is_lead=true` row, matching
+   * `bookings.lead_dog_id`. Schema enforces this implicitly via the
+   * BEFORE-INSERT triggers reading `NEW.lead_dog_id` (the gate triggers
+   * check the lead dog's vaccines/owner's signatures/payment-methods).
+   */
+  async create(
+    tx: Tx,
+    values: {
+      ownerId: string;
+      leadDogId: string;
+      category: ServiceCategory;
+      scheduledAt: Date;
+      location: LocationKey;
+      notes: string | null;
+      cancelDeadlineAt: Date;
+      additionalDogIds: readonly string[];
+    },
+  ): Promise<{ id: string }> {
+    const [bookingRow] = await tx
+      .insert(bookings)
+      .values({
+        ownerId: values.ownerId,
+        leadDogId: values.leadDogId,
+        category: values.category,
+        scheduledAt: values.scheduledAt.toISOString(),
+        location: values.location,
+        notes: values.notes,
+        cancelDeadlineAt: values.cancelDeadlineAt.toISOString(),
+        // status defaults to 'upcoming' (schema), durationMinutes/trainer*/
+        // cohort*/report*/confirmed*/dropoff*/pickup*/cancelled*/source all
+        // remain at their schema defaults (NULL / 'app' / false).
+      })
+      .returning({ id: bookings.id });
+    if (!bookingRow) {
+      throw new Error('bookingsRepository.create: bookings INSERT returned no row');
+    }
+    const dogRows = [
+      { bookingId: bookingRow.id, dogId: values.leadDogId, isLead: true },
+      ...values.additionalDogIds.map((dogId) => ({
+        bookingId: bookingRow.id,
+        dogId,
+        isLead: false,
+      })),
+    ];
+    await tx.insert(bookingDogs).values(dogRows);
+    return { id: bookingRow.id };
+  },
+
+  /**
+   * Read a freshly-inserted booking row inside the same transaction —
+   * used by the route to assemble the wire response from the row that
+   * `create` just inserted. Same projection as `findByIdForOwner` minus
+   * the ownership filter (the caller already enforced ownership via the
+   * dog ownership gate on the way in).
+   */
+  async findByIdInTx(tx: Tx, id: string): Promise<BookingRow | undefined> {
+    const rows = await tx
+      .select(BOOKING_PROJECTION)
+      .from(bookings)
+      .where(and(eq(bookings.id, id), live(bookings)))
+      .limit(1);
+    return rows[0];
   },
 };

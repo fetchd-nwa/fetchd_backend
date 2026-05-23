@@ -1,6 +1,7 @@
 import { and, eq, sql } from 'drizzle-orm';
-import { dogVaccines } from '../schema/schema.js';
+import { dogVaccines, requiredVaccines } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { Tx } from '../tx.js';
 
 /**
@@ -93,9 +94,62 @@ async function softExpire(tx: Tx, vid: string): Promise<DogVaccine | undefined> 
   return row;
 }
 
+/**
+ * Day 10 vaccine-gate pre-check — Tx-only. Returns the list of required
+ * vaccination requirements that gate `category` for which the dog does
+ * NOT have a live, in-date `dog_vaccines` row (i.e., the dog's missing or
+ * expired requirements). Empty array ⇒ the dog has every required
+ * vaccine current for this category.
+ *
+ * Mirrors the DB trigger `assert_vaccines_current` (schema.sql:1200-1229)
+ * — same "live, not soft-expired, `expires_at >= today_ct`" semantic,
+ * same `gates_categories` array filter. Date comparison uses Chicago
+ * calendar today (`(now() AT TIME ZONE 'America/Chicago')::date`),
+ * identical to the trigger so an edge-case vaccine that expires today
+ * is treated the same way by the pre-check and the trigger floor.
+ *
+ * Returns labels + requirement_keys so the route can construct typed
+ * `VaccineGap` entries with deep-link-ready data. One dog at a time —
+ * the route batches across dogs in the booking and aggregates the
+ * resulting gaps.
+ *
+ * Staff-owned dogs are exempt at the trigger level; the route narrows
+ * to owner-owned dogs upstream (parent-dog ownership gate runs first),
+ * so this repo doesn't need to re-check.
+ */
+async function findMissingForCategory(
+  tx: Tx,
+  dogId: string,
+  category: ServiceCategory,
+): Promise<{ requirement_key: string; label: string }[]> {
+  // Live required_vaccines whose gates_categories includes this category
+  // AND for which no live, in-date dog_vaccines row exists on this dog.
+  // Single query via correlated NOT EXISTS, same shape as the trigger.
+  const rows = await tx.execute(sql`
+    SELECT rv.key AS requirement_key, rv.label AS label
+    FROM ${requiredVaccines} rv
+    WHERE rv.expired_at IS NULL
+      AND ${category}::service_category = ANY (rv.gates_categories)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ${dogVaccines} dv
+        WHERE dv.dog_id = ${dogId}
+          AND dv.requirement_key = rv.key
+          AND dv.expired_at IS NULL
+          AND dv.expires_at >= (now() AT TIME ZONE 'America/Chicago')::date
+      )
+    ORDER BY rv.key ASC
+  `);
+  return (rows.rows as { requirement_key: string; label: string }[]).map((r) => ({
+    requirement_key: r.requirement_key,
+    label: r.label,
+  }));
+}
+
 export const dogVaccinesRepository = {
   findByIdForDog,
   create,
   update,
   softExpire,
+  findMissingForCategory,
 };

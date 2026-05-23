@@ -193,7 +193,11 @@ export function registerAuth(app: FastifyInstance): void {
       if (err.status >= 500) {
         request.log.error({ err }, 'auth integrity fault');
       }
-      return reply.code(err.status).send({ error: { code: err.code, message: err.message } });
+      const body =
+        err.details === undefined
+          ? { error: { code: err.code, message: err.message } }
+          : { error: { code: err.code, message: err.message, details: err.details } };
+      return reply.code(err.status).send(body);
     }
     request.log.error({ err }, 'unhandled error');
     const status = typeof err.statusCode === 'number' ? err.statusCode : 500;

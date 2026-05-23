@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { invalidate as invalidateCacheKeys } from '../lib/cache.js';
+import {
+  invalidate as invalidateCacheKeys,
+  invalidatePattern as invalidateCachePattern,
+} from '../lib/cache.js';
 import { ApiError } from '../lib/errors.js';
 import { actorOf, type Principal } from '../auth/principal.js';
 import { withIdempotency, type IdempotencyOutcome, type MutationResponse } from './idempotency.js';
@@ -90,6 +93,26 @@ export interface MutationParams<T = unknown> {
    * rather than just stderr.
    */
   keysToInvalidate?: (body: T) => string[] | Promise<string[]>;
+  /**
+   * Day-10: post-commit Redis pattern wipes (`SCAN ... MATCH glob ...
+   * UNLINK`). Used for range/window caches where a single write affects
+   * many keys — `avail:{location}:*` is the canonical example: a
+   * `bookings` INSERT changes the computed remaining capacity at
+   * `(location, date)`, which invalidates every range cache that spans
+   * that date.
+   *
+   * Same lifecycle as `keysToInvalidate`: post-commit, non-replay
+   * outcomes only, errors logged + swallowed. Patterns are passed to
+   * `invalidatePattern` from `lib/cache.ts` — a `SCAN` + batched
+   * `UNLINK`, never `KEYS` (which blocks Redis).
+   *
+   * Callers should anchor patterns with an entity prefix
+   * (`avail:fayetteville:*`, NOT `*`) — a global wildcard would drop
+   * the wrong namespace. The cache module enforces this only by
+   * convention; the §3 map in `lib/cache.ts` is the documentation-as-
+   * contract.
+   */
+  patternsToInvalidate?: (body: T) => string[] | Promise<string[]>;
 }
 
 /**
@@ -129,19 +152,38 @@ export async function withMutation<T>(
     ),
   );
 
-  if (!outcome.replayed && params.keysToInvalidate !== undefined) {
-    try {
-      const keys = await params.keysToInvalidate(outcome.body);
-      await invalidateCacheKeys(keys);
-    } catch (err) {
-      // Mutation already committed — we do NOT propagate. See the
-      // `keysToInvalidate` doc on MutationParams for the full rationale.
-      // The log line is the only signal an operator gets until Day-20
-      // wires the observability seam; keep it loud + contextual.
-      process.stderr.write(
-        `[withMutation] post-commit invalidate failed for ${params.endpoint} ` +
-          `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
-      );
+  if (!outcome.replayed) {
+    if (params.keysToInvalidate !== undefined) {
+      try {
+        const keys = await params.keysToInvalidate(outcome.body);
+        await invalidateCacheKeys(keys);
+      } catch (err) {
+        // Mutation already committed — we do NOT propagate. See the
+        // `keysToInvalidate` doc on MutationParams for the full rationale.
+        // The log line is the only signal an operator gets until Day-20
+        // wires the observability seam; keep it loud + contextual.
+        process.stderr.write(
+          `[withMutation] post-commit invalidate failed for ${params.endpoint} ` +
+            `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+        );
+      }
+    }
+    if (params.patternsToInvalidate !== undefined) {
+      try {
+        const patterns = await params.patternsToInvalidate(outcome.body);
+        for (const pattern of patterns) {
+          await invalidateCachePattern(pattern);
+        }
+      } catch (err) {
+        // Same swallow-and-log semantic as exact-key invalidation. Pattern
+        // wipes are an additional cleanup pass — the mutation committed
+        // either way, and the SCAN-based wipe self-completes on retry
+        // (the cache also self-heals via TTL).
+        process.stderr.write(
+          `[withMutation] post-commit pattern-invalidate failed for ${params.endpoint} ` +
+            `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+        );
+      }
     }
   }
 

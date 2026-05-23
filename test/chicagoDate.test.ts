@@ -80,6 +80,36 @@ test('chicagoWallTimeToUtc: spring-forward day (2026-03-08), wall time AFTER the
   assert.equal(utc.toISOString(), '2026-03-08T22:30:00.000Z');
 });
 
+test('chicagoWallTimeToUtc: spring-forward day, 07:30 wall (day-program drop-off window) → CDT', () => {
+  // Day 10 regression lock: a Day-10-era version of this fn returned 13:30
+  // UTC for 07:30 on spring-forward day — the naive UTC interpretation
+  // (07:30Z = 01:30 CST, pre-jump) seeded a pre-transition probe that the
+  // old Math.max heuristic preferred over the correct post-transition
+  // probe. The day-program drop-off window (07:30-09:00) sits in the
+  // narrow "post-jump wall but pre-jump naive UTC" window from 03:00 to
+  // 07:59 wall — bookings on spring-forward morning would land an hour
+  // late under the old code. Fixed-point iteration converges correctly.
+  const utc = chicagoWallTimeToUtc('2026-03-08', 7, 30);
+  assert.equal(utc.toISOString(), '2026-03-08T12:30:00.000Z');
+  // Same wall time on the day BEFORE spring-forward → CST applies.
+  const utcDayBefore = chicagoWallTimeToUtc('2026-03-07', 7, 30);
+  assert.equal(utcDayBefore.toISOString(), '2026-03-07T13:30:00.000Z');
+  // Same wall time on the day AFTER spring-forward → CDT applies.
+  const utcDayAfter = chicagoWallTimeToUtc('2026-03-09', 7, 30);
+  assert.equal(utcDayAfter.toISOString(), '2026-03-09T12:30:00.000Z');
+});
+
+test('chicagoWallTimeToUtc: spring-forward day, every wall time in 03:00-08:00 resolves to CDT', () => {
+  // Sweep the "bad window" hour by hour to confirm fixed-point iteration
+  // never silently shifts a post-jump wall into pre-jump UTC.
+  for (let h = 3; h <= 8; h += 1) {
+    const utc = chicagoWallTimeToUtc('2026-03-08', h, 0);
+    // CDT (UTC-5): wall + 5 hours = UTC. (Equivalent: ISO hour should be wall + 5.)
+    const isoHour = utc.toISOString().slice(11, 13);
+    assert.equal(isoHour, String(h + 5).padStart(2, '0'), `wall=${h}:00 should land in CDT`);
+  }
+});
+
 test('chicagoWallTimeToUtc: fall-back day (2026-11-01), wall time AFTER the unfold uses CST', () => {
   // 17:30 Chicago on November 1 is well past the 1am→1am repeat → CST (UTC-6).
   const utc = chicagoWallTimeToUtc('2026-11-01', 17, 30);

@@ -1,7 +1,8 @@
-import { and, asc, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { paymentMethods } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import type { Tx } from '../tx.js';
 
 /**
  * Data-access seam for `payment_methods`. Day-7b read-only addition; Day-9
@@ -48,5 +49,28 @@ export const paymentMethodsRepository = {
       .from(paymentMethods)
       .where(and(eq(paymentMethods.ownerId, ownerId), live(paymentMethods)))
       .orderBy(desc(paymentMethods.isDefault), asc(paymentMethods.createdAt));
+  },
+
+  /**
+   * Day 10 payment-gate pre-check — Tx-only. `true` iff the owner has at
+   * least one live `payment_methods` row. The BEFORE-INSERT trigger
+   * `bookings_payment_guarantee` (schema.sql:1184) is the unbypassable
+   * floor; this pre-check exists so the typical "no card on file" path
+   * surfaces a friendly `payment_required` 422 from the route layer
+   * instead of a generic check_violation 422 mapped by the trigger
+   * fallback in `gateTriggerErrorToApiError`. Same exists-only semantic;
+   * route maps the negative case to `paymentRequiredError()`.
+   *
+   * Same-tx visibility: a payment method added in the current
+   * transaction is visible to this read (`SELECT 1 EXISTS` inside the
+   * tx scope). Idempotent — repeat calls return the same answer.
+   */
+  async hasLiveForOwner(tx: Tx, ownerId: string): Promise<boolean> {
+    const [row] = await tx
+      .select({ one: sql<number>`1`.as('one') })
+      .from(paymentMethods)
+      .where(and(eq(paymentMethods.ownerId, ownerId), live(paymentMethods)))
+      .limit(1);
+    return row !== undefined;
   },
 };

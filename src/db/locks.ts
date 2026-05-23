@@ -74,8 +74,14 @@ export async function lockCohort(
  * `undefined` if no override row exists for `(location, date)` — the
  * schema's design is that day_capacity is SPARSE (rows are overrides),
  * with a per-location default rule the API applies when no row is present.
- * Materializing the default-rule row before locking is the caller's job
- * (Day-10 bookSession concern), not this primitive's.
+ *
+ * Day 10 superseded primitive: the day-program booking path uses
+ * `withCapacityLock` + `dayCapacityRepository.assertCapacityWithinLock`
+ * instead (advisory lock + count-against-default), which serializes
+ * cleanly without materializing default-rule rows in the sparse table.
+ * `lockDayCapacity` stays available for callers that genuinely want the
+ * row-lock semantic (e.g., Day-19 staff-portal override edits where the
+ * row's *existence* IS the lock target).
  */
 export async function lockDayCapacity(
   tx: Tx,
@@ -88,4 +94,103 @@ export async function lockDayCapacity(
     .where(and(eq(dayCapacity.location, location), eq(dayCapacity.date, date)))
     .for('update');
   return row;
+}
+
+/**
+ * Day 10 capacity serializer — advisory lock on `(location, date)` for the
+ * day-program booking path. Held for the lifetime of the transaction;
+ * concurrent `bookSession` calls touching the same calendar bucket serialize
+ * cleanly without forcing the sparse `day_capacity` table to materialize
+ * default-rule rows.
+ *
+ * Why advisory over row-lock for THIS path:
+ * - `day_capacity` is SPARSE (only overrides). Locking via FOR UPDATE
+ *   requires the row to exist; materializing a default-value row on every
+ *   booked date breaks the "rows = overrides" invariant the read side
+ *   relies on (a `day_capacity` row stops being an unambiguous override
+ *   signal once we start writing default-value rows alongside).
+ * - The advisory lock doesn't care whether a row exists. The capacity
+ *   computation reads the override row OR falls back to the default rule
+ *   under the same lock — symmetric with the read-side
+ *   `defaultDayCapacity` fallback.
+ * - The Day-19 staff portal will write `day_capacity` overrides; it
+ *   should ALSO acquire this advisory lock so a concurrent booking
+ *   assertion sees the staff write atomically. Documented at the call
+ *   site when Day-19 lands.
+ *
+ * Lock key: `hashtext('capacity:<location>:<date>')`. The colon separator
+ * makes "no two different (location, date) pairs collide" structurally
+ * obvious; the prefix keeps this key namespace disjoint from the
+ * `<dogId>:<mode>` advisory locks elsewhere in the file. int4 hash
+ * collisions are birthday-paradox-bounded and only cause spurious
+ * serialization (never incorrect behavior).
+ *
+ * Day-10 lock ordering protocol (deadlock avoidance): when a single
+ * transaction acquires multiple capacity locks (multi-date booking),
+ * caller MUST acquire them in ASC date order. Combined with
+ * `withDogModeLocks`'s ASC dogId-ascending ordering, two concurrent
+ * multi-key bookings can never deadlock — both observe the same
+ * total acquisition order.
+ */
+export async function withCapacityLock<T>(
+  tx: Tx,
+  location: LocationKey,
+  date: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`capacity:${location}:${date}`}))`);
+  return fn();
+}
+
+/**
+ * Day 10 batch helper for the multi-date `bookSession` path. Acquires
+ * `withCapacityLock` for every `(location, date)` pair in canonical ASC
+ * date order so two concurrent N-date bookings on overlapping date sets
+ * can never deadlock against each other — both observe the same total
+ * acquisition order. Single-date is a no-overhead degenerate of this
+ * helper (one lock acquired).
+ */
+export async function withCapacityLocks<T>(
+  tx: Tx,
+  location: LocationKey,
+  dates: readonly string[],
+  fn: () => Promise<T>,
+): Promise<T> {
+  const sortedDates = [...dates].sort();
+  for (const date of sortedDates) {
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtext(${`capacity:${location}:${date}`}))`,
+    );
+  }
+  return fn();
+}
+
+/**
+ * Day 10 batch helper for the multi-dog `bookSession` path. Acquires
+ * `withDogModeLock` for every `(dogId, mode)` pair in canonical ASC dogId
+ * order so two concurrent N-dog bookings on overlapping dog sets can
+ * never deadlock — both observe the same total acquisition order.
+ *
+ * Single-mode (every booking_dog shares the same mode in a given booking
+ * — day-school is 'school' for all dogs, day-care is 'daycare' for all):
+ * the per-pair locks all share `mode`, but the key still uses
+ * `<dogId>:<mode>` so a future mixed-mode booking shape (none planned)
+ * wouldn't deadlock against a current single-mode one.
+ *
+ * Acquisition is sequential — postgres holds advisory locks until the
+ * transaction commits, and the lock-acquire round-trips are cheap
+ * (one statement each). Parallelizing would risk deadlock against a
+ * concurrent transaction acquiring the same dogs in a different order.
+ */
+export async function withDogModeLocks<T>(
+  tx: Tx,
+  dogIds: readonly string[],
+  mode: BookingMode,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const sortedIds = [...dogIds].sort();
+  for (const dogId of sortedIds) {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}`}))`);
+  }
+  return fn();
 }

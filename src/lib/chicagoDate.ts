@@ -119,27 +119,44 @@ function chicagoOffsetMinutesAt(instant: Date): number {
  *   chicagoWallTimeToUtc('2026-01-15', 17, 30)
  *     → 2026-01-15T23:30:00.000Z  (CST, UTC-6)
  *
- * Implementation: ask "what would this wall clock be in UTC under the
- * pre-transition offset?" and "...under the post-transition offset?".
- * Most days both answers agree (one stable offset all day) and either
- * works. On the two DST-transition days the answers DIFFER:
+ * Implementation: fixed-point iteration over the offset Chicago has at
+ * the candidate UTC instant. Initial guess = offset at the naive
+ * (treat-wall-as-UTC) instant; iterate offset_n+1 = chicagoOffset(wall −
+ * offset_n) until offset converges. Most days converge in one iteration;
+ * spring-forward "well past the gap" wall times (e.g., 07:30 on
+ * 2026-03-08, which sits in the bad window where the naive UTC
+ * interpretation falls pre-jump but the wall clock interpretation falls
+ * post-jump) converge in two iterations.
  *
- *   - **Spring-forward** (e.g., 2026-03-08, 02:00 CST → 03:00 CDT). A
- *     wall time inside the 02:00-03:00 gap doesn't exist. The two
- *     guesses straddle the gap and we pick the LATER UTC, which
- *     interprets as the post-transition wall time (e.g., 02:30 → 03:30
- *     CDT). This matches the IANA / Java / Python `fold=0` convention:
- *     skip the gap forward rather than throw.
+ * Two DST edge cases:
  *
- *   - **Fall-back** (e.g., 2026-11-01, 02:00 CDT → 01:00 CST). The
- *     01:00-02:00 wall hour happens TWICE. Both guesses converge on the
- *     first occurrence (CDT, the earlier UTC instant), again matching
- *     the IANA / Java / Python first-occurrence convention.
+ *   - **Spring-forward gap** (e.g., 2026-03-08, 02:00 CST → 03:00 CDT,
+ *     the 02:00-03:00 wall hour does not exist). The iteration oscillates
+ *     between the pre-transition and post-transition probes; we break out
+ *     after a bounded number of iterations and return the LATER UTC,
+ *     interpreting the missing wall time as the post-transition wall
+ *     (02:30 → 03:30 CDT = 08:30 UTC). Matches IANA / Java / Python
+ *     `fold=0` "skip the gap forward."
  *
- * Day-program windows (07:30, 09:00, 16:30, 17:30) are hours clear of
- * the 2am transition and never hit either edge in practice — but the
- * math is correct regardless, and the edge-case behavior is tested.
+ *   - **Fall-back overlap** (e.g., 2026-11-01, 02:00 CDT → 01:00 CST, the
+ *     01:00-02:00 wall hour happens twice). The initial probe seeds with
+ *     the offset at the naive UTC, which falls in CDT (pre-jump in UTC
+ *     terms); iteration converges to the FIRST occurrence (CDT, the
+ *     earlier UTC instant), matching the IANA / Java / Python
+ *     first-occurrence convention. A future caller that needs the second
+ *     occurrence would need an explicit fold parameter — out of scope.
+ *
+ * Day-10 sensitivity (locked Day 10, 2026-05-22): the day-program
+ * drop-off window (07:30-09:00) is HOURS clear of the 02:00 wall
+ * transition but NOT clear of the 07:00-08:00 UTC transition window —
+ * a fixed two-probe heuristic returns the wrong UTC for the 07:30-07:59
+ * slice of the window on spring-forward day. The iterative form
+ * converges to the correct UTC for every wall time the API constructs;
+ * unit tests exercise every drop-off window endpoint on spring-forward,
+ * fall-back, and stable days.
  */
+const CHICAGO_MAX_OFFSET_ITERS = 3;
+
 export function chicagoWallTimeToUtc(dateStr: string, hour: number, minute: number): Date {
   const parts = dateStr.split('-');
   if (parts.length !== 3) {
@@ -157,16 +174,24 @@ export function chicagoWallTimeToUtc(dateStr: string, hour: number, minute: numb
     throw new Error(`chicagoWallTimeToUtc: invalid date string ${dateStr}`);
   }
   const wallUtcMs = Date.UTC(y, m - 1, d, hour, minute);
-  // Two probes: apply the offset Chicago has at the naive UTC guess (the
-  // "pre-transition" probe), then apply the offset at the result (the
-  // "post-transition" probe). On a normal day both probes land on the
-  // same instant. On a DST day they straddle the transition; `Math.max`
-  // resolves both the spring-forward gap (return post-transition) and
-  // the fall-back overlap (both probes equal the first occurrence) per
-  // the IANA convention documented above.
-  const probe1Offset = chicagoOffsetMinutesAt(new Date(wallUtcMs));
-  const probe1Utc = wallUtcMs - probe1Offset * 60_000;
-  const probe2Offset = chicagoOffsetMinutesAt(new Date(probe1Utc));
-  const probe2Utc = wallUtcMs - probe2Offset * 60_000;
-  return new Date(Math.max(probe1Utc, probe2Utc));
+  // Seed offset = Chicago's offset at the naive UTC instant (treating wall
+  // as UTC). For non-DST days, the first iteration converges. For
+  // post-transition spring-forward wall times in the bad window
+  // (~03:00-07:59 wall), seed offset is the PRE-jump value; one iteration
+  // crosses the transition and converges.
+  let offset = chicagoOffsetMinutesAt(new Date(wallUtcMs));
+  let guessUtcMs = wallUtcMs - offset * 60_000;
+  let lastGuessUtcMs = wallUtcMs; // sentinel — not yet a valid candidate
+  for (let i = 0; i < CHICAGO_MAX_OFFSET_ITERS; i += 1) {
+    const actualOffset = chicagoOffsetMinutesAt(new Date(guessUtcMs));
+    if (actualOffset === offset) return new Date(guessUtcMs);
+    offset = actualOffset;
+    lastGuessUtcMs = guessUtcMs;
+    guessUtcMs = wallUtcMs - offset * 60_000;
+  }
+  // Oscillating — this is the spring-forward gap case where the wall
+  // time doesn't exist. The two attempted guesses straddle the
+  // transition; pick the LATER UTC per IANA fold=0 (skip the gap
+  // forward into the post-transition wall).
+  return new Date(Math.max(guessUtcMs, lastGuessUtcMs));
 }
