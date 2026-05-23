@@ -22,11 +22,16 @@
  * parsing prose. Existing error paths emit no `details` and serialize
  * unchanged — additive on the wire (§A amendment 2026-05-22).
  *
+ * Day 11 (cohort enrollment) adds two more discriminated arms:
+ * `cohort_full` (capacity ceiling reached) and `eligibility_missing`
+ * (R7 server-derived prereq gap). Both 422 — request was syntactically
+ * fine, semantically blocked by current state.
+ *
  * The `details` payload's typed shape lives in `lib/bookingErrors.ts` so
- * the discriminated union can grow (Day 11 cohort capacity, Day 13 cancel
- * window, …) without this file taking on every booking-flow concern. The
- * envelope serializer in `auth/plugin.ts` reads `details` opaquely — same
- * cross-cutting seam, one place to change the wire shape.
+ * the discriminated union can grow (Day 13 cancel window, …) without
+ * this file taking on every booking-flow concern. The envelope serializer
+ * in `auth/plugin.ts` reads `details` opaquely — same cross-cutting seam,
+ * one place to change the wire shape.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -43,7 +48,9 @@ export type ApiErrorCode =
   | 'vaccine_missing' // Day 10: booking blocked — required vaccines missing/expired (per dog)
   | 'agreement_unsigned' // Day 10: booking blocked — required agreements unsigned at current version
   | 'insufficient_credits' // Day 10: booking blocked — per-dog credit balance would go negative
-  | 'insufficient_capacity'; // Day 10: booking blocked — day_capacity for (location,date,mode) exhausted
+  | 'insufficient_capacity' // Day 10: booking blocked — day_capacity for (location,date,mode) exhausted
+  | 'cohort_full' // Day 11: enrollment blocked — cohort.filled + requested > cohort.capacity
+  | 'eligibility_missing'; // Day 11: enrollment blocked — dog(s) missing OR-prereq for cohort's class (R7)
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   unauthenticated: 401,
@@ -63,6 +70,9 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   agreement_unsigned: 422,
   insufficient_credits: 422,
   insufficient_capacity: 422,
+  // Day 11 enrollment gates — same 422 family (state-blocked, not malformed).
+  cohort_full: 422,
+  eligibility_missing: 422,
 };
 
 /**

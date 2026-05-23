@@ -1,5 +1,6 @@
 import { ApiError } from './errors.js';
 import type { BookingMode } from './bookingMode.js';
+import type { GroupClassKey } from '../db/repositories/groupClassesRepository.js';
 import type { locationKey } from '../db/schema/schema.js';
 
 /**
@@ -74,6 +75,35 @@ export interface CapacityGap {
   readonly requested: number;
 }
 
+/**
+ * Day-11 cohort capacity gap — the M:N enrollment counterpart to
+ * `CapacityGap`. Same shape intent (seats remaining vs requested) but
+ * scoped to one cohort row, not a (location, date, mode) bucket. The
+ * cohort row's `filled` is checked against `capacity` under the cohort
+ * row lock (`lockCohort`); this details payload is what surfaces when
+ * the assertion fails. FE branch: "Spring '26 Manners-2 is full —
+ * here are other cohorts to consider."
+ */
+export interface CohortFullDetails {
+  readonly cohort_id: string;
+  readonly capacity: number;
+  readonly filled: number;
+  readonly requested: number;
+}
+
+/**
+ * Day-11 R7 eligibility gap for one dog. The cohort's class has at
+ * least one `class_prereq_options` row (OR-alternatives) and this dog
+ * has not completed ANY of the listed prereqs. `missing_alternatives`
+ * is the list of class keys the dog could complete to unlock this
+ * cohort (e.g., `['manners-1']` for Manners-2). FE branch: link the
+ * dog to the missing class catalog + show prereq path.
+ */
+export interface EligibilityGap {
+  readonly dog_id: string;
+  readonly missing_alternatives: readonly GroupClassKey[];
+}
+
 // ---- Constructors --------------------------------------------------------
 //
 // Throw via these helpers, not via raw `new ApiError(...)` at the gate
@@ -140,6 +170,39 @@ export function insufficientCapacityError(gap: CapacityGap): ApiError {
     `${gap.mode === 'school' ? 'Day School' : 'Day Care'} is full on ${gap.date} at ${gap.location} (${gap.openings_remaining} seat(s) remaining, ${gap.requested} requested).`,
     { kind: 'insufficient_capacity', ...gap },
   );
+}
+
+export function cohortFullError(details: CohortFullDetails): ApiError {
+  const seatsLeft = Math.max(0, details.capacity - details.filled);
+  return new ApiError(
+    'cohort_full',
+    `This cohort is full (${seatsLeft} seat(s) remaining, ${details.requested} requested).`,
+    { kind: 'cohort_full', ...details },
+  );
+}
+
+export function eligibilityMissingError(gaps: readonly EligibilityGap[]): ApiError {
+  if (gaps.length === 0) {
+    // Defensive — callers should only throw this when at least one dog
+    // is missing prereqs. Empty arrays would hide the gate failure.
+    throw new Error('eligibilityMissingError: gaps array must be non-empty');
+  }
+  // The structured `gaps` carry the deep-link data; the prose is a
+  // friendly summary keyed off dog count.
+  const summary =
+    gaps.length === 1
+      ? `1 dog is missing required prerequisites for this class.`
+      : `${gaps.length} dogs are missing required prerequisites for this class.`;
+  return new ApiError('eligibility_missing', summary, {
+    kind: 'eligibility_missing',
+    // Spread + map so the wire shape's `missing_alternatives` is a
+    // plain mutable array (JSON-serializable) rather than the
+    // `readonly` interface view we hold internally.
+    gaps: gaps.map((g) => ({
+      dog_id: g.dog_id,
+      missing_alternatives: [...g.missing_alternatives],
+    })),
+  });
 }
 
 /**

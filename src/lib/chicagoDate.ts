@@ -80,6 +80,45 @@ const CHICAGO_WALL_FORMATTER = new Intl.DateTimeFormat('en-US', {
 });
 
 /**
+ * Read back a UTC instant as Chicago wall parts (calendar date + hour +
+ * minute). The companion to `chicagoWallTimeToUtc` — round-trippable for
+ * the wall times the API constructs:
+ *
+ *   const start = chicagoWallTimeToUtc('2026-06-02', 18, 0);
+ *   chicagoWallPartsAt(start)
+ *     → { date: '2026-06-02', hour: 18, minute: 0 }
+ *
+ * Day-11 cohort cadence: read the cohort's `start_date` (timestamptz) as
+ * Chicago wall parts, advance the calendar date by N×7 days, then convert
+ * back via `chicagoWallTimeToUtc` so each weekly session lands at the
+ * same wall clock even across DST boundaries. A class that meets "every
+ * Tuesday at 6 PM" stays at 6 PM after spring-forward / fall-back.
+ *
+ * Seconds are intentionally not exposed — every wall clock the API
+ * stamps is to the minute. If a future caller needs second resolution
+ * we extend the return type then.
+ */
+export function chicagoWallPartsAt(instant: Date): {
+  date: string;
+  hour: number;
+  minute: number;
+} {
+  const parts = CHICAGO_WALL_FORMATTER.formatToParts(instant);
+  const get = (t: Intl.DateTimeFormatPartTypes): number => {
+    const part = parts.find((p) => p.type === t);
+    if (part === undefined) {
+      throw new Error(`chicagoWallPartsAt: missing ${t} part`);
+    }
+    return Number(part.value);
+  };
+  const year = get('year');
+  const month = get('month');
+  const day = get('day');
+  const date = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return { date, hour: get('hour'), minute: get('minute') };
+}
+
+/**
  * Offset between Chicago wall clock and UTC at a given instant, in minutes.
  * Negative for Chicago (Chicago is behind UTC): -360 in CST (winter),
  * -300 in CDT (summer). Returned as a signed integer.

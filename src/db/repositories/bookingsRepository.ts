@@ -165,6 +165,19 @@ export const bookingsRepository = {
    * `bookings.lead_dog_id`. Schema enforces this implicitly via the
    * BEFORE-INSERT triggers reading `NEW.lead_dog_id` (the gate triggers
    * check the lead dog's vaccines/owner's signatures/payment-methods).
+   *
+   * Day 11 additions:
+   *  - `cohortId` — required when `category === 'group-class'` (schema
+   *    CHECK `(category = 'group-class') = (cohort_id IS NOT NULL)`),
+   *    must be undefined / null for all other categories.
+   *  - `sessionReportId` — the shared per-(cohort, dog) report a future
+   *    Day-19 staff "author report" verb will link back. NULL at
+   *    enrollment time (no report exists yet).
+   *
+   * One primitive serves both paths because the only INSERT difference
+   * is the cohort/session_report columns — extracting a sibling
+   * `createForCohort` would duplicate the gate-trigger surface and the
+   * booking_dogs interleave for no real benefit.
    */
   async create(
     tx: Tx,
@@ -177,6 +190,8 @@ export const bookingsRepository = {
       notes: string | null;
       cancelDeadlineAt: Date;
       additionalDogIds: readonly string[];
+      cohortId?: string | null;
+      sessionReportId?: string | null;
     },
   ): Promise<BookingRow> {
     const [bookingRow] = await tx
@@ -189,8 +204,10 @@ export const bookingsRepository = {
         location: values.location,
         notes: values.notes,
         cancelDeadlineAt: values.cancelDeadlineAt.toISOString(),
+        cohortId: values.cohortId ?? null,
+        sessionReportId: values.sessionReportId ?? null,
         // status defaults to 'upcoming' (schema), durationMinutes/trainer*/
-        // cohort*/report*/confirmed*/dropoff*/pickup*/cancelled*/source all
+        // report_id/confirmed*/dropoff*/pickup*/cancelled*/source all
         // remain at their schema defaults (NULL / 'app' / false).
       })
       .returning(BOOKING_PROJECTION);

@@ -3,6 +3,7 @@ import { db } from '../client.js';
 import { dogCompletedClasses, dogs } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { GroupClassKey } from './groupClassesRepository.js';
+import type { Tx } from '../tx.js';
 
 /**
  * Data-access seam for `dog_completed_classes`. Used by the eligibility
@@ -56,5 +57,22 @@ export const dogCompletedClassesRepository = {
       .limit(1);
     if (dogExists.length === 0) return undefined;
     return [];
+  },
+
+  /**
+   * Day-11 R7-in-txn read. Returns the dog's live completed class keys
+   * directly off the join, no ownership re-check (the route runs
+   * `dogsRepository.findOwnedExists` first as the parent-dog gate, so
+   * by the time we reach this point the dog is known to be owned).
+   * Empty array = dog has no completions yet (caller decides if that
+   * fails the eligibility check based on the cohort's prereq options).
+   */
+  async findCompletedKeysForDogInTx(tx: Tx, dogId: string): Promise<GroupClassKey[]> {
+    const rows = await tx
+      .select({ classKey: dogCompletedClasses.classKey })
+      .from(dogCompletedClasses)
+      .where(and(eq(dogCompletedClasses.dogId, dogId), live(dogCompletedClasses)))
+      .orderBy(asc(dogCompletedClasses.classKey));
+    return rows.map((r) => r.classKey as GroupClassKey);
   },
 };

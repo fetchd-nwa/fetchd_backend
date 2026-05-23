@@ -9,6 +9,7 @@ import { registerBookingsRoute } from './routes/bookings.js';
 import { registerCreditPackagesRoute } from './routes/creditPackages.js';
 import { registerCreditsRoute } from './routes/credits.js';
 import { registerDogsRoute } from './routes/dogs.js';
+import { registerEnrollmentsRoute } from './routes/enrollments.js';
 import { registerEventsRoute } from './routes/events.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
@@ -44,6 +45,7 @@ export function buildApp(): FastifyInstance {
   registerRequiredVaccinesRoute(app); // [auth]
   registerAgreementsRoute(app); // [auth]
   registerBookingsRoute(app); // [auth]
+  registerEnrollmentsRoute(app); // [auth] — group-class enrollment (owner-only)
   registerAvailabilityRoute(app); // [auth] — catalog (owner + staff)
   registerCreditsRoute(app); // [auth] — owner-only (per-dog)
   registerCreditPackagesRoute(app); // [auth] — catalog (owner + staff)

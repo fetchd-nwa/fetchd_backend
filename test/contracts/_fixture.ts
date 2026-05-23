@@ -1471,19 +1471,30 @@ export async function teardownFixture(): Promise<void> {
     );
   await db.delete(eventSeries).where(eq(eventSeries.id, FIXTURE_IDS.eventSeriesPublicPupsId));
   await db.delete(pendingRequests).where(eq(pendingRequests.ownerId, FIXTURE_IDS.ownerId));
+  // Day-11 reordered the cohort/booking chain. The bookings→cohorts FK
+  // (`bookings.cohort_id REFERENCES cohorts(id)`, default NO ACTION) means a
+  // booking with cohort_id set blocks deletion of its cohort. Day-10 and
+  // earlier had zero bookings referencing cohorts so the order didn't matter;
+  // Day-11 enrollment writes bookings.cohort_id, which forces a precise FK
+  // teardown chain: credit_ledger → bookings → cohorts → classPrereqOptions
+  // → groupClasses. (credit_ledger.booking_id references bookings; bookings.
+  // cohort_id references cohorts; classPrereqOptions.class_key and
+  // cohorts.class_key both reference groupClasses.)
   await db
-    .delete(cohorts)
-    .where(inArray(cohorts.id, [FIXTURE_IDS.cohortPuppyId, FIXTURE_IDS.cohortMannersId]));
+    .delete(creditLedger)
+    .where(inArray(creditLedger.dogId, [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]));
+  await db.delete(bookings).where(eq(bookings.ownerId, FIXTURE_IDS.ownerId));
+  // Catch BOTH the fixture-id cohorts AND any per-test cohorts attached to
+  // the test group_classes (Day-11+ enrollment tests insert per-test cohorts
+  // with random UUIDs for isolation; an id-targeted delete here would leave
+  // them dangling and the `groupClasses` delete below would FK-violate).
+  await db.delete(cohorts).where(inArray(cohorts.classKey, ['puppy', 'manners-1', 'manners-2']));
   await db
     .delete(classPrereqOptions)
     .where(eq(classPrereqOptions.id, FIXTURE_IDS.classPrereqMannersOptionId));
   await db
     .delete(groupClasses)
     .where(inArray(groupClasses.key, ['puppy', 'manners-1', 'manners-2']));
-  await db
-    .delete(creditLedger)
-    .where(inArray(creditLedger.dogId, [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]));
-  await db.delete(bookings).where(eq(bookings.ownerId, FIXTURE_IDS.ownerId));
   await db
     .delete(creditPackages)
     .where(
