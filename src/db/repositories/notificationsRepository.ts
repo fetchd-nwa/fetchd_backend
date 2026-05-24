@@ -1,7 +1,12 @@
 import { and, asc, count, desc, eq, inArray, isNull, lt, or } from 'drizzle-orm';
 import { db } from '../client.js';
 import { notificationDogs, notifications } from '../schema/schema.js';
+import type { Tx } from '../tx.js';
 import type { NotificationRowForWire } from '../../lib/notificationWire.js';
+
+type NotificationType = (typeof notifications.$inferInsert)['type'] extends infer T
+  ? T & string
+  : never;
 
 /**
  * Data-access seam for `notifications` (+ `notification_dogs` denorm).
@@ -100,5 +105,63 @@ export const notificationsRepository = {
       .from(notificationDogs)
       .where(inArray(notificationDogs.notificationId, notificationIds))
       .orderBy(asc(notificationDogs.dogId));
+  },
+
+  /**
+   * INSERT a notifications row (+ optional notification_dogs join
+   * rows). Append-only by schema (no `expired_at`); a "delete
+   * notification" verb would set `read_at` or hide it FE-side, never
+   * destroy the row.
+   *
+   * Day 12 added the first write path: the staff approve verb enqueues
+   * a `booking-confirmed` notification when a non-B&T request converts
+   * to a booking. Day 13 (cancel) will enqueue `booking-cancelled`;
+   * Day 16 (worker) will enqueue from `scheduled_notifications`. The
+   * generic body shape (type / title / body / deep_link / dogIds) keeps
+   * the seam open for all of them.
+   *
+   * `senderStaffId` is the staff actor for message-received notifications
+   * (Day-16); leave undefined for booking-flow notifications. `dogIds`
+   * optional — empty/undefined produces no `notification_dogs` rows
+   * (the bell row falls back to its category icon).
+   */
+  async enqueue(
+    tx: Tx,
+    values: {
+      ownerId: string;
+      type: NotificationType;
+      title: string;
+      body: string;
+      deepLinkPath?: string | null;
+      senderStaffId?: string | null;
+      dogIds?: readonly string[];
+    },
+  ): Promise<{ id: string }> {
+    const [row] = await tx
+      .insert(notifications)
+      .values({
+        ownerId: values.ownerId,
+        type: values.type,
+        title: values.title,
+        body: values.body,
+        deepLinkPath: values.deepLinkPath ?? null,
+        senderStaffId: values.senderStaffId ?? null,
+        // receivedAt / createdAt default to now(); readAt remains NULL
+        // (unread sentinel).
+      })
+      .returning({ id: notifications.id });
+    if (!row) {
+      throw new Error('notificationsRepository.enqueue: notifications INSERT returned no row');
+    }
+    const dogIds = values.dogIds ?? [];
+    if (dogIds.length > 0) {
+      await tx.insert(notificationDogs).values(
+        dogIds.map((dogId) => ({
+          notificationId: row.id,
+          dogId,
+        })),
+      );
+    }
+    return row;
   },
 };

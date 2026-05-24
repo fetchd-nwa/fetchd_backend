@@ -3,25 +3,16 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { withCapacityLocks, withDogModeLocks } from '../db/locks.js';
-import { agreementSignaturesRepository } from '../db/repositories/agreementSignaturesRepository.js';
 import { bookingsRepository, type BookingRow } from '../db/repositories/bookingsRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
-import { dogVaccinesRepository } from '../db/repositories/dogVaccinesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
 import { locationKey } from '../db/schema/schema.js';
 import { isInView } from '../lib/bookingBucket.js';
-import {
-  agreementUnsignedError,
-  gateTriggerErrorToApiError,
-  insufficientCreditsError,
-  paymentRequiredError,
-  vaccineMissingError,
-  type CreditGap,
-  type VaccineGap,
-} from '../lib/bookingErrors.js';
+import { insufficientCreditsError, type CreditGap } from '../lib/bookingErrors.js';
+import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
+import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
 import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
 import {
@@ -322,41 +313,15 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           // 2-6. Locks → gates → capacity/insert/debit.
           const bookingsWire = await withDogModeLocks(tx, parsed.allDogIds, parsed.mode, () =>
             withCapacityLocks(tx, parsed.location, parsed.sortedDates, async () => {
-              // Payment gate
-              const hasPayment = await paymentMethodsRepository.hasLiveForOwner(
-                tx,
-                principal.ownerId,
-              );
-              if (!hasPayment) throw paymentRequiredError();
-
-              // Vaccine gate (per-dog, accumulate across all booking_dogs)
-              const vaccineGaps: VaccineGap[] = [];
-              for (const dogId of parsed.allDogIds) {
-                const missing = await dogVaccinesRepository.findMissingForCategory(
-                  tx,
-                  dogId,
-                  parsed.category,
-                );
-                for (const m of missing) {
-                  vaccineGaps.push({
-                    dog_id: dogId,
-                    requirement_key: m.requirement_key,
-                    label: m.label,
-                  });
-                }
-              }
-              if (vaccineGaps.length > 0) throw vaccineMissingError(vaccineGaps);
-
-              // Agreement gate (owner-scoped)
-              const missingAgreements =
-                await agreementSignaturesRepository.findMissingForOwnerCategory(
-                  tx,
-                  principal.ownerId,
-                  parsed.category,
-                );
-              if (missingAgreements.length > 0) {
-                throw agreementUnsignedError(missingAgreements);
-              }
+              // Gates (payment → vaccine → agreement) above the DB
+              // trigger floor. See `lib/bookingGatePreCheck.ts` for the
+              // sequence rationale; first failure aborts with full
+              // structured details for that category.
+              await checkBookingGates(tx, {
+                ownerId: principal.ownerId,
+                dogIds: parsed.allDogIds,
+                category: parsed.category,
+              });
 
               // Credit pre-check — every dog needs >= dates.length credits in `mode`.
               const creditGaps: CreditGap[] = [];
@@ -613,41 +578,4 @@ function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBooking
 function parseDateUtcMs(dateStr: string): number {
   const [y, m, d] = dateStr.split('-').map(Number);
   return Date.UTC(y!, m! - 1, d!);
-}
-
-/**
- * INSERT one booking row + its booking_dogs with the route-layer typed-
- * error mapping for the three gate triggers (defense-in-depth fallback
- * if the route-level pre-check missed a race). Trigger violations are
- * mapped back to typed `ApiError` via `gateTriggerErrorToApiError`; any
- * other error re-throws.
- *
- * The trigger fallback handles three concurrency edge cases the
- * pre-check can't fully eliminate:
- *
- *   - A concurrent vaccine soft-expire (DELETE /dogs/:id/vaccines/:vid)
- *     between the pre-check and the INSERT fires the
- *     `bookings_vaccine_guard` trigger.
- *   - A concurrent payment-method removal (Day-9+ when that endpoint
- *     lands) fires `bookings_payment_guarantee`.
- *   - A concurrent agreement-document version bump (Day-19 portal) fires
- *     `bookings_agreement_guard`.
- *
- * In all three cases the booking row never gets created, and the route
- * surfaces the same typed code the pre-check would have — with the
- * caveat that trigger errors carry less structured detail than
- * pre-check errors (the trigger has only the missing labels in a
- * comma-joined message, not the per-key structured array).
- */
-async function insertBookingWithGateMapping(
-  tx: Parameters<typeof bookingsRepository.create>[0],
-  values: Parameters<typeof bookingsRepository.create>[1],
-): Promise<Awaited<ReturnType<typeof bookingsRepository.create>>> {
-  try {
-    return await bookingsRepository.create(tx, values);
-  } catch (err) {
-    const mapped = gateTriggerErrorToApiError(err);
-    if (mapped !== undefined) throw mapped;
-    throw err;
-  }
 }

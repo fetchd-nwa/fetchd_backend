@@ -3,26 +3,19 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { lockCohort } from '../db/locks.js';
-import { agreementSignaturesRepository } from '../db/repositories/agreementSignaturesRepository.js';
-import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { dogCompletedClassesRepository } from '../db/repositories/dogCompletedClassesRepository.js';
-import { dogVaccinesRepository } from '../db/repositories/dogVaccinesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { groupClassesRepository } from '../db/repositories/groupClassesRepository.js';
-import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import {
-  agreementUnsignedError,
   cohortFullError,
   eligibilityMissingError,
-  gateTriggerErrorToApiError,
-  paymentRequiredError,
-  vaccineMissingError,
   type EligibilityGap,
-  type VaccineGap,
 } from '../lib/bookingErrors.js';
+import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
+import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { computeCohortSessionDates } from '../lib/cohortSchedule.js';
-import { toBookingWire, type BookingWire, type LocationKey } from '../lib/bookingWire.js';
+import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
 import { computeCancelDeadline } from '../lib/cancelWindow.js';
 import { ApiError } from '../lib/errors.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
@@ -200,32 +193,11 @@ export function registerEnrollmentsRoute(
           //    gate is per-dog because each dog will be a lead dog in
           //    its own bookings, and the BEFORE-INSERT trigger checks
           //    NEW.lead_dog_id's vaccines.
-          const hasPayment = await paymentMethodsRepository.hasLiveForOwner(tx, principal.ownerId);
-          if (!hasPayment) throw paymentRequiredError();
-
-          const vaccineGaps: VaccineGap[] = [];
-          for (const dogId of parsed.dogIds) {
-            const missing = await dogVaccinesRepository.findMissingForCategory(
-              tx,
-              dogId,
-              'group-class',
-            );
-            for (const m of missing) {
-              vaccineGaps.push({
-                dog_id: dogId,
-                requirement_key: m.requirement_key,
-                label: m.label,
-              });
-            }
-          }
-          if (vaccineGaps.length > 0) throw vaccineMissingError(vaccineGaps);
-
-          const missingAgreements = await agreementSignaturesRepository.findMissingForOwnerCategory(
-            tx,
-            principal.ownerId,
-            'group-class',
-          );
-          if (missingAgreements.length > 0) throw agreementUnsignedError(missingAgreements);
+          await checkBookingGates(tx, {
+            ownerId: principal.ownerId,
+            dogIds: parsed.dogIds,
+            category: 'group-class',
+          });
 
           // 7. Materialize per-week scheduled_at (DST-preserving Chicago
           //    wall-time cadence). For each (dog × week) pair, INSERT
@@ -243,13 +215,21 @@ export function registerEnrollmentsRoute(
           for (const scheduledAt of sessionDates) {
             const cancelDeadlineAt = computeCancelDeadline('group-class', scheduledAt);
             for (const dogId of sortedDogIds) {
-              const inserted = await insertCohortBookingWithGateMapping(tx, {
+              const inserted = await insertBookingWithGateMapping(tx, {
                 ownerId: principal.ownerId,
                 leadDogId: dogId,
+                category: 'group-class',
                 scheduledAt,
                 location: cohortRow.location,
+                notes: null,
                 cancelDeadlineAt,
+                additionalDogIds: [],
                 cohortId: cohortRow.id,
+                // Day-11: session_report_id is NULL at enrollment time. Day-19
+                // staff portal "author report" verb creates the report row
+                // and links it back to every weekly booking for the (cohort,
+                // dog) via `bookings.session_report_id`.
+                sessionReportId: null,
               });
               insertedWires.push(
                 toBookingWire(
@@ -317,50 +297,4 @@ function validateEnrollmentBody(body: PostEnrollmentBody): ValidatedEnrollmentBo
     cohortId: body.cohort_id,
     dogIds: body.dog_ids,
   };
-}
-
-/**
- * INSERT one cohort booking + its single booking_dogs row with the
- * route-layer typed-error mapping for the three gate triggers
- * (defense-in-depth fallback if the route-level pre-check missed a
- * race). Trigger violations map back to typed `ApiError` via
- * `gateTriggerErrorToApiError`; any other error re-throws.
- *
- * Same shape as `insertBookingWithGateMapping` in `routes/bookings.ts`
- * — rule-of-two for the trigger-fallback wrapper. If Day-12's
- * approvePendingRequest also needs it (it will, for B&T / boarding
- * INSERTs), extract to `lib/bookingInsertWithGateMapping.ts` then.
- */
-async function insertCohortBookingWithGateMapping(
-  tx: Parameters<typeof bookingsRepository.create>[0],
-  values: {
-    ownerId: string;
-    leadDogId: string;
-    scheduledAt: Date;
-    location: LocationKey;
-    cancelDeadlineAt: Date;
-    cohortId: string;
-  },
-): Promise<Awaited<ReturnType<typeof bookingsRepository.create>>> {
-  try {
-    return await bookingsRepository.create(tx, {
-      ownerId: values.ownerId,
-      leadDogId: values.leadDogId,
-      category: 'group-class',
-      scheduledAt: values.scheduledAt,
-      location: values.location,
-      notes: null,
-      cancelDeadlineAt: values.cancelDeadlineAt,
-      additionalDogIds: [],
-      cohortId: values.cohortId,
-      // Day-11: session_report_id is NULL at enrollment time. Day-19
-      // staff portal "author report" verb creates the report row and
-      // links it back to every weekly booking for the (cohort, dog).
-      sessionReportId: null,
-    });
-  } catch (err) {
-    const mapped = gateTriggerErrorToApiError(err);
-    if (mapped !== undefined) throw mapped;
-    throw err;
-  }
 }

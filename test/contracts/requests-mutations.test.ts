@@ -1,0 +1,753 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { test } from 'node:test';
+import { and, eq, inArray } from 'drizzle-orm';
+import { db } from '../../src/db/client.js';
+import {
+  bookings as bookingsTable,
+  bookingDogs as bookingDogsTable,
+  notificationDogs as notificationDogsTable,
+  notifications as notificationsTable,
+  pendingRequestDogs as pendingRequestDogsTable,
+  pendingRequestPreferredDates as pendingRequestPreferredDatesTable,
+  pendingRequests as pendingRequestsTable,
+} from '../../src/db/schema/schema.js';
+import { registerRequestsRoute } from '../../src/routes/requests.js';
+import { registerStaffRequestsRoute } from '../../src/routes/staffRequests.js';
+import type { Principal } from '../../src/auth/principal.js';
+import { FIXTURE_IDS } from './_fixture.js';
+import {
+  FIXTURE_OWNER_PRINCIPAL,
+  FIXTURE_STAFF_PRINCIPAL,
+  SKIP_WHEN_NO_DB,
+  makeContractApp,
+  registerFixtureHooks,
+} from './_harness.js';
+
+/**
+ * Day 12 contract tests for the request-and-approval surface
+ * (DATA-CONTRACT §C.1 Model 3). Covers:
+ *
+ *   - Owner side (`routes/requests.ts`):
+ *     - POST /requests (PL / B&T / boarding bodies)
+ *     - PATCH /requests/:id (preferred_dates / notes / focus / length_weeks)
+ *     - POST /requests/:id/cancel (owner self-withdrawal)
+ *
+ *   - Staff side (`routes/staffRequests.ts` — portal verb 1):
+ *     - POST /staff/requests/:id/approve (PL/boarding → converted + booking
+ *       + notification; B&T → approved-awaiting-payment, no booking yet)
+ *     - POST /staff/requests/:id/deny (staff cancellation, distinguished
+ *       from owner self-cancel by `approved_by_staff_id`)
+ *
+ * Each test creates its own pending_request rows (via direct INSERT or
+ * via the POST endpoint) so cross-test bleed-through is avoided. The
+ * fixture's teardown wipes by owner_id, catching everything by the end
+ * of the file.
+ */
+
+registerFixtureHooks();
+
+// Real "now" is ~2026-05-24 per the system clock; pick preferred_dates
+// safely in the future of any real run (well within the 92-day cap).
+const PREFERRED_1 = '2026-07-15T15:00:00Z';
+const PREFERRED_2 = '2026-07-22T15:00:00Z';
+const PREFERRED_3 = '2026-07-29T15:00:00Z';
+const APPROVE_SCHEDULED_AT = '2026-07-20T15:00:00Z';
+const APPROVE_PICKUP_AT = '2026-07-23T17:00:00Z';
+
+/** Build a Fastify app with both Day-12 routes mounted. */
+function requestsApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL): {
+  app: ReturnType<typeof makeContractApp>['app'];
+} {
+  const { app, authenticate } = makeContractApp(principal);
+  registerRequestsRoute(app, { authenticate });
+  registerStaffRequestsRoute(app, { authenticate });
+  return { app };
+}
+
+/** Inject a POST /requests call with sensible defaults. */
+async function postRequest(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  payload: Record<string, unknown>;
+  idempotencyKey?: string;
+}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+  const headers: Record<string, string> = {};
+  if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
+  return opts.app.inject({
+    method: 'POST',
+    url: '/requests',
+    headers,
+    payload: opts.payload,
+  });
+}
+
+async function patchRequest(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  id: string;
+  payload: Record<string, unknown>;
+  idempotencyKey?: string;
+}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+  const headers: Record<string, string> = {};
+  if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
+  return opts.app.inject({
+    method: 'PATCH',
+    url: `/requests/${opts.id}`,
+    headers,
+    payload: opts.payload,
+  });
+}
+
+async function cancelRequest(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  id: string;
+  idempotencyKey?: string;
+}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+  const headers: Record<string, string> = {};
+  if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
+  return opts.app.inject({
+    method: 'POST',
+    url: `/requests/${opts.id}/cancel`,
+    headers,
+    payload: {},
+  });
+}
+
+async function approveRequest(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  id: string;
+  payload: Record<string, unknown>;
+  idempotencyKey?: string;
+}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+  const headers: Record<string, string> = {};
+  if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
+  return opts.app.inject({
+    method: 'POST',
+    url: `/staff/requests/${opts.id}/approve`,
+    headers,
+    payload: opts.payload,
+  });
+}
+
+async function denyRequest(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  id: string;
+  idempotencyKey?: string;
+}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+  const headers: Record<string, string> = {};
+  if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
+  return opts.app.inject({
+    method: 'POST',
+    url: `/staff/requests/${opts.id}/deny`,
+    headers,
+    payload: {},
+  });
+}
+
+/**
+ * Direct DB insertion of a `submitted` pending_request. Used by tests
+ * that exercise the staff approve verb — bypasses POST /requests so the
+ * test isn't coupled to the submission validator. Returns the inserted
+ * id.
+ */
+async function seedSubmittedRequest(args: {
+  category: 'private-lesson' | 'board-and-train' | 'boarding';
+  additionalDogIds?: string[];
+  lengthWeeks?: number;
+}): Promise<string> {
+  const id = randomUUID();
+  await db.insert(pendingRequestsTable).values({
+    id,
+    ownerId: FIXTURE_IDS.ownerId,
+    leadDogId: FIXTURE_IDS.dog1Id,
+    category: args.category,
+    status: 'submitted',
+    lengthWeeks: args.lengthWeeks ?? null,
+  });
+  const dogRows = [{ requestId: id, dogId: FIXTURE_IDS.dog1Id, isLead: true }];
+  for (const dogId of args.additionalDogIds ?? []) {
+    dogRows.push({ requestId: id, dogId, isLead: false });
+  }
+  await db.insert(pendingRequestDogsTable).values(dogRows);
+  await db.insert(pendingRequestPreferredDatesTable).values([
+    { requestId: id, ordinal: 1, preferredAt: PREFERRED_1 },
+    { requestId: id, ordinal: 2, preferredAt: PREFERRED_2 },
+  ]);
+  return id;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /requests (owner-side submission)
+// ──────────────────────────────────────────────────────────────────────────
+
+test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const res = await postRequest({
+    app,
+    idempotencyKey: `pr-pl-${randomUUID()}`,
+    payload: {
+      category: 'private-lesson',
+      lead_dog_id: FIXTURE_IDS.dog1Id,
+      additional_dog_ids: [FIXTURE_IDS.dog2Id],
+      preferred_dates: [PREFERRED_1, PREFERRED_2, PREFERRED_3],
+      notes: { per_dog: 'Waffles needs leash polish', joint: 'walk best together' },
+      focus: { staff_preference: 'rachel', comfort_level: 'high' },
+    },
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  const body = res.json() as {
+    id: string;
+    dog_id: string;
+    additional_dog_ids?: string[];
+    category: string;
+    status: string;
+    preferred_dates: string[];
+    notes?: { per_dog?: string; joint?: string };
+    focus: { staff_preference?: string; comfort_level?: string };
+  };
+  assert.equal(body.category, 'private-lesson');
+  assert.equal(body.status, 'submitted');
+  assert.equal(body.dog_id, FIXTURE_IDS.dog1Id);
+  assert.deepEqual(body.additional_dog_ids, [FIXTURE_IDS.dog2Id]);
+  assert.equal(body.preferred_dates.length, 3);
+  assert.equal(body.notes?.per_dog, 'Waffles needs leash polish');
+  assert.equal(body.notes?.joint, 'walk best together');
+  assert.equal(body.focus.staff_preference, 'rachel');
+  assert.equal(body.focus.comfort_level, 'high');
+});
+
+test('POST /requests — board-and-train single-dog → 201', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const res = await postRequest({
+    app,
+    idempotencyKey: `pr-bnt-${randomUUID()}`,
+    payload: {
+      category: 'board-and-train',
+      lead_dog_id: FIXTURE_IDS.dog1Id,
+      preferred_dates: [PREFERRED_1, PREFERRED_2],
+      length_weeks: 2,
+    },
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  const body = res.json() as {
+    category: string;
+    length_weeks?: number;
+    additional_dog_ids?: string[];
+  };
+  assert.equal(body.category, 'board-and-train');
+  assert.equal(body.length_weeks, 2);
+  assert.equal(body.additional_dog_ids, undefined, 'B&T is single-dog — no additional_dog_ids');
+});
+
+test('POST /requests — boarding → 201', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const res = await postRequest({
+    app,
+    idempotencyKey: `pr-boarding-${randomUUID()}`,
+    payload: {
+      category: 'boarding',
+      lead_dog_id: FIXTURE_IDS.dog1Id,
+      preferred_dates: [PREFERRED_1, PREFERRED_2],
+      notes: { per_dog: '5-night stay' },
+    },
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  const body = res.json() as { category: string; length_weeks?: number };
+  assert.equal(body.category, 'boarding');
+  assert.equal(body.length_weeks, undefined);
+});
+
+test(
+  'POST /requests — B&T with additional_dog_ids → 422 (single-dog only)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = requestsApp();
+    const res = await postRequest({
+      app,
+      idempotencyKey: `pr-bnt-multi-${randomUUID()}`,
+      payload: {
+        category: 'board-and-train',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        additional_dog_ids: [FIXTURE_IDS.dog2Id],
+        preferred_dates: [PREFERRED_1],
+        length_weeks: 2,
+      },
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json() as { error: { code: string } };
+    assert.equal(body.error.code, 'invalid_payload');
+  },
+);
+
+test('POST /requests — B&T without length_weeks → 422 (required)', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const res = await postRequest({
+    app,
+    idempotencyKey: `pr-bnt-nolen-${randomUUID()}`,
+    payload: {
+      category: 'board-and-train',
+      lead_dog_id: FIXTURE_IDS.dog1Id,
+      preferred_dates: [PREFERRED_1],
+    },
+  });
+  assert.equal(res.statusCode, 422, res.body);
+});
+
+test('POST /requests — PL with length_weeks → 422 (B&T-only field)', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const res = await postRequest({
+    app,
+    idempotencyKey: `pr-pl-withlen-${randomUUID()}`,
+    payload: {
+      category: 'private-lesson',
+      lead_dog_id: FIXTURE_IDS.dog1Id,
+      preferred_dates: [PREFERRED_1],
+      length_weeks: 2,
+    },
+  });
+  assert.equal(res.statusCode, 422, res.body);
+});
+
+test('POST /requests — dog not owned by principal → 404', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const otherDogId = randomUUID();
+  const res = await postRequest({
+    app,
+    idempotencyKey: `pr-baddog-${randomUUID()}`,
+    payload: {
+      category: 'private-lesson',
+      lead_dog_id: otherDogId,
+      preferred_dates: [PREFERRED_1],
+    },
+  });
+  assert.equal(res.statusCode, 404, res.body);
+});
+
+test('POST /requests — staff principal → 403', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+  const res = await postRequest({
+    app,
+    idempotencyKey: `pr-staff-${randomUUID()}`,
+    payload: {
+      category: 'private-lesson',
+      lead_dog_id: FIXTURE_IDS.dog1Id,
+      preferred_dates: [PREFERRED_1],
+    },
+  });
+  assert.equal(res.statusCode, 403, res.body);
+});
+
+test('POST /requests — missing Idempotency-Key → 400', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const res = await postRequest({
+    app,
+    payload: {
+      category: 'private-lesson',
+      lead_dog_id: FIXTURE_IDS.dog1Id,
+      preferred_dates: [PREFERRED_1],
+    },
+  });
+  assert.equal(res.statusCode, 400, res.body);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// PATCH /requests/:id (owner-side edit)
+// ──────────────────────────────────────────────────────────────────────────
+
+test('PATCH /requests/:id — edit preferred_dates → 200', SKIP_WHEN_NO_DB, async () => {
+  const id = await seedSubmittedRequest({ category: 'private-lesson' });
+  const { app } = requestsApp();
+  const res = await patchRequest({
+    app,
+    id,
+    idempotencyKey: `pr-patch-${randomUUID()}`,
+    payload: { preferred_dates: [PREFERRED_2, PREFERRED_3] },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const body = res.json() as { preferred_dates: string[] };
+  assert.equal(body.preferred_dates.length, 2);
+});
+
+test('PATCH /requests/:id — change category → 422 (identity locked)', SKIP_WHEN_NO_DB, async () => {
+  const id = await seedSubmittedRequest({ category: 'private-lesson' });
+  const { app } = requestsApp();
+  const res = await patchRequest({
+    app,
+    id,
+    idempotencyKey: `pr-patch-cat-${randomUUID()}`,
+    payload: { category: 'boarding' },
+  });
+  assert.equal(res.statusCode, 422, res.body);
+  const body = res.json() as { error: { code: string; message: string } };
+  assert.equal(body.error.code, 'invalid_payload');
+  assert.ok(body.error.message.includes('category'));
+});
+
+test(
+  'PATCH /requests/:id — patch a converted request → 409 conflict',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The fixture's pendingRequest2 has status='converted' — perfect for this test.
+    const { app } = requestsApp();
+    const res = await patchRequest({
+      app,
+      id: FIXTURE_IDS.pendingRequest2Id,
+      idempotencyKey: `pr-patch-conv-${randomUUID()}`,
+      payload: { length_weeks: 3 },
+    });
+    assert.equal(res.statusCode, 409, res.body);
+    const body = res.json() as { error: { code: string } };
+    assert.equal(body.error.code, 'conflict');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /requests/:id/cancel (owner-side withdrawal)
+// ──────────────────────────────────────────────────────────────────────────
+
+test('POST /requests/:id/cancel — happy → status=cancelled', SKIP_WHEN_NO_DB, async () => {
+  const id = await seedSubmittedRequest({ category: 'private-lesson' });
+  const { app } = requestsApp();
+  const res = await cancelRequest({
+    app,
+    id,
+    idempotencyKey: `pr-cancel-${randomUUID()}`,
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const body = res.json() as { status: string };
+  assert.equal(body.status, 'cancelled');
+
+  // approved_by_staff_id stays NULL (owner self-cancel, not staff deny)
+  const [row] = await db
+    .select({ approvedByStaffId: pendingRequestsTable.approvedByStaffId })
+    .from(pendingRequestsTable)
+    .where(eq(pendingRequestsTable.id, id));
+  assert.equal(row?.approvedByStaffId, null);
+});
+
+test('POST /requests/:id/cancel — already-converted → 409 conflict', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp();
+  const res = await cancelRequest({
+    app,
+    id: FIXTURE_IDS.pendingRequest2Id, // status='converted'
+    idempotencyKey: `pr-cancel-conv-${randomUUID()}`,
+  });
+  assert.equal(res.statusCode, 409, res.body);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /staff/requests/:id/approve (portal verb 1)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /staff/requests/:id/approve — PL happy: converted + booking + notification',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedSubmittedRequest({ category: 'private-lesson' });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await approveRequest({
+      app,
+      id,
+      idempotencyKey: `pr-approve-pl-${randomUUID()}`,
+      payload: { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as {
+      id: string;
+      status: string;
+      approved_at?: string;
+      converted_booking_id?: string;
+    };
+    assert.equal(body.status, 'converted');
+    assert.ok(body.approved_at, 'approved_at stamped');
+    assert.ok(body.converted_booking_id, 'converted_booking_id set');
+
+    // Booking row exists with the right shape.
+    const [booking] = await db
+      .select({
+        id: bookingsTable.id,
+        category: bookingsTable.category,
+        leadDogId: bookingsTable.leadDogId,
+        location: bookingsTable.location,
+        scheduledAt: bookingsTable.scheduledAt,
+      })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.id, body.converted_booking_id!));
+    assert.ok(booking, 'booking row created');
+    assert.equal(booking?.category, 'private-lesson');
+    assert.equal(booking?.leadDogId, FIXTURE_IDS.dog1Id);
+    assert.equal(booking?.location, 'fayetteville');
+
+    // booking_dogs has the lead row.
+    const links = await db
+      .select({ dogId: bookingDogsTable.dogId, isLead: bookingDogsTable.isLead })
+      .from(bookingDogsTable)
+      .where(eq(bookingDogsTable.bookingId, body.converted_booking_id!));
+    assert.equal(links.length, 1);
+    assert.equal(links[0]?.isLead, true);
+
+    // Notification was enqueued.
+    const notifs = await db
+      .select({
+        id: notificationsTable.id,
+        type: notificationsTable.type,
+        deepLinkPath: notificationsTable.deepLinkPath,
+      })
+      .from(notificationsTable)
+      .where(
+        and(
+          eq(notificationsTable.ownerId, FIXTURE_IDS.ownerId),
+          eq(notificationsTable.type, 'booking-confirmed'),
+          eq(notificationsTable.deepLinkPath, `/bookings/${body.converted_booking_id!}`),
+        ),
+      );
+    assert.equal(notifs.length, 1, 'one booking-confirmed notification enqueued');
+
+    // pending_requests.approved_by_staff_id stamped with the staff actor.
+    const [pr] = await db
+      .select({ approvedByStaffId: pendingRequestsTable.approvedByStaffId })
+      .from(pendingRequestsTable)
+      .where(eq(pendingRequestsTable.id, id));
+    assert.equal(pr?.approvedByStaffId, FIXTURE_IDS.staffDonavanId);
+  },
+);
+
+test(
+  'POST /staff/requests/:id/approve — B&T two-step: parks at approved-awaiting-payment',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedSubmittedRequest({ category: 'board-and-train', lengthWeeks: 2 });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await approveRequest({
+      app,
+      id,
+      idempotencyKey: `pr-approve-bnt-${randomUUID()}`,
+      payload: {},
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as {
+      status: string;
+      approved_at?: string;
+      converted_booking_id?: string;
+    };
+    assert.equal(body.status, 'approved-awaiting-payment');
+    assert.ok(body.approved_at, 'approved_at stamped');
+    assert.equal(body.converted_booking_id, undefined, 'no booking insert at this step');
+
+    // Confirm DB state directly: approved_by_staff_id is set; no
+    // booking exists for this request.
+    const [pr] = await db
+      .select({
+        status: pendingRequestsTable.status,
+        approvedByStaffId: pendingRequestsTable.approvedByStaffId,
+        convertedBookingId: pendingRequestsTable.convertedBookingId,
+      })
+      .from(pendingRequestsTable)
+      .where(eq(pendingRequestsTable.id, id));
+    assert.equal(pr?.status, 'approved-awaiting-payment');
+    assert.equal(pr?.approvedByStaffId, FIXTURE_IDS.staffDonavanId);
+    assert.equal(pr?.convertedBookingId, null);
+  },
+);
+
+test(
+  'POST /staff/requests/:id/approve — boarding happy: dropoff_at + pickup_at on booking',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedSubmittedRequest({ category: 'boarding' });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await approveRequest({
+      app,
+      id,
+      idempotencyKey: `pr-approve-boarding-${randomUUID()}`,
+      payload: {
+        scheduled_at: APPROVE_SCHEDULED_AT,
+        pickup_at: APPROVE_PICKUP_AT,
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { converted_booking_id?: string };
+    assert.ok(body.converted_booking_id);
+    const [booking] = await db
+      .select({
+        dropoffAt: bookingsTable.dropoffAt,
+        pickupAt: bookingsTable.pickupAt,
+        category: bookingsTable.category,
+      })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.id, body.converted_booking_id!));
+    assert.equal(booking?.category, 'boarding');
+    assert.ok(booking?.dropoffAt, 'dropoff_at set');
+    assert.ok(booking?.pickupAt, 'pickup_at set');
+  },
+);
+
+test(
+  'POST /staff/requests/:id/approve — already-converted → 409 conflict',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The fixture's pendingRequest2 is already 'converted'.
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await approveRequest({
+      app,
+      id: FIXTURE_IDS.pendingRequest2Id,
+      idempotencyKey: `pr-approve-conv-${randomUUID()}`,
+      payload: { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' },
+    });
+    assert.equal(res.statusCode, 409, res.body);
+    const body = res.json() as { error: { code: string } };
+    assert.equal(body.error.code, 'conflict');
+  },
+);
+
+test('POST /staff/requests/:id/approve — unknown id → 404', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+  const res = await approveRequest({
+    app,
+    id: randomUUID(),
+    idempotencyKey: `pr-approve-404-${randomUUID()}`,
+    payload: { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' },
+  });
+  assert.equal(res.statusCode, 404, res.body);
+});
+
+test('POST /staff/requests/:id/approve — owner principal → 403', SKIP_WHEN_NO_DB, async () => {
+  const id = await seedSubmittedRequest({ category: 'private-lesson' });
+  const { app } = requestsApp(); // owner
+  const res = await approveRequest({
+    app,
+    id,
+    idempotencyKey: `pr-approve-owner-${randomUUID()}`,
+    payload: { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' },
+  });
+  assert.equal(res.statusCode, 403, res.body);
+});
+
+test(
+  'POST /staff/requests/:id/approve — idempotency replay returns stored body',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedSubmittedRequest({ category: 'private-lesson' });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const key = `pr-approve-idem-${randomUUID()}`;
+    const payload = { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' };
+    const first = await approveRequest({ app, id, idempotencyKey: key, payload });
+    assert.equal(first.statusCode, 200, first.body);
+    const replay = await approveRequest({ app, id, idempotencyKey: key, payload });
+    assert.equal(replay.statusCode, 200, replay.body);
+    assert.deepEqual(replay.json(), first.json(), 'replay body byte-identical');
+
+    // The replay returned the SAME converted_booking_id as the first
+    // call (per the idempotency contract). Confirm exactly one booking
+    // row exists for that id — replay didn't insert a second one.
+    const firstBody = first.json() as { converted_booking_id?: string };
+    assert.ok(firstBody.converted_booking_id, 'first call returned a booking id');
+    const matching = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.id, firstBody.converted_booking_id!));
+    assert.equal(matching.length, 1, 'exactly one booking row for the converted id');
+
+    // Also confirm pending_requests is in the converted terminal
+    // state — replay didn't re-run the txn (the markConverted state
+    // change would have raised a 409 the second time if the body had
+    // actually executed against the row).
+    const [pr] = await db
+      .select({
+        status: pendingRequestsTable.status,
+        convertedBookingId: pendingRequestsTable.convertedBookingId,
+      })
+      .from(pendingRequestsTable)
+      .where(eq(pendingRequestsTable.id, id));
+    assert.equal(pr?.status, 'converted');
+    assert.equal(pr?.convertedBookingId, firstBody.converted_booking_id);
+  },
+);
+
+test(
+  'POST /staff/requests/:id/approve — race: two concurrent approves → exactly one converts',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedSubmittedRequest({ category: 'private-lesson' });
+    const { app: app1 } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const { app: app2 } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const payload = { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' };
+    const [resA, resB] = await Promise.all([
+      approveRequest({
+        app: app1,
+        id,
+        idempotencyKey: `pr-race-a-${randomUUID()}`,
+        payload,
+      }),
+      approveRequest({
+        app: app2,
+        id,
+        idempotencyKey: `pr-race-b-${randomUUID()}`,
+        payload,
+      }),
+    ]);
+    const codes = [resA.statusCode, resB.statusCode].sort();
+    assert.deepEqual(
+      codes,
+      [200, 409],
+      `expected exactly one 200 and one 409, got ${codes.join(', ')}`,
+    );
+
+    // Exactly one booking exists for this request.
+    const [pr] = await db
+      .select({
+        status: pendingRequestsTable.status,
+        convertedBookingId: pendingRequestsTable.convertedBookingId,
+      })
+      .from(pendingRequestsTable)
+      .where(eq(pendingRequestsTable.id, id));
+    assert.equal(pr?.status, 'converted');
+    assert.ok(pr?.convertedBookingId);
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /staff/requests/:id/deny (portal verb 1 — denial)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /staff/requests/:id/deny — happy: status=cancelled + approvedByStaffId stamped',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedSubmittedRequest({ category: 'private-lesson' });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await denyRequest({
+      app,
+      id,
+      idempotencyKey: `pr-deny-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { status: string };
+    assert.equal(body.status, 'cancelled');
+    const [pr] = await db
+      .select({ approvedByStaffId: pendingRequestsTable.approvedByStaffId })
+      .from(pendingRequestsTable)
+      .where(eq(pendingRequestsTable.id, id));
+    assert.equal(
+      pr?.approvedByStaffId,
+      FIXTURE_IDS.staffDonavanId,
+      'staff actor stamped to discriminate from owner self-cancel',
+    );
+  },
+);
+
+test('POST /staff/requests/:id/deny — already-converted → 409', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+  const res = await denyRequest({
+    app,
+    id: FIXTURE_IDS.pendingRequest2Id,
+    idempotencyKey: `pr-deny-conv-${randomUUID()}`,
+  });
+  assert.equal(res.statusCode, 409, res.body);
+});
+
+// Suppress unused-import lint warnings — these tables are referenced
+// by the schema helpers but not directly by the assertions above.
+void notificationDogsTable;
+void pendingRequestPreferredDatesTable;
+void inArray;
