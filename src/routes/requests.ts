@@ -9,6 +9,7 @@ import {
   type PendingRequestRow,
 } from '../db/repositories/requestsRepository.js';
 import { comfortLevel, requestStatus } from '../db/schema/schema.js';
+import { evaluationRequiredError, type UnpassedEvaluationStatus } from '../lib/bookingErrors.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { pgTimestampToDate, pgTimestampToIso } from '../lib/pgTimestamp.js';
@@ -202,14 +203,19 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
   //   1. Per-category invariant check (B&T = single dog + length_weeks
   //      required; PL/boarding = no length_weeks).
   //   2. Ownership gate per dog (lead + every additional).
-  //   3. INSERT pending_requests row (status='submitted'). Source = 'app'.
-  //   4. INSERT pending_request_dogs (lead + additionals).
-  //   5. INSERT pending_request_preferred_dates (ordinal 1, 2, 3 …).
-  //   6. Re-read the full row + child rows and emit the wire shape.
+  //   3. Evaluation gate at the request boundary for B&T + boarding
+  //      (Day 12b, §A Amendment 2026-05-23). Lead-only — additional
+  //      dogs are caught at the staff approve verb's checkBookingGates.
+  //   4. INSERT pending_requests row (status='submitted'). Source = 'app'.
+  //   5. INSERT pending_request_dogs (lead + additionals).
+  //   6. INSERT pending_request_preferred_dates (ordinal 1, 2, 3 …).
+  //   7. Re-read the full row + child rows and emit the wire shape.
   //
-  // Returns 201 + PendingRequestWire. No gates fire on submission —
-  // requests are pre-booking intent; the gates fire when the staff
-  // approve verb attempts the booking INSERT.
+  // Returns 201 + PendingRequestWire. No payment/vaccine/agreement gates
+  // fire on submission — those fire when the staff approve verb attempts
+  // the booking INSERT. The evaluation gate is the one exception: B&T
+  // + boarding pre-check at the request boundary so owners can't submit
+  // for an un-evaluated dog (staff would otherwise bounce it back).
   app.post(
     '/requests',
     { preHandler: [authHook] },
@@ -244,7 +250,34 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
             }
           }
 
-          // 2. INSERT pending_requests row.
+          // 2. Evaluation gate at the request boundary (Day 12b,
+          //    §A Amendment 2026-05-23 step 5). Board-and-train +
+          //    boarding require the LEAD dog to have a passing
+          //    evaluation before the owner can submit a request —
+          //    saves staff a round-trip otherwise the approve verb
+          //    would have to bounce it back. Private-lesson is
+          //    staff-curated and does NOT gate at this boundary.
+          //
+          //    Additional dogs (boarding multi-dog) aren't checked
+          //    here — the staff approve verb's checkBookingGates call
+          //    will catch any unpassed additional dog at booking-
+          //    insert time. Lead-only matches both the spec and the
+          //    schema trigger's predicate.
+          if (parsed.category === 'board-and-train' || parsed.category === 'boarding') {
+            const statuses = await dogsRepository.findEvaluationStatusInTx(tx, [parsed.leadDogId]);
+            const leadEval = statuses[0];
+            if (leadEval !== undefined && leadEval.evaluationStatus !== 'passed') {
+              throw evaluationRequiredError([
+                {
+                  dog_id: parsed.leadDogId,
+                  // Narrow: the conditional above excludes 'passed'.
+                  evaluation_status: leadEval.evaluationStatus as UnpassedEvaluationStatus,
+                },
+              ]);
+            }
+          }
+
+          // 3. INSERT pending_requests row.
           const { id } = await requestsRepository.create(tx, {
             ownerId: principal.ownerId,
             leadDogId: parsed.leadDogId,
@@ -256,14 +289,14 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
             lengthWeeks: parsed.lengthWeeks,
           });
 
-          // 3. INSERT join rows.
+          // 4. INSERT join rows.
           await requestsRepository.addDogs(tx, id, {
             lead: parsed.leadDogId,
             additional: parsed.additionalDogIds,
           });
           await requestsRepository.addPreferredDates(tx, id, parsed.preferredDates);
 
-          // 4. Re-read + wire. The re-read goes through the same
+          // 5. Re-read + wire. The re-read goes through the same
           //    findFullByIdInTx the approve verb uses, so a future
           //    schema change to the projection only touches one place.
           const row = await requestsRepository.findFullByIdInTx(tx, id);

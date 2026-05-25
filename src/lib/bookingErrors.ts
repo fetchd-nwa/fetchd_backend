@@ -104,6 +104,21 @@ export interface EligibilityGap {
   readonly missing_alternatives: readonly GroupClassKey[];
 }
 
+/**
+ * Day-12b evaluation gap for one dog. `evaluation_status` carries the
+ * non-passed state so the FE renders the right copy variant:
+ *   - `'not-evaluated'` → "Book free evaluation"
+ *   - `'pending'`       → "Evaluation in progress"
+ *   - `'failed'`        → "Evaluation needs to be repeated" (staff-mediated retry)
+ * The `'passed'` value is excluded by construction — a passing dog has no gap.
+ */
+export type UnpassedEvaluationStatus = 'not-evaluated' | 'pending' | 'failed';
+
+export interface EvaluationGap {
+  readonly dog_id: string;
+  readonly evaluation_status: UnpassedEvaluationStatus;
+}
+
 // ---- Constructors --------------------------------------------------------
 //
 // Throw via these helpers, not via raw `new ApiError(...)` at the gate
@@ -181,6 +196,25 @@ export function cohortFullError(details: CohortFullDetails): ApiError {
   );
 }
 
+export function evaluationRequiredError(missing: readonly EvaluationGap[]): ApiError {
+  if (missing.length === 0) {
+    // Defensive — callers only throw this when at least one dog is
+    // unpassed. Empty arrays would hide the gate failure on the wire.
+    throw new Error('evaluationRequiredError: missing array must be non-empty');
+  }
+  // Friendly prose summary; the structured `missing[]` carries the
+  // per-dog state for the FE to render the right copy variant + the
+  // deep-link to /booking-flow/evaluation?dogId=…
+  const summary =
+    missing.length === 1
+      ? `1 dog needs to complete an evaluation before booking.`
+      : `${missing.length} dogs need to complete an evaluation before booking.`;
+  return new ApiError('evaluation_required', summary, {
+    kind: 'evaluation_required',
+    missing: [...missing],
+  });
+}
+
 export function eligibilityMissingError(gaps: readonly EligibilityGap[]): ApiError {
   if (gaps.length === 0) {
     // Defensive — callers should only throw this when at least one dog
@@ -252,6 +286,19 @@ export function gateTriggerErrorToApiError(err: unknown): ApiError | undefined {
       'agreement_unsigned',
       'Required agreement(s) unsigned (state changed mid-request — retry to see details).',
       { kind: 'agreement_unsigned', missing: [] },
+    );
+  }
+  if (text.startsWith('evaluation gate:')) {
+    // Same shape as the other gate-trigger fallbacks: the trigger raises
+    // with the lead dog id in the message text, but we don't have
+    // structured per-dog state to reconstruct the full EvaluationGap[].
+    // The pre-check produces structured details in 99.9% of cases; this
+    // path covers the narrow race where a dog's evaluation_status flipped
+    // between the pre-check and the INSERT.
+    return new ApiError(
+      'evaluation_required',
+      'Dog evaluation required (state changed mid-request — retry to see details).',
+      { kind: 'evaluation_required', missing: [] },
     );
   }
   return undefined;

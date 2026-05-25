@@ -269,6 +269,35 @@ async function update(tx: Tx, id: string, set: DogUpdate): Promise<Dog | undefin
  * `live(dogs)` on the parent. This matches the never-DELETE invariant
  * and preserves the dog's `booking_dogs` history.
  */
+/**
+ * Day-12b batched eval-status lookup for the evaluation booking gate.
+ * Returns one row per LIVE dog in `dogIds`; expired or unknown ids
+ * silently drop out (the route layer's ownership gate is the
+ * not-found path — this helper trusts its inputs are scoped).
+ *
+ * Used by `lib/bookingGatePreCheck.ts` between the payment and vaccine
+ * gates to accumulate `EvaluationGap` per dog whose
+ * `evaluation_status !== 'passed'`. Mutation routes thread `tx` so
+ * uncommitted writes earlier in the same txn are visible — same
+ * polymorphic-runner rationale as `findById` (Day-9c) and the
+ * `requestsRepository` batched lookups (Day-12).
+ *
+ * Returns the `evaluationStatus` enum value verbatim; the helper that
+ * accumulates the gap narrows to `UnpassedEvaluationStatus` after
+ * filtering out `'passed'`.
+ */
+async function findEvaluationStatusInTx(
+  tx: Tx,
+  dogIds: readonly string[],
+): Promise<{ dogId: string; evaluationStatus: EvaluationStatus }[]> {
+  if (dogIds.length === 0) return [];
+  const rows = await tx
+    .select({ dogId: dogs.id, evaluationStatus: dogs.evaluationStatus })
+    .from(dogs)
+    .where(and(inArray(dogs.id, [...dogIds]), live(dogs)));
+  return rows;
+}
+
 async function softExpire(tx: Tx, id: string): Promise<Dog | undefined> {
   const [row] = await tx
     .update(dogs)
@@ -293,6 +322,7 @@ export const dogsRepository = {
   findManyByOwner,
   findById,
   findOwnedExists,
+  findEvaluationStatusInTx,
   create,
   update,
   softExpire,

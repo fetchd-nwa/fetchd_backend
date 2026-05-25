@@ -331,7 +331,15 @@ export async function seedFixture(): Promise<void> {
       birthdate: null,
       ageMonthsOverride: 84,
       specialNotes: '',
-      evaluationStatus: 'not-evaluated',
+      // Day-12b: bumped from 'not-evaluated' → 'passed' so the fixture's
+      // booking2 (Lola lead, day-care) + booking5 (Lola lead, boarding)
+      // still seed cleanly under the new evaluation gate trigger, and so
+      // multi-dog day-care/boarding tests with Lola as a booking_dog pass.
+      // The evaluation-gate.test.ts suite flips Lola back to non-passed
+      // values per test (with finally-restore), same shape as the
+      // vaccine-gate test soft-expires + restores her Rabies record.
+      evaluationStatus: 'passed',
+      evaluationDate: '2024-06-01T15:00:00Z',
       profileImagePath: null,
     },
   ]);

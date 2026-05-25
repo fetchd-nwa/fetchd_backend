@@ -27,6 +27,13 @@
  * (R7 server-derived prereq gap). Both 422 — request was syntactically
  * fine, semantically blocked by current state.
  *
+ * Day 12b (evaluation gate) adds `evaluation_required` (422) — the 4th
+ * BOOKING GATE, mirroring payment/vaccine/agreement: any dog in a gated
+ * category (day-school / day-care / board-and-train / boarding) must have
+ * `evaluation_status='passed'`. Slots between payment and vaccine in
+ * priority order (§H "Booking gates"). Joins the discriminated `details`
+ * union as `kind: 'evaluation_required'`.
+ *
  * The `details` payload's typed shape lives in `lib/bookingErrors.ts` so
  * the discriminated union can grow (Day 13 cancel window, …) without
  * this file taking on every booking-flow concern. The envelope serializer
@@ -50,7 +57,8 @@ export type ApiErrorCode =
   | 'insufficient_credits' // Day 10: booking blocked — per-dog credit balance would go negative
   | 'insufficient_capacity' // Day 10: booking blocked — day_capacity for (location,date,mode) exhausted
   | 'cohort_full' // Day 11: enrollment blocked — cohort.filled + requested > cohort.capacity
-  | 'eligibility_missing'; // Day 11: enrollment blocked — dog(s) missing OR-prereq for cohort's class (R7)
+  | 'eligibility_missing' // Day 11: enrollment blocked — dog(s) missing OR-prereq for cohort's class (R7)
+  | 'evaluation_required'; // Day 12b: booking blocked — dog(s) missing passed evaluation for gated category
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   unauthenticated: 401,
@@ -73,6 +81,8 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   // Day 11 enrollment gates — same 422 family (state-blocked, not malformed).
   cohort_full: 422,
   eligibility_missing: 422,
+  // Day 12b evaluation gate — 422 (dog-readiness state-block, not malformed).
+  evaluation_required: 422,
 };
 
 /**
