@@ -1478,6 +1478,37 @@ export async function topUpCredits(
   });
 }
 
+/**
+ * Hard-delete every fixture row this file knows about, in FK-safe order.
+ *
+ * **FK ordering invariant (READ BEFORE EDITING):** any new table that
+ * references an existing fixture table must drop BEFORE the table it
+ * references. Foreign keys with `ON DELETE RESTRICT` block parent deletes;
+ * a missed precedence leaves teardown failing partway, the next file's
+ * seed inheriting orphan rows, and tests cascading. Earned 2026-05-26
+ * (Day-14): `credit_ledger.charge_id → charges.id` was added but the
+ * teardown still deleted `charges` first, FK-blocking the entire chain.
+ *
+ * Per-table precedence in this file's deletes:
+ *   refunds          → before bookings + charges
+ *   credit_ledger    → before charges + dogs + bookings (charges FK Day-14)
+ *   charges          → before owners + bookings
+ *   booking_dogs     → ON DELETE CASCADE on bookings (implicit)
+ *   bookings         → before dogs + owners
+ *   payment_methods  → before owners (RESTRICT)
+ *   stripe_customers → before owners (RESTRICT; Day-14)
+ *   dogs             → before owners + vets (RESTRICT on owners)
+ *   agreement_*      → before owners + agreement_documents
+ *   required_vaccines → before requirement-key-referencing dog_vaccines
+ *   vets             → before owners-dependent FKs are dropped
+ *   owners           → after all children
+ *   staff            → after bookings (RESTRICT via trainer_staff_id)
+ *
+ * Adding a new table? Update the precedence list above + the delete
+ * sequence below, AND verify with `node --test test/contracts/<file>.test.ts`
+ * — both isolation (the file alone) AND multi-file (the full suite),
+ * because race-on-shared-DB is the test container's failure mode.
+ */
 export async function teardownFixture(): Promise<void> {
   // Day-7b: notifications + announcements. notification_dogs cascades on
   // notifications delete (ON DELETE CASCADE FK). notifications cascades on

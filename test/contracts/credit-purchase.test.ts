@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
 import { charges, creditLedger, stripeCustomers } from '../../src/db/schema/schema.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { FIXTURE_IDS } from './_fixture.js';
@@ -270,3 +271,58 @@ test('POST /credit-packages/:key/purchase — staff principal → 403', SKIP_WHE
   });
   assert.equal(res.statusCode, 403);
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// chargesRepository.markStatus — pre-positioned for Day-15 webhook
+// (`payment_intent.succeeded` / `.payment_failed` event handlers).
+// Day-14 exercises only `succeeded` synchronously via the purchase route;
+// this test pins the contract for the webhook's first caller so a future
+// schema rename or status-mapping drift surfaces here, not at Day-15
+// integration time.
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'chargesRepository.markStatus flips requires_payment → succeeded and stamps updated_at',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Use db.transaction to scope the test in a tx the repo can accept
+    // (the same shape the Day-15 webhook handler will pass in).
+    const result = await db.transaction(async (tx) => {
+      const charge = await chargesRepository.create(tx, {
+        ownerId: FIXTURE_IDS.ownerId,
+        amountCents: 4500,
+        status: 'requires_payment',
+        purpose: 'package',
+        stripePaymentIntentId: `pi_test_markstatus_${randomUUID().slice(0, 8)}`,
+      });
+      const beforeUpdatedAt = (
+        await tx
+          .select({ updatedAt: charges.updatedAt })
+          .from(charges)
+          .where(eq(charges.id, charge.id))
+      )[0]!.updatedAt;
+
+      // Sleep a beat so `updated_at = now()` advances visibly.
+      await new Promise((r) => setTimeout(r, 5));
+      await chargesRepository.markStatus(tx, { id: charge.id, status: 'succeeded' });
+
+      const after = (
+        await tx
+          .select({ status: charges.status, updatedAt: charges.updatedAt })
+          .from(charges)
+          .where(eq(charges.id, charge.id))
+      )[0]!;
+      return { chargeId: charge.id, beforeUpdatedAt, after };
+    });
+
+    assert.equal(result.after.status, 'succeeded');
+    assert.ok(
+      new Date(result.after.updatedAt).getTime() >= new Date(result.beforeUpdatedAt).getTime(),
+      'updated_at advanced after markStatus',
+    );
+
+    // Cleanup — the transaction committed inside db.transaction, so the
+    // charges row persists; drop it so downstream tests see a clean owner.
+    await db.delete(charges).where(eq(charges.id, result.chargeId));
+  },
+);

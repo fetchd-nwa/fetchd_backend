@@ -15,8 +15,8 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
   defaultStripeClient,
+  stripeIntentStatusToChargeStatus,
   type StripeClient,
-  type StripePaymentIntentStatus,
 } from '../lib/stripe.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
@@ -277,25 +277,6 @@ async function loadPurchaseContext(args: {
     stripeCustomerId: customer.stripeCustomerId,
     stripePaymentMethodId: pm.stripePaymentMethodId,
   };
-}
-
-function stripeIntentStatusToChargeStatus(status: StripePaymentIntentStatus): ChargeStatus {
-  switch (status) {
-    case 'succeeded':
-      return 'succeeded';
-    case 'canceled':
-      return 'failed';
-    case 'requires_payment_method':
-    case 'requires_confirmation':
-    case 'requires_action':
-    case 'processing':
-    case 'requires_capture':
-      // Day-15 webhook flips these on terminal events. Mapping to
-      // 'requires_payment' (a slight rename mismatch with Stripe's
-      // 'requires_payment_method' but the schema enum is fixed) keeps
-      // the wire status honest — not yet succeeded, not yet failed.
-      return 'requires_payment';
-  }
 }
 
 function parseKeyParam(params: unknown): { key: string } {

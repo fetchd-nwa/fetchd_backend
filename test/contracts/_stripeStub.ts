@@ -27,21 +27,45 @@ import type {
  *   - `throwOnDetach()` — next `detachPaymentMethod` rejects
  *   - `throwOnRefund()` — next `createRefund` rejects
  *
- * All Stripe-facing calls are recorded as `{ method, args, idempotencyKey }`
- * tuples in `calls`; tests can `.filter(c => c.method === 'createRefund')`
- * to assert that a route fired the expected post-commit call.
+ * All Stripe-facing calls are recorded as discriminated-union entries in
+ * `calls`; tests can `.filter(c => c.method === 'createRefund')` to assert
+ * that a route fired the expected post-commit call AND get type-safe
+ * access to `.args` (the args type narrows on the discriminant).
  */
-export interface StripeStubCall {
-  method:
-    | 'createCustomer'
-    | 'createSetupIntent'
-    | 'createAndConfirmPaymentIntent'
-    | 'detachPaymentMethod'
-    | 'createRefund'
-    | 'retrievePaymentMethod';
-  args: unknown;
-  idempotencyKey: string | null;
-}
+
+/** Discriminated-union over StripeClient method args. The `method` tag
+ *  narrows `args` so tests can read typed fields without an `as` cast. */
+export type StripeStubCall =
+  | {
+      method: 'createCustomer';
+      args: Parameters<StripeClient['createCustomer']>[0];
+      idempotencyKey: string;
+    }
+  | {
+      method: 'createSetupIntent';
+      args: Parameters<StripeClient['createSetupIntent']>[0];
+      idempotencyKey: string;
+    }
+  | {
+      method: 'createAndConfirmPaymentIntent';
+      args: Parameters<StripeClient['createAndConfirmPaymentIntent']>[0];
+      idempotencyKey: string;
+    }
+  | {
+      method: 'detachPaymentMethod';
+      args: { paymentMethodId: string };
+      idempotencyKey: null;
+    }
+  | {
+      method: 'createRefund';
+      args: Parameters<StripeClient['createRefund']>[0];
+      idempotencyKey: string;
+    }
+  | {
+      method: 'retrievePaymentMethod';
+      args: { paymentMethodId: string };
+      idempotencyKey: null;
+    };
 
 export interface StripeStub extends StripeClient {
   /** Every Stripe call this stub received, in order. */

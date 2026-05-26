@@ -113,6 +113,35 @@ export interface MutationParams<T = unknown> {
    * contract.
    */
   patternsToInvalidate?: (body: T) => string[] | Promise<string[]>;
+  /**
+   * Day-14: post-commit side effect that ISN'T cache invalidation —
+   * typically a third-party API call (Stripe detach, Stripe refund,
+   * future R2 finalize, etc.) that the route wants to fire AFTER the DB
+   * commit but BEFORE returning to the client. Same lifecycle as
+   * `keysToInvalidate` / `patternsToInvalidate`:
+   *
+   *   - Fires **once** per non-replayed outcome (replay path skips it
+   *     because the first call's effect already landed).
+   *   - Failures are **logged + swallowed** — the DB commit is the
+   *     source of truth; the side effect's reconciliation lives
+   *     elsewhere (Stripe webhooks, retry workers, etc.).
+   *   - Receives the response body so the callback can read server-
+   *     generated state (newly-minted id, the location the mutation
+   *     touched). Routes that need additional state (e.g. the cancel
+   *     route's refund-PI handle, captured during the tx body) close
+   *     over a local variable — the body parameter is the
+   *     route-independent surface.
+   *
+   * Two production sites today (Day-14):
+   *   1. `DELETE /payment-methods/:id` — `stripe.detachPaymentMethod`
+   *   2. `POST /bookings/:id/cancel` — `stripe.createRefund` (closure-
+   *      captured refund handle, fired conditionally on money-back
+   *      branch).
+   *
+   * Adding a third site (Day-15 invoice-pay / setup_intent.succeeded
+   * webhook) is "implement the callback" — no boilerplate copy.
+   */
+  postCommit?: (body: T) => Promise<void>;
 }
 
 /**
@@ -181,6 +210,22 @@ export async function withMutation<T>(
         // (the cache also self-heals via TTL).
         process.stderr.write(
           `[withMutation] post-commit pattern-invalidate failed for ${params.endpoint} ` +
+            `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+        );
+      }
+    }
+    if (params.postCommit !== undefined) {
+      try {
+        await params.postCommit(outcome.body);
+      } catch (err) {
+        // Day-14 seam: third-party API call (Stripe detach / refund /
+        // ...) failed AFTER the DB commit. Same swallow-and-log policy
+        // as cache invalidation — the DB is the source of truth; the
+        // side effect reconciles via webhook (Day-15) or admin retry.
+        // Day-20 will route this through the observability seam so
+        // Sentry catches the drift.
+        process.stderr.write(
+          `[withMutation] post-commit side-effect failed for ${params.endpoint} ` +
             `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
         );
       }

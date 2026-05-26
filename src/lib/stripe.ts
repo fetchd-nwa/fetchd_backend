@@ -1,5 +1,6 @@
 import Stripe from 'stripe';
 import { env } from '../env.js';
+import type { ChargeStatus } from '../db/repositories/chargesRepository.js';
 
 /**
  * Stripe seam (Day 14). All Stripe API calls flow through `StripeClient`;
@@ -56,6 +57,39 @@ export interface StripePaymentIntentResult {
   status: StripePaymentIntentStatus;
   clientSecret: string | null;
   amountCents: number;
+}
+
+/**
+ * Map a Stripe `payment_intent.status` to our `charge_status` enum. Used at
+ * both ends of the PI lifecycle:
+ *   - **Day-14 sync confirm path** (`POST /credit-packages/:key/purchase`):
+ *     a fresh PI returned by `paymentIntents.create + confirm` maps to the
+ *     `charges` row status we INSERT.
+ *   - **Day-15 webhook path** (`POST /webhooks/stripe`): a terminal
+ *     `payment_intent.succeeded`/`.payment_failed` event maps to the
+ *     `markStatus` update we apply to the existing `charges` row.
+ *
+ * The schema enum (`charge_status`) doesn't have a 1:1 match for Stripe's
+ * `requires_payment_method` / `requires_confirmation` / `processing` /
+ * `requires_action` / `requires_capture` — they all collapse to
+ * `'requires_payment'` (a slight rename mismatch with the leading Stripe
+ * status; the wire status stays honest: not-yet-succeeded, not-yet-failed).
+ * Exhaustive `switch` so a future Stripe status surfaces as a TS error
+ * rather than silently mapping to a fallback.
+ */
+export function stripeIntentStatusToChargeStatus(status: StripePaymentIntentStatus): ChargeStatus {
+  switch (status) {
+    case 'succeeded':
+      return 'succeeded';
+    case 'canceled':
+      return 'failed';
+    case 'requires_payment_method':
+    case 'requires_confirmation':
+    case 'requires_action':
+    case 'processing':
+    case 'requires_capture':
+      return 'requires_payment';
+  }
 }
 
 export type StripeRefundStatus =

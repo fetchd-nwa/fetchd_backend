@@ -252,6 +252,14 @@ export function registerPaymentMethodsRoute(
         idempotencyKey,
         endpoint: 'DELETE /payment-methods/:id',
         requestHash: hashRequestBody({ id }),
+        // Post-commit Stripe detach — best-effort. `MutationParams.postCommit`
+        // owns the swallow + log + skip-on-replay boilerplate; the DB
+        // soft-expire is the source of truth, Day-15 webhook reconciliation
+        // catches drift if the detach fails.
+        postCommit: async (body) => {
+          if (body === null) return;
+          await stripe.detachPaymentMethod(body.stripePaymentMethodId);
+        },
       },
       async (tx) => {
         const expired = await paymentMethodsRepository.softExpire(tx, {
@@ -267,22 +275,6 @@ export function registerPaymentMethodsRoute(
         };
       },
     );
-
-    // Post-commit Stripe detach — best-effort; failures logged-and-
-    // swallowed (the DB soft-expire is the source of truth, Day-15
-    // webhook reconciliation catches drift). Skips on replay since the
-    // first call already issued the detach.
-    if (!outcome.replayed && outcome.body !== null) {
-      const stripePmId = outcome.body.stripePaymentMethodId;
-      try {
-        await stripe.detachPaymentMethod(stripePmId);
-      } catch (err) {
-        process.stderr.write(
-          `[DELETE /payment-methods] post-commit Stripe detach failed for ${stripePmId} ` +
-            `(idempotency_key=${idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
-        );
-      }
-    }
 
     reply.code(outcome.status);
     return outcome.status === 204 ? undefined : outcome.body;
