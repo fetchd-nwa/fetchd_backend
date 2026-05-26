@@ -16,9 +16,11 @@ import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { computeCohortSessionDates } from '../lib/cohortSchedule.js';
 import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
-import { computeCancelDeadline } from '../lib/cancelWindow.js';
+import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
+import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { ApiError } from '../lib/errors.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
+import { requireOwner } from '../lib/principalNarrows.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -109,7 +111,7 @@ export function registerEnrollmentsRoute(
     { preHandler: [authHook] },
     async (request, reply): Promise<BookingWire[]> => {
       const principal = requirePrincipal(request);
-      requireOwner(principal, 'enroll');
+      requireOwner(principal, 'enroll dogs in a cohort');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postEnrollmentBodySchema, request.body, 'body');
       const parsed = validateEnrollmentBody(body);
@@ -211,9 +213,19 @@ export function registerEnrollmentsRoute(
           // the Day-10 dog-sort convention for advisory-lock ordering).
           const sortedDogIds = [...parsed.dogIds].sort();
 
+          // Resolve free-cancel hours ONCE for the whole enrollment — all
+          // group-class sessions share the same category, so the policy
+          // is invariant across the loop. Stamping the same resolved
+          // deadline per session keeps the per-week semantics honest
+          // (each weekly session has its own deadline, but computed off
+          // the same per-category policy snapshot).
+          const groupClassHours = await cancelWindowSettingsRepository.resolveHoursFor(
+            'group-class',
+            tx,
+          );
           const insertedWires: BookingWire[] = [];
           for (const scheduledAt of sessionDates) {
-            const cancelDeadlineAt = computeCancelDeadline('group-class', scheduledAt);
+            const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAt, groupClassHours);
             for (const dogId of sortedDogIds) {
               const inserted = await insertBookingWithGateMapping(tx, {
                 ownerId: principal.ownerId,
@@ -258,23 +270,6 @@ export function registerEnrollmentsRoute(
 }
 
 // ---- helpers ---------------------------------------------------------
-
-/**
- * Narrow the principal to owner. `[asserts]` predicate so subsequent
- * `principal.ownerId` reads compile without a cast. Mirrors the
- * `requireOwner` shape in `routes/bookings.ts` (rule-of-two — extract
- * to `lib/principalNarrows.ts` if Day 12 surfaces a third call site;
- * for now the literal-union action keeps both call sites local to
- * their route).
- */
-function requireOwner(
-  principal: ReturnType<typeof requirePrincipal>,
-  action: 'enroll',
-): asserts principal is { kind: 'owner'; ownerId: string; supabaseUid: string } {
-  if (principal.kind !== 'owner') {
-    throw new ApiError('forbidden', `only owners may ${action} dogs in a cohort`);
-  }
-}
 
 /**
  * Cross-field invariants Zod doesn't express cleanly: dog_ids must be

@@ -5,6 +5,7 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { vetsRepository } from '../db/repositories/vetsRepository.js';
 import { ApiError } from '../lib/errors.js';
 import { normalizeOptional } from '../lib/normalize.js';
+import { requireStaff } from '../lib/principalNarrows.js';
 import { toVetWire, type VetWire } from '../lib/vetWire.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
@@ -73,15 +74,6 @@ const patchBodySchema = z
   .strict()
   .partial();
 
-function requireStaff(
-  principal: ReturnType<typeof requirePrincipal>,
-  action: 'edit' | 'delete',
-): void {
-  if (principal.kind !== 'staff') {
-    throw new ApiError('forbidden', `only staff may ${action} vets`);
-  }
-}
-
 export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
 
@@ -144,7 +136,7 @@ export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions =
 
   app.patch('/vets/:id', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireStaff(principal, 'edit');
+    requireStaff(principal, 'edit vets');
 
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
@@ -194,7 +186,7 @@ export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions =
 
   app.delete('/vets/:id', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireStaff(principal, 'delete');
+    requireStaff(principal, 'delete vets');
 
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 

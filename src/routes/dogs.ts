@@ -31,6 +31,7 @@ import {
 import { ApiError } from '../lib/errors.js';
 import { normalizeOptional } from '../lib/normalize.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
+import { requireOwner } from '../lib/principalNarrows.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -196,20 +197,6 @@ const feedingBodySchema = z
   })
   .strict();
 
-/**
- * Narrow the principal to owner. All dog mutations (top-level + nested)
- * are owner-only — staff dog-management is a Day-19 portal verb. Uses
- * an `asserts` predicate so the call site narrows the static type.
- */
-function requireOwner(
-  principal: ReturnType<typeof requirePrincipal>,
-  action: 'create' | 'edit' | 'delete',
-): asserts principal is { kind: 'owner'; ownerId: string; supabaseUid: string } {
-  if (principal.kind !== 'owner') {
-    throw new ApiError('forbidden', `only owners may ${action} their dogs`);
-  }
-}
-
 export interface DogsRouteOptions extends AuthRouteOptions {
   /**
    * Injectable clock so contract tests get a deterministic `age_months`. A
@@ -254,7 +241,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.post('/dogs', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'create');
+    requireOwner(principal, 'create their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const body = parseOrThrow(postDogBodySchema, request.body, 'dog payload');
@@ -311,7 +298,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.patch('/dogs/:id', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'edit');
+    requireOwner(principal, 'edit their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId } = parseOrThrow(paramsSchema, request.params, 'dog id');
@@ -378,7 +365,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.delete('/dogs/:id', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'delete');
+    requireOwner(principal, 'delete their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId } = parseOrThrow(paramsSchema, request.params, 'dog id');
@@ -410,7 +397,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.post('/dogs/:id/vaccines', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'create');
+    requireOwner(principal, 'create their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId } = parseOrThrow(paramsSchema, request.params, 'dog id');
@@ -453,7 +440,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.patch('/dogs/:id/vaccines/:vid', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'edit');
+    requireOwner(principal, 'edit their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId, vid } = parseOrThrow(vaccineParamsSchema, request.params, 'dog/vaccine id');
@@ -512,7 +499,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.delete('/dogs/:id/vaccines/:vid', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'delete');
+    requireOwner(principal, 'delete their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId, vid } = parseOrThrow(vaccineParamsSchema, request.params, 'dog/vaccine id');
@@ -547,7 +534,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.post('/dogs/:id/medications', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'create');
+    requireOwner(principal, 'create their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId } = parseOrThrow(paramsSchema, request.params, 'dog id');
@@ -581,7 +568,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.patch('/dogs/:id/medications/:mid', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'edit');
+    requireOwner(principal, 'edit their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId, mid } = parseOrThrow(
@@ -629,7 +616,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.delete('/dogs/:id/medications/:mid', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'delete');
+    requireOwner(principal, 'delete their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId, mid } = parseOrThrow(
@@ -668,7 +655,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   app.put('/dogs/:id/feeding', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    requireOwner(principal, 'edit');
+    requireOwner(principal, 'edit their dogs');
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const { id: dogId } = parseOrThrow(paramsSchema, request.params, 'dog id');

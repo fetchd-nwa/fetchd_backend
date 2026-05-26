@@ -1,4 +1,4 @@
-import { and, eq, inArray, ne } from 'drizzle-orm';
+import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { bookingDogs, bookings } from '../schema/schema.js';
 import { live } from '../softExpire.js';
@@ -43,6 +43,19 @@ export interface BookingRow {
   trainerStaffId: string | null;
 }
 
+/**
+ * Full row with `ownerId` and `cancelDeadlineAt` — fields the route layer
+ * needs for cross-owner defense + cancel-window math, but the public wire
+ * shape doesn't carry. Day-13 cancel txn reads this projection.
+ */
+export interface BookingFullRow extends BookingRow {
+  ownerId: string;
+  leadDogId: string;
+  cancelDeadlineAt: string | null;
+  cohortId: string | null;
+  expiredAt: string | null;
+}
+
 /** A `booking_dogs` join row — lead + additional per booking. */
 export interface BookingDogJoinRow {
   bookingId: string;
@@ -68,6 +81,15 @@ const BOOKING_PROJECTION = {
   cancelForfeited: bookings.cancelForfeited,
   pickupAt: bookings.pickupAt,
   trainerStaffId: bookings.trainerStaffId,
+} as const;
+
+const BOOKING_FULL_PROJECTION = {
+  ...BOOKING_PROJECTION,
+  ownerId: bookings.ownerId,
+  leadDogId: bookings.leadDogId,
+  cancelDeadlineAt: bookings.cancelDeadlineAt,
+  cohortId: bookings.cohortId,
+  expiredAt: bookings.expiredAt,
 } as const;
 
 export const bookingsRepository = {
@@ -224,5 +246,77 @@ export const bookingsRepository = {
     ];
     await tx.insert(bookingDogs).values(dogRows);
     return bookingRow;
+  },
+
+  // -------------------------------------------------------------------
+  // Day 13 — cancel path. `lockById` + `findFullByIdInTx` give the
+  // cancel route the row-lock + ownership/state checks it needs;
+  // `markCancelled` performs the soft-cancel write (no row delete).
+  // -------------------------------------------------------------------
+
+  /**
+   * Row-lock a booking for the duration of the transaction. Concurrent
+   * cancel attempts on the same booking serialize here. Returns the
+   * locked row (full projection: includes `ownerId`, `cancelDeadlineAt`,
+   * `cohortId` — the cancel txn needs all three for owner/state checks
+   * and the capacity-release branch).
+   *
+   * `undefined` if the id doesn't exist. Mirrors
+   * `requestsRepository.lockById` — soft-expire is NOT filtered here;
+   * the caller decides the semantic for an expired row (the cancel
+   * route treats `expiredAt IS NOT NULL` as 404, same as not-found).
+   */
+  async lockById(tx: Tx, id: string): Promise<BookingFullRow | undefined> {
+    const [row] = await tx
+      .select(BOOKING_FULL_PROJECTION)
+      .from(bookings)
+      .where(eq(bookings.id, id))
+      .for('update');
+    return row;
+  },
+
+  /**
+   * Re-read the full row inside the tx after a mutation, so the route
+   * can wire back the post-cancel shape (status='cancelled',
+   * cancelledAt set, cancelForfeited resolved). No `live()` filter —
+   * mirrors `lockById`'s "existence-by-id" semantic; the route already
+   * decided liveness when it locked the row.
+   */
+  async findFullByIdInTx(tx: Tx, id: string): Promise<BookingFullRow | undefined> {
+    const [row] = await tx
+      .select(BOOKING_FULL_PROJECTION)
+      .from(bookings)
+      .where(eq(bookings.id, id))
+      .limit(1);
+    return row;
+  },
+
+  /**
+   * Soft-cancel one booking. Sets `status='cancelled'`, `cancelledAt =
+   * now()`, and `cancelForfeited` per the per-row deadline check. The
+   * `cancellation_reason` text column is reserved for a future Day-14+
+   * surface (owner cancel-reason picker, staff "force cancel" reason);
+   * Day-13 leaves it NULL.
+   *
+   * `cancelForfeited` is computed in SQL against `cancel_deadline_at`
+   * (`now() > cancel_deadline_at`). Doing the check in SQL means a
+   * deadline of NULL — possible on legacy-import rows pre-Day-10 —
+   * coerces to `cancel_forfeited = false` (NULL > anything is NULL,
+   * COALESCEd to false). Defensible behavior: a missing deadline can't
+   * be enforced, so treat the cancel as in-window.
+   *
+   * No `expired_at` write — DATA-CONTRACT §A2 "never DELETE" applies:
+   * cancellation is a status flip, not a row-expire. Audit row captures
+   * the prior status.
+   */
+  async markCancelled(tx: Tx, id: string): Promise<void> {
+    await tx
+      .update(bookings)
+      .set({
+        status: 'cancelled',
+        cancelledAt: sql`now()`,
+        cancelForfeited: sql`COALESCE(now() > ${bookings.cancelDeadlineAt}, false)`,
+      })
+      .where(eq(bookings.id, id));
   },
 };

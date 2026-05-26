@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { computeCancelDeadline, freeCancelHoursBefore } from '../src/lib/cancelWindow.js';
+import { computeCancelDeadline, defaultFreeCancelHoursBefore } from '../src/lib/cancelWindow.js';
 
-// Day 10: per-category cancel windows are LOCKED API logic (DATA-CONTRACT
-// §I lines 682-696). The math is pure UTC offset so DST never silently
-// shifts a "24 hour" promise to 23h or 25h. These tests pin both the
-// per-category numbers and the timezone-invariant arithmetic.
+// Day 10 locked the per-category cancel-window API logic (DATA-CONTRACT
+// §I lines 682-696). Day 13 (2026-05-26) moved the ACTIVE policy to the
+// `cancel_window_settings` DB table — owner-tunable from the staff
+// portal — so the values exercised here are now the per-category
+// FALLBACK defaults, not the live policy. The fallbacks still pin the
+// timezone-invariant arithmetic + the DST-no-drift contract.
 
 const HOUR_MS = 3_600_000;
 
@@ -22,7 +24,7 @@ test('day-care free cancel = 24h (same as day-school)', () => {
 });
 
 test('private-lesson free cancel = 24h', () => {
-  assert.equal(freeCancelHoursBefore('private-lesson'), 24);
+  assert.equal(defaultFreeCancelHoursBefore('private-lesson'), 24);
 });
 
 test('group-class free cancel = 48h (cohort capacity reserved)', () => {
@@ -44,7 +46,7 @@ test('board-and-train free cancel = 168h / 7 days (multi-week commit)', () => {
 });
 
 test('evaluation free cancel = 24h', () => {
-  assert.equal(freeCancelHoursBefore('evaluation'), 24);
+  assert.equal(defaultFreeCancelHoursBefore('evaluation'), 24);
 });
 
 test('cancel deadline crosses spring-forward: 24 REAL hours, not 23 wall hours', () => {

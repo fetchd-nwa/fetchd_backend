@@ -1,8 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import type { StaffRole } from '../auth/principal.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { requireStaff } from '../lib/principalNarrows.js';
 import {
   requestsRepository,
   type PendingRequestFullRow,
@@ -11,7 +11,8 @@ import { notificationsRepository } from '../db/repositories/notificationsReposit
 import { locationKey } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
-import { computeCancelDeadline } from '../lib/cancelWindow.js';
+import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
+import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
@@ -107,7 +108,7 @@ export function registerStaffRequestsRoute(
     { preHandler: [authHook] },
     async (request, reply): Promise<PendingRequestWire> => {
       const principal = requirePrincipal(request);
-      requireStaff(principal, 'approve');
+      requireStaff(principal, 'approve pending requests');
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(approveBodySchema, request.body ?? {}, 'body');
@@ -157,7 +158,8 @@ export function registerStaffRequestsRoute(
               category: row.category,
             });
 
-            const cancelDeadlineAt = computeCancelDeadline(row.category, parsed.scheduledAt);
+            const hours = await cancelWindowSettingsRepository.resolveHoursFor(row.category, tx);
+            const cancelDeadlineAt = computeCancelDeadlineFromHours(parsed.scheduledAt, hours);
             const inserted = await insertBookingWithGateMapping(tx, {
               ownerId: row.ownerId,
               leadDogId: row.leadDogId,
@@ -224,7 +226,7 @@ export function registerStaffRequestsRoute(
     { preHandler: [authHook] },
     async (request): Promise<PendingRequestWire> => {
       const principal = requirePrincipal(request);
-      requireStaff(principal, 'deny');
+      requireStaff(principal, 'deny pending requests');
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(denyBodySchema, request.body ?? {}, 'body');
@@ -264,22 +266,6 @@ export function registerStaffRequestsRoute(
       return outcome.body;
     },
   );
-}
-
-// ---- principal narrow -----------------------------------------------
-
-/**
- * Narrow the principal to staff for the portal verbs. Action union
- * extends the Day-9b `'edit' | 'delete'` set; if a fourth route
- * surfaces the helper should move to `lib/principalNarrows.ts`.
- */
-function requireStaff(
-  principal: ReturnType<typeof requirePrincipal>,
-  action: 'approve' | 'deny',
-): asserts principal is { kind: 'staff'; staffId: string; role: StaffRole; supabaseUid: string } {
-  if (principal.kind !== 'staff') {
-    throw new ApiError('forbidden', `only staff may ${action} pending requests`);
-  }
 }
 
 // ---- body validation -------------------------------------------------

@@ -1428,6 +1428,31 @@ export async function seedFixture(): Promise<void> {
   ]);
 }
 
+/**
+ * Top up a fixture dog with `amount` extra credits of `mode`. Promoted
+ * to the shared fixture at Day 13 (rule-of-three: booking-create +
+ * evaluation-gate + bookings-cancel all need it for the credit-paid
+ * paths). The reason field is `'purchase'`, mirroring how Day-14
+ * package-purchase will write rows; `note` carries a unique tag so
+ * accumulating top-ups across tests are visible in audit_log if
+ * something goes sideways.
+ */
+export async function topUpCredits(
+  dogId: string,
+  mode: 'school' | 'daycare',
+  amount: number,
+): Promise<void> {
+  const { creditLedger } = await import('../../src/db/schema/schema.js');
+  const { randomUUID } = await import('node:crypto');
+  await db.insert(creditLedger).values({
+    dogId,
+    mode,
+    delta: amount,
+    reason: 'purchase',
+    note: `Test top-up ${randomUUID()}`,
+  });
+}
+
 export async function teardownFixture(): Promise<void> {
   // Day-7b: notifications + announcements. notification_dogs cascades on
   // notifications delete (ON DELETE CASCADE FK). notifications cascades on
@@ -1488,6 +1513,15 @@ export async function teardownFixture(): Promise<void> {
   // → groupClasses. (credit_ledger.booking_id references bookings; bookings.
   // cohort_id references cohorts; classPrereqOptions.class_key and
   // cohorts.class_key both reference groupClasses.)
+  // Day-13: refunds + charges both reference bookings via FK. Tests
+  // (money-back cancel branch) seed `charges` rows attached to the
+  // fixture owner's bookings, and the cancel txn appends `refunds`
+  // rows. Both must be deleted before bookings or the bookings delete
+  // FK-violates and the after-hook hangs the process via stuck Redis
+  // connections (earned 2026-05-26).
+  const { refunds, charges } = await import('../../src/db/schema/schema.js');
+  await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
+  await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   await db
     .delete(creditLedger)
     .where(inArray(creditLedger.dogId, [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]));

@@ -4,12 +4,16 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { withCapacityLocks, withDogModeLocks } from '../db/locks.js';
 import { bookingsRepository, type BookingRow } from '../db/repositories/bookingsRepository.js';
+import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
+import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
+import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
+import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
 import { locationKey } from '../db/schema/schema.js';
-import { isInView } from '../lib/bookingBucket.js';
+import { isInView, type ServiceCategory } from '../lib/bookingBucket.js';
 import { insufficientCreditsError, type CreditGap } from '../lib/bookingErrors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
@@ -24,9 +28,10 @@ import {
   type DayProgramCategory,
 } from '../lib/bookingSchedule.js';
 import { groupBookingDogs, toBookingWire, type BookingWire } from '../lib/bookingWire.js';
-import { computeCancelDeadline } from '../lib/cancelWindow.js';
+import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
+import { requireOwner } from '../lib/principalNarrows.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
@@ -288,7 +293,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
     { preHandler: [authHook] },
     async (request, reply): Promise<BookingWire[]> => {
       const principal = requirePrincipal(request);
-      requireOwner(principal, 'create');
+      requireOwner(principal, 'create a booking');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postBookingBodySchema, request.body, 'body');
       const parsed = validateBookingBody(body, nowFactory());
@@ -354,7 +359,16 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                   date,
                   parsed.dropoff,
                 );
-                const cancelDeadlineAt = computeCancelDeadline(parsed.category, scheduledAt);
+                // Resolve the active free-cancel hours from `cancel_window_
+                // settings` (Day 13 — staff-tunable from the portal). The
+                // resolved deadline is stamped on the row at creation; a
+                // later policy change does NOT retroactively re-stamp
+                // existing bookings.
+                const hours = await cancelWindowSettingsRepository.resolveHoursFor(
+                  parsed.category,
+                  tx,
+                );
+                const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAt, hours);
 
                 const inserted = await insertBookingWithGateMapping(tx, {
                   ownerId: principal.ownerId,
@@ -394,6 +408,168 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           );
 
           return { status: 201, body: bookingsWire };
+        },
+      );
+
+      reply.code(outcome.status);
+      return outcome.body;
+    },
+  );
+
+  // --- POST /bookings/:id/cancel -----------------------------------------
+  //
+  // Day 13 owner-self cancel (schema.sql `cancelBooking` txn-contract).
+  // Three outcome branches:
+  //
+  //   1. FORFEIT — `now > cancel_deadline_at`. `cancel_forfeited=true`;
+  //      no credit refund, no money refund, capacity still released via
+  //      the status flip.
+  //   2. CREDIT-BACK — within window, booking was credit-paid (one or
+  //      more `credit_ledger` 'booking-debit' rows exist). One +1
+  //      'cancel-refund' row inserted per debit; balance recomputes.
+  //   3. MONEY-BACK — within window, booking was money-paid (succeeded
+  //      `charges` row exists). A `refunds` row inserted at 'pending';
+  //      the Stripe refund API call is queued post-commit (Day 14
+  //      wires the real seam; Day 13 is the DB-side substrate).
+  //
+  // A booking that's neither credit-paid nor money-paid (free service,
+  // e.g. evaluation) within-window cancel just flips status — no
+  // ledger or refund row. Forfeited cancels of free services do the
+  // same. Either way, the booking-cancelled notification fires.
+  //
+  // Capacity release: day-school / day-care use dynamic counting
+  // (`assertCapacityWithinLock` excludes `status='cancelled'` rows),
+  // so flipping the status IS the release — no decrement call. Other
+  // categories carry no day_capacity counter.
+  //
+  // Group-class is NOT supported by this endpoint — those bookings
+  // are tied to a cohort row's `filled` counter that increments per
+  // dog (not per per-week booking), so the right verb is "withdraw
+  // dog from cohort" (deferred Day-11 sibling). Group-class cancel
+  // attempts surface 422 with a typed message.
+  app.post(
+    '/bookings/:id/cancel',
+    { preHandler: [authHook] },
+    async (request, reply): Promise<BookingWire> => {
+      const principal = requirePrincipal(request);
+      requireOwner(principal, 'cancel a booking');
+      const { id } = parseUuidParam(request.params);
+      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+
+      const outcome = await withMutation<BookingWire>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /bookings/:id/cancel',
+          requestHash: hashRequestBody({ id }),
+          // Day-13 cache invalidation: drop the per-location availability
+          // range cache so the freed seat surfaces in the next /availability
+          // read. Booking reads themselves aren't cached today.
+          patternsToInvalidate: (body) =>
+            body.location !== undefined && body.location !== null
+              ? [`avail:${body.location}:*`]
+              : [],
+        },
+        async (tx) => {
+          // 1. Row-lock the booking. Serializes concurrent cancel
+          //    attempts (same shape Day-12 used for pending_requests).
+          const row = await bookingsRepository.lockById(tx, id);
+          // 404 for the same response shape whether the row doesn't
+          // exist OR doesn't belong to the principal — ids don't
+          // enumerate across owners.
+          if (row === undefined || row.expiredAt !== null || row.ownerId !== principal.ownerId) {
+            throw new ApiError('not_found', `booking ${id} not found`);
+          }
+          // 409 on already-cancelled — idempotency catches a replay
+          // with the same key, this catches a state race or a
+          // re-tap with a new key.
+          if (row.status === 'cancelled') {
+            throw new ApiError('conflict', `booking ${id} is already cancelled`);
+          }
+          // 422 on group-class — see header comment.
+          if (row.category === 'group-class') {
+            throw new ApiError(
+              'invalid_payload',
+              'group-class bookings cancel via cohort withdraw — not yet implemented',
+            );
+          }
+
+          // 2. Soft-cancel. `cancelForfeited` is computed in SQL
+          //    against `cancel_deadline_at`; the resolved value lands
+          //    on the row on commit.
+          await bookingsRepository.markCancelled(tx, id);
+
+          // 3. Re-read the post-update row so the refund branch reads
+          //    the resolved `cancelForfeited` (not the pre-update
+          //    snapshot). Same shape Day-12 used after request
+          //    state-machine transitions.
+          const updated = await bookingsRepository.findFullByIdInTx(tx, id);
+          if (updated === undefined) {
+            throw new Error(`POST /bookings/${id}/cancel: row vanished after mark-cancelled`);
+          }
+
+          // 4. Refund branching — only within the window.
+          if (!updated.cancelForfeited) {
+            const debits = await creditLedgerRepository.findDebitsForBooking(tx, id);
+            if (debits.length > 0) {
+              // CREDIT-BACK: one +1 refund row per original debit.
+              for (const debit of debits) {
+                await creditLedgerRepository.refundForBooking(tx, {
+                  dogId: debit.dogId,
+                  mode: debit.mode,
+                  bookingId: id,
+                });
+              }
+            } else {
+              const charge = await chargesRepository.findSucceededForBooking(tx, id);
+              if (charge !== undefined) {
+                // MONEY-BACK: refunds row at 'pending'; Stripe API call
+                // is Day-14's seam. The cumulative-refund rule (refunds
+                // ≤ charge amount) is enforced here API-side.
+                const alreadyRefunded = await refundsRepository.sumNonFailedForCharge(
+                  tx,
+                  charge.id,
+                );
+                const maxRefund = charge.amountCents - alreadyRefunded;
+                if (maxRefund > 0) {
+                  await refundsRepository.createPending(tx, {
+                    ownerId: row.ownerId,
+                    chargeId: charge.id,
+                    bookingId: id,
+                    amountCents: maxRefund,
+                    reason: 'cancel',
+                  });
+                }
+              }
+              // Else: neither credit-paid nor money-paid (free service,
+              // e.g. eval). No ledger or refund row; the status flip
+              // is the full effect.
+            }
+          }
+          // Forfeited branch: no refund of any kind.
+
+          // 5. Enqueue the booking-cancelled notification. Dog ids come
+          //    from booking_dogs (joined at notification time so the
+          //    bell row's chips show the right dogs). booking_dogs rows
+          //    were committed at Day-10 creation; visible to the pool
+          //    read inside this tx.
+          const dogJoinRows = await bookingsRepository.findDogsByBookingIds([id]);
+          const dogIds = dogJoinRows.map((r) => r.dogId);
+          await notificationsRepository.enqueue(tx, {
+            ownerId: row.ownerId,
+            type: 'booking-cancelled',
+            title: 'Booking cancelled',
+            body: cancellationBody(row.category, row.scheduledAt, updated.cancelForfeited),
+            deepLinkPath: `/bookings/${id}`,
+            dogIds,
+          });
+
+          // 6. Wire the updated row for the response.
+          const [wire] = await wireBookings([updated]);
+          if (wire === undefined) {
+            throw new Error(`POST /bookings/${id}/cancel: wire assembly returned no row`);
+          }
+          return { status: 200, body: wire };
         },
       );
 
@@ -465,21 +641,6 @@ async function wireBookings(rows: BookingRow[]): Promise<BookingWire[]> {
 // =========================================================================
 // Day 10 POST /bookings helpers
 // =========================================================================
-
-/**
- * Narrow the principal to owner. POST /bookings is owner-only — staff
- * portal bookings are a Day-19 verb at `/staff/bookings`. The `asserts`
- * predicate narrows the static type at the call site so subsequent
- * `principal.ownerId` reads compile without a cast.
- */
-function requireOwner(
-  principal: ReturnType<typeof requirePrincipal>,
-  action: 'create',
-): asserts principal is { kind: 'owner'; ownerId: string; supabaseUid: string } {
-  if (principal.kind !== 'owner') {
-    throw new ApiError('forbidden', `only owners may ${action} a booking`);
-  }
-}
 
 /**
  * Validated, derived form of the request body. `parseOrThrow` handles
@@ -578,4 +739,47 @@ function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBooking
 function parseDateUtcMs(dateStr: string): number {
   const [y, m, d] = dateStr.split('-').map(Number);
   return Date.UTC(y!, m! - 1, d!);
+}
+
+// =========================================================================
+// Day 13 POST /bookings/:id/cancel helpers
+// =========================================================================
+
+/**
+ * Notification body for the booking-cancelled push. Mirrors
+ * `staffRequests.notificationBodyFor` for the confirmed counterpart;
+ * brief, category-aware, mentions the forfeit state when applicable so
+ * the owner doesn't have to dig into the booking detail to learn the
+ * refund didn't land.
+ *
+ * The deep link path lives in the enqueue call; this helper produces
+ * only the body string.
+ */
+function cancellationBody(
+  category: ServiceCategory,
+  scheduledAtIso: string,
+  forfeited: boolean,
+): string {
+  const when = new Date(scheduledAtIso).toLocaleDateString('en-US', {
+    timeZone: 'America/Chicago',
+    month: 'short',
+    day: 'numeric',
+  });
+  const noun =
+    category === 'boarding'
+      ? `boarding stay starting ${when}`
+      : category === 'board-and-train'
+        ? `board & train starting ${when}`
+        : category === 'private-lesson'
+          ? `private lesson on ${when}`
+          : category === 'day-school'
+            ? `day school on ${when}`
+            : category === 'day-care'
+              ? `day care on ${when}`
+              : category === 'evaluation'
+                ? `evaluation on ${when}`
+                : `session on ${when}`;
+  return forfeited
+    ? `Your ${noun} is cancelled. The cancellation window has passed — no refund.`
+    : `Your ${noun} is cancelled. Refund is on the way.`;
 }

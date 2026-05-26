@@ -14,7 +14,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -98,24 +98,6 @@ function futureWeekday(nth: number): string {
  * across prior tests in the same file. */
 async function clearCreditLedger(dogId: string): Promise<void> {
   await db.delete(creditLedger).where(eq(creditLedger.dogId, dogId));
-}
-
-/** Top up a fixture dog with `amount` extra credits of `mode` so a
- * specific test has enough headroom for its debits. Multiple top-ups
- * accumulate; tests deliberately add fresh credits rather than rely on
- * prior-test leftovers. */
-async function topUpCredits(
-  dogId: string,
-  mode: 'school' | 'daycare',
-  amount: number,
-): Promise<void> {
-  await db.insert(creditLedger).values({
-    dogId,
-    mode,
-    delta: amount,
-    reason: 'purchase',
-    note: `Day-10 test top-up ${randomUUID()}`,
-  });
 }
 
 /** Build a Fastify app with the bookings route registered + the
@@ -277,9 +259,14 @@ test(
 );
 
 test(
-  'POST /bookings — sets cancel_deadline_at = scheduledAt - 24h (day-school)',
+  'POST /bookings — stamps cancel_deadline_at from active cancel_window_settings policy (seeded 48h flat)',
   SKIP_WHEN_NO_DB,
   async () => {
+    // Day 13 moved the active policy to the cancel_window_settings DB
+    // table, seeded at 48h flat across all categories. The route reads
+    // it via cancelWindowSettingsRepository.resolveHoursFor() at booking
+    // creation and stamps the resolved deadline on the row. A test that
+    // tunes the policy then booked would see its tuned value land here.
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     const { app } = bookingApp();
     const date = futureDate(14);
@@ -305,7 +292,7 @@ test(
       .where(eq(bookingsTable.id, body[0]!.id));
     assert.ok(row);
     const delta = new Date(row.scheduledAt).getTime() - new Date(row.cancelDeadlineAt!).getTime();
-    assert.equal(delta, 24 * 60 * 60 * 1000);
+    assert.equal(delta, 48 * 60 * 60 * 1000);
   },
 );
 

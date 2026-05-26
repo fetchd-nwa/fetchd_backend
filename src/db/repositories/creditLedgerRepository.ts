@@ -88,4 +88,55 @@ export const creditLedgerRepository = {
       .where(and(eq(creditLedger.dogId, dogId), eq(creditLedger.mode, mode)));
     return row?.balance ?? null;
   },
+
+  /**
+   * Day 13 — every `booking-debit` row for one booking. Used by the cancel
+   * txn to determine (a) was this booking credit-paid? (non-empty result),
+   * and (b) which (dog, mode) pairs to credit back, one per debit row.
+   *
+   * Multi-dog day-school + day-care bookings produced N debit rows (one
+   * per dog). Multi-DATE bookings live as separate booking rows (Day 10
+   * iterates per date), so this function reads only the debits for THIS
+   * single booking_id.
+   *
+   * Append-only — no `live()` filter. The credit_ledger has no expired_at.
+   */
+  async findDebitsForBooking(
+    tx: Tx,
+    bookingId: string,
+  ): Promise<{ dogId: string; mode: BookingMode }[]> {
+    return tx
+      .select({
+        dogId: creditLedger.dogId,
+        mode: creditLedger.mode,
+      })
+      .from(creditLedger)
+      .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'booking-debit')));
+  },
+
+  /**
+   * Day 13 — INSERT one +1 `cancel-refund` row to reverse a prior
+   * `booking-debit`. Append-only: the original debit row stays, the
+   * refund row counterbalances it, so the dog's balance recomputes to
+   * its pre-booking value via `SUM(delta)`. Audit trail captures both.
+   *
+   * One row per (dog, mode) pair from the original debits — multi-dog
+   * bookings need N refund rows. Caller iterates `findDebitsForBooking`.
+   */
+  async refundForBooking(
+    tx: Tx,
+    args: {
+      dogId: string;
+      mode: BookingMode;
+      bookingId: string;
+    },
+  ): Promise<void> {
+    await tx.insert(creditLedger).values({
+      dogId: args.dogId,
+      mode: args.mode,
+      delta: 1,
+      reason: 'cancel-refund',
+      bookingId: args.bookingId,
+    });
+  },
 };

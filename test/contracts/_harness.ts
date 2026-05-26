@@ -73,12 +73,21 @@ export function registerFixtureHooks(): void {
     await seedFixture();
   });
   after(async () => {
-    await teardownFixture();
-    // Node 25's `--test-isolation=process` default spawns one subprocess
-    // per test file. The ioredis socket keeps THIS subprocess's event
-    // loop alive after the tests finish, so node:test can't exit
-    // cleanly. Closing here is local to this subprocess.
-    await closeRedis();
+    // Always close Redis even if teardownFixture throws. ioredis keeps a
+    // live socket that pins the subprocess event loop; if teardown
+    // bubbles before closeRedis runs, the process hangs indefinitely
+    // (earned 2026-05-26 — a Day-13 FK violation in teardown left the
+    // booking-cancel subprocess alive for 2h+ instead of failing
+    // cleanly). try/finally guarantees the close.
+    try {
+      await teardownFixture();
+    } finally {
+      // Node 25's `--test-isolation=process` default spawns one subprocess
+      // per test file. The ioredis socket keeps THIS subprocess's event
+      // loop alive after the tests finish, so node:test can't exit
+      // cleanly. Closing here is local to this subprocess.
+      await closeRedis();
+    }
   });
 }
 

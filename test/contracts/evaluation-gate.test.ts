@@ -18,7 +18,7 @@ import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
 import { registerStaffRequestsRoute } from '../../src/routes/staffRequests.js';
 import type { Principal } from '../../src/auth/principal.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -90,22 +90,6 @@ function futureWeekday(nth: number): string {
     }
     offset += 1;
   }
-}
-
-/** Top up a fixture dog with `amount` extra credits of `mode`. */
-async function topUpCredits(
-  dogId: string,
-  mode: 'school' | 'daycare',
-  amount: number,
-): Promise<void> {
-  const { creditLedger } = await import('../../src/db/schema/schema.js');
-  await db.insert(creditLedger).values({
-    dogId,
-    mode,
-    delta: amount,
-    reason: 'purchase',
-    note: `Day-12b eval test top-up ${randomUUID()}`,
-  });
 }
 
 /** Flip a dog's evaluation_status for the duration of `body`, restoring

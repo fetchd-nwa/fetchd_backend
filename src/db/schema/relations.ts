@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm/relations";
-import { owners, dogs, staff, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, cohorts, reports, mediaAssets, bookings, afterSchoolOptins, pendingRequests, creditLedger, creditPackages, charges, stripeCustomers, paymentMethods, invoices, memberships, agreementSignatures, agreementDocuments, refunds, idempotencyKeys, threads, notifications, messages, eventSeries, events, eventRsvps, scheduledNotifications, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, bookingDogs } from "./schema.js";
+import { owners, dogs, staff, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, cohorts, reports, mediaAssets, bookings, afterSchoolOptins, pendingRequests, cancelWindowSettings, creditLedger, creditPackages, charges, paymentMethods, stripeCustomers, invoices, memberships, agreementSignatures, agreementDocuments, refunds, idempotencyKeys, threads, notifications, messages, eventSeries, events, eventRsvps, scheduledNotifications, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, bookingDogs } from "./schema.js";
 
 export const dogsRelations = relations(dogs, ({one, many}) => ({
 	owner: one(owners, {
@@ -39,8 +39,8 @@ export const ownersRelations = relations(owners, ({many}) => ({
 	bookings: many(bookings),
 	afterSchoolOptins: many(afterSchoolOptins),
 	pendingRequests: many(pendingRequests),
-	stripeCustomers: many(stripeCustomers),
 	paymentMethods: many(paymentMethods),
+	stripeCustomers: many(stripeCustomers),
 	charges: many(charges),
 	invoices: many(invoices),
 	memberships: many(memberships),
@@ -60,6 +60,7 @@ export const staffRelations = relations(staff, ({many}) => ({
 	reports: many(reports),
 	bookings: many(bookings),
 	pendingRequests: many(pendingRequests),
+	cancelWindowSettings: many(cancelWindowSettings),
 	threads: many(threads),
 	notifications: many(notifications),
 	messages: many(messages),
@@ -246,6 +247,13 @@ export const pendingRequestsRelations = relations(pendingRequests, ({one, many})
 	pendingRequestPreferredDates: many(pendingRequestPreferredDates),
 }));
 
+export const cancelWindowSettingsRelations = relations(cancelWindowSettings, ({one}) => ({
+	staff: one(staff, {
+		fields: [cancelWindowSettings.updatedByStaffId],
+		references: [staff.id]
+	}),
+}));
+
 export const creditLedgerRelations = relations(creditLedger, ({one}) => ({
 	dog: one(dogs, {
 		fields: [creditLedger.dogId],
@@ -283,19 +291,19 @@ export const chargesRelations = relations(charges, ({one, many}) => ({
 	refunds: many(refunds),
 }));
 
-export const stripeCustomersRelations = relations(stripeCustomers, ({one}) => ({
-	owner: one(owners, {
-		fields: [stripeCustomers.ownerId],
-		references: [owners.id]
-	}),
-}));
-
 export const paymentMethodsRelations = relations(paymentMethods, ({one, many}) => ({
 	owner: one(owners, {
 		fields: [paymentMethods.ownerId],
 		references: [owners.id]
 	}),
 	invoices: many(invoices),
+}));
+
+export const stripeCustomersRelations = relations(stripeCustomers, ({one}) => ({
+	owner: one(owners, {
+		fields: [stripeCustomers.ownerId],
+		references: [owners.id]
+	}),
 }));
 
 export const invoicesRelations = relations(invoices, ({one}) => ({

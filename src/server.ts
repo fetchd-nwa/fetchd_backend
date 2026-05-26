@@ -20,6 +20,7 @@ import { registerRatesRoute } from './routes/rates.js';
 import { registerReportsRoute } from './routes/reports.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
+import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
 import { registerThreadsRoute } from './routes/threads.js';
 import { registerVetsRoute } from './routes/vets.js';
@@ -53,6 +54,7 @@ export function buildApp(): FastifyInstance {
   registerRatesRoute(app); // [auth] — catalog (owner + staff)
   registerRequestsRoute(app); // [auth] — owner-only
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny)
+  registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
   registerGroupClassesRoute(app); // [auth] — catalogs (owner+staff); eligibility owner-only
   registerReportsRoute(app); // [auth] — owner-only (scoped via dog FK)
   registerThreadsRoute(app); // [auth] — owner-only

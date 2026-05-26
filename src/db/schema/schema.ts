@@ -523,6 +523,22 @@ export const pendingRequests = pgTable("pending_requests", {
 	}
 });
 
+export const cancelWindowSettings = pgTable("cancel_window_settings", {
+	category: serviceCategory().primaryKey().notNull(),
+	hoursBefore: integer("hours_before").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		cancelWindowSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "cancel_window_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+		cancelWindowSettingsHoursBeforeCheck: check("cancel_window_settings_hours_before_check", sql`hours_before > 0`),
+	}
+});
+
 export const creditLedger = pgTable("credit_ledger", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	dogId: uuid("dog_id").notNull(),
@@ -575,21 +591,6 @@ export const creditPackages = pgTable("credit_packages", {
 	}
 });
 
-export const stripeCustomers = pgTable("stripe_customers", {
-	ownerId: uuid("owner_id").primaryKey().notNull(),
-	stripeCustomerId: text("stripe_customer_id").notNull(),
-	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-}, (table) => {
-	return {
-		stripeCustomersOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "stripe_customers_owner_id_fkey"
-		}).onDelete("restrict"),
-		stripeCustomersStripeCustomerIdKey: unique("stripe_customers_stripe_customer_id_key").on(table.stripeCustomerId),
-	}
-});
-
 export const paymentMethods = pgTable("payment_methods", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	ownerId: uuid("owner_id").notNull(),
@@ -613,6 +614,21 @@ export const paymentMethods = pgTable("payment_methods", {
 		}).onDelete("restrict"),
 		paymentMethodsStripePaymentMethodIdKey: unique("payment_methods_stripe_payment_method_id_key").on(table.stripePaymentMethodId),
 		paymentMethodsExpMonthCheck: check("payment_methods_exp_month_check", sql`(exp_month >= 1) AND (exp_month <= 12)`),
+	}
+});
+
+export const stripeCustomers = pgTable("stripe_customers", {
+	ownerId: uuid("owner_id").primaryKey().notNull(),
+	stripeCustomerId: text("stripe_customer_id").notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		stripeCustomersOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "stripe_customers_owner_id_fkey"
+		}).onDelete("restrict"),
+		stripeCustomersStripeCustomerIdKey: unique("stripe_customers_stripe_customer_id_key").on(table.stripeCustomerId),
 	}
 });
 
@@ -758,20 +774,6 @@ export const agreementSignatures = pgTable("agreement_signatures", {
 	}
 });
 
-export const agreementDocuments = pgTable("agreement_documents", {
-	key: text().primaryKey().notNull(),
-	label: text().notNull(),
-	currentVersion: integer("current_version").notNull(),
-	required: boolean().default(true).notNull(),
-	appliesTo: serviceCategory("applies_to").array().default([]).notNull(),
-	bodyUrl: text("body_url"),
-	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
-}, (table) => {
-	return {
-		agreementDocumentsCurrentVersionCheck: check("agreement_documents_current_version_check", sql`current_version > 0`),
-	}
-});
-
 export const refunds = pgTable("refunds", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	ownerId: uuid("owner_id").notNull(),
@@ -804,6 +806,20 @@ export const refunds = pgTable("refunds", {
 		}),
 		refundsStripeRefundIdKey: unique("refunds_stripe_refund_id_key").on(table.stripeRefundId),
 		refundsAmountCentsCheck: check("refunds_amount_cents_check", sql`amount_cents > 0`),
+	}
+});
+
+export const agreementDocuments = pgTable("agreement_documents", {
+	key: text().primaryKey().notNull(),
+	label: text().notNull(),
+	currentVersion: integer("current_version").notNull(),
+	required: boolean().default(true).notNull(),
+	appliesTo: serviceCategory("applies_to").array().default([]).notNull(),
+	bodyUrl: text("body_url"),
+	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		agreementDocumentsCurrentVersionCheck: check("agreement_documents_current_version_check", sql`current_version > 0`),
 	}
 });
 

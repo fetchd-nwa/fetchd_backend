@@ -12,6 +12,7 @@ import { comfortLevel, requestStatus } from '../db/schema/schema.js';
 import { evaluationRequiredError, type UnpassedEvaluationStatus } from '../lib/bookingErrors.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
+import { requireOwner } from '../lib/principalNarrows.js';
 import { pgTimestampToDate, pgTimestampToIso } from '../lib/pgTimestamp.js';
 import {
   groupRequestDogs,
@@ -221,7 +222,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
     { preHandler: [authHook] },
     async (request, reply): Promise<PendingRequestWire> => {
       const principal = requirePrincipal(request);
-      requireOwner(principal, 'submit');
+      requireOwner(principal, 'submit a request');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postRequestBodySchema, request.body, 'body');
       const parsed = validatePostRequestBody(body);
@@ -328,7 +329,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
     { preHandler: [authHook] },
     async (request): Promise<PendingRequestWire> => {
       const principal = requirePrincipal(request);
-      requireOwner(principal, 'edit');
+      requireOwner(principal, 'edit their requests');
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(patchRequestBodySchema, request.body, 'body');
@@ -404,7 +405,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
     { preHandler: [authHook] },
     async (request): Promise<PendingRequestWire> => {
       const principal = requirePrincipal(request);
-      requireOwner(principal, 'cancel');
+      requireOwner(principal, 'cancel their requests');
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
@@ -462,31 +463,6 @@ function parseUuidParam(params: unknown): { id: string } {
     throw new ApiError('bad_request', `invalid path: ${formatZodIssues(parsed.error)}`);
   }
   return parsed.data;
-}
-
-// ---- principal narrows ----------------------------------------------
-
-/**
- * Narrow the principal to owner. Same shape as `routes/bookings.ts:
- * requireOwner` and `routes/enrollments.ts:requireOwner` — three
- * literal-union actions today (`'create'` / `'enroll'` / `'submit'` /
- * `'edit'` / `'cancel'`); extract to `lib/principalNarrows.ts` when a
- * fourth route surfaces. The action narrows the message at the call
- * site so a typo can't silently land.
- */
-function requireOwner(
-  principal: ReturnType<typeof requirePrincipal>,
-  action: 'submit' | 'edit' | 'cancel',
-): asserts principal is { kind: 'owner'; ownerId: string; supabaseUid: string } {
-  if (principal.kind !== 'owner') {
-    const verb =
-      action === 'submit'
-        ? 'submit a request'
-        : action === 'edit'
-          ? 'edit their requests'
-          : 'cancel their requests';
-    throw new ApiError('forbidden', `only owners may ${verb}`);
-  }
 }
 
 // ---- body validation -------------------------------------------------
