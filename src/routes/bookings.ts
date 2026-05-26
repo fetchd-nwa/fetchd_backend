@@ -33,6 +33,7 @@ import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
+import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -155,11 +156,19 @@ type PostBookingBody = z.infer<typeof postBookingBodySchema>;
 
 export interface BookingsRouteOptions extends AuthRouteOptions {
   now?: () => Date;
+  /**
+   * Stripe seam (Day 14). The cancel route's money-back branch fires a
+   * post-commit `stripe.createRefund` against the prior PaymentIntent.
+   * Contract tests inject an in-memory stub; production wires
+   * `defaultStripeClient`.
+   */
+  stripe?: StripeClient;
 }
 
 export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
   const nowFactory = opts.now ?? ((): Date => new Date());
+  const stripe = opts.stripe ?? defaultStripeClient;
 
   // --- GET /bookings?view=upcoming|past ---------------------------------
   app.get('/bookings', { preHandler: [authHook] }, async (request): Promise<BookingWire[]> => {
@@ -456,6 +465,14 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
+      // Day-14: closure-captured handle for the post-commit Stripe refund.
+      // Set inside the money-back branch below; consumed AFTER the
+      // withMutation block returns. Stays undefined for forfeit / credit-
+      // back / free-service / no-prior-refunds paths.
+      let pendingStripeRefund:
+        | { refundId: string; paymentIntentId: string; amountCents: number }
+        | undefined;
+
       const outcome = await withMutation<BookingWire>(
         {
           principal,
@@ -523,22 +540,36 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             } else {
               const charge = await chargesRepository.findSucceededForBooking(tx, id);
               if (charge !== undefined) {
-                // MONEY-BACK: refunds row at 'pending'; Stripe API call
-                // is Day-14's seam. The cumulative-refund rule (refunds
-                // ≤ charge amount) is enforced here API-side.
+                // MONEY-BACK: refunds row at 'pending'. The cumulative-
+                // refund rule (refunds ≤ charge amount) is enforced
+                // here API-side. The real Stripe `refunds.create` call
+                // fires post-commit (Day-14 seam — captured into the
+                // outer closure for execution after the withMutation
+                // block returns).
                 const alreadyRefunded = await refundsRepository.sumNonFailedForCharge(
                   tx,
                   charge.id,
                 );
                 const maxRefund = charge.amountCents - alreadyRefunded;
                 if (maxRefund > 0) {
-                  await refundsRepository.createPending(tx, {
+                  const refund = await refundsRepository.createPending(tx, {
                     ownerId: row.ownerId,
                     chargeId: charge.id,
                     bookingId: id,
                     amountCents: maxRefund,
                     reason: 'cancel',
                   });
+                  if (charge.stripePaymentIntentId !== null) {
+                    pendingStripeRefund = {
+                      refundId: refund.id,
+                      paymentIntentId: charge.stripePaymentIntentId,
+                      amountCents: maxRefund,
+                    };
+                  }
+                  // Charges with NULL stripe_payment_intent_id are pre-
+                  // Day-14 / pre-Stripe-wire seeds (test fixtures). The
+                  // refunds row at 'pending' captures the intent; a
+                  // manual / Day-19 portal pass would resolve it.
                 }
               }
               // Else: neither credit-paid nor money-paid (free service,
@@ -572,6 +603,31 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           return { status: 200, body: wire };
         },
       );
+
+      // Day-14: post-commit Stripe refund (HANDOFF §4.2). Fires only on
+      // new (non-replayed) money-back cancellations; failures are logged
+      // + swallowed because the DB-side `refunds` row at 'pending' is
+      // the source of truth and the Day-15 webhook reconciles the
+      // terminal status (`charge.refund.updated`).
+      if (!outcome.replayed && pendingStripeRefund !== undefined) {
+        const refund = pendingStripeRefund;
+        try {
+          await stripe.createRefund(
+            {
+              paymentIntentId: refund.paymentIntentId,
+              amountCents: refund.amountCents,
+              reason: 'requested_by_customer',
+            },
+            `${idempotencyKey}:refund`,
+          );
+        } catch (err) {
+          process.stderr.write(
+            `[POST /bookings/${id}/cancel] post-commit Stripe refund failed ` +
+              `for refund_id=${refund.refundId} (idempotency_key=${idempotencyKey}): ` +
+              `${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+          );
+        }
+      }
 
       reply.code(outcome.status);
       return outcome.body;

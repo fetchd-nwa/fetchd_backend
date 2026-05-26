@@ -192,8 +192,12 @@ async function findById(
  * reassigned ownership (not in the current spec, but consistent with the
  * other ownership-aware repo methods) doesn't slip through the gate.
  */
-async function findOwnedExists(dogId: string, ownerId: string, tx: Tx): Promise<boolean> {
-  const [row] = await tx
+async function findOwnedExists(
+  dogId: string,
+  ownerId: string,
+  runner: Runner = db,
+): Promise<boolean> {
+  const [row] = await runner
     .select({ exists: sql<boolean>`true` })
     .from(dogs)
     .where(and(eq(dogs.id, dogId), eq(dogs.ownerId, ownerId), live(dogs)))

@@ -14,6 +14,7 @@ import {
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { FIXTURE_IDS, FIXTURE_NOW, topUpCredits } from './_fixture.js';
+import { makeStripeStub } from './_stripeStub.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -82,10 +83,12 @@ function realFutureWeekday(nth: number): string {
 
 function cancelApp(principal = FIXTURE_OWNER_PRINCIPAL): {
   app: ReturnType<typeof makeContractApp>['app'];
+  stripe: ReturnType<typeof makeStripeStub>;
 } {
   const { app, authenticate } = makeContractApp(principal);
-  registerBookingsRoute(app, { authenticate, now: FIXTURE_NOW });
-  return { app };
+  const stripe = makeStripeStub();
+  registerBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe });
+  return { app, stripe };
 }
 
 async function postCancel(opts: {
@@ -389,6 +392,98 @@ test(
       .where(and(eq(refunds.bookingId, bookingId), eq(refunds.status, 'pending')));
     assert.equal(cancelRefundRows.length, 1);
     assert.equal(cancelRefundRows[0]!.amountCents, 7000, 'remaining = 10000 - 3000 prior');
+  },
+);
+
+test(
+  'POST /bookings/:id/cancel — money-back fires post-commit Stripe refund (Day-14 seam)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
+    const bookingId = await seedRawBooking({
+      category: 'private-lesson',
+      scheduledAt,
+      cancelDeadlineAt,
+      location: null,
+    });
+    await seedSucceededCharge({ bookingId, amountCents: 12_345 });
+
+    const { app, stripe } = cancelApp();
+    const res = await postCancel({
+      app,
+      bookingId,
+      idempotencyKey: `cn-money-stripe-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+
+    const refundCalls = stripe.calls.filter((c) => c.method === 'createRefund');
+    assert.equal(refundCalls.length, 1, 'post-commit Stripe refund fired exactly once');
+    const args = refundCalls[0]!.args as { paymentIntentId: string; amountCents: number };
+    assert.equal(args.amountCents, 12_345);
+    assert.match(args.paymentIntentId, /^pi_test_/);
+  },
+);
+
+test(
+  'POST /bookings/:id/cancel — money-back: Stripe refund failure is swallowed (DB refund row persists)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
+    const bookingId = await seedRawBooking({
+      category: 'private-lesson',
+      scheduledAt,
+      cancelDeadlineAt,
+      location: null,
+    });
+    await seedSucceededCharge({ bookingId, amountCents: 5_000 });
+
+    const { app, stripe } = cancelApp();
+    stripe.throwOnRefund();
+    const res = await postCancel({
+      app,
+      bookingId,
+      idempotencyKey: `cn-money-stripe-fail-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, 'route still returns success — DB is source of truth');
+
+    const refundRows = await db
+      .select({ amountCents: refunds.amountCents, status: refunds.status })
+      .from(refunds)
+      .where(eq(refunds.bookingId, bookingId));
+    assert.equal(refundRows.length, 1);
+    assert.equal(refundRows[0]!.status, 'pending', 'Day-15 webhook reconciles to terminal state');
+  },
+);
+
+test(
+  'POST /bookings/:id/cancel — replay does NOT re-fire Stripe refund',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
+    const bookingId = await seedRawBooking({
+      category: 'private-lesson',
+      scheduledAt,
+      cancelDeadlineAt,
+      location: null,
+    });
+    await seedSucceededCharge({ bookingId, amountCents: 3_000 });
+
+    const { app, stripe } = cancelApp();
+    const key = `cn-money-replay-${randomUUID()}`;
+    const first = await postCancel({ app, bookingId, idempotencyKey: key });
+    assert.equal(first.statusCode, 200);
+    assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 1);
+
+    const replay = await postCancel({ app, bookingId, idempotencyKey: key });
+    assert.equal(replay.statusCode, 200);
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createRefund').length,
+      1,
+      'replay skipped the post-commit Stripe round-trip',
+    );
   },
 );
 

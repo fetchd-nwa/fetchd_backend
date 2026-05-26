@@ -139,4 +139,37 @@ export const creditLedgerRepository = {
       bookingId: args.bookingId,
     });
   },
+
+  /**
+   * Day 14 — INSERT one `purchase` row crediting a dog with the package's
+   * credit count after a Stripe charge succeeds. `delta` is positive
+   * (grant); `package_key` ties the row back to the catalog row that
+   * sourced it; `charge_id` ties it back to the charges row so the audit
+   * trail joins purchase → charge → Stripe PaymentIntent end-to-end.
+   *
+   * Called inside the POST /credit-packages/:key/purchase txn AFTER the
+   * Stripe `paymentIntents.create + confirm` returns succeeded and AFTER
+   * the `charges` INSERT lands. Multi-credit purchases produce ONE row
+   * with `delta = credits`, not N rows of `delta = 1` (the schema's
+   * `SUM(delta)` view recomputes either way; one row is cleaner audit).
+   */
+  async creditPurchase(
+    tx: Tx,
+    args: {
+      dogId: string;
+      mode: BookingMode;
+      delta: number;
+      packageKey: string;
+      chargeId: string;
+    },
+  ): Promise<void> {
+    await tx.insert(creditLedger).values({
+      dogId: args.dogId,
+      mode: args.mode,
+      delta: args.delta,
+      reason: 'purchase',
+      packageKey: args.packageKey,
+      chargeId: args.chargeId,
+    });
+  },
 };

@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { charges } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
 
@@ -10,17 +10,26 @@ import type { Tx } from '../tx.js';
  * refunds against a charge are tracked separately in the `refunds`
  * table.
  *
- * Day 13 introduces the FIRST read here — `findSucceededForBooking`
- * gives the cancel txn the charge to refund (money-back branch).
- * Future days (14 = Stripe core, 15 = webhooks) add the write path.
+ * Day 13 introduced the first read here. Day 14 adds the write path:
+ *   - `create` — INSERT after Stripe `paymentIntents.create + confirm`
+ *     returns; status mirrors what Stripe returned (`succeeded` for the
+ *     test-mode happy path; `requires_action` / `processing` for 3DS
+ *     and async-settled methods, with Day-15 webhook reconciling).
+ *   - `markSucceeded` / `markFailed` — Day-15 webhook callees; left
+ *     stubbed here so the cancel + tests can reference the contract.
  */
+
+export type ChargePurpose = 'payg' | 'package' | 'board-train' | 'membership' | 'group-class';
+export type ChargeStatus = 'requires_payment' | 'succeeded' | 'failed' | 'refunded';
 
 export interface ChargeRow {
   id: string;
   ownerId: string;
   amountCents: number;
-  status: 'requires_payment' | 'succeeded' | 'failed' | 'refunded';
+  status: ChargeStatus;
   bookingId: string | null;
+  stripePaymentIntentId: string | null;
+  purpose: ChargePurpose;
 }
 
 const CHARGE_PROJECTION = {
@@ -29,6 +38,8 @@ const CHARGE_PROJECTION = {
   amountCents: charges.amountCents,
   status: charges.status,
   bookingId: charges.bookingId,
+  stripePaymentIntentId: charges.stripePaymentIntentId,
+  purpose: charges.purpose,
 } as const;
 
 export const chargesRepository = {
@@ -54,5 +65,77 @@ export const chargesRepository = {
       .where(and(eq(charges.bookingId, bookingId), eq(charges.status, 'succeeded')))
       .limit(1);
     return row;
+  },
+
+  /**
+   * INSERT a charges row after Stripe's `paymentIntents.create + confirm`
+   * returns. The Stripe status maps 1:1 to our `charge_status` enum for
+   * 'succeeded' and 'requires_payment' / 'failed'; processing / 3DS
+   * intermediate states map to 'requires_payment' (the Day-15 webhook
+   * flips on the terminal event). Caller is responsible for catching
+   * `unique_violation` on the unique stripePaymentIntentId — a retry
+   * with the same Idempotency-Key returns the same PI id, and the
+   * `withIdempotency` outer wrap should prevent re-entry; this is the
+   * belt-and-suspenders constraint.
+   */
+  async create(
+    tx: Tx,
+    args: {
+      ownerId: string;
+      amountCents: number;
+      currency?: string;
+      status: ChargeStatus;
+      purpose: ChargePurpose;
+      stripePaymentIntentId: string;
+      bookingId?: string | null;
+    },
+  ): Promise<ChargeRow> {
+    const [row] = await tx
+      .insert(charges)
+      .values({
+        ownerId: args.ownerId,
+        amountCents: args.amountCents,
+        currency: args.currency ?? 'usd',
+        status: args.status,
+        purpose: args.purpose,
+        stripePaymentIntentId: args.stripePaymentIntentId,
+        bookingId: args.bookingId ?? null,
+      })
+      .returning(CHARGE_PROJECTION);
+    if (!row) {
+      throw new Error('chargesRepository.create: INSERT returned no row');
+    }
+    return row;
+  },
+
+  /**
+   * Look up a charge by its Stripe PaymentIntent id. Day-15 webhook will
+   * use this to find the row to flip on terminal events; Day-14 uses it
+   * inside the contract tests to assert the post-purchase write landed.
+   */
+  async findByStripePaymentIntentId(
+    tx: Tx,
+    stripePaymentIntentId: string,
+  ): Promise<ChargeRow | undefined> {
+    const [row] = await tx
+      .select(CHARGE_PROJECTION)
+      .from(charges)
+      .where(eq(charges.stripePaymentIntentId, stripePaymentIntentId))
+      .limit(1);
+    return row;
+  },
+
+  /**
+   * Flip a charge's status (`requires_payment` → `succeeded` / `failed`).
+   * Stamps `updated_at = now()`. Idempotent — calling with the same target
+   * status is a no-op write. Used by Day-15 webhook on terminal Stripe
+   * events; surfaced here so the test-mode synchronous confirm path can
+   * write a definitive status without round-tripping through the webhook.
+   */
+  async markStatus(tx: Tx, args: { id: string; status: ChargeStatus }): Promise<void> {
+    await tx
+      .update(charges)
+      .set({ status: args.status, updatedAt: sql`now()` })
+      .where(eq(charges.id, args.id));
   },
 };

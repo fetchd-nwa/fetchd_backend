@@ -6,6 +6,7 @@ import {
   announcements,
   bookingDogs,
   bookings,
+  cancelWindowSettings,
   classPrereqOptions,
   cohorts,
   creditLedger,
@@ -26,6 +27,7 @@ import {
   notifications,
   owners,
   paymentMethods,
+  stripeCustomers,
   pendingRequestDogs,
   pendingRequestPreferredDates,
   pendingRequests,
@@ -81,6 +83,12 @@ export const FIXTURE_IDS = {
   staffRachelSupabaseUid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2',
   staffRachelId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
   paymentMethod1Id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1',
+  // Day-14: Stripe customer mapping for the fixture owner. Required by the
+  // POST /credit-packages/:key/purchase route's `loadPurchaseContext` step
+  // — a payment_methods row without a matching stripe_customers row is a
+  // 422 (broken API contract). Routes accept any text for the stripe id;
+  // tests assert against the stub-returned id, not this string.
+  stripeCustomerId: 'cus_fixture_test_visa',
   // Day-5 bookings (numbered for stability across snapshots).
   // 1-5 = upcoming, 6-8 = past, 9 = cancelled, 10 = far-future DST CST coverage.
   booking1Id: '77777777-7777-4777-8777-777777777771',
@@ -236,6 +244,14 @@ export const FIXTURE_NOW = (): Date => FIXTURE_TODAY;
  */
 export async function seedFixture(): Promise<void> {
   await teardownFixture();
+
+  // Day-13 leak guard: the test container's DB is persistent across `npm test`
+  // runs (schema seed runs once at container create, not per-run), so any
+  // test that PATCHes `cancel_window_settings` leaves the policy tuned for
+  // subsequent runs. Restore the seeded 48h-flat baseline here so every file
+  // starts from the same policy — booking tests asserting the seeded delta
+  // are deterministic regardless of run order or prior leaks.
+  await db.update(cancelWindowSettings).set({ hoursBefore: 48, updatedByStaffId: null });
 
   await db.insert(vets).values({
     id: FIXTURE_IDS.vetId,
@@ -450,6 +466,15 @@ export async function seedFixture(): Promise<void> {
   // BEFORE-INSERT trigger (any owner booking without one is rejected with
   // ERRCODE check_violation). Test-mode Stripe id only; nothing here ever
   // hits real Stripe in a contract test.
+  // Day-14: stripe_customers must exist BEFORE the payment_methods INSERT
+  // for the credit-purchase route's validation chain. FK is owner → stripe
+  // customer one-to-one; insert is independent of payment_methods schema-
+  // wise but ordering here matches the prod flow.
+  await db.insert(stripeCustomers).values({
+    ownerId: FIXTURE_IDS.ownerId,
+    stripeCustomerId: FIXTURE_IDS.stripeCustomerId,
+  });
+
   await db.insert(paymentMethods).values({
     id: FIXTURE_IDS.paymentMethod1Id,
     ownerId: FIXTURE_IDS.ownerId,
@@ -1521,10 +1546,14 @@ export async function teardownFixture(): Promise<void> {
   // connections (earned 2026-05-26).
   const { refunds, charges } = await import('../../src/db/schema/schema.js');
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
-  await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+  // FK order: credit_ledger.charge_id → charges.id (Day-14 purchase path
+  // attaches the ledger row to a charge), so ledger must drop BEFORE
+  // charges. Filtering by dog_id alone misses charge-attached rows for
+  // OTHER dogs; widen to "any charge from this owner" before purging.
   await db
     .delete(creditLedger)
     .where(inArray(creditLedger.dogId, [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]));
+  await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(bookings).where(eq(bookings.ownerId, FIXTURE_IDS.ownerId));
   // Catch BOTH the fixture-id cohorts AND any per-test cohorts attached to
   // the test group_classes (Day-11+ enrollment tests insert per-test cohorts
@@ -1561,6 +1590,11 @@ export async function teardownFixture(): Promise<void> {
     );
   await db.delete(dayCapacity).where(eq(dayCapacity.location, 'fayetteville'));
   await db.delete(paymentMethods).where(eq(paymentMethods.ownerId, FIXTURE_IDS.ownerId));
+  // Day-14: stripe_customers FK→owners is ON DELETE RESTRICT, so it must
+  // drop before the owners delete below. Order vs payment_methods doesn't
+  // matter (no FK between them) but pairing them here keeps the Stripe-
+  // side rows clustered for future readers.
+  await db.delete(stripeCustomers).where(eq(stripeCustomers.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(dogs).where(eq(dogs.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(agreementSignatures).where(eq(agreementSignatures.ownerId, FIXTURE_IDS.ownerId));
   await db
