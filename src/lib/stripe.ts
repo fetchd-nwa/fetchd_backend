@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 import { env } from '../env.js';
 import type { ChargeStatus } from '../db/repositories/chargesRepository.js';
+import { ApiError } from './errors.js';
 
 /**
  * Stripe seam (Day 14). All Stripe API calls flow through `StripeClient`;
@@ -105,6 +106,59 @@ export interface StripeRefundResult {
   amountCents: number;
 }
 
+/**
+ * Day-15 narrow webhook event type — the discriminated union the dispatch
+ * loop in `routes/stripeWebhook.ts` switches on. Built by the seam's
+ * `constructWebhookEvent` so the rest of the codebase never imports the
+ * wide `Stripe.Event` type (which carries dozens of optional shapes per
+ * event type and would leak Stripe SDK details across the dependency
+ * rule's "domain knows nothing about Stripe" boundary).
+ *
+ * Each arm carries only the fields the matching handler uses; new event
+ * types arrive as new arms — the `'unhandled'` catch-all keeps the
+ * receiver from 5xx-ing on a Stripe-side product release we haven't
+ * wired yet.
+ *
+ * The mapping from Stripe's wire shapes lives in `defaultStripeClient.
+ * constructWebhookEvent` (real impl) and in the test stub's
+ * `setNextEvent` (test impl) — both produce this same narrow union.
+ */
+export type StripeWebhookEvent =
+  | {
+      id: string;
+      type: 'payment_intent.succeeded';
+      paymentIntentId: StripePaymentIntentId;
+      amountCents: number;
+      metadata: Record<string, string>;
+    }
+  | {
+      id: string;
+      type: 'payment_intent.payment_failed';
+      paymentIntentId: StripePaymentIntentId;
+      amountCents: number;
+      metadata: Record<string, string>;
+    }
+  | {
+      id: string;
+      type: 'setup_intent.succeeded';
+      setupIntentId: string;
+      paymentMethodId: StripePaymentMethodId;
+      customerId: StripeCustomerId;
+    }
+  | {
+      id: string;
+      type: 'charge.refund.updated';
+      refundId: StripeRefundId;
+      paymentIntentId: StripePaymentIntentId | null;
+      amountCents: number;
+      status: StripeRefundStatus;
+    }
+  | {
+      id: string;
+      type: 'unhandled';
+      rawType: string;
+    };
+
 export interface StripeClient {
   /**
    * Create a Stripe customer for an owner — once per owner. Idempotency key
@@ -169,15 +223,27 @@ export interface StripeClient {
 
   /**
    * Fetch a payment method's displayable bits (brand/last4/exp/cardholder).
-   * Used by the Day-14 SetupIntent → `payment_methods` write path when the
-   * FE confirms the SetupIntent client-side and POSTs back the resulting
-   * payment_method id. The Day-15 webhook will be the long-term canonical
-   * source; the Day-14 synchronous variant exists so the test-mode flow
-   * can complete without spinning up the webhook handler.
+   * Used by the Day-15 `setup_intent.succeeded` webhook to materialize the
+   * `payment_methods` row when the FE confirms a SetupIntent client-side.
    */
   retrievePaymentMethod(
     paymentMethodId: StripePaymentMethodId,
   ): Promise<StripePaymentMethodSnapshot>;
+
+  /**
+   * Verify the `Stripe-Signature` header against the raw request body and
+   * the configured webhook secret, and return the narrow {@link StripeWebhookEvent}
+   * for the dispatch loop. The default impl wraps
+   * `stripe.webhooks.constructEvent` and projects Stripe's wide event
+   * type onto our narrow union; an invalid signature throws (the route
+   * maps to 400). Test stubs verify nothing and return whichever event
+   * was queued via the stub's `setNextEvent` knob.
+   *
+   * `signature` may be undefined when the header is absent — the seam
+   * normalizes to "throw with signature_verification" so the route's
+   * happy path doesn't need a separate guard.
+   */
+  constructWebhookEvent(rawBody: string, signature: string | undefined): StripeWebhookEvent;
 }
 
 /**
@@ -277,4 +343,95 @@ export const defaultStripeClient: StripeClient = {
       cardholderName: pm.billing_details.name ?? '',
     };
   },
+
+  constructWebhookEvent(rawBody, signature) {
+    if (signature === undefined) {
+      throw new ApiError('bad_request', 'missing Stripe-Signature header');
+    }
+    let event: Stripe.Event;
+    try {
+      event = stripeSingleton.webhooks.constructEvent(
+        rawBody,
+        signature,
+        env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new ApiError('bad_request', `Stripe-Signature verification failed: ${reason}`);
+    }
+    return projectStripeEvent(event);
+  },
 };
+
+/**
+ * Pure projection from Stripe's wide `Stripe.Event` (per their SDK type)
+ * onto our narrow {@link StripeWebhookEvent} discriminated union. Exported
+ * so contract tests can drive the dispatch loop with hand-built
+ * `Stripe.Event`-shaped payloads when the in-memory stub isn't used.
+ *
+ * Each `case` reads only the fields the matching handler needs; the
+ * `'unhandled'` arm carries the raw type for log breadcrumbs. Casts are
+ * pinned to the SDK's per-event object types — narrowed by the literal
+ * `event.type` discriminant.
+ */
+export function projectStripeEvent(event: Stripe.Event): StripeWebhookEvent {
+  switch (event.type) {
+    case 'payment_intent.succeeded': {
+      const pi = event.data.object as Stripe.PaymentIntent;
+      return {
+        id: event.id,
+        type: 'payment_intent.succeeded',
+        paymentIntentId: pi.id,
+        amountCents: pi.amount,
+        metadata: pi.metadata ?? {},
+      };
+    }
+    case 'payment_intent.payment_failed': {
+      const pi = event.data.object as Stripe.PaymentIntent;
+      return {
+        id: event.id,
+        type: 'payment_intent.payment_failed',
+        paymentIntentId: pi.id,
+        amountCents: pi.amount,
+        metadata: pi.metadata ?? {},
+      };
+    }
+    case 'setup_intent.succeeded': {
+      const si = event.data.object as Stripe.SetupIntent;
+      const paymentMethodId =
+        typeof si.payment_method === 'string' ? si.payment_method : (si.payment_method?.id ?? null);
+      const customerId = typeof si.customer === 'string' ? si.customer : (si.customer?.id ?? null);
+      if (paymentMethodId === null || customerId === null) {
+        // Defensive: a setup_intent.succeeded without an attached card or
+        // customer would be malformed in test mode and uncommon in prod.
+        // Surface as 'unhandled' so the dispatch loop logs + 200s rather
+        // than 5xx-ing and triggering retry storms.
+        return { id: event.id, type: 'unhandled', rawType: event.type };
+      }
+      return {
+        id: event.id,
+        type: 'setup_intent.succeeded',
+        setupIntentId: si.id,
+        paymentMethodId,
+        customerId,
+      };
+    }
+    case 'charge.refund.updated': {
+      const refund = event.data.object as Stripe.Refund;
+      const piId =
+        typeof refund.payment_intent === 'string'
+          ? refund.payment_intent
+          : (refund.payment_intent?.id ?? null);
+      return {
+        id: event.id,
+        type: 'charge.refund.updated',
+        refundId: refund.id,
+        paymentIntentId: piId,
+        amountCents: refund.amount,
+        status: (refund.status ?? 'pending') as StripeRefundStatus,
+      };
+    }
+    default:
+      return { id: event.id, type: 'unhandled', rawType: event.type };
+  }
+}

@@ -809,6 +809,20 @@ export const refunds = pgTable("refunds", {
 	}
 });
 
+// Stripe webhook dedupe ledger — Day 15. See schema.sql ~line 829 for the
+// full motivation. Indexes shadow the SQL definition.
+export const stripeEvents = pgTable("stripe_events", {
+	eventId: text("event_id").primaryKey().notNull(),
+	eventType: text("event_type").notNull(),
+	receivedAt: timestamp("received_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	processedAt: timestamp("processed_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		typeReceivedIdx: index("stripe_events_type_received_idx").using("btree", table.eventType.asc(), table.receivedAt.desc()),
+		unprocessedIdx: index("stripe_events_unprocessed_idx").using("btree", table.receivedAt.asc()).where(sql`processed_at IS NULL`),
+	}
+});
+
 export const agreementDocuments = pgTable("agreement_documents", {
 	key: text().primaryKey().notNull(),
 	label: text().notNull(),

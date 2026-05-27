@@ -138,4 +138,18 @@ export const chargesRepository = {
       .set({ status: args.status, updatedAt: sql`now()` })
       .where(eq(charges.id, args.id));
   },
+
+  /**
+   * Read a charge by primary key. Day-15 webhook uses this after looking
+   * up by PaymentIntent id to fetch the row a refund webhook matched
+   * against. Returns undefined if no such row.
+   */
+  async findById(tx: Tx, id: string): Promise<ChargeRow | undefined> {
+    const [row] = await tx
+      .select(CHARGE_PROJECTION)
+      .from(charges)
+      .where(eq(charges.id, id))
+      .limit(1);
+    return row;
+  },
 };

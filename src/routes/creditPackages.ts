@@ -6,12 +6,11 @@ import { chargesRepository, type ChargeStatus } from '../db/repositories/charges
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
-import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
 import { bookingMode } from '../db/schema/schema.js';
 import { invalidatePattern } from '../lib/cache.js';
 import { ApiError } from '../lib/errors.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
   defaultStripeClient,
@@ -143,6 +142,7 @@ export function registerCreditPackagesRoute(
             dog_id: body.dog_id,
             package_key: pkg.key,
             credits: String(pkg.credits),
+            mode: pkg.mode,
           },
         },
         `${idempotencyKey}:payment-intent`,
@@ -220,11 +220,10 @@ export function registerCreditPackagesRoute(
 }
 
 /**
- * Resolve the (package, dog ownership, payment_method, stripe_customer)
- * tuple for a purchase. All four reads use the pool (not a tx) — they're
- * read-only validation, and `withMutation` downstream owns the write tx.
- * Split into one function so the route body reads as one named effect
- * rather than four inline DB hits.
+ * Resolve the (package, dog ownership, Stripe pm context) tuple for a
+ * purchase. The Stripe pm-context half (payment_method + stripe_customer)
+ * is shared with `POST /invoices/:id/pay` + B&T `confirm-payment` and
+ * lives in `lib/loadStripePaymentContext.ts` (rule-of-two extract Day-15).
  *
  * 404 collapses for "missing" + "not yours" + "expired" / "retired" — id
  * enumeration is the security concern; the wire response carries the
@@ -250,32 +249,15 @@ async function loadPurchaseContext(args: {
     throw new ApiError('not_found', `dog ${args.dogId} not found`);
   }
 
-  const pm = await paymentMethodsRepository.findLiveByIdForOwner(db, {
-    id: args.paymentMethodId,
+  const stripeCtx = await loadStripePaymentContext({
     ownerId: args.ownerId,
+    paymentMethodId: args.paymentMethodId,
   });
-  if (pm === undefined) {
-    throw new ApiError('not_found', `payment method ${args.paymentMethodId} not found`);
-  }
-
-  const customer = await stripeCustomersRepository.findByOwner(db, args.ownerId);
-  if (customer === undefined) {
-    // The owner has a payment_methods row but no stripe_customers row.
-    // Defensive — the SetupIntent route is supposed to provision the
-    // customer alongside the payment method. If we're here, something
-    // wrote payment_methods out of band (test fixture without seeding
-    // a stripe_customers row). 422 because the API contract is broken,
-    // not the request.
-    throw new ApiError(
-      'invalid_payload',
-      `owner ${args.ownerId} has a payment method but no stripe_customers row`,
-    );
-  }
 
   return {
     pkg,
-    stripeCustomerId: customer.stripeCustomerId,
-    stripePaymentMethodId: pm.stripePaymentMethodId,
+    stripeCustomerId: stripeCtx.stripeCustomerId,
+    stripePaymentMethodId: stripeCtx.stripePaymentMethodId,
   };
 }
 

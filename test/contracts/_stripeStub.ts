@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { ApiError } from '../../src/lib/errors.js';
 import type {
   StripeClient,
   StripePaymentIntentResult,
   StripePaymentIntentStatus,
   StripePaymentMethodSnapshot,
   StripeRefundResult,
+  StripeWebhookEvent,
 } from '../../src/lib/stripe.js';
 
 /**
@@ -65,6 +67,11 @@ export type StripeStubCall =
       method: 'retrievePaymentMethod';
       args: { paymentMethodId: string };
       idempotencyKey: null;
+    }
+  | {
+      method: 'constructWebhookEvent';
+      args: { rawBody: string; signature: string | undefined };
+      idempotencyKey: null;
     };
 
 export interface StripeStub extends StripeClient {
@@ -78,6 +85,13 @@ export interface StripeStub extends StripeClient {
   throwOnRefund(): void;
   /** Replace what `retrievePaymentMethod` returns next. */
   setPaymentMethodSnapshot(snapshot: Partial<StripePaymentMethodSnapshot>): void;
+  /**
+   * Queue the next webhook event the dispatch loop should receive.
+   * `constructWebhookEvent` returns this event regardless of signature
+   * (test stubs verify nothing). Pass `null` to make the next call throw
+   * a `bad_request` ApiError (simulating a bogus signature).
+   */
+  setNextEvent(event: StripeWebhookEvent | null): void;
 }
 
 export function makeStripeStub(): StripeStub {
@@ -86,6 +100,10 @@ export function makeStripeStub(): StripeStub {
   let detachShouldThrow = false;
   let refundShouldThrow = false;
   let pmSnapshotOverride: Partial<StripePaymentMethodSnapshot> = {};
+  // `undefined` = no event queued; `null` = next call throws (bad signature);
+  // an event = next call returns it. Distinguishing null from undefined lets
+  // tests assert "no signature verification ran" vs "explicit bad signature".
+  let nextEvent: StripeWebhookEvent | null | undefined;
 
   const testIdPrefix = (kind: string): string => `${kind}_test_${randomUUID().slice(0, 8)}`;
 
@@ -102,6 +120,9 @@ export function makeStripeStub(): StripeStub {
     },
     setPaymentMethodSnapshot(snapshot) {
       pmSnapshotOverride = snapshot;
+    },
+    setNextEvent(event) {
+      nextEvent = event;
     },
 
     async createCustomer(args, idempotencyKey) {
@@ -166,6 +187,27 @@ export function makeStripeStub(): StripeStub {
         cardholderName: 'Test Cardholder',
         ...pmSnapshotOverride,
       };
+    },
+
+    constructWebhookEvent(rawBody, signature) {
+      calls.push({
+        method: 'constructWebhookEvent',
+        args: { rawBody, signature },
+        idempotencyKey: null,
+      });
+      if (nextEvent === undefined) {
+        throw new Error(
+          'stub: constructWebhookEvent called with no event queued — call setNextEvent first',
+        );
+      }
+      const queued = nextEvent;
+      nextEvent = undefined; // reset so a stale event can't bleed across requests
+      if (queued === null) {
+        // Mirror the real impl's failure shape — ApiError(bad_request)
+        // bubbles through the route's existing ApiError→HTTP mapper as 400.
+        throw new ApiError('bad_request', 'stub: simulated Stripe-Signature failure');
+      }
+      return queued;
     },
   };
 

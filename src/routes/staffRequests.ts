@@ -15,8 +15,8 @@ import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowS
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
-import { pgTimestampToIso } from '../lib/pgTimestamp.js';
-import { groupRequestDogs, toRequestWire, type PendingRequestWire } from '../lib/requestWire.js';
+import { groupRequestDogs, type PendingRequestWire } from '../lib/requestWire.js';
+import { wireOneRequest } from '../lib/wireOneRequest.js';
 import type { LocationKey } from '../lib/bookingWire.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
@@ -419,33 +419,6 @@ function notificationBodyFor(
   // awaiting-payment; group-class/day-program use POST /enrollments
   // and /bookings); the default keeps the fallback honest.
   return `Your session on ${when} is confirmed.`;
-}
-
-/**
- * Resolve one full row to its PendingRequest wire shape. Mirrors
- * `wireRequestsInTx` from `routes/requests.ts` but inlined here so the
- * file is self-contained (the shared assembly helper is private to the
- * other route file; promoting it to `lib/requestWire.ts` would couple
- * the wire helper to repo calls — declined for now).
- *
- * Routes through the tx so the freshly-updated row + the
- * pending_request_dogs / preferred_dates rows are visible (the
- * mutation hasn't committed yet at this point).
- */
-async function wireOneRequest(
-  tx: Parameters<typeof requestsRepository.findFullByIdInTx>[0],
-  row: PendingRequestFullRow,
-): Promise<PendingRequestWire> {
-  const [dogRows, dateRows] = await Promise.all([
-    requestsRepository.findDogsByRequestIds([row.id], tx),
-    requestsRepository.findPreferredDatesByRequestIds([row.id], tx),
-  ]);
-  const dogIds = groupRequestDogs(dogRows).get(row.id);
-  if (dogIds === undefined) {
-    throw new Error(`pending_request ${row.id}: no pending_request_dogs rows`);
-  }
-  const dates = dateRows.map((r) => pgTimestampToIso(r.preferredAt));
-  return toRequestWire(row, dogIds, dates);
 }
 
 function parseUuidParam(params: unknown): { id: string } {

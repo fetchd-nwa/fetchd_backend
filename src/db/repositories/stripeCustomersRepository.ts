@@ -45,6 +45,26 @@ export const stripeCustomersRepository = {
   },
 
   /**
+   * Reverse lookup — Day 15 webhook entry point. Stripe events carry the
+   * Stripe customer id (`cus_*`); we need to resolve back to our owner row
+   * to write the payment_methods row, write the credit_ledger row, etc.
+   * The unique constraint on `stripe_customer_id` makes this a 1:0..1
+   * lookup. Polymorphic runner so the webhook handler can call this
+   * inside its dispatch tx.
+   */
+  async findByStripeCustomerId(
+    runner: Runner,
+    stripeCustomerId: string,
+  ): Promise<StripeCustomerRow | undefined> {
+    const [row] = await runner
+      .select(STRIPE_CUSTOMER_PROJECTION)
+      .from(stripeCustomers)
+      .where(eq(stripeCustomers.stripeCustomerId, stripeCustomerId))
+      .limit(1);
+    return row;
+  },
+
+  /**
    * INSERT the mapping row after Stripe has minted the customer. Caller's
    * responsibility to make the Stripe call idempotent (we pass the
    * Idempotency-Key through to Stripe.customers.create); the DB INSERT is

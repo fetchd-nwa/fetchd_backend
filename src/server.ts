@@ -13,15 +13,18 @@ import { registerEnrollmentsRoute } from './routes/enrollments.js';
 import { registerEventsRoute } from './routes/events.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
+import { registerInvoicesRoute } from './routes/invoices.js';
 import { registerMeRoute } from './routes/me.js';
 import { registerNotificationsRoute } from './routes/notifications.js';
 import { registerPaymentMethodsRoute } from './routes/paymentMethods.js';
 import { registerRatesRoute } from './routes/rates.js';
 import { registerReportsRoute } from './routes/reports.js';
+import { registerRequestConfirmPaymentRoute } from './routes/requestConfirmPayment.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
+import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
 import { registerThreadsRoute } from './routes/threads.js';
 import { registerVetsRoute } from './routes/vets.js';
 
@@ -41,6 +44,7 @@ export function buildApp(): FastifyInstance {
   registerAuth(app);
   registerHealthRoute(app); // [public] — no auth guard
   registerAuthWebhook(app); // [public, signed] — own raw-body scope
+  registerStripeWebhookRoute(app); // [public, signed] — Day-15; own raw-body scope
   registerMeRoute(app); // [auth]
   registerDogsRoute(app); // [auth]
   registerVetsRoute(app); // [auth]
@@ -62,6 +66,8 @@ export function buildApp(): FastifyInstance {
   registerNotificationsRoute(app); // [auth] — owner-only
   registerAnnouncementsRoute(app); // [auth] — catalog (owner + staff)
   registerPaymentMethodsRoute(app); // [auth] — owner-only
+  registerInvoicesRoute(app); // [auth, $] — Day-15 invoice settlement
+  registerRequestConfirmPaymentRoute(app); // [auth, $] — Day-15 B&T conversion
 
   return app;
 }

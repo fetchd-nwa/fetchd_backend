@@ -492,9 +492,19 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           // metadata). MutationParams.postCommit owns the swallow/log/
           // skip-on-replay boilerplate; the DB `refunds` row at 'pending'
           // is the commitment, Day-15 webhook reconciles terminal status.
+          //
+          // Day-15: also persist the returned `re_*` id back onto the
+          // refunds row so the `charge.refund.updated` webhook matches
+          // deterministically by `stripe_refund_id`. The id-write uses
+          // the pool runner (the main tx already committed) and a
+          // `stripe_refund_id IS NULL` guard so a duplicate post-commit
+          // can't clobber a webhook-set value (extremely rare; this is
+          // belt-and-suspenders). Failure to persist the id here drops
+          // back to the webhook's race-recovery path
+          // (`findUnmatchedPendingForCharge`) — same swallow/log policy.
           postCommit: async () => {
             if (pendingStripeRefund === undefined) return;
-            await stripe.createRefund(
+            const result = await stripe.createRefund(
               {
                 paymentIntentId: pendingStripeRefund.paymentIntentId,
                 amountCents: pendingStripeRefund.amountCents,
@@ -502,6 +512,10 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
               },
               `${idempotencyKey}:refund`,
             );
+            await refundsRepository.markStripeId({
+              id: pendingStripeRefund.refundId,
+              stripeRefundId: result.id,
+            });
           },
         },
         async (tx) => {

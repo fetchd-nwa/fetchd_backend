@@ -1575,7 +1575,19 @@ export async function teardownFixture(): Promise<void> {
   // rows. Both must be deleted before bookings or the bookings delete
   // FK-violates and the after-hook hangs the process via stuck Redis
   // connections (earned 2026-05-26).
-  const { refunds, charges } = await import('../../src/db/schema/schema.js');
+  const { refunds, charges, invoices, stripeEvents } =
+    await import('../../src/db/schema/schema.js');
+  const { like } = await import('drizzle-orm');
+  // Day-15: stripe_events is a webhook dedupe ledger; tests insert events
+  // with the `evt_test_` prefix so this pattern-delete keeps the table
+  // clean across runs. Independent of the FK chain — no foreign keys
+  // reference stripe_events.
+  await db.delete(stripeEvents).where(like(stripeEvents.eventId, 'evt_test_%'));
+  // Day-15: invoices restricts on owner_id + payment_method_id; drop
+  // before payment_methods + owners. invoices.paid_charge_id is FK to
+  // charges (no on-delete), so drop invoices BEFORE charges as well —
+  // charge delete would FK-block otherwise once a paid invoice exists.
+  await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
   // FK order: credit_ledger.charge_id → charges.id (Day-14 purchase path
   // attaches the ledger row to a charge), so ledger must drop BEFORE

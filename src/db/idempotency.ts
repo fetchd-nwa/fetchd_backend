@@ -1,4 +1,5 @@
 import { eq, sql } from 'drizzle-orm';
+import { db } from './client.js';
 import { ApiError } from '../lib/errors.js';
 import { idempotencyKeys } from './schema/schema.js';
 import type { Tx } from './tx.js';
@@ -125,4 +126,47 @@ export async function withIdempotency<T>(
     .where(eq(idempotencyKeys.key, claim.key));
 
   return { ...response, replayed: false };
+}
+
+/**
+ * Pool-level peek for a completed idempotency record. Day-15 addition —
+ * routes whose pre-validation depends on state that the mutation itself
+ * mutates (`POST /invoices/:id/pay` flips invoice → 'paid'; a replay's
+ * pre-validation would see 'paid' and 409 BEFORE the idempotency layer
+ * could replay the original 201) call this FIRST, replay if found,
+ * else continue normally.
+ *
+ * Returns the stored response (with `replayed: true`) when a completed
+ * record exists for the given key + endpoint + body hash. Returns
+ * undefined for:
+ *   - Key never seen (first arrival — caller proceeds normally).
+ *   - Key seen but `completed_at IS NULL` (in-flight elsewhere — the
+ *     `withIdempotency` claim path will throw `idempotency_inflight` on
+ *     this attempt; the peek just defers to the claim).
+ *
+ * Throws `idempotency_mismatch` when the key matches but `endpoint` /
+ * `requestHash` differ — same semantic as `withIdempotency`'s mismatch
+ * path; surfaces a client bug at the boundary rather than letting the
+ * route proceed against stale state.
+ */
+export async function peekCompletedIdempotency<T>(
+  key: string,
+  endpoint: string,
+  requestHash: string,
+): Promise<IdempotencyOutcome<T> | undefined> {
+  const [existing] = await db
+    .select()
+    .from(idempotencyKeys)
+    .where(eq(idempotencyKeys.key, key))
+    .limit(1);
+  if (!existing) return undefined;
+  if (existing.endpoint !== endpoint || existing.requestHash !== requestHash) {
+    throw new ApiError('idempotency_mismatch', 'Idempotency-Key reused with a different request');
+  }
+  if (existing.completedAt === null) return undefined;
+  return {
+    status: existing.responseStatus ?? 200,
+    body: existing.responseBody as T,
+    replayed: true,
+  };
 }
