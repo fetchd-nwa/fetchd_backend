@@ -88,6 +88,12 @@ const envSchema = z.object({
   STRIPE_SECRET_KEY: z.string().min(1),
   STRIPE_WEBHOOK_SECRET: z.string().min(1),
 
+  // Day-16: signed bearer secret on `POST /workers/tick`. pg_cron + pg_net
+  // POSTs from inside Postgres with this header so the scheduler endpoint
+  // can't be hit by anyone else. Local dev / tests use a placeholder; rotate
+  // in staging/prod via the hosting env. Constant-time compare in the route.
+  SCHEDULER_WEBHOOK_SECRET: z.string().min(1),
+
   // Cloudflare R2 — private media. Reserved; wired Day 17.
   R2_ACCOUNT_ID: z.string().min(1),
   R2_ACCESS_KEY_ID: z.string().min(1),

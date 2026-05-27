@@ -1,4 +1,4 @@
-import { eq, sql } from 'drizzle-orm';
+import { eq, lt, sql } from 'drizzle-orm';
 import { db } from './client.js';
 import { ApiError } from '../lib/errors.js';
 import { idempotencyKeys } from './schema/schema.js';
@@ -169,4 +169,27 @@ export async function peekCompletedIdempotency<T>(
     body: existing.responseBody as T,
     replayed: true,
   };
+}
+
+/**
+ * TTL sweep for `idempotency_keys`. The ONE schema table exempt from
+ * never-delete: rows older than the retry-safety window get pruned
+ * (schema.sql lines ~918-920). Day-16 scheduler composition wires this
+ * into the recurring tick.
+ *
+ * Default window is 24h — comfortably longer than any client-side retry
+ * loop (clients drop on timeout long before then) yet short enough that
+ * the table stays small. Returns the row count for the worker's tick
+ * summary.
+ *
+ * Pool runner by design: this is maintenance, not part of a request tx.
+ * A failed sweep is logged-and-swallowed by the scheduler (the next tick
+ * retries; one missed sweep is benign).
+ */
+export async function sweepExpiredIdempotencyKeys(args: { olderThan: Date }): Promise<number> {
+  const deleted = await db
+    .delete(idempotencyKeys)
+    .where(lt(idempotencyKeys.createdAt, args.olderThan.toISOString()))
+    .returning({ key: idempotencyKeys.key });
+  return deleted.length;
 }

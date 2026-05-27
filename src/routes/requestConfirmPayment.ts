@@ -11,6 +11,7 @@ import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { bookings } from '../db/schema/schema.js';
 import { boardTrainPriceCentsForLengthWeeks } from '../lib/boardTrainPricing.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
+import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { ApiError } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
@@ -235,6 +236,19 @@ export function registerRequestConfirmPaymentRoute(
               pickupAt: pickupAtDate.toISOString(),
             })
             .where(eq(bookings.id, inserted.id));
+
+          // Day-16: enqueue reminder + boarding-profile-check. B&T
+          // explicitly carries dropoff_at distinct from scheduled_at
+          // (multi-week stay) — pass it so the 24h-pre-drop-off prompt
+          // anchors on the actual stay start.
+          await enqueueBookingReminders(tx, {
+            bookingId: inserted.id,
+            ownerId: row.ownerId,
+            leadDogId: grouped.lead,
+            category: 'board-and-train',
+            scheduledAt: scheduledAtDate,
+            dropoffAt: dropoffAtDate,
+          });
 
           // Pay-now: INSERT the charges row mirroring Stripe status.
           // Pay-later: INSERT an open invoice — the worker auto-charges

@@ -27,6 +27,7 @@ import { registerStaffRequestsRoute } from './routes/staffRequests.js';
 import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
 import { registerThreadsRoute } from './routes/threads.js';
 import { registerVetsRoute } from './routes/vets.js';
+import { registerWorkersTickRoute } from './routes/workersTick.js';
 
 /**
  * Builds the Fastify app and registers routes. Kept separate from the boot
@@ -68,6 +69,7 @@ export function buildApp(): FastifyInstance {
   registerPaymentMethodsRoute(app); // [auth] — owner-only
   registerInvoicesRoute(app); // [auth, $] — Day-15 invoice settlement
   registerRequestConfirmPaymentRoute(app); // [auth, $] — Day-15 B&T conversion
+  registerWorkersTickRoute(app); // [public, signed] — Day-16 scheduler trigger
 
   return app;
 }

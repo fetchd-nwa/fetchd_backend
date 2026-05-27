@@ -13,6 +13,7 @@ import { ApiError } from '../lib/errors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
+import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { groupRequestDogs, type PendingRequestWire } from '../lib/requestWire.js';
@@ -181,6 +182,18 @@ export function registerStaffRequestsRoute(
                 pickupAt: parsed.pickupAt,
               });
             }
+
+            // Day-16: enqueue reminder + (boarding only) the 24h-pre-
+            // drop-off profile check. For boarding, dropoff_at equals
+            // parsed.scheduledAt (the row above set them the same way).
+            await enqueueBookingReminders(tx, {
+              bookingId: inserted.id,
+              ownerId: row.ownerId,
+              leadDogId: row.leadDogId,
+              category: row.category,
+              scheduledAt: parsed.scheduledAt,
+              dropoffAt: row.category === 'boarding' ? parsed.scheduledAt : null,
+            });
 
             await requestsRepository.markConverted(tx, id, {
               approvedByStaffId: principal.staffId,

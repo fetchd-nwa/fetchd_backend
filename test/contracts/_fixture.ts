@@ -23,10 +23,12 @@ import {
   events,
   groupClasses,
   messages,
+  deviceTokens,
   notificationDogs,
   notifications,
   owners,
   paymentMethods,
+  scheduledNotifications,
   stripeCustomers,
   pendingRequestDogs,
   pendingRequestPreferredDates,
@@ -1510,6 +1512,20 @@ export async function topUpCredits(
  * because race-on-shared-DB is the test container's failure mode.
  */
 export async function teardownFixture(): Promise<void> {
+  // Day-16: scheduled_notifications must drop BEFORE notifications —
+  // the FK `emitted_notification_id → notifications.id` has no ON DELETE
+  // (default NO ACTION), so an already-emitted scheduled row would block
+  // its corresponding notifications delete otherwise. Also drops
+  // device_tokens (owner-cascade safe but explicit-cleanup keeps the
+  // teardown deterministic). idempotency_keys are owner-cascade by FK
+  // but the Day-16 TTL sweep test seeds rows with no owner_id, so an
+  // explicit DELETE by created_at window would over-broaden; instead
+  // each test scopes its own cleanup. Day-9+ mutation tests' keys are
+  // owner-scoped so owner-cascade handles them.
+  await db
+    .delete(scheduledNotifications)
+    .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
+  await db.delete(deviceTokens).where(eq(deviceTokens.ownerId, FIXTURE_IDS.ownerId));
   // Day-7b: notifications + announcements. notification_dogs cascades on
   // notifications delete (ON DELETE CASCADE FK). notifications cascades on
   // owners delete (also CASCADE) but we drop by owner_id explicitly so the

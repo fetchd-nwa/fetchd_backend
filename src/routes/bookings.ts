@@ -16,6 +16,7 @@ import { locationKey } from '../db/schema/schema.js';
 import { isInView, type ServiceCategory } from '../lib/bookingBucket.js';
 import { insufficientCreditsError, type CreditGap } from '../lib/bookingErrors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
+import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
 import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
@@ -397,6 +398,18 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                     bookingId: inserted.id,
                   });
                 }
+
+                // Day-16: enqueue the scheduled reminder rows for this
+                // booking. UNIQUE on dedupe_key makes an idempotent replay
+                // safe; the schedule rows roll back with the booking on
+                // any later in-tx failure.
+                await enqueueBookingReminders(tx, {
+                  bookingId: inserted.id,
+                  ownerId: principal.ownerId,
+                  leadDogId: parsed.leadDogId,
+                  category: parsed.category,
+                  scheduledAt,
+                });
 
                 // `inserted` IS the BookingRow projection (`bookingsRepository.create`
                 // RETURNING ...BOOKING_PROJECTION). No re-fetch needed — the route

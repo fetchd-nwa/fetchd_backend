@@ -13,6 +13,7 @@ import {
   type EligibilityGap,
 } from '../lib/bookingErrors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
+import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { computeCohortSessionDates } from '../lib/cohortSchedule.js';
 import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
@@ -242,6 +243,16 @@ export function registerEnrollmentsRoute(
                 // and links it back to every weekly booking for the (cohort,
                 // dog) via `bookings.session_report_id`.
                 sessionReportId: null,
+              });
+              // Day-16: enqueue the per-session reminder. Per-dog × per-
+              // session × per-cohort means N×W rows for an enrollment;
+              // each gets its own UNIQUE dedupe_key (booking_id-scoped).
+              await enqueueBookingReminders(tx, {
+                bookingId: inserted.id,
+                ownerId: principal.ownerId,
+                leadDogId: dogId,
+                category: 'group-class',
+                scheduledAt,
               });
               insertedWires.push(
                 toBookingWire(
