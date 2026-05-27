@@ -243,3 +243,108 @@ test(
     assert.equal(resB.scanned, 0, 'second tick should see no pending rows after the first claimed');
   },
 );
+
+test(
+  'runMediaDerivativesOnce — concurrent ticks divide queue via SKIP LOCKED (no double-process)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Seed N jobs and run two ticks in parallel; assert the UNION of their
+    // claimed work equals N (no row is processed twice). Mirrors the
+    // Day-16 scheduler-worker race test pattern — proves the full
+    // FOR UPDATE SKIP LOCKED + status='processing' claim invariant under
+    // genuine concurrency, not just sequential second-pass filtering.
+    const TOTAL_JOBS = 5;
+    const sharedR2 = makeR2Stub();
+    const png = await makePngBytes(200, 200);
+    const assetIds: string[] = [];
+    for (let i = 0; i < TOTAL_JOBS; i++) {
+      const { assetId } = await seedAssetAndJob({
+        kind: 'image',
+        bytes: png,
+        contentType: 'image/png',
+        r2: sharedR2,
+      });
+      assetIds.push(assetId);
+    }
+
+    const [resA, resB] = await Promise.all([
+      runMediaDerivativesOnce({ r2: sharedR2, limit: TOTAL_JOBS }),
+      runMediaDerivativesOnce({ r2: sharedR2, limit: TOTAL_JOBS }),
+    ]);
+
+    // Union of scanned across both ticks equals exactly TOTAL_JOBS — no
+    // row was claimed twice, no row was missed.
+    assert.equal(
+      resA.scanned + resB.scanned,
+      TOTAL_JOBS,
+      `expected union scanned=${TOTAL_JOBS}, got ${resA.scanned}+${resB.scanned}`,
+    );
+    // No job appears in both results (the strongest no-double-process check).
+    const claimedA = new Set(resA.results.map((r) => r.mediaAssetId));
+    const claimedB = new Set(resB.results.map((r) => r.mediaAssetId));
+    const intersection = [...claimedA].filter((id) => claimedB.has(id));
+    assert.equal(
+      intersection.length,
+      0,
+      `tick A and tick B both claimed: ${intersection.join(', ')}`,
+    );
+
+    // Every job landed at 'done' with 3 derivatives on the source row.
+    for (const assetId of assetIds) {
+      const job = await mediaDerivativeJobsRepository.findByMediaAssetId(db, assetId);
+      assert.equal(job!.status, 'done', `job ${assetId} should be 'done'`);
+      const row = await mediaAssetsRepository.findById(assetId);
+      assert.equal(row!.derivatives.length, 3);
+    }
+  },
+);
+
+test(
+  'runMediaDerivativesOnce — mid-pipeline R2 failure: source unchanged + job parked + partial derivatives orphaned',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The 3rd put (i.e. after 2 successful derivative uploads) throws —
+    // a more realistic failure mode than "first put fails." Confirms the
+    // partial-fail invariant: the source row's derivatives stay empty
+    // (no half-populated manifest visible to readers), the job is parked
+    // at 'failed' with a clear last_error, and the partial bytes in R2
+    // are orphaned (Day-20 cleanup-sweep candidates).
+    const r2 = makeR2Stub();
+    const png = await makePngBytes(400, 300);
+    const { assetId } = await seedAssetAndJob({
+      kind: 'image',
+      bytes: png,
+      contentType: 'image/png',
+      r2,
+    });
+    // Let the first 2 derivative puts succeed; the 3rd throws.
+    r2.throwOnPutObjectAfter(2);
+
+    const result = await runMediaDerivativesOnce({ r2, limit: 1 });
+    assert.equal(result.results[0]!.outcome, 'failed-other');
+    assert.match(result.results[0]!.error ?? '', /R2 putObject/);
+
+    // Source row's derivatives manifest is empty — the worker writes the
+    // manifest in ONE statement at the end, so a partial pipeline leaves
+    // the manifest empty (no half-populated state visible).
+    const row = await mediaAssetsRepository.findById(assetId);
+    assert.equal(row!.derivatives.length, 0);
+    assert.equal(row!.blurhash, null);
+    assert.equal(row!.width, null);
+
+    // Job parked at 'failed' with the error captured.
+    const job = await mediaDerivativeJobsRepository.findByMediaAssetId(db, assetId);
+    assert.equal(job!.status, 'failed');
+    assert.match(job!.lastError ?? '', /R2 putObject/);
+
+    // Two derivative-key uploads landed in R2 before the 3rd threw — the
+    // orphans Day-20 cleanup sweeps. (Test asserts the partial-fail
+    // signature so the cleanup-sweep day knows what shape to scan for.)
+    const derivativeKeys = Array.from(r2.objects.keys()).filter((k) => k.startsWith('derivative/'));
+    assert.equal(
+      derivativeKeys.length,
+      2,
+      `expected 2 partial-pipeline derivatives in R2, got ${derivativeKeys.length}`,
+    );
+  },
+);

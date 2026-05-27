@@ -22,7 +22,8 @@
     "db:nuke": "docker compose -f ../docker-compose.yml down -v",
     "db:test:up": "docker compose -f ../docker-compose.yml --profile test up -d db-test --wait",
     "db:test:down": "docker compose -f ../docker-compose.yml --profile test down",
-    "db:test:nuke": "docker compose -f ../docker-compose.yml --profile test rm -sf db-test && docker volume rm -f fetchd-pg-test-data"
+    "db:test:nuke": "docker compose -f ../docker-compose.yml --profile test rm -sf db-test && docker volume rm -f fetchd-pg-test-data",
+    "smoke:r2": "tsx scripts/smoke-r2.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1054.0",

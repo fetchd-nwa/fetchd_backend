@@ -26,6 +26,12 @@ import type {
  *     transport-failure-shaped Error. Used by the derivatives worker test
  *     to confirm a failure flips the job row to `'failed'` + records
  *     `last_error`, and the source asset stays usable.
+ *   - `throwOnPutObjectAfter(n)` — the (n+1)th `putObjectBytes` rejects
+ *     (i.e. the first `n` succeed). Used to exercise mid-pipeline failures
+ *     where some derivatives land in R2 before the worker errors — the
+ *     job parks at `'failed'`, the source row stays at `derivatives = []`
+ *     (no half-populated manifest), and the partial R2 objects become
+ *     Day-20-cleanup-sweep candidates.
  *   - `seedObject({key, contentType, bytes})` — pre-populate the bucket
  *     with bytes (used by the worker test to seed a source image without
  *     going through the route).
@@ -47,6 +53,7 @@ export interface R2Stub extends R2Client {
   readonly objects: Map<string, R2StubObject>;
   setNextHeadObjectMissing(): void;
   throwOnNextPutObject(): void;
+  throwOnPutObjectAfter(n: number): void;
   seedObject(args: { key: string; contentType: string; bytes: Uint8Array }): void;
 }
 
@@ -55,6 +62,9 @@ export function makeR2Stub(): R2Stub {
   const objects = new Map<string, R2StubObject>();
   let nextHeadMissing = false;
   let nextPutThrows = false;
+  /** -1 = disabled; otherwise the count of remaining successful puts before
+   *  the next put rejects. Decremented on every put. */
+  let putsUntilThrow = -1;
 
   return {
     calls,
@@ -64,6 +74,9 @@ export function makeR2Stub(): R2Stub {
     },
     throwOnNextPutObject() {
       nextPutThrows = true;
+    },
+    throwOnPutObjectAfter(n) {
+      putsUntilThrow = n;
     },
     seedObject({ key, contentType, bytes }) {
       objects.set(key, { contentType, bytes });
@@ -111,6 +124,13 @@ export function makeR2Stub(): R2Stub {
       if (nextPutThrows) {
         nextPutThrows = false;
         throw new Error('stub: simulated R2 putObject transport failure');
+      }
+      if (putsUntilThrow >= 0) {
+        if (putsUntilThrow === 0) {
+          putsUntilThrow = -1;
+          throw new Error('stub: simulated R2 putObject mid-pipeline failure');
+        }
+        putsUntilThrow -= 1;
       }
       objects.set(key, { contentType, bytes });
     },

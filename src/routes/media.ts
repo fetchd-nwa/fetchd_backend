@@ -298,19 +298,15 @@ function ownerUploadLinkage(
  * URLs the assertions can match on.
  */
 async function signMediaUrls(row: MediaAssetRow, r2: R2Client): Promise<MediaWire> {
-  const baseUrl = await r2.signGetUrl({
-    key: row.objectKey,
-    expiresSeconds: GET_URL_TTL_SECONDS,
-  });
+  // Sign the base + every derivative URL in parallel. The stub returns
+  // synchronously; the production AWS SDK signer is async (SigV4 over
+  // crypto) so each `signGetUrl` is an independent IO unit — `Promise.all`
+  // collapses N round-trips' worth of latency into one.
+  const [baseUrl, derivativeUrls] = await Promise.all([
+    r2.signGetUrl({ key: row.objectKey, expiresSeconds: GET_URL_TTL_SECONDS }),
+    signDerivativeUrls(row.derivatives, r2),
+  ]);
   const expiresAt = new Date(Date.now() + GET_URL_TTL_SECONDS * 1000).toISOString();
-
-  const derivativeUrls: Record<string, string> = {};
-  for (const derivative of row.derivatives) {
-    derivativeUrls[derivative.label] = await r2.signGetUrl({
-      key: derivative.objectKey,
-      expiresSeconds: GET_URL_TTL_SECONDS,
-    });
-  }
 
   return {
     id: row.id,
@@ -324,4 +320,20 @@ async function signMediaUrls(row: MediaAssetRow, r2: R2Client): Promise<MediaWir
     duration_ms: row.durationMs,
     derivatives: derivativeUrls,
   };
+}
+
+async function signDerivativeUrls(
+  derivatives: MediaAssetRow['derivatives'],
+  r2: R2Client,
+): Promise<Record<string, string>> {
+  const signed = await Promise.all(
+    derivatives.map(async (d) => {
+      const url = await r2.signGetUrl({
+        key: d.objectKey,
+        expiresSeconds: GET_URL_TTL_SECONDS,
+      });
+      return [d.label, url] as const;
+    }),
+  );
+  return Object.fromEntries(signed);
 }
