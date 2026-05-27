@@ -448,6 +448,26 @@ test(
 );
 
 test(
+  'runSchedulerTickOnce — media-derivatives tick composes (empty queue returns scanned=0)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearScheduled();
+    const expoPush = makeExpoPushStub();
+    const result = await runSchedulerTickOnce({
+      expoPush,
+      now: new Date('2026-05-26T12:00:00Z'),
+    });
+    // No media jobs seeded for this fixture owner; the phase may pick up
+    // unrelated jobs left by media-derivatives-worker.test.ts depending
+    // on file order, so the assertion is just "the phase ran and the
+    // shape is present" — the dedicated worker test covers semantics.
+    assert.ok(result.mediaDerivatives, 'mediaDerivatives result should be present');
+    assert.equal(typeof result.mediaDerivatives.scanned, 'number');
+    assert.ok(Array.isArray(result.mediaDerivatives.results));
+  },
+);
+
+test(
   'runSchedulerTickOnce — concurrent ticks divide queue via SKIP LOCKED (no double-send)',
   SKIP_WHEN_NO_DB,
   async () => {

@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { env } from '../env.js';
 import { ApiError } from '../lib/errors.js';
 import { defaultExpoPushClient, type ExpoPushClient } from '../lib/expoPush.js';
+import { defaultR2Client, type R2Client } from '../lib/r2.js';
 import { runSchedulerTickOnce, type SchedulerTickResult } from '../workers/scheduler.js';
 
 /**
@@ -29,12 +30,14 @@ import { runSchedulerTickOnce, type SchedulerTickResult } from '../workers/sched
 export interface WorkersTickOpts {
   /** Override the Expo push client (contract tests inject the stub). */
   expoPush?: ExpoPushClient;
+  /** Override the R2 client for the media-derivatives phase (Day 17). */
+  r2?: R2Client;
   /**
    * Override the worker entrypoint. Contract tests inject a fake to assert
    * the route plumbs args/auth correctly without hitting the DB worker
    * surface (which has its own dedicated test file).
    */
-  runTick?: (opts: { expoPush?: ExpoPushClient }) => Promise<SchedulerTickResult>;
+  runTick?: (opts: { expoPush?: ExpoPushClient; r2?: R2Client }) => Promise<SchedulerTickResult>;
 }
 
 function firstHeader(value: string | string[] | undefined): string | undefined {
@@ -52,7 +55,8 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTickOpts = {}): void {
   const runTick =
-    opts.runTick ?? ((tickOpts: { expoPush?: ExpoPushClient }) => runSchedulerTickOnce(tickOpts));
+    opts.runTick ??
+    ((tickOpts: { expoPush?: ExpoPushClient; r2?: R2Client }) => runSchedulerTickOnce(tickOpts));
 
   app.post('/workers/tick', async (request, reply) => {
     const auth = firstHeader(request.headers['authorization']);
@@ -64,7 +68,10 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
       throw new ApiError('unauthenticated', 'invalid scheduler webhook secret');
     }
 
-    const result = await runTick({ expoPush: opts.expoPush ?? defaultExpoPushClient });
+    const result = await runTick({
+      expoPush: opts.expoPush ?? defaultExpoPushClient,
+      r2: opts.r2 ?? defaultR2Client,
+    });
     request.log.info(
       {
         workerTick: 'scheduler',
@@ -73,6 +80,7 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
         pushTicketsOk: result.scheduledNotifications.pushTicketsOk,
         pushTicketsError: result.scheduledNotifications.pushTicketsError,
         invoicesScanned: result.invoiceAutoCharge.scanned,
+        mediaDerivativesScanned: result.mediaDerivatives.scanned,
         idempotencyKeysSwept: result.idempotencyKeysSwept,
       },
       'scheduler tick complete',

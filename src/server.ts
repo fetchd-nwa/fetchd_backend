@@ -14,6 +14,7 @@ import { registerEventsRoute } from './routes/events.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerInvoicesRoute } from './routes/invoices.js';
+import { registerMediaRoute } from './routes/media.js';
 import { registerMeRoute } from './routes/me.js';
 import { registerNotificationsRoute } from './routes/notifications.js';
 import { registerPaymentMethodsRoute } from './routes/paymentMethods.js';
@@ -26,6 +27,7 @@ import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
 import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
 import { registerThreadsRoute } from './routes/threads.js';
+import { registerUploadsSignRoute } from './routes/uploadsSign.js';
 import { registerVetsRoute } from './routes/vets.js';
 import { registerWorkersTickRoute } from './routes/workersTick.js';
 
@@ -69,6 +71,8 @@ export function buildApp(): FastifyInstance {
   registerPaymentMethodsRoute(app); // [auth] — owner-only
   registerInvoicesRoute(app); // [auth, $] — Day-15 invoice settlement
   registerRequestConfirmPaymentRoute(app); // [auth, $] — Day-15 B&T conversion
+  registerUploadsSignRoute(app); // [auth] — Day-17 presigned R2 PUT
+  registerMediaRoute(app); // [auth] — Day-17 register/read/soft-expire media
   registerWorkersTickRoute(app); // [public, signed] — Day-16 scheduler trigger
 
   return app;

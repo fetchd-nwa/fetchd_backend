@@ -12,7 +12,9 @@ import {
   type ExpoPushMessage,
   type ExpoPushTicket,
 } from '../lib/expoPush.js';
+import type { R2Client } from '../lib/r2.js';
 import { runInvoiceAutoChargeOnce, type InvoiceAutoChargeTickResult } from './invoiceAutoCharge.js';
+import { runMediaDerivativesOnce, type MediaDerivativesTickResult } from './mediaDerivatives.js';
 
 interface WorkerLogger {
   info(obj: Record<string, unknown>, msg?: string): void;
@@ -62,10 +64,15 @@ const IDEMPOTENCY_TTL_HOURS = 24;
 
 export interface SchedulerTickOpts {
   expoPush?: ExpoPushClient;
+  /** R2 client for the media-derivatives phase (Day 17). */
+  r2?: R2Client;
   /** Per-tick batch size for the scheduled_notifications scan. Default 50. */
   notificationsLimit?: number;
   /** Per-tick batch size for the invoice auto-charge scan. Default 50. */
   invoiceLimit?: number;
+  /** Per-tick batch size for the media-derivatives scan. Default 5
+   *  (sharp is CPU-bound; small batch keeps tick latency bounded). */
+  mediaDerivativesLimit?: number;
   /** "Now" for the scans + sweep cutoff. Tests pin a fixed instant. */
   now?: Date;
   /** Logger — defaults to no-op so tests stay quiet. */
@@ -82,6 +89,7 @@ export interface ScheduledNotificationsTickResult {
 export interface SchedulerTickResult {
   scheduledNotifications: ScheduledNotificationsTickResult;
   invoiceAutoCharge: InvoiceAutoChargeTickResult;
+  mediaDerivatives: MediaDerivativesTickResult;
   idempotencyKeysSwept: number;
 }
 
@@ -117,6 +125,29 @@ export async function runSchedulerTickOnce(
     log,
   });
 
+  // Phase 4 — media derivatives (Day 17). Each job runs claim → sharp →
+  // settle independently; failures stay parked on the job row and don't
+  // block the rest of the tick. The composed worker uses its own R2
+  // client seam (defaults to the production client when not injected).
+  let mediaDerivativesResult: MediaDerivativesTickResult;
+  try {
+    mediaDerivativesResult = await runMediaDerivativesOnce({
+      r2: opts.r2,
+      limit: opts.mediaDerivativesLimit,
+      log,
+    });
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'media-derivatives',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'media-derivatives phase threw at the worker boundary; will retry next tick',
+    );
+    mediaDerivativesResult = { scanned: 0, results: [] };
+  }
+
   const sweepCutoff = new Date(now.getTime() - IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000);
   let idempotencyKeysSwept = 0;
   try {
@@ -139,6 +170,7 @@ export async function runSchedulerTickOnce(
   return {
     scheduledNotifications: notificationsResult,
     invoiceAutoCharge: invoiceResult,
+    mediaDerivatives: mediaDerivativesResult,
     idempotencyKeysSwept,
   };
 }

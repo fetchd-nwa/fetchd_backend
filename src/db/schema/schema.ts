@@ -14,6 +14,7 @@ export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'm
 export const invoiceStatus = pgEnum("invoice_status", ['open', 'paid', 'void'])
 export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment', 'membership-grant'])
 export const locationKey = pgEnum("location_key", ['fayetteville', 'bentonville'])
+export const mediaDerivativeJobStatus = pgEnum("media_derivative_job_status", ['pending', 'processing', 'done', 'failed'])
 export const mediaKind = pgEnum("media_kind", ['image', 'video'])
 export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avatar', 'report-photo', 'report-video', 'message-attachment'])
 export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check'])
@@ -364,6 +365,26 @@ export const mediaAssets = pgTable("media_assets", {
 			columns: [table.reportId],
 			foreignColumns: [reports.id],
 			name: "media_assets_report_id_fkey"
+		}).onDelete("cascade"),
+	}
+});
+
+export const mediaDerivativeJobs = pgTable("media_derivative_jobs", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	mediaAssetId: uuid("media_asset_id").notNull(),
+	status: mediaDerivativeJobStatus().default('pending').notNull(),
+	attempts: integer().default(0).notNull(),
+	lastError: text("last_error"),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		pendingIdx: index("media_derivative_jobs_pending_idx").using("btree", table.createdAt.asc().nullsLast().op("timestamptz_ops")).where(sql`(status = 'pending'::media_derivative_job_status)`),
+		mediaDerivativeJobsMediaAssetIdKey: unique("media_derivative_jobs_media_asset_id_key").on(table.mediaAssetId),
+		mediaDerivativeJobsMediaAssetIdFkey: foreignKey({
+			columns: [table.mediaAssetId],
+			foreignColumns: [mediaAssets.id],
+			name: "media_derivative_jobs_media_asset_id_fkey"
 		}).onDelete("cascade"),
 	}
 });

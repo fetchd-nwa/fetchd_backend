@@ -30,6 +30,7 @@ const FAKE_RESULT: SchedulerTickResult = {
     pushTicketsError: 0,
   },
   invoiceAutoCharge: { scanned: 0, results: [] },
+  mediaDerivatives: { scanned: 0, results: [] },
   idempotencyKeysSwept: 0,
 };
 
