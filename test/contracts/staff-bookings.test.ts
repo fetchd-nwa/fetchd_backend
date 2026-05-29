@@ -7,6 +7,7 @@ import {
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
   charges,
+  creditLedger,
   notifications,
   refunds,
 } from '../../src/db/schema/schema.js';
@@ -406,3 +407,115 @@ test('POST /staff/bookings/:id/attendance — owner principal → 403', SKIP_WHE
   });
   assert.equal(res.statusCode, 403, res.body);
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// Cancel — the two refund branches NOT covered above (forfeit + credit-back)
+// + idempotency replay, proving the shared cancel txn is correct through the
+// cross-owner staff route across all three outcomes.
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /staff/bookings/:id/cancel — past-deadline forfeit → cancel_forfeited, no refund',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedBooking({
+      category: 'private-lesson',
+      scheduledAt: new Date(REAL_NOW_MS + 30 * ONE_HOUR_MS).toISOString(),
+      cancelDeadlineAt: new Date(REAL_NOW_MS - 6 * ONE_HOUR_MS).toISOString(), // window passed
+    });
+    const { app } = staffBookingsApp();
+    const res = await post({
+      app,
+      url: `/staff/bookings/${id}/cancel`,
+      idempotencyKey: `cx-forfeit-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { status: string; cancel_forfeited?: boolean };
+    assert.equal(body.status, 'cancelled');
+    assert.equal(body.cancel_forfeited, true);
+
+    const refundRows = await db.select().from(refunds).where(eq(refunds.bookingId, id));
+    assert.equal(refundRows.length, 0, 'forfeit leaves no refund row');
+  },
+);
+
+test(
+  'POST /staff/bookings/:id/cancel — credit-paid within window → cancel-refund ledger row',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedBooking({
+      category: 'day-school',
+      scheduledAt: new Date(REAL_NOW_MS + 72 * ONE_HOUR_MS).toISOString(),
+      cancelDeadlineAt: new Date(REAL_NOW_MS + 48 * ONE_HOUR_MS).toISOString(),
+    });
+    // Seed the booking-debit the cancel txn's credit-back branch reverses.
+    await db.insert(creditLedger).values({
+      dogId: FIXTURE_IDS.dog1Id,
+      mode: 'school',
+      delta: -1,
+      reason: 'booking-debit',
+      bookingId: id,
+    });
+
+    const { app } = staffBookingsApp();
+    const res = await post({
+      app,
+      url: `/staff/bookings/${id}/cancel`,
+      idempotencyKey: `cx-credit-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+
+    const refundLedger = await db
+      .select({ delta: creditLedger.delta, dogId: creditLedger.dogId })
+      .from(creditLedger)
+      .where(and(eq(creditLedger.bookingId, id), eq(creditLedger.reason, 'cancel-refund')));
+    assert.equal(refundLedger.length, 1, 'one cancel-refund row for the credit-paid booking');
+    assert.equal(refundLedger[0]!.delta, 1);
+    assert.equal(refundLedger[0]!.dogId, FIXTURE_IDS.dog1Id);
+  },
+);
+
+test(
+  'POST /staff/bookings/:id/cancel — idempotency replay returns stored body, no double-cancel',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedBooking({
+      category: 'private-lesson',
+      scheduledAt: new Date(REAL_NOW_MS + 72 * ONE_HOUR_MS).toISOString(),
+      cancelDeadlineAt: new Date(REAL_NOW_MS + 48 * ONE_HOUR_MS).toISOString(),
+    });
+    const { app } = staffBookingsApp();
+    const key = `cx-idem-${randomUUID()}`;
+    const first = await post({ app, url: `/staff/bookings/${id}/cancel`, idempotencyKey: key });
+    assert.equal(first.statusCode, 200, first.body);
+    const replay = await post({ app, url: `/staff/bookings/${id}/cancel`, idempotencyKey: key });
+    assert.equal(replay.statusCode, 200, replay.body);
+    assert.deepEqual(replay.json(), first.json(), 'replay byte-identical');
+  },
+);
+
+test(
+  'POST /staff/bookings/:id/attendance — idempotency replay returns stored body',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedBooking({});
+    const { app } = staffBookingsApp();
+    const key = `at-idem-${randomUUID()}`;
+    const payload = { dog_id: FIXTURE_IDS.dog1Id, status: 'attended' };
+    const first = await post({
+      app,
+      url: `/staff/bookings/${id}/attendance`,
+      idempotencyKey: key,
+      payload,
+    });
+    assert.equal(first.statusCode, 200, first.body);
+    const replay = await post({
+      app,
+      url: `/staff/bookings/${id}/attendance`,
+      idempotencyKey: key,
+      payload,
+    });
+    assert.equal(replay.statusCode, 200, replay.body);
+    assert.deepEqual(replay.json(), first.json(), 'replay byte-identical');
+  },
+);
