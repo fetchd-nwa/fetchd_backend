@@ -159,6 +159,29 @@ export const bookingsRepository = {
   },
 
   /**
+   * Count the dog's PAST (completed, non-cancelled) sessions in a category —
+   * dog on the `booking_dogs` roster (lead or additional). Cross-owner (staff
+   * context, no owner filter). Drives the report author's auto visit number:
+   * the report being written is visit `count + 1`.
+   */
+  async countPastSessionsForDog(dogId: string, category: ServiceCategory): Promise<number> {
+    const [row] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(bookings)
+      .innerJoin(bookingDogs, eq(bookingDogs.bookingId, bookings.id))
+      .where(
+        and(
+          eq(bookingDogs.dogId, dogId),
+          live(bookingDogs),
+          eq(bookings.category, category),
+          eq(bookings.status, 'past'),
+          live(bookings),
+        ),
+      );
+    return row?.count ?? 0;
+  },
+
+  /**
    * Resolve booking_dogs rows for a batch of booking ids — lead +
    * additional per booking. Caller groups via
    * `lib/bookingWire.groupBookingDogs` for snapshot-stable ordering.

@@ -76,3 +76,54 @@ test('GET /staff/dogs — owner principal → 403', SKIP_WHEN_NO_DB, async () =>
   const res = await app.inject({ method: 'GET', url: '/staff/dogs' });
   assert.equal(res.statusCode, 403, res.body);
 });
+
+// --- Day-19c: session-count (report author's auto visit number) -------------
+
+test(
+  'GET /staff/dogs/:id/session-count — counts past sessions in the category',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = staffDogsApp();
+    // Waffles has exactly one PAST day-school booking (booking6); booking1 +
+    // bookingDst are upcoming, booking9 is cancelled.
+    const res = await app.inject({
+      method: 'GET',
+      url: `/staff/dogs/${FIXTURE_IDS.dog1Id}/session-count?category=day-school`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as { count: number }).count, 1);
+  },
+);
+
+test(
+  'GET /staff/dogs/:id/session-count — zero when no past sessions in the category',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = staffDogsApp();
+    // Waffles' only private-lesson (booking3) is upcoming, not past.
+    const res = await app.inject({
+      method: 'GET',
+      url: `/staff/dogs/${FIXTURE_IDS.dog1Id}/session-count?category=private-lesson`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as { count: number }).count, 0);
+  },
+);
+
+test('GET /staff/dogs/:id/session-count — owner principal → 403', SKIP_WHEN_NO_DB, async () => {
+  const app = staffDogsApp(FIXTURE_OWNER_PRINCIPAL);
+  const res = await app.inject({
+    method: 'GET',
+    url: `/staff/dogs/${FIXTURE_IDS.dog1Id}/session-count?category=day-school`,
+  });
+  assert.equal(res.statusCode, 403, res.body);
+});
+
+test('GET /staff/dogs/:id/session-count — unknown category → 400', SKIP_WHEN_NO_DB, async () => {
+  const app = staffDogsApp();
+  const res = await app.inject({
+    method: 'GET',
+    url: `/staff/dogs/${FIXTURE_IDS.dog1Id}/session-count?category=not-a-category`,
+  });
+  assert.equal(res.statusCode, 400, res.body);
+});
