@@ -11,6 +11,7 @@ import { registerCreditsRoute } from './routes/credits.js';
 import { registerDogsRoute } from './routes/dogs.js';
 import { registerEnrollmentsRoute } from './routes/enrollments.js';
 import { registerEventsRoute } from './routes/events.js';
+import { registerDeviceTokensRoute } from './routes/device-tokens.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerInvoicesRoute } from './routes/invoices.js';
@@ -69,6 +70,7 @@ export function buildApp(): FastifyInstance {
   registerNotificationsRoute(app); // [auth] — owner-only
   registerAnnouncementsRoute(app); // [auth] — catalog (owner + staff)
   registerPaymentMethodsRoute(app); // [auth] — owner-only
+  registerDeviceTokensRoute(app); // [auth] — owner-only (Day-18c push registration)
   registerInvoicesRoute(app); // [auth, $] — Day-15 invoice settlement
   registerRequestConfirmPaymentRoute(app); // [auth, $] — Day-15 B&T conversion
   registerUploadsSignRoute(app); // [auth] — Day-17 presigned R2 PUT
