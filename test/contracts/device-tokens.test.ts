@@ -135,6 +135,46 @@ test(
 );
 
 test(
+  'POST /device-tokens — re-register AFTER revoke inserts a fresh live row',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The partial-unique index is partial (WHERE expired_at IS NULL) precisely
+    // so a device that revokes then re-grants push gets a new live row rather
+    // than colliding with its own tombstone. This proves that path.
+    const token = freshToken();
+    const { app } = buildApp();
+    const first = await app.inject({
+      method: 'POST',
+      url: '/device-tokens',
+      headers: { 'idempotency-key': `dt-rr-1-${randomUUID()}` },
+      payload: { token, platform: 'ios' },
+    });
+    assert.equal(first.statusCode, 201);
+    const firstId = (first.json() as { id: string }).id;
+
+    const del = await app.inject({
+      method: 'DELETE',
+      url: `/device-tokens/${encodeURIComponent(token)}`,
+      headers: { 'idempotency-key': `dt-rr-del-${randomUUID()}` },
+    });
+    assert.equal(del.statusCode, 204);
+    assert.equal(await liveRowCount(token), 0, 'no live row after revoke');
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/device-tokens',
+      headers: { 'idempotency-key': `dt-rr-2-${randomUUID()}` },
+      payload: { token, platform: 'ios' },
+    });
+    assert.equal(second.statusCode, 201);
+    const secondId = (second.json() as { id: string }).id;
+    assert.notEqual(secondId, firstId, 'a fresh row, not the revoked tombstone');
+    assert.equal(await liveRowCount(token), 1, 'exactly one live row again');
+    await cleanup(token);
+  },
+);
+
+test(
   'POST /device-tokens — replay with same key returns identical body, no new row',
   SKIP_WHEN_NO_DB,
   async () => {
