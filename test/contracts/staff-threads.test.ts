@@ -86,6 +86,63 @@ test('GET /staff/threads — owner principal → 403', SKIP_WHEN_NO_DB, async ()
 });
 
 // ──────────────────────────────────────────────────────────────────────────
+// GET /staff/threads/:id/messages (Day-19b cross-owner conversation read)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'GET /staff/threads/:id/messages — staff reads a cross-owner conversation',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = staffThreadsApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/staff/threads/${FIXTURE_IDS.thread1Id}/messages`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const rows = res.json() as {
+      id: string;
+      thread_id: string;
+      sender_id: string;
+      text: string;
+      sent_at: string;
+      is_read: boolean;
+    }[];
+    // Assert the seeded messages are all present (this file's reply tests
+    // also insert into thread1, so assert specific ids, never a total).
+    const seeded = [
+      FIXTURE_IDS.message1Id,
+      FIXTURE_IDS.message2Id,
+      FIXTURE_IDS.message3Id,
+      FIXTURE_IDS.message4Id,
+      FIXTURE_IDS.message5Id,
+    ];
+    const returnedIds = new Set(rows.map((r) => r.id));
+    for (const id of seeded) {
+      assert.ok(returnedIds.has(id), `seeded message ${id} present`);
+    }
+    assert.ok(
+      rows.every((r) => r.thread_id === FIXTURE_IDS.thread1Id),
+      'every message belongs to the requested thread',
+    );
+  },
+);
+
+test('GET /staff/threads/:id/messages — unknown thread → 404', SKIP_WHEN_NO_DB, async () => {
+  const app = staffThreadsApp();
+  const res = await app.inject({ method: 'GET', url: `/staff/threads/${randomUUID()}/messages` });
+  assert.equal(res.statusCode, 404, res.body);
+});
+
+test('GET /staff/threads/:id/messages — owner principal → 403', SKIP_WHEN_NO_DB, async () => {
+  const app = staffThreadsApp(FIXTURE_OWNER_PRINCIPAL);
+  const res = await app.inject({
+    method: 'GET',
+    url: `/staff/threads/${FIXTURE_IDS.thread1Id}/messages`,
+  });
+  assert.equal(res.statusCode, 403, res.body);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
 // POST /staff/threads/:id/messages
 // ──────────────────────────────────────────────────────────────────────────
 

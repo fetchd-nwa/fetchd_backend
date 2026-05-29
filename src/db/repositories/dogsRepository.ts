@@ -2,6 +2,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import {
   dogs,
+  owners,
   vets,
   dogVaccines,
   dogMedications,
@@ -328,6 +329,44 @@ async function findOwnerIdInTx(tx: Tx, dogId: string): Promise<string | undefine
   return row?.ownerId ?? undefined;
 }
 
+/**
+ * One row of the cross-owner staff dog directory (`GET /staff/dogs`,
+ * Day-19b). The data layer owns its own return-type vocabulary; the route
+ * converts to the snake_case §B-style wire.
+ */
+export interface StaffDogRow {
+  id: string;
+  name: string;
+  breed: string;
+  ownerId: string;
+  ownerName: string;
+  profileImagePath: string | null;
+}
+
+/**
+ * Cross-owner dog directory for the staff portal. The staff verbs reference
+ * dogs by UUID and carry no names; this resolves dog_id → name + owner for
+ * display and powers the report-author dog picker. Owner-owned live dogs
+ * only — the inner join on live `owners` excludes staff-owned school cats
+ * (those carry `staff_owner_id`, never an `owner_id`). Ordered by name.
+ * Unbounded: a Day-20 pagination item like the other `GET /staff/*` reads.
+ */
+async function findAllLiveForStaff(): Promise<StaffDogRow[]> {
+  return db
+    .select({
+      id: dogs.id,
+      name: dogs.name,
+      breed: dogs.breed,
+      ownerId: owners.id,
+      ownerName: owners.name,
+      profileImagePath: dogs.profileImagePath,
+    })
+    .from(dogs)
+    .innerJoin(owners, and(eq(owners.id, dogs.ownerId), live(owners)))
+    .where(live(dogs))
+    .orderBy(dogs.name, dogs.id);
+}
+
 function bucketBy<T, K>(items: T[], key: (item: T) => K): Map<K, T[]> {
   const result = new Map<K, T[]>();
   for (const item of items) {
@@ -345,6 +384,7 @@ export const dogsRepository = {
   findOwnedExists,
   findEvaluationStatusInTx,
   findOwnerIdInTx,
+  findAllLiveForStaff,
   create,
   update,
   softExpire,

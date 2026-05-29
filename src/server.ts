@@ -26,6 +26,7 @@ import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
+import { registerStaffDogsRoute } from './routes/staffDogs.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
 import { registerStaffThreadsRoute } from './routes/staffThreads.js';
@@ -66,6 +67,7 @@ export function buildApp(): FastifyInstance {
   registerRequestsRoute(app); // [auth] — owner-only
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
   registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
+  registerStaffDogsRoute(app); // [staff] — Day-19b portal dog directory (name resolution)
   registerStaffBookingsRoute(app); // [staff] — Day-19 portal verb 4 (confirm / cancel / attendance)
   registerStaffThreadsRoute(app); // [staff] — Day-19 portal verb 3 (thread queue + staff reply)
   registerStaffReportsRoute(app); // [staff] — Day-19 portal verb 2 (report authoring)

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   bookings as bookingsTable,
@@ -106,6 +106,31 @@ async function seedBookingForDog(dogId: string): Promise<string> {
   });
   await db.insert(bookingDogsTable).values([{ bookingId: id, dogId, isLead: true }]);
   return id;
+}
+
+/** Seed N weekly group-class bookings for one (cohort, dog). */
+async function seedGroupClassWeeks(
+  dogId: string,
+  cohortId: string,
+  weekDates: string[],
+): Promise<string[]> {
+  const ids = weekDates.map(() => randomUUID());
+  await db.insert(bookingsTable).values(
+    weekDates.map((scheduledAt, i) => ({
+      id: ids[i]!,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: dogId,
+      category: 'group-class' as const,
+      status: 'upcoming' as const,
+      scheduledAt,
+      location: 'fayetteville' as const,
+      cohortId,
+    })),
+  );
+  await db
+    .insert(bookingDogsTable)
+    .values(ids.map((id) => ({ bookingId: id, dogId, isLead: true })));
+  return ids;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -229,6 +254,58 @@ test(
     const payload = { ...sessionPayload(), dog_id: FIXTURE_IDS.dog1Id, link_booking_id: bookingId };
     const res = await postReport({ app, payload, idempotencyKey: `rp-linkbad-${randomUUID()}` });
     assert.equal(res.statusCode, 422, res.body);
+  },
+);
+
+test(
+  'POST /staff/reports — group-class report fans the link out to every weekly booking for the (cohort, dog)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohortId = FIXTURE_IDS.cohortMannersId;
+    const weekIds = await seedGroupClassWeeks(FIXTURE_IDS.dog1Id, cohortId, [
+      '2026-06-01T15:00:00Z',
+      '2026-06-08T15:00:00Z',
+      '2026-06-15T15:00:00Z',
+    ]);
+    // Negative control: a different dog in the SAME cohort must NOT be linked.
+    const [otherDogBooking] = await seedGroupClassWeeks(FIXTURE_IDS.dog2Id, cohortId, [
+      '2026-06-01T15:00:00Z',
+    ]);
+    try {
+      const app = staffReportsApp();
+      const payload = {
+        dog_id: FIXTURE_IDS.dog1Id,
+        date: REPORT_DATE,
+        category: 'group-class',
+        program: 'group-class-session',
+        excerpt: 'Manners 2 cohort recap.',
+        full_text: 'Four weeks of group manners — solid recall + place.',
+        content: { class_name: 'Group Manners 2', weeks: [{ week_number: 1 }] },
+        link_booking_id: weekIds[0], // pick ONE week; the link must fan out to all
+      };
+      const res = await postReport({ app, payload, idempotencyKey: `rp-gc-${randomUUID()}` });
+      assert.equal(res.statusCode, 201, res.body);
+      const reportId = (res.json() as { id: string }).id;
+
+      const linked = await db
+        .select({ id: bookingsTable.id, sessionReportId: bookingsTable.sessionReportId })
+        .from(bookingsTable)
+        .where(inArray(bookingsTable.id, weekIds));
+      assert.equal(linked.length, weekIds.length, 'all weekly bookings present');
+      for (const row of linked) {
+        assert.equal(row.sessionReportId, reportId, `week ${row.id} back-linked to the report`);
+      }
+
+      const [other] = await db
+        .select({ sessionReportId: bookingsTable.sessionReportId })
+        .from(bookingsTable)
+        .where(eq(bookingsTable.id, otherDogBooking!));
+      assert.equal(other?.sessionReportId, null, "a different dog's cohort booking is NOT linked");
+    } finally {
+      const all = [...weekIds, otherDogBooking!];
+      await db.delete(bookingDogsTable).where(inArray(bookingDogsTable.bookingId, all));
+      await db.delete(bookingsTable).where(inArray(bookingsTable.id, all));
+    }
   },
 );
 

@@ -32,11 +32,16 @@ import { toReportWire, type ReportProgram, type ReportWire } from '../lib/report
  * booking's `session_report_id`, and enqueues a `report-published`
  * notification to the dog's owner.
  *
- * DEFERRED to a later pass (documented in HANDOFF, R2 ambiguity / scope):
+ * Group-class reports back-link the WHOLE cohort run: a `link_booking_id`
+ * pointing at a group-class booking propagates `session_report_id` to every
+ * weekly booking for that (cohort, dog) — see
+ * `bookingsRepository.setSessionReportId` (Day-19b, DATA-CONTRACT group-class
+ * enrollment). The `report_id`-vs-`session_report_id` distinction is left
+ * documented-open; only `session_report_id` is used here.
+ *
+ * DEFERRED to Day-19c (documented in HANDOFF):
  *   - report-photo / report-video media attachment (staff-author media
  *     ownership rework across POST/GET/DELETE /media).
- *   - the group-class multi-week back-link (every weekly booking for a
- *     cohort+dog) + the `report_id`-vs-`session_report_id` distinction.
  */
 
 const SERVICE_CATEGORY_VALUES = pgEnumTuple(serviceCategory);
@@ -153,8 +158,9 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
             content: body.content ?? null,
           });
 
-          // Optional single-booking back-link. The booking must be live +
-          // its lead dog must be this report's dog (coherence guard).
+          // Optional back-link. The booking must be live + its lead dog must
+          // be this report's dog (coherence guard). For a group-class booking
+          // the link fans out to every weekly booking of the (cohort, dog).
           if (body.link_booking_id !== undefined) {
             const linked = await bookingsRepository.setSessionReportId(tx, {
               bookingId: body.link_booking_id,

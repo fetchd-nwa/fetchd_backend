@@ -54,6 +54,21 @@ export const threadsRepository = {
   },
 
   /**
+   * Whether a live thread exists by id, cross-owner. Drives the 404 on the
+   * Day-19b staff message read (`GET /staff/threads/:id/messages`):
+   * `messagesRepository.findLiveByThread` can't distinguish "no such thread"
+   * from "live thread with no messages yet", so existence is checked here.
+   */
+  async existsLive(id: string): Promise<boolean> {
+    const [row] = await db
+      .select({ exists: sql<boolean>`true` })
+      .from(threads)
+      .where(and(eq(threads.id, id), live(threads)))
+      .limit(1);
+    return row !== undefined;
+  },
+
+  /**
    * Resolve a live thread's `owner_id` inside a tx (or `undefined` if the
    * id doesn't exist / is expired). The Day-19 staff reply verb needs the
    * owner to address the `message-received` notification; the route 404s

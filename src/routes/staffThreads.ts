@@ -13,8 +13,9 @@ import { wireManyMessages, wireManyThreads } from '../lib/wireManyThreads.js';
 /**
  * Day-19 staff portal verb 3 — messaging reply.
  *
- *   GET  /staff/threads               — the cross-owner thread queue
- *   POST /staff/threads/:id/messages  — staff reply (sender_kind='staff')
+ *   GET  /staff/threads                  — the cross-owner thread queue
+ *   GET  /staff/threads/:id/messages     — cross-owner conversation read (19b)
+ *   POST /staff/threads/:id/messages     — staff reply (sender_kind='staff')
  *
  * Cross-owner reads/writes gated by `requireStaff`; the owner-scoped read
  * surface lives in `routes/threads.ts`. The reply is the first message-
@@ -45,6 +46,29 @@ export function registerStaffThreadsRoute(app: FastifyInstance, opts: AuthRouteO
     const rows = await threadsRepository.findLive();
     return wireManyThreads(rows);
   });
+
+  // --- GET /staff/threads/:id/messages ------------------------------------
+  //
+  // Cross-owner conversation read (Day-19b). The reply verb is useless
+  // without the staffer seeing the thread first; the owner-side read
+  // (`routes/threads.ts`) is owner-scoped, so staff need their own
+  // cross-owner read. 404 when the thread doesn't exist (checked via
+  // `existsLive` — an empty live thread must read as `[]`, not 404).
+  app.get(
+    '/staff/threads/:id/messages',
+    { preHandler: [authHook] },
+    async (request): Promise<MessageWire[]> => {
+      const principal = requirePrincipal(request);
+      requireStaff(principal, 'read a thread');
+      const { id } = parseUuidParam(request.params);
+      const exists = await threadsRepository.existsLive(id);
+      if (!exists) {
+        throw new ApiError('not_found', `thread ${id} not found`);
+      }
+      const rows = await messagesRepository.findLiveByThread(id);
+      return wireManyMessages(rows);
+    },
+  );
 
   // --- POST /staff/threads/:id/messages -----------------------------------
   //

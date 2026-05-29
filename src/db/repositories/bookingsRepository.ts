@@ -357,8 +357,16 @@ export const bookingsRepository = {
    * matches the report's dog; returns the matched id (or `undefined` for
    * no live booking / dog mismatch, which the route maps to 422). The
    * `lead_dog_id` predicate is the coherence guard — a report can only
-   * link a booking for the same dog. The group-class multi-week back-link
-   * (every weekly booking for a cohort+dog) is deferred to a later pass.
+   * link a booking for the same dog.
+   *
+   * Group-class multi-week back-link (Day-19b, DATA-CONTRACT group-class
+   * enrollment): a group-class report covers the whole cohort run, so when
+   * the picked booking is a group-class booking it propagates the link to
+   * EVERY live weekly booking for that (cohort, dog) — not just the one. The
+   * `lead_dog_id = dog` predicate holds for all weekly rows (enrollment
+   * stamps `lead_dog_id = $dog` per row). Non-group-class is unchanged
+   * (single booking). `report_id` (the other bookings→reports FK) is left
+   * untouched — its role is documented-open, not part of this linkage.
    */
   async setSessionReportId(
     tx: Tx,
@@ -370,8 +378,22 @@ export const bookingsRepository = {
       .where(
         and(eq(bookings.id, args.bookingId), eq(bookings.leadDogId, args.dogId), live(bookings)),
       )
-      .returning({ id: bookings.id });
-    return row?.id;
+      .returning({ id: bookings.id, category: bookings.category, cohortId: bookings.cohortId });
+    if (row === undefined) return undefined;
+
+    if (row.category === 'group-class' && row.cohortId !== null) {
+      await tx
+        .update(bookings)
+        .set({ sessionReportId: args.reportId, updatedAt: sql`now()` })
+        .where(
+          and(
+            eq(bookings.cohortId, row.cohortId),
+            eq(bookings.leadDogId, args.dogId),
+            live(bookings),
+          ),
+        );
+    }
+    return row.id;
   },
 
   /**
