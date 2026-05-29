@@ -1,7 +1,8 @@
-import { and, asc, count, desc, eq, inArray, isNull, ne } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { messages, threadDogs, threads } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import type { Tx } from '../tx.js';
 import type { ThreadRowForWire } from '../../lib/threadWire.js';
 
 /**
@@ -36,6 +37,47 @@ export const threadsRepository = {
       .from(threads)
       .where(and(eq(threads.ownerId, ownerId), live(threads)))
       .orderBy(desc(threads.lastMessageAt));
+  },
+
+  /**
+   * Every live thread across ALL owners, newest `last_message_at` first —
+   * the Day-19 staff-portal queue (`GET /staff/threads`). Cross-owner by
+   * design (`requireStaff` gates the route); the owner-scoped sibling is
+   * `findLiveByOwner`.
+   */
+  async findLive(): Promise<ThreadRow[]> {
+    return db
+      .select(THREAD_PROJECTION)
+      .from(threads)
+      .where(live(threads))
+      .orderBy(desc(threads.lastMessageAt));
+  },
+
+  /**
+   * Resolve a live thread's `owner_id` inside a tx (or `undefined` if the
+   * id doesn't exist / is expired). The Day-19 staff reply verb needs the
+   * owner to address the `message-received` notification; the route 404s
+   * on `undefined`.
+   */
+  async findOwnerById(tx: Tx, id: string): Promise<string | undefined> {
+    const [row] = await tx
+      .select({ ownerId: threads.ownerId })
+      .from(threads)
+      .where(and(eq(threads.id, id), live(threads)))
+      .limit(1);
+    return row?.ownerId;
+  },
+
+  /**
+   * Bump the thread's `last_message` preview + `last_message_at` so the
+   * thread list re-sorts to the top after a new message. Called by the
+   * Day-19 staff reply verb inside the same tx as the message INSERT.
+   */
+  async bumpLastMessage(tx: Tx, id: string, preview: string): Promise<void> {
+    await tx
+      .update(threads)
+      .set({ lastMessage: preview, lastMessageAt: sql`now()` })
+      .where(eq(threads.id, id));
   },
 
   /**

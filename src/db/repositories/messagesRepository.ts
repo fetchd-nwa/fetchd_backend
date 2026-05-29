@@ -2,6 +2,7 @@ import { and, asc, eq } from 'drizzle-orm';
 import { db } from '../client.js';
 import { messages } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import type { Tx } from '../tx.js';
 import type { MessageRowForWire } from '../../lib/threadWire.js';
 
 /**
@@ -44,5 +45,31 @@ export const messagesRepository = {
       .from(messages)
       .where(and(eq(messages.threadId, threadId), live(messages)))
       .orderBy(asc(messages.sentAt));
+  },
+
+  /**
+   * INSERT a staff-authored message (Day-19 portal verb 3). Sets
+   * `sender_kind='staff'` + `sender_staff_id`; `sender_owner_id` stays
+   * NULL (the schema `messages_check` CHECK enforces the XOR). Returns the
+   * inserted row in the read projection so the route can wire it back. The
+   * route validates `text` + thread existence before calling.
+   */
+  async createStaffMessage(
+    tx: Tx,
+    args: { threadId: string; staffId: string; text: string },
+  ): Promise<MessageRow> {
+    const [row] = await tx
+      .insert(messages)
+      .values({
+        threadId: args.threadId,
+        senderKind: 'staff',
+        senderStaffId: args.staffId,
+        text: args.text,
+      })
+      .returning(MESSAGE_PROJECTION);
+    if (!row) {
+      throw new Error('messagesRepository.createStaffMessage: INSERT returned no row');
+    }
+    return row;
   },
 };

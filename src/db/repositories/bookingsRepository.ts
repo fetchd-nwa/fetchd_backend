@@ -1,6 +1,6 @@
-import { and, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { bookingDogs, bookings } from '../schema/schema.js';
+import { bookingAttendance, bookingDogs, bookings } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { BookingStatus, LocationKey } from '../../lib/bookingWire.js';
@@ -103,6 +103,19 @@ export const bookingsRepository = {
       .select(BOOKING_PROJECTION)
       .from(bookings)
       .where(and(eq(bookings.ownerId, ownerId), ne(bookings.status, 'cancelled'), live(bookings)));
+  },
+
+  /**
+   * Every live, non-cancelled booking across ALL owners — the Day-19
+   * staff-portal queue read (`GET /staff/bookings`). Cross-owner by
+   * design (`requireStaff` gates the route); the owner-scoped sibling is
+   * `findLiveActiveByOwner`. The route sorts by scheduled_at.
+   */
+  async findLiveActive(): Promise<BookingRow[]> {
+    return db
+      .select(BOOKING_PROJECTION)
+      .from(bookings)
+      .where(and(ne(bookings.status, 'cancelled'), live(bookings)));
   },
 
   /**
@@ -318,5 +331,82 @@ export const bookingsRepository = {
         cancelForfeited: sql`COALESCE(now() > ${bookings.cancelDeadlineAt}, false)`,
       })
       .where(eq(bookings.id, id));
+  },
+
+  // -------------------------------------------------------------------
+  // Day 19 — staff portal verb 4 (confirm + per-dog attendance). The
+  // shared cancel txn lives in `lib/cancelBookingService.ts`.
+  // -------------------------------------------------------------------
+
+  /**
+   * Staff confirm. Stamps `confirmed_at = now()` ONLY when currently
+   * NULL, so a re-confirm with a fresh Idempotency-Key is a no-op that
+   * preserves the FIRST confirm time (the value drives reminder
+   * scheduling). The route re-reads + wires; this returns nothing.
+   */
+  async setConfirmed(tx: Tx, id: string): Promise<void> {
+    await tx
+      .update(bookings)
+      .set({ confirmedAt: sql`now()`, updatedAt: sql`now()` })
+      .where(and(eq(bookings.id, id), isNull(bookings.confirmedAt)));
+  },
+
+  /**
+   * Back-link a booking to a freshly-authored report (Day-19 verb 2).
+   * Sets `session_report_id` on a live booking whose `lead_dog_id`
+   * matches the report's dog; returns the matched id (or `undefined` for
+   * no live booking / dog mismatch, which the route maps to 422). The
+   * `lead_dog_id` predicate is the coherence guard — a report can only
+   * link a booking for the same dog. The group-class multi-week back-link
+   * (every weekly booking for a cohort+dog) is deferred to a later pass.
+   */
+  async setSessionReportId(
+    tx: Tx,
+    args: { bookingId: string; reportId: string; dogId: string },
+  ): Promise<string | undefined> {
+    const [row] = await tx
+      .update(bookings)
+      .set({ sessionReportId: args.reportId, updatedAt: sql`now()` })
+      .where(
+        and(eq(bookings.id, args.bookingId), eq(bookings.leadDogId, args.dogId), live(bookings)),
+      )
+      .returning({ id: bookings.id });
+    return row?.id;
+  },
+
+  /**
+   * Record a per-dog check-in (Day-19 attendance). Sets `attendance`,
+   * `checked_in_at = now()`, and the acting `checked_in_by_staff_id` on
+   * the `booking_dogs` row, returning the resolved `attendance` +
+   * `checkedInAt` for the wire. `undefined` when the (booking, dog) pair
+   * isn't on the roster — the route 404s on that (the `RETURNING` folds
+   * the existence check into the write). The route validates `status` to
+   * the non-'pending' subset before calling.
+   */
+  async setAttendance(
+    tx: Tx,
+    args: {
+      bookingId: string;
+      dogId: string;
+      status: (typeof bookingAttendance.enumValues)[number];
+      staffId: string;
+    },
+  ): Promise<
+    { attendance: (typeof bookingAttendance.enumValues)[number]; checkedInAt: string } | undefined
+  > {
+    const [row] = await tx
+      .update(bookingDogs)
+      .set({
+        attendance: args.status,
+        checkedInAt: sql`now()`,
+        checkedInByStaffId: args.staffId,
+      })
+      .where(and(eq(bookingDogs.bookingId, args.bookingId), eq(bookingDogs.dogId, args.dogId)))
+      .returning({
+        attendance: bookingDogs.attendance,
+        checkedInAt: bookingDogs.checkedInAt,
+      });
+    if (row === undefined || row.checkedInAt === null) return undefined;
+    return { attendance: row.attendance, checkedInAt: row.checkedInAt };
   },
 };

@@ -311,6 +311,23 @@ async function softExpire(tx: Tx, id: string): Promise<Dog | undefined> {
   return row;
 }
 
+/**
+ * Resolve a live dog's `owner_id` inside a tx, cross-owner (staff
+ * context). `undefined` if the dog doesn't exist / is expired. The
+ * Day-19 report-authoring verb needs the owner to address the
+ * `report-published` notification and to confirm the dog exists.
+ */
+async function findOwnerIdInTx(tx: Tx, dogId: string): Promise<string | undefined> {
+  const [row] = await tx
+    .select({ ownerId: dogs.ownerId })
+    .from(dogs)
+    .where(and(eq(dogs.id, dogId), live(dogs)))
+    .limit(1);
+  // owner_id is NOT NULL in the DB; the introspected drizzle type widens
+  // it to `string | null`, so coerce the (impossible) null to undefined.
+  return row?.ownerId ?? undefined;
+}
+
 function bucketBy<T, K>(items: T[], key: (item: T) => K): Map<K, T[]> {
   const result = new Map<K, T[]>();
   for (const item of items) {
@@ -327,6 +344,7 @@ export const dogsRepository = {
   findById,
   findOwnedExists,
   findEvaluationStatusInTx,
+  findOwnerIdInTx,
   create,
   update,
   softExpire,

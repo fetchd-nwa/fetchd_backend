@@ -8,7 +8,7 @@ import {
   type PendingRequestFullRow,
 } from '../db/repositories/requestsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
-import { locationKey } from '../db/schema/schema.js';
+import { locationKey, requestStatus } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
@@ -18,6 +18,7 @@ import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMappin
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { groupRequestDogs, type PendingRequestWire } from '../lib/requestWire.js';
 import { wireOneRequest } from '../lib/wireOneRequest.js';
+import { sortRequestsBySubmittedAt, wireManyRequests } from '../lib/wireManyRequests.js';
 import type { LocationKey } from '../lib/bookingWire.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
@@ -63,7 +64,9 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  */
 
 const LOCATION_KEYS = pgEnumTuple(locationKey);
+const REQUEST_STATUS_VALUES = pgEnumTuple(requestStatus);
 const uuidParamSchema = z.object({ id: z.string().uuid() });
+const statusQuerySchema = z.object({ status: z.enum(REQUEST_STATUS_VALUES).optional() });
 
 const isoDateTimeSchema = z.string().datetime({ offset: true });
 
@@ -102,6 +105,26 @@ export function registerStaffRequestsRoute(
   opts: AuthRouteOptions = {},
 ): void {
   const authHook = resolveAuthHook(opts);
+
+  // --- GET /staff/requests?status= ----------------------------------------
+  //
+  // Day-19 staff-portal queue (verb-1 read). Cross-owner by design —
+  // `requireStaff` gates the route, so every owner's live requests are
+  // visible. The portal passes `?status=submitted` to triage the
+  // approve/deny queue; status is optional (omitted → all live).
+  // Newest-submitted first, mirroring the owner-side GET /requests sort.
+  app.get(
+    '/staff/requests',
+    { preHandler: [authHook] },
+    async (request): Promise<PendingRequestWire[]> => {
+      const principal = requirePrincipal(request);
+      requireStaff(principal, 'read the staff request queue');
+      const { status } = parseStatusQuery(request.query);
+      const rows = await requestsRepository.findLive(status);
+      const sorted = sortRequestsBySubmittedAt(rows, 'desc');
+      return wireManyRequests(sorted);
+    },
+  );
 
   // --- POST /staff/requests/:id/approve -----------------------------------
   app.post(
@@ -438,6 +461,14 @@ function parseUuidParam(params: unknown): { id: string } {
   const parsed = uuidParamSchema.safeParse(params);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid path: ${parsed.error.message}`);
+  }
+  return parsed.data;
+}
+
+function parseStatusQuery(query: unknown): z.infer<typeof statusQuerySchema> {
+  const parsed = statusQuerySchema.safeParse(query);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid query: ${parsed.error.message}`);
   }
   return parsed.data;
 }

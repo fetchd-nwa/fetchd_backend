@@ -1,7 +1,8 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { dogs, reports } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import type { Tx } from '../tx.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { ReportProgram } from '../../lib/reportWire.js';
 
@@ -105,5 +106,92 @@ export const reportsRepository = {
       .orderBy(desc(reports.date))
       .limit(1);
     return rows[0];
+  },
+
+  // -------------------------------------------------------------------
+  // Day 19 — staff portal verb 2 (report authoring). Tx-only writes
+  // compose inside `withMutation`; the route validates the R2 shape
+  // (content-by-program) above this layer.
+  // -------------------------------------------------------------------
+
+  /**
+   * INSERT a report row. `results`/`content` are JSONB (objects or null);
+   * the schema `reports_check` CHECK enforces content-presence-by-program
+   * as a backstop to the route's Zod validator. Returns the new id.
+   */
+  async create(
+    tx: Tx,
+    values: {
+      dogId: string;
+      date: string;
+      trainerStaffId: string | null;
+      category: ServiceCategory;
+      program: ReportProgram;
+      excerpt: string;
+      fullText: string;
+      visitCount: number | null;
+      verdictHeadline: string | null;
+      results: unknown;
+      content: unknown;
+    },
+  ): Promise<{ id: string }> {
+    const [row] = await tx
+      .insert(reports)
+      .values({
+        dogId: values.dogId,
+        date: values.date,
+        trainerStaffId: values.trainerStaffId,
+        category: values.category,
+        program: values.program,
+        excerpt: values.excerpt,
+        fullText: values.fullText,
+        visitCount: values.visitCount,
+        verdictHeadline: values.verdictHeadline,
+        results: values.results,
+        content: values.content,
+      })
+      .returning({ id: reports.id });
+    if (!row) {
+      throw new Error('reportsRepository.create: INSERT returned no row');
+    }
+    return row;
+  },
+
+  /**
+   * Read a report by id inside a tx (no owner scope — staff context).
+   * `undefined` if absent/expired. The Day-19 PATCH verb needs the live
+   * `program` to re-validate content-by-program against the stored row.
+   */
+  async findByIdInTx(tx: Tx, id: string): Promise<ReportRow | undefined> {
+    const [row] = await tx
+      .select(REPORT_PROJECTION)
+      .from(reports)
+      .where(and(eq(reports.id, id), live(reports)))
+      .limit(1);
+    return row;
+  },
+
+  /**
+   * Partial UPDATE of the editable content fields (identity columns
+   * dog_id / category / program are locked — a re-author creates a new
+   * report). `undefined`-valued keys are left unchanged by the caller's
+   * set object; `results`/`content` may be set to null to clear.
+   */
+  async update(
+    tx: Tx,
+    id: string,
+    set: {
+      excerpt?: string;
+      fullText?: string;
+      visitCount?: number | null;
+      verdictHeadline?: string | null;
+      results?: unknown;
+      content?: unknown;
+    },
+  ): Promise<void> {
+    await tx
+      .update(reports)
+      .set({ ...set, updatedAt: sql`now()` })
+      .where(eq(reports.id, id));
   },
 };

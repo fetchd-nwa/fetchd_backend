@@ -3,23 +3,14 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import {
-  requestsRepository,
-  type PendingRequestFullRow,
-  type PendingRequestRow,
-} from '../db/repositories/requestsRepository.js';
+import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { comfortLevel, requestStatus } from '../db/schema/schema.js';
 import { evaluationRequiredError, type UnpassedEvaluationStatus } from '../lib/bookingErrors.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
-import { pgTimestampToDate, pgTimestampToIso } from '../lib/pgTimestamp.js';
-import {
-  groupRequestDogs,
-  toRequestWire,
-  type ComfortLevel,
-  type PendingRequestWire,
-} from '../lib/requestWire.js';
+import { type ComfortLevel, type PendingRequestWire } from '../lib/requestWire.js';
+import { sortRequestsBySubmittedAt, wireManyRequests } from '../lib/wireManyRequests.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -167,8 +158,8 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
       if (principal.kind !== 'owner') return [];
 
       const rows = await requestsRepository.findLiveByOwner(principal.ownerId, status);
-      const sorted = sortBySubmittedAt(rows, 'desc');
-      return wireRequests(sorted);
+      const sorted = sortRequestsBySubmittedAt(rows, 'desc');
+      return wireManyRequests(sorted);
     },
   );
 
@@ -186,7 +177,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
       if (row === undefined) {
         throw new ApiError('not_found', `pending request ${id} not found`);
       }
-      const [wire] = await wireRequests([row]);
+      const [wire] = await wireManyRequests([row]);
       if (wire === undefined) {
         // pending_request_dogs is empty for this request — structural bug.
         throw new Error(
@@ -304,7 +295,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
           if (row === undefined) {
             throw new Error(`POST /requests: row ${id} vanished before re-fetch`);
           }
-          const [wire] = await wireRequestsInTx(tx, [row]);
+          const [wire] = await wireManyRequests([row], tx);
           if (wire === undefined) {
             throw new Error(`POST /requests: wire assembly for ${id} returned no row`);
           }
@@ -382,7 +373,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
           if (updated === undefined) {
             throw new Error(`PATCH /requests/${id}: row vanished before re-fetch`);
           }
-          const [wire] = await wireRequestsInTx(tx, [updated]);
+          const [wire] = await wireManyRequests([updated], tx);
           if (wire === undefined) {
             throw new Error(`PATCH /requests/${id}: wire assembly returned no row`);
           }
@@ -435,7 +426,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
           if (updated === undefined) {
             throw new Error(`POST /requests/${id}/cancel: row vanished before re-fetch`);
           }
-          const [wire] = await wireRequestsInTx(tx, [updated]);
+          const [wire] = await wireManyRequests([updated], tx);
           if (wire === undefined) {
             throw new Error(`POST /requests/${id}/cancel: wire assembly returned no row`);
           }
@@ -661,101 +652,4 @@ function normalizeNullableString(input: string | undefined): string | null {
   if (input === undefined) return null;
   const trimmed = input.trim();
   return trimmed === '' ? null : trimmed;
-}
-
-// ---- sort + denormalize ----------------------------------------------
-
-/**
- * Sort by submitted_at — DESC (newest first) for the list view. Uses
- * `pgTimestampToDate` (not `new Date`) so the PG default timestamptz
- * format (single-pair `+TZ`, V8-incompatible) round-trips correctly —
- * same parser as `routes/bookings.ts:sortByScheduledAt`.
- */
-function sortBySubmittedAt(
-  rows: PendingRequestRow[],
-  direction: 'asc' | 'desc',
-): PendingRequestRow[] {
-  const sorted = [...rows].sort(
-    (a, b) =>
-      pgTimestampToDate(a.submittedAt).getTime() - pgTimestampToDate(b.submittedAt).getTime(),
-  );
-  return direction === 'desc' ? sorted.reverse() : sorted;
-}
-
-/**
- * Denormalize a set of pending-request rows into wire shapes. Two batched
- * lookups (pending_request_dogs + pending_request_preferred_dates) regardless
- * of row count — cost is constant in the input size. Throws if any request
- * has no `pending_request_dogs` rows (structural invariant violation).
- *
- * The non-Tx version uses pool db (read-side endpoints). For the
- * mutation-route re-read after INSERT/UPDATE see `wireRequestsInTx`.
- */
-async function wireRequests(rows: PendingRequestRow[]): Promise<PendingRequestWire[]> {
-  if (rows.length === 0) return [];
-  const ids = rows.map((r) => r.id);
-  const [dogRows, dateRows] = await Promise.all([
-    requestsRepository.findDogsByRequestIds(ids),
-    requestsRepository.findPreferredDatesByRequestIds(ids),
-  ]);
-  return assembleWires(rows, dogRows, dateRows);
-}
-
-/**
- * In-transaction wire assembly — re-reads pending_request_dogs +
- * preferred_dates against the same tx so a freshly-inserted row reads
- * back consistently. Same projection as the non-Tx version; the
- * polymorphic-runner repo methods route through `tx` so uncommitted
- * writes are visible.
- *
- * Day-12 mutation routes (POST/PATCH/cancel + the staff approve verb)
- * call this. The structural invariant (lead row present) is the same
- * as the read path's; an empty result means a row vanished mid-tx
- * which would be a real bug.
- */
-async function wireRequestsInTx(
-  tx: Parameters<typeof requestsRepository.findFullByIdInTx>[0],
-  rows: PendingRequestFullRow[],
-): Promise<PendingRequestWire[]> {
-  if (rows.length === 0) return [];
-  const ids = rows.map((r) => r.id);
-  const [dogRows, dateRows] = await Promise.all([
-    requestsRepository.findDogsByRequestIds(ids, tx),
-    requestsRepository.findPreferredDatesByRequestIds(ids, tx),
-  ]);
-  return assembleWires(rows, dogRows, dateRows);
-}
-
-function assembleWires(
-  rows: PendingRequestRow[],
-  dogRows: Awaited<ReturnType<typeof requestsRepository.findDogsByRequestIds>>,
-  dateRows: Awaited<ReturnType<typeof requestsRepository.findPreferredDatesByRequestIds>>,
-): PendingRequestWire[] {
-  const dogsByRequest = groupRequestDogs(dogRows);
-  const datesByRequest = groupPreferredDates(dateRows);
-  return rows.map((row) => {
-    const dogIds = dogsByRequest.get(row.id);
-    if (dogIds === undefined) {
-      throw new Error(`pending_request ${row.id}: no pending_request_dogs rows found`);
-    }
-    const dates = datesByRequest.get(row.id) ?? [];
-    return toRequestWire(row, dogIds, dates);
-  });
-}
-
-/**
- * Group preferred-date rows into a per-request ISO array. Repo sorts by
- * `ordinal` ASC; this preserves that order and converts timestamptz to
- * ISO 8601 for emit.
- */
-function groupPreferredDates(
-  rows: { requestId: string; ordinal: number; preferredAt: string }[],
-): Map<string, string[]> {
-  const result = new Map<string, string[]>();
-  for (const row of rows) {
-    const existing = result.get(row.requestId) ?? [];
-    existing.push(pgTimestampToIso(row.preferredAt));
-    result.set(row.requestId, existing);
-  }
-  return result;
 }

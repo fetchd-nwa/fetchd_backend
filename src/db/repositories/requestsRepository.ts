@@ -107,6 +107,20 @@ export const requestsRepository = {
   },
 
   /**
+   * Every live pending request across ALL owners, optionally filtered by
+   * `status` — the Day-19 staff-portal queue read. Cross-owner by design
+   * (`requireStaff` gates the route); the owner-scoped sibling is
+   * `findLiveByOwner`. The route sorts by submitted_at.
+   */
+  async findLive(statusFilter?: RequestStatus): Promise<PendingRequestRow[]> {
+    const conditions =
+      statusFilter !== undefined
+        ? and(eq(pendingRequests.status, statusFilter), live(pendingRequests))
+        : live(pendingRequests);
+    return db.select(PENDING_REQUEST_PROJECTION).from(pendingRequests).where(conditions);
+  },
+
+  /**
    * Single request by id, owner-scoped. Same response for not-found vs
    * not-yours so attackers can't enumerate request ids.
    */

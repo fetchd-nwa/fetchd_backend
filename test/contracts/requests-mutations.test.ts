@@ -6,8 +6,10 @@ import { db } from '../../src/db/client.js';
 import {
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
+  dogs as dogsTable,
   notificationDogs as notificationDogsTable,
   notifications as notificationsTable,
+  owners as ownersTable,
   pendingRequestDogs as pendingRequestDogsTable,
   pendingRequestPreferredDates as pendingRequestPreferredDatesTable,
   pendingRequests as pendingRequestsTable,
@@ -745,6 +747,191 @@ test('POST /staff/requests/:id/deny — already-converted → 409', SKIP_WHEN_NO
   });
   assert.equal(res.statusCode, 409, res.body);
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /staff/requests?status= (portal verb 1 — the triage queue read)
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Inject a staff queue read; status omitted → all live. */
+async function getStaffRequests(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  status?: string;
+}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+  const url =
+    opts.status !== undefined ? `/staff/requests?status=${opts.status}` : '/staff/requests';
+  return opts.app.inject({ method: 'GET', url });
+}
+
+/**
+ * Seed a single fixture-owner request with an explicit status (and
+ * optionally submitted_at, for ordering assertions). Sibling of
+ * `seedSubmittedRequest` — kept separate because that one's name promises
+ * 'submitted' and the queue tests need other terminal states too.
+ */
+async function seedRequestRow(args: { status: string; submittedAt?: string }): Promise<string> {
+  const id = randomUUID();
+  await db.insert(pendingRequestsTable).values({
+    id,
+    ownerId: FIXTURE_IDS.ownerId,
+    leadDogId: FIXTURE_IDS.dog1Id,
+    category: 'private-lesson',
+    status: args.status as 'submitted',
+    ...(args.submittedAt !== undefined ? { submittedAt: args.submittedAt } : {}),
+  });
+  await db
+    .insert(pendingRequestDogsTable)
+    .values([{ requestId: id, dogId: FIXTURE_IDS.dog1Id, isLead: true }]);
+  await db
+    .insert(pendingRequestPreferredDatesTable)
+    .values([{ requestId: id, ordinal: 1, preferredAt: PREFERRED_1 }]);
+  return id;
+}
+
+test(
+  'GET /staff/requests?status=submitted — staff sees a submitted request with the §B wire shape',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedSubmittedRequest({ category: 'private-lesson' });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await getStaffRequests({ app, status: 'submitted' });
+    assert.equal(res.statusCode, 200, res.body);
+    const rows = res.json() as {
+      id: string;
+      category: string;
+      status: string;
+      dog_id: string;
+      preferred_dates: string[];
+    }[];
+    const mine = rows.find((r) => r.id === id);
+    assert.ok(mine, 'seeded submitted request is present in the staff queue');
+    assert.equal(mine.category, 'private-lesson');
+    assert.equal(mine.status, 'submitted');
+    assert.equal(mine.dog_id, FIXTURE_IDS.dog1Id);
+    assert.ok(mine.preferred_dates.length >= 1, 'preferred_dates denormalized onto the wire');
+  },
+);
+
+test(
+  'GET /staff/requests?status=submitted — excludes non-submitted rows',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const submittedId = await seedRequestRow({ status: 'submitted' });
+    const convertedId = await seedRequestRow({ status: 'converted' });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await getStaffRequests({ app, status: 'submitted' });
+    assert.equal(res.statusCode, 200, res.body);
+    const ids = (res.json() as { id: string }[]).map((r) => r.id);
+    assert.ok(ids.includes(submittedId), 'submitted request present');
+    assert.ok(!ids.includes(convertedId), 'converted request filtered out by status=submitted');
+  },
+);
+
+test(
+  'GET /staff/requests — no status filter returns all live states',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const submittedId = await seedRequestRow({ status: 'submitted' });
+    const convertedId = await seedRequestRow({ status: 'converted' });
+    const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await getStaffRequests({ app });
+    assert.equal(res.statusCode, 200, res.body);
+    const ids = (res.json() as { id: string }[]).map((r) => r.id);
+    assert.ok(ids.includes(submittedId), 'submitted present without a filter');
+    assert.ok(ids.includes(convertedId), 'converted present without a filter');
+  },
+);
+
+test('GET /staff/requests — newest submitted_at first', SKIP_WHEN_NO_DB, async () => {
+  const olderId = await seedRequestRow({
+    status: 'submitted',
+    submittedAt: '2026-05-01T12:00:00Z',
+  });
+  const newerId = await seedRequestRow({
+    status: 'submitted',
+    submittedAt: '2026-05-02T12:00:00Z',
+  });
+  const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+  const res = await getStaffRequests({ app, status: 'submitted' });
+  assert.equal(res.statusCode, 200, res.body);
+  const ids = (res.json() as { id: string }[]).map((r) => r.id);
+  assert.ok(ids.indexOf(newerId) < ids.indexOf(olderId), 'newer request sorts ahead of older');
+});
+
+test('GET /staff/requests — owner principal → 403', SKIP_WHEN_NO_DB, async () => {
+  const { app } = requestsApp(); // owner
+  const res = await getStaffRequests({ app, status: 'submitted' });
+  assert.equal(res.statusCode, 403, res.body);
+});
+
+test(
+  "GET /staff/requests — cross-owner: staff sees a different owner's request",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const owner2Id = randomUUID();
+    const dog2bId = randomUUID();
+    const requestId = randomUUID();
+    try {
+      await db.insert(ownersTable).values({
+        id: owner2Id,
+        supabaseUid: randomUUID(),
+        name: 'Second Owner',
+        email: `owner2-${owner2Id}@example.com`,
+        phone: '555-0003',
+        location: 'Fayetteville, AR',
+        avatarImagePath: '',
+        emergencyName: 'EC',
+        emergencyRelationship: 'friend',
+        emergencyPhone: '555-0004',
+        pushNotificationsEnabled: true,
+        pushNotificationCategories: { booking: true, message: true },
+        emailNotificationsEnabled: true,
+        emailNotificationCategories: { booking: true, message: true },
+      });
+      await db.insert(dogsTable).values({
+        id: dog2bId,
+        ownerId: owner2Id,
+        name: 'Cross Dog',
+        breed: 'Mixed',
+        birthdate: '2022-01-01',
+        specialNotes: '',
+        evaluationStatus: 'passed',
+        evaluationDate: '2024-01-01T15:00:00Z',
+        profileImagePath: null,
+      });
+      await db.insert(pendingRequestsTable).values({
+        id: requestId,
+        ownerId: owner2Id,
+        leadDogId: dog2bId,
+        category: 'private-lesson',
+        status: 'submitted',
+      });
+      await db
+        .insert(pendingRequestDogsTable)
+        .values([{ requestId, dogId: dog2bId, isLead: true }]);
+      await db
+        .insert(pendingRequestPreferredDatesTable)
+        .values([{ requestId, ordinal: 1, preferredAt: PREFERRED_1 }]);
+
+      const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
+      const res = await getStaffRequests({ app, status: 'submitted' });
+      assert.equal(res.statusCode, 200, res.body);
+      const ids = (res.json() as { id: string }[]).map((r) => r.id);
+      assert.ok(ids.includes(requestId), 'staff queue spans owners (cross-owner read)');
+    } finally {
+      // Teardown wipes by the fixture owner only — clean up owner2's rows
+      // here (reverse FK order) so they don't bleed into later tests.
+      await db
+        .delete(pendingRequestPreferredDatesTable)
+        .where(eq(pendingRequestPreferredDatesTable.requestId, requestId));
+      await db
+        .delete(pendingRequestDogsTable)
+        .where(eq(pendingRequestDogsTable.requestId, requestId));
+      await db.delete(pendingRequestsTable).where(eq(pendingRequestsTable.id, requestId));
+      await db.delete(dogsTable).where(eq(dogsTable.id, dog2bId));
+      await db.delete(ownersTable).where(eq(ownersTable.id, owner2Id));
+    }
+  },
+);
 
 // Suppress unused-import lint warnings — these tables are referenced
 // by the schema helpers but not directly by the assertions above.

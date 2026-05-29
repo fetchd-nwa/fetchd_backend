@@ -3,17 +3,10 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
-import {
-  toMessageWire,
-  toThreadWire,
-  type MessageRowForWire,
-  type MessageWire,
-  type ResolvedParticipant,
-  type ThreadWire,
-} from '../lib/threadWire.js';
+import { type MessageWire, type ThreadWire } from '../lib/threadWire.js';
+import { wireManyMessages, wireManyThreads } from '../lib/wireManyThreads.js';
 import { messagesRepository } from '../db/repositories/messagesRepository.js';
-import { staffRepository } from '../db/repositories/staffRepository.js';
-import { threadsRepository, type ThreadRow } from '../db/repositories/threadsRepository.js';
+import { threadsRepository } from '../db/repositories/threadsRepository.js';
 
 /**
  * `GET /threads` `[auth]` · `GET /threads/:id` `[auth]` ·
@@ -49,7 +42,7 @@ export function registerThreadsRoute(app: FastifyInstance, opts: AuthRouteOption
     const principal = requirePrincipal(request);
     if (principal.kind !== 'owner') return [];
     const rows = await threadsRepository.findLiveByOwner(principal.ownerId);
-    return wireThreads(rows);
+    return wireManyThreads(rows);
   });
 
   // --- GET /threads/:id ---------------------------------------------------
@@ -63,7 +56,7 @@ export function registerThreadsRoute(app: FastifyInstance, opts: AuthRouteOption
     if (row === undefined) {
       throw new ApiError('not_found', `thread ${id} not found`);
     }
-    const [wire] = await wireThreads([row]);
+    const [wire] = await wireManyThreads([row]);
     if (wire === undefined) {
       // Unreachable: wireThreads returns one wire per input row.
       throw new Error(`thread ${id}: failed to build wire shape`);
@@ -88,7 +81,7 @@ export function registerThreadsRoute(app: FastifyInstance, opts: AuthRouteOption
         throw new ApiError('not_found', `thread ${id} not found`);
       }
       const rows = await messagesRepository.findLiveByThread(id);
-      return wireMessages(rows);
+      return wireManyMessages(rows);
     },
   );
 }
@@ -101,110 +94,4 @@ function parseUuidParam(params: unknown): { id: string } {
     throw new ApiError('bad_request', `invalid path: ${formatZodIssues(parsed.error)}`);
   }
   return parsed.data;
-}
-
-// ---- batched wiring ------------------------------------------------------
-
-/**
- * Denormalize a batch of thread rows into wire shapes. Three batched
- * lookups regardless of row count (participants, thread_dogs, unread-
- * counts) — cost is constant in the input size.
- *
- * Participant resolution: every fixture thread has a live participant
- * staff row (schema column is nullable but the comment + business reality
- * say "always set" — see Day-7a handoff for the future NOT NULL
- * tightening). A thread referencing a missing/expired staff id throws so
- * a structural fault surfaces loud, not silent.
- */
-async function wireThreads(rows: ThreadRow[]): Promise<ThreadWire[]> {
-  if (rows.length === 0) return [];
-  const threadIds = rows.map((r) => r.id);
-  const participantStaffIds = [
-    ...new Set(rows.map((r) => r.participantStaffId).filter((v): v is string => v !== null)),
-  ];
-  const [participantRows, dogRows, unreadRows] = await Promise.all([
-    staffRepository.findParticipantsByIds(participantStaffIds),
-    threadsRepository.findDogsByThreadIds(threadIds),
-    threadsRepository.findUnreadCountsByThreadIds(threadIds),
-  ]);
-  const participantsById = new Map<string, ResolvedParticipant>(
-    participantRows.map((p) => [p.id, p] as const),
-  );
-  const dogsByThread = groupDogIds(dogRows);
-  const unreadByThread = new Map(unreadRows.map((r) => [r.threadId, r.unreadCount] as const));
-
-  return rows.map((row) => {
-    const participant = resolveParticipantOrThrow(row, participantsById);
-    const relatedDogIds = dogsByThread.get(row.id) ?? [];
-    const unreadCount = unreadByThread.get(row.id) ?? 0;
-    return toThreadWire(row, participant, relatedDogIds, unreadCount);
-  });
-}
-
-/**
- * Denormalize a batch of message rows into wire shapes. One batched
- * staff-name lookup feeds the polymorphic-sender flattening; owner-sent
- * messages omit `sender_name` per the convention noted on
- * `lib/threadWire.toMessageWire`.
- */
-async function wireMessages(rows: MessageRowForWire[]): Promise<MessageWire[]> {
-  if (rows.length === 0) return [];
-  const staffSenderIds = [
-    ...new Set(
-      rows
-        .filter((m) => m.senderKind === 'staff')
-        .map((m) => m.senderStaffId)
-        .filter((v): v is string => v !== null),
-    ),
-  ];
-  const staffNameRows = await staffRepository.findNamesByIds(staffSenderIds);
-  const staffNamesById = new Map(staffNameRows.map((s) => [s.id, s.name] as const));
-
-  return rows.map((row) => {
-    let senderName: string | null = null;
-    if (row.senderKind === 'staff' && row.senderStaffId !== null) {
-      senderName = staffNamesById.get(row.senderStaffId) ?? null;
-    }
-    return toMessageWire(row, senderName);
-  });
-}
-
-/**
- * Group `thread_dogs` rows into a per-thread sorted id list. Repo orders
- * by `dog_id` ASC; this preserves that order so the snapshot diff is
- * stable across reseeds.
- */
-function groupDogIds(rows: { threadId: string; dogId: string }[]): Map<string, string[]> {
-  const result = new Map<string, string[]>();
-  for (const row of rows) {
-    const existing = result.get(row.threadId) ?? [];
-    existing.push(row.dogId);
-    result.set(row.threadId, existing);
-  }
-  return result;
-}
-
-/**
- * Look up the resolved participant for a thread row. Throws if the
- * participant_staff_id is null (a temporary structural invariant — the
- * schema allows NULL but business reality always sets it; see Day-7a
- * handoff) or the staff row is missing/expired (would silently emit a
- * broken wire shape otherwise).
- */
-function resolveParticipantOrThrow(
-  row: ThreadRow,
-  participantsById: Map<string, ResolvedParticipant>,
-): ResolvedParticipant {
-  if (row.participantStaffId === null) {
-    throw new Error(
-      `thread ${row.id}: participant_staff_id is null (no NULL-participant wire shape exists yet)`,
-    );
-  }
-  const participant = participantsById.get(row.participantStaffId);
-  if (participant === undefined) {
-    throw new Error(
-      `thread ${row.id}: participant_staff_id ${row.participantStaffId} not found in live staff`,
-    );
-  }
-  return participant;
 }

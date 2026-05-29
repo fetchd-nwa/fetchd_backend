@@ -24,8 +24,11 @@ import { registerReportsRoute } from './routes/reports.js';
 import { registerRequestConfirmPaymentRoute } from './routes/requestConfirmPayment.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
+import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
+import { registerStaffReportsRoute } from './routes/staffReports.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
+import { registerStaffThreadsRoute } from './routes/staffThreads.js';
 import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
 import { registerThreadsRoute } from './routes/threads.js';
 import { registerUploadsSignRoute } from './routes/uploadsSign.js';
@@ -61,8 +64,11 @@ export function buildApp(): FastifyInstance {
   registerCreditPackagesRoute(app); // [auth] — catalog (owner + staff)
   registerRatesRoute(app); // [auth] — catalog (owner + staff)
   registerRequestsRoute(app); // [auth] — owner-only
-  registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny)
+  registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
   registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
+  registerStaffBookingsRoute(app); // [staff] — Day-19 portal verb 4 (confirm / cancel / attendance)
+  registerStaffThreadsRoute(app); // [staff] — Day-19 portal verb 3 (thread queue + staff reply)
+  registerStaffReportsRoute(app); // [staff] — Day-19 portal verb 2 (report authoring)
   registerGroupClassesRoute(app); // [auth] — catalogs (owner+staff); eligibility owner-only
   registerReportsRoute(app); // [auth] — owner-only (scoped via dog FK)
   registerThreadsRoute(app); // [auth] — owner-only
