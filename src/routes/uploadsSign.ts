@@ -1,8 +1,12 @@
-import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { ApiError } from '../lib/errors.js';
+import {
+  MAX_UPLOAD_BYTES,
+  assertContentTypeMatchesPurpose,
+  mediaObjectKey,
+} from '../lib/mediaKeys.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
@@ -25,7 +29,6 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * sweep finds them.
  */
 
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB — generous for high-res phone photos
 const PUT_URL_TTL_SECONDS = 60 * 15; // 15 min — long enough for a slow connection
 
 const mediaPurposeSchema = z.enum([
@@ -35,19 +38,6 @@ const mediaPurposeSchema = z.enum([
   'report-video',
   'message-attachment',
 ]);
-
-/**
- * Accepted Content-Types per purpose. The PUT signature pins the
- * Content-Type at sign-time, so we validate the request here BEFORE the
- * client can attempt an upload with an unsupported MIME.
- *
- * Day-17 ships sharp-only — image purposes accept image/*; `report-video`
- * accepts video MIMEs so the bytes are uploaded but the derivatives worker
- * parks the job with 'video derivatives not yet implemented' (the source
- * is still readable; ffmpeg lands a later day).
- */
-const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
-const VIDEO_TYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
 
 const bodySchema = z
   .object({
@@ -107,8 +97,7 @@ export function registerUploadsSignRoute(
 
       const principalScope =
         principal.kind === 'owner' ? `owner-${principal.ownerId}` : `staff-${principal.staffId}`;
-      const extension = extensionForContentType(content_type);
-      const key = `${purpose}/${principalScope}/${randomUUID()}${extension}`;
+      const key = mediaObjectKey(purpose, principalScope, content_type);
 
       const { url, headers } = await r2.signPutUrl({
         key,
@@ -126,54 +115,4 @@ export function registerUploadsSignRoute(
       return { url, headers, key, expires_at: expiresAt };
     },
   );
-}
-
-function assertContentTypeMatchesPurpose(
-  purpose: z.infer<typeof mediaPurposeSchema>,
-  contentType: string,
-): void {
-  const isImage = IMAGE_TYPES.has(contentType);
-  const isVideo = VIDEO_TYPES.has(contentType);
-  const wantsImage =
-    purpose === 'dog-profile' ||
-    purpose === 'owner-avatar' ||
-    purpose === 'report-photo' ||
-    purpose === 'message-attachment';
-  const wantsVideo = purpose === 'report-video';
-
-  if (wantsImage && !isImage) {
-    throw new ApiError(
-      'bad_request',
-      `purpose '${purpose}' requires an image content_type (jpeg/png/webp/heic/heif), got '${contentType}'`,
-    );
-  }
-  if (wantsVideo && !isVideo) {
-    throw new ApiError(
-      'bad_request',
-      `purpose '${purpose}' requires a video content_type (mp4/quicktime/webm), got '${contentType}'`,
-    );
-  }
-}
-
-function extensionForContentType(contentType: string): string {
-  switch (contentType) {
-    case 'image/jpeg':
-      return '.jpg';
-    case 'image/png':
-      return '.png';
-    case 'image/webp':
-      return '.webp';
-    case 'image/heic':
-      return '.heic';
-    case 'image/heif':
-      return '.heif';
-    case 'video/mp4':
-      return '.mp4';
-    case 'video/quicktime':
-      return '.mov';
-    case 'video/webm':
-      return '.webm';
-    default:
-      return '';
-  }
 }

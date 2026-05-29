@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
@@ -9,41 +9,60 @@ import {
   type MediaPurpose,
 } from '../db/repositories/mediaAssetsRepository.js';
 import { mediaDerivativeJobsRepository } from '../db/repositories/mediaDerivativeJobsRepository.js';
+import { reportsRepository } from '../db/repositories/reportsRepository.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { ApiError } from '../lib/errors.js';
-import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import {
+  MAX_UPLOAD_BYTES,
+  assertContentTypeMatchesPurpose,
+  mediaObjectKey,
+} from '../lib/mediaKeys.js';
+import {
+  requireOwner,
+  requireStaff,
+  type OwnerPrincipal,
+  type StaffPrincipal,
+} from '../lib/principalNarrows.js';
+import { defaultR2Client, type HeadObjectResult, type R2Client } from '../lib/r2.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
- * Media surface (Day 17, DATA-CONTRACT §C.2):
+ * Media surface (Day 17 + Day-19c staff-author arm, DATA-CONTRACT §C.2):
  *
  *   - `POST /media`        `[auth]`  — register an upload landed in R2
  *   - `GET /media/:id`     `[auth]`  — ownership-checked presigned GET
  *   - `DELETE /media/:id`  `[auth]`  — soft-expire (R2 bytes retained)
  *
- * Scope (Day 17 cut, see HANDOFF):
- *   - **Owner uploads only:** dog-profile, owner-avatar, message-attachment.
+ * Two POST arms, split on `purpose`:
+ *   - **Owner uploads:** dog-profile, owner-avatar, message-attachment.
  *     `dog-profile` requires the principal to own the dog; the other two
- *     scope to the principal's owner_id.
- *   - **Report-photo / report-video are deferred to Day 19** (staff portal).
- *     POSTing those purposes today returns 422 with a clear message — the
- *     authoring path lives with the staff report-creation surface, not the
- *     owner upload surface. The schema enum + R2 + worker all support it
- *     today; Day-19 adds the route arm.
+ *     scope to the principal's own owner_id. A staff principal POSTing one
+ *     of these → 403 (owner-only). `createdBy='owner'`.
+ *   - **Staff report media (Day-19c):** report-photo, report-video. Staff-
+ *     authored — the route resolves `report_id → report.dog_id →
+ *     dogs.owner_id` and stamps that owner on the row, so the dog's owner
+ *     (not the staffer) can read it back via the owner-scoped GET. An owner
+ *     principal POSTing one of these → 403 (staff-only). `createdBy='staff'`.
+ *
+ * Read/delete scope: an owner sees + soft-expires only their own media
+ * (cross-tenant → 404, never reveal existence). Staff are cross-owner trusted
+ * — the staff portal reads dogs/bookings/threads cross-owner, so a staffer
+ * may GET/DELETE any live media (reviewing a report needs the dog's photos
+ * regardless of which owner authored them).
  *
  * Lifecycle:
- *   1. Owner: `POST /uploads/sign` → PUT bytes directly to R2.
- *   2. Owner: `POST /media {key, purpose, dog_id?}` → server `r2.headObject`
- *      to confirm the upload landed → INSERT media_assets row + enqueue a
- *      `media_derivative_jobs` row in the same tx (rolls back together on
- *      any post-insert failure).
+ *   1. `POST /uploads/sign` → PUT bytes directly to R2.
+ *   2. `POST /media {key, purpose, dog_id?|report_id?}` → server
+ *      `r2.headObject` to confirm the upload landed → INSERT media_assets row
+ *      + enqueue a `media_derivative_jobs` row in the same tx (rolls back
+ *      together on any post-insert failure).
  *   3. Background: the derivatives worker (`runMediaDerivativesOnce`,
  *      composed into the scheduler tick) claims the job, runs sharp,
  *      writes thumb/feed/lightbox WebPs to R2, updates `media_assets.
  *      derivatives` + `blurhash` + `width`/`height`.
- *   4. FE: `GET /media/:id` returns a short-lived signed URL the FE renders
- *      via expo-image. The FE caches by id; signed-URL refresh on TTL
- *      expiry is a Day-18 concern.
+ *   4. Client: `GET /media/:id` returns a short-lived signed URL rendered
+ *      via expo-image (owner app) / `<img>` (portal). Signed-URL refresh on
+ *      TTL expiry is a client concern.
  */
 
 const GET_URL_TTL_SECONDS = 60 * 5; // 5 min — short enough to be useless if leaked
@@ -68,6 +87,23 @@ const postBodySchema = z
     report_id: z.string().uuid().nullable().optional(),
   })
   .strict();
+
+type PostMediaBody = z.infer<typeof postBodySchema>;
+
+/**
+ * POST /media/upload query — the staff report-media proxy. The bytes ride in
+ * the request body (raw, parsed as a Buffer in the scoped parser below); the
+ * metadata rides here. report_id is required (the row's owner resolves through
+ * it); dog_id is derived from the report, never supplied.
+ */
+const uploadQuerySchema = z
+  .object({
+    purpose: z.enum(['report-photo', 'report-video']),
+    report_id: z.string().uuid(),
+  })
+  .strict();
+
+type UploadQuery = z.infer<typeof uploadQuerySchema>;
 
 export interface MediaWire {
   id: string;
@@ -103,81 +139,18 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
 
   app.post('/media', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    if (principal.kind !== 'owner') {
-      throw new ApiError(
-        'forbidden',
-        'staff media uploads land with the Day-19 staff portal; owner uploads only today',
-      );
-    }
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    const body = parsePostBody(request.body);
 
-    const parsed = postBodySchema.safeParse(request.body);
-    if (!parsed.success) {
-      throw new ApiError('bad_request', `invalid media payload: ${formatZodIssues(parsed.error)}`);
+    // Split on purpose: report-photo/report-video are staff-authored (resolve
+    // report → dog → owner); the other three are owner uploads. The role gate
+    // runs before any R2 round-trip so a forbidden request never touches R2.
+    if (body.purpose === 'report-photo' || body.purpose === 'report-video') {
+      requireStaff(principal, 'author report media');
+      return authorStaffReportMedia(principal, body, idempotencyKey, r2, reply);
     }
-    const { key, purpose, dog_id: dogId, report_id: reportId } = parsed.data;
-
-    const linkage = ownerUploadLinkage(purpose, dogId ?? null, reportId ?? null);
-
-    // Verify the upload actually landed in R2 BEFORE we INSERT the row.
-    // Confirms the client's claim AND captures real bytes/content-type for
-    // the row (vs. trusting the sign-time `byte_size` which is advisory).
-    const head = await r2.headObject({ key });
-    if (head === null) {
-      throw new ApiError(
-        'invalid_payload',
-        'no R2 object exists at the supplied key — did the upload complete?',
-        { kind: 'media-upload-missing' },
-      );
-    }
-
-    // Carry the created row out of the tx so the post-commit URL signing
-    // doesn't need a second DB hit. The `body` type is `MediaAssetRow`
-    // mid-flight; we map to `MediaWire` after the URL sign below.
-    const outcome = await withMutation<MediaAssetRow>(
-      {
-        principal,
-        idempotencyKey,
-        endpoint: 'POST /media',
-        requestHash: hashRequestBody(parsed.data),
-        keysToInvalidate: () => [],
-      },
-      async (tx) => {
-        if (linkage.dogId !== null) {
-          const owned = await dogsRepository.findOwnedExists(linkage.dogId, principal.ownerId, tx);
-          if (!owned) {
-            throw new ApiError('not_found', 'dog not found (ownership scope filtered)');
-          }
-        }
-
-        const row = await mediaAssetsRepository.create(tx, {
-          ownerId: principal.ownerId,
-          dogId: linkage.dogId,
-          reportId: linkage.reportId,
-          kind: linkage.kind,
-          purpose,
-          objectKey: key,
-          contentType: head.contentType,
-          bytes: head.bytes,
-          createdBy: 'owner',
-        });
-
-        // Enqueue the derivatives job in the SAME tx so a withMutation
-        // rollback also rolls back the job row — no orphan jobs for
-        // non-existent media_assets rows. The worker (composed into the
-        // scheduler tick) picks it up on the next cron firing.
-        await mediaDerivativeJobsRepository.enqueue(tx, { mediaAssetId: row.id });
-
-        return { status: 201, body: row };
-      },
-    );
-
-    // Sign the URL POST-commit so the response carries a working URL.
-    // Outside `withMutation` to keep the third-party seam off the tx
-    // (matches the Day-14/15 "Stripe calls go after commit" invariant).
-    const wire = await signMediaUrls(outcome.body, r2);
-    reply.code(outcome.status);
-    return wire;
+    requireOwner(principal, 'upload media');
+    return uploadOwnerMedia(principal, body, idempotencyKey, r2, reply);
   });
 
   // -------------------------------------------------------------------------
@@ -196,12 +169,11 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
       throw new ApiError('not_found', 'media not found');
     }
 
-    // Owner-scoped: a media row belongs to one owner. Staff are also
-    // authenticated principals; today the staff path isn't wired to
-    // browse arbitrary media — Day-19 adds the staff portal arm. For
-    // now staff principals get 404 (same shape as an owner reading
-    // someone else's media — never reveal cross-tenant existence).
-    if (principal.kind !== 'owner' || row.ownerId !== principal.ownerId) {
+    // Owners see only their own media — a cross-tenant read is a 404, never a
+    // 403, so existence never leaks. Staff are cross-owner trusted (the staff
+    // portal reads dogs/bookings/threads cross-owner; a staffer reviewing a
+    // report needs the dog's photos regardless of which owner authored them).
+    if (principal.kind === 'owner' && row.ownerId !== principal.ownerId) {
       throw new ApiError('not_found', 'media not found');
     }
 
@@ -214,10 +186,6 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
 
   app.delete('/media/:id', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
-    if (principal.kind !== 'owner') {
-      throw new ApiError('forbidden', 'staff media deletion lands with the Day-19 staff portal');
-    }
-
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const parsedParams = paramsSchema.safeParse(request.params);
@@ -235,8 +203,13 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
         keysToInvalidate: () => [],
       },
       async (tx) => {
+        // Owner: only their own row. Staff: any row (cross-owner trusted).
+        // Either miss is a 404 so existence never leaks across tenants.
         const row = await mediaAssetsRepository.findById(id, tx);
-        if (row === undefined || row.ownerId !== principal.ownerId) {
+        if (
+          row === undefined ||
+          (principal.kind === 'owner' && row.ownerId !== principal.ownerId)
+        ) {
           throw new ApiError('not_found', 'media not found');
         }
         await mediaAssetsRepository.softExpire(tx, id);
@@ -247,29 +220,212 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
     reply.code(outcome.status);
     return outcome.body;
   });
+
+  registerMediaUploadProxy(app, authHook, r2);
 }
 
 /**
- * Validate purpose + payload combo and pull out the linkage fields for the
- * owner upload path. `dog_id` is required for dog-profile, forbidden
- * elsewhere. `report_id` is the staff path (deferred to Day-19) so today's
- * owner route rejects it everywhere.
+ * POST /media/upload `[staff]` — the Day-19c portal upload path. The portal
+ * (a browser) POSTs the file bytes here and the SERVER streams them to R2;
+ * the browser never touches R2 (so no per-origin bucket CORS, no presigned-URL
+ * exposure). The mobile path keeps the presign flow (`POST /uploads/sign` +
+ * `POST /media`) — native clients aren't CORS-bound and direct upload avoids
+ * proxying large photos through the API. Report photos are small, so the
+ * server holding the bytes is cheap.
  *
- * The function returns the resolved fields (kind + cleaned dog_id/report_id)
- * so the caller doesn't repeat the per-purpose branching.
+ * Bytes ride in the raw request body (a scoped `*` content-type parser reads
+ * them as a Buffer — encapsulated so the other media routes keep JSON parsing);
+ * `purpose` + `report_id` ride in the query string. Staff-only; the row's owner
+ * resolves through the report (see {@link resolveStaffReportLinkage}).
+ */
+function registerMediaUploadProxy(
+  app: FastifyInstance,
+  authHook: ReturnType<typeof resolveAuthHook>,
+  r2: R2Client,
+): void {
+  app.register(async (scope) => {
+    // Within this encapsulated scope ONLY, every body is read as a raw Buffer.
+    // The portal sends the file with its real image/video Content-Type; the
+    // app's default JSON parsing is untouched outside this scope.
+    scope.addContentTypeParser(
+      '*',
+      { parseAs: 'buffer', bodyLimit: MAX_UPLOAD_BYTES },
+      (_req, body, done) => done(null, body),
+    );
+
+    scope.post(
+      '/media/upload',
+      { preHandler: [authHook], bodyLimit: MAX_UPLOAD_BYTES },
+      async (request, reply): Promise<MediaWire> => {
+        const principal = requirePrincipal(request);
+        requireStaff(principal, 'author report media');
+        const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+
+        const query = parseUploadQuery(request.query);
+        const contentType = request.headers['content-type'] ?? '';
+        assertContentTypeMatchesPurpose(query.purpose, contentType);
+
+        const bytes = request.body;
+        if (!Buffer.isBuffer(bytes) || bytes.length === 0) {
+          throw new ApiError('bad_request', 'empty upload body');
+        }
+
+        // Stream the bytes to R2 server-side, then record the row. The PUT is
+        // before `withMutation` (third-party calls stay off the tx); a retry
+        // with the same Idempotency-Key replays the first row and leaves this
+        // PUT's object as a swept-later orphan — so the request hash is the
+        // STABLE metadata (not the per-call random key).
+        const key = mediaObjectKey(query.purpose, `staff-${principal.staffId}`, contentType);
+        await r2.putObjectBytes({ key, contentType, bytes: new Uint8Array(bytes) });
+
+        const kind: MediaKind = query.purpose === 'report-video' ? 'video' : 'image';
+        const outcome = await withMutation<MediaAssetRow>(
+          {
+            principal,
+            idempotencyKey,
+            endpoint: 'POST /media/upload',
+            requestHash: hashRequestBody(query),
+            keysToInvalidate: () => [],
+          },
+          async (tx) => {
+            const linkage = await resolveStaffReportLinkage(tx, query.report_id);
+            const row = await createMediaRow(tx, {
+              ownerId: linkage.ownerId,
+              dogId: linkage.dogId,
+              reportId: query.report_id,
+              kind,
+              purpose: query.purpose,
+              objectKey: key,
+              contentType,
+              bytes: bytes.length,
+              createdBy: 'staff',
+            });
+            return { status: 201, body: row };
+          },
+        );
+
+        return finishMedia(reply, outcome.status, outcome.body, r2);
+      },
+    );
+  });
+}
+
+/**
+ * Owner upload arm: dog-profile / owner-avatar / message-attachment. Stamps
+ * the principal's own owner_id; `dog-profile` additionally requires + verifies
+ * ownership of the dog. Mirrors the staff arm's structure (verify upload →
+ * tx[create + enqueue] → sign), differing only in the linkage source.
+ */
+async function uploadOwnerMedia(
+  principal: OwnerPrincipal,
+  body: PostMediaBody,
+  idempotencyKey: string,
+  r2: R2Client,
+  reply: FastifyReply,
+): Promise<MediaWire> {
+  const linkage = ownerUploadLinkage(body.purpose, body.dog_id ?? null, body.report_id ?? null);
+  const head = await verifyUploadLanded(r2, body.key);
+
+  const outcome = await withMutation<MediaAssetRow>(
+    {
+      principal,
+      idempotencyKey,
+      endpoint: 'POST /media',
+      requestHash: hashRequestBody(body),
+      keysToInvalidate: () => [],
+    },
+    async (tx) => {
+      if (linkage.dogId !== null) {
+        const owned = await dogsRepository.findOwnedExists(linkage.dogId, principal.ownerId, tx);
+        if (!owned) {
+          throw new ApiError('not_found', 'dog not found (ownership scope filtered)');
+        }
+      }
+      const row = await createMediaRow(tx, {
+        ownerId: principal.ownerId,
+        dogId: linkage.dogId,
+        reportId: linkage.reportId,
+        kind: linkage.kind,
+        purpose: body.purpose,
+        objectKey: body.key,
+        contentType: head.contentType,
+        bytes: head.bytes,
+        createdBy: 'owner',
+      });
+      return { status: 201, body: row };
+    },
+  );
+
+  return finishMedia(reply, outcome.status, outcome.body, r2);
+}
+
+/**
+ * Staff report-media arm (Day-19c): report-photo / report-video. The row's
+ * owner is resolved `report_id → report.dog_id → dogs.owner_id` so the dog's
+ * owner — not the authoring staffer — can read it back via the owner-scoped
+ * GET. `dog_id` is derived from the report (a client-supplied one is rejected
+ * to prevent a dog/report mismatch). `createdBy='staff'`.
+ */
+async function authorStaffReportMedia(
+  principal: StaffPrincipal,
+  body: PostMediaBody,
+  idempotencyKey: string,
+  r2: R2Client,
+  reply: FastifyReply,
+): Promise<MediaWire> {
+  const reportId = body.report_id ?? null;
+  if (reportId === null || reportId === '') {
+    throw new ApiError('bad_request', `purpose '${body.purpose}' requires report_id`);
+  }
+  if (body.dog_id !== null && body.dog_id !== undefined && body.dog_id !== '') {
+    throw new ApiError(
+      'bad_request',
+      `purpose '${body.purpose}' derives dog_id from the report; do not supply it`,
+    );
+  }
+  const kind: MediaKind = body.purpose === 'report-video' ? 'video' : 'image';
+  const head = await verifyUploadLanded(r2, body.key);
+
+  const outcome = await withMutation<MediaAssetRow>(
+    {
+      principal,
+      idempotencyKey,
+      endpoint: 'POST /media',
+      requestHash: hashRequestBody(body),
+      keysToInvalidate: () => [],
+    },
+    async (tx) => {
+      const linkage = await resolveStaffReportLinkage(tx, reportId);
+      const row = await createMediaRow(tx, {
+        ownerId: linkage.ownerId,
+        dogId: linkage.dogId,
+        reportId,
+        kind,
+        purpose: body.purpose,
+        objectKey: body.key,
+        contentType: head.contentType,
+        bytes: head.bytes,
+        createdBy: 'staff',
+      });
+      return { status: 201, body: row };
+    },
+  );
+
+  return finishMedia(reply, outcome.status, outcome.body, r2);
+}
+
+/**
+ * Validate purpose + payload combo for the OWNER upload arm and return the
+ * resolved linkage. `dog_id` is required for dog-profile, forbidden elsewhere;
+ * `report_id` belongs to the staff arm and is rejected here everywhere.
+ * report-photo / report-video never reach this function — the route routes
+ * them to {@link authorStaffReportMedia} — so they're a defensive 403.
  */
 function ownerUploadLinkage(
   purpose: MediaPurpose,
   dogId: string | null,
   reportId: string | null,
 ): { dogId: string | null; reportId: string | null; kind: MediaKind } {
-  if (purpose === 'report-photo' || purpose === 'report-video') {
-    throw new ApiError(
-      'invalid_payload',
-      `purpose '${purpose}' is authored via the staff portal; not yet implemented`,
-      { kind: 'media-staff-upload-deferred' },
-    );
-  }
   if (purpose === 'dog-profile') {
     if (dogId === null || dogId === '') {
       throw new ApiError('bad_request', `purpose 'dog-profile' requires dog_id`);
@@ -279,15 +435,107 @@ function ownerUploadLinkage(
     }
     return { dogId, reportId: null, kind: 'image' };
   }
-  // owner-avatar + message-attachment: no FK linkage; the row carries
-  // owner_id (the principal) only.
-  if (dogId !== null && dogId !== '') {
-    throw new ApiError('bad_request', `purpose '${purpose}' cannot carry dog_id`);
+  if (purpose === 'owner-avatar' || purpose === 'message-attachment') {
+    // No FK linkage; the row carries owner_id (the principal) only.
+    if (dogId !== null && dogId !== '') {
+      throw new ApiError('bad_request', `purpose '${purpose}' cannot carry dog_id`);
+    }
+    if (reportId !== null && reportId !== '') {
+      throw new ApiError('bad_request', `purpose '${purpose}' cannot carry report_id`);
+    }
+    return { dogId: null, reportId: null, kind: 'image' };
   }
-  if (reportId !== null && reportId !== '') {
-    throw new ApiError('bad_request', `purpose '${purpose}' cannot carry report_id`);
+  throw new ApiError('forbidden', `purpose '${purpose}' is authored via the staff portal`);
+}
+
+/** Parse the POST /media body or throw a 400 with the Zod issue detail. */
+function parsePostBody(raw: unknown): PostMediaBody {
+  const parsed = postBodySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid media payload: ${formatZodIssues(parsed.error)}`);
   }
-  return { dogId: null, reportId: null, kind: 'image' };
+  return parsed.data;
+}
+
+/** Parse the POST /media/upload query or throw a 400. */
+function parseUploadQuery(raw: unknown): UploadQuery {
+  const parsed = uploadQuerySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid upload query: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data;
+}
+
+/**
+ * Resolve a report's owner for staff-authored media: `report_id →
+ * report.dog_id → dogs.owner_id`. The media row carries THAT owner so the
+ * dog's owner — not the authoring staffer — can read it back via the
+ * owner-scoped GET. 404 if the report (or its dog) isn't live. Shared by the
+ * `POST /media` staff arm + the `POST /media/upload` proxy.
+ */
+async function resolveStaffReportLinkage(
+  tx: Parameters<typeof reportsRepository.findByIdInTx>[0],
+  reportId: string,
+): Promise<{ ownerId: string; dogId: string }> {
+  const report = await reportsRepository.findByIdInTx(tx, reportId);
+  if (report === undefined) {
+    throw new ApiError('not_found', `report ${reportId} not found`);
+  }
+  const ownerId = await dogsRepository.findOwnerIdInTx(tx, report.dogId);
+  if (ownerId === undefined) {
+    // dogs.owner_id is NOT NULL; only reachable if the report's dog was
+    // soft-expired between authoring and now.
+    throw new ApiError('not_found', `report ${reportId} dog is no longer live`);
+  }
+  return { ownerId, dogId: report.dogId };
+}
+
+/**
+ * Create-side shared by every POST arm: INSERT the row + enqueue its
+ * derivatives job in the SAME tx so a `withMutation` rollback drops both (no
+ * orphan jobs for non-existent assets). Three callers (owner register / staff
+ * register / staff proxy) — extracted at the rule-of-two.
+ */
+async function createMediaRow(
+  tx: Parameters<typeof mediaAssetsRepository.create>[0],
+  values: Parameters<typeof mediaAssetsRepository.create>[1],
+): Promise<MediaAssetRow> {
+  const row = await mediaAssetsRepository.create(tx, values);
+  await mediaDerivativeJobsRepository.enqueue(tx, { mediaAssetId: row.id });
+  return row;
+}
+
+/**
+ * Confirm the upload actually landed in R2 BEFORE inserting a row that
+ * references the key. Returns the head (real bytes + content-type) so the row
+ * records what landed, not the advisory sign-time `byte_size`. 422 if absent.
+ */
+async function verifyUploadLanded(r2: R2Client, key: string): Promise<HeadObjectResult> {
+  const head = await r2.headObject({ key });
+  if (head === null) {
+    throw new ApiError(
+      'invalid_payload',
+      'no R2 object exists at the supplied key — did the upload complete?',
+      { kind: 'media-upload-missing' },
+    );
+  }
+  return head;
+}
+
+/**
+ * Sign the row's URLs POST-commit, set the response status, and return the
+ * wire. Signing lives outside `withMutation` to keep the third-party seam off
+ * the tx (the Day-14/15 "call after commit" invariant). Both POST arms end here.
+ */
+async function finishMedia(
+  reply: FastifyReply,
+  status: number,
+  row: MediaAssetRow,
+  r2: R2Client,
+): Promise<MediaWire> {
+  const wire = await signMediaUrls(row, r2);
+  reply.code(status);
+  return wire;
 }
 
 /**
