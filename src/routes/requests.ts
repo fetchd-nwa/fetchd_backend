@@ -5,7 +5,11 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { comfortLevel, requestStatus } from '../db/schema/schema.js';
-import { evaluationRequiredError, type UnpassedEvaluationStatus } from '../lib/bookingErrors.js';
+import {
+  alreadyRequestedError,
+  evaluationRequiredError,
+  type UnpassedEvaluationStatus,
+} from '../lib/bookingErrors.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -267,6 +271,19 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
                 },
               ]);
             }
+          }
+
+          // 2b. Duplicate guard (Day-19d) — block a second OPEN request of
+          //     the same category for a dog that already has one in flight.
+          //     Once the prior request converts or cancels, re-requesting is
+          //     allowed. Roster-matched (lead or additional).
+          const alreadyRequested = await requestsRepository.findOpenByDogsAndCategory(
+            tx,
+            parsed.allDogIds,
+            parsed.category,
+          );
+          if (alreadyRequested.length > 0) {
+            throw alreadyRequestedError({ category: parsed.category, dog_ids: alreadyRequested });
           }
 
           // 3. INSERT pending_requests row.

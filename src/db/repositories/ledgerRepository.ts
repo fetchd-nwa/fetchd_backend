@@ -1,0 +1,138 @@
+import { and, eq, inArray } from 'drizzle-orm';
+import { db } from '../client.js';
+import { bookings, charges, creditLedger, invoices } from '../schema/schema.js';
+import type { ChargePurpose, ChargeStatus } from './chargesRepository.js';
+import type { ServiceCategory } from '../../lib/bookingBucket.js';
+import type { Tx } from '../tx.js';
+
+/** Polymorphic runner — pool for pre/post-tx reads, Tx for in-mutation work. */
+type Runner = Tx | typeof db;
+
+export type LedgerKind = 'session' | 'credit-pack' | 'membership' | 'payg';
+export type LedgerStatus = 'paid' | 'open' | 'refunded';
+export type LedgerMode = 'school' | 'daycare';
+
+export interface LedgerEntryRow {
+  id: string;
+  kind: LedgerKind;
+  status: LedgerStatus;
+  amountCents: number;
+  date: string; // ISO timestamptz
+  dogId: string | null;
+  category: ServiceCategory | null;
+  mode: LedgerMode | null;
+}
+
+// A charge is a ledger line only when it represents a completed money event.
+// `requires_payment` (pending/3DS) and `failed` charges are not shown.
+const LEDGER_CHARGE_STATUSES: ChargeStatus[] = ['succeeded', 'refunded'];
+
+function kindForPurpose(purpose: ChargePurpose): LedgerKind {
+  switch (purpose) {
+    case 'package':
+      return 'credit-pack';
+    case 'payg':
+      return 'payg';
+    case 'membership':
+      return 'membership';
+    case 'board-train':
+    case 'group-class':
+      return 'session';
+  }
+}
+
+// Category fallback for session/payg rows whose charge/invoice isn't linked to
+// a booking (e.g. a B&T invoice still keyed to the request, or a group-class
+// charge spanning multiple bookings). The booking's category wins when present.
+function categoryForPurpose(purpose: ChargePurpose): ServiceCategory | null {
+  switch (purpose) {
+    case 'board-train':
+      return 'board-and-train';
+    case 'group-class':
+      return 'group-class';
+    default:
+      return null;
+  }
+}
+
+export const ledgerRepository = {
+  /**
+   * The owner's billing ledger, newest first: every completed/refunded
+   * `charge` plus every `open` invoice, reconstructed into the FE's
+   * `InvoiceEntry` shape from the real money tables.
+   *
+   * Notes on fidelity:
+   *   - Credit-funded day-school/day-care sessions are NOT ledger lines — the
+   *     `package` purchase that funded them is the money event. This is the
+   *     real billing model, not the prototype's per-session fabrication.
+   *   - dog/mode come from `credit_ledger` for package purchases; dog/category
+   *     come from the linked `booking` for payg/board-train/group-class.
+   *   - Card brand/last4 is intentionally absent: `charges` carries no
+   *     payment_method link (only `stripe_payment_intent_id`), so the FE
+   *     renders no card chip rather than a fabricated one. Adding it would
+   *     need a `charges.payment_method_id` column (frozen schema).
+   */
+  async listForOwner(runner: Runner, ownerId: string): Promise<LedgerEntryRow[]> {
+    const chargeRows = await runner
+      .select({
+        id: charges.id,
+        amountCents: charges.amountCents,
+        status: charges.status,
+        purpose: charges.purpose,
+        date: charges.createdAt,
+        bookingCategory: bookings.category,
+        bookingLeadDog: bookings.leadDogId,
+        packDogId: creditLedger.dogId,
+        packMode: creditLedger.mode,
+      })
+      .from(charges)
+      .leftJoin(bookings, eq(bookings.id, charges.bookingId))
+      .leftJoin(creditLedger, eq(creditLedger.chargeId, charges.id))
+      .where(and(eq(charges.ownerId, ownerId), inArray(charges.status, LEDGER_CHARGE_STATUSES)));
+
+    const chargeEntries: LedgerEntryRow[] = chargeRows.map((row) => {
+      const kind = kindForPurpose(row.purpose);
+      const isPackage = kind === 'credit-pack';
+      return {
+        id: row.id,
+        kind,
+        status: row.status === 'refunded' ? 'refunded' : 'paid',
+        amountCents: row.amountCents,
+        date: row.date,
+        dogId: isPackage ? row.packDogId : row.bookingLeadDog,
+        category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
+        mode: isPackage ? row.packMode : null,
+      };
+    });
+
+    const invoiceRows = await runner
+      .select({
+        id: invoices.id,
+        amountCents: invoices.amountCents,
+        purpose: invoices.purpose,
+        date: invoices.issuedAt,
+        bookingCategory: bookings.category,
+        bookingLeadDog: bookings.leadDogId,
+      })
+      .from(invoices)
+      .leftJoin(bookings, eq(bookings.id, invoices.bookingId))
+      .where(and(eq(invoices.ownerId, ownerId), eq(invoices.status, 'open')));
+
+    const invoiceEntries: LedgerEntryRow[] = invoiceRows.map((row) => {
+      const kind = kindForPurpose(row.purpose);
+      const isPackage = kind === 'credit-pack';
+      return {
+        id: row.id,
+        kind,
+        status: 'open',
+        amountCents: row.amountCents,
+        date: row.date,
+        dogId: isPackage ? null : row.bookingLeadDog,
+        category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
+        mode: null,
+      };
+    });
+
+    return [...chargeEntries, ...invoiceEntries].sort((a, b) => b.date.localeCompare(a.date));
+  },
+};

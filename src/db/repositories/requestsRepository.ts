@@ -85,6 +85,11 @@ const PENDING_REQUEST_FULL_PROJECTION = {
   expiredAt: pendingRequests.expiredAt,
 } as const;
 
+// A request is "open" (still in flight) in these states — the Day-19d
+// duplicate guard counts only these. `converted` + `cancelled` are resolved,
+// so a dog can submit a fresh same-category request once a prior one closes.
+const OPEN_REQUEST_STATUSES = ['submitted', 'approved', 'approved-awaiting-payment'] as const;
+
 export const requestsRepository = {
   /**
    * Every live pending request for one owner, newest-submitted first.
@@ -245,6 +250,36 @@ export const requestsRepository = {
    * (notes/focus/length_weeks) come through with null when absent —
    * the route normalizes empty strings to null upstream.
    */
+  /**
+   * Day-19d duplicate guard. Of the given dogs, which already appear on a
+   * LIVE, still-OPEN request of this category — `status` ∈ submitted /
+   * approved / approved-awaiting-payment. `converted` + `cancelled` don't
+   * count, so a dog can re-request once a prior request resolves. Matched on
+   * the `pending_request_dogs` roster (lead or additional). Run inside the
+   * submit txn.
+   */
+  async findOpenByDogsAndCategory(
+    tx: Tx,
+    dogIds: string[],
+    category: ServiceCategory,
+  ): Promise<string[]> {
+    if (dogIds.length === 0) return [];
+    const rows = await tx
+      .selectDistinct({ dogId: pendingRequestDogs.dogId })
+      .from(pendingRequests)
+      .innerJoin(pendingRequestDogs, eq(pendingRequestDogs.requestId, pendingRequests.id))
+      .where(
+        and(
+          inArray(pendingRequestDogs.dogId, dogIds),
+          live(pendingRequestDogs),
+          eq(pendingRequests.category, category),
+          inArray(pendingRequests.status, [...OPEN_REQUEST_STATUSES]),
+          live(pendingRequests),
+        ),
+      );
+    return rows.map((r) => r.dogId);
+  },
+
   async create(
     tx: Tx,
     values: {

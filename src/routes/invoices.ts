@@ -6,6 +6,8 @@ import { peekCompletedIdempotency } from '../db/idempotency.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { chargesRepository, type ChargeStatus } from '../db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
+import { ledgerRepository } from '../db/repositories/ledgerRepository.js';
+import { toLedgerEntryWire, type LedgerEntryWire } from '../lib/ledgerWire.js';
 import { ApiError } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -58,6 +60,16 @@ const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
 export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
   const stripe = opts.stripe ?? defaultStripeClient;
+
+  // `GET /invoices` `[auth]` — the owner's billing ledger (charges + open
+  // invoices), newest first. Owner-scoped; a staff principal gets an empty
+  // list (the portal uses `/staff/*`), matching the GET /bookings convention.
+  app.get('/invoices', { preHandler: [authHook] }, async (request): Promise<LedgerEntryWire[]> => {
+    const principal = requirePrincipal(request);
+    if (principal.kind !== 'owner') return [];
+    const rows = await ledgerRepository.listForOwner(db, principal.ownerId);
+    return rows.map(toLedgerEntryWire);
+  });
 
   app.post(
     '/invoices/:id/pay',

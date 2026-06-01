@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   bookings as bookingsTable,
@@ -199,6 +199,33 @@ async function seedSubmittedRequest(args: {
   return id;
 }
 
+/** Soft-expire the dog's OPEN private-lesson requests (lead or additional) so
+ * a fresh PL submit isn't tripped by the Day-19d duplicate guard against the
+ * fixture-seeded PL request. Scoped to PL + open statuses — leaves the
+ * converted/cancelled + other-category fixture requests the other tests use. */
+async function clearOpenPrivateLessonRequests(dogId: string): Promise<void> {
+  const idRows = await db
+    .select({ requestId: pendingRequestDogsTable.requestId })
+    .from(pendingRequestDogsTable)
+    .where(eq(pendingRequestDogsTable.dogId, dogId));
+  const ids = [...new Set(idRows.map((r) => r.requestId))];
+  if (ids.length === 0) return;
+  await db
+    .update(pendingRequestsTable)
+    .set({ expiredAt: new Date().toISOString() })
+    .where(
+      and(
+        inArray(pendingRequestsTable.id, ids),
+        eq(pendingRequestsTable.category, 'private-lesson'),
+        inArray(pendingRequestsTable.status, [
+          'submitted',
+          'approved',
+          'approved-awaiting-payment',
+        ]),
+      ),
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // POST /bookings — pre-check fires for gated categories
 // ──────────────────────────────────────────────────────────────────────────
@@ -351,6 +378,10 @@ test(
   'POST /requests — private-lesson with un-passed lead → 201 (PL is not eval-gated at submission)',
   SKIP_WHEN_NO_DB,
   async () => {
+    // Soft-expire dog1's open private-lesson requests so this submit isn't
+    // tripped by the Day-19d duplicate guard against the fixture-seeded PL
+    // request — this test is about the eval gate, not the dup guard.
+    await clearOpenPrivateLessonRequests(FIXTURE_IDS.dog1Id);
     await withDogEvalStatus(FIXTURE_IDS.dog1Id, 'not-evaluated', async () => {
       const { app } = requestsApp();
       const res = await postRequest({

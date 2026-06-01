@@ -177,11 +177,39 @@ async function seedSubmittedRequest(args: {
   return id;
 }
 
+/** Soft-expire only the OPEN (submitted/approved/awaiting-payment) requests
+ * these dogs are on, so the Day-19d duplicate guard doesn't trip a fresh
+ * same-category submit against fixture-seeded requests. Leaves converted /
+ * cancelled requests intact (they don't trip the guard and other tests depend
+ * on them). Test-only isolation (mirrors the booking tests' clear helpers). */
+async function clearOpenRequestsForDogs(dogIds: string[]): Promise<void> {
+  const idRows = await db
+    .select({ requestId: pendingRequestDogsTable.requestId })
+    .from(pendingRequestDogsTable)
+    .where(inArray(pendingRequestDogsTable.dogId, dogIds));
+  const ids = [...new Set(idRows.map((r) => r.requestId))];
+  if (ids.length === 0) return;
+  await db
+    .update(pendingRequestsTable)
+    .set({ expiredAt: new Date().toISOString() })
+    .where(
+      and(
+        inArray(pendingRequestsTable.id, ids),
+        inArray(pendingRequestsTable.status, [
+          'submitted',
+          'approved',
+          'approved-awaiting-payment',
+        ]),
+      ),
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // POST /requests (owner-side submission)
 // ──────────────────────────────────────────────────────────────────────────
 
 test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WHEN_NO_DB, async () => {
+  await clearOpenRequestsForDogs([FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]);
   const { app } = requestsApp();
   const res = await postRequest({
     app,
@@ -216,6 +244,45 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
   assert.equal(body.focus.staff_preference, 'rachel');
   assert.equal(body.focus.comfort_level, 'high');
 });
+
+test(
+  'POST /requests — dog with an open same-category request → 422 already_requested (Day-19d guard)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearOpenRequestsForDogs([FIXTURE_IDS.dog1Id]);
+    const { app } = requestsApp();
+    const first = await postRequest({
+      app,
+      idempotencyKey: `pr-dup-1-${randomUUID()}`,
+      payload: {
+        category: 'private-lesson',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: [PREFERRED_1, PREFERRED_2],
+      },
+    });
+    assert.equal(first.statusCode, 201, first.body);
+
+    const second = await postRequest({
+      app,
+      idempotencyKey: `pr-dup-2-${randomUUID()}`,
+      payload: {
+        category: 'private-lesson',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: [PREFERRED_3],
+      },
+    });
+    assert.equal(second.statusCode, 422, second.body);
+    const dup = second.json() as {
+      error: { code: string; details: { kind: string; category: string; dog_ids: string[] } };
+    };
+    assert.equal(dup.error.code, 'already_requested');
+    assert.equal(dup.error.details.category, 'private-lesson');
+    assert.deepEqual(dup.error.details.dog_ids, [FIXTURE_IDS.dog1Id]);
+
+    // Clean up so a later private-lesson test for this dog isn't tripped.
+    await clearOpenRequestsForDogs([FIXTURE_IDS.dog1Id]);
+  },
+);
 
 test('POST /requests — board-and-train single-dog → 201', SKIP_WHEN_NO_DB, async () => {
   const { app } = requestsApp();

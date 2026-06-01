@@ -58,7 +58,10 @@ export type ApiErrorCode =
   | 'insufficient_capacity' // Day 10: booking blocked — day_capacity for (location,date,mode) exhausted
   | 'cohort_full' // Day 11: enrollment blocked — cohort.filled + requested > cohort.capacity
   | 'eligibility_missing' // Day 11: enrollment blocked — dog(s) missing OR-prereq for cohort's class (R7)
-  | 'evaluation_required'; // Day 12b: booking blocked — dog(s) missing passed evaluation for gated category
+  | 'evaluation_required' // Day 12b: booking blocked — dog(s) missing passed evaluation for gated category
+  | 'already_booked' // Day 19d: day-program booking blocked — dog already has a live booking for (category, day)
+  | 'already_enrolled' // Day 19d: enrollment blocked — dog already enrolled in this cohort
+  | 'already_requested'; // Day 19d: request blocked — dog already has an open request of this category
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   unauthenticated: 401,
@@ -83,6 +86,10 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   eligibility_missing: 422,
   // Day 12b evaluation gate — 422 (dog-readiness state-block, not malformed).
   evaluation_required: 422,
+  // Day 19d duplicate guards — 422 (state-block: the booking already exists).
+  already_booked: 422,
+  already_enrolled: 422,
+  already_requested: 422,
 };
 
 /**

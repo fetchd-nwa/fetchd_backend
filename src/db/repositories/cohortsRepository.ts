@@ -1,6 +1,6 @@
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { cohorts } from '../schema/schema.js';
+import { cohorts, groupClasses } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { GroupClassKey } from './groupClassesRepository.js';
 import type { LocationKey } from '../../lib/bookingWire.js';
@@ -38,6 +38,23 @@ const COHORT_PROJECTION = {
 } as const;
 
 export const cohortsRepository = {
+  /**
+   * Day-19d: resolve the group-class NAME for a batch of cohort ids. Used by
+   * the bookings read to title a group-class booking with its class name
+   * ("Manners 1") instead of the generic category. Joins cohorts→group_classes;
+   * returns a Map keyed by cohort id (missing ids simply absent).
+   */
+  async resolveClassNamesByIds(ids: readonly string[]): Promise<Map<string, string>> {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return new Map();
+    const rows = await db
+      .select({ cohortId: cohorts.id, className: groupClasses.name })
+      .from(cohorts)
+      .innerJoin(groupClasses, eq(groupClasses.key, cohorts.classKey))
+      .where(inArray(cohorts.id, unique));
+    return new Map(rows.map((r) => [r.cohortId, r.className]));
+  },
+
   /** Live cohorts for one class, ordered by start_date ASC (next first). */
   async findByClassKey(classKey: GroupClassKey): Promise<CohortRow[]> {
     return db

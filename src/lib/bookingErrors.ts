@@ -119,6 +119,35 @@ export interface EvaluationGap {
   readonly evaluation_status: UnpassedEvaluationStatus;
 }
 
+/**
+ * Day-19d duplicate guard — one day-program slot the dog is already booked
+ * into. A "live" booking is any non-cancelled row, so a dog can re-book a day
+ * it previously cancelled. `category` + `date` (YYYY-MM-DD, Chicago) let the
+ * FE name the exact collision ("Waffles is already booked for Day School on
+ * Jun 8").
+ */
+export interface AlreadyBookedConflict {
+  readonly dog_id: string;
+  readonly category: string;
+  readonly date: string;
+}
+
+/** Day-19d duplicate guard — the dog(s) already enrolled in this cohort. */
+export interface AlreadyEnrolledDetails {
+  readonly cohort_id: string;
+  readonly dog_ids: readonly string[];
+}
+
+/**
+ * Day-19d duplicate guard — the dog(s) that already have an OPEN request of
+ * this category (a second identical request can't be submitted until the
+ * first resolves). `category` is the requested service category.
+ */
+export interface AlreadyRequestedDetails {
+  readonly category: string;
+  readonly dog_ids: readonly string[];
+}
+
 // ---- Constructors --------------------------------------------------------
 //
 // Throw via these helpers, not via raw `new ApiError(...)` at the gate
@@ -237,6 +266,40 @@ export function eligibilityMissingError(gaps: readonly EligibilityGap[]): ApiErr
       missing_alternatives: [...g.missing_alternatives],
     })),
   });
+}
+
+export function alreadyBookedError(conflicts: readonly AlreadyBookedConflict[]): ApiError {
+  if (conflicts.length === 0) {
+    throw new Error('alreadyBookedError: conflicts array must be non-empty');
+  }
+  const summary =
+    conflicts.length === 1
+      ? `This dog already has a booking on ${conflicts[0]!.date}.`
+      : `These dogs already have bookings on ${conflicts.length} of the requested days.`;
+  return new ApiError('already_booked', summary, {
+    kind: 'already_booked',
+    conflicts: [...conflicts],
+  });
+}
+
+export function alreadyEnrolledError(details: AlreadyEnrolledDetails): ApiError {
+  return new ApiError(
+    'already_enrolled',
+    details.dog_ids.length === 1
+      ? 'This dog is already enrolled in this class.'
+      : `${details.dog_ids.length} dogs are already enrolled in this class.`,
+    { kind: 'already_enrolled', cohort_id: details.cohort_id, dog_ids: [...details.dog_ids] },
+  );
+}
+
+export function alreadyRequestedError(details: AlreadyRequestedDetails): ApiError {
+  return new ApiError(
+    'already_requested',
+    details.dog_ids.length === 1
+      ? 'This dog already has an open request of this type.'
+      : `${details.dog_ids.length} dogs already have an open request of this type.`,
+    { kind: 'already_requested', category: details.category, dog_ids: [...details.dog_ids] },
+  );
 }
 
 /**

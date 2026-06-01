@@ -29,8 +29,14 @@ import { env } from '../src/env.js';
 import {
   bookingDogs,
   bookings,
+  charges,
+  classPrereqOptions,
+  cohorts,
   creditLedger,
+  dogCompletedClasses,
   dogs,
+  groupClasses,
+  invoices,
   messages,
   notificationDogs,
   notifications,
@@ -101,6 +107,27 @@ const SEED = {
   msg2Id: '0e550000-0000-4000-8000-000000000002',
   msg3Id: '0e550000-0000-4000-8000-000000000003',
   msg4Id: '0e550000-0000-4000-8000-000000000004',
+
+  // Payment methods (explicit ids — invoices FK them).
+  paymentMethodAllisonId: 'b00a0000-0000-4000-8000-000000000001',
+  paymentMethodJordanId: 'b00a0000-0000-4000-8000-000000000002',
+
+  // Billing ledger for Allison (the full-history owner the owner-app dev
+  // principal should point at) — one row per FE ledger kind/status.
+  chargePackageId: 'c0a50000-0000-4000-8000-000000000001',
+  chargePaygId: 'c0a50000-0000-4000-8000-000000000002',
+  chargeMembershipId: 'c0a50000-0000-4000-8000-000000000003',
+  chargeRefundedId: 'c0a50000-0000-4000-8000-000000000004',
+  invoiceOpenId: '12005000-0000-4000-8000-000000000001',
+
+  // Group-class cohorts (all 3 class types, both locations, varied fills +
+  // one full cohort to demo the cohort-full state).
+  cohortPuppyFayId: 'c0407000-0000-4000-8000-000000000001',
+  cohortPuppyBenId: 'c0407000-0000-4000-8000-000000000002',
+  cohortManners1FayId: 'c0407000-0000-4000-8000-000000000003',
+  cohortManners1BenId: 'c0407000-0000-4000-8000-000000000004',
+  cohortManners2FayId: 'c0407000-0000-4000-8000-000000000005',
+  cohortManners2FullId: 'c0407000-0000-4000-8000-000000000006',
 } as const;
 
 function daysFromNow(days: number, hour = 14): string {
@@ -121,12 +148,24 @@ async function wipe(): Promise<void> {
   await db.delete(pendingRequestPreferredDates);
   await db.delete(pendingRequestDogs);
   await db.delete(pendingRequests);
+  // refunds → invoices → creditLedger all reference charges; delete them before
+  // charges, and charges before bookings (charges.booking_id) + paymentMethods
+  // (invoices.payment_method_id).
   await db.delete(refunds);
+  await db.delete(invoices);
   await db.delete(creditLedger);
+  await db.delete(charges);
   await db.delete(bookingDogs);
   await db.delete(bookings);
+  // cohorts are referenced by bookings.cohort_id (deleted above); group_classes
+  // are referenced by cohorts.class_key + class_prereq_options — delete the
+  // children first, then the catalog.
+  await db.delete(cohorts);
+  await db.delete(classPrereqOptions);
+  await db.delete(groupClasses);
   await db.delete(paymentMethods);
   await db.delete(stripeCustomers);
+  await db.delete(dogCompletedClasses);
   await db.delete(dogs);
   await db.delete(owners);
   await db.delete(staff);
@@ -195,6 +234,7 @@ async function seed(): Promise<void> {
   ]);
   await db.insert(paymentMethods).values([
     {
+      id: SEED.paymentMethodAllisonId,
       ownerId: SEED.ownerAllisonId,
       stripePaymentMethodId: 'pm_seed_allison',
       brand: 'visa',
@@ -205,6 +245,7 @@ async function seed(): Promise<void> {
       isDefault: true,
     },
     {
+      id: SEED.paymentMethodJordanId,
       ownerId: SEED.ownerJordanId,
       stripePaymentMethodId: 'pm_seed_jordan',
       brand: 'mastercard',
@@ -262,6 +303,123 @@ async function seed(): Promise<void> {
       profileImagePath: 'dogs/ollie/ollie-pfp.jpeg',
     },
   ]);
+
+  // Group-class catalog — all three class types (price in cents on the wire;
+  // the FE renders whole dollars). Mirrors mobile/src/mock/group-classes.json.
+  await db.insert(groupClasses).values([
+    {
+      key: 'puppy',
+      name: 'Puppy Class',
+      weeks: 4,
+      pricePerDogCents: 15_000,
+      capacity: 15,
+      ageRange: 'Ages 7–13 weeks',
+      description:
+        'Open enrollment any Saturday. Socialization, confidence-building, and the very first basics.',
+      enrollmentType: 'open',
+    },
+    {
+      key: 'manners-1',
+      name: 'Manners 1',
+      weeks: 6,
+      pricePerDogCents: 25_000,
+      capacity: 15,
+      ageRange: null,
+      description: 'Foundation course. Sit, down, come, stay, place, leave it, and leash manners.',
+      enrollmentType: 'cohort',
+    },
+    {
+      key: 'manners-2',
+      name: 'Manners 2',
+      weeks: 6,
+      pricePerDogCents: 25_000,
+      capacity: 15,
+      ageRange: null,
+      description:
+        'Builds on Manners 1. Reliability with distance, distractions, and harder environments.',
+      enrollmentType: 'cohort',
+    },
+  ]);
+  // OR-prereq: Manners 2 requires Manners 1 (R7 eligibility source of truth).
+  await db
+    .insert(classPrereqOptions)
+    .values([{ classKey: 'manners-2', prereqClassKey: 'manners-1' }]);
+  // Cohorts — both locations, varied fills, future starts (relative to now so
+  // they stay bookable), plus one FULL cohort to demo the cohort-full state.
+  // capacity snapshots the class cap (15); end_date = start + (weeks-1) weeks.
+  await db.insert(cohorts).values([
+    {
+      id: SEED.cohortPuppyFayId,
+      classKey: 'puppy',
+      location: 'fayetteville',
+      startDate: daysFromNow(7, 15),
+      endDate: daysFromNow(7 + 3 * 7, 15),
+      weeklyTime: '10:00 am',
+      weeks: 4,
+      capacity: 15,
+      filled: 6,
+    },
+    {
+      id: SEED.cohortPuppyBenId,
+      classKey: 'puppy',
+      location: 'bentonville',
+      startDate: daysFromNow(10, 15),
+      endDate: daysFromNow(10 + 3 * 7, 15),
+      weeklyTime: '10:00 am',
+      weeks: 4,
+      capacity: 15,
+      filled: 4,
+    },
+    {
+      id: SEED.cohortManners1FayId,
+      classKey: 'manners-1',
+      location: 'fayetteville',
+      startDate: daysFromNow(14, 16),
+      endDate: daysFromNow(14 + 5 * 7, 16),
+      weeklyTime: '11:00 am',
+      weeks: 6,
+      capacity: 15,
+      filled: 8,
+    },
+    {
+      id: SEED.cohortManners1BenId,
+      classKey: 'manners-1',
+      location: 'bentonville',
+      startDate: daysFromNow(21, 23),
+      endDate: daysFromNow(21 + 5 * 7, 23),
+      weeklyTime: '6:30 pm',
+      weeks: 6,
+      capacity: 15,
+      filled: 12,
+    },
+    {
+      id: SEED.cohortManners2FayId,
+      classKey: 'manners-2',
+      location: 'fayetteville',
+      startDate: daysFromNow(20, 17),
+      endDate: daysFromNow(20 + 5 * 7, 17),
+      weeklyTime: '12:00 pm',
+      weeks: 6,
+      capacity: 15,
+      filled: 4,
+    },
+    {
+      // Full cohort — exercises the cohort-full gate in the enroll flow.
+      id: SEED.cohortManners2FullId,
+      classKey: 'manners-2',
+      location: 'fayetteville',
+      startDate: daysFromNow(45, 17),
+      endDate: daysFromNow(45 + 5 * 7, 17),
+      weeklyTime: '12:00 pm',
+      weeks: 6,
+      capacity: 15,
+      filled: 15,
+    },
+  ]);
+  // Lola has completed Manners 1 → she's eligible for Manners 2; Waffles
+  // hasn't → enrolling Waffles in Manners 2 fires the prereq gate. Demos both
+  // sides of the R7 eligibility check for Allison.
+  await db.insert(dogCompletedClasses).values([{ dogId: SEED.dogLolaId, classKey: 'manners-1' }]);
 
   await db.insert(bookings).values([
     {
@@ -321,6 +479,71 @@ async function seed(): Promise<void> {
     { bookingId: SEED.bookingBrodieBoardingId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogOllieId, isLead: false },
+  ]);
+
+  // Billing ledger for Allison — populates the owner app's Invoices tab in
+  // real mode with one row per FE kind/status. (`GET /invoices`, Day-19d.)
+  await db.insert(charges).values([
+    {
+      id: SEED.chargePackageId,
+      ownerId: SEED.ownerAllisonId,
+      amountCents: 40500,
+      status: 'succeeded',
+      purpose: 'package',
+      createdAt: daysFromNow(-30, 15),
+    },
+    {
+      id: SEED.chargePaygId,
+      ownerId: SEED.ownerAllisonId,
+      amountCents: 9000,
+      status: 'succeeded',
+      purpose: 'payg',
+      bookingId: SEED.bookingLolaLessonId,
+      createdAt: daysFromNow(-20, 15),
+    },
+    {
+      id: SEED.chargeMembershipId,
+      ownerId: SEED.ownerAllisonId,
+      amountCents: 7900,
+      status: 'succeeded',
+      purpose: 'membership',
+      createdAt: daysFromNow(-15, 15),
+    },
+    {
+      // Refunded group-class charge — exercises the 'refunded' status + the
+      // purpose-derived category for a charge with no booking link.
+      id: SEED.chargeRefundedId,
+      ownerId: SEED.ownerAllisonId,
+      amountCents: 20000,
+      status: 'refunded',
+      purpose: 'group-class',
+      createdAt: daysFromNow(-25, 15),
+    },
+  ]);
+  // The credit-pack grant that the package charge funded — gives the ledger
+  // row its dog + mode.
+  await db.insert(creditLedger).values([
+    {
+      dogId: SEED.dogWafflesId,
+      mode: 'school',
+      delta: 10,
+      reason: 'purchase',
+      chargeId: SEED.chargePackageId,
+      createdAt: daysFromNow(-30, 15),
+    },
+  ]);
+  // One open (pay-later) invoice — the only tappable, payable ledger row.
+  await db.insert(invoices).values([
+    {
+      id: SEED.invoiceOpenId,
+      ownerId: SEED.ownerAllisonId,
+      amountCents: 18000,
+      status: 'open',
+      purpose: 'board-train',
+      paymentMethodId: SEED.paymentMethodAllisonId,
+      issuedAt: daysFromNow(-3, 15),
+      dueAt: daysFromNow(7, 15),
+    },
   ]);
 
   await db.insert(pendingRequests).values([
@@ -445,7 +668,8 @@ async function main(): Promise<void> {
   await wipe();
   await seed();
   console.log(
-    `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 4 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, 2 threads. ` +
+    `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 4 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
+      `2 threads, 3 group classes + 6 cohorts, billing ledger. ` +
       `Portal principal: staff:${SEED.staffShanthiId}:owner-shanthi`,
   );
   process.exit(0);

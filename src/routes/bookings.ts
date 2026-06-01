@@ -11,11 +11,16 @@ import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { locationKey } from '../db/schema/schema.js';
 import { isInView } from '../lib/bookingBucket.js';
-import { insufficientCreditsError, type CreditGap } from '../lib/bookingErrors.js';
+import {
+  alreadyBookedError,
+  insufficientCreditsError,
+  type AlreadyBookedConflict,
+  type CreditGap,
+} from '../lib/bookingErrors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
-import { bucketChicagoToday } from '../lib/chicagoDate.js';
+import { bucketChicagoToday, bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
 import {
   DEFAULT_DROPOFF_TIME,
@@ -351,6 +356,27 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                 }
               }
               if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
+
+              // Duplicate guard (Day-19d) — block re-booking a day the dog
+              // already attends in this category. Cancelled bookings are
+              // excluded, so a cancelled day can be re-booked. Checked under
+              // the day-mode lock, so a concurrent insert can't slip a
+              // duplicate past this.
+              const dupConflicts: AlreadyBookedConflict[] = [];
+              for (const dogId of parsed.allDogIds) {
+                const existing = await bookingsRepository.findLiveScheduledAtForDogCategory(
+                  tx,
+                  dogId,
+                  parsed.category,
+                );
+                const bookedDays = new Set(existing.map(bucketToChicagoDate));
+                for (const date of parsed.sortedDates) {
+                  if (bookedDays.has(date)) {
+                    dupConflicts.push({ dog_id: dogId, category: parsed.category, date });
+                  }
+                }
+              }
+              if (dupConflicts.length > 0) throw alreadyBookedError(dupConflicts);
 
               // Per-date: capacity → INSERT booking + booking_dogs → INSERT debits.
               const wires: BookingWire[] = [];

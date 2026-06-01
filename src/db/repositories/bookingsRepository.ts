@@ -41,6 +41,7 @@ export interface BookingRow {
   cancelForfeited: boolean;
   pickupAt: string | null;
   trainerStaffId: string | null;
+  cohortId: string | null;
 }
 
 /**
@@ -52,7 +53,6 @@ export interface BookingFullRow extends BookingRow {
   ownerId: string;
   leadDogId: string;
   cancelDeadlineAt: string | null;
-  cohortId: string | null;
   expiredAt: string | null;
 }
 
@@ -81,6 +81,7 @@ const BOOKING_PROJECTION = {
   cancelForfeited: bookings.cancelForfeited,
   pickupAt: bookings.pickupAt,
   trainerStaffId: bookings.trainerStaffId,
+  cohortId: bookings.cohortId,
 } as const;
 
 const BOOKING_FULL_PROJECTION = {
@@ -179,6 +180,58 @@ export const bookingsRepository = {
         ),
       );
     return row?.count ?? 0;
+  },
+
+  /**
+   * Day-19d duplicate guard (day programs). Live (non-cancelled) `scheduled_at`
+   * timestamps for this dog in this category — matched on the `booking_dogs`
+   * roster (lead OR additional), since a day-program booking can carry several
+   * dogs. Run inside the booking txn under the day-mode lock; the route buckets
+   * each to its Chicago day and intersects with the requested days — a
+   * collision means the dog is already booked that day. Cancelled rows are
+   * excluded so a re-book after cancel is allowed.
+   */
+  async findLiveScheduledAtForDogCategory(
+    tx: Tx,
+    dogId: string,
+    category: ServiceCategory,
+  ): Promise<string[]> {
+    const rows = await tx
+      .select({ scheduledAt: bookings.scheduledAt })
+      .from(bookings)
+      .innerJoin(bookingDogs, eq(bookingDogs.bookingId, bookings.id))
+      .where(
+        and(
+          eq(bookingDogs.dogId, dogId),
+          live(bookingDogs),
+          eq(bookings.category, category),
+          ne(bookings.status, 'cancelled'),
+          live(bookings),
+        ),
+      );
+    return rows.map((r) => r.scheduledAt);
+  },
+
+  /**
+   * Day-19d duplicate guard (cohort enrollment). Of the given dogs, which
+   * already have a live (non-cancelled) booking in this cohort. Run inside the
+   * enrollment txn under the cohort lock so a concurrent enroll can't slip a
+   * duplicate past the check.
+   */
+  async findEnrolledDogsInCohort(tx: Tx, cohortId: string, dogIds: string[]): Promise<string[]> {
+    if (dogIds.length === 0) return [];
+    const rows = await tx
+      .selectDistinct({ leadDogId: bookings.leadDogId })
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.cohortId, cohortId),
+          inArray(bookings.leadDogId, dogIds),
+          ne(bookings.status, 'cancelled'),
+          live(bookings),
+        ),
+      );
+    return rows.map((r) => r.leadDogId);
   },
 
   /**

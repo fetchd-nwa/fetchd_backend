@@ -26,14 +26,20 @@ export interface BookingWire {
   location?: LocationKey;
   cancelled_at?: string;
   cancel_forfeited?: boolean;
+  // Group-class only (DATA-CONTRACT §A Amendment 2026-06-01). `cohort_id` is
+  // the stable key the FE groups weekly sessions by (one card per cohort +
+  // date, dogs stacked); `group_class_name` titles the card ("Manners 1").
+  cohort_id?: string;
+  group_class_name?: string;
 }
 
 /**
  * The subset of `bookings` columns the wire shape consumes. A structural
  * type kept narrow so the query layer doesn't accidentally couple the wire
- * helper to columns it doesn't need (cohort_id, confirmed_at,
- * cancellation_reason, cancel_deadline_at, dropoff_at, pickup_at,
- * external_ref, source — all internal state, none on the §B wire today).
+ * helper to columns it doesn't need (confirmed_at, cancellation_reason,
+ * cancel_deadline_at, dropoff_at, pickup_at, external_ref, source — all
+ * internal state, none on the §B wire today). `cohortId` joined the wire
+ * Day-19d so the FE can group + title group-class bookings.
  */
 export interface BookingRowForWire {
   id: string;
@@ -46,6 +52,7 @@ export interface BookingRowForWire {
   location: LocationKey | null;
   cancelledAt: string | null;
   cancelForfeited: boolean;
+  cohortId: string | null;
 }
 
 export interface BookingDogRow {
@@ -70,6 +77,7 @@ export function toBookingWire(
   row: BookingRowForWire,
   dogIds: BookingDogIds,
   trainerName: string | null,
+  groupClassName?: string,
 ): BookingWire {
   const wire: BookingWire = {
     id: row.id,
@@ -84,6 +92,10 @@ export function toBookingWire(
   if (row.notes !== null && row.notes !== '') wire.notes = row.notes;
   if (row.sessionReportId !== null) wire.session_report_id = row.sessionReportId;
   if (row.location !== null) wire.location = row.location;
+  if (row.cohortId !== null) wire.cohort_id = row.cohortId;
+  if (groupClassName !== undefined && groupClassName !== '') {
+    wire.group_class_name = groupClassName;
+  }
   if (row.status === 'cancelled') {
     if (row.cancelledAt !== null) wire.cancelled_at = pgTimestampToIso(row.cancelledAt);
     wire.cancel_forfeited = row.cancelForfeited;

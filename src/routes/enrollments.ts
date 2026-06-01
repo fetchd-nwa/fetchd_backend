@@ -3,11 +3,13 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { lockCohort } from '../db/locks.js';
+import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { dogCompletedClassesRepository } from '../db/repositories/dogCompletedClassesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { groupClassesRepository } from '../db/repositories/groupClassesRepository.js';
 import {
+  alreadyEnrolledError,
   cohortFullError,
   eligibilityMissingError,
   type EligibilityGap,
@@ -72,14 +74,12 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  * surface cohort enrollments via the cohort detail screen but never
  * via this endpoint.
  *
- * Known caveat: duplicate-enrollment prevention is not enforced
- * server-side today. An owner enrolling the same dog into the same
- * cohort twice (deliberate race with two different Idempotency-Keys,
- * same body would replay) would create duplicate bookings. The FE
- * prevents the double-click case, idempotency catches the retry case;
- * a (cohort_id, lead_dog_id) live-bookings check inside the txn would
- * close the rare race. Deferred — flag for Day 13 (cancel) revisit
- * since "re-enroll after cancel" would interact.
+ * Duplicate-enrollment guard (Day-19d, step 3b): a `(cohort_id,
+ * lead_dog_id)` live-bookings check runs under the cohort lock — a dog
+ * already enrolled (non-cancelled bookings in this cohort) is rejected
+ * with `already_enrolled` 422. Cancelled bookings are excluded, so
+ * "re-enroll after cancel" works. Idempotency still replays the exact
+ * retry; the guard catches two distinct enroll attempts.
  */
 
 /**
@@ -149,6 +149,19 @@ export function registerEnrollmentsRoute(
           //    doesn't exist for enrollment purposes).
           if (cohortRow === undefined || cohortRow.expiredAt !== null) {
             throw new ApiError('not_found', `cohort ${parsed.cohortId} not found`);
+          }
+
+          // 3b. Duplicate guard (Day-19d) — a dog already enrolled in this
+          //     cohort (live, non-cancelled bookings) can't re-enroll.
+          //     Checked under the cohort lock so a concurrent enroll can't
+          //     slip a duplicate past it (closes the Day-11 caveat).
+          const alreadyEnrolled = await bookingsRepository.findEnrolledDogsInCohort(
+            tx,
+            parsed.cohortId,
+            parsed.dogIds,
+          );
+          if (alreadyEnrolled.length > 0) {
+            throw alreadyEnrolledError({ cohort_id: parsed.cohortId, dog_ids: alreadyEnrolled });
           }
 
           // 4. Capacity assertion against the LOCKED snapshot. Schema

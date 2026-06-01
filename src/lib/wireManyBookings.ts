@@ -1,4 +1,5 @@
 import { bookingsRepository, type BookingRow } from '../db/repositories/bookingsRepository.js';
+import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
 import { groupBookingDogs, toBookingWire, type BookingWire } from './bookingWire.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
@@ -22,9 +23,13 @@ import { pgTimestampToDate } from './pgTimestamp.js';
 export async function wireManyBookings(rows: BookingRow[]): Promise<BookingWire[]> {
   if (rows.length === 0) return [];
   const ids = rows.map((r) => r.id);
-  const [bookingDogRows, trainerName] = await Promise.all([
+  // Cohort ids on group-class bookings → resolve the class name so the FE can
+  // title the booking with its class ("Manners 1") instead of "Group Class".
+  const cohortIds = rows.map((r) => r.cohortId).filter((id): id is string => id !== null);
+  const [bookingDogRows, trainerName, classNamesByCohort] = await Promise.all([
     bookingsRepository.findDogsByBookingIds(ids),
     staffRepository.resolveTrainerNames(rows),
+    cohortsRepository.resolveClassNamesByIds(cohortIds),
   ]);
   const dogsByBooking = groupBookingDogs(bookingDogRows);
   return rows.map((row) => {
@@ -32,7 +37,8 @@ export async function wireManyBookings(rows: BookingRow[]): Promise<BookingWire[
     if (dogIds === undefined) {
       throw new Error(`booking ${row.id}: no booking_dogs rows found`);
     }
-    return toBookingWire(row, dogIds, trainerName(row.trainerStaffId));
+    const groupClassName = row.cohortId !== null ? classNamesByCohort.get(row.cohortId) : undefined;
+    return toBookingWire(row, dogIds, trainerName(row.trainerStaffId), groupClassName);
   });
 }
 

@@ -11,6 +11,7 @@ import {
   dayCapacity,
   dogVaccines as dogVaccinesTable,
   paymentMethods,
+  pendingRequests,
 } from '../../src/db/schema/schema.js';
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
@@ -100,6 +101,32 @@ async function clearCreditLedger(dogId: string): Promise<void> {
   await db.delete(creditLedger).where(eq(creditLedger.dogId, dogId));
 }
 
+/** Hard-delete every booking this dog is on (lead or additional) plus its
+ * credit-ledger debits + roster rows. Test-only scaffolding (the route never
+ * deletes bookings) so a test that books a given (dog, day) isn't tripped by
+ * the Day-19d duplicate guard against a booking an EARLIER test left on the
+ * same day. Same isolation rationale as `clearCreditLedger`. */
+async function clearDogBookings(dogId: string): Promise<void> {
+  await db.transaction(async (tx) => {
+    const idRows = await tx
+      .select({ bookingId: bookingDogsTable.bookingId })
+      .from(bookingDogsTable)
+      .where(eq(bookingDogsTable.dogId, dogId));
+    const ids = idRows.map((r) => r.bookingId);
+    if (ids.length === 0) return;
+    // Detach any pending_request that converted into one of these bookings —
+    // its converted_booking_id FK would otherwise block the delete. (An
+    // earlier request→approve→convert test can leave such a row.)
+    await tx
+      .update(pendingRequests)
+      .set({ convertedBookingId: null })
+      .where(inArray(pendingRequests.convertedBookingId, ids));
+    await tx.delete(creditLedger).where(inArray(creditLedger.bookingId, ids));
+    await tx.delete(bookingDogsTable).where(inArray(bookingDogsTable.bookingId, ids));
+    await tx.delete(bookingsTable).where(inArray(bookingsTable.id, ids));
+  });
+}
+
 /** Build a Fastify app with the bookings route registered + the
  * deterministic fixture clock so date validation uses the FIXTURE_TODAY
  * "today." */
@@ -180,6 +207,96 @@ test(
     assert.equal(debits.length, 1, 'exactly one debit per booking per dog');
     assert.equal(debits[0]!.delta, -1);
     assert.equal(debits[0]!.reason, 'booking-debit');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Day-19d duplicate guard
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /bookings — same dog + category + day already booked → 422 already_booked with conflict detail',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
+    const { app } = bookingApp();
+    const date = futureWeekday(25);
+    const first = await postBooking({
+      app,
+      idempotencyKey: `bk-dup-1-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(first.statusCode, 201, first.body);
+
+    const second = await postBooking({
+      app,
+      idempotencyKey: `bk-dup-2-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(second.statusCode, 422, second.body);
+    const body = second.json() as {
+      error: {
+        code: string;
+        details: {
+          kind: string;
+          conflicts: Array<{ dog_id: string; category: string; date: string }>;
+        };
+      };
+    };
+    assert.equal(body.error.code, 'already_booked');
+    assert.deepEqual(body.error.details.conflicts, [
+      { dog_id: FIXTURE_IDS.dog1Id, category: 'day-school', date },
+    ]);
+  },
+);
+
+test(
+  'POST /bookings — a CANCELLED booking on that day does NOT block re-booking',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
+    const { app } = bookingApp();
+    const date = futureWeekday(26);
+    const first = await postBooking({
+      app,
+      idempotencyKey: `bk-rb-1-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(first.statusCode, 201, first.body);
+    const firstId = (first.json() as Array<{ id: string }>)[0]!.id;
+
+    // Cancel it directly (test scaffolding) — a cancelled day frees the slot.
+    await db
+      .update(bookingsTable)
+      .set({ status: 'cancelled' })
+      .where(eq(bookingsTable.id, firstId));
+
+    const second = await postBooking({
+      app,
+      idempotencyKey: `bk-rb-2-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(second.statusCode, 201, second.body);
   },
 );
 
@@ -739,6 +856,7 @@ test(
   'POST /bookings — same key + different body → 422 idempotency_mismatch',
   SKIP_WHEN_NO_DB,
   async () => {
+    await clearDogBookings(FIXTURE_IDS.dog1Id);
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     const { app } = bookingApp();
     const key = `bk-mismatch-${randomUUID()}`;
@@ -824,6 +942,8 @@ test(
   async () => {
     // Top up enough for both dogs to book the same date. Override day_capacity
     // to 1 so only ONE dog can fit — the other 422s on insufficient_capacity.
+    await clearDogBookings(FIXTURE_IDS.dog1Id);
+    await clearDogBookings(FIXTURE_IDS.dog2Id);
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     await topUpCredits(FIXTURE_IDS.dog2Id, 'school', 1);
     const date = futureDate(37);
@@ -912,6 +1032,8 @@ test(
   'POST /bookings — booking_dogs link rows match the request (is_lead exactly on lead_dog_id)',
   SKIP_WHEN_NO_DB,
   async () => {
+    await clearDogBookings(FIXTURE_IDS.dog1Id);
+    await clearDogBookings(FIXTURE_IDS.dog2Id);
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     await topUpCredits(FIXTURE_IDS.dog2Id, 'school', 1);
     const { app } = bookingApp();

@@ -180,6 +180,41 @@ test(
 );
 
 test(
+  'POST /enrollments — same dog already enrolled in the cohort → 422 already_enrolled (Day-19d guard)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app } = enrollApp();
+    const first = await postEnrollment({
+      app,
+      idempotencyKey: `enr-dup-1-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id] },
+    });
+    assert.equal(first.statusCode, 201, first.body);
+
+    const second = await postEnrollment({
+      app,
+      idempotencyKey: `enr-dup-2-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id] },
+    });
+    assert.equal(second.statusCode, 422, second.body);
+    const body = second.json() as {
+      error: { code: string; details: { kind: string; cohort_id: string; dog_ids: string[] } };
+    };
+    assert.equal(body.error.code, 'already_enrolled');
+    assert.equal(body.error.details.cohort_id, cohort.id);
+    assert.deepEqual(body.error.details.dog_ids, [FIXTURE_IDS.dog1Id]);
+
+    // The duplicate attempt did not bump filled past the first enrollment.
+    const [row] = await db
+      .select({ filled: cohortsTable.filled })
+      .from(cohortsTable)
+      .where(eq(cohortsTable.id, cohort.id));
+    assert.equal(row?.filled, 1, 'filled stays at 1 — the duplicate enroll was rejected');
+  },
+);
+
+test(
   'POST /enrollments — multi-dog (2 dogs) → 2 × weeks bookings + filled +2',
   SKIP_WHEN_NO_DB,
   async () => {
