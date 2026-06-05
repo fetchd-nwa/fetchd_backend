@@ -10,5 +10,6 @@
     "longitude": -94.1719
   },
   "is_recurring": true,
-  "description": "Bring your favorite ball."
+  "description": "Bring your favorite ball.",
+  "spots_filled": 2
 }

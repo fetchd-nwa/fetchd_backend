@@ -13,6 +13,7 @@
     "title": "Group Manners 1 starting in June",
     "body": "Saturdays at 10am, 4 weeks. Fayetteville only.",
     "published_at": "2026-05-10T18:00:00.000Z",
-    "deep_link_path": "/classes/manners-1"
+    "deep_link_path": "/classes/manners-1",
+    "cta": { "label": "See available dates", "kind": "enroll", "target": "manners-1" }
   }
 ]

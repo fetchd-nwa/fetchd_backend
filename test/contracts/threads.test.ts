@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { registerThreadsRoute } from '../../src/routes/threads.js';
 import { FIXTURE_IDS } from './_fixture.js';
@@ -171,3 +172,111 @@ test(
     assert.equal(res.statusCode, 404);
   },
 );
+
+// --- POST /threads/:id/read --------------------------------------------
+// NOTE: this mutates thread1's messages (read_at), so it runs AFTER the
+// GET tests above that assert unread_count > 0. Fresh Idempotency-Key per
+// run avoids replay.
+
+test('POST /threads/:id/read returns 204 and clears unread_count', SKIP_WHEN_NO_DB, async () => {
+  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  registerThreadsRoute(app, { authenticate });
+  const res = await app.inject({
+    method: 'POST',
+    url: `/threads/${FIXTURE_IDS.thread1Id}/read`,
+    headers: { 'idempotency-key': randomUUID() },
+  });
+  assert.equal(res.statusCode, 204);
+
+  const after = await app.inject({ method: 'GET', url: `/threads/${FIXTURE_IDS.thread1Id}` });
+  assert.equal((after.json() as { unread_count: number }).unread_count, 0);
+});
+
+test(
+  'POST /threads/:id/read for a non-owned/unknown thread returns 404',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerThreadsRoute(app, { authenticate });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/threads/00000000-0000-4000-8000-000000000099/read',
+      headers: { 'idempotency-key': randomUUID() },
+    });
+    assert.equal(res.statusCode, 404);
+  },
+);
+
+test('POST /threads/:id/read as a staff principal returns 404', SKIP_WHEN_NO_DB, async () => {
+  const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  registerThreadsRoute(app, { authenticate });
+  const res = await app.inject({
+    method: 'POST',
+    url: `/threads/${FIXTURE_IDS.thread1Id}/read`,
+    headers: { 'idempotency-key': randomUUID() },
+  });
+  assert.equal(res.statusCode, 404);
+});
+
+// --- POST /threads/:id/messages (owner send) ---------------------------
+// Mutates thread1 (adds a message), so it runs after the GET-message tests.
+
+test(
+  'POST /threads/:id/messages sends an owner message (201; sender_id=owner; no sender_name)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerThreadsRoute(app, { authenticate });
+    const res = await app.inject({
+      method: 'POST',
+      url: `/threads/${FIXTURE_IDS.thread1Id}/messages`,
+      headers: { 'idempotency-key': randomUUID() },
+      payload: { text: 'See you Friday!' },
+    });
+    assert.equal(res.statusCode, 201);
+    const wire = res.json() as { text: string; sender_id: string; sender_name?: string };
+    assert.equal(wire.text, 'See you Friday!');
+    assert.equal(wire.sender_id, FIXTURE_IDS.ownerId);
+    assert.equal('sender_name' in wire, false); // owner messages omit the name
+  },
+);
+
+test('POST /threads/:id/messages with blank text returns 400', SKIP_WHEN_NO_DB, async () => {
+  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  registerThreadsRoute(app, { authenticate });
+  const res = await app.inject({
+    method: 'POST',
+    url: `/threads/${FIXTURE_IDS.thread1Id}/messages`,
+    headers: { 'idempotency-key': randomUUID() },
+    payload: { text: '   ' },
+  });
+  assert.equal(res.statusCode, 400);
+});
+
+test(
+  'POST /threads/:id/messages to a non-owned/unknown thread returns 404',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerThreadsRoute(app, { authenticate });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/threads/00000000-0000-4000-8000-000000000099/messages',
+      headers: { 'idempotency-key': randomUUID() },
+      payload: { text: 'hi' },
+    });
+    assert.equal(res.statusCode, 404);
+  },
+);
+
+test('POST /threads/:id/messages as a staff principal returns 404', SKIP_WHEN_NO_DB, async () => {
+  const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  registerThreadsRoute(app, { authenticate });
+  const res = await app.inject({
+    method: 'POST',
+    url: `/threads/${FIXTURE_IDS.thread1Id}/messages`,
+    headers: { 'idempotency-key': randomUUID() },
+    payload: { text: 'hi' },
+  });
+  assert.equal(res.statusCode, 404);
+});

@@ -9,5 +9,7 @@
     "latitude": 36.3729,
     "longitude": -94.2088
   },
-  "is_recurring": false
+  "is_recurring": false,
+  "spots_filled": 0,
+  "capacity": 20
 }

@@ -27,6 +27,7 @@
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
 import {
+  announcements,
   bookingDogs,
   bookings,
   charges,
@@ -35,6 +36,9 @@ import {
   creditLedger,
   dogCompletedClasses,
   dogs,
+  eventRsvpDogs,
+  eventRsvps,
+  events,
   groupClasses,
   invoices,
   messages,
@@ -128,6 +132,18 @@ const SEED = {
   cohortManners1BenId: 'c0407000-0000-4000-8000-000000000004',
   cohortManners2FayId: 'c0407000-0000-4000-8000-000000000005',
   cohortManners2FullId: 'c0407000-0000-4000-8000-000000000006',
+  cohortPublicPupsFayId: 'c0407000-0000-4000-8000-000000000007',
+  // Recent-Updates announcements (Fayetteville-targeted home-screen catalog).
+  annClosureId: 'a11c0000-0000-4000-8000-000000000001',
+  annYappyHourId: 'a11c0000-0000-4000-8000-000000000002',
+  annPuppyClassId: 'a11c0000-0000-4000-8000-000000000003',
+  annMeetTeamId: 'a11c0000-0000-4000-8000-000000000004',
+  annSummerPackagesId: 'a11c0000-0000-4000-8000-000000000005',
+  annClassMovedId: 'a11c0000-0000-4000-8000-000000000006',
+  // Events + an RSVP (so the spots bar isn't empty). Yappy Hour is the only
+  // event — Public Pups is a group class (see groupClasses), not an event.
+  eventYappyHourId: 'e0e70000-0000-4000-8000-000000000001',
+  rsvpJordanYappyId: 'e0e70000-0000-4000-8000-0000000000a1',
 } as const;
 
 function daysFromNow(days: number, hour = 14): string {
@@ -136,9 +152,36 @@ function daysFromNow(days: number, hour = 14): string {
   return d.toISOString();
 }
 
+// Human Chicago weekday+date label (e.g. "Friday, June 6") computed off the
+// seed run so closure copy never references a stale hardcoded calendar date.
+function chicagoDateLabel(daysAhead: number): string {
+  const d = new Date(Date.now() + daysAhead * 24 * 60 * 60 * 1000);
+  return d.toLocaleDateString('en-US', {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    timeZone: 'America/Chicago',
+  });
+}
+
+// Next occurrence of a weekday (0=Sun .. 6=Sat) at `hour` UTC — keeps seeded
+// events in the near future on every re-seed. Always strictly forward (never
+// "today"), so an event seeded on its own weekday lands a week out.
+function nextWeekday(targetDow: number, hour: number): string {
+  const d = new Date();
+  const add = (targetDow - d.getUTCDay() + 7) % 7 || 7;
+  d.setUTCDate(d.getUTCDate() + add);
+  d.setUTCHours(hour, 0, 0, 0);
+  return d.toISOString();
+}
+
 async function wipe(): Promise<void> {
   // Child → parent FK order. Includes the transactional tables a portal demo
   // (approve/cancel/reply) can write, so a re-seed starts clean.
+  await db.delete(announcements);
+  await db.delete(eventRsvpDogs);
+  await db.delete(eventRsvps);
+  await db.delete(events);
   await db.delete(notificationDogs);
   await db.delete(notifications);
   await db.delete(scheduledNotifications);
@@ -339,6 +382,25 @@ async function seed(): Promise<void> {
         'Builds on Manners 1. Reliability with distance, distractions, and harder environments.',
       enrollmentType: 'cohort',
     },
+    {
+      // Public Pups — a 6-week real-world public-manners course (a group class,
+      // NOT an event). Each week meets at a different public location around
+      // town; that rotation lives in the description because a cohort carries a
+      // single `location` (per-week locations aren't modeled — see cohort note).
+      key: 'public-pups',
+      name: 'Public Pups',
+      weeks: 6,
+      pricePerDogCents: 25_000,
+      capacity: 12,
+      ageRange: null,
+      description:
+        'A six-week course in real-world public manners. Each week meets at a different ' +
+        'public spot around town, so your dog practices staying calm and focused wherever ' +
+        "you go — not just in the training room. You'll also learn to read your dog's early " +
+        'stress signals and step in before a situation tips over, keeping outings positive ' +
+        'for both of you.',
+      enrollmentType: 'cohort',
+    },
   ]);
   // OR-prereq: Manners 2 requires Manners 1 (R7 eligibility source of truth).
   await db
@@ -414,6 +476,20 @@ async function seed(): Promise<void> {
       weeks: 6,
       capacity: 15,
       filled: 15,
+    },
+    {
+      // Public Pups — a 6-week course cohort. `location` is the home/first-week
+      // base; the weekly rotation to different public spots isn't modeled (the
+      // schema has one location per cohort), so it lives in the class description.
+      id: SEED.cohortPublicPupsFayId,
+      classKey: 'public-pups',
+      location: 'fayetteville',
+      startDate: daysFromNow(7, 15),
+      endDate: daysFromNow(7 + 5 * 7, 15),
+      weeklyTime: '9:00 am',
+      weeks: 6,
+      capacity: 12,
+      filled: 5,
     },
   ]);
   // Lola has completed Manners 1 → she's eligible for Manners 2; Waffles
@@ -661,6 +737,132 @@ async function seed(): Promise<void> {
       readAt: null,
     },
   ]);
+
+  // Recent-Updates announcements for the Fayetteville home screen. Tapping a
+  // card opens the generic /announcement/[id] detail screen (hero + explanation
+  // + optional CTA), EXCEPT: `urgent` → the closure modal, and any row with a
+  // `deepLinkPath` → that screen directly (a destination that IS the full
+  // experience and already explains + signs up: `report` → its report card, the
+  // Yappy Hour event → its sign-up screen, the Puppy Class → its info screen).
+  // The detail-screen CTA is a typed union: `route` (allowlisted in-app path,
+  // used by Meet-the-team), plus `enroll` (group_class_key) + `external` (https
+  // URL) — both supported by the model but unused by the current seed.
+  // `daysFromNow` keeps them recent on re-seed; published newest-first.
+  await db.insert(announcements).values([
+    {
+      id: SEED.annClosureId,
+      category: 'urgent',
+      title: `Fayetteville closed ${chicagoDateLabel(5)}`,
+      body:
+        `Our Fayetteville location will be closed ${chicagoDateLabel(5)} while the whole ` +
+        `team is at a continuing-education workshop. Day School and Day Care are cancelled ` +
+        `that day — your trainer will reach out to adjust standing schedules. Boarding and ` +
+        `pickups are unaffected.`,
+      publishedAt: daysFromNow(-1, 15),
+      targetLocation: 'Fayetteville, AR',
+    },
+    {
+      id: SEED.annYappyHourId,
+      category: 'event',
+      title: 'Yappy Hour is back this Saturday',
+      publishedAt: daysFromNow(-2, 16),
+      // Deep-links to the data-driven event screen, which explains the event AND
+      // has the dog-picker RSVP. `/event/[id]` renders ANY event row — a new
+      // event is a seed row + an announcement pointing at its id, no new screen.
+      deepLinkPath: `/event/${SEED.eventYappyHourId}`,
+      targetLocation: 'Fayetteville, AR',
+    },
+    {
+      id: SEED.annPuppyClassId,
+      category: 'class',
+      title: 'Summer puppy class signups are open',
+      publishedAt: daysFromNow(-3, 15),
+      // The Puppy Class info screen explains the course AND has the "See
+      // available dates" enroll button, so the card links straight there
+      // (no generic detail in between), like the Yappy Hour event.
+      deepLinkPath: '/info/puppy-class',
+      targetLocation: 'Fayetteville, AR',
+    },
+    {
+      id: SEED.annMeetTeamId,
+      category: 'team',
+      title: 'Meet your Fayetteville trainers',
+      body:
+        `Get to know the team behind your dog's progress. Rachel, Donavan, and Angie each ` +
+        `bring a different specialty — from puppy foundations to reactivity and ` +
+        `board-and-train — and they're who you'll see at drop-off and in your report cards.` +
+        `\n\nTap through to read a little about each of them and what they focus on.`,
+      publishedAt: daysFromNow(-5, 14),
+      // route CTA — allowlisted in-app screen (the team directory).
+      ctaLabel: 'Meet the team',
+      ctaKind: 'route',
+      ctaTarget: '/info/staff',
+      targetLocation: 'Fayetteville, AR',
+    },
+    {
+      id: SEED.annClassMovedId,
+      category: 'class',
+      title: 'Manners classes have moved',
+      body:
+        `Heads up — our group Manners classes have moved to a new, larger training room at ` +
+        `our Fayetteville location. Same trainers, same weekly schedule — just a roomier ` +
+        `space with better footing for the dogs.\n\nIf you're already enrolled, your cohort's ` +
+        `day and time are unchanged; just check in at the front desk and they'll point you ` +
+        `to the new room.`,
+      publishedAt: daysFromNow(-6, 14),
+      // informational — no CTA (demonstrates the no-button detail screen).
+      targetLocation: 'Fayetteville, AR',
+    },
+    {
+      id: SEED.annSummerPackagesId,
+      category: 'promo',
+      title: 'Summer Day School packages now available',
+      body:
+        `Buy a 10- or 20-day Day School package this summer and save compared to paying per ` +
+        `day. Packages never expire and can be split across all of your dogs, so they're ` +
+        `easy to share between siblings.`,
+      publishedAt: daysFromNow(-7, 14),
+      targetLocation: 'Fayetteville, AR',
+    },
+  ]);
+
+  // Yappy Hour — the one event, for the data-driven /event/[id] screen. (Public
+  // Pups is a group class, not an event — see groupClasses above.) Carries a soft
+  // `capacity` so the spots bar has a denominator.
+  // NOTE: Yappy Hour's loc_address/coords are a Fayetteville-area placeholder —
+  // swap in NWA's real school address when known (drives the map "directions").
+  await db.insert(events).values([
+    {
+      id: SEED.eventYappyHourId,
+      name: 'Yappy Hour',
+      startsAt: nextWeekday(6, 22), // next Saturday ~5pm Chicago (22:00 UTC)
+      durationMinutes: 120,
+      locLabel: 'NWA School for Dogs · Fayetteville',
+      locAddress: 'Fayetteville, AR',
+      locLatitude: 36.0822,
+      locLongitude: -94.1719,
+      description:
+        `A relaxed off-the-clock social for graduates of any NWA program — or pups who'd ` +
+        `like to be one someday. Open play in the big yard, kiddie pools out, and a treat ` +
+        `bar under the awning. Bring your dog (or two, or three), some water, and a ` +
+        `willingness to chat. We'll have trainers on the floor to keep things calm and ` +
+        `answer questions. Humans get coffee, dogs get puppuccinos.`,
+      isRecurring: false,
+      capacity: 25,
+    },
+  ]);
+
+  // One existing RSVP (Jordan's two dogs → Yappy Hour) so spots_filled = 2/25
+  // out of the gate — Allison can then sign up Waffles/Lola against a live bar.
+  await db.insert(eventRsvps).values({
+    id: SEED.rsvpJordanYappyId,
+    ownerId: SEED.ownerJordanId,
+    eventId: SEED.eventYappyHourId,
+  });
+  await db.insert(eventRsvpDogs).values([
+    { rsvpId: SEED.rsvpJordanYappyId, dogId: SEED.dogBrodieId },
+    { rsvpId: SEED.rsvpJordanYappyId, dogId: SEED.dogOllieId },
+  ]);
 }
 
 async function main(): Promise<void> {
@@ -669,7 +871,7 @@ async function main(): Promise<void> {
   await seed();
   console.log(
     `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 4 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
-      `2 threads, 3 group classes + 6 cohorts, billing ledger. ` +
+      `2 threads, 4 group classes + 7 cohorts, billing ledger, 6 announcements, 1 event. ` +
       `Portal principal: staff:${SEED.staffShanthiId}:owner-shanthi`,
   );
   process.exit(0);

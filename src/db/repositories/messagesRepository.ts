@@ -1,4 +1,4 @@
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { messages } from '../schema/schema.js';
 import { live } from '../softExpire.js';
@@ -71,5 +71,51 @@ export const messagesRepository = {
       throw new Error('messagesRepository.createStaffMessage: INSERT returned no row');
     }
     return row;
+  },
+
+  /**
+   * INSERT an owner-authored message (Day-19e owner send). Sets
+   * `sender_kind='owner'` + `sender_owner_id`; `sender_staff_id` stays NULL
+   * (the schema `messages_check` CHECK enforces the XOR). Mirrors
+   * `createStaffMessage`. The route validates `text` + ownership before calling.
+   */
+  async createOwnerMessage(
+    tx: Tx,
+    args: { threadId: string; ownerId: string; text: string },
+  ): Promise<MessageRow> {
+    const [row] = await tx
+      .insert(messages)
+      .values({
+        threadId: args.threadId,
+        senderKind: 'owner',
+        senderOwnerId: args.ownerId,
+        text: args.text,
+      })
+      .returning(MESSAGE_PROJECTION);
+    if (!row) {
+      throw new Error('messagesRepository.createOwnerMessage: INSERT returned no row');
+    }
+    return row;
+  },
+
+  /**
+   * Mark a thread's owner-facing messages read: set `read_at = now()` on every
+   * live, unread, non-owner message in the thread (those are exactly the ones
+   * the §B `unread_count` counts — `sender_kind != 'owner' AND read_at IS NULL`).
+   * Idempotent: re-running touches nothing once they're read. Owner-scoping is
+   * the route's job (`threadsRepository.ownsThread`), same as `findLiveByThread`.
+   */
+  async markThreadReadForOwner(tx: Tx, threadId: string): Promise<void> {
+    await tx
+      .update(messages)
+      .set({ readAt: sql`now()` })
+      .where(
+        and(
+          eq(messages.threadId, threadId),
+          ne(messages.senderKind, 'owner'),
+          isNull(messages.readAt),
+          live(messages),
+        ),
+      );
   },
 };

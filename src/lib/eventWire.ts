@@ -14,11 +14,11 @@ import { pgTimestampToIso } from './pgTimestamp.js';
  *     loc_longitude) → nested `location: { label, address, latitude,
  *     longitude }` object.
  *
- * Deferred (additive when FE consumes): `events.series_id`, `events.capacity`.
- * Both are real DB state but absent from the current FE Raw type; per §B
- * "No shape changes beyond R5 (absolute dates) and R6 (uuid ids)" we don't
- * emit them yet. The day the FE adds a capacity bar or series indicator,
- * each is an additive wire key — no breaking change.
+ * Day-19e: `capacity` + `spots_filled` now emitted — the data-driven
+ * `/event/[id]` screen renders the spots bar from them. `capacity` is the
+ * soft cap (omit when NULL = uncapped); `spots_filled` is the live count of
+ * RSVP'd dogs (sum of `event_rsvp_dogs` over the event's live `event_rsvps`),
+ * resolved by the route and passed in. Still deferred: `events.series_id`.
  *
  * RSVPs: `event_rsvps` carries `owner_id` + `event_id` + timestamp, and
  * `event_rsvp_dogs` is the M:N to dogs. The wire denormalizes the dog ids
@@ -41,6 +41,8 @@ export interface EventWire {
   location: EventLocationWire;
   description?: string;
   is_recurring: boolean;
+  capacity?: number; // soft cap; omitted when NULL (uncapped)
+  spots_filled: number; // live RSVP'd dog count
 }
 
 export interface EventRsvpWire {
@@ -65,6 +67,7 @@ export interface EventRowForWire {
   locLongitude: number;
   description: string | null;
   isRecurring: boolean;
+  capacity: number | null;
 }
 
 /** Subset of `event_rsvps` columns the wire helper consumes. */
@@ -79,7 +82,7 @@ export interface EventRsvpRowForWire {
  * Optional-omit on `description?` per the Day-4a convention (omit when
  * null/empty); all other keys are required.
  */
-export function toEventWire(row: EventRowForWire): EventWire {
+export function toEventWire(row: EventRowForWire, spotsFilled: number): EventWire {
   const wire: EventWire = {
     id: row.id,
     name: row.name,
@@ -92,9 +95,13 @@ export function toEventWire(row: EventRowForWire): EventWire {
       longitude: row.locLongitude,
     },
     is_recurring: row.isRecurring,
+    spots_filled: spotsFilled,
   };
   if (row.description !== null && row.description !== '') {
     wire.description = row.description;
+  }
+  if (row.capacity !== null) {
+    wire.capacity = row.capacity;
   }
   return wire;
 }

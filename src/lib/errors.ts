@@ -61,7 +61,8 @@ export type ApiErrorCode =
   | 'evaluation_required' // Day 12b: booking blocked — dog(s) missing passed evaluation for gated category
   | 'already_booked' // Day 19d: day-program booking blocked — dog already has a live booking for (category, day)
   | 'already_enrolled' // Day 19d: enrollment blocked — dog already enrolled in this cohort
-  | 'already_requested'; // Day 19d: request blocked — dog already has an open request of this category
+  | 'already_requested' // Day 19d: request blocked — dog already has an open request of this category
+  | 'event_full'; // Day 19e: event RSVP blocked — live rsvp dogs + requested > events.capacity (owner self-serve soft cap)
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   unauthenticated: 401,
@@ -90,6 +91,8 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   already_booked: 422,
   already_enrolled: 422,
   already_requested: 422,
+  // Day 19e event RSVP soft cap — 422 (state-block: event is full).
+  event_full: 422,
 };
 
 /**

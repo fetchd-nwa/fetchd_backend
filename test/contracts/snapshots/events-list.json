@@ -11,7 +11,8 @@
       "longitude": -94.1719
     },
     "is_recurring": true,
-    "description": "Past event — included in /events response per FE contract."
+    "description": "Past event — included in /events response per FE contract.",
+    "spots_filled": 0
   },
   {
     "id": "55555555-5555-4555-8555-aaaaaaaaaaa1",
@@ -25,7 +26,8 @@
       "longitude": -94.1719
     },
     "is_recurring": true,
-    "description": "Bring your favorite ball."
+    "description": "Bring your favorite ball.",
+    "spots_filled": 2
   },
   {
     "id": "55555555-5555-4555-8555-aaaaaaaaaaa2",
@@ -38,6 +40,24 @@
       "latitude": 36.3729,
       "longitude": -94.2088
     },
-    "is_recurring": false
+    "is_recurring": false,
+    "spots_filled": 0,
+    "capacity": 20
+  },
+  {
+    "id": "55555555-5555-4555-8555-aaaaaaaaaaa4",
+    "name": "Tiny Meetup",
+    "date": "2026-06-20T19:00:00.000Z",
+    "duration_minutes": 60,
+    "location": {
+      "label": "Fayetteville yard",
+      "address": "123 Main St, Fayetteville, AR",
+      "latitude": 36.0822,
+      "longitude": -94.1719
+    },
+    "is_recurring": false,
+    "description": "Capacity 1 — exercises the event_full soft cap.",
+    "spots_filled": 0,
+    "capacity": 1
   }
 ]

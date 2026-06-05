@@ -27,6 +27,9 @@ const ANNOUNCEMENT_PROJECTION = {
   body: announcements.body,
   publishedAt: announcements.publishedAt,
   deepLinkPath: announcements.deepLinkPath,
+  ctaLabel: announcements.ctaLabel,
+  ctaKind: announcements.ctaKind,
+  ctaTarget: announcements.ctaTarget,
 } as const;
 
 /**
@@ -45,6 +48,9 @@ const ANNOUNCEMENT_ROW_SCHEMA: z.ZodType<AnnouncementRow> = z.object({
   body: z.string().nullable(),
   publishedAt: z.string(),
   deepLinkPath: z.string().nullable(),
+  ctaLabel: z.string().nullable(),
+  ctaKind: z.enum(['enroll', 'route', 'external']).nullable(),
+  ctaTarget: z.string().nullable(),
 });
 const ANNOUNCEMENT_ROWS_SCHEMA = ANNOUNCEMENT_ROW_SCHEMA.array();
 

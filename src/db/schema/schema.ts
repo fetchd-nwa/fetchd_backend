@@ -10,7 +10,7 @@ export const chargePurpose = pgEnum("charge_purpose", ['package', 'payg', 'board
 export const chargeStatus = pgEnum("charge_status", ['requires_payment', 'succeeded', 'failed', 'refunded'])
 export const comfortLevel = pgEnum("comfort_level", ['low', 'medium', 'high'])
 export const evaluationStatus = pgEnum("evaluation_status", ['not-evaluated', 'pending', 'passed', 'failed'])
-export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'manners-2'])
+export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'manners-2', 'public-pups'])
 export const invoiceStatus = pgEnum("invoice_status", ['open', 'paid', 'void'])
 export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment', 'membership-grant'])
 export const locationKey = pgEnum("location_key", ['fayetteville', 'bentonville'])
@@ -1099,6 +1099,11 @@ export const announcements = pgTable("announcements", {
 	body: text(),
 	publishedAt: timestamp("published_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	deepLinkPath: text("deep_link_path"),
+	ctaLabel: text("cta_label"),
+	// CHECK (cta_kind IN ('enroll','route','external')) enforces this at the DB;
+	// $type reflects that guarantee at compile time so reads narrow without a cast.
+	ctaKind: text("cta_kind").$type<'enroll' | 'route' | 'external'>(),
+	ctaTarget: text("cta_target"),
 	targetLocation: appLocation("target_location"),
 	isPinned: boolean("is_pinned").default(false).notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),

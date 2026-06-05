@@ -9,6 +9,10 @@ import { announcementCategory } from '../db/schema/schema.js';
  * Conventions (Day-5a/4a wire-shape rules):
  *   - Required keys: always emit. (`id`, `category`, `title`, `published_at`).
  *   - Optional `?` keys: omit when null/empty. `body?` and `deep_link_path?`.
+ *   - `cta?` (Day 19e) — the Recent-Updates detail CTA. Emitted as a nested
+ *     object so its three correlated fields travel as a unit (the DB CHECK
+ *     guarantees all-or-none). The FE parses `kind`+`target` into a typed
+ *     discriminated union at its wire boundary (route allowlist enforced there).
  *
  * NOT emitted (server-side concerns):
  *   - `target_location` — server uses it for the `?location=` query filter;
@@ -19,6 +23,15 @@ import { announcementCategory } from '../db/schema/schema.js';
 
 export type AnnouncementCategory = (typeof announcementCategory.enumValues)[number];
 
+/** CTA target discriminator. See `announcements.cta_kind` (schema.sql). */
+export type AnnouncementCtaKind = 'enroll' | 'route' | 'external';
+
+export interface AnnouncementCtaWire {
+  label: string;
+  kind: AnnouncementCtaKind;
+  target: string;
+}
+
 export interface AnnouncementWire {
   id: string;
   category: AnnouncementCategory;
@@ -26,6 +39,7 @@ export interface AnnouncementWire {
   body?: string;
   published_at: string;
   deep_link_path?: string;
+  cta?: AnnouncementCtaWire;
 }
 
 /**
@@ -39,6 +53,9 @@ export interface AnnouncementRowForWire {
   body: string | null;
   publishedAt: string;
   deepLinkPath: string | null;
+  ctaLabel: string | null;
+  ctaKind: AnnouncementCtaKind | null;
+  ctaTarget: string | null;
 }
 
 /**
@@ -56,6 +73,10 @@ export function toAnnouncementWire(row: AnnouncementRowForWire): AnnouncementWir
   }
   if (row.deepLinkPath !== null && row.deepLinkPath !== '') {
     wire.deep_link_path = row.deepLinkPath;
+  }
+  // CTA is all-or-none at the DB; emit as a unit only when fully present.
+  if (row.ctaLabel !== null && row.ctaKind !== null && row.ctaTarget !== null) {
+    wire.cta = { label: row.ctaLabel, kind: row.ctaKind, target: row.ctaTarget };
   }
   return wire;
 }

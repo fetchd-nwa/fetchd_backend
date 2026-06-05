@@ -1,5 +1,5 @@
 import { and, eq, sql } from 'drizzle-orm';
-import { bookingMode, cohorts, dayCapacity, locationKey } from './schema/schema.js';
+import { bookingMode, cohorts, dayCapacity, events, locationKey } from './schema/schema.js';
 import type { Tx } from './tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
@@ -60,6 +60,24 @@ export async function lockCohort(
   cohortId: string,
 ): Promise<typeof cohorts.$inferSelect | undefined> {
   const [row] = await tx.select().from(cohorts).where(eq(cohorts.id, cohortId)).for('update');
+  return row;
+}
+
+/**
+ * Row-lock an event for the duration of the transaction — the
+ * `POST /events/:id/rsvp` soft-cap primitive (Day-19e). Concurrent RSVPs to
+ * the same event serialize on this row so the
+ * `live_dogs - owner_current + |dog_ids| <= capacity` assertion is race-free.
+ * Returns the locked row (the caller reads `capacity` + does the arithmetic),
+ * or `undefined` when the id doesn't exist. Soft-expire is intentionally NOT
+ * filtered — same rationale as `lockCohort`: the route's `live` check runs
+ * before the lock, and we lock the same id we just read.
+ */
+export async function lockEvent(
+  tx: Tx,
+  eventId: string,
+): Promise<typeof events.$inferSelect | undefined> {
+  const [row] = await tx.select().from(events).where(eq(events.id, eventId)).for('update');
   return row;
 }
 

@@ -182,6 +182,7 @@ export const FIXTURE_IDS = {
   eventPublicPupsId: '55555555-5555-4555-8555-aaaaaaaaaaa1',
   eventYappyHourId: '55555555-5555-4555-8555-aaaaaaaaaaa2',
   eventPastId: '55555555-5555-4555-8555-aaaaaaaaaaa3',
+  eventCappedId: '55555555-5555-4555-8555-aaaaaaaaaaa4', // capacity 1 — exercises event_full
   eventRsvp1Id: '66666666-6666-4666-8666-aaaaaaaaaaa1',
   // Day-7b: notifications + announcements fixture. Following Day-7a's
   // "reuse first-octet + unique last-octet" idiom — first-octet `7` (booking
@@ -1322,6 +1323,20 @@ export async function seedFixture(): Promise<void> {
       seriesId: FIXTURE_IDS.eventSeriesPublicPupsId,
       capacity: null,
     },
+    {
+      id: FIXTURE_IDS.eventCappedId,
+      name: 'Tiny Meetup',
+      startsAt: '2026-06-20T19:00:00Z',
+      durationMinutes: 60,
+      locLabel: 'Fayetteville yard',
+      locAddress: '123 Main St, Fayetteville, AR',
+      locLatitude: 36.0822,
+      locLongitude: -94.1719,
+      description: 'Capacity 1 — exercises the event_full soft cap.',
+      isRecurring: false,
+      seriesId: null,
+      capacity: 1,
+    },
   ]);
 
   await db.insert(eventRsvps).values({
@@ -1438,6 +1453,11 @@ export async function seedFixture(): Promise<void> {
       body: 'Saturdays at 10am, 4 weeks. Fayetteville only.',
       publishedAt: '2026-05-10T18:00:00Z',
       deepLinkPath: '/classes/manners-1',
+      // Day-19e: exercises the cta wire (the all-present branch) — an enroll CTA
+      // emits as a nested `cta` object alongside the legacy deep_link_path.
+      ctaLabel: 'See available dates',
+      ctaKind: 'enroll',
+      ctaTarget: 'manners-1',
       targetLocation: 'Fayetteville, AR',
       isPinned: false,
     },
@@ -1572,6 +1592,7 @@ export async function teardownFixture(): Promise<void> {
         FIXTURE_IDS.eventPublicPupsId,
         FIXTURE_IDS.eventYappyHourId,
         FIXTURE_IDS.eventPastId,
+        FIXTURE_IDS.eventCappedId,
       ]),
     );
   await db.delete(eventSeries).where(eq(eventSeries.id, FIXTURE_IDS.eventSeriesPublicPupsId));
