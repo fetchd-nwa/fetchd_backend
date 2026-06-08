@@ -6,7 +6,7 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { toRateWire, type RateWire } from '../lib/ratesWire.js';
-import { locationKey, serviceCategory } from '../db/schema/schema.js';
+import { LOCATION_SLUGS, serviceCategory } from '../db/schema/schema.js';
 import { serviceRatesRepository } from '../db/repositories/serviceRatesRepository.js';
 
 /**
@@ -26,7 +26,7 @@ import { serviceRatesRepository } from '../db/repositories/serviceRatesRepositor
  */
 
 const CATEGORIES = pgEnumTuple(serviceCategory);
-const LOCATIONS = pgEnumTuple(locationKey);
+const LOCATIONS = LOCATION_SLUGS;
 
 const querySchema = z.object({
   category: z.enum(CATEGORIES),

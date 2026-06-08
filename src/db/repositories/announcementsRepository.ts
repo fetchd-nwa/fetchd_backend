@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { readThrough } from '../../lib/cache.js';
 import { pgEnumTuple } from '../../lib/pgEnumTuple.js';
 import { db } from '../client.js';
-import { announcementCategory, announcements, appLocation } from '../schema/schema.js';
+import { announcementCategory, announcements, type LocationKey } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { AnnouncementRowForWire } from '../../lib/announcementWire.js';
 
@@ -18,7 +18,6 @@ import type { AnnouncementRowForWire } from '../../lib/announcementWire.js';
  */
 
 export type AnnouncementRow = AnnouncementRowForWire;
-export type AppLocation = (typeof appLocation.enumValues)[number];
 
 const ANNOUNCEMENT_PROJECTION = {
   id: announcements.id,
@@ -55,7 +54,7 @@ const ANNOUNCEMENT_ROW_SCHEMA: z.ZodType<AnnouncementRow> = z.object({
 const ANNOUNCEMENT_ROWS_SCHEMA = ANNOUNCEMENT_ROW_SCHEMA.array();
 
 /** Cache key for `findLive`. `'all'` is the bare-query (no `?location=`). */
-export function announcementsCacheKey(location: AppLocation | null): string {
+export function announcementsCacheKey(location: LocationKey | null): string {
   return `ann:${location ?? 'all'}`;
 }
 
@@ -74,7 +73,7 @@ export const announcementsRepository = {
    * Invalidated by Day-12+ announcement publish/expire mutations via
    * `invalidate([announcementsCacheKey(loc)])`.
    */
-  async findLive(location: AppLocation | null): Promise<AnnouncementRow[]> {
+  async findLive(location: LocationKey | null): Promise<AnnouncementRow[]> {
     return readThrough(
       announcementsCacheKey(location),
       ANNOUNCEMENTS_TTL_SEC,

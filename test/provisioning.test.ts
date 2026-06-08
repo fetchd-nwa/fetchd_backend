@@ -137,7 +137,7 @@ test(
             name: 'Audit Tmp',
             email: 'audit-tmp@example.com',
             phone: '000',
-            location: 'Fayetteville, AR',
+            location: 'fayetteville',
           })
           .returning({ id: owners.id });
         assert.ok(created);

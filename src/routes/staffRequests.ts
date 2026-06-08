@@ -8,7 +8,7 @@ import {
   type PendingRequestFullRow,
 } from '../db/repositories/requestsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
-import { locationKey, requestStatus } from '../db/schema/schema.js';
+import { LOCATION_SLUGS, requestStatus } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
@@ -63,7 +63,7 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  * HANDOFF for the documented semantic gap.
  */
 
-const LOCATION_KEYS = pgEnumTuple(locationKey);
+const LOCATION_KEYS = LOCATION_SLUGS;
 const REQUEST_STATUS_VALUES = pgEnumTuple(requestStatus);
 const uuidParamSchema = z.object({ id: z.string().uuid() });
 const statusQuerySchema = z.object({ status: z.enum(REQUEST_STATUS_VALUES).optional() });

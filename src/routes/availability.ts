@@ -5,7 +5,7 @@ import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { defaultDayCapacity, enumerateRangeWithCap } from '../lib/availability.js';
-import { bookingMode, locationKey } from '../db/schema/schema.js';
+import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 
 /**
@@ -25,7 +25,7 @@ import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.
  */
 
 const MODES = pgEnumTuple(bookingMode);
-const LOCATIONS = pgEnumTuple(locationKey);
+const LOCATIONS = LOCATION_SLUGS;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 

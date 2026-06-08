@@ -215,9 +215,9 @@ export const FIXTURE_IDS = {
   // ordering, NULL target_location = all-locations match, specific
   // target_location filter, live() filter on expired row.
   //   ann1 — pinned, target=NULL (all), category=team, body + deep_link.
-  //   ann2 — not pinned, target='Bentonville, AR', category=event, NO
+  //   ann2 — not pinned, target='bentonville', category=event, NO
   //     body, NO deep_link.
-  //   ann3 — not pinned, target='Fayetteville, AR', category=class, body
+  //   ann3 — not pinned, target='fayetteville', category=class, body
   //     + deep_link.
   //   annExpired — pinned, target=NULL, expired_at set. Must NOT appear
   //     in any response.
@@ -317,7 +317,7 @@ export async function seedFixture(): Promise<void> {
     name: 'Allison Fixture',
     email: 'fixture@example.com',
     phone: '555-0001',
-    location: 'Fayetteville, AR',
+    location: 'fayetteville',
     avatarImagePath: '',
     emergencyName: 'Sam Fixture',
     emergencyRelationship: 'spouse',
@@ -452,7 +452,7 @@ export async function seedFixture(): Promise<void> {
       supabaseUid: FIXTURE_IDS.staffDonavanSupabaseUid,
       name: 'Donavan',
       role: 'trainer',
-      location: 'Fayetteville, AR',
+      location: 'fayetteville',
       imagePath: null,
       active: true,
     },
@@ -461,7 +461,7 @@ export async function seedFixture(): Promise<void> {
       supabaseUid: FIXTURE_IDS.staffRachelSupabaseUid,
       name: 'Rachel',
       role: 'trainer',
-      location: 'Fayetteville, AR',
+      location: 'fayetteville',
       imagePath: null,
     },
   ]);
@@ -1474,7 +1474,7 @@ export async function seedFixture(): Promise<void> {
       body: null, // optional-omit branch
       publishedAt: '2026-05-18T17:00:00Z',
       deepLinkPath: null, // optional-omit branch
-      targetLocation: 'Bentonville, AR',
+      targetLocation: 'bentonville',
       isPinned: false,
     },
     {
@@ -1489,7 +1489,7 @@ export async function seedFixture(): Promise<void> {
       ctaLabel: 'See available dates',
       ctaKind: 'enroll',
       ctaTarget: 'manners-1',
-      targetLocation: 'Fayetteville, AR',
+      targetLocation: 'fayetteville',
       isPinned: false,
     },
     {

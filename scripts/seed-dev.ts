@@ -221,7 +221,7 @@ async function seed(): Promise<void> {
       supabaseUid: '00000000-0000-4000-8000-0000000000b1',
       name: 'Shanthi',
       role: 'owner-shanthi',
-      location: 'Fayetteville, AR',
+      location: 'fayetteville',
       active: true,
     },
     {
@@ -229,7 +229,7 @@ async function seed(): Promise<void> {
       supabaseUid: '00000000-0000-4000-8000-0000000000b2',
       name: 'Rachel',
       role: 'trainer',
-      location: 'Fayetteville, AR',
+      location: 'fayetteville',
       active: true,
     },
     {
@@ -237,7 +237,7 @@ async function seed(): Promise<void> {
       supabaseUid: '00000000-0000-4000-8000-0000000000b3',
       name: 'Donavan',
       role: 'trainer',
-      location: 'Fayetteville, AR',
+      location: 'fayetteville',
       active: true,
     },
     {
@@ -245,7 +245,7 @@ async function seed(): Promise<void> {
       supabaseUid: '00000000-0000-4000-8000-0000000000b4',
       name: 'Fed Acosta',
       role: 'trainer',
-      location: 'Bentonville, AR',
+      location: 'bentonville',
       active: true,
     },
   ]);
@@ -257,7 +257,7 @@ async function seed(): Promise<void> {
       name: 'Allison Frye',
       email: 'allison@example.com',
       phone: '479-555-0101',
-      location: 'Fayetteville, AR',
+      location: 'fayetteville',
     },
     {
       id: SEED.ownerJordanId,
@@ -265,7 +265,7 @@ async function seed(): Promise<void> {
       name: 'Jordan Blake',
       email: 'jordan@example.com',
       phone: '479-555-0102',
-      location: 'Bentonville, AR',
+      location: 'bentonville',
     },
   ]);
 
@@ -760,7 +760,7 @@ async function seed(): Promise<void> {
         `that day — your trainer will reach out to adjust standing schedules. Boarding and ` +
         `pickups are unaffected.`,
       publishedAt: daysFromNow(-1, 15),
-      targetLocation: 'Fayetteville, AR',
+      targetLocation: 'fayetteville',
     },
     {
       id: SEED.annYappyHourId,
@@ -771,7 +771,7 @@ async function seed(): Promise<void> {
       // has the dog-picker RSVP. `/event/[id]` renders ANY event row — a new
       // event is a seed row + an announcement pointing at its id, no new screen.
       deepLinkPath: `/event/${SEED.eventYappyHourId}`,
-      targetLocation: 'Fayetteville, AR',
+      targetLocation: 'fayetteville',
     },
     {
       id: SEED.annPuppyClassId,
@@ -782,7 +782,7 @@ async function seed(): Promise<void> {
       // available dates" enroll button, so the card links straight there
       // (no generic detail in between), like the Yappy Hour event.
       deepLinkPath: '/info/puppy-class',
-      targetLocation: 'Fayetteville, AR',
+      targetLocation: 'fayetteville',
     },
     {
       id: SEED.annMeetTeamId,
@@ -798,7 +798,7 @@ async function seed(): Promise<void> {
       ctaLabel: 'Meet the team',
       ctaKind: 'route',
       ctaTarget: '/info/staff',
-      targetLocation: 'Fayetteville, AR',
+      targetLocation: 'fayetteville',
     },
     {
       id: SEED.annClassMovedId,
@@ -812,7 +812,7 @@ async function seed(): Promise<void> {
         `to the new room.`,
       publishedAt: daysFromNow(-6, 14),
       // informational — no CTA (demonstrates the no-button detail screen).
-      targetLocation: 'Fayetteville, AR',
+      targetLocation: 'fayetteville',
     },
     {
       id: SEED.annSummerPackagesId,
@@ -823,7 +823,7 @@ async function seed(): Promise<void> {
         `day. Packages never expire and can be split across all of your dogs, so they're ` +
         `easy to share between siblings.`,
       publishedAt: daysFromNow(-7, 14),
-      targetLocation: 'Fayetteville, AR',
+      targetLocation: 'fayetteville',
     },
   ]);
 

@@ -325,7 +325,7 @@ test(
         name: 'E2E Test',
         email: `e2e-${supabaseUid}@example.com`,
         phone: '000',
-        location: 'Fayetteville, AR',
+        location: 'fayetteville',
       })
       .returning();
     assert.ok(created);

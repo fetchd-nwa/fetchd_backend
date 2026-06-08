@@ -5,11 +5,11 @@ import { defaultDayCapacity } from '../../lib/availability.js';
 import { insufficientCapacityError } from '../../lib/bookingErrors.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
 import { db } from '../client.js';
-import { bookingDogs, bookings, dayCapacity, dogs, type locationKey } from '../schema/schema.js';
+import { bookingDogs, bookings, dayCapacity, dogs, type LOCATION_SLUGS } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { Tx } from '../tx.js';
 
-type LocationKey = (typeof locationKey.enumValues)[number];
+type LocationKey = (typeof LOCATION_SLUGS)[number];
 
 /**
  * Sparse override rows for day-program capacity (schema.sql:589-594). Only

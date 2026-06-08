@@ -2,7 +2,6 @@ import { pgTable, uniqueIndex, unique, uuid, text, boolean, jsonb, timestamp, in
 import { sql } from "drizzle-orm"
 
 export const announcementCategory = pgEnum("announcement_category", ['urgent', 'team', 'class', 'event', 'promo', 'report'])
-export const appLocation = pgEnum("app_location", ['Fayetteville, AR', 'Bentonville, AR'])
 export const bookingAttendance = pgEnum("booking_attendance", ['pending', 'attended', 'no-show', 'excused'])
 export const bookingMode = pgEnum("booking_mode", ['school', 'daycare'])
 export const bookingStatus = pgEnum("booking_status", ['upcoming', 'past', 'cancelled'])
@@ -13,7 +12,11 @@ export const evaluationStatus = pgEnum("evaluation_status", ['not-evaluated', 'p
 export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'manners-2', 'public-pups'])
 export const invoiceStatus = pgEnum("invoice_status", ['open', 'paid', 'void'])
 export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment', 'membership-grant'])
-export const locationKey = pgEnum("location_key", ['fayetteville', 'bentonville'])
+// Locations are a table since the Δ 2026-06-08 (was the `location_key`/`app_location`
+// enums). `slug` is the natural key + the wire value; `LOCATION_SLUGS` is the TS
+// tuple for z.enum validation (replaces the old LOCATION_SLUGS).
+export const LOCATION_SLUGS = ['fayetteville', 'bentonville'] as const;
+export type LocationKey = (typeof LOCATION_SLUGS)[number];
 export const mediaDerivativeJobStatus = pgEnum("media_derivative_job_status", ['pending', 'processing', 'done', 'failed'])
 export const mediaKind = pgEnum("media_kind", ['image', 'video'])
 export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avatar', 'report-photo', 'report-video', 'message-attachment'])
@@ -30,13 +33,24 @@ export const staffRole = pgEnum("staff_role", ['owner-shanthi', 'trainer', 'offi
 export const threadCategory = pgEnum("thread_category", ['sessions', 'billing', 'enrollment', 'other'])
 
 
+export const locations = pgTable("locations", {
+	slug: text().primaryKey().notNull(),
+	displayName: text("display_name").notNull(),
+	address: text(),
+	latitude: doublePrecision(),
+	longitude: doublePrecision(),
+	timezone: text().default('America/Chicago').notNull(),
+	active: boolean().default(true).notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+});
+
 export const owners = pgTable("owners", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	supabaseUid: uuid("supabase_uid").notNull(),
 	name: text().notNull(),
 	email: text().notNull(),
 	phone: text().notNull(),
-	location: appLocation().notNull(),
+	location: text().$type<LocationKey>().notNull().references(() => locations.slug),
 	avatarImagePath: text("avatar_image_path"),
 	emergencyName: text("emergency_name"),
 	emergencyRelationship: text("emergency_relationship"),
@@ -107,7 +121,7 @@ export const staff = pgTable("staff", {
 	supabaseUid: uuid("supabase_uid").notNull(),
 	name: text().notNull(),
 	role: staffRole().notNull(),
-	location: appLocation(),
+	location: text().$type<LocationKey>().references(() => locations.slug),
 	imagePath: text("image_path"),
 	active: boolean().default(true).notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
@@ -264,7 +278,7 @@ export const classPrereqOptions = pgTable("class_prereq_options", {
 export const cohorts = pgTable("cohorts", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	classKey: groupClassKey("class_key").notNull(),
-	location: locationKey().notNull(),
+	location: text().$type<LocationKey>().notNull().references(() => locations.slug),
 	startDate: timestamp("start_date", { withTimezone: true, mode: 'string' }).notNull(),
 	endDate: timestamp("end_date", { withTimezone: true, mode: 'string' }),
 	weeklyTime: text("weekly_time").notNull(),
@@ -405,7 +419,7 @@ export const bookings = pgTable("bookings", {
 	confirmedAt: timestamp("confirmed_at", { withTimezone: true, mode: 'string' }),
 	dropoffAt: timestamp("dropoff_at", { withTimezone: true, mode: 'string' }),
 	pickupAt: timestamp("pickup_at", { withTimezone: true, mode: 'string' }),
-	location: locationKey(),
+	location: text().$type<LocationKey>().references(() => locations.slug),
 	cancelledAt: timestamp("cancelled_at", { withTimezone: true, mode: 'string' }),
 	cancellationReason: text("cancellation_reason"),
 	cancelDeadlineAt: timestamp("cancel_deadline_at", { withTimezone: true, mode: 'string' }),
@@ -564,7 +578,7 @@ export const creditLedger = pgTable("credit_ledger", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	dogId: uuid("dog_id").notNull(),
 	mode: bookingMode().notNull(),
-	location: locationKey().notNull(),
+	location: text().$type<LocationKey>().notNull().references(() => locations.slug),
 	delta: integer().notNull(),
 	reason: ledgerReason().notNull(),
 	bookingId: uuid("booking_id"),
@@ -600,7 +614,7 @@ export const creditLedger = pgTable("credit_ledger", {
 
 export const creditPackages = pgTable("credit_packages", {
 	key: text().notNull(),
-	location: locationKey().notNull(),
+	location: text().$type<LocationKey>().notNull().references(() => locations.slug),
 	mode: bookingMode().notNull(),
 	credits: integer().notNull(),
 	priceCents: integer("price_cents").notNull(),
@@ -884,7 +898,7 @@ export const idempotencyKeys = pgTable("idempotency_keys", {
 export const serviceRates = pgTable("service_rates", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	category: serviceCategory().notNull(),
-	location: locationKey(),
+	location: text().$type<LocationKey>().references(() => locations.slug),
 	amountCents: integer("amount_cents").notNull(),
 	unit: rateUnit().notNull(),
 	effectiveFrom: date("effective_from").notNull(),
@@ -1107,7 +1121,7 @@ export const announcements = pgTable("announcements", {
 	// $type reflects that guarantee at compile time so reads narrow without a cast.
 	ctaKind: text("cta_kind").$type<'enroll' | 'route' | 'external'>(),
 	ctaTarget: text("cta_target"),
-	targetLocation: appLocation("target_location"),
+	targetLocation: text("target_location").$type<LocationKey>().references(() => locations.slug),
 	isPinned: boolean("is_pinned").default(false).notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
@@ -1246,7 +1260,7 @@ export const pendingRequestPreferredDates = pgTable("pending_request_preferred_d
 });
 
 export const dayCapacity = pgTable("day_capacity", {
-	location: locationKey().notNull(),
+	location: text().$type<LocationKey>().notNull().references(() => locations.slug),
 	date: date().notNull(),
 	schoolOpenings: integer("school_openings").notNull(),
 	daycareOpenings: integer("daycare_openings").notNull(),
@@ -1290,7 +1304,7 @@ export const bookingDogs = pgTable("booking_dogs", {
 });
 export const dogCreditBalance = pgView("dog_credit_balance", {	dogId: uuid("dog_id"),
 	mode: bookingMode(),
-	location: locationKey(),
+	location: text("location").$type<LocationKey>(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	balance: bigint({ mode: "number" }),
 }).as(sql`SELECT dog_id, mode, location, COALESCE(sum(delta), 0::bigint) AS balance FROM credit_ledger GROUP BY dog_id, mode, location`);

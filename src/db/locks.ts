@@ -1,9 +1,9 @@
 import { and, eq, sql } from 'drizzle-orm';
-import { bookingMode, cohorts, dayCapacity, events, locationKey } from './schema/schema.js';
+import { bookingMode, cohorts, dayCapacity, events, LOCATION_SLUGS } from './schema/schema.js';
 import type { Tx } from './tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
-type LocationKey = (typeof locationKey.enumValues)[number];
+type LocationKey = (typeof LOCATION_SLUGS)[number];
 
 /**
  * Per-(dog, mode) transaction-scoped advisory lock — the booking

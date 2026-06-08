@@ -1,10 +1,10 @@
 import { and, eq } from 'drizzle-orm';
 import { db } from '../client.js';
-import { dogCreditBalance, dogs, locationKey } from '../schema/schema.js';
+import { dogCreditBalance, dogs, LOCATION_SLUGS } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import { assertNever } from '../../lib/assertNever.js';
 
-type LocationKey = (typeof locationKey.enumValues)[number];
+type LocationKey = (typeof LOCATION_SLUGS)[number];
 
 /**
  * Per-dog credit balance, owner-scoped. Combines ownership check + balance

@@ -1,10 +1,11 @@
 import { z } from 'zod';
 import { withActor } from '../db/tx.js';
 import { RELINK } from '../db/softExpire.js';
-import { appLocation, owners, staff, staffRole } from '../db/schema/schema.js';
+import { owners, staff, staffRole } from '../db/schema/schema.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
+import { displayToSlug, LOCATION_DISPLAY_NAMES } from '../lib/locations.js';
 
 /**
  * The mirror row is provisioned ONLY here, from the Supabase "user created"
@@ -21,7 +22,7 @@ import { pgEnumTuple } from '../lib/pgEnumTuple.js';
  */
 const WEBHOOK_ACTOR = 'system:auth-webhook';
 
-const LOCATIONS = pgEnumTuple(appLocation);
+const LOCATIONS = LOCATION_DISPLAY_NAMES;
 const STAFF_ROLES = pgEnumTuple(staffRole);
 type AppLocation = (typeof LOCATIONS)[number];
 type StaffRoleName = (typeof STAFF_ROLES)[number];
@@ -135,7 +136,7 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
           name: target.name,
           email: target.email,
           phone: target.phone,
-          location: target.location,
+          location: displayToSlug(target.location),
         })
         .onConflictDoUpdate({
           target: owners.supabaseUid,
@@ -144,7 +145,7 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
             name: target.name,
             email: target.email,
             phone: target.phone,
-            location: target.location,
+            location: displayToSlug(target.location),
           },
         })
         .returning({ id: owners.id });
@@ -152,13 +153,14 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
       return { kind: 'owner', id: row.id };
     }
 
+    const staffLocation = target.location !== null ? displayToSlug(target.location) : null;
     const [row] = await tx
       .insert(staff)
       .values({
         supabaseUid: target.supabaseUid,
         name: target.name,
         role: target.role,
-        location: target.location,
+        location: staffLocation,
       })
       .onConflictDoUpdate({
         target: staff.supabaseUid,
@@ -166,7 +168,7 @@ export async function provisionFromWebhook(body: unknown): Promise<ProvisionResu
           ...RELINK,
           name: target.name,
           role: target.role,
-          location: target.location,
+          location: staffLocation,
         },
       })
       .returning({ id: staff.id });

@@ -42,7 +42,7 @@ test(
             name: 'Soft Expire Tmp',
             email: `soft-expire-${randomUUID()}@example.com`,
             phone: '000',
-            location: 'Fayetteville, AR',
+            location: 'fayetteville',
           })
           .returning();
         assert.ok(created);

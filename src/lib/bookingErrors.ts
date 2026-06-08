@@ -1,7 +1,7 @@
 import { ApiError } from './errors.js';
 import type { BookingMode } from './bookingMode.js';
 import type { GroupClassKey } from '../db/repositories/groupClassesRepository.js';
-import type { locationKey } from '../db/schema/schema.js';
+import type { LOCATION_SLUGS } from '../db/schema/schema.js';
 
 /**
  * Typed `details` payloads for the booking-write surface (Day 10+). The
@@ -24,7 +24,7 @@ import type { locationKey } from '../db/schema/schema.js';
  * path, the existing single-gate arms stay valid).
  */
 
-type LocationKey = (typeof locationKey.enumValues)[number];
+type LocationKey = (typeof LOCATION_SLUGS)[number];
 
 /**
  * One missing vaccine for one dog. `requirement_key` lets the FE deep-

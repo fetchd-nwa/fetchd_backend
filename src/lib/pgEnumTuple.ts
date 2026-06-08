@@ -15,7 +15,7 @@
  * Day 5b's `/availability` (mode + location) and `/rates` (category +
  * location) added three more — overdue.
  *
- *   const LOCATIONS = pgEnumTuple(locationKey);
+ *   const LOCATIONS = LOCATION_SLUGS;
  *   z.enum(LOCATIONS); // typed [LocationKey, ...LocationKey[]]
  */
 export function pgEnumTuple<T extends string>(pgEnum: { enumValues: readonly T[] }): [T, ...T[]] {

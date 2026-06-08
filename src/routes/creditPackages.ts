@@ -6,8 +6,7 @@ import { chargesRepository, type ChargeStatus } from '../db/repositories/charges
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { bookingMode, locationKey } from '../db/schema/schema.js';
-import { pgEnumTuple } from '../lib/pgEnumTuple.js';
+import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { invalidatePattern } from '../lib/cache.js';
 import { ApiError } from '../lib/errors.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
@@ -21,7 +20,7 @@ import {
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
-const LOCATION_KEYS = pgEnumTuple(locationKey);
+const LOCATION_KEYS = LOCATION_SLUGS;
 type LocationKey = (typeof LOCATION_KEYS)[number];
 
 /**

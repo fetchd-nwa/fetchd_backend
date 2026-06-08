@@ -1,10 +1,10 @@
 import { and, asc, eq } from 'drizzle-orm';
 import { db } from '../client.js';
-import { bookingMode, creditPackages, locationKey } from '../schema/schema.js';
+import { bookingMode, creditPackages, LOCATION_SLUGS } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
-type LocationKey = (typeof locationKey.enumValues)[number];
+type LocationKey = (typeof LOCATION_SLUGS)[number];
 type Runner = Tx | typeof db;
 
 /**

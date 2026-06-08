@@ -9,7 +9,7 @@ import { creditLedgerRepository } from '../db/repositories/creditLedgerRepositor
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
-import { locationKey } from '../db/schema/schema.js';
+import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import { isInView } from '../lib/bookingBucket.js';
 import {
   alreadyBookedError,
@@ -35,7 +35,6 @@ import { cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { ApiError } from '../lib/errors.js';
-import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
@@ -106,7 +105,7 @@ const MAX_LOOKAHEAD_DAYS = 92;
 const ONE_DAY_MS = 86_400_000;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const LOCATION_KEYS = pgEnumTuple(locationKey);
+const LOCATION_KEYS = LOCATION_SLUGS;
 
 /**
  * Validate that a YYYY-MM-DD string maps to a real calendar day —

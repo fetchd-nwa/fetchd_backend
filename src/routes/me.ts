@@ -2,12 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
-import { appLocation, owners, staff } from '../db/schema/schema.js';
+import { owners, staff } from '../db/schema/schema.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
-import { pgEnumTuple } from '../lib/pgEnumTuple.js';
+import { slugToDisplay, displayToSlug, LOCATION_DISPLAY_NAMES } from '../lib/locations.js';
 
 /**
  * Owner `/me` is a **frozen wire shape** — the exact keys the FE `toUser`
@@ -23,7 +23,8 @@ function ownerProfile(row: typeof owners.$inferSelect) {
     name: row.name,
     email: row.email,
     phone: row.phone,
-    location: row.location,
+    // DB stores the slug; the FE `toUser` wire expects the display label.
+    location: slugToDisplay(row.location),
     avatar_image_path: row.avatarImagePath ?? '',
     emergency_contact: {
       name: row.emergencyName ?? '',
@@ -47,7 +48,7 @@ function staffProfile(row: typeof staff.$inferSelect) {
     id: row.id,
     name: row.name,
     role: row.role,
-    location: row.location,
+    location: row.location !== null ? slugToDisplay(row.location) : null,
     image_path: row.imagePath ?? '',
     active: row.active,
   };
@@ -57,13 +58,11 @@ function staffProfile(row: typeof staff.$inferSelect) {
 // silently no-op); `.partial()` makes every field optional (PATCH semantics);
 // `email` is intentionally absent — identity is not self-editable here.
 // `emergency_contact` is whole-object replace (matches the FE's submit shape).
-const LOCATIONS = pgEnumTuple(appLocation);
-
 const patchMeSchema = z
   .object({
     name: z.string().min(1),
     phone: z.string().min(1),
-    location: z.enum(LOCATIONS),
+    location: z.enum(LOCATION_DISPLAY_NAMES),
     avatar_image_path: z.string(),
     emergency_contact: z.object({
       name: z.string(),
@@ -82,7 +81,7 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
   const set: Partial<typeof owners.$inferInsert> = {};
   if (patch.name !== undefined) set.name = patch.name;
   if (patch.phone !== undefined) set.phone = patch.phone;
-  if (patch.location !== undefined) set.location = patch.location;
+  if (patch.location !== undefined) set.location = displayToSlug(patch.location);
   if (patch.avatar_image_path !== undefined) set.avatarImagePath = patch.avatar_image_path;
   if (patch.emergency_contact !== undefined) {
     set.emergencyName = patch.emergency_contact.name;

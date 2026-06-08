@@ -944,7 +944,7 @@ test(
         name: 'Second Owner',
         email: `owner2-${owner2Id}@example.com`,
         phone: '555-0003',
-        location: 'Fayetteville, AR',
+        location: 'fayetteville',
         avatarImagePath: '',
         emergencyName: 'EC',
         emergencyRelationship: 'friend',

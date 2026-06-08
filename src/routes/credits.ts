@@ -4,8 +4,7 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { creditsRepository } from '../db/repositories/creditsRepository.js';
-import { locationKey } from '../db/schema/schema.js';
-import { pgEnumTuple } from '../lib/pgEnumTuple.js';
+import { LOCATION_SLUGS } from '../db/schema/schema.js';
 
 /**
  * `GET /dogs/:id/credits?location=<key>` `[auth]` — per-dog, per-mode,
@@ -22,7 +21,7 @@ import { pgEnumTuple } from '../lib/pgEnumTuple.js';
  * through dogs guarantees a wire shape whenever the dog exists.
  */
 
-const LOCATION_KEYS = pgEnumTuple(locationKey);
+const LOCATION_KEYS = LOCATION_SLUGS;
 type LocationKey = (typeof LOCATION_KEYS)[number];
 
 const uuidParamSchema = z.object({ id: z.string().uuid() });
