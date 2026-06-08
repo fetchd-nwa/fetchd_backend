@@ -1,7 +1,9 @@
 import { and, eq, sql } from 'drizzle-orm';
-import { creditLedger } from '../schema/schema.js';
+import { creditLedger, locationKey } from '../schema/schema.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
 import type { Tx } from '../tx.js';
+
+type LocationKey = (typeof locationKey.enumValues)[number];
 
 /**
  * Data-access seam for `credit_ledger` (schema.sql:645). Append-only by
@@ -49,12 +51,14 @@ export const creditLedgerRepository = {
     args: {
       dogId: string;
       mode: BookingMode;
+      location: LocationKey;
       bookingId: string;
     },
   ): Promise<void> {
     await tx.insert(creditLedger).values({
       dogId: args.dogId,
       mode: args.mode,
+      location: args.location,
       delta: -1,
       reason: 'booking-debit',
       bookingId: args.bookingId,
@@ -79,13 +83,24 @@ export const creditLedgerRepository = {
    * the result of this AFTER inserting the debit (so the post-debit
    * balance is what's checked).
    */
-  async balanceForDogInTx(tx: Tx, dogId: string, mode: BookingMode): Promise<number | null> {
+  async balanceForDogInTx(
+    tx: Tx,
+    dogId: string,
+    mode: BookingMode,
+    location: LocationKey,
+  ): Promise<number | null> {
     const [row] = await tx
       .select({
         balance: sql<number | null>`SUM(${creditLedger.delta})::int`.as('balance'),
       })
       .from(creditLedger)
-      .where(and(eq(creditLedger.dogId, dogId), eq(creditLedger.mode, mode)));
+      .where(
+        and(
+          eq(creditLedger.dogId, dogId),
+          eq(creditLedger.mode, mode),
+          eq(creditLedger.location, location),
+        ),
+      );
     return row?.balance ?? null;
   },
 
@@ -104,11 +119,12 @@ export const creditLedgerRepository = {
   async findDebitsForBooking(
     tx: Tx,
     bookingId: string,
-  ): Promise<{ dogId: string; mode: BookingMode }[]> {
+  ): Promise<{ dogId: string; mode: BookingMode; location: LocationKey }[]> {
     return tx
       .select({
         dogId: creditLedger.dogId,
         mode: creditLedger.mode,
+        location: creditLedger.location,
       })
       .from(creditLedger)
       .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'booking-debit')));
@@ -128,12 +144,14 @@ export const creditLedgerRepository = {
     args: {
       dogId: string;
       mode: BookingMode;
+      location: LocationKey;
       bookingId: string;
     },
   ): Promise<void> {
     await tx.insert(creditLedger).values({
       dogId: args.dogId,
       mode: args.mode,
+      location: args.location,
       delta: 1,
       reason: 'cancel-refund',
       bookingId: args.bookingId,
@@ -158,6 +176,7 @@ export const creditLedgerRepository = {
     args: {
       dogId: string;
       mode: BookingMode;
+      location: LocationKey;
       delta: number;
       packageKey: string;
       chargeId: string;
@@ -166,6 +185,7 @@ export const creditLedgerRepository = {
     await tx.insert(creditLedger).values({
       dogId: args.dogId,
       mode: args.mode,
+      location: args.location,
       delta: args.delta,
       reason: 'purchase',
       packageKey: args.packageKey,

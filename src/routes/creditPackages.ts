@@ -6,7 +6,8 @@ import { chargesRepository, type ChargeStatus } from '../db/repositories/charges
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { bookingMode } from '../db/schema/schema.js';
+import { bookingMode, locationKey } from '../db/schema/schema.js';
+import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { invalidatePattern } from '../lib/cache.js';
 import { ApiError } from '../lib/errors.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
@@ -20,6 +21,8 @@ import {
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
+const LOCATION_KEYS = pgEnumTuple(locationKey);
+type LocationKey = (typeof LOCATION_KEYS)[number];
 
 /**
  * `GET /credit-packages` `[auth]` — the active catalog of purchasable
@@ -42,6 +45,7 @@ type BookingMode = (typeof bookingMode.enumValues)[number];
 
 export interface CreditPackageWire {
   key: string;
+  location: LocationKey;
   mode: BookingMode;
   credits: number;
   price_cents: number;
@@ -70,10 +74,15 @@ const keyParamSchema = z.object({
     .regex(/^[a-z0-9-]+$/i, 'key must be alphanumeric with dashes'),
 });
 
+// Catalog + purchase are per-location since the Δ 2026-06-04 (pricing varies
+// by school). The owner app passes its selected location.
+const packagesQuerySchema = z.object({ location: z.enum(LOCATION_KEYS) });
+
 const purchaseBodySchema = z
   .object({
     dog_id: z.string().uuid('dog_id must be a UUID'),
     payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
+    location: z.enum(LOCATION_KEYS),
   })
   .strict();
 
@@ -89,7 +98,8 @@ export function registerCreditPackagesRoute(
     { preHandler: [authHook] },
     async (request): Promise<CreditPackageWire[]> => {
       requirePrincipal(request); // any authenticated principal; catalog is shared
-      return creditPackagesRepository.findActive();
+      const { location } = parsePackagesQuery(request.query);
+      return creditPackagesRepository.findActive(location);
     },
   );
 
@@ -124,6 +134,7 @@ export function registerCreditPackagesRoute(
       // Stripe with a stale intent.
       const purchaseContext = await loadPurchaseContext({
         key,
+        location: body.location,
         ownerId: principal.ownerId,
         dogId: body.dog_id,
         paymentMethodId: body.payment_method_id,
@@ -143,6 +154,7 @@ export function registerCreditPackagesRoute(
             package_key: pkg.key,
             credits: String(pkg.credits),
             mode: pkg.mode,
+            location: pkg.location,
           },
         },
         `${idempotencyKey}:payment-intent`,
@@ -180,6 +192,7 @@ export function registerCreditPackagesRoute(
             await creditLedgerRepository.creditPurchase(tx, {
               dogId: body.dog_id,
               mode: pkg.mode,
+              location: pkg.location,
               delta: pkg.credits,
               packageKey: pkg.key,
               chargeId: charge.id,
@@ -231,15 +244,22 @@ export function registerCreditPackagesRoute(
  */
 async function loadPurchaseContext(args: {
   key: string;
+  location: LocationKey;
   ownerId: string;
   dogId: string;
   paymentMethodId: string;
 }): Promise<{
-  pkg: { key: string; mode: BookingMode; credits: number; price_cents: number };
+  pkg: {
+    key: string;
+    location: LocationKey;
+    mode: BookingMode;
+    credits: number;
+    price_cents: number;
+  };
   stripeCustomerId: string;
   stripePaymentMethodId: string;
 }> {
-  const pkg = await creditPackagesRepository.findByKey(db, args.key);
+  const pkg = await creditPackagesRepository.findByKey(db, args.key, args.location);
   if (pkg === undefined) {
     throw new ApiError('not_found', `credit package ${args.key} not found or retired`);
   }
@@ -265,6 +285,14 @@ function parseKeyParam(params: unknown): { key: string } {
   const parsed = keyParamSchema.safeParse(params);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid path: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data;
+}
+
+function parsePackagesQuery(query: unknown): { location: LocationKey } {
+  const parsed = packagesQuerySchema.safeParse(query);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid query: ${formatZodIssues(parsed.error)}`);
   }
   return parsed.data;
 }

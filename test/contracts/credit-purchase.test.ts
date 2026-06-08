@@ -67,6 +67,7 @@ test(
       payload: {
         dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 201, res.body);
@@ -113,6 +114,7 @@ test(
       payload: {
         dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 201, res.body);
@@ -154,6 +156,7 @@ test(
       payload: {
         dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
       },
     });
     assert.equal(first.statusCode, 201);
@@ -165,6 +168,7 @@ test(
       payload: {
         dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
       },
     });
     assert.equal(replay.statusCode, 201);
@@ -191,6 +195,7 @@ test(
       payload: {
         dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 404);
@@ -209,6 +214,7 @@ test(
       payload: {
         dog_id: '00000000-0000-4000-8000-000000000000',
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 404);
@@ -227,6 +233,7 @@ test(
       payload: {
         dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: '00000000-0000-4000-8000-000000000000',
+        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 404);
@@ -247,6 +254,7 @@ test(
       payload: {
         dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 422);

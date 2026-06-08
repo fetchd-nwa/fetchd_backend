@@ -602,6 +602,7 @@ async function seed(): Promise<void> {
     {
       dogId: SEED.dogWafflesId,
       mode: 'school',
+      location: 'fayetteville',
       delta: 10,
       reason: 'purchase',
       chargeId: SEED.chargePackageId,

@@ -19,7 +19,7 @@ test(
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     registerCreditPackagesRoute(app, { authenticate });
 
-    const res = await app.inject({ method: 'GET', url: '/credit-packages' });
+    const res = await app.inject({ method: 'GET', url: '/credit-packages?location=fayetteville' });
     if (res.statusCode !== 200) {
       throw new Error(`/credit-packages returned ${res.statusCode}: ${res.body}`);
     }
@@ -34,8 +34,37 @@ test(
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     registerCreditPackagesRoute(app, { authenticate });
 
-    const res = await app.inject({ method: 'GET', url: '/credit-packages' });
+    const res = await app.inject({ method: 'GET', url: '/credit-packages?location=fayetteville' });
     assert.equal(res.statusCode, 200);
     assert.deepStrictEqual(res.json(), loadSnapshot('credit-packages'));
+  },
+);
+
+test(
+  'GET /credit-packages?location=bentonville returns the Bentonville catalog (per-location pricing Δ 2026-06-04)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditPackagesRoute(app, { authenticate });
+
+    const res = await app.inject({ method: 'GET', url: '/credit-packages?location=bentonville' });
+    if (res.statusCode !== 200) {
+      throw new Error(`/credit-packages returned ${res.statusCode}: ${res.body}`);
+    }
+    assert.deepStrictEqual(res.json(), loadSnapshot('credit-packages-bentonville'));
+  },
+);
+
+test(
+  'GET /credit-packages without a location query returns 400 bad_request',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditPackagesRoute(app, { authenticate });
+
+    const res = await app.inject({ method: 'GET', url: '/credit-packages' });
+    assert.equal(res.statusCode, 400);
+    const body = res.json() as { error?: { code?: string } };
+    assert.equal(body.error?.code, 'bad_request');
   },
 );

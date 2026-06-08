@@ -329,128 +329,139 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           }
 
           // 2-6. Locks → gates → capacity/insert/debit.
-          const bookingsWire = await withDogModeLocks(tx, parsed.allDogIds, parsed.mode, () =>
-            withCapacityLocks(tx, parsed.location, parsed.sortedDates, async () => {
-              // Gates (payment → vaccine → agreement) above the DB
-              // trigger floor. See `lib/bookingGatePreCheck.ts` for the
-              // sequence rationale; first failure aborts with full
-              // structured details for that category.
-              await checkBookingGates(tx, {
-                ownerId: principal.ownerId,
-                dogIds: parsed.allDogIds,
-                category: parsed.category,
-              });
+          const bookingsWire = await withDogModeLocks(
+            tx,
+            parsed.allDogIds,
+            parsed.mode,
+            parsed.location,
+            () =>
+              withCapacityLocks(tx, parsed.location, parsed.sortedDates, async () => {
+                // Gates (payment → vaccine → agreement) above the DB
+                // trigger floor. See `lib/bookingGatePreCheck.ts` for the
+                // sequence rationale; first failure aborts with full
+                // structured details for that category.
+                await checkBookingGates(tx, {
+                  ownerId: principal.ownerId,
+                  dogIds: parsed.allDogIds,
+                  category: parsed.category,
+                });
 
-              // Credit pre-check — every dog needs >= dates.length credits in `mode`.
-              const creditGaps: CreditGap[] = [];
-              for (const dogId of parsed.allDogIds) {
-                const balance =
-                  (await creditLedgerRepository.balanceForDogInTx(tx, dogId, parsed.mode)) ?? 0;
-                if (balance < parsed.sortedDates.length) {
-                  creditGaps.push({
-                    dog_id: dogId,
-                    mode: parsed.mode,
-                    balance,
-                    required: parsed.sortedDates.length,
-                  });
-                }
-              }
-              if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
-
-              // Duplicate guard (Day-19d) — block re-booking a day the dog
-              // already attends in this category. Cancelled bookings are
-              // excluded, so a cancelled day can be re-booked. Checked under
-              // the day-mode lock, so a concurrent insert can't slip a
-              // duplicate past this.
-              const dupConflicts: AlreadyBookedConflict[] = [];
-              for (const dogId of parsed.allDogIds) {
-                const existing = await bookingsRepository.findLiveScheduledAtForDogCategory(
-                  tx,
-                  dogId,
-                  parsed.category,
-                );
-                const bookedDays = new Set(existing.map(bucketToChicagoDate));
-                for (const date of parsed.sortedDates) {
-                  if (bookedDays.has(date)) {
-                    dupConflicts.push({ dog_id: dogId, category: parsed.category, date });
+                // Credit pre-check — every dog needs >= dates.length credits in `mode`.
+                const creditGaps: CreditGap[] = [];
+                for (const dogId of parsed.allDogIds) {
+                  const balance =
+                    (await creditLedgerRepository.balanceForDogInTx(
+                      tx,
+                      dogId,
+                      parsed.mode,
+                      parsed.location,
+                    )) ?? 0;
+                  if (balance < parsed.sortedDates.length) {
+                    creditGaps.push({
+                      dog_id: dogId,
+                      mode: parsed.mode,
+                      balance,
+                      required: parsed.sortedDates.length,
+                    });
                   }
                 }
-              }
-              if (dupConflicts.length > 0) throw alreadyBookedError(dupConflicts);
+                if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
 
-              // Per-date: capacity → INSERT booking + booking_dogs → INSERT debits.
-              const wires: BookingWire[] = [];
-              for (const date of parsed.sortedDates) {
-                await dayCapacityRepository.assertCapacityWithinLock(tx, {
-                  location: parsed.location,
-                  date,
-                  mode: parsed.mode,
-                  requestedCount: parsed.allDogIds.length,
-                });
-
-                const scheduledAt = computeDayProgramScheduledAt(
-                  parsed.category,
-                  date,
-                  parsed.dropoff,
-                );
-                // Resolve the active free-cancel hours from `cancel_window_
-                // settings` (Day 13 — staff-tunable from the portal). The
-                // resolved deadline is stamped on the row at creation; a
-                // later policy change does NOT retroactively re-stamp
-                // existing bookings.
-                const hours = await cancelWindowSettingsRepository.resolveHoursFor(
-                  parsed.category,
-                  tx,
-                );
-                const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAt, hours);
-
-                const inserted = await insertBookingWithGateMapping(tx, {
-                  ownerId: principal.ownerId,
-                  leadDogId: parsed.leadDogId,
-                  category: parsed.category,
-                  scheduledAt,
-                  location: parsed.location,
-                  notes: parsed.notes,
-                  cancelDeadlineAt,
-                  additionalDogIds: parsed.additionalDogIds,
-                });
-
+                // Duplicate guard (Day-19d) — block re-booking a day the dog
+                // already attends in this category. Cancelled bookings are
+                // excluded, so a cancelled day can be re-booked. Checked under
+                // the day-mode lock, so a concurrent insert can't slip a
+                // duplicate past this.
+                const dupConflicts: AlreadyBookedConflict[] = [];
                 for (const dogId of parsed.allDogIds) {
-                  await creditLedgerRepository.debitForBooking(tx, {
+                  const existing = await bookingsRepository.findLiveScheduledAtForDogCategory(
+                    tx,
                     dogId,
-                    mode: parsed.mode,
-                    bookingId: inserted.id,
-                  });
+                    parsed.category,
+                  );
+                  const bookedDays = new Set(existing.map(bucketToChicagoDate));
+                  for (const date of parsed.sortedDates) {
+                    if (bookedDays.has(date)) {
+                      dupConflicts.push({ dog_id: dogId, category: parsed.category, date });
+                    }
+                  }
                 }
+                if (dupConflicts.length > 0) throw alreadyBookedError(dupConflicts);
 
-                // Day-16: enqueue the scheduled reminder rows for this
-                // booking. UNIQUE on dedupe_key makes an idempotent replay
-                // safe; the schedule rows roll back with the booking on
-                // any later in-tx failure.
-                await enqueueBookingReminders(tx, {
-                  bookingId: inserted.id,
-                  ownerId: principal.ownerId,
-                  leadDogId: parsed.leadDogId,
-                  category: parsed.category,
-                  scheduledAt,
-                });
+                // Per-date: capacity → INSERT booking + booking_dogs → INSERT debits.
+                const wires: BookingWire[] = [];
+                for (const date of parsed.sortedDates) {
+                  await dayCapacityRepository.assertCapacityWithinLock(tx, {
+                    location: parsed.location,
+                    date,
+                    mode: parsed.mode,
+                    requestedCount: parsed.allDogIds.length,
+                  });
 
-                // `inserted` IS the BookingRow projection (`bookingsRepository.create`
-                // RETURNING ...BOOKING_PROJECTION). No re-fetch needed — the route
-                // assembles the wire shape directly off the inserted row.
-                wires.push(
-                  toBookingWire(
-                    inserted,
-                    {
-                      lead: parsed.leadDogId,
-                      additional: [...parsed.additionalDogIds].sort(),
-                    },
-                    null /* day programs carry no trainer */,
-                  ),
-                );
-              }
-              return wires;
-            }),
+                  const scheduledAt = computeDayProgramScheduledAt(
+                    parsed.category,
+                    date,
+                    parsed.dropoff,
+                  );
+                  // Resolve the active free-cancel hours from `cancel_window_
+                  // settings` (Day 13 — staff-tunable from the portal). The
+                  // resolved deadline is stamped on the row at creation; a
+                  // later policy change does NOT retroactively re-stamp
+                  // existing bookings.
+                  const hours = await cancelWindowSettingsRepository.resolveHoursFor(
+                    parsed.category,
+                    tx,
+                  );
+                  const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAt, hours);
+
+                  const inserted = await insertBookingWithGateMapping(tx, {
+                    ownerId: principal.ownerId,
+                    leadDogId: parsed.leadDogId,
+                    category: parsed.category,
+                    scheduledAt,
+                    location: parsed.location,
+                    notes: parsed.notes,
+                    cancelDeadlineAt,
+                    additionalDogIds: parsed.additionalDogIds,
+                  });
+
+                  for (const dogId of parsed.allDogIds) {
+                    await creditLedgerRepository.debitForBooking(tx, {
+                      dogId,
+                      mode: parsed.mode,
+                      location: parsed.location,
+                      bookingId: inserted.id,
+                    });
+                  }
+
+                  // Day-16: enqueue the scheduled reminder rows for this
+                  // booking. UNIQUE on dedupe_key makes an idempotent replay
+                  // safe; the schedule rows roll back with the booking on
+                  // any later in-tx failure.
+                  await enqueueBookingReminders(tx, {
+                    bookingId: inserted.id,
+                    ownerId: principal.ownerId,
+                    leadDogId: parsed.leadDogId,
+                    category: parsed.category,
+                    scheduledAt,
+                  });
+
+                  // `inserted` IS the BookingRow projection (`bookingsRepository.create`
+                  // RETURNING ...BOOKING_PROJECTION). No re-fetch needed — the route
+                  // assembles the wire shape directly off the inserted row.
+                  wires.push(
+                    toBookingWire(
+                      inserted,
+                      {
+                        lead: parsed.leadDogId,
+                        additional: [...parsed.additionalDogIds].sort(),
+                      },
+                      null /* day programs carry no trainer */,
+                    ),
+                  );
+                }
+                return wires;
+              }),
           );
 
           return { status: 201, body: bookingsWire };

@@ -1,0 +1,11 @@
+[
+  {
+    "key": "test-school-5",
+    "location": "bentonville",
+    "mode": "school",
+    "credits": 5,
+    "price_cents": 27500,
+    "label": "5 School Credits (Bentonville fixture)",
+    "is_popular": false
+  }
+]

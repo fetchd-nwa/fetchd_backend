@@ -85,6 +85,7 @@ async function seedLedger(): Promise<void> {
     {
       dogId: FIXTURE_IDS.dog1Id,
       mode: 'school',
+      location: 'fayetteville',
       delta: 10,
       reason: 'purchase',
       chargeId: LEDGER.chargePackageId,

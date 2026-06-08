@@ -91,6 +91,7 @@ export async function cancelBookingInTx(
         await creditLedgerRepository.refundForBooking(tx, {
           dogId: debit.dogId,
           mode: debit.mode,
+          location: debit.location,
           bookingId: id,
         });
       }

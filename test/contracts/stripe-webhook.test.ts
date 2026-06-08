@@ -179,6 +179,7 @@ test(
         package_key: FIXTURE_IDS.creditPackageSchool5Key,
         credits: '5',
         mode: 'school',
+        location: 'fayetteville',
       },
     });
     const res = await app.inject({
@@ -228,6 +229,7 @@ test(
     await db.insert(creditLedger).values({
       dogId: FIXTURE_IDS.dog1Id,
       mode: 'school',
+      location: 'fayetteville',
       delta: 5,
       reason: 'purchase',
       packageKey: FIXTURE_IDS.creditPackageSchool5Key,

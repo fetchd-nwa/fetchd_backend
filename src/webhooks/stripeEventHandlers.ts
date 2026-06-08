@@ -1,6 +1,6 @@
 import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
-import { creditLedger, paymentMethods } from '../db/schema/schema.js';
+import { creditLedger, locationKey, paymentMethods } from '../db/schema/schema.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
@@ -15,6 +15,12 @@ import {
 } from '../lib/stripe.js';
 import { and, eq } from 'drizzle-orm';
 import type { BookingMode } from '../lib/bookingMode.js';
+
+type LocationKey = (typeof locationKey.enumValues)[number];
+
+function isLocationKey(value: string | undefined): value is LocationKey {
+  return value === 'fayetteville' || value === 'bentonville';
+}
 
 /**
  * The actor string written into `app.actor` for every webhook-driven DB
@@ -142,12 +148,14 @@ async function maybeWritePurchaseLedgerRow(
   const packageKey = args.metadata.package_key;
   const credits = Number(args.metadata.credits);
   const mode = args.metadata.mode as BookingMode | undefined;
+  const location = args.metadata.location;
   if (
     typeof dogId !== 'string' ||
     typeof packageKey !== 'string' ||
     !Number.isFinite(credits) ||
     credits <= 0 ||
-    (mode !== 'school' && mode !== 'daycare')
+    (mode !== 'school' && mode !== 'daycare') ||
+    !isLocationKey(location)
   ) {
     // Metadata missing/malformed (a charge minted by something other
     // than the Day-14 credit-purchase route). Log + skip; the charge
@@ -158,6 +166,7 @@ async function maybeWritePurchaseLedgerRow(
   await creditLedgerRepository.creditPurchase(tx, {
     dogId,
     mode,
+    location,
     delta: credits,
     packageKey,
     chargeId: args.chargeId,
@@ -213,13 +222,18 @@ async function handlePaymentIntentFailed(
       // delete or edit the original. Use the same `mode` + `dog_id` —
       // these are stamped on the original purchase row.
       const [orig] = await tx
-        .select({ dogId: creditLedger.dogId, mode: creditLedger.mode })
+        .select({
+          dogId: creditLedger.dogId,
+          mode: creditLedger.mode,
+          location: creditLedger.location,
+        })
         .from(creditLedger)
         .where(eq(creditLedger.id, row.id));
       if (orig) {
         await tx.insert(creditLedger).values({
           dogId: orig.dogId,
           mode: orig.mode,
+          location: orig.location,
           delta: -row.delta,
           reason: 'adjustment',
           chargeId: charge.id,

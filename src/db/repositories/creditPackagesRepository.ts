@@ -1,9 +1,10 @@
 import { and, asc, eq } from 'drizzle-orm';
 import { db } from '../client.js';
-import { bookingMode, creditPackages } from '../schema/schema.js';
+import { bookingMode, creditPackages, locationKey } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
+type LocationKey = (typeof locationKey.enumValues)[number];
 type Runner = Tx | typeof db;
 
 /**
@@ -20,6 +21,7 @@ type Runner = Tx | typeof db;
  */
 export interface CreditPackageRow {
   key: string;
+  location: LocationKey;
   mode: BookingMode;
   credits: number;
   price_cents: number;
@@ -29,6 +31,7 @@ export interface CreditPackageRow {
 
 const PACKAGE_PROJECTION = {
   key: creditPackages.key,
+  location: creditPackages.location,
   mode: creditPackages.mode,
   credits: creditPackages.credits,
   price_cents: creditPackages.priceCents,
@@ -37,11 +40,11 @@ const PACKAGE_PROJECTION = {
 } as const;
 
 export const creditPackagesRepository = {
-  async findActive(): Promise<CreditPackageRow[]> {
+  async findActive(location: LocationKey): Promise<CreditPackageRow[]> {
     return db
       .select(PACKAGE_PROJECTION)
       .from(creditPackages)
-      .where(eq(creditPackages.active, true))
+      .where(and(eq(creditPackages.active, true), eq(creditPackages.location, location)))
       .orderBy(asc(creditPackages.mode), asc(creditPackages.credits));
   },
 
@@ -55,11 +58,21 @@ export const creditPackagesRepository = {
    * Tx-scoped so the same-tx INSERT into `charges` + `credit_ledger` sees
    * a consistent snapshot of the package row.
    */
-  async findByKey(runner: Runner, key: string): Promise<CreditPackageRow | undefined> {
+  async findByKey(
+    runner: Runner,
+    key: string,
+    location: LocationKey,
+  ): Promise<CreditPackageRow | undefined> {
     const [row] = await runner
       .select(PACKAGE_PROJECTION)
       .from(creditPackages)
-      .where(and(eq(creditPackages.key, key), eq(creditPackages.active, true)))
+      .where(
+        and(
+          eq(creditPackages.key, key),
+          eq(creditPackages.location, location),
+          eq(creditPackages.active, true),
+        ),
+      )
       .limit(1);
     return row;
   },

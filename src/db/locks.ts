@@ -32,9 +32,10 @@ export async function withDogModeLock<T>(
   tx: Tx,
   dogId: string,
   mode: BookingMode,
+  location: LocationKey,
   fn: () => Promise<T>,
 ): Promise<T> {
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}`}))`);
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}:${location}`}))`);
   return fn();
 }
 
@@ -204,11 +205,14 @@ export async function withDogModeLocks<T>(
   tx: Tx,
   dogIds: readonly string[],
   mode: BookingMode,
+  location: LocationKey,
   fn: () => Promise<T>,
 ): Promise<T> {
   const sortedIds = [...dogIds].sort();
   for (const dogId of sortedIds) {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}`}))`);
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}:${location}`}))`,
+    );
   }
   return fn();
 }

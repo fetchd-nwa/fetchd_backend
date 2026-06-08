@@ -1,8 +1,10 @@
 import { and, eq } from 'drizzle-orm';
 import { db } from '../client.js';
-import { dogCreditBalance, dogs } from '../schema/schema.js';
+import { dogCreditBalance, dogs, locationKey } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import { assertNever } from '../../lib/assertNever.js';
+
+type LocationKey = (typeof locationKey.enumValues)[number];
 
 /**
  * Per-dog credit balance, owner-scoped. Combines ownership check + balance
@@ -29,14 +31,21 @@ export interface CreditsBalance {
 }
 
 export const creditsRepository = {
-  async findBalancesForOwnedDog(dogId: string, ownerId: string): Promise<CreditsBalance | null> {
+  async findBalancesForOwnedDog(
+    dogId: string,
+    ownerId: string,
+    location: LocationKey,
+  ): Promise<CreditsBalance | null> {
     const rows = await db
       .select({
         mode: dogCreditBalance.mode,
         balance: dogCreditBalance.balance,
       })
       .from(dogs)
-      .leftJoin(dogCreditBalance, eq(dogCreditBalance.dogId, dogs.id))
+      .leftJoin(
+        dogCreditBalance,
+        and(eq(dogCreditBalance.dogId, dogs.id), eq(dogCreditBalance.location, location)),
+      )
       .where(and(eq(dogs.id, dogId), eq(dogs.ownerId, ownerId), live(dogs)));
 
     if (rows.length === 0) return null;

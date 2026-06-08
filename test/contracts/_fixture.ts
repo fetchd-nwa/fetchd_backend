@@ -112,6 +112,7 @@ export const FIXTURE_IDS = {
   creditPackageRetiredKey: 'test-retired-pack',
   creditLedgerPurchaseId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1',
   creditLedgerDebitId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc2',
+  creditLedgerBentonvilleId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc3',
   serviceRateSchoolFayId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd1',
   serviceRateSchoolNullLocId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd2',
   serviceRateDaycareCurrentId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd3',
@@ -648,6 +649,7 @@ export async function seedFixture(): Promise<void> {
   await db.insert(creditPackages).values([
     {
       key: FIXTURE_IDS.creditPackageSchool5Key,
+      location: 'fayetteville',
       mode: 'school',
       credits: 5,
       priceCents: 25_000,
@@ -657,6 +659,7 @@ export async function seedFixture(): Promise<void> {
     },
     {
       key: FIXTURE_IDS.creditPackageSchool10Key,
+      location: 'fayetteville',
       mode: 'school',
       credits: 10,
       priceCents: 45_000,
@@ -666,6 +669,7 @@ export async function seedFixture(): Promise<void> {
     },
     {
       key: FIXTURE_IDS.creditPackageDaycare8Key,
+      location: 'fayetteville',
       mode: 'daycare',
       credits: 8,
       priceCents: 30_000,
@@ -673,8 +677,21 @@ export async function seedFixture(): Promise<void> {
       isPopular: false,
       active: true,
     },
+    // Δ 2026-06-04: same pack key at Bentonville with a DIFFERENT price —
+    // exercises the composite (key, location) PK + per-location pricing.
+    {
+      key: FIXTURE_IDS.creditPackageSchool5Key,
+      location: 'bentonville',
+      mode: 'school',
+      credits: 5,
+      priceCents: 27_500,
+      label: '5 School Credits (Bentonville fixture)',
+      isPopular: false,
+      active: true,
+    },
     {
       key: FIXTURE_IDS.creditPackageRetiredKey,
+      location: 'fayetteville',
       mode: 'school',
       credits: 3,
       priceCents: 15_000,
@@ -820,6 +837,7 @@ export async function seedFixture(): Promise<void> {
       id: FIXTURE_IDS.creditLedgerPurchaseId,
       dogId: FIXTURE_IDS.dog1Id,
       mode: 'school',
+      location: 'fayetteville',
       delta: 5,
       reason: 'purchase',
       packageKey: FIXTURE_IDS.creditPackageSchool5Key,
@@ -829,10 +847,23 @@ export async function seedFixture(): Promise<void> {
       id: FIXTURE_IDS.creditLedgerDebitId,
       dogId: FIXTURE_IDS.dog1Id,
       mode: 'school',
+      location: 'fayetteville',
       delta: -1,
       reason: 'booking-debit',
       bookingId: FIXTURE_IDS.booking1Id,
       note: 'Fixture debit for booking1',
+    },
+    // Δ 2026-06-04: a Bentonville grant so Waffles' balance differs by
+    // location — Fayetteville {school:4, daycare:0}, Bentonville {school:0,
+    // daycare:2}. Proves GET /dogs/:id/credits is location-scoped.
+    {
+      id: FIXTURE_IDS.creditLedgerBentonvilleId,
+      dogId: FIXTURE_IDS.dog1Id,
+      mode: 'daycare',
+      location: 'bentonville',
+      delta: 2,
+      reason: 'adjustment',
+      note: 'Fixture Bentonville daycare grant',
     },
   ]);
 
@@ -1488,12 +1519,14 @@ export async function topUpCredits(
   dogId: string,
   mode: 'school' | 'daycare',
   amount: number,
+  location: 'fayetteville' | 'bentonville' = 'fayetteville',
 ): Promise<void> {
   const { creditLedger } = await import('../../src/db/schema/schema.js');
   const { randomUUID } = await import('node:crypto');
   await db.insert(creditLedger).values({
     dogId,
     mode,
+    location,
     delta: amount,
     reason: 'purchase',
     note: `Test top-up ${randomUUID()}`,

@@ -20,11 +20,46 @@ test(
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     registerCreditsRoute(app, { authenticate });
 
-    const res = await app.inject({ method: 'GET', url: `/dogs/${FIXTURE_IDS.dog1Id}/credits` });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/dogs/${FIXTURE_IDS.dog1Id}/credits?location=fayetteville`,
+    });
     if (res.statusCode !== 200) {
       throw new Error(`/dogs/:id/credits returned ${res.statusCode}: ${res.body}`);
     }
     assert.deepStrictEqual(res.json(), loadSnapshot('credits-waffles'));
+  },
+);
+
+test(
+  'GET /dogs/:id/credits is location-scoped — Waffles at Bentonville is a different balance (Δ 2026-06-04)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditsRoute(app, { authenticate });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/dogs/${FIXTURE_IDS.dog1Id}/credits?location=bentonville`,
+    });
+    if (res.statusCode !== 200) {
+      throw new Error(`/dogs/:id/credits returned ${res.statusCode}: ${res.body}`);
+    }
+    assert.deepStrictEqual(res.json(), loadSnapshot('credits-waffles-bentonville'));
+  },
+);
+
+test(
+  'GET /dogs/:id/credits without a location query returns 400 bad_request',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditsRoute(app, { authenticate });
+
+    const res = await app.inject({ method: 'GET', url: `/dogs/${FIXTURE_IDS.dog1Id}/credits` });
+    assert.equal(res.statusCode, 400);
+    const body = res.json() as { error?: { code?: string } };
+    assert.equal(body.error?.code, 'bad_request');
   },
 );
 
@@ -35,7 +70,10 @@ test(
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     registerCreditsRoute(app, { authenticate });
 
-    const res = await app.inject({ method: 'GET', url: `/dogs/${FIXTURE_IDS.dog2Id}/credits` });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/dogs/${FIXTURE_IDS.dog2Id}/credits?location=fayetteville`,
+    });
     if (res.statusCode !== 200) {
       throw new Error(`/dogs/:id/credits returned ${res.statusCode}: ${res.body}`);
     }
@@ -53,7 +91,7 @@ test(
     // A well-formed UUID that doesn't exist in the fixture.
     const res = await app.inject({
       method: 'GET',
-      url: '/dogs/00000000-0000-4000-8000-000000000000/credits',
+      url: '/dogs/00000000-0000-4000-8000-000000000000/credits?location=fayetteville',
     });
     assert.equal(res.statusCode, 404);
     const body = res.json() as { error?: { code?: string } };
@@ -68,7 +106,10 @@ test(
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     registerCreditsRoute(app, { authenticate });
 
-    const res = await app.inject({ method: 'GET', url: `/dogs/${FIXTURE_IDS.dog1Id}/credits` });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/dogs/${FIXTURE_IDS.dog1Id}/credits?location=fayetteville`,
+    });
     assert.equal(res.statusCode, 404);
     const body = res.json() as { error?: { code?: string } };
     assert.equal(body.error?.code, 'not_found');

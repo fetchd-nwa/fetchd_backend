@@ -564,6 +564,7 @@ export const creditLedger = pgTable("credit_ledger", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	dogId: uuid("dog_id").notNull(),
 	mode: bookingMode().notNull(),
+	location: locationKey().notNull(),
 	delta: integer().notNull(),
 	reason: ledgerReason().notNull(),
 	bookingId: uuid("booking_id"),
@@ -573,7 +574,7 @@ export const creditLedger = pgTable("credit_ledger", {
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 }, (table) => {
 	return {
-		dogModeIdx: index("credit_ledger_dog_mode_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.mode.asc().nullsLast().op("uuid_ops")),
+		dogModeIdx: index("credit_ledger_dog_mode_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.mode.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("enum_ops")),
 		creditLedgerDogIdFkey: foreignKey({
 			columns: [table.dogId],
 			foreignColumns: [dogs.id],
@@ -585,8 +586,8 @@ export const creditLedger = pgTable("credit_ledger", {
 			name: "credit_ledger_booking_id_fkey"
 		}),
 		creditLedgerPackageKeyFkey: foreignKey({
-			columns: [table.packageKey],
-			foreignColumns: [creditPackages.key],
+			columns: [table.packageKey, table.location],
+			foreignColumns: [creditPackages.key, creditPackages.location],
 			name: "credit_ledger_package_key_fkey"
 		}),
 		creditLedgerChargeFk: foreignKey({
@@ -598,7 +599,8 @@ export const creditLedger = pgTable("credit_ledger", {
 });
 
 export const creditPackages = pgTable("credit_packages", {
-	key: text().primaryKey().notNull(),
+	key: text().notNull(),
+	location: locationKey().notNull(),
 	mode: bookingMode().notNull(),
 	credits: integer().notNull(),
 	priceCents: integer("price_cents").notNull(),
@@ -607,6 +609,7 @@ export const creditPackages = pgTable("credit_packages", {
 	active: boolean().default(true).notNull(),
 }, (table) => {
 	return {
+		creditPackagesPkey: primaryKey({ columns: [table.key, table.location], name: "credit_packages_pkey" }),
 		creditPackagesCreditsCheck: check("credit_packages_credits_check", sql`credits > 0`),
 		creditPackagesPriceCentsCheck: check("credit_packages_price_cents_check", sql`price_cents >= 0`),
 	}
@@ -1287,6 +1290,7 @@ export const bookingDogs = pgTable("booking_dogs", {
 });
 export const dogCreditBalance = pgView("dog_credit_balance", {	dogId: uuid("dog_id"),
 	mode: bookingMode(),
+	location: locationKey(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	balance: bigint({ mode: "number" }),
-}).as(sql`SELECT dog_id, mode, COALESCE(sum(delta), 0::bigint) AS balance FROM credit_ledger GROUP BY dog_id, mode`);
+}).as(sql`SELECT dog_id, mode, location, COALESCE(sum(delta), 0::bigint) AS balance FROM credit_ledger GROUP BY dog_id, mode, location`);

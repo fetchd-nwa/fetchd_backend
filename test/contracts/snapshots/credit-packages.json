@@ -1,6 +1,7 @@
 [
   {
     "key": "test-school-5",
+    "location": "fayetteville",
     "mode": "school",
     "credits": 5,
     "price_cents": 25000,
@@ -9,6 +10,7 @@
   },
   {
     "key": "test-school-10",
+    "location": "fayetteville",
     "mode": "school",
     "credits": 10,
     "price_cents": 45000,
@@ -17,6 +19,7 @@
   },
   {
     "key": "test-daycare-8",
+    "location": "fayetteville",
     "mode": "daycare",
     "credits": 8,
     "price_cents": 30000,

@@ -31,7 +31,7 @@ async function probeAdvisoryLock(probe: PoolClient, key: string): Promise<boolea
 // blocking — so we can assert true/false instead of timing out).
 
 test(
-  'withDogModeLock holds a per-(dog, mode) advisory lock for the duration of the transaction',
+  'withDogModeLock holds a per-(dog, mode, location) advisory lock for the duration of the transaction',
   { skip: dbConfigured ? false : 'DATABASE_URL not set' },
   async () => {
     const dogId = randomUUID();
@@ -40,17 +40,18 @@ test(
     try {
       // Before the inner transaction starts, the lock must be free.
       assert.equal(
-        await probeAdvisoryLock(probe, `${dogId}:school`),
+        await probeAdvisoryLock(probe, `${dogId}:school:fayetteville`),
         true,
         'lock should be free before any acquirer runs',
       );
 
       let lockObservedHeld = false;
       await db.transaction(async (tx) => {
-        await withDogModeLock(tx, dogId, 'school', async () => {
+        await withDogModeLock(tx, dogId, 'school', 'fayetteville', async () => {
           // While `fn` runs under the lock, the probe must NOT be able to
           // acquire the same key.
-          lockObservedHeld = (await probeAdvisoryLock(probe, `${dogId}:school`)) === false;
+          lockObservedHeld =
+            (await probeAdvisoryLock(probe, `${dogId}:school:fayetteville`)) === false;
         });
       });
 
@@ -64,7 +65,7 @@ test(
       // there's no explicit `pg_advisory_unlock` in the implementation —
       // `_xact_` means the lifetime is bound to the transaction.
       assert.equal(
-        await probeAdvisoryLock(probe, `${dogId}:school`),
+        await probeAdvisoryLock(probe, `${dogId}:school:fayetteville`),
         true,
         'lock should auto-release on transaction commit',
       );
@@ -75,7 +76,7 @@ test(
 );
 
 test(
-  'withDogModeLock: different (dog, mode) pairs do NOT serialize (lock is per pair, not global)',
+  'withDogModeLock: different (dog, mode, location) triples do NOT serialize (lock is per triple, not global)',
   { skip: dbConfigured ? false : 'DATABASE_URL not set' },
   async () => {
     const dogA = randomUUID();
@@ -84,26 +85,35 @@ test(
 
     try {
       await db.transaction(async (tx) => {
-        await withDogModeLock(tx, dogA, 'school', async () => {
-          // Same dog, same mode → blocked (the only colliding key).
+        await withDogModeLock(tx, dogA, 'school', 'fayetteville', async () => {
+          // Same dog, same mode, same location → blocked (the only colliding key).
           assert.equal(
-            await probeAdvisoryLock(probe, `${dogA}:school`),
+            await probeAdvisoryLock(probe, `${dogA}:school:fayetteville`),
             false,
-            'same (dog, mode) must be blocked',
+            'same (dog, mode, location) must be blocked',
           );
 
           // Same dog, different mode → independent. A dog being booked into
           // school doesn't block a separate daycare booking for the same dog.
           assert.equal(
-            await probeAdvisoryLock(probe, `${dogA}:daycare`),
+            await probeAdvisoryLock(probe, `${dogA}:daycare:fayetteville`),
             true,
             'same dog but different mode must NOT block',
+          );
+
+          // Same dog + mode but DIFFERENT location → independent (Δ 2026-06-04).
+          // Credits are per-location, so a Fayetteville booking must not block a
+          // Bentonville one for the same dog + mode.
+          assert.equal(
+            await probeAdvisoryLock(probe, `${dogA}:school:bentonville`),
+            true,
+            'same dog + mode but different location must NOT block',
           );
 
           // Different dog, same mode → independent. Two dogs booking school
           // at the same time must serialize per-dog, not globally.
           assert.equal(
-            await probeAdvisoryLock(probe, `${dogB}:school`),
+            await probeAdvisoryLock(probe, `${dogB}:school:fayetteville`),
             true,
             'different dog must NOT block',
           );

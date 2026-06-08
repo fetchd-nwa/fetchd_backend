@@ -452,6 +452,7 @@ test(
     await db.insert(creditLedger).values({
       dogId: FIXTURE_IDS.dog1Id,
       mode: 'school',
+      location: 'fayetteville',
       delta: -1,
       reason: 'booking-debit',
       bookingId: id,
