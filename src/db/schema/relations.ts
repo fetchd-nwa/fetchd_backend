@@ -264,8 +264,8 @@ export const creditLedgerRelations = relations(creditLedger, ({one}) => ({
 		references: [bookings.id]
 	}),
 	creditPackage: one(creditPackages, {
-		fields: [creditLedger.packageKey],
-		references: [creditPackages.key]
+		fields: [creditLedger.packageId],
+		references: [creditPackages.id]
 	}),
 	charge: one(charges, {
 		fields: [creditLedger.chargeId],

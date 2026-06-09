@@ -92,7 +92,7 @@ export async function dispatchStripeEvent(
 // AND no `credit_ledger` purchase row exists for this charge yet (e.g.
 // the requires_action / async-confirm path that Day-14 left to the
 // webhook), write the ledger row using metadata captured at PI creation
-// (`dog_id`, `package_key`, `credits`).
+// (`dog_id`, `package_id`, `credits`).
 // ─────────────────────────────────────────────────────────────────────────
 
 async function handlePaymentIntentSucceeded(
@@ -145,13 +145,13 @@ async function maybeWritePurchaseLedgerRow(
   if (existing.length > 0) return;
 
   const dogId = args.metadata.dog_id;
-  const packageKey = args.metadata.package_key;
+  const packageId = args.metadata.package_id;
   const credits = Number(args.metadata.credits);
   const mode = args.metadata.mode as BookingMode | undefined;
   const location = args.metadata.location;
   if (
     typeof dogId !== 'string' ||
-    typeof packageKey !== 'string' ||
+    typeof packageId !== 'string' ||
     !Number.isFinite(credits) ||
     credits <= 0 ||
     (mode !== 'school' && mode !== 'daycare') ||
@@ -168,7 +168,7 @@ async function maybeWritePurchaseLedgerRow(
     mode,
     location,
     delta: credits,
-    packageKey,
+    packageId,
     chargeId: args.chargeId,
   });
 }

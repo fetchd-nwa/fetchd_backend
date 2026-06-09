@@ -6,7 +6,7 @@ import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
 import { charges, creditLedger, stripeCustomers } from '../../src/db/schema/schema.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -41,7 +41,7 @@ function buildApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL): {
 } {
   const { app, authenticate } = makeContractApp(principal);
   const stripe = makeStripeStub();
-  registerCreditPackagesRoute(app, { authenticate, stripe });
+  registerCreditPackagesRoute(app, { authenticate, stripe, now: FIXTURE_NOW });
   return { app, stripe };
 }
 

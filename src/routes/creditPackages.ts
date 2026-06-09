@@ -9,6 +9,7 @@ import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { invalidatePattern } from '../lib/cache.js';
 import { ApiError } from '../lib/errors.js';
+import { bucketChicagoToday } from '../lib/chicagoDate.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -63,6 +64,12 @@ export interface CreditPurchaseWire {
 export interface CreditPackagesRouteOptions extends AuthRouteOptions {
   /** Stripe seam (Day 14). Contract tests inject a stub. */
   stripe?: StripeClient;
+  /**
+   * Injectable clock so contract tests get a deterministic "today" for the
+   * effective-dated catalog lookup (Δ 2026-06-08). A factory, not a `Date`,
+   * so a captured clock can't freeze production. Default = `new Date()`.
+   */
+  now?: () => Date;
 }
 
 const keyParamSchema = z.object({
@@ -91,6 +98,7 @@ export function registerCreditPackagesRoute(
 ): void {
   const authHook = resolveAuthHook(opts);
   const stripe = opts.stripe ?? defaultStripeClient;
+  const nowFactory = opts.now ?? ((): Date => new Date());
 
   app.get(
     '/credit-packages',
@@ -98,7 +106,7 @@ export function registerCreditPackagesRoute(
     async (request): Promise<CreditPackageWire[]> => {
       requirePrincipal(request); // any authenticated principal; catalog is shared
       const { location } = parsePackagesQuery(request.query);
-      return creditPackagesRepository.findActive(location);
+      return creditPackagesRepository.findActive(location, bucketChicagoToday(nowFactory()));
     },
   );
 
@@ -137,6 +145,7 @@ export function registerCreditPackagesRoute(
         ownerId: principal.ownerId,
         dogId: body.dog_id,
         paymentMethodId: body.payment_method_id,
+        today: bucketChicagoToday(nowFactory()),
       });
       const pkg = purchaseContext.pkg;
 
@@ -150,6 +159,10 @@ export function registerCreditPackagesRoute(
           metadata: {
             owner_id: principal.ownerId,
             dog_id: body.dog_id,
+            // package_id is the load-bearing FK the async webhook stamps onto
+            // the ledger; package_key rides along for human-readable Stripe
+            // dashboard reconciliation.
+            package_id: pkg.id,
             package_key: pkg.key,
             credits: String(pkg.credits),
             mode: pkg.mode,
@@ -193,7 +206,7 @@ export function registerCreditPackagesRoute(
               mode: pkg.mode,
               location: pkg.location,
               delta: pkg.credits,
-              packageKey: pkg.key,
+              packageId: pkg.id,
               chargeId: charge.id,
             });
           }
@@ -247,8 +260,10 @@ async function loadPurchaseContext(args: {
   ownerId: string;
   dogId: string;
   paymentMethodId: string;
+  today: string;
 }): Promise<{
   pkg: {
+    id: string;
     key: string;
     location: LocationKey;
     mode: BookingMode;
@@ -258,7 +273,7 @@ async function loadPurchaseContext(args: {
   stripeCustomerId: string;
   stripePaymentMethodId: string;
 }> {
-  const pkg = await creditPackagesRepository.findByKey(db, args.key, args.location);
+  const pkg = await creditPackagesRepository.findByKey(db, args.key, args.location, args.today);
   if (pkg === undefined) {
     throw new ApiError('not_found', `credit package ${args.key} not found or retired`);
   }

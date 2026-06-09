@@ -161,9 +161,10 @@ export const creditLedgerRepository = {
   /**
    * Day 14 — INSERT one `purchase` row crediting a dog with the package's
    * credit count after a Stripe charge succeeds. `delta` is positive
-   * (grant); `package_key` ties the row back to the catalog row that
-   * sourced it; `charge_id` ties it back to the charges row so the audit
-   * trail joins purchase → charge → Stripe PaymentIntent end-to-end.
+   * (grant); `package_id` ties the row back to the exact effective-dated
+   * catalog row (price) that sourced it; `charge_id` ties it back to the
+   * charges row so the audit trail joins purchase → charge → Stripe
+   * PaymentIntent end-to-end.
    *
    * Called inside the POST /credit-packages/:key/purchase txn AFTER the
    * Stripe `paymentIntents.create + confirm` returns succeeded and AFTER
@@ -178,7 +179,7 @@ export const creditLedgerRepository = {
       mode: BookingMode;
       location: LocationKey;
       delta: number;
-      packageKey: string;
+      packageId: string;
       chargeId: string;
     },
   ): Promise<void> {
@@ -188,7 +189,7 @@ export const creditLedgerRepository = {
       location: args.location,
       delta: args.delta,
       reason: 'purchase',
-      packageKey: args.packageKey,
+      packageId: args.packageId,
       chargeId: args.chargeId,
     });
   },

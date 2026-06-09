@@ -176,7 +176,7 @@ test(
       amountCents: 4500,
       metadata: {
         dog_id: FIXTURE_IDS.dog1Id,
-        package_key: FIXTURE_IDS.creditPackageSchool5Key,
+        package_id: FIXTURE_IDS.creditPackageSchool5Id,
         credits: '5',
         mode: 'school',
         location: 'fayetteville',
@@ -232,7 +232,7 @@ test(
       location: 'fayetteville',
       delta: 5,
       reason: 'purchase',
-      packageKey: FIXTURE_IDS.creditPackageSchool5Key,
+      packageId: FIXTURE_IDS.creditPackageSchool5Id,
       chargeId: chargeRow!.id,
     });
 
@@ -245,7 +245,7 @@ test(
       amountCents: 4500,
       metadata: {
         dog_id: FIXTURE_IDS.dog1Id,
-        package_key: 'whatever',
+        package_id: 'whatever',
         credits: '5',
         mode: 'school',
       },

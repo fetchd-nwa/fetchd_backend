@@ -582,7 +582,7 @@ export const creditLedger = pgTable("credit_ledger", {
 	delta: integer().notNull(),
 	reason: ledgerReason().notNull(),
 	bookingId: uuid("booking_id"),
-	packageKey: text("package_key"),
+	packageId: uuid("package_id"),
 	chargeId: uuid("charge_id"),
 	note: text(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
@@ -599,10 +599,10 @@ export const creditLedger = pgTable("credit_ledger", {
 			foreignColumns: [bookings.id],
 			name: "credit_ledger_booking_id_fkey"
 		}),
-		creditLedgerPackageKeyFkey: foreignKey({
-			columns: [table.packageKey, table.location],
-			foreignColumns: [creditPackages.key, creditPackages.location],
-			name: "credit_ledger_package_key_fkey"
+		creditLedgerPackageIdFkey: foreignKey({
+			columns: [table.packageId],
+			foreignColumns: [creditPackages.id],
+			name: "credit_ledger_package_id_fkey"
 		}),
 		creditLedgerChargeFk: foreignKey({
 			columns: [table.chargeId],
@@ -613,6 +613,7 @@ export const creditLedger = pgTable("credit_ledger", {
 });
 
 export const creditPackages = pgTable("credit_packages", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
 	key: text().notNull(),
 	location: text().$type<LocationKey>().notNull().references(() => locations.slug),
 	mode: bookingMode().notNull(),
@@ -620,10 +621,11 @@ export const creditPackages = pgTable("credit_packages", {
 	priceCents: integer("price_cents").notNull(),
 	label: text().notNull(),
 	isPopular: boolean("is_popular").default(false).notNull(),
-	active: boolean().default(true).notNull(),
+	effectiveFrom: date("effective_from").default(sql`CURRENT_DATE`).notNull(),
+	effectiveTo: date("effective_to"),
 }, (table) => {
 	return {
-		creditPackagesPkey: primaryKey({ columns: [table.key, table.location], name: "credit_packages_pkey" }),
+		creditPackagesKeyLocationEffectiveFromKey: unique("credit_packages_key_location_effective_from_key").on(table.key, table.location, table.effectiveFrom),
 		creditPackagesCreditsCheck: check("credit_packages_credits_check", sql`credits > 0`),
 		creditPackagesPriceCentsCheck: check("credit_packages_price_cents_check", sql`price_cents >= 0`),
 	}

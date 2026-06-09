@@ -110,6 +110,10 @@ export const FIXTURE_IDS = {
   creditPackageSchool10Key: 'test-school-10',
   creditPackageDaycare8Key: 'test-daycare-8',
   creditPackageRetiredKey: 'test-retired-pack',
+  // The surrogate id of the CURRENT-window test-school-5 @ fayetteville row
+  // (Δ 2026-06-08 effective-dating) — the exact priced version the fixture
+  // purchase ledger row + the webhook test point at.
+  creditPackageSchool5Id: 'cccccccc-cccc-4ccc-8ccc-ccccccccca51',
   creditLedgerPurchaseId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1',
   creditLedgerDebitId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc2',
   creditLedgerBentonvilleId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc3',
@@ -642,12 +646,36 @@ export async function seedFixture(): Promise<void> {
     },
   ]);
 
-  // Day-5b catalog: credit_packages. Two active school packs (5/10), one
-  // active daycare pack (8), one retired (active=false — verifies the
-  // server-side active=true filter). Snapshot covers Postgres enum order
-  // (booking_mode declared 'school','daycare' → school packs emit first).
+  // Day-5b catalog, effective-dated since Δ 2026-06-08 (parity with
+  // service_rates). At FIXTURE_TODAY (2026-05-19) the live catalog is exactly
+  // the three current-window fayetteville packs + the one bentonville pack, so
+  // the snapshot is byte-identical to the pre-effective-dating shape. The extra
+  // windows exercise the filter:
+  //   - test-school-5 @ fayetteville carries THREE windows of one key — a
+  //     superseded past price, the CURRENT price (the row the purchase ledger +
+  //     snapshot point at), and a FUTURE scheduled reprice — proving "pick the
+  //     window that contains today" (past + future both excluded).
+  //   - the retired pack's only window is already closed at FIXTURE_TODAY → it
+  //     is absent from the catalog (this is the retire mechanism now, replacing
+  //     the old active=false switch).
+  // Enum order: booking_mode declared 'school','daycare' → school emits first.
   await db.insert(creditPackages).values([
+    // test-school-5 @ fayetteville — superseded prior price (window closed).
     {
+      key: FIXTURE_IDS.creditPackageSchool5Key,
+      location: 'fayetteville',
+      mode: 'school',
+      credits: 5,
+      priceCents: 22_000,
+      label: '5 School Credits (old price)',
+      isPopular: false,
+      effectiveFrom: '2025-06-01',
+      effectiveTo: '2026-01-01',
+    },
+    // test-school-5 @ fayetteville — CURRENT price (live window at FIXTURE_TODAY).
+    // The fixture purchase ledger row's package_id points at this exact row.
+    {
+      id: FIXTURE_IDS.creditPackageSchool5Id,
       key: FIXTURE_IDS.creditPackageSchool5Key,
       location: 'fayetteville',
       mode: 'school',
@@ -655,7 +683,21 @@ export async function seedFixture(): Promise<void> {
       priceCents: 25_000,
       label: '5 School Credits (fixture)',
       isPopular: false,
-      active: true,
+      effectiveFrom: '2026-01-01',
+      effectiveTo: '2027-01-01',
+    },
+    // test-school-5 @ fayetteville — FUTURE scheduled reprice (window opens
+    // after FIXTURE_TODAY → excluded from today's catalog).
+    {
+      key: FIXTURE_IDS.creditPackageSchool5Key,
+      location: 'fayetteville',
+      mode: 'school',
+      credits: 5,
+      priceCents: 28_000,
+      label: '5 School Credits (2027 price)',
+      isPopular: false,
+      effectiveFrom: '2027-01-01',
+      effectiveTo: null,
     },
     {
       key: FIXTURE_IDS.creditPackageSchool10Key,
@@ -665,7 +707,8 @@ export async function seedFixture(): Promise<void> {
       priceCents: 45_000,
       label: '10 School Credits (fixture)',
       isPopular: true,
-      active: true,
+      effectiveFrom: '2026-01-01',
+      effectiveTo: null,
     },
     {
       key: FIXTURE_IDS.creditPackageDaycare8Key,
@@ -675,10 +718,11 @@ export async function seedFixture(): Promise<void> {
       priceCents: 30_000,
       label: '8 Daycare Credits (fixture)',
       isPopular: false,
-      active: true,
+      effectiveFrom: '2026-01-01',
+      effectiveTo: null,
     },
     // Δ 2026-06-04: same pack key at Bentonville with a DIFFERENT price —
-    // exercises the composite (key, location) PK + per-location pricing.
+    // exercises per-location pricing.
     {
       key: FIXTURE_IDS.creditPackageSchool5Key,
       location: 'bentonville',
@@ -687,8 +731,11 @@ export async function seedFixture(): Promise<void> {
       priceCents: 27_500,
       label: '5 School Credits (Bentonville fixture)',
       isPopular: false,
-      active: true,
+      effectiveFrom: '2026-01-01',
+      effectiveTo: null,
     },
+    // Fully retired: window already closed at FIXTURE_TODAY, no replacement →
+    // absent from the catalog (replaces the old active=false retire switch).
     {
       key: FIXTURE_IDS.creditPackageRetiredKey,
       location: 'fayetteville',
@@ -697,7 +744,8 @@ export async function seedFixture(): Promise<void> {
       priceCents: 15_000,
       label: 'Retired Test Pack',
       isPopular: false,
-      active: false,
+      effectiveFrom: '2025-06-01',
+      effectiveTo: '2026-04-01',
     },
   ]);
 
@@ -829,7 +877,7 @@ export async function seedFixture(): Promise<void> {
   // Day-5b: credit_ledger entries for Waffles only (Lola has zero ledger
   // rows → exercises the zero-sentinel branch of GET /dogs/:id/credits via
   // the LEFT JOIN through dogs in creditsRepository).
-  //   +5 school purchase (references credit_packages.test-school-5)
+  //   +5 school purchase (references the current test-school-5 @ fay row by id)
   //   -1 school debit  (references booking1 — Waffles' upcoming day-school)
   // Resulting balance: { school: 4, daycare: 0 }
   await db.insert(creditLedger).values([
@@ -840,7 +888,7 @@ export async function seedFixture(): Promise<void> {
       location: 'fayetteville',
       delta: 5,
       reason: 'purchase',
-      packageKey: FIXTURE_IDS.creditPackageSchool5Key,
+      packageId: FIXTURE_IDS.creditPackageSchool5Id,
       note: 'Fixture purchase of 5-pack',
     },
     {
