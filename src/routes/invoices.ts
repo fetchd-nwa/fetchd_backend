@@ -151,6 +151,10 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
             purpose: invoiceRow.purpose,
             stripePaymentIntentId: intent.id,
             bookingId: invoiceRow.bookingId,
+            // Δ 2026-06-09: propagate enrollment identity (group-class pay-later
+            // settled manually) so a later withdraw can find + refund it.
+            cohortId: invoiceRow.cohortId,
+            dogId: invoiceRow.dogId,
           });
 
           let invoiceStatus: 'open' | 'paid' | 'void' = 'open';

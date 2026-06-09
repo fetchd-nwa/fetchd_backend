@@ -7,13 +7,17 @@ import {
   agreementDocuments,
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
+  charges as chargesTable,
   cohorts as cohortsTable,
+  invoices as invoicesTable,
   paymentMethods,
+  refunds as refundsTable,
   requiredVaccines,
 } from '../../src/db/schema/schema.js';
+import { and as andOp } from 'drizzle-orm';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import type { GroupClassKey } from '../../src/db/repositories/groupClassesRepository.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -21,6 +25,7 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
+import { makeStripeStub } from './_stripeStub.js';
 
 /**
  * Day 11 contract tests for POST /enrollments — group-class cohort
@@ -82,16 +87,23 @@ async function makeCohort(args: {
   return { id, filled, weeks };
 }
 
-/** Build a Fastify app with the enrollments route registered. */
+/** Build a Fastify app with the enrollments route registered. Injects a Stripe
+ * stub (pay-now / withdraw refund) + FIXTURE_NOW (the withdraw pre-start guard). */
 function enrollApp(principal = FIXTURE_OWNER_PRINCIPAL): {
   app: ReturnType<typeof makeContractApp>['app'];
+  stripe: ReturnType<typeof makeStripeStub>;
 } {
   const { app, authenticate } = makeContractApp(principal);
-  registerEnrollmentsRoute(app, { authenticate });
-  return { app };
+  const stripe = makeStripeStub();
+  registerEnrollmentsRoute(app, { authenticate, stripe, now: FIXTURE_NOW });
+  return { app, stripe };
 }
 
-/** Inject a POST /enrollments call with sensible defaults. */
+/**
+ * Inject a POST /enrollments call. Defaults to a valid card + `pay_later: true`
+ * so the structural assertions (bookings, capacity, gates, idempotency) don't
+ * each have to thread Stripe; pay-now tests override `pay_later: false`.
+ */
 async function postEnrollment(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   payload: Record<string, unknown>;
@@ -107,7 +119,11 @@ async function postEnrollment(opts: {
     method: 'POST',
     url: '/enrollments',
     headers,
-    payload: opts.payload,
+    payload: {
+      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      pay_later: true,
+      ...opts.payload,
+    },
   });
 }
 
@@ -693,3 +709,288 @@ test('POST /enrollments — duplicate dog_ids → 422 invalid_payload', SKIP_WHE
   assert.equal(res.statusCode, 422);
   assert.equal((res.json() as { error: { code: string } }).error.code, 'invalid_payload');
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// Payment (Δ 2026-06-09) — pay-now charge / pay-later invoice
+// ──────────────────────────────────────────────────────────────────────────
+
+const PUPPY_PRICE_PER_DOG_CENTS = 12_000; // fixture group_classes.puppy
+
+async function postWithdraw(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  cohortId: string;
+  dogId: string;
+  idempotencyKey?: string;
+}): Promise<
+  ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> extends Promise<infer R>
+    ? R
+    : never
+> {
+  const headers: Record<string, string> = {};
+  if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
+  return opts.app.inject({
+    method: 'POST',
+    url: `/enrollments/${opts.cohortId}/withdraw`,
+    headers,
+    payload: { dog_id: opts.dogId },
+  });
+}
+
+test(
+  'POST /enrollments — pay-now → succeeded group-class charge per dog (cohort_id + dog_id stamped)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-paynow-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+
+    // One PaymentIntent confirmed for the one dog.
+    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    assert.equal(piCalls.length, 1);
+
+    const charge = await db
+      .select()
+      .from(chargesTable)
+      .where(
+        andOp(eq(chargesTable.cohortId, cohort.id), eq(chargesTable.dogId, FIXTURE_IDS.dog1Id)),
+      );
+    assert.equal(charge.length, 1, 'one charge for the (cohort, dog)');
+    assert.equal(charge[0]!.status, 'succeeded');
+    assert.equal(charge[0]!.purpose, 'group-class');
+    assert.equal(charge[0]!.amountCents, PUPPY_PRICE_PER_DOG_CENTS);
+
+    // No invoice on the pay-now path.
+    const invs = await db.select().from(invoicesTable).where(eq(invoicesTable.cohortId, cohort.id));
+    assert.equal(invs.length, 0);
+  },
+);
+
+test(
+  'POST /enrollments — pay-later → open group-class invoice due 24h before the first session (no Stripe call)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({
+      classKey: 'puppy',
+      capacity: 6,
+      filled: 0,
+      weeks: 4,
+      startDate: SIX_WEEKS_OUT_UTC,
+    });
+    const { app, stripe } = enrollApp();
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-paylater-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: true },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+      0,
+      'pay-later does not call Stripe at enroll time',
+    );
+
+    const invs = await db
+      .select()
+      .from(invoicesTable)
+      .where(
+        andOp(eq(invoicesTable.cohortId, cohort.id), eq(invoicesTable.dogId, FIXTURE_IDS.dog1Id)),
+      );
+    assert.equal(invs.length, 1, 'one open invoice for the (cohort, dog)');
+    assert.equal(invs[0]!.status, 'open');
+    assert.equal(invs[0]!.purpose, 'group-class');
+    assert.equal(invs[0]!.amountCents, PUPPY_PRICE_PER_DOG_CENTS);
+    // due_at = first session (cohort start) − 24h. SIX_WEEKS_OUT − 24h.
+    const expectedDue = new Date(new Date(SIX_WEEKS_OUT_UTC).getTime() - 24 * 60 * 60 * 1000);
+    assert.equal(new Date(invs[0]!.dueAt).getTime(), expectedDue.getTime());
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Withdraw (Δ 2026-06-09) — refund (pay-now) / void (pay-later) / guards
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /enrollments/:cohortId/withdraw — pay-now → refund + filled−1 + bookings cancelled',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    await postEnrollment({
+      app,
+      idempotencyKey: `enr-wd-pay-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+    });
+
+    const res = await postWithdraw({
+      app,
+      cohortId: cohort.id,
+      dogId: FIXTURE_IDS.dog1Id,
+      idempotencyKey: `wd-pay-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { withdrawn: boolean; refunded_cents: number };
+    assert.equal(body.withdrawn, true);
+    assert.equal(body.refunded_cents, PUPPY_PRICE_PER_DOG_CENTS, 'full per-dog refund');
+
+    // Stripe refund fired (post-commit) + a refunds row landed.
+    assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 1);
+    const refundRows = await db
+      .select()
+      .from(refundsTable)
+      .where(eq(refundsTable.ownerId, FIXTURE_IDS.ownerId));
+    assert.ok(refundRows.length >= 1);
+
+    // Seat released + every weekly booking cancelled.
+    const [updated] = await db
+      .select({ filled: cohortsTable.filled })
+      .from(cohortsTable)
+      .where(eq(cohortsTable.id, cohort.id));
+    assert.equal(updated?.filled, 0, 'filled decremented back to 0');
+    const live = await db
+      .select({ status: bookingsTable.status })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.ok(
+      live.every((b) => b.status === 'cancelled'),
+      'all weekly bookings cancelled',
+    );
+
+    // Cleanup the refunds/charges this test created so the shared owner state
+    // stays clean for later files.
+    await db.delete(refundsTable).where(eq(refundsTable.ownerId, FIXTURE_IDS.ownerId));
+    await db.delete(chargesTable).where(eq(chargesTable.cohortId, cohort.id));
+  },
+);
+
+test(
+  'POST /enrollments/:cohortId/withdraw — pay-later (unpaid) → invoice voided, nothing charged',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    await postEnrollment({
+      app,
+      idempotencyKey: `enr-wd-later-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: true },
+    });
+
+    const res = await postWithdraw({
+      app,
+      cohortId: cohort.id,
+      dogId: FIXTURE_IDS.dog1Id,
+      idempotencyKey: `wd-later-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { refunded_cents: number };
+    assert.equal(body.refunded_cents, 0, 'nothing was charged, so nothing refunded');
+    assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 0);
+
+    // Invoice voided → the auto-charge worker will never bill it.
+    const invs = await db
+      .select({ status: invoicesTable.status })
+      .from(invoicesTable)
+      .where(eq(invoicesTable.cohortId, cohort.id));
+    assert.equal(invs.length, 1);
+    assert.equal(invs[0]!.status, 'void');
+
+    const [updated] = await db
+      .select({ filled: cohortsTable.filled })
+      .from(cohortsTable)
+      .where(eq(cohortsTable.id, cohort.id));
+    assert.equal(updated?.filled, 0);
+
+    await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohort.id));
+  },
+);
+
+test(
+  'POST /enrollments/:cohortId/withdraw — class already started → 409 conflict (no self-serve withdraw)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Cohort started a week before FIXTURE_NOW (2026-05-19). Enroll succeeds
+    // (enroll has no started-guard); withdraw is blocked.
+    const cohort = await makeCohort({
+      classKey: 'puppy',
+      capacity: 6,
+      filled: 0,
+      weeks: 4,
+      startDate: '2026-05-12T23:00:00Z',
+    });
+    const { app } = enrollApp();
+    await postEnrollment({
+      app,
+      idempotencyKey: `enr-wd-started-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: true },
+    });
+
+    const res = await postWithdraw({
+      app,
+      cohortId: cohort.id,
+      dogId: FIXTURE_IDS.dog1Id,
+      idempotencyKey: `wd-started-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 409, res.body);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'conflict');
+
+    await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohort.id));
+  },
+);
+
+test(
+  'POST /enrollments/:cohortId/withdraw — dog not enrolled → 409 conflict',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0 });
+    const { app } = enrollApp();
+    const res = await postWithdraw({
+      app,
+      cohortId: cohort.id,
+      dogId: FIXTURE_IDS.dog1Id,
+      idempotencyKey: `wd-none-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 409, res.body);
+  },
+);
+
+test(
+  'GET /enrollments — lists the owner current enrollments with payment_status + can_withdraw',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({
+      classKey: 'puppy',
+      capacity: 6,
+      filled: 0,
+      weeks: 4,
+      startDate: SIX_WEEKS_OUT_UTC,
+    });
+    const { app } = enrollApp();
+    await postEnrollment({
+      app,
+      idempotencyKey: `enr-get-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: true },
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/enrollments' });
+    assert.equal(res.statusCode, 200, res.body);
+    const rows = res.json() as Array<{
+      cohort_id: string;
+      dog_id: string;
+      class_key: string;
+      payment_status: string;
+      can_withdraw: boolean;
+    }>;
+    const mine = rows.find((r) => r.cohort_id === cohort.id && r.dog_id === FIXTURE_IDS.dog1Id);
+    assert.ok(mine, 'the new enrollment is listed');
+    assert.equal(mine!.class_key, 'puppy');
+    assert.equal(mine!.payment_status, 'pay-later');
+    assert.equal(mine!.can_withdraw, true, 'future cohort → still withdrawable');
+
+    await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohort.id));
+  },
+);

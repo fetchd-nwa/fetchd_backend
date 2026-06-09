@@ -38,6 +38,7 @@ export interface InvoiceRow {
   purpose: ChargePurpose;
   bookingId: string | null;
   cohortId: string | null;
+  dogId: string | null;
   requestId: string | null;
   paymentMethodId: string;
   paidChargeId: string | null;
@@ -55,6 +56,7 @@ const INVOICE_PROJECTION = {
   purpose: invoices.purpose,
   bookingId: invoices.bookingId,
   cohortId: invoices.cohortId,
+  dogId: invoices.dogId,
   requestId: invoices.requestId,
   paymentMethodId: invoices.paymentMethodId,
   paidChargeId: invoices.paidChargeId,
@@ -103,6 +105,7 @@ export const invoicesRepository = {
       nextAttemptAt?: string;
       bookingId?: string | null;
       cohortId?: string | null;
+      dogId?: string | null;
       requestId?: string | null;
     },
   ): Promise<InvoiceRow> {
@@ -117,6 +120,7 @@ export const invoicesRepository = {
         nextAttemptAt: args.nextAttemptAt ?? args.dueAt,
         bookingId: args.bookingId ?? null,
         cohortId: args.cohortId ?? null,
+        dogId: args.dogId ?? null,
         requestId: args.requestId ?? null,
       })
       .returning(INVOICE_PROJECTION);
@@ -148,6 +152,46 @@ export const invoicesRepository = {
       .where(and(eq(invoices.id, args.id), eq(invoices.status, 'open')))
       .returning({ id: invoices.id });
     return updated.length;
+  },
+
+  /**
+   * Flip an OPEN invoice → 'void' (Δ 2026-06-09). The group-class withdraw
+   * verb's pay-later branch: cancelling an enrollment before the auto-charge
+   * fires voids the open invoice so the worker (which scans `status='open'`)
+   * never charges it — "nothing is ever charged". Filtered on `status='open'`
+   * so it can't reverse an already-paid invoice (that path is a refund, not a
+   * void); returns the row count for the caller to detect that race.
+   */
+  async markVoid(tx: Tx, args: { id: string }): Promise<number> {
+    const updated = await tx
+      .update(invoices)
+      .set({ status: 'void', nextAttemptAt: null })
+      .where(and(eq(invoices.id, args.id), eq(invoices.status, 'open')))
+      .returning({ id: invoices.id });
+    return updated.length;
+  },
+
+  /**
+   * The open group-class invoice for one (cohort, dog) enrollment, if any —
+   * the withdraw verb's "is this dog's enrollment an unpaid pay-later?" probe.
+   * Only `status='open'` (a paid one is a charge-refund, not a void).
+   */
+  async findOpenForCohortDog(
+    tx: Tx,
+    args: { cohortId: string; dogId: string },
+  ): Promise<InvoiceRow | undefined> {
+    const [row] = await tx
+      .select(INVOICE_PROJECTION)
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.cohortId, args.cohortId),
+          eq(invoices.dogId, args.dogId),
+          eq(invoices.status, 'open'),
+        ),
+      )
+      .limit(1);
+    return row;
   },
 
   /**

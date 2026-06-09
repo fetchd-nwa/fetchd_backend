@@ -107,7 +107,9 @@ export const refundsRepository = {
     args: {
       ownerId: string;
       chargeId: string;
-      bookingId: string;
+      // Nullable: a group-class withdraw refunds a per-(cohort, dog) charge not
+      // tied to a single booking row (Δ 2026-06-09).
+      bookingId: string | null;
       amountCents: number;
       reason?: string | null;
     },

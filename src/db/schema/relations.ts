@@ -287,6 +287,14 @@ export const chargesRelations = relations(charges, ({one, many}) => ({
 		fields: [charges.bookingId],
 		references: [bookings.id]
 	}),
+	cohort: one(cohorts, {
+		fields: [charges.cohortId],
+		references: [cohorts.id]
+	}),
+	dog: one(dogs, {
+		fields: [charges.dogId],
+		references: [dogs.id]
+	}),
 	invoices: many(invoices),
 	refunds: many(refunds),
 }));
@@ -318,6 +326,10 @@ export const invoicesRelations = relations(invoices, ({one}) => ({
 	cohort: one(cohorts, {
 		fields: [invoices.cohortId],
 		references: [cohorts.id]
+	}),
+	dog: one(dogs, {
+		fields: [invoices.dogId],
+		references: [dogs.id]
 	}),
 	pendingRequest: one(pendingRequests, {
 		fields: [invoices.requestId],

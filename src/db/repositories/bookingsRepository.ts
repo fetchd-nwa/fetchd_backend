@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { bookingAttendance, bookingDogs, bookings } from '../schema/schema.js';
 import { live } from '../softExpire.js';
@@ -232,6 +232,32 @@ export const bookingsRepository = {
         ),
       );
     return rows.map((r) => r.leadDogId);
+  },
+
+  /**
+   * The live (non-cancelled) booking ids for one dog in one cohort, oldest
+   * session first (Δ 2026-06-09 group-class withdraw). An enrollment is
+   * `weeks` weekly rows for the (cohort, dog); the withdraw verb cancels all of
+   * them. The earliest `scheduled_at` doubles as the cohort's first-session
+   * instant for the "class hasn't started" guard. Empty = not enrolled.
+   */
+  async findLiveBookingsForCohortDog(
+    tx: Tx,
+    cohortId: string,
+    dogId: string,
+  ): Promise<{ id: string; scheduledAt: string }[]> {
+    return tx
+      .select({ id: bookings.id, scheduledAt: bookings.scheduledAt })
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.cohortId, cohortId),
+          eq(bookings.leadDogId, dogId),
+          ne(bookings.status, 'cancelled'),
+          live(bookings),
+        ),
+      )
+      .orderBy(asc(bookings.scheduledAt));
   },
 
   /**

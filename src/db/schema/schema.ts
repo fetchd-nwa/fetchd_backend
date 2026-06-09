@@ -681,6 +681,8 @@ export const charges = pgTable("charges", {
 	status: chargeStatus().default('requires_payment').notNull(),
 	purpose: chargePurpose().notNull(),
 	bookingId: uuid("booking_id"),
+	cohortId: uuid("cohort_id"),
+	dogId: uuid("dog_id"),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 }, (table) => {
@@ -696,6 +698,16 @@ export const charges = pgTable("charges", {
 			foreignColumns: [bookings.id],
 			name: "charges_booking_id_fkey"
 		}),
+		chargesCohortIdFkey: foreignKey({
+			columns: [table.cohortId],
+			foreignColumns: [cohorts.id],
+			name: "charges_cohort_id_fkey"
+		}),
+		chargesDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "charges_dog_id_fkey"
+		}),
 		chargesStripePaymentIntentIdKey: unique("charges_stripe_payment_intent_id_key").on(table.stripePaymentIntentId),
 		chargesAmountCentsCheck: check("charges_amount_cents_check", sql`amount_cents >= 0`),
 	}
@@ -710,6 +722,7 @@ export const invoices = pgTable("invoices", {
 	purpose: chargePurpose().notNull(),
 	bookingId: uuid("booking_id"),
 	cohortId: uuid("cohort_id"),
+	dogId: uuid("dog_id"),
 	requestId: uuid("request_id"),
 	paymentMethodId: uuid("payment_method_id").notNull(),
 	paidChargeId: uuid("paid_charge_id"),
@@ -738,6 +751,11 @@ export const invoices = pgTable("invoices", {
 			columns: [table.cohortId],
 			foreignColumns: [cohorts.id],
 			name: "invoices_cohort_id_fkey"
+		}).onDelete("set null"),
+		invoicesDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "invoices_dog_id_fkey"
 		}).onDelete("set null"),
 		invoicesRequestIdFkey: foreignKey({
 			columns: [table.requestId],

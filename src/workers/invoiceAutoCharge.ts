@@ -235,6 +235,11 @@ async function processOne(
     purpose: invoice.purpose,
     stripePaymentIntentId: intent.id,
     bookingId: invoice.bookingId,
+    // Δ 2026-06-09: carry the enrollment identity from the invoice onto the
+    // charge so a group-class withdraw after the auto-charge fires can still
+    // find + refund this dog's payment via `findSucceededForCohortDog`.
+    cohortId: invoice.cohortId,
+    dogId: invoice.dogId,
   });
 
   if (chargeStatus === 'succeeded') {

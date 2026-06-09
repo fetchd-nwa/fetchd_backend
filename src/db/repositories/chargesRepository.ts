@@ -88,6 +88,10 @@ export const chargesRepository = {
       purpose: ChargePurpose;
       stripePaymentIntentId: string;
       bookingId?: string | null;
+      // Δ 2026-06-09: set together for a group-class enrollment charge so the
+      // withdraw verb can find + refund a single dog's payment.
+      cohortId?: string | null;
+      dogId?: string | null;
     },
   ): Promise<ChargeRow> {
     const [row] = await tx
@@ -100,11 +104,38 @@ export const chargesRepository = {
         purpose: args.purpose,
         stripePaymentIntentId: args.stripePaymentIntentId,
         bookingId: args.bookingId ?? null,
+        cohortId: args.cohortId ?? null,
+        dogId: args.dogId ?? null,
       })
       .returning(CHARGE_PROJECTION);
     if (!row) {
       throw new Error('chargesRepository.create: INSERT returned no row');
     }
+    return row;
+  },
+
+  /**
+   * The succeeded group-class charge for one (cohort, dog) enrollment, if
+   * any — the withdraw verb's "was this dog's enrollment paid-now?" probe.
+   * A 'refunded' charge is excluded (already reversed), so a double-withdraw
+   * finds nothing to refund. Pay-later enrollments have no charge here (the
+   * money lives on an open `invoices` row instead).
+   */
+  async findSucceededForCohortDog(
+    tx: Tx,
+    args: { cohortId: string; dogId: string },
+  ): Promise<ChargeRow | undefined> {
+    const [row] = await tx
+      .select(CHARGE_PROJECTION)
+      .from(charges)
+      .where(
+        and(
+          eq(charges.cohortId, args.cohortId),
+          eq(charges.dogId, args.dogId),
+          eq(charges.status, 'succeeded'),
+        ),
+      )
+      .limit(1);
     return row;
   },
 

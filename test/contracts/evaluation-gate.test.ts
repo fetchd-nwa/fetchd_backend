@@ -474,6 +474,8 @@ test(
         payload: {
           cohort_id: FIXTURE_IDS.cohortPuppyId,
           dog_ids: [FIXTURE_IDS.dog2Id],
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          pay_later: true,
         },
       });
       assert.equal(res.statusCode, 201, res.body);

@@ -4,10 +4,17 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { lockCohort } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
+import { chargesRepository, type ChargeStatus } from '../db/repositories/chargesRepository.js';
 import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { dogCompletedClassesRepository } from '../db/repositories/dogCompletedClassesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
+import {
+  enrollmentsRepository,
+  type EnrollmentPaymentStatus,
+} from '../db/repositories/enrollmentsRepository.js';
 import { groupClassesRepository } from '../db/repositories/groupClassesRepository.js';
+import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
+import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import {
   alreadyEnrolledError,
   cohortFullError,
@@ -22,8 +29,14 @@ import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { ApiError } from '../lib/errors.js';
+import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
+import {
+  defaultStripeClient,
+  stripeIntentStatusToChargeStatus,
+  type StripeClient,
+} from '../lib/stripe.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -58,17 +71,21 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  *      race-induced gate violations via `gateTriggerErrorToApiError`.
  *   8. `cohortsRepository.bumpFilled(tx, cohort_id, +|dog_ids|)` under
  *      the held row lock.
- *   9. NO credit_ledger debit — group-class is paid per-purchase
- *      (Day 14), not per-credit.
+ *   9. Payment (Δ 2026-06-09), per dog — group-class is money-paid, not
+ *      credit-paid. Pay-now: a Stripe PaymentIntent per dog is confirmed
+ *      BEFORE this tx (a declined card blocks enrollment); this step writes
+ *      the succeeded `charges` rows (cohort_id + dog_id stamped). Pay-later:
+ *      a card-backed open `invoices` row per dog due 24h before the first
+ *      session — the auto-charge worker bills it then. Withdrawing before the
+ *      first session refunds the charge / voids the open invoice.
  *  10. Post-commit: no cache invalidation today (the cohort catalog
  *      cache is keyed by class_key, not cohort id, and a `filled`
  *      bump doesn't change the catalog wire shape). Day-19 staff
  *      cohort edits will add `cohorts:*` patterns.
  *
- * Body shape per DATA-CONTRACT §C line 495 + §C.1 Model 2:
- *   `{ cohort_id: uuid, dog_ids: uuid[] }`
- * Returns 201 + `BookingWire[]` length = `|dog_ids| × cohort.weeks`,
- * ASC by scheduled_at then dog_id (stable across runs).
+ * Body: `{ cohort_id: uuid, dog_ids: uuid[], payment_method_id: uuid,
+ *   pay_later?: boolean }`. Returns 201 + `BookingWire[]` length =
+ *   `|dog_ids| × cohort.weeks`, ASC by scheduled_at then dog_id.
  *
  * Owner-only. Staff principals get 403 — the Day-19 staff portal will
  * surface cohort enrollments via the cohort detail screen but never
@@ -90,22 +107,48 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  */
 const MAX_DOGS_PER_REQUEST = 5;
 
+/**
+ * Pay-later auto-charge lead time (Δ 2026-06-09): a card-backed open invoice
+ * is created with `due_at = cohort_start − 24h`, and the existing invoice
+ * auto-charge worker charges it then. Unenrolling before that voids the
+ * invoice, so a pay-later that's withdrawn early is never charged.
+ */
+const GROUP_CLASS_AUTOCHARGE_LEAD_MS = 24 * 60 * 60 * 1000;
+
 const postEnrollmentBodySchema = z
   .object({
     cohort_id: z.string().uuid(),
     dog_ids: z.array(z.string().uuid()).min(1).max(MAX_DOGS_PER_REQUEST),
+    payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
+    // pay-now (the default) charges each dog's card immediately; pay-later
+    // defers to the auto-charge worker 24h before the first session.
+    pay_later: z.boolean().optional(),
   })
   .strict();
 
 type PostEnrollmentBody = z.infer<typeof postEnrollmentBodySchema>;
 
-export type EnrollmentsRouteOptions = AuthRouteOptions;
+export interface EnrollmentsRouteOptions extends AuthRouteOptions {
+  /** Stripe seam (Δ 2026-06-09 pay-now / withdraw refund). Tests inject a stub. */
+  stripe?: StripeClient;
+  /**
+   * Injectable clock for the withdraw "class hasn't started yet" guard, so a
+   * contract test gets a deterministic now vs the fixture cohort start dates.
+   * Default = `new Date()`.
+   */
+  now?: () => Date;
+}
+
+const cohortIdParamSchema = z.object({ cohortId: z.string().uuid('cohortId must be a UUID') });
+const withdrawBodySchema = z.object({ dog_id: z.string().uuid('dog_id must be a UUID') }).strict();
 
 export function registerEnrollmentsRoute(
   app: FastifyInstance,
   opts: EnrollmentsRouteOptions = {},
 ): void {
   const authHook = resolveAuthHook(opts);
+  const stripe = opts.stripe ?? defaultStripeClient;
+  const nowFactory = opts.now ?? ((): Date => new Date());
 
   app.post(
     '/enrollments',
@@ -116,6 +159,28 @@ export function registerEnrollmentsRoute(
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postEnrollmentBodySchema, request.body, 'body');
       const parsed = validateEnrollmentBody(body);
+      // Deterministic dog order: pre-tx Stripe charges + in-tx booking rows
+      // iterate the same sorted list (stable ids + matching charge↔booking pairs).
+      const sortedDogIds = [...parsed.dogIds].sort();
+
+      // ── Pre-tx: per-dog price + (pay-now) Stripe charges OUTSIDE the tx ──
+      // The amount is server-authoritative (the class's per-dog price), never
+      // client-passed. Pay-now confirms each dog's PaymentIntent BEFORE the
+      // enroll tx so a declined card blocks enrollment; the tx writes the
+      // charge rows referencing these intents. Pay-later skips Stripe entirely
+      // (the auto-charge worker bills the open invoice at due_at).
+      const amountPerDogCents = await resolvePerDogPriceCents(parsed.cohortId);
+      const paidIntents = parsed.payLater
+        ? []
+        : await chargeEachDogNow({
+            stripe,
+            ownerId: principal.ownerId,
+            paymentMethodId: parsed.paymentMethodId,
+            cohortId: parsed.cohortId,
+            dogIds: sortedDogIds,
+            amountPerDogCents,
+            idempotencyKey,
+          });
 
       const outcome = await withMutation<BookingWire[]>(
         {
@@ -222,10 +287,9 @@ export function registerEnrollmentsRoute(
           //    insert surfaces as a typed ApiError.
           const startInstant = pgTimestampToDate(cohortRow.startDate);
           const sessionDates = computeCohortSessionDates(startInstant, cohortRow.weeks);
-          // Iterate dogs in sorted order so multi-dog enrollments
-          // produce deterministic id sequences across runs (matches
-          // the Day-10 dog-sort convention for advisory-lock ordering).
-          const sortedDogIds = [...parsed.dogIds].sort();
+          // `sortedDogIds` (handler scope) gives deterministic id sequences
+          // across runs (matches the Day-10 dog-sort convention) and pairs each
+          // pay-now charge with its dog.
 
           // Resolve free-cancel hours ONCE for the whole enrollment — all
           // group-class sessions share the same category, so the policy
@@ -283,7 +347,194 @@ export function registerEnrollmentsRoute(
           //    real use case).
           await cohortsRepository.bumpFilled(tx, cohortRow.id, requested);
 
+          // 9. Payment rows, per dog (Δ 2026-06-09 — group-class is paid
+          //    per-(cohort, dog) so a single dog can be withdrawn + refunded).
+          //    Pay-now: a succeeded `charges` row per pre-confirmed intent (shows
+          //    in the billing ledger immediately). Pay-later: a card-backed open
+          //    `invoices` row due 24h before the first session — the auto-charge
+          //    worker bills it then; withdrawing earlier voids it (never charged).
+          if (parsed.payLater) {
+            const dueAt = new Date(
+              pgTimestampToDate(cohortRow.startDate).getTime() - GROUP_CLASS_AUTOCHARGE_LEAD_MS,
+            ).toISOString();
+            for (const dogId of sortedDogIds) {
+              await invoicesRepository.createOpen(tx, {
+                ownerId: principal.ownerId,
+                amountCents: amountPerDogCents,
+                purpose: 'group-class',
+                paymentMethodId: parsed.paymentMethodId,
+                dueAt,
+                cohortId: cohortRow.id,
+                dogId,
+              });
+            }
+          } else {
+            for (const intent of paidIntents) {
+              await chargesRepository.create(tx, {
+                ownerId: principal.ownerId,
+                amountCents: intent.amountCents,
+                status: intent.status,
+                purpose: 'group-class',
+                stripePaymentIntentId: intent.intentId,
+                cohortId: cohortRow.id,
+                dogId: intent.dogId,
+              });
+            }
+          }
+
           return { status: 201, body: insertedWires };
+        },
+      );
+
+      reply.code(outcome.status);
+      return outcome.body;
+    },
+  );
+
+  // --- GET /enrollments -------------------------------------------------
+  //
+  // The owner's current group-class enrollments — one row per live (cohort,
+  // dog) pairing, for the mobile "Currently enrolled" section. `can_withdraw`
+  // mirrors the withdraw verb's guard (self-serve withdraw is allowed until the
+  // first session starts); the verb re-checks it authoritatively under the lock.
+  app.get(
+    '/enrollments',
+    { preHandler: [authHook] },
+    async (request): Promise<EnrollmentWire[]> => {
+      const principal = requirePrincipal(request);
+      requireOwner(principal, 'list enrollments');
+      const rows = await enrollmentsRepository.listForOwner(principal.ownerId);
+      const nowMs = nowFactory().getTime();
+      return rows.map((row) => toEnrollmentWire(row, nowMs));
+    },
+  );
+
+  // --- POST /enrollments/:cohortId/withdraw -----------------------------
+  //
+  // Per-dog unenroll (Δ 2026-06-09). Under the cohort lock: guard the class
+  // hasn't started, soft-cancel that dog's weekly bookings, decrement
+  // `cohorts.filled`, then settle the money — an unpaid pay-later open invoice
+  // is VOIDED (never charged); a succeeded charge (pay-now, or a pay-later that
+  // already auto-charged) is REFUNDED (refunds row at 'pending' + post-commit
+  // Stripe refund, mirroring the booking-cancel money-back branch).
+  app.post(
+    '/enrollments/:cohortId/withdraw',
+    { preHandler: [authHook] },
+    async (request, reply): Promise<{ withdrawn: true; refunded_cents: number }> => {
+      const principal = requirePrincipal(request);
+      requireOwner(principal, 'withdraw from a cohort');
+      const { cohortId } = parseOrThrow(cohortIdParamSchema, request.params, 'path');
+      const { dog_id: dogId } = parseOrThrow(withdrawBodySchema, request.body, 'body');
+      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+
+      // Closure handle for the post-commit Stripe refund (money-back branch);
+      // undefined for the void / free paths (postCommit no-ops).
+      let pendingStripeRefund:
+        | { refundId: string; paymentIntentId: string; amountCents: number }
+        | undefined;
+
+      const outcome = await withMutation<{ withdrawn: true; refunded_cents: number }>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /enrollments/:cohortId/withdraw',
+          requestHash: hashRequestBody({ cohortId, dogId }),
+          keysToInvalidate: () => [],
+          postCommit: async () => {
+            if (pendingStripeRefund === undefined) return;
+            const result = await stripe.createRefund(
+              {
+                paymentIntentId: pendingStripeRefund.paymentIntentId,
+                amountCents: pendingStripeRefund.amountCents,
+                reason: 'requested_by_customer',
+              },
+              `${idempotencyKey}:refund`,
+            );
+            await refundsRepository.markStripeId({
+              id: pendingStripeRefund.refundId,
+              stripeRefundId: result.id,
+            });
+          },
+        },
+        async (tx) => {
+          // 1. Lock the cohort — serialize against concurrent enroll/withdraw
+          //    so the `filled` decrement is race-free. 404 collapses gone +
+          //    soft-expired.
+          const cohortRow = await lockCohort(tx, cohortId);
+          if (cohortRow === undefined || cohortRow.expiredAt !== null) {
+            throw new ApiError('not_found', `cohort ${cohortId} not found`);
+          }
+
+          // 2. Ownership — the dog must belong to the principal (same 404 for
+          //    "not owned" vs "doesn't exist").
+          const owned = await dogsRepository.findOwnedExists(dogId, principal.ownerId, tx);
+          if (!owned) {
+            throw new ApiError('not_found', `dog ${dogId} not found`);
+          }
+
+          // 3. The dog's live weekly bookings in this cohort. None → not enrolled.
+          const enrolledBookings = await bookingsRepository.findLiveBookingsForCohortDog(
+            tx,
+            cohortId,
+            dogId,
+          );
+          if (enrolledBookings.length === 0) {
+            throw new ApiError('conflict', `dog ${dogId} is not enrolled in cohort ${cohortId}`);
+          }
+
+          // 4. Pre-start guard — self-serve withdraw closes once the first
+          //    session has started (staff can still cancel via the portal).
+          const firstSessionMs = new Date(enrolledBookings[0]!.scheduledAt).getTime();
+          if (nowFactory().getTime() >= firstSessionMs) {
+            throw new ApiError(
+              'conflict',
+              'this class has already started — contact us to withdraw',
+            );
+          }
+
+          // 5. Soft-cancel every weekly booking + release the cohort seat.
+          for (const booking of enrolledBookings) {
+            await bookingsRepository.markCancelled(tx, booking.id);
+          }
+          await cohortsRepository.bumpFilled(tx, cohortId, -1);
+
+          // 6. Settle the money. Void an unpaid pay-later invoice (never
+          //    charged); refund a succeeded charge (pay-now / already-charged
+          //    pay-later). Exactly one of the two matches an enrollment.
+          let refundedCents = 0;
+          const openInvoice = await invoicesRepository.findOpenForCohortDog(tx, {
+            cohortId,
+            dogId,
+          });
+          if (openInvoice !== undefined) {
+            await invoicesRepository.markVoid(tx, { id: openInvoice.id });
+          } else {
+            const charge = await chargesRepository.findSucceededForCohortDog(tx, {
+              cohortId,
+              dogId,
+            });
+            if (charge !== undefined && charge.stripePaymentIntentId !== null) {
+              const alreadyRefunded = await refundsRepository.sumNonFailedForCharge(tx, charge.id);
+              const maxRefund = charge.amountCents - alreadyRefunded;
+              if (maxRefund > 0) {
+                const refund = await refundsRepository.createPending(tx, {
+                  ownerId: principal.ownerId,
+                  chargeId: charge.id,
+                  bookingId: null,
+                  amountCents: maxRefund,
+                  reason: 'cancel',
+                });
+                pendingStripeRefund = {
+                  refundId: refund.id,
+                  paymentIntentId: charge.stripePaymentIntentId,
+                  amountCents: maxRefund,
+                };
+                refundedCents = maxRefund;
+              }
+            }
+          }
+
+          return { status: 200, body: { withdrawn: true, refunded_cents: refundedCents } };
         },
       );
 
@@ -296,6 +547,45 @@ export function registerEnrollmentsRoute(
 // ---- helpers ---------------------------------------------------------
 
 /**
+ * The "Currently enrolled" wire row. `payment_status` is `paid` (charged) /
+ * `pay-later` (card-backed open invoice, auto-charges before the first session)
+ * / `pending` (async charge not yet settled). `can_withdraw` is the self-serve
+ * window — true until the first session's instant.
+ */
+export interface EnrollmentWire {
+  cohort_id: string;
+  dog_id: string;
+  class_key: string;
+  class_name: string;
+  location: string;
+  start_date: string;
+  weekly_time: string | null;
+  weeks: number;
+  first_session_at: string;
+  payment_status: EnrollmentPaymentStatus;
+  can_withdraw: boolean;
+}
+
+function toEnrollmentWire(
+  row: Awaited<ReturnType<typeof enrollmentsRepository.listForOwner>>[number],
+  nowMs: number,
+): EnrollmentWire {
+  return {
+    cohort_id: row.cohortId,
+    dog_id: row.dogId,
+    class_key: row.classKey,
+    class_name: row.className,
+    location: row.location,
+    start_date: row.startDate,
+    weekly_time: row.weeklyTime,
+    weeks: row.weeks,
+    first_session_at: row.firstSessionAt,
+    payment_status: row.paymentStatus,
+    can_withdraw: new Date(row.firstSessionAt).getTime() > nowMs,
+  };
+}
+
+/**
  * Cross-field invariants Zod doesn't express cleanly: dog_ids must be
  * distinct (the same dog enrolling twice in one body is the same
  * defect from the user's POV as a duplicate in the array). UUID
@@ -305,6 +595,8 @@ export function registerEnrollmentsRoute(
 interface ValidatedEnrollmentBody {
   cohortId: string;
   dogIds: string[];
+  paymentMethodId: string;
+  payLater: boolean;
 }
 
 function validateEnrollmentBody(body: PostEnrollmentBody): ValidatedEnrollmentBody {
@@ -315,5 +607,80 @@ function validateEnrollmentBody(body: PostEnrollmentBody): ValidatedEnrollmentBo
   return {
     cohortId: body.cohort_id,
     dogIds: body.dog_ids,
+    paymentMethodId: body.payment_method_id,
+    payLater: body.pay_later ?? false,
   };
+}
+
+/**
+ * Server-authoritative per-dog price for a cohort's class (anti-scam: the FE
+ * never passes the amount). Reads the cohort → its class's `price_per_dog_cents`.
+ * 404 if the cohort is gone/soft-expired (the enroll tx re-checks under lock).
+ */
+async function resolvePerDogPriceCents(cohortId: string): Promise<number> {
+  // Best-effort pre-tx read for the price; the enroll tx re-locks + re-checks
+  // cohort liveness authoritatively (this only needs the per-dog amount).
+  const cohort = await cohortsRepository.findById(cohortId);
+  if (cohort === undefined) {
+    throw new ApiError('not_found', `cohort ${cohortId} not found`);
+  }
+  const groupClass = await groupClassesRepository.findByKey(cohort.classKey);
+  if (groupClass === undefined) {
+    throw new ApiError('invalid_payload', `cohort ${cohortId} references an unknown class`);
+  }
+  return groupClass.pricePerDogCents;
+}
+
+interface PaidEnrollmentIntent {
+  dogId: string;
+  intentId: string;
+  status: ChargeStatus;
+  amountCents: number;
+}
+
+/**
+ * Pay-now: confirm one PaymentIntent per dog OUTSIDE the enroll tx (a long
+ * network call can't pin a tx open; a declined card throws here and blocks
+ * enrollment). One intent per dog — not a single combined charge — so each
+ * dog's enrollment can be refunded independently on withdraw. The per-dog
+ * idempotency-key suffix keeps retries Stripe-deduped.
+ */
+async function chargeEachDogNow(args: {
+  stripe: StripeClient;
+  ownerId: string;
+  paymentMethodId: string;
+  cohortId: string;
+  dogIds: readonly string[];
+  amountPerDogCents: number;
+  idempotencyKey: string;
+}): Promise<PaidEnrollmentIntent[]> {
+  const ctx = await loadStripePaymentContext({
+    ownerId: args.ownerId,
+    paymentMethodId: args.paymentMethodId,
+  });
+  const intents: PaidEnrollmentIntent[] = [];
+  for (const dogId of args.dogIds) {
+    const intent = await args.stripe.createAndConfirmPaymentIntent(
+      {
+        customerId: ctx.stripeCustomerId,
+        paymentMethodId: ctx.stripePaymentMethodId,
+        amountCents: args.amountPerDogCents,
+        currency: 'usd',
+        metadata: {
+          owner_id: args.ownerId,
+          dog_id: dogId,
+          cohort_id: args.cohortId,
+          purpose: 'group-class',
+        },
+      },
+      `${args.idempotencyKey}:dog:${dogId}`,
+    );
+    intents.push({
+      dogId,
+      intentId: intent.id,
+      status: stripeIntentStatusToChargeStatus(intent.status),
+      amountCents: intent.amountCents,
+    });
+  }
+  return intents;
 }
