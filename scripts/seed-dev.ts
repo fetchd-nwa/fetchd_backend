@@ -32,6 +32,7 @@ import {
   bookings,
   charges,
   classPrereqOptions,
+  classResources,
   cohorts,
   creditLedger,
   dogCompletedClasses,
@@ -310,6 +311,10 @@ async function seed(): Promise<void> {
       specialNotes: 'Eager learner; loves water.',
       evaluationStatus: 'passed',
       evaluationDate: '2024-03-01T15:00:00Z',
+      // Boarding is staff-granted per dog (default false). Waffles is the one
+      // boarding client here — demonstrates the gate (her boarding tile + flow
+      // show; the other seed dogs' don't).
+      boardingEnabled: true,
       profileImagePath: 'dogs/waffles/waffles-pfp.jpg',
     },
     {
@@ -406,6 +411,35 @@ async function seed(): Promise<void> {
   await db
     .insert(classPrereqOptions)
     .values([{ classKey: 'manners-2', prereqClassKey: 'manners-1' }]);
+  // Per-class resources — link cards surfaced on the dog-profile Group page,
+  // gated by completion (shown only once a dog has a live dog_completed_classes
+  // row for the class). Lola completed Manners 1 below, so her Manners 1 resource
+  // demonstrates the UNLOCKED state; the Puppy resources stay hidden for every
+  // seed dog (none completed Puppy) — the LOCKED state. Content is placeholder
+  // pending Shanthi; deep_link_path must resolve to a real /info route.
+  await db.insert(classResources).values([
+    {
+      classKey: 'puppy',
+      title: 'Puppy Class Recap',
+      subtitle: 'What we covered and how to keep practicing at home',
+      deepLinkPath: '/info/puppy-class',
+      position: 0,
+    },
+    {
+      classKey: 'puppy',
+      title: 'Yappy Hour',
+      subtitle: 'Bi-weekly evening social for clients and their dogs',
+      deepLinkPath: '/info/yappy-hour',
+      position: 1,
+    },
+    {
+      classKey: 'manners-1',
+      title: 'Yappy Hour',
+      subtitle: 'Practice your new manners at a real-world social',
+      deepLinkPath: '/info/yappy-hour',
+      position: 0,
+    },
+  ]);
   // Cohorts — both locations, varied fills, future starts (relative to now so
   // they stay bookable), plus one FULL cohort to demo the cohort-full state.
   // capacity snapshots the class cap (15); end_date = start + (weeks-1) weeks.

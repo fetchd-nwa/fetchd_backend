@@ -61,6 +61,7 @@ export interface DogWire {
   feeding: FeedingWire;
   special_notes: string;
   evaluation_status: EvaluationStatus;
+  boarding_enabled: boolean;
   evaluation_date?: string;
   completed_class_keys?: GroupClassKey[];
   vet?: VetWire;
@@ -84,6 +85,7 @@ export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
     feeding: toFeedingWire(feeding),
     special_notes: dog.specialNotes,
     evaluation_status: dog.evaluationStatus,
+    boarding_enabled: dog.boardingEnabled,
   };
 
   if (dog.evaluationDate !== null) wire.evaluation_date = pgTimestampToIso(dog.evaluationDate);

@@ -364,6 +364,9 @@ export async function seedFixture(): Promise<void> {
       // vaccine-gate test soft-expires + restores her Rabies record.
       evaluationStatus: 'passed',
       evaluationDate: '2024-06-01T15:00:00Z',
+      // Lola boards in this fixture (booking5) → exercises the boarding_enabled
+      // = true wire path; Waffles stays default false for the false path.
+      boardingEnabled: true,
       profileImagePath: null,
     },
   ]);

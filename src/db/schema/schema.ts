@@ -83,6 +83,7 @@ export const dogs = pgTable("dogs", {
 	specialNotes: text("special_notes").default('').notNull(),
 	evaluationStatus: evaluationStatus("evaluation_status").default('not-evaluated').notNull(),
 	evaluationDate: timestamp("evaluation_date", { withTimezone: true, mode: 'string' }),
+	boardingEnabled: boolean("boarding_enabled").default(false).notNull(),
 	primaryVetId: uuid("primary_vet_id"),
 	capacityExempt: boolean("capacity_exempt").generatedAlwaysAs(sql`(staff_owner_id IS NOT NULL)`),
 	externalRef: text("external_ref"),
@@ -272,6 +273,27 @@ export const classPrereqOptions = pgTable("class_prereq_options", {
 			foreignColumns: [groupClasses.key],
 			name: "class_prereq_options_prereq_class_key_fkey"
 		}),
+	}
+});
+
+export const classResources = pgTable("class_resources", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	classKey: groupClassKey("class_key").notNull(),
+	title: text().notNull(),
+	subtitle: text(),
+	deepLinkPath: text("deep_link_path").notNull(),
+	position: smallint().default(0).notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		classIdx: index("class_resources_class_idx").using("btree", table.classKey.asc().nullsLast().op("enum_ops")).where(sql`(expired_at IS NULL)`),
+		uidx: uniqueIndex("class_resources_uidx").using("btree", table.classKey.asc().nullsLast().op("enum_ops"), table.deepLinkPath.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
+		classResourcesClassKeyFkey: foreignKey({
+			columns: [table.classKey],
+			foreignColumns: [groupClasses.key],
+			name: "class_resources_class_key_fkey"
+		}).onDelete("cascade"),
 	}
 });
 

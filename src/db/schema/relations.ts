@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm/relations";
-import { owners, dogs, staff, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, cohorts, reports, mediaAssets, bookings, afterSchoolOptins, pendingRequests, cancelWindowSettings, creditLedger, creditPackages, charges, paymentMethods, stripeCustomers, invoices, memberships, agreementSignatures, agreementDocuments, refunds, idempotencyKeys, threads, notifications, messages, eventSeries, events, eventRsvps, scheduledNotifications, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, bookingDogs } from "./schema.js";
+import { owners, dogs, staff, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, bookings, afterSchoolOptins, pendingRequests, cancelWindowSettings, creditLedger, creditPackages, charges, paymentMethods, stripeCustomers, invoices, memberships, agreementSignatures, agreementDocuments, refunds, idempotencyKeys, threads, notifications, messages, eventSeries, events, eventRsvps, scheduledNotifications, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, bookingDogs } from "./schema.js";
 
 export const dogsRelations = relations(dogs, ({one, many}) => ({
 	owner: one(owners, {
@@ -120,6 +120,13 @@ export const classPrereqOptionsRelations = relations(classPrereqOptions, ({one})
 	}),
 }));
 
+export const classResourcesRelations = relations(classResources, ({one}) => ({
+	groupClass: one(groupClasses, {
+		fields: [classResources.classKey],
+		references: [groupClasses.key]
+	}),
+}));
+
 export const groupClassesRelations = relations(groupClasses, ({many}) => ({
 	classPrereqOptions_classKey: many(classPrereqOptions, {
 		relationName: "classPrereqOptions_classKey_groupClasses_key"
@@ -127,6 +134,7 @@ export const groupClassesRelations = relations(groupClasses, ({many}) => ({
 	classPrereqOptions_prereqClassKey: many(classPrereqOptions, {
 		relationName: "classPrereqOptions_prereqClassKey_groupClasses_key"
 	}),
+	classResources: many(classResources),
 	cohorts: many(cohorts),
 }));
 
