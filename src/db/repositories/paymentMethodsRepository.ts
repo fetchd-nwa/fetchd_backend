@@ -119,6 +119,25 @@ export const paymentMethodsRepository = {
   },
 
   /**
+   * Dedupe probe by Stripe payment-method id, across ALL rows (live AND
+   * soft-expired) — Stripe never reuses a `pm_*` id, so its presence in any
+   * state means "already materialized". Used by `materializePaymentMethod`
+   * so the synchronous confirm route and the `setup_intent.succeeded` webhook
+   * racing on the same card collapse to one row.
+   */
+  async existsByStripePaymentMethodId(
+    runner: Runner,
+    stripePaymentMethodId: string,
+  ): Promise<boolean> {
+    const [row] = await runner
+      .select({ one: sql<number>`1`.as('one') })
+      .from(paymentMethods)
+      .where(eq(paymentMethods.stripePaymentMethodId, stripePaymentMethodId))
+      .limit(1);
+    return row !== undefined;
+  },
+
+  /**
    * INSERT a new payment_methods row. Day-14 SetupIntent confirm path:
    * after Stripe's `setup_intent.succeeded`, the FE POSTs back the
    * resulting Stripe payment_method id; the route calls

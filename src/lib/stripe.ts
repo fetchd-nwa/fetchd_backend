@@ -44,6 +44,23 @@ export interface StripePaymentMethodSnapshot {
   cardholderName: string;
 }
 
+export type StripeSetupIntentStatus =
+  | 'requires_payment_method'
+  | 'requires_confirmation'
+  | 'requires_action'
+  | 'processing'
+  | 'canceled'
+  | 'succeeded';
+
+export interface StripeSetupIntentSnapshot {
+  id: string;
+  status: StripeSetupIntentStatus;
+  /** Attached customer — null until the SetupIntent is associated with one. */
+  customerId: StripeCustomerId | null;
+  /** Attached payment method — populated once the FE confirms the SetupIntent. */
+  paymentMethodId: StripePaymentMethodId | null;
+}
+
 export type StripePaymentIntentStatus =
   | 'requires_payment_method'
   | 'requires_confirmation'
@@ -183,6 +200,18 @@ export interface StripeClient {
   ): Promise<{ id: string; clientSecret: string }>;
 
   /**
+   * Retrieve a SetupIntent's terminal state — the synchronous counterpart to
+   * the `setup_intent.succeeded` webhook. After the FE confirms the SetupIntent
+   * client-side, `POST /payment-methods/confirm` retrieves it to (a) verify
+   * `status === 'succeeded'` and (b) read back the attached `customer` +
+   * `payment_method` so the `payment_methods` row is written from Stripe's
+   * source of truth, never a client-supplied id. The webhook remains the async
+   * backstop for the identical write (idempotent by stripe_payment_method_id).
+   * A GET in Stripe's API — no idempotency key needed.
+   */
+  retrieveSetupIntent(setupIntentId: string): Promise<StripeSetupIntentSnapshot>;
+
+  /**
    * Create + confirm a PaymentIntent in one round-trip — the "synchronous
    * confirmation" path the credit-purchase route uses (DATA-CONTRACT §G,
    * HANDOFF Day-14). With a stored card + test mode, this returns
@@ -281,6 +310,24 @@ export const defaultStripeClient: StripeClient = {
       throw new Error(`Stripe SetupIntent ${intent.id} returned null client_secret — unexpected`);
     }
     return { id: intent.id, clientSecret: intent.client_secret };
+  },
+
+  async retrieveSetupIntent(setupIntentId) {
+    const intent = await stripeSingleton.setupIntents.retrieve(setupIntentId);
+    // `customer` / `payment_method` come back as either an id string or an
+    // expanded object depending on the SetupIntent — normalize both to the id.
+    const customerId =
+      typeof intent.customer === 'string' ? intent.customer : (intent.customer?.id ?? null);
+    const paymentMethodId =
+      typeof intent.payment_method === 'string'
+        ? intent.payment_method
+        : (intent.payment_method?.id ?? null);
+    return {
+      id: intent.id,
+      status: intent.status,
+      customerId,
+      paymentMethodId,
+    };
   },
 
   async createAndConfirmPaymentIntent(args, idempotencyKey) {

@@ -12,6 +12,7 @@ import { ApiError } from '../lib/errors.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
+import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
@@ -64,6 +65,8 @@ interface SetupIntentResponseBody {
 const uuidParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
 
 const patchBodySchema = z.object({ is_default: z.literal(true) }).strict();
+
+const confirmBodySchema = z.object({ setup_intent_id: z.string().min(1) }).strict();
 
 export function registerPaymentMethodsRoute(
   app: FastifyInstance,
@@ -161,6 +164,84 @@ export function registerPaymentMethodsRoute(
             status: 201,
             body: { setup_intent_id: intent.id, client_secret: intent.clientSecret },
           };
+        },
+      );
+
+      reply.code(outcome.status);
+      return outcome.body;
+    },
+  );
+
+  // --- POST /payment-methods/confirm -----------------------------------
+  //
+  // Synchronous counterpart to the `setup_intent.succeeded` webhook. The FE
+  // confirms the SetupIntent client-side (Stripe Elements), then POSTs its id
+  // here so the card row materializes immediately — no waiting on an async
+  // webhook for the "card added" UX. The webhook stays wired as the backstop;
+  // both converge on `materializePaymentMethod`, idempotent by
+  // stripe_payment_method_id, so a confirm + a webhook racing on the same card
+  // collapse to one row.
+  //
+  // Trust model: the client supplies a `setup_intent_id`, never a
+  // payment_method id. We retrieve the SetupIntent from Stripe and verify
+  //   (a) status === 'succeeded' (the card actually attached), and
+  //   (b) its customer maps to THIS owner (tenancy gate — a client can't
+  //       confirm someone else's SetupIntent onto their own account).
+  // The displayable card bits (brand/last4/exp) come from Stripe's
+  // `retrievePaymentMethod`, never the client.
+  //
+  // Returns the full owner card list (mirrors GET + PATCH) so the FE replaces
+  // its cache with canonical post-confirm state in one round-trip.
+  app.post(
+    '/payment-methods/confirm',
+    { preHandler: [authHook] },
+    async (request, reply): Promise<PaymentMethodWire[]> => {
+      const principal = requirePrincipal(request);
+      requireOwner(principal, 'confirm a payment method');
+      const { setup_intent_id } = parseConfirmBody(request.body);
+      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+
+      // cache-noop: payment_methods not in the §3 cache map.
+      const outcome = await withMutation<PaymentMethodWire[]>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /payment-methods/confirm',
+          requestHash: hashRequestBody({ setupIntentId: setup_intent_id }),
+        },
+        async (tx) => {
+          // The owner must already have a Stripe customer (the setup-intent
+          // route provisions it before the FE can confirm). Absence here means
+          // the client skipped the setup-intent step — malformed flow.
+          const customerRow = await stripeCustomersRepository.findByOwner(tx, principal.ownerId);
+          if (customerRow === undefined) {
+            throw new ApiError(
+              'bad_request',
+              'no Stripe customer on file; request a setup intent before confirming',
+            );
+          }
+
+          // All Stripe calls live inside the mutation closure so a replay with
+          // the same Idempotency-Key returns the stored body without re-hitting
+          // Stripe (mirrors the setup-intent route).
+          const intent = await stripe.retrieveSetupIntent(setup_intent_id);
+          if (intent.status !== 'succeeded' || intent.paymentMethodId === null) {
+            throw new ApiError(
+              'bad_request',
+              `setup intent ${setup_intent_id} is not a completed card setup (status ${intent.status})`,
+            );
+          }
+          if (intent.customerId !== customerRow.stripeCustomerId) {
+            // Tenancy gate. 404 rather than 403 so a probe can't confirm that
+            // someone else's SetupIntent exists (same convention as :id reads).
+            throw new ApiError('not_found', `setup intent ${setup_intent_id} not found`);
+          }
+
+          const snapshot = await stripe.retrievePaymentMethod(intent.paymentMethodId);
+          await materializePaymentMethod(tx, { ownerId: principal.ownerId, snapshot });
+
+          const rows = await paymentMethodsRepository.findLiveByOwner(principal.ownerId, tx);
+          return { status: 200, body: rows.map(toPaymentMethodWire) };
         },
       );
 
@@ -303,6 +384,14 @@ function parseUuidParam(params: unknown): { id: string } {
 
 function parsePatchBody(body: unknown): z.infer<typeof patchBodySchema> {
   const parsed = patchBodySchema.safeParse(body);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid body: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data;
+}
+
+function parseConfirmBody(body: unknown): z.infer<typeof confirmBodySchema> {
+  const parsed = confirmBodySchema.safeParse(body);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid body: ${formatZodIssues(parsed.error)}`);
   }

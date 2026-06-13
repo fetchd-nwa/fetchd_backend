@@ -1,8 +1,8 @@
 import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
-import { creditLedger, LOCATION_SLUGS, paymentMethods } from '../db/schema/schema.js';
+import { creditLedger, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
-import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
+import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
 import { withActor, type Tx } from '../db/tx.js';
@@ -281,34 +281,15 @@ async function handleSetupIntentSucceeded(
   const snapshot = await opts.stripe.retrievePaymentMethod(event.paymentMethodId);
 
   return withActor(WEBHOOK_ACTOR, async (tx) => {
-    // Idempotent dedupe by stripe_payment_method_id. If the row already
-    // exists (a redelivered event got past the stripe_events claim race),
-    // return no-op.
-    const [existing] = await tx
-      .select({ id: paymentMethods.id })
-      .from(paymentMethods)
-      .where(eq(paymentMethods.stripePaymentMethodId, event.paymentMethodId))
-      .limit(1);
-    if (existing) {
+    // Shared with the synchronous POST /payment-methods/confirm route — dedupe
+    // by stripe_payment_method_id + first-card-default rule live in one place.
+    const result = await materializePaymentMethod(tx, { ownerId: customerMap.ownerId, snapshot });
+    if (result.outcome === 'already-present') {
       return { outcome: 'payment-method-already-present' };
     }
-
-    const isFirstCard = !(await paymentMethodsRepository.hasLiveForOwner(tx, customerMap.ownerId));
-
-    await paymentMethodsRepository.create(tx, {
-      ownerId: customerMap.ownerId,
-      stripePaymentMethodId: event.paymentMethodId,
-      brand: snapshot.brand,
-      last4: snapshot.last4,
-      expMonth: snapshot.expMonth,
-      expYear: snapshot.expYear,
-      cardholderName: snapshot.cardholderName,
-      isDefault: isFirstCard,
-    });
-
     return {
       outcome: 'wrote-payment-method',
-      note: isFirstCard ? 'first card; isDefault=true' : 'isDefault=false',
+      note: result.isDefault ? 'first card; isDefault=true' : 'isDefault=false',
     };
   });
 }

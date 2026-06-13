@@ -159,6 +159,149 @@ test(
 );
 
 // ──────────────────────────────────────────────────────────────────────────
+// POST /payment-methods/confirm
+//
+// Synchronous SetupIntent confirm. The first-card-default rule + dedupe live in
+// the shared `materializePaymentMethod` (covered via the webhook path in
+// stripe-webhook.test.ts); these tests pin the route's own surface: the Stripe
+// retrieve calls, the status gate, the tenancy gate, replay, and auth.
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /payment-methods/confirm — writes the card + returns the owner list (non-default; fixture card stays default)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const pmId = `pm_test_confirm_${randomUUID().slice(0, 8)}`;
+    const { app, stripe } = buildApp();
+    stripe.setSetupIntentSnapshot({
+      status: 'succeeded',
+      customerId: FIXTURE_IDS.stripeCustomerId,
+      paymentMethodId: pmId,
+    });
+    stripe.setPaymentMethodSnapshot({ last4: '1111', cardholderName: 'Confirm Test' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/payment-methods/confirm',
+      headers: { 'idempotency-key': `pm-confirm-${randomUUID()}` },
+      payload: { setup_intent_id: `seti_test_${randomUUID().slice(0, 8)}` },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+
+    const body = res.json() as Array<{ id: string; last4: string; is_default: boolean }>;
+    const added = body.find((r) => r.last4 === '1111');
+    assert.ok(added, 'new card present in returned list');
+    assert.equal(added!.is_default, false, 'fixture card stays default; new card is not');
+    assert.equal(body.filter((r) => r.is_default).length, 1, 'exactly one default');
+
+    // The route retrieves the SetupIntent, then the payment method.
+    const methods = stripe.calls.map((c) => c.method);
+    assert.ok(methods.includes('retrieveSetupIntent'));
+    assert.ok(methods.includes('retrievePaymentMethod'));
+
+    await db.delete(paymentMethods).where(eq(paymentMethods.stripePaymentMethodId, pmId));
+  },
+);
+
+test(
+  'POST /payment-methods/confirm — replay with same key returns identical body, no extra Stripe call',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const pmId = `pm_test_confirm_replay_${randomUUID().slice(0, 8)}`;
+    const { app, stripe } = buildApp();
+    stripe.setSetupIntentSnapshot({
+      status: 'succeeded',
+      customerId: FIXTURE_IDS.stripeCustomerId,
+      paymentMethodId: pmId,
+    });
+    const key = `pm-confirm-replay-${randomUUID()}`;
+    const payload = { setup_intent_id: `seti_test_${randomUUID().slice(0, 8)}` };
+
+    const first = await app.inject({
+      method: 'POST',
+      url: '/payment-methods/confirm',
+      headers: { 'idempotency-key': key },
+      payload,
+    });
+    assert.equal(first.statusCode, 200, first.body);
+    const callsAfterFirst = stripe.calls.length;
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/payment-methods/confirm',
+      headers: { 'idempotency-key': key },
+      payload,
+    });
+    assert.equal(replay.statusCode, 200);
+    assert.deepEqual(replay.json(), first.json());
+    assert.equal(stripe.calls.length, callsAfterFirst, 'replay skipped the Stripe round-trip');
+
+    await db.delete(paymentMethods).where(eq(paymentMethods.stripePaymentMethodId, pmId));
+  },
+);
+
+test(
+  'POST /payment-methods/confirm — SetupIntent not succeeded → 400, no row written',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    stripe.setSetupIntentSnapshot({
+      status: 'requires_payment_method',
+      customerId: FIXTURE_IDS.stripeCustomerId,
+      paymentMethodId: null,
+    });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/payment-methods/confirm',
+      headers: { 'idempotency-key': `pm-confirm-unconfirmed-${randomUUID()}` },
+      payload: { setup_intent_id: `seti_test_${randomUUID().slice(0, 8)}` },
+    });
+    assert.equal(res.statusCode, 400, res.body);
+  },
+);
+
+test(
+  'POST /payment-methods/confirm — SetupIntent belongs to a different customer → 404 (tenancy gate)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    stripe.setSetupIntentSnapshot({
+      status: 'succeeded',
+      customerId: 'cus_some_other_owner',
+      paymentMethodId: `pm_test_${randomUUID().slice(0, 8)}`,
+    });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/payment-methods/confirm',
+      headers: { 'idempotency-key': `pm-confirm-tenancy-${randomUUID()}` },
+      payload: { setup_intent_id: `seti_test_${randomUUID().slice(0, 8)}` },
+    });
+    assert.equal(res.statusCode, 404, res.body);
+  },
+);
+
+test('POST /payment-methods/confirm — staff principal → 403', SKIP_WHEN_NO_DB, async () => {
+  const { app } = buildApp(FIXTURE_STAFF_PRINCIPAL);
+  const res = await app.inject({
+    method: 'POST',
+    url: '/payment-methods/confirm',
+    headers: { 'idempotency-key': `pm-confirm-staff-${randomUUID()}` },
+    payload: { setup_intent_id: 'seti_test_staff' },
+  });
+  assert.equal(res.statusCode, 403);
+});
+
+test('POST /payment-methods/confirm — missing Idempotency-Key → 400', SKIP_WHEN_NO_DB, async () => {
+  const { app } = buildApp();
+  const res = await app.inject({
+    method: 'POST',
+    url: '/payment-methods/confirm',
+    payload: { setup_intent_id: 'seti_test_nokey' },
+  });
+  assert.equal(res.statusCode, 400);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
 // PATCH /payment-methods/:id
 // ──────────────────────────────────────────────────────────────────────────
 

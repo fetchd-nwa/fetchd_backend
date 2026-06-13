@@ -6,6 +6,7 @@ import type {
   StripePaymentIntentStatus,
   StripePaymentMethodSnapshot,
   StripeRefundResult,
+  StripeSetupIntentSnapshot,
   StripeWebhookEvent,
 } from '../../src/lib/stripe.js';
 
@@ -49,6 +50,11 @@ export type StripeStubCall =
       idempotencyKey: string;
     }
   | {
+      method: 'retrieveSetupIntent';
+      args: { setupIntentId: string };
+      idempotencyKey: null;
+    }
+  | {
       method: 'createAndConfirmPaymentIntent';
       args: Parameters<StripeClient['createAndConfirmPaymentIntent']>[0];
       idempotencyKey: string;
@@ -86,6 +92,13 @@ export interface StripeStub extends StripeClient {
   /** Replace what `retrievePaymentMethod` returns next. */
   setPaymentMethodSnapshot(snapshot: Partial<StripePaymentMethodSnapshot>): void;
   /**
+   * Override what `retrieveSetupIntent` returns next. Defaults to a succeeded
+   * SetupIntent with a `pm_test_*` payment method; tests exercising the
+   * confirm route's tenancy gate set `customerId` to the fixture's Stripe
+   * customer id (or a mismatch to assert the 404 path).
+   */
+  setSetupIntentSnapshot(snapshot: Partial<StripeSetupIntentSnapshot>): void;
+  /**
    * Queue the next webhook event the dispatch loop should receive.
    * `constructWebhookEvent` returns this event regardless of signature
    * (test stubs verify nothing). Pass `null` to make the next call throw
@@ -100,6 +113,7 @@ export function makeStripeStub(): StripeStub {
   let detachShouldThrow = false;
   let refundShouldThrow = false;
   let pmSnapshotOverride: Partial<StripePaymentMethodSnapshot> = {};
+  let setupIntentOverride: Partial<StripeSetupIntentSnapshot> = {};
   // `undefined` = no event queued; `null` = next call throws (bad signature);
   // an event = next call returns it. Distinguishing null from undefined lets
   // tests assert "no signature verification ran" vs "explicit bad signature".
@@ -121,6 +135,9 @@ export function makeStripeStub(): StripeStub {
     setPaymentMethodSnapshot(snapshot) {
       pmSnapshotOverride = snapshot;
     },
+    setSetupIntentSnapshot(snapshot) {
+      setupIntentOverride = snapshot;
+    },
     setNextEvent(event) {
       nextEvent = event;
     },
@@ -135,6 +152,17 @@ export function makeStripeStub(): StripeStub {
       const id = testIdPrefix('seti');
       calls.push({ method: 'createSetupIntent', args, idempotencyKey });
       return { id, clientSecret: `${id}_secret_${randomUUID().slice(0, 8)}` };
+    },
+
+    async retrieveSetupIntent(setupIntentId): Promise<StripeSetupIntentSnapshot> {
+      calls.push({ method: 'retrieveSetupIntent', args: { setupIntentId }, idempotencyKey: null });
+      return {
+        id: setupIntentId,
+        status: 'succeeded',
+        customerId: `cus_test_${randomUUID().slice(0, 8)}`,
+        paymentMethodId: `pm_test_${randomUUID().slice(0, 8)}`,
+        ...setupIntentOverride,
+      };
     },
 
     async createAndConfirmPaymentIntent(args, idempotencyKey): Promise<StripePaymentIntentResult> {
