@@ -1,4 +1,4 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { mediaAssets } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -170,6 +170,21 @@ export const mediaAssetsRepository = {
       .where(and(eq(mediaAssets.id, id), isNull(mediaAssets.expiredAt)))
       .limit(1);
     return raw === undefined ? undefined : projectMediaAssetRow(raw);
+  },
+
+  /**
+   * Batch-load live rows by id (filters soft-expired). Two callers: the threads
+   * send route validates a message's attachment ids (owner + purpose) in one
+   * round-trip, and the dog/owner image-URL resolver turns stored media-asset
+   * UUIDs into object keys to sign. Missing/expired ids simply don't appear.
+   */
+  async findManyByIds(ids: string[], runner: Runner = db): Promise<MediaAssetRow[]> {
+    if (ids.length === 0) return [];
+    const raws = await runner
+      .select(MEDIA_ASSET_PROJECTION)
+      .from(mediaAssets)
+      .where(and(inArray(mediaAssets.id, ids), isNull(mediaAssets.expiredAt)));
+    return raws.map(projectMediaAssetRow);
   },
 
   /**

@@ -28,6 +28,8 @@ import {
   type MedicationWire,
   type VaccineWire,
 } from '../lib/dogWire.js';
+import { assertOwnedImagePath, buildProfileImageUrlResolver } from '../lib/profileImageUrls.js';
+import { defaultR2Client, type R2Client } from '../lib/r2.js';
 import { ApiError } from '../lib/errors.js';
 import { normalizeOptional } from '../lib/normalize.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
@@ -157,6 +159,10 @@ const patchDogBodySchema = z
     special_notes: optionalText,
     evaluation_status: z.enum(EVALUATION_STATUSES),
     evaluation_date: optionalEvaluationDate,
+    // A media_assets UUID (after a dog-profile upload) or '' to clear. The
+    // tx guards that a UUID is the owner's own dog-profile media; the read
+    // resolver turns it into a signed URL (lib/profileImageUrls).
+    profile_image_path: z.string(),
   })
   .strict()
   .partial();
@@ -205,11 +211,28 @@ export interface DogsRouteOptions extends AuthRouteOptions {
    * `() => new Date()`.
    */
   now?: () => Date;
+  /** Override the R2 client (contract tests inject the stub for image signing). */
+  r2?: R2Client;
 }
 
 export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
   const now = opts.now ?? (() => new Date());
+  const r2 = opts.r2 ?? defaultR2Client;
+
+  // Resolve every dog wire's profile_image_path (media UUID → signed URL;
+  // bundled paths pass through). One batched lookup + parallel signing.
+  const withResolvedDogImages = async (wires: DogWire[]): Promise<DogWire[]> => {
+    const resolve = await buildProfileImageUrlResolver(
+      wires.map((w) => w.profile_image_path),
+      r2,
+    );
+    return wires.map((w) => ({ ...w, profile_image_path: resolve(w.profile_image_path) }));
+  };
+  const withResolvedDogImage = async (wire: DogWire): Promise<DogWire> => {
+    const [resolved] = await withResolvedDogImages([wire]);
+    return resolved ?? wire;
+  };
 
   // ────────────────────────────────────────────────────────────────────
   // Top-level dogs (Day 9a + 9c)
@@ -221,7 +244,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
     const assembled = await dogsRepository.findManyByOwner(principal.ownerId);
     const today = now();
-    return assembled.map((d) => toDogWire(d, today));
+    return withResolvedDogImages(assembled.map((d) => toDogWire(d, today)));
   });
 
   app.get('/dogs/:id', { preHandler: [authHook] }, async (request): Promise<DogWire> => {
@@ -236,7 +259,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
     if (!assembled) {
       throw new ApiError('not_found', 'dog not found');
     }
-    return toDogWire(assembled, now());
+    return withResolvedDogImage(toDogWire(assembled, now()));
   });
 
   app.post('/dogs', { preHandler: [authHook] }, async (request, reply) => {
@@ -288,7 +311,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
           // than emit a wrong wire shape.
           throw new Error('dogs.create: row vanished before re-fetch inside txn');
         }
-        return { status: 201, body: toDogWire(assembled, now()) };
+        return { status: 201, body: await withResolvedDogImage(toDogWire(assembled, now())) };
       },
     );
 
@@ -315,6 +338,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
     }
     if (body.evaluation_status !== undefined) set.evaluationStatus = body.evaluation_status;
     if (body.evaluation_date !== undefined) set.evaluationDate = body.evaluation_date;
+    if (body.profile_image_path !== undefined) set.profileImagePath = body.profile_image_path;
 
     if (Object.keys(set).length === 0) {
       throw new ApiError('bad_request', 'no updatable fields in request body');
@@ -333,6 +357,9 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
       async (tx) => {
         if (!(await dogsRepository.findOwnedExists(dogId, principal.ownerId, tx))) {
           throw new ApiError('not_found', 'dog not found');
+        }
+        if (set.profileImagePath !== undefined) {
+          await assertOwnedImagePath(tx, principal.ownerId, set.profileImagePath, 'dog-profile');
         }
         if (reassignVetId !== undefined && reassignVetId !== null) {
           const targetVet = await vetsRepository.findByIdForShare(reassignVetId, tx);
@@ -355,7 +382,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
         if (!assembled) {
           throw new Error('dogs.patch: row vanished before re-fetch inside txn');
         }
-        return { status: 200, body: toDogWire(assembled, now()) };
+        return { status: 200, body: await withResolvedDogImage(toDogWire(assembled, now())) };
       },
     );
 

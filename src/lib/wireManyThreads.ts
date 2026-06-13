@@ -1,13 +1,24 @@
 import { staffRepository } from '../db/repositories/staffRepository.js';
 import { threadsRepository, type ThreadRow } from '../db/repositories/threadsRepository.js';
 import {
+  messagesRepository,
+  type MessageAttachmentRow,
+} from '../db/repositories/messagesRepository.js';
+import type { R2Client } from './r2.js';
+import {
   toMessageWire,
   toThreadWire,
+  type MessageAttachmentWire,
   type MessageRowForWire,
   type MessageWire,
   type ResolvedParticipant,
   type ThreadWire,
 } from './threadWire.js';
+
+// Message attachment GET URLs are signed short: the open thread polls every 4s
+// (see useMessages THREAD_POLL_MS), well inside this TTL, so a refresh always
+// lands before the URL dies — and a leaked URL is useless within minutes.
+const MESSAGE_ATTACHMENT_URL_TTL_SECONDS = 60 * 5;
 
 /**
  * Batched denormalization of N thread rows into `ThreadWire` shapes.
@@ -47,10 +58,15 @@ export async function wireManyThreads(rows: ThreadRow[]): Promise<ThreadWire[]> 
 
 /**
  * Denormalize a batch of message rows into wire shapes. One batched
- * staff-name lookup feeds the polymorphic-sender flattening; owner-sent
- * messages omit `sender_name` per `lib/threadWire.toMessageWire`.
+ * staff-name lookup feeds the polymorphic-sender flattening (owner-sent
+ * messages omit `sender_name` per `lib/threadWire.toMessageWire`); one batched
+ * attachment lookup + parallel URL signing feeds the per-message media list.
+ * `r2` is injected so contract tests substitute the in-memory stub.
  */
-export async function wireManyMessages(rows: MessageRowForWire[]): Promise<MessageWire[]> {
+export async function wireManyMessages(
+  rows: MessageRowForWire[],
+  r2: R2Client,
+): Promise<MessageWire[]> {
   if (rows.length === 0) return [];
   const staffSenderIds = [
     ...new Set(
@@ -60,16 +76,57 @@ export async function wireManyMessages(rows: MessageRowForWire[]): Promise<Messa
         .filter((v): v is string => v !== null),
     ),
   ];
-  const staffNameRows = await staffRepository.findNamesByIds(staffSenderIds);
+  const [staffNameRows, attachmentRows] = await Promise.all([
+    staffRepository.findNamesByIds(staffSenderIds),
+    messagesRepository.findAttachmentsByMessageIds(rows.map((r) => r.id)),
+  ]);
   const staffNamesById = new Map(staffNameRows.map((s) => [s.id, s.name] as const));
+  const attachmentsByMessage = await signAttachmentsByMessage(attachmentRows, r2);
 
   return rows.map((row) => {
     let senderName: string | null = null;
     if (row.senderKind === 'staff' && row.senderStaffId !== null) {
       senderName = staffNamesById.get(row.senderStaffId) ?? null;
     }
-    return toMessageWire(row, senderName);
+    return toMessageWire(row, senderName, attachmentsByMessage.get(row.id) ?? []);
   });
+}
+
+/**
+ * Sign each attachment's object key into a short-lived GET URL (in parallel)
+ * and group the results by message id, preserving the repo's position order.
+ */
+async function signAttachmentsByMessage(
+  rows: MessageAttachmentRow[],
+  r2: R2Client,
+): Promise<Map<string, MessageAttachmentWire[]>> {
+  const signed = await Promise.all(
+    rows.map(async (row): Promise<readonly [string, MessageAttachmentWire]> => {
+      const url = await r2.signGetUrl({
+        key: row.objectKey,
+        expiresSeconds: MESSAGE_ATTACHMENT_URL_TTL_SECONDS,
+      });
+      return [
+        row.messageId,
+        {
+          media_id: row.mediaAssetId,
+          kind: row.kind,
+          url,
+          width: row.width,
+          height: row.height,
+          blurhash: row.blurhash,
+          duration_ms: row.durationMs,
+        },
+      ] as const;
+    }),
+  );
+  const byMessage = new Map<string, MessageAttachmentWire[]>();
+  for (const [messageId, wire] of signed) {
+    const existing = byMessage.get(messageId) ?? [];
+    existing.push(wire);
+    byMessage.set(messageId, existing);
+  }
+  return byMessage;
 }
 
 /**

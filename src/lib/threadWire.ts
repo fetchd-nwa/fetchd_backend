@@ -43,12 +43,30 @@ export interface ThreadWire {
   unread_count: number;
 }
 
+/**
+ * One photo/video attachment on a message. `media_id` is the `media_assets`
+ * row; `url` is a short-lived signed GET URL (signed in `wireManyMessages`,
+ * 5-min TTL — the thread polls far faster). `width`/`height`/`blurhash` let the
+ * FE lay the image out without a second round-trip; `duration_ms` is video-only.
+ */
+export interface MessageAttachmentWire {
+  media_id: string;
+  kind: 'image' | 'video';
+  url: string;
+  width: number | null;
+  height: number | null;
+  blurhash: string | null;
+  duration_ms: number | null;
+}
+
 export interface MessageWire {
   id: string;
   thread_id: string;
   sender_id: string;
   sender_name?: string;
   text: string;
+  /** Photo/video attachments, ordered as sent. Omitted when the message has none. */
+  attachments?: MessageAttachmentWire[];
   sent_at: string;
   is_read: boolean;
 }
@@ -138,7 +156,11 @@ export function toThreadWire(
  * message's sender row was hard-deleted, which shouldn't happen but is
  * tolerated). `is_read` derives from `read_at IS NOT NULL`.
  */
-export function toMessageWire(row: MessageRowForWire, senderName: string | null): MessageWire {
+export function toMessageWire(
+  row: MessageRowForWire,
+  senderName: string | null,
+  attachments: MessageAttachmentWire[] = [],
+): MessageWire {
   const senderId = flattenMessageSenderId(row);
   const wire: MessageWire = {
     id: row.id,
@@ -150,6 +172,9 @@ export function toMessageWire(row: MessageRowForWire, senderName: string | null)
   };
   if (senderName !== null && senderName !== '') {
     wire.sender_name = senderName;
+  }
+  if (attachments.length > 0) {
+    wire.attachments = attachments;
   }
   return wire;
 }

@@ -8,6 +8,8 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
 import { slugToDisplay, displayToSlug, LOCATION_DISPLAY_NAMES } from '../lib/locations.js';
+import { assertOwnedImagePath, buildProfileImageUrlResolver } from '../lib/profileImageUrls.js';
+import { defaultR2Client, type R2Client } from '../lib/r2.js';
 
 /**
  * Owner `/me` is a **frozen wire shape** — the exact keys the FE `toUser`
@@ -17,6 +19,19 @@ import { slugToDisplay, displayToSlug, LOCATION_DISPLAY_NAMES } from '../lib/loc
  * `''` rather than `null` so the FE translator's unconditional property reads
  * never hit `undefined` — the mock always carried strings.
  */
+/**
+ * Resolve the owner profile's `avatar_image_path` to a signed URL when it's a
+ * media-asset UUID (set after an avatar upload); bundled/'' paths pass through.
+ * Keeps the wire a plain string per schema.sql's read-time-resolution contract.
+ */
+async function withResolvedAvatar(
+  profile: ReturnType<typeof ownerProfile>,
+  r2: R2Client,
+): Promise<ReturnType<typeof ownerProfile>> {
+  const resolve = await buildProfileImageUrlResolver([profile.avatar_image_path], r2);
+  return { ...profile, avatar_image_path: resolve(profile.avatar_image_path) };
+}
+
 function ownerProfile(row: typeof owners.$inferSelect) {
   return {
     id: row.id,
@@ -111,8 +126,14 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
  * test can pin the principal without standing up the full Supabase JWKS
  * verifier; production calls with no opts and gets the real `authenticate`.
  */
-export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
+export interface MeRouteOpts extends AuthRouteOptions {
+  /** Override the R2 client (contract tests inject the stub for avatar signing). */
+  r2?: R2Client;
+}
+
+export function registerMeRoute(app: FastifyInstance, opts: MeRouteOpts = {}): void {
   const authHook = resolveAuthHook(opts);
+  const r2 = opts.r2 ?? defaultR2Client;
 
   app.get('/me', { preHandler: [authHook] }, async (request) => {
     const principal = requirePrincipal(request);
@@ -124,7 +145,7 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
         // expired mid-request. Treat as the account being gone.
         throw new ApiError('not_provisioned', 'owner record no longer available');
       }
-      return ownerProfile(row);
+      return withResolvedAvatar(ownerProfile(row), r2);
     }
 
     const [row] = await db.select().from(staff).where(eq(staff.id, principal.staffId)).limit(1);
@@ -164,6 +185,9 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
         keysToInvalidate: () => [],
       },
       async (tx) => {
+        if (typeof set.avatarImagePath === 'string') {
+          await assertOwnedImagePath(tx, principal.ownerId, set.avatarImagePath, 'owner-avatar');
+        }
         const [row] = await tx
           .update(owners)
           .set(set)
@@ -172,7 +196,7 @@ export function registerMeRoute(app: FastifyInstance, opts: AuthRouteOptions = {
         if (!row) {
           throw new ApiError('not_provisioned', 'owner record no longer available');
         }
-        return { status: 200, body: ownerProfile(row) };
+        return { status: 200, body: await withResolvedAvatar(ownerProfile(row), r2) };
       },
     );
 

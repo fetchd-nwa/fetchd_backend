@@ -15,6 +15,7 @@ import { ApiError } from '../lib/errors.js';
 import {
   MAX_UPLOAD_BYTES,
   assertContentTypeMatchesPurpose,
+  mediaKindForContentType,
   mediaObjectKey,
 } from '../lib/mediaKeys.js';
 import {
@@ -325,6 +326,9 @@ async function uploadOwnerMedia(
 ): Promise<MediaWire> {
   const linkage = ownerUploadLinkage(body.purpose, body.dog_id ?? null, body.report_id ?? null);
   const head = await verifyUploadLanded(r2, body.key);
+  // Kind follows the actual uploaded content type — a message-attachment can be
+  // a photo OR a video; dog-profile/owner-avatar are image-gated upstream.
+  const kind = mediaKindForContentType(head.contentType);
 
   const outcome = await withMutation<MediaAssetRow>(
     {
@@ -345,7 +349,7 @@ async function uploadOwnerMedia(
         ownerId: principal.ownerId,
         dogId: linkage.dogId,
         reportId: linkage.reportId,
-        kind: linkage.kind,
+        kind,
         purpose: body.purpose,
         objectKey: body.key,
         contentType: head.contentType,
@@ -425,7 +429,7 @@ function ownerUploadLinkage(
   purpose: MediaPurpose,
   dogId: string | null,
   reportId: string | null,
-): { dogId: string | null; reportId: string | null; kind: MediaKind } {
+): { dogId: string | null; reportId: string | null } {
   if (purpose === 'dog-profile') {
     if (dogId === null || dogId === '') {
       throw new ApiError('bad_request', `purpose 'dog-profile' requires dog_id`);
@@ -433,7 +437,7 @@ function ownerUploadLinkage(
     if (reportId !== null && reportId !== '') {
       throw new ApiError('bad_request', `purpose 'dog-profile' cannot carry report_id`);
     }
-    return { dogId, reportId: null, kind: 'image' };
+    return { dogId, reportId: null };
   }
   if (purpose === 'owner-avatar' || purpose === 'message-attachment') {
     // No FK linkage; the row carries owner_id (the principal) only.
@@ -443,7 +447,7 @@ function ownerUploadLinkage(
     if (reportId !== null && reportId !== '') {
       throw new ApiError('bad_request', `purpose '${purpose}' cannot carry report_id`);
     }
-    return { dogId: null, reportId: null, kind: 'image' };
+    return { dogId: null, reportId: null };
   }
   throw new ApiError('forbidden', `purpose '${purpose}' is authored via the staff portal`);
 }

@@ -1044,6 +1044,29 @@ export const messages = pgTable("messages", {
 	}
 });
 
+export const messageAttachments = pgTable("message_attachments", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	messageId: uuid("message_id").notNull(),
+	mediaAssetId: uuid("media_asset_id").notNull(),
+	position: integer().default(0).notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		messageIdx: index("message_attachments_message_idx").using("btree", table.messageId.asc().nullsLast().op("uuid_ops"), table.position.asc().nullsLast().op("int4_ops")),
+		messageMediaUidx: uniqueIndex("message_attachments_message_media_uidx").using("btree", table.messageId.asc().nullsLast().op("uuid_ops"), table.mediaAssetId.asc().nullsLast().op("uuid_ops")),
+		messageAttachmentsMessageIdFkey: foreignKey({
+			columns: [table.messageId],
+			foreignColumns: [messages.id],
+			name: "message_attachments_message_id_fkey"
+		}).onDelete("cascade"),
+		messageAttachmentsMediaAssetIdFkey: foreignKey({
+			columns: [table.mediaAssetId],
+			foreignColumns: [mediaAssets.id],
+			name: "message_attachments_media_asset_id_fkey"
+		}),
+	}
+});
+
 export const eventSeries = pgTable("event_series", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	name: text().notNull(),

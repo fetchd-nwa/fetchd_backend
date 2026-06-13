@@ -9,6 +9,7 @@ import { ApiError } from '../lib/errors.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { type MessageWire, type ThreadWire } from '../lib/threadWire.js';
 import { wireManyMessages, wireManyThreads } from '../lib/wireManyThreads.js';
+import { defaultR2Client, type R2Client } from '../lib/r2.js';
 
 /**
  * Day-19 staff portal verb 3 — messaging reply.
@@ -32,8 +33,17 @@ const messageBodySchema = z
   .object({ text: z.string().trim().min(1).max(MAX_MESSAGE_LEN) })
   .strict();
 
-export function registerStaffThreadsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
+export interface StaffThreadsRouteOpts extends AuthRouteOptions {
+  /** Override the R2 client (contract tests inject the stub for URL signing). */
+  r2?: R2Client;
+}
+
+export function registerStaffThreadsRoute(
+  app: FastifyInstance,
+  opts: StaffThreadsRouteOpts = {},
+): void {
   const authHook = resolveAuthHook(opts);
+  const r2 = opts.r2 ?? defaultR2Client;
 
   // --- GET /staff/threads -------------------------------------------------
   //
@@ -66,7 +76,7 @@ export function registerStaffThreadsRoute(app: FastifyInstance, opts: AuthRouteO
         throw new ApiError('not_found', `thread ${id} not found`);
       }
       const rows = await messagesRepository.findLiveByThread(id);
-      return wireManyMessages(rows);
+      return wireManyMessages(rows, r2);
     },
   );
 
@@ -117,7 +127,7 @@ export function registerStaffThreadsRoute(app: FastifyInstance, opts: AuthRouteO
             senderStaffId: principal.staffId,
           });
 
-          const [wire] = await wireManyMessages([row]);
+          const [wire] = await wireManyMessages([row], r2);
           if (wire === undefined) {
             throw new Error(`staff reply ${id}: wire assembly returned no row`);
           }

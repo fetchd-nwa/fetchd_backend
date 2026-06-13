@@ -1,9 +1,27 @@
-import { and, asc, eq, isNull, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { messages } from '../schema/schema.js';
+import { mediaAssets, messageAttachments, messages } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { Tx } from '../tx.js';
 import type { MessageRowForWire } from '../../lib/threadWire.js';
+import type { MediaKind } from './mediaAssetsRepository.js';
+
+/**
+ * One attachment row joined to its media asset, for the message wire. Lives in
+ * the data layer (not threadWire) because it's a DB projection; the wire helper
+ * shapes + signs it. Only attachments whose media_asset is live are returned.
+ */
+export interface MessageAttachmentRow {
+  messageId: string;
+  mediaAssetId: string;
+  kind: MediaKind;
+  objectKey: string;
+  width: number | null;
+  height: number | null;
+  blurhash: string | null;
+  durationMs: number | null;
+  position: number;
+}
 
 /**
  * Data-access seam for `messages`. Day-7a addition. The polymorphic sender
@@ -81,7 +99,7 @@ export const messagesRepository = {
    */
   async createOwnerMessage(
     tx: Tx,
-    args: { threadId: string; ownerId: string; text: string },
+    args: { threadId: string; ownerId: string; text: string; attachmentMediaIds?: string[] },
   ): Promise<MessageRow> {
     const [row] = await tx
       .insert(messages)
@@ -95,7 +113,47 @@ export const messagesRepository = {
     if (!row) {
       throw new Error('messagesRepository.createOwnerMessage: INSERT returned no row');
     }
+    const attachmentMediaIds = args.attachmentMediaIds ?? [];
+    if (attachmentMediaIds.length > 0) {
+      // Link rows carry `position` = the client's order so the bubble renders
+      // them as sent. The route has already validated each id is the owner's
+      // live message-attachment media (see threads.ts).
+      await tx.insert(messageAttachments).values(
+        attachmentMediaIds.map((mediaAssetId, position) => ({
+          messageId: row.id,
+          mediaAssetId,
+          position,
+        })),
+      );
+    }
     return row;
+  },
+
+  /**
+   * Batch-load attachments for a set of messages, joined to their (live) media
+   * asset, ordered by message then position. The wire helper signs each
+   * `objectKey` into a short-lived GET URL. A soft-expired media asset drops
+   * out of the join (inner join + `expired_at IS NULL`), so an "unsent" photo
+   * silently disappears from the bubble.
+   */
+  async findAttachmentsByMessageIds(messageIds: string[]): Promise<MessageAttachmentRow[]> {
+    if (messageIds.length === 0) return [];
+    return db
+      .select({
+        messageId: messageAttachments.messageId,
+        mediaAssetId: messageAttachments.mediaAssetId,
+        kind: mediaAssets.kind,
+        objectKey: mediaAssets.objectKey,
+        width: mediaAssets.width,
+        height: mediaAssets.height,
+        blurhash: mediaAssets.blurhash,
+        durationMs: mediaAssets.durationMs,
+        position: messageAttachments.position,
+      })
+      .from(messageAttachments)
+      .innerJoin(mediaAssets, eq(messageAttachments.mediaAssetId, mediaAssets.id))
+      .where(and(inArray(messageAttachments.messageId, messageIds), isNull(mediaAssets.expiredAt)))
+      .orderBy(asc(messageAttachments.messageId), asc(messageAttachments.position));
   },
 
   /**

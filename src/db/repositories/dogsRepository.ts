@@ -69,6 +69,7 @@ export interface DogUpdate {
   specialNotes?: string;
   evaluationStatus?: EvaluationStatus;
   evaluationDate?: string | null;
+  profileImagePath?: string;
 }
 
 async function findManyByOwner(ownerId: string): Promise<AssembledDog[]> {

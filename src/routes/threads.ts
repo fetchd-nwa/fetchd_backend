@@ -6,8 +6,14 @@ import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { type MessageWire, type ThreadWire } from '../lib/threadWire.js';
 import { wireManyMessages, wireManyThreads } from '../lib/wireManyThreads.js';
-import { messagesRepository } from '../db/repositories/messagesRepository.js';
+import { messagesRepository, type MessageRow } from '../db/repositories/messagesRepository.js';
+import {
+  mediaAssetsRepository,
+  type MediaAssetRow,
+} from '../db/repositories/mediaAssetsRepository.js';
 import { threadsRepository } from '../db/repositories/threadsRepository.js';
+import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import type { Tx } from '../db/tx.js';
 
 /**
  * `GET /threads` `[auth]` · `GET /threads/:id` `[auth]` ·
@@ -36,12 +42,30 @@ const uuidParamSchema = z.object({
 });
 
 const MAX_MESSAGE_LEN = 4000;
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+// A message needs a body OR at least one attachment — an empty send is rejected.
+// `text` is optional so an attachment-only message is valid (stored as text='').
 const messageBodySchema = z
-  .object({ text: z.string().trim().min(1).max(MAX_MESSAGE_LEN) })
-  .strict();
+  .object({
+    text: z.string().trim().max(MAX_MESSAGE_LEN).optional(),
+    attachment_media_ids: z.array(z.string().uuid()).max(MAX_ATTACHMENTS_PER_MESSAGE).optional(),
+  })
+  .strict()
+  .refine(
+    (body) =>
+      (body.text !== undefined && body.text.length > 0) ||
+      (body.attachment_media_ids !== undefined && body.attachment_media_ids.length > 0),
+    { message: 'a message must have text or at least one attachment' },
+  );
 
-export function registerThreadsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
+export interface ThreadsRouteOpts extends AuthRouteOptions {
+  /** Override the R2 client (contract tests inject the stub for URL signing). */
+  r2?: R2Client;
+}
+
+export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpts = {}): void {
   const authHook = resolveAuthHook(opts);
+  const r2 = opts.r2 ?? defaultR2Client;
 
   // --- GET /threads -------------------------------------------------------
   app.get('/threads', { preHandler: [authHook] }, async (request): Promise<ThreadWire[]> => {
@@ -87,7 +111,7 @@ export function registerThreadsRoute(app: FastifyInstance, opts: AuthRouteOption
         throw new ApiError('not_found', `thread ${id} not found`);
       }
       const rows = await messagesRepository.findLiveByThread(id);
-      return wireManyMessages(rows);
+      return wireManyMessages(rows, r2);
     },
   );
 
@@ -137,44 +161,102 @@ export function registerThreadsRoute(app: FastifyInstance, opts: AuthRouteOption
     if (!owns) {
       throw new ApiError('not_found', `thread ${id} not found`);
     }
-    const { text } = parseMessageBody(request.body);
+    const { text, attachmentMediaIds } = parseMessageBody(request.body);
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     // cache-noop: threads/messages aren't in the §3 cache map (reads aren't cached).
-    const outcome = await withMutation<MessageWire>(
+    // The mutation returns the message ROW; the wire (which reads the just-
+    // committed attachment links) is assembled AFTER commit — the attachment
+    // loader reads via the pool, so it must run post-commit to see the inserts.
+    const outcome = await withMutation<MessageRow>(
       {
         principal,
         idempotencyKey,
         endpoint: 'POST /threads/:id/messages',
-        requestHash: hashRequestBody({ id, text }),
+        requestHash: hashRequestBody({ id, text, attachmentMediaIds }),
       },
       async (tx) => {
+        // Validate the attachments belong to this owner + are message media
+        // BEFORE the insert, inside the tx so a soft-expire can't race us.
+        const attachmentRows = await validateOwnerAttachments(
+          tx,
+          principal.ownerId,
+          attachmentMediaIds,
+        );
         const row = await messagesRepository.createOwnerMessage(tx, {
           threadId: id,
           ownerId: principal.ownerId,
           text,
+          attachmentMediaIds,
         });
-        await threadsRepository.bumpLastMessage(tx, id, text);
-        const [wire] = await wireManyMessages([row]);
-        if (wire === undefined) {
-          throw new Error(`thread ${id}: failed to build message wire`);
-        }
-        return { status: 201, body: wire };
+        await threadsRepository.bumpLastMessage(tx, id, threadPreview(text, attachmentRows));
+        return { status: 201, body: row };
       },
     );
+
+    const [wire] = await wireManyMessages([outcome.body], r2);
+    if (wire === undefined) {
+      throw new Error(`thread ${id}: failed to build message wire`);
+    }
     reply.code(outcome.status);
-    return outcome.body;
+    return wire;
   });
+}
+
+/**
+ * Validate a message's attachment ids in one round-trip: each must be a live
+ * media asset, owned by the sender, with `purpose='message-attachment'`. A
+ * missing or cross-owner id is a 404 (existence never leaks); a wrong-purpose
+ * id is a 422. Returns the rows in the order supplied (for the thread preview).
+ */
+async function validateOwnerAttachments(
+  tx: Tx,
+  ownerId: string,
+  ids: string[],
+): Promise<MediaAssetRow[]> {
+  if (ids.length === 0) return [];
+  const rows = await mediaAssetsRepository.findManyByIds(ids, tx);
+  const rowById = new Map(rows.map((r) => [r.id, r] as const));
+  const ordered: MediaAssetRow[] = [];
+  for (const mediaId of ids) {
+    const row = rowById.get(mediaId);
+    if (row === undefined || row.ownerId !== ownerId) {
+      throw new ApiError('not_found', `attachment media ${mediaId} not found`);
+    }
+    if (row.purpose !== 'message-attachment') {
+      throw new ApiError('invalid_payload', `media ${mediaId} is not a message attachment`);
+    }
+    ordered.push(row);
+  }
+  return ordered;
+}
+
+/**
+ * Thread-list preview line. Uses the message body when present; for an
+ * attachment-only message, a media summary ("Photo" / "Video" / "N attachments")
+ * so the threads list isn't blank.
+ */
+function threadPreview(text: string, attachments: MediaAssetRow[]): string {
+  if (text !== '') return text;
+  if (attachments.length === 1) {
+    return attachments[0]?.kind === 'video' ? 'Video' : 'Photo';
+  }
+  return `${attachments.length} attachments`;
 }
 
 // ---- body parsing --------------------------------------------------------
 
-function parseMessageBody(body: unknown): { text: string } {
+function parseMessageBody(body: unknown): { text: string; attachmentMediaIds: string[] } {
   const parsed = messageBodySchema.safeParse(body);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid body: ${formatZodIssues(parsed.error)}`);
   }
-  return parsed.data;
+  // Normalize: an attachment-only message stores text='' (the schema's refine
+  // guarantees text-nonempty OR ≥1 attachment, so this is never a no-op send).
+  return {
+    text: parsed.data.text ?? '',
+    attachmentMediaIds: parsed.data.attachment_media_ids ?? [],
+  };
 }
 
 // ---- param parsing -------------------------------------------------------

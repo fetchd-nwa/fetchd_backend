@@ -26,15 +26,26 @@ const VIDEO_TYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
 
 /**
  * Enforce the per-purpose content-type rule. Image purposes accept image/*;
- * `report-video` accepts video MIMEs. Day-17 ships sharp-only — a video's
- * derivatives job parks until ffmpeg lands, but the source is still stored +
- * readable. Throws 400 on a mismatch.
+ * `report-video` accepts video MIMEs; `message-attachment` accepts EITHER
+ * (owners send both photos and videos in chat). Day-17 ships sharp-only — a
+ * video's derivatives job parks until ffmpeg lands, but the source is still
+ * stored + readable. Throws 400 on a mismatch.
  */
 export function assertContentTypeMatchesPurpose(purpose: MediaPurpose, contentType: string): void {
   const isImage = IMAGE_TYPES.has(contentType);
   const isVideo = VIDEO_TYPES.has(contentType);
-  const wantsVideo = purpose === 'report-video';
 
+  if (purpose === 'message-attachment') {
+    if (!isImage && !isVideo) {
+      throw new ApiError(
+        'bad_request',
+        `purpose '${purpose}' requires an image or video content_type, got '${contentType}'`,
+      );
+    }
+    return;
+  }
+
+  const wantsVideo = purpose === 'report-video';
   if (wantsVideo && !isVideo) {
     throw new ApiError(
       'bad_request',
@@ -47,6 +58,11 @@ export function assertContentTypeMatchesPurpose(purpose: MediaPurpose, contentTy
       `purpose '${purpose}' requires an image content_type (jpeg/png/webp/heic/heif), got '${contentType}'`,
     );
   }
+}
+
+/** Map a content type to its media kind. Videos are `video/*`; everything else image. */
+export function mediaKindForContentType(contentType: string): 'image' | 'video' {
+  return contentType.startsWith('video/') ? 'video' : 'image';
 }
 
 /** Server-generated R2 object key: `{purpose}/{principal-scope}/{uuid}.{ext}`. */

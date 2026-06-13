@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm/relations";
-import { owners, dogs, staff, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, bookings, afterSchoolOptins, pendingRequests, cancelWindowSettings, creditLedger, creditPackages, charges, paymentMethods, stripeCustomers, invoices, memberships, agreementSignatures, agreementDocuments, refunds, idempotencyKeys, threads, notifications, messages, eventSeries, events, eventRsvps, scheduledNotifications, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, bookingDogs } from "./schema.js";
+import { owners, dogs, staff, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, bookings, afterSchoolOptins, pendingRequests, cancelWindowSettings, creditLedger, creditPackages, charges, paymentMethods, stripeCustomers, invoices, memberships, agreementSignatures, agreementDocuments, refunds, idempotencyKeys, threads, notifications, messages, messageAttachments, eventSeries, events, eventRsvps, scheduledNotifications, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, bookingDogs } from "./schema.js";
 
 export const dogsRelations = relations(dogs, ({one, many}) => ({
 	owner: one(owners, {
@@ -166,7 +166,7 @@ export const reportsRelations = relations(reports, ({one, many}) => ({
 	scheduledNotifications: many(scheduledNotifications),
 }));
 
-export const mediaAssetsRelations = relations(mediaAssets, ({one}) => ({
+export const mediaAssetsRelations = relations(mediaAssets, ({one, many}) => ({
 	owner: one(owners, {
 		fields: [mediaAssets.ownerId],
 		references: [owners.id]
@@ -179,6 +179,7 @@ export const mediaAssetsRelations = relations(mediaAssets, ({one}) => ({
 		fields: [mediaAssets.reportId],
 		references: [reports.id]
 	}),
+	messageAttachments: many(messageAttachments),
 }));
 
 export const bookingsRelations = relations(bookings, ({one, many}) => ({
@@ -427,7 +428,7 @@ export const notificationsRelations = relations(notifications, ({one, many}) => 
 	notificationDogs: many(notificationDogs),
 }));
 
-export const messagesRelations = relations(messages, ({one}) => ({
+export const messagesRelations = relations(messages, ({one, many}) => ({
 	thread: one(threads, {
 		fields: [messages.threadId],
 		references: [threads.id]
@@ -439,6 +440,18 @@ export const messagesRelations = relations(messages, ({one}) => ({
 	staff: one(staff, {
 		fields: [messages.senderStaffId],
 		references: [staff.id]
+	}),
+	messageAttachments: many(messageAttachments),
+}));
+
+export const messageAttachmentsRelations = relations(messageAttachments, ({one}) => ({
+	message: one(messages, {
+		fields: [messageAttachments.messageId],
+		references: [messages.id]
+	}),
+	mediaAsset: one(mediaAssets, {
+		fields: [messageAttachments.mediaAssetId],
+		references: [mediaAssets.id]
 	}),
 }));
 
