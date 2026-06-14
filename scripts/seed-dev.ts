@@ -35,6 +35,7 @@ import {
   classResources,
   cohorts,
   creditLedger,
+  creditPackages,
   dogCompletedClasses,
   dogs,
   eventRsvpDogs,
@@ -198,6 +199,7 @@ async function wipe(): Promise<void> {
   await db.delete(refunds);
   await db.delete(invoices);
   await db.delete(creditLedger);
+  await db.delete(creditPackages);
   await db.delete(charges);
   await db.delete(bookingDogs);
   await db.delete(bookings);
@@ -300,6 +302,76 @@ async function seed(): Promise<void> {
       isDefault: true,
     },
   ]);
+
+  // Credit-package catalog — real NWA pricing from the Gingr portal (Δ
+  // 2026-06-13). Fayetteville + Bentonville carry the identical set; staff will
+  // edit/add/remove packages via the portal post-launch, so this is the launch
+  // catalog, not a fixed source of truth. Multi-credit packs (credits > 1)
+  // expire 1 year after purchase — enforced by the deferred credit-expiry task;
+  // the single-day pack (1 credit) never expires.
+  const creditPackageCatalog = [
+    {
+      key: 'school-2x-weekly',
+      mode: 'school',
+      credits: 8,
+      priceCents: 45600,
+      label: '2x Weekly Package',
+      isPopular: false,
+    },
+    {
+      key: 'school-3x-weekly',
+      mode: 'school',
+      credits: 12,
+      priceCents: 64800,
+      label: '3x Weekly Package',
+      isPopular: true,
+    },
+    {
+      key: 'school-5x-weekly',
+      mode: 'school',
+      credits: 20,
+      priceCents: 102000,
+      label: '5x Weekly Package',
+      isPopular: false,
+    },
+    {
+      key: 'school-alumni-10',
+      mode: 'school',
+      credits: 10,
+      priceCents: 32000,
+      label: 'Alumni — 10 Visits',
+      isPopular: false,
+    },
+    {
+      key: 'daycare-10',
+      mode: 'daycare',
+      credits: 10,
+      priceCents: 35000,
+      label: 'Day Care Package',
+      isPopular: false,
+    },
+    {
+      key: 'school-single-day',
+      mode: 'school',
+      credits: 1,
+      priceCents: 6000,
+      label: 'Single Day School',
+      isPopular: false,
+    },
+  ] as const;
+  await db.insert(creditPackages).values(
+    (['fayetteville', 'bentonville'] as const).flatMap((location) =>
+      creditPackageCatalog.map((pkg) => ({
+        key: pkg.key,
+        location,
+        mode: pkg.mode,
+        credits: pkg.credits,
+        priceCents: pkg.priceCents,
+        label: pkg.label,
+        isPopular: pkg.isPopular,
+      })),
+    ),
+  );
 
   await db.insert(dogs).values([
     {
