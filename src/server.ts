@@ -34,6 +34,7 @@ import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
 import { registerThreadsRoute } from './routes/threads.js';
 import { registerUploadsSignRoute } from './routes/uploadsSign.js';
 import { registerVetsRoute } from './routes/vets.js';
+import { registerWelcomeDogsRoute } from './routes/welcomeDogs.js';
 import { registerWorkersTickRoute } from './routes/workersTick.js';
 
 /**
@@ -51,6 +52,7 @@ export function buildApp(): FastifyInstance {
   // ApiError→HTTP mapper every route relies on.
   registerAuth(app);
   registerHealthRoute(app); // [public] — no auth guard
+  registerWelcomeDogsRoute(app); // [public] — pre-login welcome gallery
   registerAuthWebhook(app); // [public, signed] — own raw-body scope
   registerStripeWebhookRoute(app); // [public, signed] — Day-15; own raw-body scope
   registerMeRoute(app); // [auth]

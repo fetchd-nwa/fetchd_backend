@@ -50,6 +50,7 @@ function ownerProfile(row: typeof owners.$inferSelect) {
     push_notification_categories: row.pushNotificationCategories,
     email_notifications_enabled: row.emailNotificationsEnabled,
     email_notification_categories: row.emailNotificationCategories,
+    show_dogs_on_welcome: row.showDogsOnWelcome,
   };
 }
 
@@ -88,6 +89,7 @@ const patchMeSchema = z
     push_notification_categories: z.record(z.unknown()),
     email_notifications_enabled: z.boolean(),
     email_notification_categories: z.record(z.unknown()),
+    show_dogs_on_welcome: z.boolean(),
   })
   .strict()
   .partial();
@@ -111,6 +113,7 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
     set.emailNotificationsEnabled = patch.email_notifications_enabled;
   if (patch.email_notification_categories !== undefined)
     set.emailNotificationCategories = patch.email_notification_categories;
+  if (patch.show_dogs_on_welcome !== undefined) set.showDogsOnWelcome = patch.show_dogs_on_welcome;
   return set;
 }
 

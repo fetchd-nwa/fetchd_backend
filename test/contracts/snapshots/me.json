@@ -13,5 +13,6 @@
   "push_notifications_enabled": true,
   "push_notification_categories": { "booking": true, "message": true },
   "email_notifications_enabled": true,
-  "email_notification_categories": { "booking": true, "message": true }
+  "email_notification_categories": { "booking": true, "message": true },
+  "show_dogs_on_welcome": true
 }

@@ -59,6 +59,7 @@ export const owners = pgTable("owners", {
 	pushNotificationCategories: jsonb("push_notification_categories").default({}).notNull(),
 	emailNotificationsEnabled: boolean("email_notifications_enabled").default(true).notNull(),
 	emailNotificationCategories: jsonb("email_notification_categories").default({}).notNull(),
+	showDogsOnWelcome: boolean("show_dogs_on_welcome").default(true).notNull(),
 	externalRef: text("external_ref"),
 	source: recordSource().default('app').notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
