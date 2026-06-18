@@ -535,9 +535,13 @@ test(
 );
 
 test(
-  'charge.refund.updated returns refund-not-yet-recorded when no row matches',
+  'charge.refund.updated with no matching refunds row → 500 + claim released (forces redelivery)',
   SKIP_WHEN_NO_DB,
   async () => {
+    // Behavior change (booking/refund review 2026-06-18): a refund event whose
+    // DB row isn't found is a delivery race (the refunds row commits before the
+    // Stripe call), so we throw → release the claim → 500 → Stripe redelivers,
+    // rather than mark it processed and strand the refund at 'pending'.
     await cleanupTestState();
     const { app, stripe } = buildApp();
     const eventId = evtId();
@@ -555,10 +559,13 @@ test(
       headers: { 'stripe-signature': 't=1,v1=fake' },
       payload: { id: eventId },
     });
-    assert.equal(res.statusCode, 200);
-    assert.equal((res.json() as { outcome: string }).outcome, 'refund-not-yet-recorded');
+    assert.equal(res.statusCode, 500);
 
-    await db.delete(stripeEvents).where(eq(stripeEvents.eventId, eventId));
+    const rows = await db
+      .select({ eventId: stripeEvents.eventId })
+      .from(stripeEvents)
+      .where(eq(stripeEvents.eventId, eventId));
+    assert.equal(rows.length, 0, 'claim released so Stripe redelivers');
   },
 );
 

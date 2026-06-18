@@ -40,16 +40,26 @@ export interface WebhookHandlerResult {
     | 'flipped-charge-succeeded'
     | 'flipped-charge-failed'
     | 'charge-already-terminal'
+    | 'reconstructed-package-purchase'
     | 'wrote-payment-method'
     | 'payment-method-already-present'
     | 'flipped-refund-succeeded'
     | 'flipped-refund-failed'
-    | 'refund-not-yet-recorded'
     | 'orphan-event'
     | 'noop';
   /** Optional human-readable note for the log line. */
   note?: string;
 }
+
+/**
+ * Thrown by a handler when it can't yet process an event whose backing DB
+ * row should exist imminently (a delivery race) — e.g. a `charge.refund.
+ * updated` that beats the cancel route's `refunds` insert+commit. The
+ * receiver catches it, releases the `stripe_events` claim, and re-throws →
+ * 500 → Stripe redelivers. Distinct from a genuine `orphan-event` (which is
+ * marked processed and dropped) precisely because we WANT the retry.
+ */
+export class WebhookRetryError extends Error {}
 
 /**
  * Dispatch table: one handler per narrow event-type arm. Each handler
@@ -101,9 +111,22 @@ async function handlePaymentIntentSucceeded(
   return withActor(WEBHOOK_ACTOR, async (tx) => {
     const charge = await chargesRepository.findByStripePaymentIntentId(tx, event.paymentIntentId);
     if (charge === undefined) {
+      // No charges row for a SUCCEEDED PaymentIntent — Stripe captured money
+      // but the synchronous purchase write never landed (DB failure after the
+      // Stripe call committed at Stripe's side). For a credit-package purchase
+      // the PI metadata carries everything to rebuild the record, so the
+      // webhook is the safety net: reconstruct the charge + grant idempotently.
+      // (Invoice auto-charge orphans self-heal via the worker's next tick, so
+      // only the client-driven package purchase needs this path.)
+      const reconstructed = await maybeReconstructOrphanedPackagePurchase(tx, {
+        paymentIntentId: event.paymentIntentId,
+        amountCents: event.amountCents,
+        metadata: event.metadata,
+      });
+      if (reconstructed) return { outcome: 'reconstructed-package-purchase' };
       return {
         outcome: 'orphan-event',
-        note: `no charges row for PI ${event.paymentIntentId}`,
+        note: `no charges row for PI ${event.paymentIntentId} (no package metadata to reconstruct)`,
       };
     }
 
@@ -126,6 +149,46 @@ async function handlePaymentIntentSucceeded(
   });
 }
 
+interface PackagePurchaseMetadata {
+  dogId: string;
+  packageId: string;
+  credits: number;
+  mode: BookingMode;
+  location: LocationKey;
+}
+
+/**
+ * Validate the grant-bearing PaymentIntent metadata the credit-purchase route
+ * stamps (`routes/creditPackages.ts`). Returns the typed fields, or undefined
+ * when the metadata is missing/malformed (a PI minted by something other than
+ * a package purchase — e.g. an invoice auto-charge). `owner_id` is NOT here:
+ * the ledger grant doesn't need it, and the catch-up consumer reads the owner
+ * off the existing charge row. The reconstruct consumer validates `owner_id`
+ * separately (it has no charge row to read it from).
+ */
+function parsePackagePurchaseMetadata(
+  metadata: Record<string, string>,
+): PackagePurchaseMetadata | undefined {
+  const dogId = metadata.dog_id;
+  const packageId = metadata.package_id;
+  const credits = Number(metadata.credits);
+  const mode = metadata.mode;
+  const location = metadata.location;
+  if (
+    typeof dogId !== 'string' ||
+    dogId.length === 0 ||
+    typeof packageId !== 'string' ||
+    packageId.length === 0 ||
+    !Number.isFinite(credits) ||
+    credits <= 0 ||
+    (mode !== 'school' && mode !== 'daycare') ||
+    !isLocationKey(location)
+  ) {
+    return undefined;
+  }
+  return { dogId, packageId, credits, mode, location };
+}
+
 /**
  * Write a `credit_ledger` purchase row if one doesn't already exist for
  * this charge. The async-confirm path of `POST /credit-packages/:key/purchase`
@@ -144,33 +207,53 @@ async function maybeWritePurchaseLedgerRow(
     .limit(1);
   if (existing.length > 0) return;
 
-  const dogId = args.metadata.dog_id;
-  const packageId = args.metadata.package_id;
-  const credits = Number(args.metadata.credits);
-  const mode = args.metadata.mode as BookingMode | undefined;
-  const location = args.metadata.location;
-  if (
-    typeof dogId !== 'string' ||
-    typeof packageId !== 'string' ||
-    !Number.isFinite(credits) ||
-    credits <= 0 ||
-    (mode !== 'school' && mode !== 'daycare') ||
-    !isLocationKey(location)
-  ) {
-    // Metadata missing/malformed (a charge minted by something other
-    // than the Day-14 credit-purchase route). Log + skip; the charge
-    // row's `succeeded` flip still landed, which is the load-bearing
-    // fact for the audit + future reconciliation.
+  const parsed = parsePackagePurchaseMetadata(args.metadata);
+  if (parsed === undefined) {
+    // Metadata missing/malformed (a charge minted by something other than
+    // the credit-purchase route). Skip the grant; the charge row's status is
+    // the load-bearing fact for the audit + future reconciliation.
     return;
   }
   await creditLedgerRepository.creditPurchase(tx, {
-    dogId,
-    mode,
-    location,
-    delta: credits,
-    packageId,
+    dogId: parsed.dogId,
+    mode: parsed.mode,
+    location: parsed.location,
+    delta: parsed.credits,
+    packageId: parsed.packageId,
     chargeId: args.chargeId,
   });
+}
+
+/**
+ * Rebuild a missing credit-package purchase from the PaymentIntent metadata
+ * after a sync-path DB failure left Stripe holding the money with no record.
+ * Returns true when it reconstructed (the PI was a package purchase), false
+ * when the metadata isn't a package purchase (a genuine orphan the caller
+ * reports as such). Idempotent: the charge insert is `ON CONFLICT DO NOTHING`
+ * on the unique PI, and the grant is the same `maybeWritePurchaseLedgerRow`
+ * no-op-if-present write — so a concurrent client retry and this path can't
+ * double-charge or double-grant.
+ */
+async function maybeReconstructOrphanedPackagePurchase(
+  tx: Tx,
+  args: { paymentIntentId: string; amountCents: number; metadata: Record<string, string> },
+): Promise<boolean> {
+  const parsed = parsePackagePurchaseMetadata(args.metadata);
+  if (parsed === undefined) return false;
+  // The reconstruct builds the charge from scratch, so it additionally needs
+  // the owner (the grant path above gets it from the existing charge row).
+  const ownerId = args.metadata.owner_id;
+  if (typeof ownerId !== 'string' || ownerId.length === 0) return false;
+
+  const { charge } = await chargesRepository.insertIfAbsentByPaymentIntent(tx, {
+    ownerId,
+    amountCents: args.amountCents,
+    status: 'succeeded',
+    purpose: 'package',
+    stripePaymentIntentId: args.paymentIntentId,
+  });
+  await maybeWritePurchaseLedgerRow(tx, { chargeId: charge.id, metadata: args.metadata });
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -338,10 +421,15 @@ async function handleChargeRefundUpdated(
     }
 
     if (refund === undefined) {
-      return {
-        outcome: 'refund-not-yet-recorded',
-        note: `no refunds row for ${event.refundId}; Stripe will redeliver`,
-      };
+      // The `refunds` row is committed BEFORE the cancel route's post-commit
+      // Stripe call, so "not found" here is a delivery race that resolves on
+      // the next redelivery — NOT a terminal orphan. Throw so the receiver
+      // releases the claim and Stripe redelivers; marking it processed (the
+      // old behavior) would strand the refund at 'pending' forever and never
+      // flip the charge to 'refunded'.
+      throw new WebhookRetryError(
+        `no refunds row yet for ${event.refundId}; forcing Stripe redelivery`,
+      );
     }
 
     if (refund.status === mappedStatus && backfillStripeId === undefined) {

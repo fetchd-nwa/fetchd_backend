@@ -115,6 +115,50 @@ export const chargesRepository = {
   },
 
   /**
+   * INSERT a charge, idempotent on the unique `stripe_payment_intent_id`.
+   * Returns the row (newly created OR the pre-existing one) + whether this
+   * call created it.
+   *
+   * The webhook orphan-recovery path (`handlePaymentIntentSucceeded`) uses
+   * this to reconstruct a `charges` row from PI metadata when the synchronous
+   * purchase write failed entirely AFTER Stripe captured payment — otherwise
+   * the money is taken with no record and no credits. Safe under a concurrent
+   * client retry: the unique PI makes the second INSERT a no-op (`DO NOTHING`)
+   * that falls through to the re-SELECT, so the grant is written exactly once.
+   */
+  async insertIfAbsentByPaymentIntent(
+    tx: Tx,
+    args: {
+      ownerId: string;
+      amountCents: number;
+      status: ChargeStatus;
+      purpose: ChargePurpose;
+      stripePaymentIntentId: string;
+    },
+  ): Promise<{ charge: ChargeRow; created: boolean }> {
+    const [inserted] = await tx
+      .insert(charges)
+      .values({
+        ownerId: args.ownerId,
+        amountCents: args.amountCents,
+        currency: 'usd',
+        status: args.status,
+        purpose: args.purpose,
+        stripePaymentIntentId: args.stripePaymentIntentId,
+      })
+      .onConflictDoNothing({ target: charges.stripePaymentIntentId })
+      .returning(CHARGE_PROJECTION);
+    if (inserted) return { charge: inserted, created: true };
+    const existing = await this.findByStripePaymentIntentId(tx, args.stripePaymentIntentId);
+    if (existing === undefined) {
+      throw new Error(
+        `insertIfAbsentByPaymentIntent: conflict on ${args.stripePaymentIntentId} but no row found`,
+      );
+    }
+    return { charge: existing, created: false };
+  },
+
+  /**
    * The succeeded group-class charge for one (cohort, dog) enrollment, if
    * any — the withdraw verb's "was this dog's enrollment paid-now?" probe.
    * A 'refunded' charge is excluded (already reversed), so a double-withdraw
