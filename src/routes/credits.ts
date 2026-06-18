@@ -5,6 +5,7 @@ import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { creditsRepository } from '../db/repositories/creditsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
+import type { BookingMode } from '../lib/bookingMode.js';
 
 /**
  * `GET /dogs/:id/credits?location=<key>` `[auth]` — per-dog, per-mode,
@@ -27,11 +28,24 @@ type LocationKey = (typeof LOCATION_KEYS)[number];
 const uuidParamSchema = z.object({ id: z.string().uuid() });
 const creditsQuerySchema = z.object({ location: z.enum(LOCATION_KEYS) });
 
+/** A live expiring lot's remaining credits + lapse date (soonest-first list). */
+export interface CreditLotWire {
+  mode: BookingMode;
+  remaining: number;
+  expires_at: string;
+}
+
 export interface CreditsWire {
   dog_id: string;
   location: LocationKey;
   school: number;
   daycare: number;
+  /**
+   * Live lots that EXPIRE (count + date), soonest first. Never-expiring credits
+   * are omitted — they're in `school`/`daycare` but have nothing to warn about.
+   * Δ 2026-06-18 (credit-expiry lot model).
+   */
+  expiring_lots: CreditLotWire[];
 }
 
 export function registerCreditsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
@@ -55,7 +69,18 @@ export function registerCreditsRoute(app: FastifyInstance, opts: AuthRouteOption
       if (balances === null) {
         throw new ApiError('not_found', `dog ${dogId} not found`);
       }
-      return { dog_id: dogId, location, school: balances.school, daycare: balances.daycare };
+      const lots = await creditsRepository.findExpiringLots(dogId, location);
+      return {
+        dog_id: dogId,
+        location,
+        school: balances.school,
+        daycare: balances.daycare,
+        expiring_lots: lots.map((lot) => ({
+          mode: lot.mode,
+          remaining: lot.remaining,
+          expires_at: lot.expiresAt,
+        })),
+      };
     },
   );
 }

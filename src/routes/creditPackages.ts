@@ -8,6 +8,7 @@ import { creditPackagesRepository } from '../db/repositories/creditPackagesRepos
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { invalidatePattern } from '../lib/cache.js';
+import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
 import { ApiError } from '../lib/errors.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
@@ -208,6 +209,9 @@ export function registerCreditPackagesRoute(
               delta: pkg.credits,
               packageId: pkg.id,
               chargeId: charge.id,
+              // Stamp the lot's expiry from the then-current window (non-
+              // retroactive). 1-credit packs never expire (helper returns null).
+              expiresAt: resolvePurchaseExpiry(pkg.location, pkg.credits, nowFactory()),
             });
           }
 

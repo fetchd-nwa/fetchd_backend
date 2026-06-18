@@ -3,6 +3,8 @@ import { db } from '../client.js';
 import { dogCreditBalance, dogs, LOCATION_SLUGS } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import { assertNever } from '../../lib/assertNever.js';
+import { findLiveExpiringLots } from './creditLedgerRepository.js';
+import type { BookingMode } from '../../lib/bookingMode.js';
 
 type LocationKey = (typeof LOCATION_SLUGS)[number];
 
@@ -28,6 +30,18 @@ type LocationKey = (typeof LOCATION_SLUGS)[number];
 export interface CreditsBalance {
   school: number;
   daycare: number;
+}
+
+/**
+ * One live EXPIRING lot's remaining credits + when they lapse. Never-expiring
+ * credits (1-credit packs, legacy/imports, pool) aren't listed — there's
+ * nothing to warn about; they're already in the `CreditsBalance` totals.
+ */
+export interface CreditLot {
+  mode: BookingMode;
+  remaining: number;
+  /** ISO timestamp; always present (only expiring lots are returned). */
+  expiresAt: string;
 }
 
 export const creditsRepository = {
@@ -69,5 +83,21 @@ export const creditsRepository = {
       }
     }
     return { school, daycare };
+  },
+
+  /**
+   * The dog's LIVE expiring lots for a location — remaining credits per lot +
+   * expiry, soonest first — so the owner app can surface "N credits expire on
+   * {date}". Remaining = the lot's grant plus every allocation (debit−/refund+)
+   * tagged to it; exhausted and expired lots are excluded. Ownership is NOT
+   * re-checked here; callers gate on `findBalancesForOwnedDog` first.
+   */
+  async findExpiringLots(dogId: string, location: LocationKey): Promise<CreditLot[]> {
+    const lots = await findLiveExpiringLots(db, { dogId, location });
+    return lots.map((lot) => ({
+      mode: lot.mode,
+      remaining: lot.remaining,
+      expiresAt: lot.expiresAt,
+    }));
   },
 };

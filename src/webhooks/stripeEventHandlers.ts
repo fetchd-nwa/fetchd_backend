@@ -2,6 +2,7 @@ import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedger, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
@@ -221,6 +222,10 @@ async function maybeWritePurchaseLedgerRow(
     delta: parsed.credits,
     packageId: parsed.packageId,
     chargeId: args.chargeId,
+    // Same lot-expiry stamp as the sync purchase route (this covers the catch-up
+    // grant AND the orphan reconstruct, which delegates here). 1-credit packs
+    // never expire (helper returns null).
+    expiresAt: resolvePurchaseExpiry(parsed.location, parsed.credits, new Date()),
   });
 }
 

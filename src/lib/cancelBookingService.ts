@@ -86,13 +86,18 @@ export async function cancelBookingInTx(
   if (!updated.cancelForfeited) {
     const debits = await creditLedgerRepository.findDebitsForBooking(tx, id);
     if (debits.length > 0) {
-      // CREDIT-BACK: one +1 refund row per original debit.
+      // CREDIT-BACK: one +1 refund row per original debit, routed back to the
+      // lot it drew from (or a fresh lot if that lot has since expired).
+      const now = new Date();
       for (const debit of debits) {
         await creditLedgerRepository.refundForBooking(tx, {
           dogId: debit.dogId,
           mode: debit.mode,
           location: debit.location,
           bookingId: id,
+          lotId: debit.lotId,
+          lotExpiresAt: debit.lotExpiresAt,
+          now,
         });
       }
     } else {
