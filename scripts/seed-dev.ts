@@ -634,7 +634,11 @@ async function seed(): Promise<void> {
       category: 'boarding',
       status: 'upcoming',
       scheduledAt: daysFromNow(5, 15),
-      durationMinutes: null,
+      // Spans dropoff (day 5, 15:00) → pickup (day 9, 17:00) = 4d2h. The wire
+      // only emits `duration_minutes` (never pickup_at), so the owner app's
+      // residential booking-conflict block reads the stay length from here —
+      // leaving it null would gray a single day instead of the whole stay.
+      durationMinutes: 5880,
       trainerStaffId: SEED.staffFedId,
       dropoffAt: daysFromNow(5, 15),
       pickupAt: daysFromNow(9, 17),
