@@ -220,7 +220,7 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
       additional_dog_ids: [FIXTURE_IDS.dog2Id],
       preferred_dates: [PREFERRED_1, PREFERRED_2, PREFERRED_3],
       notes: { per_dog: 'Waffles needs leash polish', joint: 'walk best together' },
-      focus: { staff_preference: 'rachel', comfort_level: 'high' },
+      focus: { staff_preference: 'rachel', descriptor_keys: ['nervous', 'reactive-on-leash'] },
     },
   });
   assert.equal(res.statusCode, 201, res.body);
@@ -232,7 +232,7 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
     status: string;
     preferred_dates: string[];
     notes?: { per_dog?: string; joint?: string };
-    focus: { staff_preference?: string; comfort_level?: string };
+    focus: { staff_preference?: string; descriptor_keys?: string[] };
   };
   assert.equal(body.category, 'private-lesson');
   assert.equal(body.status, 'submitted');
@@ -242,7 +242,7 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
   assert.equal(body.notes?.per_dog, 'Waffles needs leash polish');
   assert.equal(body.notes?.joint, 'walk best together');
   assert.equal(body.focus.staff_preference, 'rachel');
-  assert.equal(body.focus.comfort_level, 'high');
+  assert.deepEqual(body.focus.descriptor_keys, ['nervous', 'reactive-on-leash']);
 });
 
 test(

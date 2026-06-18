@@ -8,7 +8,6 @@ import {
 import { live } from '../softExpire.js';
 import type { Tx } from '../tx.js';
 import type {
-  ComfortLevel,
   PendingRequestDogRow,
   PendingRequestRowForWire,
   RequestStatus,
@@ -71,7 +70,7 @@ const PENDING_REQUEST_PROJECTION = {
   notesPerDog: pendingRequests.notesPerDog,
   notesJoint: pendingRequests.notesJoint,
   staffPreference: pendingRequests.staffPreference,
-  comfortLevel: pendingRequests.comfortLevel,
+  descriptorKeys: pendingRequests.descriptorKeys,
   lengthWeeks: pendingRequests.lengthWeeks,
   approvedAt: pendingRequests.approvedAt,
   convertedBookingId: pendingRequests.convertedBookingId,
@@ -289,7 +288,7 @@ export const requestsRepository = {
       notesPerDog: string | null;
       notesJoint: string | null;
       staffPreference: string | null;
-      comfortLevel: ComfortLevel | null;
+      descriptorKeys: string[];
       lengthWeeks: number | null;
     },
   ): Promise<{ id: string }> {
@@ -302,7 +301,7 @@ export const requestsRepository = {
         notesPerDog: values.notesPerDog,
         notesJoint: values.notesJoint,
         staffPreference: values.staffPreference,
-        comfortLevel: values.comfortLevel,
+        descriptorKeys: values.descriptorKeys,
         lengthWeeks: values.lengthWeeks,
         // status defaults to 'submitted' (schema); submittedAt /
         // createdAt / updatedAt default to now(); source defaults to
@@ -365,7 +364,7 @@ export const requestsRepository = {
       notesPerDog?: string | null;
       notesJoint?: string | null;
       staffPreference?: string | null;
-      comfortLevel?: ComfortLevel | null;
+      descriptorKeys?: string[];
       lengthWeeks?: number | null;
     },
   ): Promise<void> {

@@ -4,7 +4,7 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { requestsRepository } from '../db/repositories/requestsRepository.js';
-import { comfortLevel, requestStatus } from '../db/schema/schema.js';
+import { requestStatus } from '../db/schema/schema.js';
 import {
   alreadyRequestedError,
   evaluationRequiredError,
@@ -13,7 +13,7 @@ import {
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
-import { type ComfortLevel, type PendingRequestWire } from '../lib/requestWire.js';
+import { type PendingRequestWire } from '../lib/requestWire.js';
 import { sortRequestsBySubmittedAt, wireManyRequests } from '../lib/wireManyRequests.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
@@ -37,7 +37,7 @@ import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
  * Wire shape per §B PendingRequest (R1 multi-dog, R8 structured focus).
  * The DB stores notes + focus as scalar columns; the wire helper composes
  * them into `{notes:{per_dog?,joint?}, focus:{staff_preference?,
- * comfort_level?}}`. `notes` is whole-object optional-omit; `focus` is
+ * descriptor_keys?}}`. `notes` is whole-object optional-omit; `focus` is
  * required outer (always emit `{}` minimum), inner keys optional-omit.
  *
  * Layer responsibilities (mirrors Day-5a bookings):
@@ -47,7 +47,6 @@ import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
  *   wire    → DB row + dog ids + preferred-date ISOs → §B JSON shape
  */
 const REQUEST_STATUS_VALUES = pgEnumTuple(requestStatus);
-const COMFORT_LEVEL_VALUES = pgEnumTuple(comfortLevel);
 
 const statusQuerySchema = z.object({
   status: z.enum(REQUEST_STATUS_VALUES).optional(),
@@ -87,6 +86,12 @@ const MAX_LOOKAHEAD_DAYS = 92;
 const MAX_LENGTH_WEEKS = 12;
 const MAX_NOTE_LENGTH = 2000;
 const MAX_STAFF_PREF_LENGTH = 100;
+// `descriptor_keys` are staff-defined trait slugs (vocabulary in dog_descriptors,
+// surfaced as FE pills). Stored as an opaque text[] — no FK on array elements
+// (same loose coupling as staff_preference → staff slug), so the API only bounds
+// shape: a generous count cap and per-key length cap against a hostile body.
+const MAX_DESCRIPTOR_KEYS = 20;
+const MAX_DESCRIPTOR_KEY_LENGTH = 64;
 const ONE_DAY_MS = 86_400_000;
 
 /**
@@ -101,7 +106,10 @@ type RequestCategory = (typeof REQUEST_CATEGORIES)[number];
 const focusBodySchema = z
   .object({
     staff_preference: z.string().trim().max(MAX_STAFF_PREF_LENGTH).optional(),
-    comfort_level: z.enum(COMFORT_LEVEL_VALUES).optional(),
+    descriptor_keys: z
+      .array(z.string().trim().min(1).max(MAX_DESCRIPTOR_KEY_LENGTH))
+      .max(MAX_DESCRIPTOR_KEYS)
+      .optional(),
   })
   .strict();
 
@@ -294,7 +302,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
             notesPerDog: parsed.notesPerDog,
             notesJoint: parsed.notesJoint,
             staffPreference: parsed.staffPreference,
-            comfortLevel: parsed.comfortLevel,
+            descriptorKeys: parsed.descriptorKeys,
             lengthWeeks: parsed.lengthWeeks,
           });
 
@@ -377,7 +385,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
             notesPerDog: parsed.notesPerDog,
             notesJoint: parsed.notesJoint,
             staffPreference: parsed.staffPreference,
-            comfortLevel: parsed.comfortLevel,
+            descriptorKeys: parsed.descriptorKeys,
             lengthWeeks: parsed.lengthWeeks,
           });
           if (parsed.preferredDates !== undefined) {
@@ -484,7 +492,7 @@ interface ValidatedPostRequestBody {
   notesPerDog: string | null;
   notesJoint: string | null;
   staffPreference: string | null;
-  comfortLevel: ComfortLevel | null;
+  descriptorKeys: string[];
   lengthWeeks: number | null;
 }
 
@@ -563,7 +571,7 @@ function validatePostRequestBody(body: PostRequestBody): ValidatedPostRequestBod
     notesPerDog: normalizeNullableString(body.notes?.per_dog),
     notesJoint: normalizeNullableString(body.notes?.joint),
     staffPreference: normalizeNullableString(body.focus?.staff_preference),
-    comfortLevel: body.focus?.comfort_level ?? null,
+    descriptorKeys: body.focus?.descriptor_keys ?? [],
     lengthWeeks: body.length_weeks ?? null,
   };
 }
@@ -572,7 +580,8 @@ interface ValidatedPatchRequestBody {
   notesPerDog: string | null | undefined;
   notesJoint: string | null | undefined;
   staffPreference: string | null | undefined;
-  comfortLevel: ComfortLevel | null | undefined;
+  // text[] is NOT NULL, so "clear" = []; undefined = leave unchanged (no null state).
+  descriptorKeys: string[] | undefined;
   lengthWeeks: number | null | undefined;
   preferredDates: string[] | undefined;
 }
@@ -620,7 +629,7 @@ function validatePatchRequestBody(body: PatchRequestBody): ValidatedPatchRequest
     notesPerDog: extractPatchScalar(body.notes, 'per_dog'),
     notesJoint: extractPatchScalar(body.notes, 'joint'),
     staffPreference: extractPatchScalar(body.focus, 'staff_preference'),
-    comfortLevel: extractPatchEnum<ComfortLevel>(body.focus, 'comfort_level'),
+    descriptorKeys: extractPatchDescriptorKeys(body.focus),
     lengthWeeks: body.length_weeks === undefined ? undefined : (body.length_weeks ?? null),
     preferredDates: body.preferred_dates,
   };
@@ -649,15 +658,26 @@ function extractPatchScalar(
   return normalizeNullableString(typeof value === 'string' ? value : undefined);
 }
 
-function extractPatchEnum<T extends string>(
+/**
+ * Lift the nested `focus.descriptor_keys` array to the partial-update shape.
+ * `descriptor_keys` is a NOT-NULL text[] (default `{}`), so there's no null
+ * state — "clear" is an empty array:
+ *   - focus undefined → undefined (leave unchanged)
+ *   - focus null → [] (whole focus cleared → no descriptors)
+ *   - focus present, descriptor_keys undefined → undefined (leave unchanged)
+ *   - focus present, descriptor_keys present → the array (set; [] clears)
+ *
+ * Mirrors `extractPatchScalar`'s tri-state, collapsed for the not-null array
+ * (Zod has already validated each key's shape).
+ */
+function extractPatchDescriptorKeys(
   container: { [k: string]: unknown } | null | undefined,
-  key: string,
-): T | null | undefined {
+): string[] | undefined {
   if (container === undefined) return undefined;
-  if (container === null) return null;
-  const value = container[key];
+  if (container === null) return [];
+  const value = container['descriptor_keys'];
   if (value === undefined) return undefined;
-  return value === null ? null : (value as T);
+  return value as string[];
 }
 
 /**

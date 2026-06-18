@@ -7,7 +7,6 @@ export const bookingMode = pgEnum("booking_mode", ['school', 'daycare'])
 export const bookingStatus = pgEnum("booking_status", ['upcoming', 'past', 'cancelled'])
 export const chargePurpose = pgEnum("charge_purpose", ['package', 'payg', 'board-train', 'membership', 'group-class'])
 export const chargeStatus = pgEnum("charge_status", ['requires_payment', 'succeeded', 'failed', 'refunded'])
-export const comfortLevel = pgEnum("comfort_level", ['low', 'medium', 'high'])
 export const evaluationStatus = pgEnum("evaluation_status", ['not-evaluated', 'pending', 'passed', 'failed'])
 export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'manners-2', 'public-pups'])
 export const invoiceStatus = pgEnum("invoice_status", ['open', 'paid', 'void'])
@@ -543,7 +542,7 @@ export const pendingRequests = pgTable("pending_requests", {
 	notesPerDog: text("notes_per_dog"),
 	notesJoint: text("notes_joint"),
 	staffPreference: text("staff_preference"),
-	comfortLevel: comfortLevel("comfort_level"),
+	descriptorKeys: text("descriptor_keys").array().default([]).notNull(),
 	lengthWeeks: integer("length_weeks"),
 	approvedAt: timestamp("approved_at", { withTimezone: true, mode: 'string' }),
 	approvedByStaffId: uuid("approved_by_staff_id"),
@@ -607,11 +606,15 @@ export const creditLedger = pgTable("credit_ledger", {
 	bookingId: uuid("booking_id"),
 	packageId: uuid("package_id"),
 	chargeId: uuid("charge_id"),
+	expiresAt: timestamp("expires_at", { withTimezone: true, mode: 'string' }),
+	lotId: uuid("lot_id"),
 	note: text(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 }, (table) => {
 	return {
 		dogModeIdx: index("credit_ledger_dog_mode_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.mode.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("enum_ops")),
+		lotFifoIdx: index("credit_ledger_lot_fifo_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.mode.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("enum_ops"), table.expiresAt.asc().nullsLast().op("timestamptz_ops")).where(sql`((delta > 0) AND (lot_id IS NULL))`),
+		lotIdIdx: index("credit_ledger_lot_id_idx").using("btree", table.lotId.asc().nullsLast().op("uuid_ops")).where(sql`(lot_id IS NOT NULL)`),
 		creditLedgerDogIdFkey: foreignKey({
 			columns: [table.dogId],
 			foreignColumns: [dogs.id],
@@ -626,6 +629,11 @@ export const creditLedger = pgTable("credit_ledger", {
 			columns: [table.packageId],
 			foreignColumns: [creditPackages.id],
 			name: "credit_ledger_package_id_fkey"
+		}),
+		creditLedgerLotIdFkey: foreignKey({
+			columns: [table.lotId],
+			foreignColumns: [table.id],
+			name: "credit_ledger_lot_id_fkey"
 		}),
 		creditLedgerChargeFk: foreignKey({
 			columns: [table.chargeId],
@@ -1373,4 +1381,4 @@ export const dogCreditBalance = pgView("dog_credit_balance", {	dogId: uuid("dog_
 	location: text("location").$type<LocationKey>(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	balance: bigint({ mode: "number" }),
-}).as(sql`SELECT dog_id, mode, location, COALESCE(sum(delta), 0::bigint) AS balance FROM credit_ledger GROUP BY dog_id, mode, location`);
+}).as(sql`SELECT cl.dog_id, cl.mode, cl.location, COALESCE(sum(cl.delta), 0::bigint) AS balance FROM credit_ledger cl LEFT JOIN credit_ledger lot ON lot.id = cl.lot_id WHERE CASE WHEN cl.lot_id IS NOT NULL THEN lot.expires_at IS NULL OR lot.expires_at > now() WHEN cl.delta > 0 THEN cl.expires_at IS NULL OR cl.expires_at > now() ELSE true END GROUP BY cl.dog_id, cl.mode, cl.location`);

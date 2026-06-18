@@ -1,13 +1,13 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
 import type { ServiceCategory } from './bookingBucket.js';
-import { comfortLevel, requestStatus } from '../db/schema/schema.js';
+import { requestStatus } from '../db/schema/schema.js';
 
 /**
  * Wire shape for `PendingRequest` per DATA-CONTRACT §B (R1, R8). The DB
  * stores notes as two separate `text` columns (`notes_per_dog`,
- * `notes_joint`) and focus as two separate scalar columns
- * (`staff_preference text`, `comfort_level` enum); the wire composes them
- * into structured sub-objects. Optional-omit follows the Day-4a
+ * `notes_joint`) and focus as a scalar (`staff_preference text`) plus a
+ * staff-defined trait list (`descriptor_keys text[]`); the wire composes
+ * them into structured sub-objects. Optional-omit follows the Day-4a
  * convention: omit a key when its source is null/empty.
  *
  *   - `additional_dog_ids?` — omit when there's only a lead dog.
@@ -15,12 +15,13 @@ import { comfortLevel, requestStatus } from '../db/schema/schema.js';
  *     are null/empty. Inner keys are individually optional-omit.
  *   - `focus` — REQUIRED outer key per §B (R8); always emit an object,
  *     even if it's `{}`. Inner keys are individually optional-omit so
- *     `{ comfort_level: 'high' }` and `{}` are both valid shapes.
+ *     `{ descriptor_keys: ['nervous'] }` and `{}` are both valid shapes.
+ *     Δ 2026-06-17: `descriptor_keys: string[]` (staff-defined multi-select
+ *     trait pills) replaced the single `comfort_level` enum.
  *   - `length_weeks?` — board-and-train-only on the FE; omit when null.
  *   - `approved_at?`, `converted_booking_id?` — emit only after the
  *     staff portal converts the request.
  */
-export type ComfortLevel = (typeof comfortLevel.enumValues)[number];
 export type RequestStatus = (typeof requestStatus.enumValues)[number];
 
 export interface PendingRequestNotesWire {
@@ -30,7 +31,7 @@ export interface PendingRequestNotesWire {
 
 export interface PendingRequestFocusWire {
   staff_preference?: string;
-  comfort_level?: ComfortLevel;
+  descriptor_keys?: string[];
 }
 
 export interface PendingRequestWire {
@@ -61,7 +62,7 @@ export interface PendingRequestRowForWire {
   notesPerDog: string | null;
   notesJoint: string | null;
   staffPreference: string | null;
-  comfortLevel: ComfortLevel | null;
+  descriptorKeys: string[];
   lengthWeeks: number | null;
   approvedAt: string | null;
   convertedBookingId: string | null;
@@ -132,7 +133,7 @@ function buildFocus(row: PendingRequestRowForWire): PendingRequestFocusWire {
   if (row.staffPreference !== null && row.staffPreference !== '') {
     focus.staff_preference = row.staffPreference;
   }
-  if (row.comfortLevel !== null) focus.comfort_level = row.comfortLevel;
+  if (row.descriptorKeys.length > 0) focus.descriptor_keys = row.descriptorKeys;
   return focus;
 }
 

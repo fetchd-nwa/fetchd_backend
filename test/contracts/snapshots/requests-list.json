@@ -16,7 +16,7 @@
     },
     "focus": {
       "staff_preference": "rachel",
-      "comfort_level": "high"
+      "descriptor_keys": ["nervous", "reactive-on-leash"]
     },
     "status": "submitted"
   },

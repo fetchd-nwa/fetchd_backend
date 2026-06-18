@@ -47,7 +47,7 @@ async function seedApprovedAwaitingPaymentBT(): Promise<string> {
       notesPerDog: 'Build a foundation cue set',
       notesJoint: null,
       staffPreference: null,
-      comfortLevel: null,
+      descriptorKeys: [],
       lengthWeeks: 2,
     }),
   );
@@ -208,7 +208,7 @@ test(
         notesPerDog: null,
         notesJoint: null,
         staffPreference: null,
-        comfortLevel: null,
+        descriptorKeys: [],
         lengthWeeks: 2,
       }),
     );

@@ -743,7 +743,7 @@ async function seed(): Promise<void> {
       submittedAt: daysFromNow(-1, 16),
       notesPerDog: 'Waffles needs leash polish.',
       staffPreference: 'rachel',
-      comfortLevel: 'high',
+      descriptorKeys: ['high-energy', 'food-motivated'],
     },
     {
       id: SEED.requestBrodieBoardingId,
@@ -753,7 +753,7 @@ async function seed(): Promise<void> {
       status: 'submitted',
       submittedAt: daysFromNow(-2, 11),
       notesJoint: 'Travel for work — flexible on dates.',
-      comfortLevel: 'medium',
+      descriptorKeys: ['easy-going'],
     },
     {
       id: SEED.requestLolaBoardTrainId,
@@ -764,7 +764,7 @@ async function seed(): Promise<void> {
       submittedAt: daysFromNow(-1, 9),
       lengthWeeks: 2,
       notesPerDog: 'Two-week reactivity intensive.',
-      comfortLevel: 'high',
+      descriptorKeys: ['reactive-on-leash', 'nervous'],
     },
   ]);
 

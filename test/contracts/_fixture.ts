@@ -1188,7 +1188,7 @@ export async function seedFixture(): Promise<void> {
   // Two pending requests:
   //   - request1: submitted private-lesson, MULTI-DOG (Waffles lead +
   //     Lola), full notes (per_dog + joint), full focus (staff_preference
-  //     + comfort_level), 3 preferred dates → exercises every required +
+  //     + descriptor_keys), 3 preferred dates → exercises every required +
   //     optional key on the PendingRequest wire shape.
   //   - request2: converted board-and-train, single dog (Waffles),
   //     length_weeks=2, approved_at + approved_by_staff_id +
@@ -1208,7 +1208,7 @@ export async function seedFixture(): Promise<void> {
       notesPerDog: 'Waffles needs leash polish; Lola is reactive to bikes.',
       notesJoint: 'They walk best on a coupler — keep them together if possible.',
       staffPreference: 'rachel',
-      comfortLevel: 'high',
+      descriptorKeys: ['nervous', 'reactive-on-leash'],
     },
     {
       id: FIXTURE_IDS.pendingRequest2Id,
