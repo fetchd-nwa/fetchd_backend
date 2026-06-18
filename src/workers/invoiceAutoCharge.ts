@@ -2,7 +2,7 @@ import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
-import { withActor, type Tx } from '../db/tx.js';
+import { withActor } from '../db/tx.js';
 import {
   defaultStripeClient,
   stripeIntentStatusToChargeStatus,
@@ -18,35 +18,32 @@ interface WorkerLogger {
 }
 
 /**
- * Invoice auto-charge worker (Day 15). One-shot function — Day 16
- * (`scheduled_notifications` scheduler) wires the recurring trigger;
- * today this runs from a CLI or test harness on demand.
+ * Invoice auto-charge worker (Day 15; lease refactor 2026-06-18). One-shot
+ * function — Day 16 (`scheduled_notifications` scheduler) wires the recurring
+ * trigger; today this runs from a CLI or test harness on demand.
  *
- * Per-invoice lifecycle (one tx per invoice, claimed via FOR UPDATE
- * SKIP LOCKED so concurrent workers don't double-charge):
+ * **No Stripe call ever runs inside a DB transaction.** The tick is:
  *
- *   1. `lockDueOpenForUpdate` — claims a batch of open invoices whose
- *      `next_attempt_at <= now()`. Lock held until the tx commits.
- *   2. For each invoice:
- *      a. Look up the owner's Stripe customer + the bound payment_method.
- *      b. Call `stripe.createAndConfirmPaymentIntent` (idempotency-keyed
- *         on `auto-charge:{invoice.id}:{attempts}` so a retry of the
- *         same attempt re-uses the same PI; a fresh attempt mints a
- *         new one).
- *      c. SUCCEEDED: INSERT charges row + `markPaid` flips the invoice.
- *      d. REQUIRES_PAYMENT (3DS / processing): INSERT charges row at
- *         requires_payment, leave the invoice 'open'; the Day-15
- *         webhook flips charge on terminal event but does NOT today
- *         re-settle the invoice (known caveat — same as POST /pay).
- *      e. FAILED / other terminal failures: increment
- *         `auto_charge_attempts`, set `next_attempt_at = now() +
- *         backoff(attempts)`. After MAX_ATTEMPTS, park the invoice
- *         (`next_attempt_at = null`) — staff notification surface
- *         lands at Day-16 / Day-19.
+ *   1. **Claim tx (short).** `leaseDueOpen` locks a batch of due open invoices
+ *      (`FOR UPDATE SKIP LOCKED`) and pushes their `next_attempt_at` to a lease
+ *      horizon, then commits. The row locks are released immediately; the lease
+ *      keeps other workers from re-scooping the batch.
+ *   2. **Per invoice, OUTSIDE any tx:** read the bound card + Stripe customer
+ *      (pool reads), then `createAndConfirmPaymentIntent` (idempotency-keyed on
+ *      `auto-charge:{id}:{attempts}` so a retry of the same attempt re-uses the
+ *      same PI; a fresh attempt mints a new one).
+ *   3. **Record tx (short).**
+ *      - SUCCEEDED → INSERT `charges` + `markPaid`, atomically.
+ *      - Stripe threw (decline) → `recordFailedAttempt` (backoff, or park at
+ *        `MAX_ATTEMPTS`).
+ *      - Returned a NON-settled status (requires_action / processing /
+ *        requires_payment_method) → **cancel the PI** (best-effort) so it can't
+ *        later auto-succeed and double-charge against the next retry's fresh
+ *        PI, then `recordFailedAttempt`.
  *
- * The `withActor` per-invoice tx attributes writes under
- * `system:stripe-webhook` (same actor as the webhook handlers; the
- * webhook + worker both reconcile Stripe-side state).
+ * Crash safety: a worker that dies between the Stripe call and the record tx
+ * leaves the lease to expire; the re-lease re-attempts with the SAME
+ * attempt-keyed idempotency, so Stripe returns the same PI — no double charge.
  *
  * Returns a summary so the caller (CLI / test) can log a tick report.
  */
@@ -56,6 +53,13 @@ const WORKER_ACTOR = 'system:stripe-webhook';
 /** Hard cap on dunning attempts before the invoice parks. Day-16 scheduler
  *  will tune from a config knob; today matches Stripe's smart-retry default. */
 export const MAX_AUTO_CHARGE_ATTEMPTS = 4;
+
+/** How long a claimed invoice is reserved (its `next_attempt_at` is pushed
+ *  this far out) while the worker does the Stripe round-trip with no tx open.
+ *  Comfortably longer than a Stripe call (~30s) so a healthy worker always
+ *  records before the lease lapses; short enough that a crashed worker's
+ *  invoices retry promptly. */
+export const LEASE_MINUTES = 5;
 
 /** Backoff schedule (in minutes) per attempt index — 1, 60, 24h, 72h.
  *  attempt 0 → next at +1m  (fast retry for transient blips)
@@ -78,7 +82,6 @@ export interface InvoiceAutoChargeAttemptResult {
   invoiceId: string;
   outcome:
     | 'paid'
-    | 'requires-action'
     | 'failed-retry-scheduled'
     | 'failed-parked'
     | 'skipped-pm-missing'
@@ -99,9 +102,10 @@ const NOOP_LOG: WorkerLogger = {
 };
 
 /**
- * Run one tick. Returns the per-invoice outcomes for the batch. Safe to
- * call concurrently — the `FOR UPDATE SKIP LOCKED` scan ensures each
- * invoice is claimed by exactly one worker at a time.
+ * Run one tick. Claims a batch in a short tx, then processes each invoice
+ * with the Stripe call OUTSIDE any transaction. Safe to call concurrently —
+ * `leaseDueOpen` uses `FOR UPDATE SKIP LOCKED` + a lease so each invoice is
+ * owned by exactly one worker per lease window.
  */
 export async function runInvoiceAutoChargeOnce(
   opts: InvoiceAutoChargeOpts = {},
@@ -109,87 +113,61 @@ export async function runInvoiceAutoChargeOnce(
   const stripe = opts.stripe ?? defaultStripeClient;
   const log = opts.log ?? NOOP_LOG;
   const now = opts.now ?? new Date();
+  const leaseUntil = new Date(now.getTime() + LEASE_MINUTES * 60 * 1000);
 
+  // Claim tx: lease the batch, release the row locks on commit.
+  const leased = await withActor(WORKER_ACTOR, (tx) =>
+    invoicesRepository.leaseDueOpen(tx, { limit: opts.limit, now, leaseUntil }),
+  );
+  log.info(
+    { workerTick: 'invoice-auto-charge', batchSize: leased.length },
+    'invoice auto-charge tick claimed batch',
+  );
+
+  // Process each leased invoice with no tx open across the Stripe call.
   const results: InvoiceAutoChargeAttemptResult[] = [];
-
-  // The tx wraps the entire batch — FOR UPDATE SKIP LOCKED locks the
-  // claimed rows for this connection until commit. Each invoice's
-  // processing happens inside the same tx (sequential per worker); a
-  // second worker tick selects the next batch (skipping the locked
-  // rows). For batches large enough to make Stripe latency dominate,
-  // Day-16 will switch to one-tx-per-invoice; today the simpler shape
-  // is enough.
-  await withActor(WORKER_ACTOR, async (tx) => {
-    const batch = await invoicesRepository.lockDueOpenForUpdate(tx, {
-      limit: opts.limit,
-      now,
-    });
-    log.info(
-      { workerTick: 'invoice-auto-charge', batchSize: batch.length },
-      'invoice auto-charge tick claimed batch',
-    );
-
-    for (const invoice of batch) {
-      const result = await processOne(tx, invoice, stripe, now, log);
-      results.push(result);
-    }
-  });
-
+  for (const invoice of leased) {
+    results.push(await processOne(invoice, stripe, now, log));
+  }
   return { scanned: results.length, results };
 }
 
 /**
- * Single-invoice processing inside the worker tx. Encapsulates the
- * Stripe call + the charges/invoice writes + the dunning math.
- *
- * Stripe call is awaited inside the tx — that breaks the "Stripe calls
- * pre-tx OR post-tx" rule, but the worker context is different: the
- * lock is held precisely to prevent concurrent attempts, and the
- * invoice id is the unit of work. The duration the tx stays open is
- * bounded by Stripe's own timeout (~30s); during that window the row
- * is locked for this connection only. Day-16 may revisit if connection
- * pressure becomes an issue.
+ * Process one leased invoice: pool reads → Stripe (no tx) → short record tx.
+ * Never holds a transaction open across the Stripe round-trip.
  */
 async function processOne(
-  tx: Tx,
   invoice: InvoiceRow,
   stripe: StripeClient,
   now: Date,
   log: WorkerLogger,
 ): Promise<InvoiceAutoChargeAttemptResult> {
-  const pm = await paymentMethodsRepository.findLiveByIdForOwner(tx, {
+  // Pool reads — no tx needed; the lease already reserved the row.
+  const pm = await paymentMethodsRepository.findLiveByIdForOwner(db, {
     id: invoice.paymentMethodId,
     ownerId: invoice.ownerId,
   });
   if (pm === undefined) {
-    // Card was deleted between issue + auto-charge. Park the invoice.
     log.warn(
       { invoiceId: invoice.id, paymentMethodId: invoice.paymentMethodId },
       'invoice auto-charge: payment method missing; parking invoice',
     );
-    await invoicesRepository.recordFailedAttempt(tx, {
-      id: invoice.id,
-      nextAttemptAt: null,
-    });
+    await recordFailed(invoice.id, null);
     return { invoiceId: invoice.id, outcome: 'skipped-pm-missing', nextAttemptAt: null };
   }
 
-  const customer = await stripeCustomersRepository.findByOwner(tx, invoice.ownerId);
+  const customer = await stripeCustomersRepository.findByOwner(db, invoice.ownerId);
   if (customer === undefined) {
     log.warn(
       { invoiceId: invoice.id, ownerId: invoice.ownerId },
       'invoice auto-charge: stripe_customers row missing; parking invoice',
     );
-    await invoicesRepository.recordFailedAttempt(tx, {
-      id: invoice.id,
-      nextAttemptAt: null,
-    });
+    await recordFailed(invoice.id, null);
     return { invoiceId: invoice.id, outcome: 'skipped-customer-missing', nextAttemptAt: null };
   }
 
-  // Idempotency-keyed on the attempt index so a retry of THIS attempt
-  // re-uses Stripe's cached PI; a fresh attempt (after a retry was
-  // scheduled) mints a new one.
+  // Idempotency-keyed on the attempt index so a retry of THIS attempt (incl.
+  // a crash-recovery re-lease) re-uses the same PI; a fresh attempt mints one.
   const attemptKey = `auto-charge:${invoice.id}:${invoice.autoChargeAttempts}`;
   let intent: StripePaymentIntentResult;
   try {
@@ -209,16 +187,13 @@ async function processOne(
       attemptKey,
     );
   } catch (err) {
-    // Stripe-side rejection (card declined, etc). Schedule retry / park.
+    // Stripe-side rejection (card declined, etc) — terminal failed PI.
     log.warn(
       { invoiceId: invoice.id, err: err instanceof Error ? err.message : String(err) },
       'invoice auto-charge: Stripe call failed',
     );
     const nextAttemptAt = scheduleNextAttempt(invoice.autoChargeAttempts, now);
-    await invoicesRepository.recordFailedAttempt(tx, {
-      id: invoice.id,
-      nextAttemptAt,
-    });
+    await recordFailed(invoice.id, nextAttemptAt);
     return {
       invoiceId: invoice.id,
       outcome: nextAttemptAt === null ? 'failed-parked' : 'failed-retry-scheduled',
@@ -228,41 +203,62 @@ async function processOne(
 
   const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
 
-  const charge = await chargesRepository.create(tx, {
-    ownerId: invoice.ownerId,
-    amountCents: intent.amountCents,
-    status: chargeStatus,
-    purpose: invoice.purpose,
-    stripePaymentIntentId: intent.id,
-    bookingId: invoice.bookingId,
-    // Δ 2026-06-09: carry the enrollment identity from the invoice onto the
-    // charge so a group-class withdraw after the auto-charge fires can still
-    // find + refund this dog's payment via `findSucceededForCohortDog`.
-    cohortId: invoice.cohortId,
-    dogId: invoice.dogId,
-  });
-
   if (chargeStatus === 'succeeded') {
-    await invoicesRepository.markPaid(tx, { id: invoice.id, paidChargeId: charge.id });
-    return { invoiceId: invoice.id, outcome: 'paid', chargeId: charge.id };
+    const chargeId = await recordPaid(invoice, intent.id);
+    return { invoiceId: invoice.id, outcome: 'paid', chargeId };
   }
 
-  // Async/3DS path: leave invoice open, charge at requires_payment;
-  // the webhook flips the charge on terminal event. Increment attempts
-  // so a stuck async PI eventually exhausts retries — Day-16 may want
-  // to distinguish "async pending" from "failed" but the simple
-  // semantic is enough today.
+  // Non-settled status (requires_action / processing / requires_payment_method).
+  // Cancel the PI so it can't later auto-succeed and double-charge against the
+  // next retry's fresh PI, then record a failed attempt (counts toward park).
+  // Best-effort: a PI Stripe won't let us cancel is covered by the attempt-
+  // keyed idempotency on the next retry.
+  try {
+    await stripe.cancelPaymentIntent(intent.id);
+  } catch (err) {
+    log.warn(
+      { invoiceId: invoice.id, paymentIntentId: intent.id, err: errMsg(err) },
+      'invoice auto-charge: could not cancel unsettled PaymentIntent (best-effort)',
+    );
+  }
   const nextAttemptAt = scheduleNextAttempt(invoice.autoChargeAttempts, now);
-  await invoicesRepository.recordFailedAttempt(tx, {
-    id: invoice.id,
-    nextAttemptAt,
-  });
+  await recordFailed(invoice.id, nextAttemptAt);
   return {
     invoiceId: invoice.id,
-    outcome: 'requires-action',
-    chargeId: charge.id,
+    outcome: nextAttemptAt === null ? 'failed-parked' : 'failed-retry-scheduled',
     nextAttemptAt,
   };
+}
+
+/** Short record tx: a succeeded charge + flip the invoice paid, atomically. */
+async function recordPaid(invoice: InvoiceRow, paymentIntentId: string): Promise<string> {
+  return withActor(WORKER_ACTOR, async (tx) => {
+    const charge = await chargesRepository.create(tx, {
+      ownerId: invoice.ownerId,
+      amountCents: invoice.amountCents,
+      status: 'succeeded',
+      purpose: invoice.purpose,
+      stripePaymentIntentId: paymentIntentId,
+      bookingId: invoice.bookingId,
+      // Carry the enrollment identity so a group-class withdraw after the
+      // auto-charge can still find + refund this dog's payment.
+      cohortId: invoice.cohortId,
+      dogId: invoice.dogId,
+    });
+    await invoicesRepository.markPaid(tx, { id: invoice.id, paidChargeId: charge.id });
+    return charge.id;
+  });
+}
+
+/** Short record tx: increment attempts + reschedule (or `null` to park). */
+async function recordFailed(invoiceId: string, nextAttemptAt: string | null): Promise<void> {
+  await withActor(WORKER_ACTOR, (tx) =>
+    invoicesRepository.recordFailedAttempt(tx, { id: invoiceId, nextAttemptAt }),
+  );
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**

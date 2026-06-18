@@ -65,6 +65,11 @@ export type StripeStubCall =
       idempotencyKey: null;
     }
   | {
+      method: 'cancelPaymentIntent';
+      args: { paymentIntentId: string };
+      idempotencyKey: null;
+    }
+  | {
       method: 'createRefund';
       args: Parameters<StripeClient['createRefund']>[0];
       idempotencyKey: string;
@@ -188,6 +193,14 @@ export function makeStripeStub(): StripeStub {
         detachShouldThrow = false;
         throw new Error('stub: detach failed');
       }
+    },
+
+    async cancelPaymentIntent(paymentIntentId) {
+      calls.push({
+        method: 'cancelPaymentIntent',
+        args: { paymentIntentId },
+        idempotencyKey: null,
+      });
     },
 
     async createRefund(args, idempotencyKey): Promise<StripeRefundResult> {

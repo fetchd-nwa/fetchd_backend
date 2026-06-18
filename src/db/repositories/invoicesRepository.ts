@@ -1,4 +1,4 @@
-import { and, asc, eq, isNotNull, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, lte, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { invoices } from '../schema/schema.js';
 import type { ChargePurpose } from './chargesRepository.js';
@@ -223,6 +223,49 @@ export const invoicesRepository = {
       .orderBy(asc(invoices.nextAttemptAt))
       .limit(limit)
       .for('update', { skipLocked: true });
+  },
+
+  /**
+   * Lease a batch of due open invoices for processing OUTSIDE a transaction.
+   * Locks the due rows (`FOR UPDATE SKIP LOCKED` so parallel workers divide
+   * the queue) and pushes `next_attempt_at` to `leaseUntil` so no other
+   * worker re-scoops them while THIS worker does the Stripe round-trip with
+   * no DB tx open — that's what keeps the Stripe call off the transaction's
+   * latency budget (vs the old `lockDueOpenForUpdate`, which held the row
+   * lock across the network call for the whole batch).
+   *
+   * Returned rows carry the PRE-lease `auto_charge_attempts` (the UPDATE
+   * doesn't touch that column); the worker keys Stripe idempotency on it. A
+   * worker crash before it records the outcome leaves the lease to expire,
+   * and the attempt-keyed idempotency makes the re-lease safe (Stripe returns
+   * the same PI — no double charge).
+   */
+  async leaseDueOpen(
+    tx: Tx,
+    args: { limit?: number; now?: Date; leaseUntil: Date },
+  ): Promise<InvoiceRow[]> {
+    const limit = args.limit ?? 50;
+    const cutoff = args.now
+      ? sql`${invoices.nextAttemptAt} <= ${args.now.toISOString()}::timestamptz`
+      : sql`${invoices.nextAttemptAt} <= now()`;
+    const due = await tx
+      .select({ id: invoices.id })
+      .from(invoices)
+      .where(and(eq(invoices.status, 'open'), isNotNull(invoices.nextAttemptAt), cutoff))
+      .orderBy(asc(invoices.nextAttemptAt))
+      .limit(limit)
+      .for('update', { skipLocked: true });
+    if (due.length === 0) return [];
+    return tx
+      .update(invoices)
+      .set({ nextAttemptAt: args.leaseUntil.toISOString() })
+      .where(
+        inArray(
+          invoices.id,
+          due.map((r) => r.id),
+        ),
+      )
+      .returning(INVOICE_PROJECTION);
   },
 
   /**

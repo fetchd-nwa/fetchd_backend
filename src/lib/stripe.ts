@@ -239,6 +239,16 @@ export interface StripeClient {
   detachPaymentMethod(paymentMethodId: StripePaymentMethodId): Promise<void>;
 
   /**
+   * Cancel a PaymentIntent that didn't settle on an off-session auto-charge
+   * attempt (returned `requires_action` / `processing` / `requires_payment_
+   * method` rather than `succeeded`), so it can't later auto-succeed and
+   * double-charge against the next retry's fresh PI. Best-effort: the worker
+   * swallows failures — a PI Stripe refuses to cancel (already settling) is
+   * covered by the attempt-keyed Stripe idempotency on the next retry.
+   */
+  cancelPaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<void>;
+
+  /**
    * Refund a portion (or all) of a prior PaymentIntent. Used by POST
    * /bookings/:id/cancel money-back branch post-commit (Day-13 stubbed
    * this; Day-14 wires it). Stripe is asynchronous for refunds — the
@@ -353,6 +363,10 @@ export const defaultStripeClient: StripeClient = {
 
   async detachPaymentMethod(paymentMethodId) {
     await stripeSingleton.paymentMethods.detach(paymentMethodId);
+  },
+
+  async cancelPaymentIntent(paymentIntentId) {
+    await stripeSingleton.paymentIntents.cancel(paymentIntentId);
   },
 
   async createRefund(args, idempotencyKey) {
