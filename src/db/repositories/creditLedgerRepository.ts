@@ -1,11 +1,9 @@
 import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { creditLedger, dogCreditBalance, LOCATION_SLUGS } from '../schema/schema.js';
+import { creditLedger, dogCreditBalance, type LocationKey } from '../schema/schema.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
 import { resolveRefundExpiry } from '../../lib/creditExpiry.js';
 import type { Tx } from '../tx.js';
-
-type LocationKey = (typeof LOCATION_SLUGS)[number];
 
 /**
  * Data-access seam for `credit_ledger` (schema.sql:853). Append-only by

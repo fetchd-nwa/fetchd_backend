@@ -1,6 +1,6 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
 import type { ServiceCategory } from './bookingBucket.js';
-import { bookingStatus, LOCATION_SLUGS } from '../db/schema/schema.js';
+import { bookingStatus, type LocationKey } from '../db/schema/schema.js';
 
 /**
  * Wire shape for `Booking` per DATA-CONTRACT §B (Δ 2026-05-19 +
@@ -10,7 +10,7 @@ import { bookingStatus, LOCATION_SLUGS } from '../db/schema/schema.js';
  * not a not-yet-happened-event.
  */
 export type BookingStatus = (typeof bookingStatus.enumValues)[number];
-export type LocationKey = (typeof LOCATION_SLUGS)[number];
+export type { LocationKey };
 
 export interface BookingWire {
   id: string;

@@ -1,7 +1,7 @@
 import { ApiError } from './errors.js';
 import type { BookingMode } from './bookingMode.js';
 import type { GroupClassKey } from '../db/repositories/groupClassesRepository.js';
-import type { LOCATION_SLUGS } from '../db/schema/schema.js';
+import type { LocationKey } from '../db/schema/schema.js';
 
 /**
  * Typed `details` payloads for the booking-write surface (Day 10+). The
@@ -23,8 +23,6 @@ import type { LOCATION_SLUGS } from '../db/schema/schema.js';
  * without restructuring (add a `multi_gate_block` arm + a `code: 'invalid_payload'`
  * path, the existing single-gate arms stay valid).
  */
-
-type LocationKey = (typeof LOCATION_SLUGS)[number];
 
 /**
  * One missing vaccine for one dog. `requirement_key` lets the FE deep-

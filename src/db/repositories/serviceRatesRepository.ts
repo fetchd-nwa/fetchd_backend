@@ -1,9 +1,8 @@
 import { and, desc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { LOCATION_SLUGS, rateUnit, serviceCategory, serviceRates } from '../schema/schema.js';
+import { rateUnit, serviceCategory, serviceRates, type LocationKey } from '../schema/schema.js';
 
 type ServiceCategory = (typeof serviceCategory.enumValues)[number];
-type LocationKey = (typeof LOCATION_SLUGS)[number];
 type RateUnit = (typeof rateUnit.enumValues)[number];
 
 /**

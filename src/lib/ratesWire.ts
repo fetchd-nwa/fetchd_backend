@@ -1,8 +1,7 @@
-import { LOCATION_SLUGS, rateUnit, serviceCategory } from '../db/schema/schema.js';
+import { rateUnit, serviceCategory, type LocationKey } from '../db/schema/schema.js';
 import type { ServiceRateRow } from '../db/repositories/serviceRatesRepository.js';
 
 type ServiceCategory = (typeof serviceCategory.enumValues)[number];
-type LocationKey = (typeof LOCATION_SLUGS)[number];
 type RateUnit = (typeof rateUnit.enumValues)[number];
 
 /**

@@ -1,6 +1,6 @@
 import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
-import { creditLedger, LOCATION_SLUGS } from '../db/schema/schema.js';
+import { creditLedger, type LocationKey } from '../db/schema/schema.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
@@ -16,8 +16,6 @@ import {
 } from '../lib/stripe.js';
 import { and, eq } from 'drizzle-orm';
 import type { BookingMode } from '../lib/bookingMode.js';
-
-type LocationKey = (typeof LOCATION_SLUGS)[number];
 
 function isLocationKey(value: string | undefined): value is LocationKey {
   return value === 'fayetteville' || value === 'bentonville';
