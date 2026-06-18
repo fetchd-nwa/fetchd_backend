@@ -483,6 +483,32 @@ function parseUuidParam(params: unknown): { id: string } {
 
 // ---- body validation -------------------------------------------------
 
+/**
+ * Preferred-date invariants shared by POST + PATCH: distinct, in the future,
+ * and within MAX_LOOKAHEAD_DAYS. Throws invalid_payload on the first offender.
+ */
+function assertPreferredDatesWithinWindow(dates: readonly string[]): void {
+  const nowMs = Date.now();
+  const lookAheadMs = nowMs + MAX_LOOKAHEAD_DAYS * ONE_DAY_MS;
+  const seen = new Set<string>();
+  for (const iso of dates) {
+    if (seen.has(iso)) {
+      throw new ApiError('invalid_payload', `preferred_dates contains duplicate ${iso}`);
+    }
+    seen.add(iso);
+    const ms = Date.parse(iso);
+    if (ms <= nowMs) {
+      throw new ApiError('invalid_payload', `preferred_dates entry ${iso} is in the past`);
+    }
+    if (ms > lookAheadMs) {
+      throw new ApiError(
+        'invalid_payload',
+        `preferred_dates entry ${iso} exceeds the ${MAX_LOOKAHEAD_DAYS}-day lookahead window`,
+      );
+    }
+  }
+}
+
 interface ValidatedPostRequestBody {
   category: RequestCategory;
   leadDogId: string;
@@ -541,26 +567,7 @@ function validatePostRequestBody(body: PostRequestBody): ValidatedPostRequestBod
     );
   }
 
-  // Preferred dates — distinct, in the future, within lookahead.
-  const nowMs = Date.now();
-  const lookAheadMs = nowMs + MAX_LOOKAHEAD_DAYS * ONE_DAY_MS;
-  const dateSet = new Set<string>();
-  for (const iso of body.preferred_dates) {
-    if (dateSet.has(iso)) {
-      throw new ApiError('invalid_payload', `preferred_dates contains duplicate ${iso}`);
-    }
-    dateSet.add(iso);
-    const ms = Date.parse(iso);
-    if (ms <= nowMs) {
-      throw new ApiError('invalid_payload', `preferred_dates entry ${iso} is in the past`);
-    }
-    if (ms > lookAheadMs) {
-      throw new ApiError(
-        'invalid_payload',
-        `preferred_dates entry ${iso} exceeds the ${MAX_LOOKAHEAD_DAYS}-day lookahead window`,
-      );
-    }
-  }
+  assertPreferredDatesWithinWindow(body.preferred_dates);
 
   return {
     category: body.category,
@@ -601,25 +608,7 @@ function validatePatchRequestBody(body: PatchRequestBody): ValidatedPatchRequest
 
   // Preferred dates — same future-window check as POST.
   if (body.preferred_dates !== undefined) {
-    const nowMs = Date.now();
-    const lookAheadMs = nowMs + MAX_LOOKAHEAD_DAYS * ONE_DAY_MS;
-    const dateSet = new Set<string>();
-    for (const iso of body.preferred_dates) {
-      if (dateSet.has(iso)) {
-        throw new ApiError('invalid_payload', `preferred_dates contains duplicate ${iso}`);
-      }
-      dateSet.add(iso);
-      const ms = Date.parse(iso);
-      if (ms <= nowMs) {
-        throw new ApiError('invalid_payload', `preferred_dates entry ${iso} is in the past`);
-      }
-      if (ms > lookAheadMs) {
-        throw new ApiError(
-          'invalid_payload',
-          `preferred_dates entry ${iso} exceeds the ${MAX_LOOKAHEAD_DAYS}-day lookahead window`,
-        );
-      }
-    }
+    assertPreferredDatesWithinWindow(body.preferred_dates);
   }
 
   // Notes / focus / length_weeks — undefined = leave unchanged; null =
