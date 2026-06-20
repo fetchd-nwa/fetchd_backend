@@ -5,6 +5,7 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { withServiceRateLock } from '../db/locks.js';
 import {
   serviceRatesRepository,
+  type StaffRateHistoryRow,
   type StaffServiceRateRow,
 } from '../db/repositories/serviceRatesRepository.js';
 import {
@@ -17,26 +18,26 @@ import { bucketChicagoToday, isValidCalendarDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
-import { parseOrThrow } from '../lib/zodIssues.js';
+import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
- * `GET /staff/rates` `[staff]` + `POST /staff/rates` `[staff]` — the
- * staff-portal per-location service-rate editor (DATA-CONTRACT §B Rate +
- * 2026-06-20 amendment). Owner-facing pricing is read-only at `GET /rates`;
- * this is the write side. Owner principals get 403 — rates are staff config.
+ * Staff per-location service-rate editor (DATA-CONTRACT §B Rate + 2026-06-20
+ * amendment). Owner-facing pricing is read-only at `GET /rates`; this is the
+ * write side, owner principals get 403.
  *
- * `service_rates` is an **effective-dated** catalog: each (category, location)
- * track is a sequence of rows with non-overlapping `[effective_from,
- * effective_to)` windows (open-ended `effective_to NULL` = current). Editing a
- * price is therefore NEVER an in-place amount change — it closes the current
- * window and opens a new one (`serviceRatesRepository.supersedeRate`), so a
- * past booking's as-charged rate (and a PAYG invoice's locked amount) survive
- * the change. The supersede runs under a per-track advisory lock so concurrent
- * edits can't leave two open windows.
+ *   GET  /staff/rates                       active + scheduled catalog
+ *   GET  /staff/rates/history?category&loc  full change log for one track
+ *   POST /staff/rates                       set a rate (effective-dated supersede)
+ *   POST /staff/rates/:id/void              cancel/remove an entry
  *
- * Read shape (`GET /staff/rates`): every row active or scheduled at today
- * (expired history excluded), so the portal can show each track's current rate
- * plus any pending change.
+ * `service_rates` is **append-only**: a price change closes the open window's
+ * `effective_to` and inserts a new row; a same-day re-edit voids the prior
+ * entry and inserts a new one; a cancel voids an entry (reopening its
+ * predecessor). `amount_cents`/`unit`/`note` are never overwritten — so a past
+ * booking's as-charged rate (and a locked PAYG invoice) survive every change,
+ * and the rows themselves form the audit-able change history. All writes run
+ * under `withServiceRateLock` (per-track advisory lock) so concurrent edits
+ * can't corrupt the windows.
  */
 
 const SERVICE_CATEGORY_VALUES = pgEnumTuple(serviceCategory);
@@ -59,7 +60,7 @@ const MAX_AMOUNT_CENTS = 1_000_000;
  * `amount_cents` (see routes/bookings.ts), so those two categories MUST be
  * priced `per-day` — a `per-week`/`flat` figure would be silently billed as a
  * daily one. Other categories have no live rate-charged money path yet, so
- * their unit is unconstrained here.
+ * their unit is unconstrained here (the PAYG charger also guards this defensively).
  */
 const PER_DAY_REQUIRED_CATEGORIES = new Set<string>(['day-school', 'day-care']);
 
@@ -81,10 +82,18 @@ const postBodySchema = z
   })
   .strict();
 
+const historyQuerySchema = z.object({
+  category: z.enum(SERVICE_CATEGORY_VALUES),
+  location: z.enum(LOCATION_VALUES),
+});
+
+const uuidParamSchema = z.object({ id: z.string().uuid() });
+
 type ServiceCategory = (typeof serviceCategory.enumValues)[number];
 type RateUnit = (typeof rateUnit.enumValues)[number];
 
 interface StaffRateWire {
+  id: string;
   category: ServiceCategory;
   location: LocationKey | null;
   amount_cents: number;
@@ -92,10 +101,18 @@ interface StaffRateWire {
   effective_from: string;
   effective_to: string | null;
   note: string | null;
+  created_by_staff_id: string | null;
+}
+
+interface StaffRateHistoryWire extends StaffRateWire {
+  created_at: string;
+  voided_at: string | null;
+  voided_by_staff_id: string | null;
 }
 
 function toStaffRateWire(row: StaffServiceRateRow): StaffRateWire {
   return {
+    id: row.id,
     category: row.category,
     location: row.location,
     amount_cents: row.amount_cents,
@@ -103,6 +120,16 @@ function toStaffRateWire(row: StaffServiceRateRow): StaffRateWire {
     effective_from: row.effective_from,
     effective_to: row.effective_to,
     note: row.note,
+    created_by_staff_id: row.created_by_staff_id,
+  };
+}
+
+function toHistoryWire(row: StaffRateHistoryRow): StaffRateHistoryWire {
+  return {
+    ...toStaffRateWire(row),
+    created_at: row.created_at,
+    voided_at: row.voided_at,
+    voided_by_staff_id: row.voided_by_staff_id,
   };
 }
 
@@ -120,7 +147,7 @@ export function registerStaffRatesRoute(
   const nowFactory = opts.now ?? ((): Date => new Date());
 
   // --- GET /staff/rates -------------------------------------------------
-  // Every rate row active or scheduled at today (expired history excluded).
+  // Every rate row active or scheduled at today (expired + voided excluded).
   app.get('/staff/rates', { preHandler: [authHook] }, async (request): Promise<StaffRateWire[]> => {
     const principal = requirePrincipal(request);
     requireStaff(principal, 'read service rates');
@@ -128,6 +155,21 @@ export function registerStaffRatesRoute(
     const rows = await serviceRatesRepository.findActiveAndScheduledForStaff(today);
     return rows.map(toStaffRateWire);
   });
+
+  // --- GET /staff/rates/history?category=&location= ---------------------
+  // The full change log for one track (every row incl. expired + voided),
+  // newest first — the append-only rows ARE the history.
+  app.get(
+    '/staff/rates/history',
+    { preHandler: [authHook] },
+    async (request): Promise<StaffRateHistoryWire[]> => {
+      const principal = requirePrincipal(request);
+      requireStaff(principal, 'read rate history');
+      const { category, location } = parseQuery(historyQuerySchema, request.query);
+      const rows = await serviceRatesRepository.findHistoryForTrack(category, location);
+      return rows.map(toHistoryWire);
+    },
+  );
 
   // --- POST /staff/rates ------------------------------------------------
   // Set the rate for one (category, location) track, effective-dated. Returns
@@ -160,14 +202,10 @@ export function registerStaffRatesRoute(
         endpoint: 'POST /staff/rates',
         requestHash: hashRequestBody({ ...body, effective_from: effectiveFrom }),
         // No cache wipe: service_rates is read direct from pg (no Redis read-
-        // through) by both GET /rates and the PAYG booking path — they observe
-        // the new row on the next read with no invalidation hop.
+        // through) by both GET /rates and the PAYG booking path.
         keysToInvalidate: () => [],
       },
       async (tx) => {
-        // Advisory lock per (category, location) so two concurrent edits to the
-        // same track serialize — otherwise both could read "no open row" and
-        // leave two open windows.
         const result = await withServiceRateLock(tx, body.category, body.location, () =>
           serviceRatesRepository.supersedeRate(tx, {
             category: body.category,
@@ -176,18 +214,72 @@ export function registerStaffRatesRoute(
             unit: body.unit,
             effectiveFrom,
             note: body.note ?? null,
+            createdByStaffId: principal.staffId,
           }),
         );
-        if (result.kind === 'conflict') {
-          throw new ApiError(
-            'conflict',
-            `a later rate for ${body.category} @ ${body.location} already takes effect ${result.scheduledFrom}; choose an effective_from on or after it, or edit that row`,
-          );
-        }
         return { status: 200, body: toStaffRateWire(result.row) };
       },
     );
 
     return outcome.body;
   });
+
+  // --- POST /staff/rates/:id/void ---------------------------------------
+  // Cancel/remove one entry (a scheduled future change or the current rate).
+  // Soft-voids it and reopens its predecessor so no pricing gap opens — there
+  // is no way to trap a track. Returns the voided row. Idempotency-Key required.
+  app.post(
+    '/staff/rates/:id/void',
+    { preHandler: [authHook] },
+    async (request): Promise<StaffRateWire> => {
+      const principal = requirePrincipal(request);
+      requireStaff(principal, 'void a service rate');
+      const { id } = parseUuidParam(request.params);
+      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+
+      const outcome = await withMutation<StaffRateWire>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /staff/rates/:id/void',
+          requestHash: hashRequestBody({ id }),
+          keysToInvalidate: () => [],
+        },
+        async (tx) => {
+          // (category, location) are immutable, so reading them for the lock key
+          // outside the lock is safe; the void+reopen runs under the lock.
+          const track = await serviceRatesRepository.findTrackById(id, tx);
+          if (track === undefined) {
+            throw new ApiError('not_found', `service rate ${id} not found`);
+          }
+          const voided = await withServiceRateLock(tx, track.category, track.location ?? '', () =>
+            serviceRatesRepository.voidRate(tx, { id, voidedByStaffId: principal.staffId }),
+          );
+          if (voided === undefined) {
+            // Vanished or already voided between the track read and the lock.
+            throw new ApiError('not_found', `service rate ${id} not found`);
+          }
+          return { status: 200, body: toStaffRateWire(voided) };
+        },
+      );
+
+      return outcome.body;
+    },
+  );
+}
+
+function parseQuery<T extends z.ZodTypeAny>(schema: T, raw: unknown): z.infer<T> {
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid query: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data;
+}
+
+function parseUuidParam(params: unknown): { id: string } {
+  const parsed = uuidParamSchema.safeParse(params);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid path: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data;
 }

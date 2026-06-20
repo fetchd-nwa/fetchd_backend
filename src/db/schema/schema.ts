@@ -956,9 +956,25 @@ export const serviceRates = pgTable("service_rates", {
 	effectiveTo: date("effective_to"),
 	note: text(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	// Append-only money config (Δ 2026-06-20): never value-overwritten. A change
+	// closes effective_to + inserts a new row; a mistake/cancel sets voided_at
+	// (soft-void, excluded from active). created_by/voided_by stamp the actor.
+	createdByStaffId: uuid("created_by_staff_id"),
+	voidedAt: timestamp("voided_at", { withTimezone: true, mode: 'string' }),
+	voidedByStaffId: uuid("voided_by_staff_id"),
 }, (table) => {
 	return {
 		lookupIdx: index("service_rates_lookup_idx").using("btree", table.category.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("date_ops"), table.effectiveFrom.desc().nullsFirst().op("date_ops")),
+		serviceRatesCreatedByStaffIdFkey: foreignKey({
+			columns: [table.createdByStaffId],
+			foreignColumns: [staff.id],
+			name: "service_rates_created_by_staff_id_fkey"
+		}).onDelete("set null"),
+		serviceRatesVoidedByStaffIdFkey: foreignKey({
+			columns: [table.voidedByStaffId],
+			foreignColumns: [staff.id],
+			name: "service_rates_voided_by_staff_id_fkey"
+		}).onDelete("set null"),
 		serviceRatesAmountCentsCheck: check("service_rates_amount_cents_check", sql`amount_cents >= 0`),
 		serviceRatesCheck: check("service_rates_check", sql`(effective_to IS NULL) OR (effective_to > effective_from)`),
 	}

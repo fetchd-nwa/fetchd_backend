@@ -814,6 +814,16 @@ async function resolvePaygPlan(
     );
   }
 
+  // Defense-in-depth (#7): PAYG charges one booking DATE off `amount_cents`, so
+  // the rate MUST be per-day. The staff editor enforces this for day programs,
+  // but a seed/SQL row could bypass it — refuse to charge rather than silently
+  // bill a weekly/flat figure as a daily one. Config invariant → 500 (loud).
+  if (rate.unit !== 'per-day') {
+    throw new Error(
+      `PAYG rate for ${parsed.category} @ ${parsed.location} has unit '${rate.unit}', expected 'per-day' — refusing to charge to avoid mis-billing`,
+    );
+  }
+
   return { paymentMethodId: parsed.payment.paymentMethodId, amountCents: rate.amount_cents };
 }
 
