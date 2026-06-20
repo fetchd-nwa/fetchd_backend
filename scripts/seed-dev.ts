@@ -376,31 +376,39 @@ async function seed(): Promise<void> {
 
   // Day-program PAYG rates — the per-day price a pay-as-you-go (non-credit)
   // day-school / day-care booking is charged (DATA-CONTRACT §B rates + the
-  // 2026-06-19 PAYG amendment). Org-default (location null) so both locations
-  // resolve them; staff add location-specific rows via the portal later. These
-  // are the only `service_rates` rows seeded — without them a real-mode PAYG
-  // booking (and `GET /rates`) 404s. School matches the single-day pack ($60);
-  // day care is a small premium over the 10-pack's per-day rate ($35 → $40).
-  await db.insert(serviceRates).values([
-    {
-      category: 'day-school',
-      location: null,
-      amountCents: 6000,
-      unit: 'per-day',
-      effectiveFrom: '2025-01-01',
-      effectiveTo: null,
-      note: 'PAYG day-school rate (launch)',
-    },
-    {
-      category: 'day-care',
-      location: null,
-      amountCents: 4000,
-      unit: 'per-day',
-      effectiveFrom: '2025-01-01',
-      effectiveTo: null,
-      note: 'PAYG day-care rate (launch)',
-    },
-  ]);
+  // 2026-06-19 PAYG amendment). Per-location: real NWA pricing is TBD and WILL
+  // differ between locations; until staff set it via the portal (TODO: per-
+  // location service-rate editor), these are launch placeholders — Fayetteville
+  // base + a flat Bentonville premium. Without a row a real-mode PAYG booking
+  // (and `GET /rates`) 404s. School base matches the single-day pack ($60); day
+  // care is a small premium over the 10-pack's per-day rate ($35 → $40).
+  const BENTONVILLE_PAYG_PREMIUM_CENTS = 500;
+  const dayProgramRateBases = [
+    { category: 'day-school' as const, amountCents: 6000 },
+    { category: 'day-care' as const, amountCents: 4000 },
+  ];
+  await db.insert(serviceRates).values(
+    dayProgramRateBases.flatMap((base) => [
+      {
+        category: base.category,
+        location: 'fayetteville' as const,
+        amountCents: base.amountCents,
+        unit: 'per-day' as const,
+        effectiveFrom: '2025-01-01',
+        effectiveTo: null,
+        note: `PAYG ${base.category} rate, Fayetteville (launch placeholder)`,
+      },
+      {
+        category: base.category,
+        location: 'bentonville' as const,
+        amountCents: base.amountCents + BENTONVILLE_PAYG_PREMIUM_CENTS,
+        unit: 'per-day' as const,
+        effectiveFrom: '2025-01-01',
+        effectiveTo: null,
+        note: `PAYG ${base.category} rate, Bentonville (launch placeholder, +$5)`,
+      },
+    ]),
+  );
 
   await db.insert(dogs).values([
     {
