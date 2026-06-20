@@ -41,6 +41,7 @@ const REAL_NOW_MS = Date.now();
 const ONE_DAY_MS = 86_400_000;
 const ONE_HOUR_MS = 3_600_000;
 const DAY_SCHOOL_FAY_RATE_CENTS = 7500;
+const DAY_CARE_RATE_CENTS = 4500;
 
 /** YYYY-MM-DD for the `nth` weekday after FIXTURE_TODAY (validation clock).
  * Weekday-only so day_capacity defaults to 3/3 (weekends seed 0/0 = closed). */
@@ -407,5 +408,37 @@ test(
     assert.equal(debits.length, 1, 'credits path debits exactly once per dog');
     assert.equal(debits[0]!.delta, -1);
     assert.equal((await paygInvoicesFor(bookingId)).length, 0, 'credits path schedules no invoice');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Multi-dog billing — one combined charge for the whole roster
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /bookings — multi-dog PAYG schedules one invoice for the per-day rate × the roster size',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = bookingApp();
+    const res = await postBooking({
+      app,
+      idempotencyKey: `pg-multidog-${randomUUID()}`,
+      payload: {
+        category: 'day-care',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        additional_dog_ids: [FIXTURE_IDS.dog2Id],
+        dates: [futureWeekday(49)],
+        location: 'fayetteville',
+        payment: 'payg',
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const bookingId = (res.json() as Array<{ id: string }>)[0]!.id;
+
+    const invs = await paygInvoicesFor(bookingId);
+    assert.equal(invs.length, 1, 'one combined invoice for the booking, not one per dog');
+    assert.equal(invs[0]!.amountCents, DAY_CARE_RATE_CENTS * 2, 'per-day rate × 2 dogs');
+    assert.equal((await bookingDebitsFor(bookingId)).length, 0, 'PAYG never debits credits');
   },
 );

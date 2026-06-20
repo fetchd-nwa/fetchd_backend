@@ -455,18 +455,31 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                   });
 
                   if (paygPlan !== null) {
-                    // PAYG: no credit debit. Schedule a card auto-charge ~1h
+                    // PAYG: no credit debit. Schedule a card auto-charge 1h
                     // before drop-off; the invoiceAutoCharge worker (Day-15)
                     // bills the open invoice at due_at. A within-window cancel
                     // voids it (see cancelBookingService).
+                    //
+                    // Amount is the per-day rate × the booking's roster size —
+                    // one combined charge for all dogs on the booking (one
+                    // statement line, one Stripe fee), mirroring the credits
+                    // path's one-debit-per-dog total. dog count is bounded by
+                    // MAX_DOGS_PER_REQUEST.
+                    //
+                    // Cancel-void safety: `cancelDeadlineAt = scheduledAt −
+                    // hours_before`, and the `cancel_window_settings_hours_
+                    // before_check` CHECK (hours_before > 0, integer ⇒ ≥ 1h)
+                    // guarantees `cancelDeadlineAt ≤ dueAt = scheduledAt − 1h`.
+                    // So a within-window cancel always lands before the auto-
+                    // charge and can void the invoice — enforced at the schema
+                    // floor, no app-level guard needed.
+                    const dueAt = new Date(scheduledAt.getTime() - PAYG_DUE_BEFORE_DROPOFF_MS);
                     await invoicesRepository.createOpen(tx, {
                       ownerId: principal.ownerId,
-                      amountCents: paygPlan.amountCents,
+                      amountCents: paygPlan.amountCents * parsed.allDogIds.length,
                       purpose: 'payg',
                       paymentMethodId: paygPlan.paymentMethodId,
-                      dueAt: new Date(
-                        scheduledAt.getTime() - PAYG_DUE_BEFORE_DROPOFF_MS,
-                      ).toISOString(),
+                      dueAt: dueAt.toISOString(),
                       bookingId: inserted.id,
                     });
                   } else {
