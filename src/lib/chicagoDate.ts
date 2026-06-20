@@ -64,6 +64,22 @@ export function bucketChicagoToday(now: Date = new Date()): string {
 }
 
 /**
+ * True iff `s` is a real calendar day in `YYYY-MM-DD` form — `2026-13-40`
+ * passes a regex but isn't a date. Timezone-independent (pure UTC round-trip);
+ * lives here as the single home for the date-string validity check shared by
+ * every validate-on-read/write surface (`/availability`, `POST /bookings`,
+ * `POST /staff/rates`). Pair it with an `ISO_DATE` shape regex at the call
+ * site; this layers on the "is it a real day" check the regex can't express.
+ */
+export function isValidCalendarDate(s: string): boolean {
+  const [y, m, d] = s.split('-').map(Number);
+  if (y === undefined || m === undefined || d === undefined) return false;
+  const ms = Date.UTC(y, m - 1, d);
+  const back = new Date(ms);
+  return back.getUTCFullYear() === y && back.getUTCMonth() === m - 1 && back.getUTCDate() === d;
+}
+
+/**
  * The wall-clock formatter we use to read back an instant in Chicago time.
  * `hourCycle: 'h23'` pins the hour to 0..23 (midnight = 00, not 24) so the
  * round-trip arithmetic in `chicagoOffsetMinutesAt` is unambiguous.

@@ -24,7 +24,11 @@ import {
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
-import { bucketChicagoToday, bucketToChicagoDate } from '../lib/chicagoDate.js';
+import {
+  bucketChicagoToday,
+  bucketToChicagoDate,
+  isValidCalendarDate,
+} from '../lib/chicagoDate.js';
 import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
 import {
   DEFAULT_DROPOFF_TIME,
@@ -119,21 +123,6 @@ const PAYG_DUE_BEFORE_DROPOFF_MS = 60 * 60 * 1000;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const LOCATION_KEYS = LOCATION_SLUGS;
-
-/**
- * Validate that a YYYY-MM-DD string maps to a real calendar day —
- * `2026-13-40` would pass the regex but isn't a date. Same shape as the
- * Day-5b helper in `routes/availability.ts:isValidCalendarDate`; the
- * two consumers (validate-on-read range expansion, validate-on-write
- * booking creation) share the same correctness floor.
- */
-function isValidCalendarDate(s: string): boolean {
-  const [y, m, d] = s.split('-').map(Number);
-  if (y === undefined || m === undefined || d === undefined) return false;
-  const ms = Date.UTC(y, m - 1, d);
-  const back = new Date(ms);
-  return back.getUTCFullYear() === y && back.getUTCMonth() === m - 1 && back.getUTCDate() === d;
-}
 
 /**
  * POST /bookings body — day-program creation (day-school / day-care).

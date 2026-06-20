@@ -5,6 +5,7 @@ import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { defaultDayCapacity, enumerateRangeWithCap } from '../lib/availability.js';
+import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 
@@ -28,20 +29,6 @@ const MODES = pgEnumTuple(bookingMode);
 const LOCATIONS = LOCATION_SLUGS;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-
-/**
- * Real calendar dates only. `2026-13-40` matches the regex but isn't a
- * date — `Date.UTC` would silently overflow it to `2027-02-09`. Round-
- * tripping through `Date.UTC` and formatting back is the cleanest test
- * for "this is a real calendar day."
- */
-function isValidCalendarDate(s: string): boolean {
-  const [y, m, d] = s.split('-').map(Number);
-  if (y === undefined || m === undefined || d === undefined) return false;
-  const ms = Date.UTC(y, m - 1, d);
-  const back = new Date(ms);
-  return back.getUTCFullYear() === y && back.getUTCMonth() === m - 1 && back.getUTCDate() === d;
-}
 
 const dateField = z
   .string()

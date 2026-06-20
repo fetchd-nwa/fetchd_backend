@@ -1740,18 +1740,12 @@ export async function teardownFixture(): Promise<void> {
         FIXTURE_IDS.creditPackageRetiredKey,
       ]),
     );
-  await db
-    .delete(serviceRates)
-    .where(
-      inArray(serviceRates.id, [
-        FIXTURE_IDS.serviceRateSchoolFayId,
-        FIXTURE_IDS.serviceRateSchoolNullLocId,
-        FIXTURE_IDS.serviceRateDaycareCurrentId,
-        FIXTURE_IDS.serviceRateDaycareFutureId,
-        FIXTURE_IDS.serviceRateDaycareBentonClosedId,
-        FIXTURE_IDS.serviceRateBoardingEmptyNoteId,
-      ]),
-    );
+  // Clear the WHOLE table, not just the seeded fixture ids: the staff
+  // rate-editor write path (`POST /staff/rates`) inserts rows with random
+  // UUIDs, so an id-scoped delete would leak them across files and pollute
+  // every later rate lookup. `service_rates` is fixture-owned in tests (schema
+  // .sql seeds none), so a full delete is safe + keeps the table reset per file.
+  await db.delete(serviceRates);
   await db.delete(dayCapacity).where(eq(dayCapacity.location, 'fayetteville'));
   await db.delete(paymentMethods).where(eq(paymentMethods.ownerId, FIXTURE_IDS.ownerId));
   // Day-14: stripe_customers FK→owners is ON DELETE RESTRICT, so it must

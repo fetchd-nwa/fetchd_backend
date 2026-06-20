@@ -39,6 +39,34 @@ export async function withDogModeLock<T>(
 }
 
 /**
+ * Per-(category, location) transaction-scoped advisory lock — the
+ * service-rate supersede serializer (`POST /staff/rates`). The effective-dated
+ * write reads the current open rate row, then closes it + inserts a new one;
+ * two concurrent edits to the SAME (category, location) track must serialize so
+ * they can't both observe "no later row" and leave two open (`effective_to IS
+ * NULL`) rows — which would break the non-overlap invariant the rate lookup
+ * (`findActiveRate`) and the next supersede both rely on. Held until the outer
+ * transaction commits OR rolls back.
+ *
+ * Key: `hashtext('service-rate:<category>:<location>')`. The prefix keeps this
+ * namespace disjoint from the booking/`capacity:` advisory locks; the colon
+ * separators make "no two different (category, location) tracks collide"
+ * structurally obvious. int4 hash collisions are birthday-paradox-bounded and
+ * only cause spurious serialization, never incorrect behavior.
+ */
+export async function withServiceRateLock<T>(
+  tx: Tx,
+  category: string,
+  location: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await tx.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${`service-rate:${category}:${location}`}))`,
+  );
+  return fn();
+}
+
+/**
  * Row-lock a cohort for the duration of the transaction — the
  * `enrollInGroupClass` capacity-ceiling primitive (`schema.sql` Transaction
  * contract notes, `enrollInGroupClass` ~line 1276). Concurrent enrollment
