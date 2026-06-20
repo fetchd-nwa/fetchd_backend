@@ -8,8 +8,12 @@ import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowS
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
+import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
+import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import { serviceRatesRepository } from '../db/repositories/serviceRatesRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
+import type { Tx } from '../db/tx.js';
 import { isInView } from '../lib/bookingBucket.js';
 import {
   alreadyBookedError,
@@ -104,6 +108,15 @@ const MAX_DOGS_PER_REQUEST = 5;
 const MAX_LOOKAHEAD_DAYS = 92;
 const ONE_DAY_MS = 86_400_000;
 
+/**
+ * PAYG auto-charge timing — the open `'payg'` invoice is due one hour before
+ * the booking's scheduled drop-off, so the worker bills the card just ahead of
+ * the session (matching the DATA-CONTRACT 2026-06-19 amendment's "~1h before
+ * scheduled_at"). The free-cancel window for day programs is wider than this,
+ * so a within-window cancel always voids the invoice before it charges.
+ */
+const PAYG_DUE_BEFORE_DROPOFF_MS = 60 * 60 * 1000;
+
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const LOCATION_KEYS = LOCATION_SLUGS;
 
@@ -131,6 +144,12 @@ function isValidCalendarDate(s: string): boolean {
  * `parseAndValidatePostBody` adds the cross-field invariants Zod
  * doesn't express cleanly (dates distinct, lead not in additionals,
  * dropoff within window).
+ *
+ * `payment` (Δ 2026-06-19): a day-program group pays from the credit balance
+ * (default, omitted) or pay-as-you-go (`'payg'` — skip the credit debit, charge
+ * the card ~1h before drop-off via an open `'payg'` invoice). `payment_method_id`
+ * is required when `payment: 'payg'` (the cross-field rule lives in
+ * `validateBookingBody`; Zod only enforces shape here).
  */
 const postBookingBodySchema = z
   .object({
@@ -152,6 +171,8 @@ const postBookingBodySchema = z
     dropoff_time: z.string().regex(DROPOFF_TIME_REGEX, 'must be HH:MM').optional(),
     location: z.enum(LOCATION_KEYS),
     notes: z.string().max(2000).optional(),
+    payment: z.enum(['credits', 'payg']).optional(),
+    payment_method_id: z.string().uuid().optional(),
   })
   .strict();
 
@@ -345,26 +366,34 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                   category: parsed.category,
                 });
 
-                // Credit pre-check — every dog needs >= dates.length credits in `mode`.
-                const creditGaps: CreditGap[] = [];
-                for (const dogId of parsed.allDogIds) {
-                  const balance =
-                    (await creditLedgerRepository.balanceForDogInTx(
-                      tx,
-                      dogId,
-                      parsed.mode,
-                      parsed.location,
-                    )) ?? 0;
-                  if (balance < parsed.sortedDates.length) {
-                    creditGaps.push({
-                      dog_id: dogId,
-                      mode: parsed.mode,
-                      balance,
-                      required: parsed.sortedDates.length,
-                    });
+                // Payment branch (Δ 2026-06-19). PAYG validates the card + the
+                // active per-day rate up front and SKIPS the credit pre-check;
+                // 'credits' runs the per-dog balance check. `paygPlan` (set only
+                // for PAYG) decides the per-booking money write in the loop:
+                // schedule a card auto-charge vs. debit the credit ledger.
+                const paygPlan = await resolvePaygPlan(tx, parsed, principal.ownerId, nowFactory());
+                if (paygPlan === null) {
+                  // Credit pre-check — every dog needs >= dates.length credits in `mode`.
+                  const creditGaps: CreditGap[] = [];
+                  for (const dogId of parsed.allDogIds) {
+                    const balance =
+                      (await creditLedgerRepository.balanceForDogInTx(
+                        tx,
+                        dogId,
+                        parsed.mode,
+                        parsed.location,
+                      )) ?? 0;
+                    if (balance < parsed.sortedDates.length) {
+                      creditGaps.push({
+                        dog_id: dogId,
+                        mode: parsed.mode,
+                        balance,
+                        required: parsed.sortedDates.length,
+                      });
+                    }
                   }
+                  if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
                 }
-                if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
 
                 // Duplicate guard (Day-19d) — block re-booking a day the dog
                 // already attends in this category. Cancelled bookings are
@@ -387,7 +416,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                 }
                 if (dupConflicts.length > 0) throw alreadyBookedError(dupConflicts);
 
-                // Per-date: capacity → INSERT booking + booking_dogs → INSERT debits.
+                // Per-date: capacity → INSERT booking + booking_dogs → money
+                // write (PAYG invoice schedule, or credit-ledger debits).
                 const wires: BookingWire[] = [];
                 for (const date of parsed.sortedDates) {
                   await dayCapacityRepository.assertCapacityWithinLock(tx, {
@@ -424,13 +454,30 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                     additionalDogIds: parsed.additionalDogIds,
                   });
 
-                  for (const dogId of parsed.allDogIds) {
-                    await creditLedgerRepository.debitForBooking(tx, {
-                      dogId,
-                      mode: parsed.mode,
-                      location: parsed.location,
+                  if (paygPlan !== null) {
+                    // PAYG: no credit debit. Schedule a card auto-charge ~1h
+                    // before drop-off; the invoiceAutoCharge worker (Day-15)
+                    // bills the open invoice at due_at. A within-window cancel
+                    // voids it (see cancelBookingService).
+                    await invoicesRepository.createOpen(tx, {
+                      ownerId: principal.ownerId,
+                      amountCents: paygPlan.amountCents,
+                      purpose: 'payg',
+                      paymentMethodId: paygPlan.paymentMethodId,
+                      dueAt: new Date(
+                        scheduledAt.getTime() - PAYG_DUE_BEFORE_DROPOFF_MS,
+                      ).toISOString(),
                       bookingId: inserted.id,
                     });
+                  } else {
+                    for (const dogId of parsed.allDogIds) {
+                      await creditLedgerRepository.debitForBooking(tx, {
+                        dogId,
+                        mode: parsed.mode,
+                        location: parsed.location,
+                        bookingId: inserted.id,
+                      });
+                    }
                   }
 
                   // Day-16: enqueue the scheduled reminder rows for this
@@ -618,6 +665,14 @@ function parseUuidParam(params: unknown): { id: string } {
  * shape. The route handler doesn't touch the raw Zod-parsed body after
  * this point.
  */
+/**
+ * How the group is paid (Δ 2026-06-19). A tagged union so `paymentMethodId`
+ * exists *only* on the PAYG arm — `'credits'` carries no card, `'payg'` always
+ * carries one (the cross-field requirement is enforced in `validateBookingBody`,
+ * not modeled as an optional that downstream code has to re-check).
+ */
+type PaymentPlan = { kind: 'credits' } | { kind: 'payg'; paymentMethodId: string };
+
 interface ValidatedBookingBody {
   category: DayProgramCategory;
   leadDogId: string;
@@ -628,6 +683,7 @@ interface ValidatedBookingBody {
   location: (typeof LOCATION_KEYS)[number];
   notes: string | null;
   mode: ReturnType<typeof dayProgramCategoryToMode>;
+  payment: PaymentPlan;
 }
 
 function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBookingBody {
@@ -693,7 +749,70 @@ function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBooking
     location: body.location,
     notes: body.notes ?? null,
     mode: dayProgramCategoryToMode(body.category),
+    payment: resolvePaymentPlan(body),
   };
+}
+
+/**
+ * Resolve the body's payment fields into the tagged `PaymentPlan`. Default is
+ * `'credits'` (omitted `payment`). PAYG requires `payment_method_id` — the
+ * card's ownership + liveness is validated in-tx (here we only enforce
+ * presence). A `payment_method_id` sent on a `'credits'` group is ignored
+ * (additive, backward-compatible).
+ */
+function resolvePaymentPlan(body: PostBookingBody): PaymentPlan {
+  if ((body.payment ?? 'credits') === 'credits') return { kind: 'credits' };
+  if (body.payment_method_id === undefined) {
+    throw new ApiError('invalid_payload', 'payment_method_id is required when payment is payg');
+  }
+  return { kind: 'payg', paymentMethodId: body.payment_method_id };
+}
+
+/** The PAYG money plan resolved in-tx: the validated card + the per-session amount. */
+interface PaygPlan {
+  paymentMethodId: string;
+  amountCents: number;
+}
+
+/**
+ * In-tx PAYG validation. Returns `null` for a `'credits'` group (the route runs
+ * the credit pre-check instead). For a `'payg'` group, verifies the card is
+ * owned + live and resolves the active per-day rate — both 404 on miss
+ * (card 404 mirrors `loadStripePaymentContext`'s collapse of not-found /
+ * not-yours / soft-expired; rate 404 mirrors `GET /rates`). The returned
+ * `amountCents` is the charge per booking date.
+ */
+async function resolvePaygPlan(
+  tx: Tx,
+  parsed: ValidatedBookingBody,
+  ownerId: string,
+  now: Date,
+): Promise<PaygPlan | null> {
+  if (parsed.payment.kind !== 'payg') return null;
+
+  const card = await paymentMethodsRepository.findLiveByIdForOwner(tx, {
+    id: parsed.payment.paymentMethodId,
+    ownerId,
+  });
+  if (card === undefined) {
+    throw new ApiError('not_found', `payment method ${parsed.payment.paymentMethodId} not found`);
+  }
+
+  const today = bucketChicagoToday(now);
+  const rate = await serviceRatesRepository.findActiveRate(
+    parsed.category,
+    parsed.location,
+    today,
+    tx,
+  );
+  if (rate === undefined) {
+    throw new ApiError(
+      'not_found',
+      `no active rate for category=${parsed.category} location=${parsed.location} on ${today}`,
+    );
+  }
+
+  return { paymentMethodId: parsed.payment.paymentMethodId, amountCents: rate.amount_cents };
 }
 
 /**

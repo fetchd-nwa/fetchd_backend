@@ -195,6 +195,30 @@ export const invoicesRepository = {
   },
 
   /**
+   * The open PAYG invoice for one booking, if any — the booking-cancel verb's
+   * "is there a pending auto-charge to void?" probe. A within-window cancel
+   * voids it (nothing is ever charged); past-window leaves it (it charges =
+   * forfeit). Only `status='open'` (a settled one is a charge-refund, handled
+   * by the cancel money-back branch). `purpose='payg'` is the only booking-
+   * linked invoice today, but the filter keeps the read honest as invoice
+   * kinds grow.
+   */
+  async findOpenForBooking(tx: Tx, args: { bookingId: string }): Promise<InvoiceRow | undefined> {
+    const [row] = await tx
+      .select(INVOICE_PROJECTION)
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.bookingId, args.bookingId),
+          eq(invoices.status, 'open'),
+          eq(invoices.purpose, 'payg'),
+        ),
+      )
+      .limit(1);
+    return row;
+  },
+
+  /**
    * Worker scan: open invoices whose `next_attempt_at` is due. Uses
    * `FOR UPDATE SKIP LOCKED` so concurrent worker instances can divide
    * the queue without blocking each other. Limit caps batch size for

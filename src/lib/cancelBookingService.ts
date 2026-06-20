@@ -1,6 +1,7 @@
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import type { Tx } from '../db/tx.js';
@@ -126,9 +127,18 @@ export async function cancelBookingInTx(
           // Charges with NULL stripe_payment_intent_id are pre-Stripe-wire
           // seeds; the refunds row at 'pending' captures the intent.
         }
+      } else {
+        // PAYG within-window: void the pending auto-charge so the worker
+        // never bills a cancelled session. There's no prior credit debit
+        // (PAYG skips it) and no settled charge yet (due_at is ~1h before
+        // drop-off, inside the cancel window), so the open invoice is the
+        // only money artifact. A genuinely free service (no invoice) is a
+        // no-op — the status flip is the full effect.
+        const openInvoice = await invoicesRepository.findOpenForBooking(tx, { bookingId: id });
+        if (openInvoice !== undefined) {
+          await invoicesRepository.markVoid(tx, { id: openInvoice.id });
+        }
       }
-      // Else: neither credit- nor money-paid (free service) — the status
-      // flip is the full effect.
     }
   }
   // Forfeited branch: no refund of any kind.

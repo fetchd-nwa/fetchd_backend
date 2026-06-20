@@ -53,6 +53,7 @@ import {
   pendingRequests,
   refunds,
   scheduledNotifications,
+  serviceRates,
   staff,
   stripeCustomers,
   threadDogs,
@@ -372,6 +373,34 @@ async function seed(): Promise<void> {
       })),
     ),
   );
+
+  // Day-program PAYG rates — the per-day price a pay-as-you-go (non-credit)
+  // day-school / day-care booking is charged (DATA-CONTRACT §B rates + the
+  // 2026-06-19 PAYG amendment). Org-default (location null) so both locations
+  // resolve them; staff add location-specific rows via the portal later. These
+  // are the only `service_rates` rows seeded — without them a real-mode PAYG
+  // booking (and `GET /rates`) 404s. School matches the single-day pack ($60);
+  // day care is a small premium over the 10-pack's per-day rate ($35 → $40).
+  await db.insert(serviceRates).values([
+    {
+      category: 'day-school',
+      location: null,
+      amountCents: 6000,
+      unit: 'per-day',
+      effectiveFrom: '2025-01-01',
+      effectiveTo: null,
+      note: 'PAYG day-school rate (launch)',
+    },
+    {
+      category: 'day-care',
+      location: null,
+      amountCents: 4000,
+      unit: 'per-day',
+      effectiveFrom: '2025-01-01',
+      effectiveTo: null,
+      note: 'PAYG day-care rate (launch)',
+    },
+  ]);
 
   await db.insert(dogs).values([
     {

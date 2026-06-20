@@ -1,6 +1,10 @@
 import { and, desc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { rateUnit, serviceCategory, serviceRates, type LocationKey } from '../schema/schema.js';
+import type { Tx } from '../tx.js';
+
+/** Polymorphic runner — pool for stand-alone reads, Tx for in-mutation work. */
+type Runner = Tx | typeof db;
 
 type ServiceCategory = (typeof serviceCategory.enumValues)[number];
 type RateUnit = (typeof rateUnit.enumValues)[number];
@@ -36,13 +40,18 @@ export const serviceRatesRepository = {
    * cross-cutting timezone invariant.
    *
    * Returns `undefined` when no row matches (route maps to 404).
+   *
+   * Polymorphic runner: the `/rates` route reads against the pool (default),
+   * the PAYG booking branch passes its mutation `tx` so the rate read shares
+   * the booking transaction.
    */
   async findActiveRate(
     category: ServiceCategory,
     location: LocationKey,
     today: string,
+    runner: Runner = db,
   ): Promise<ServiceRateRow | undefined> {
-    const rows = await db
+    const rows = await runner
       .select({
         category: serviceRates.category,
         location: serviceRates.location,
