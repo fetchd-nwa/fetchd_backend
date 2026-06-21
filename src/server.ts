@@ -27,6 +27,7 @@ import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffCreditExpiryRoute } from './routes/staffCreditExpiry.js';
+import { registerStaffInvoicesRoute } from './routes/staffInvoices.js';
 import { registerStaffDogsRoute } from './routes/staffDogs.js';
 import { registerStaffRatesRoute } from './routes/staffRates.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
@@ -72,6 +73,7 @@ export function buildApp(): FastifyInstance {
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
   registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
   registerStaffCreditExpiryRoute(app); // [staff] — staff-tunable credit-expiry settings (2026-06-20)
+  registerStaffInvoicesRoute(app); // [staff] — parked-invoice worklist (credit-expiry Phase 3)
   registerStaffRatesRoute(app); // [staff] — per-location service-rate editor (2026-06-20)
   registerStaffDogsRoute(app); // [staff] — Day-19b portal dog directory (name resolution)
   registerStaffBookingsRoute(app); // [staff] — Day-19 portal verb 4 (confirm / cancel / attendance)

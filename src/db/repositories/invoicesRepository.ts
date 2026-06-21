@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNotNull, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { invoices } from '../schema/schema.js';
 import type { ChargePurpose } from './chargesRepository.js';
@@ -337,5 +337,34 @@ export const invoicesRepository = {
       .select(INVOICE_PROJECTION)
       .from(invoices)
       .where(and(eq(invoices.status, 'open'), lte(invoices.dueAt, now.toISOString())));
+  },
+
+  /**
+   * PARKED invoices for the staff worklist: `status='open'` AND
+   * `next_attempt_at IS NULL` — the auto-charge worker has GIVEN UP (no further
+   * attempt scheduled), so only a human can resolve them (chase a new card,
+   * void, etc). Backs `GET /staff/invoices?parked`.
+   *
+   * Why `next_attempt_at IS NULL` and not just `auto_charge_attempts >= MAX`:
+   * the worker parks an invoice (sets `next_attempt_at = NULL`) in TWO ways —
+   * (a) exhausting MAX dunning attempts, and (b) a missing/expired card or
+   * Stripe customer on the FIRST attempt (no point retrying a charge with no
+   * card). The attempts-only predicate misses case (b), leaving a genuinely
+   * stuck invoice invisible to staff. `next_attempt_at IS NULL` is the single
+   * honest "the worker won't touch this again" signal that covers both.
+   *
+   * `minAttempts` is accepted (the worker's `MAX_AUTO_CHARGE_ATTEMPTS`) for
+   * forward-compat, but the `next_attempt_at IS NULL` predicate is the source
+   * of truth; a row parked at MAX always has it null. Passing the threshold in
+   * keeps this seam free of a worker import (dependency rule: repos don't
+   * import workers). Ordered by `due_at` ASC — the longest-overdue surfaces
+   * first for triage. Pool runner.
+   */
+  async findParked(_args: { minAttempts: number }, runner: Runner = db): Promise<InvoiceRow[]> {
+    return runner
+      .select(INVOICE_PROJECTION)
+      .from(invoices)
+      .where(and(eq(invoices.status, 'open'), isNull(invoices.nextAttemptAt)))
+      .orderBy(asc(invoices.dueAt));
   },
 };

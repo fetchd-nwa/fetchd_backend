@@ -5,6 +5,10 @@ import {
   type ScheduledNotificationRow,
 } from '../db/repositories/scheduledNotificationsRepository.js';
 import { sweepExpiredIdempotencyKeys } from '../db/idempotency.js';
+import {
+  enqueueCreditExpiryWarnings,
+  type EnqueueCreditExpiryWarningsResult,
+} from '../lib/enqueueCreditExpiryWarnings.js';
 import { withActor, type Tx } from '../db/tx.js';
 import {
   defaultExpoPushClient,
@@ -90,6 +94,7 @@ export interface SchedulerTickResult {
   scheduledNotifications: ScheduledNotificationsTickResult;
   invoiceAutoCharge: InvoiceAutoChargeTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
+  creditExpiryWarnings: EnqueueCreditExpiryWarningsResult;
   idempotencyKeysSwept: number;
 }
 
@@ -148,6 +153,38 @@ export async function runSchedulerTickOnce(
     mediaDerivativesResult = { scanned: 0, results: [] };
   }
 
+  // Phase 5 — credit-expiry warnings (credit-expiry Phase 3). Scan live,
+  // non-exhausted credit lots within their location's warning window and
+  // enqueue a `credits-expiring` scheduled notification per lot (dedup-keyed
+  // on the lot id so a lot is warned exactly once across ticks). The enqueued
+  // rows are delivered by THIS tick's Phase-1 delivery on the NEXT tick
+  // (scheduled_for = now; the claim happens before this phase runs). Own tx,
+  // own log-and-swallow boundary so a scan failure can't block the TTL sweep.
+  let creditExpiryWarningsResult: EnqueueCreditExpiryWarningsResult = { scanned: 0, enqueued: 0 };
+  try {
+    creditExpiryWarningsResult = await withActor(SCHEDULER_ACTOR, (tx) =>
+      enqueueCreditExpiryWarnings(tx, now),
+    );
+    log.info(
+      {
+        workerTick: 'scheduler',
+        phase: 'credit-expiry-warnings',
+        scanned: creditExpiryWarningsResult.scanned,
+        enqueued: creditExpiryWarningsResult.enqueued,
+      },
+      'credit-expiry-warnings scan complete',
+    );
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'credit-expiry-warnings',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'credit-expiry-warnings phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
   const sweepCutoff = new Date(now.getTime() - IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000);
   let idempotencyKeysSwept = 0;
   try {
@@ -171,6 +208,7 @@ export async function runSchedulerTickOnce(
     scheduledNotifications: notificationsResult,
     invoiceAutoCharge: invoiceResult,
     mediaDerivatives: mediaDerivativesResult,
+    creditExpiryWarnings: creditExpiryWarningsResult,
     idempotencyKeysSwept,
   };
 }

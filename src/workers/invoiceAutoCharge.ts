@@ -1,5 +1,7 @@
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
+import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
+import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
 import { withActor } from '../db/tx.js';
@@ -152,7 +154,7 @@ async function processOne(
       { invoiceId: invoice.id, paymentMethodId: invoice.paymentMethodId },
       'invoice auto-charge: payment method missing; parking invoice',
     );
-    await recordFailed(invoice.id, null);
+    await recordFailed(invoice, null);
     return { invoiceId: invoice.id, outcome: 'skipped-pm-missing', nextAttemptAt: null };
   }
 
@@ -162,7 +164,7 @@ async function processOne(
       { invoiceId: invoice.id, ownerId: invoice.ownerId },
       'invoice auto-charge: stripe_customers row missing; parking invoice',
     );
-    await recordFailed(invoice.id, null);
+    await recordFailed(invoice, null);
     return { invoiceId: invoice.id, outcome: 'skipped-customer-missing', nextAttemptAt: null };
   }
 
@@ -193,7 +195,7 @@ async function processOne(
       'invoice auto-charge: Stripe call failed',
     );
     const nextAttemptAt = scheduleNextAttempt(invoice.autoChargeAttempts, now);
-    await recordFailed(invoice.id, nextAttemptAt);
+    await recordFailed(invoice, nextAttemptAt);
     return {
       invoiceId: invoice.id,
       outcome: nextAttemptAt === null ? 'failed-parked' : 'failed-retry-scheduled',
@@ -222,7 +224,7 @@ async function processOne(
     );
   }
   const nextAttemptAt = scheduleNextAttempt(invoice.autoChargeAttempts, now);
-  await recordFailed(invoice.id, nextAttemptAt);
+  await recordFailed(invoice, nextAttemptAt);
   return {
     invoiceId: invoice.id,
     outcome: nextAttemptAt === null ? 'failed-parked' : 'failed-retry-scheduled',
@@ -230,7 +232,12 @@ async function processOne(
   };
 }
 
-/** Short record tx: a succeeded charge + flip the invoice paid, atomically. */
+/**
+ * Short record tx: a succeeded charge + flip the invoice paid + emit the
+ * `payment-succeeded` receipt notification, all atomically. The notification
+ * INSERT lives INSIDE this tx so a charge that rolls back never leaves a
+ * "we charged you" receipt behind (transaction-boundary invariant).
+ */
 async function recordPaid(invoice: InvoiceRow, paymentIntentId: string): Promise<string> {
   return withActor(WORKER_ACTOR, async (tx) => {
     const charge = await chargesRepository.create(tx, {
@@ -246,15 +253,75 @@ async function recordPaid(invoice: InvoiceRow, paymentIntentId: string): Promise
       dogId: invoice.dogId,
     });
     await invoicesRepository.markPaid(tx, { id: invoice.id, paidChargeId: charge.id });
+    await notificationsRepository.enqueue(tx, {
+      ownerId: invoice.ownerId,
+      type: 'payment-succeeded',
+      title: 'Payment received',
+      body: `We charged your card ${formatDollars(invoice.amountCents)} for your ${purposeLabel(
+        invoice.purpose,
+      )}.`,
+      deepLinkPath: '/account/billing',
+      dogIds: invoice.dogId ? [invoice.dogId] : [],
+    });
     return charge.id;
   });
 }
 
-/** Short record tx: increment attempts + reschedule (or `null` to park). */
-async function recordFailed(invoiceId: string, nextAttemptAt: string | null): Promise<void> {
-  await withActor(WORKER_ACTOR, (tx) =>
-    invoicesRepository.recordFailedAttempt(tx, { id: invoiceId, nextAttemptAt }),
-  );
+/**
+ * Short record tx: increment attempts + reschedule (or `null` to park). When
+ * the invoice PARKS (`nextAttemptAt === null` — the terminal state at MAX
+ * attempts, or a missing card/customer), emit ONE `payment-failed`
+ * notification inside the SAME tx. NOTIFY-ON-PARK-ONLY is the anti-spam
+ * invariant: an intermediate retry (a non-null `nextAttemptAt`) never notifies,
+ * so the owner hears once — when there's nothing left to retry and they must
+ * act — not on every transient decline. Co-locating the INSERT with the
+ * status flip means a notification is never emitted for an attempt that rolls
+ * back.
+ */
+async function recordFailed(invoice: InvoiceRow, nextAttemptAt: string | null): Promise<void> {
+  await withActor(WORKER_ACTOR, async (tx) => {
+    await invoicesRepository.recordFailedAttempt(tx, { id: invoice.id, nextAttemptAt });
+    if (nextAttemptAt !== null) return; // retry scheduled — do NOT notify (anti-spam)
+    await notificationsRepository.enqueue(tx, {
+      ownerId: invoice.ownerId,
+      type: 'payment-failed',
+      title: 'Payment failed',
+      body: `We couldn't process your payment of ${formatDollars(
+        invoice.amountCents,
+      )} for your ${purposeLabel(invoice.purpose)}. Please update your card.`,
+      deepLinkPath: '/account/billing',
+      dogIds: invoice.dogId ? [invoice.dogId] : [],
+    });
+  });
+}
+
+/** Whole-dollar-aware USD formatter for receipt copy. Stripe amounts are cents;
+ *  `$120` reads better than `$120.00` for round amounts, but cents show when
+ *  present. */
+function formatDollars(amountCents: number): string {
+  const dollars = amountCents / 100;
+  return `$${Number.isInteger(dollars) ? dollars.toString() : dollars.toFixed(2)}`;
+}
+
+/**
+ * Human label for the thing being charged, varied by `charge_purpose`, for the
+ * receipt + failure copy. Day-program (`payg`), `board-train`, and
+ * `group-class` are the auto-charged invoice purposes today; `package` /
+ * `membership` are covered for totality (an invoice can carry any purpose).
+ */
+function purposeLabel(purpose: ChargePurpose): string {
+  switch (purpose) {
+    case 'payg':
+      return 'day program session';
+    case 'board-train':
+      return 'Board & Train program';
+    case 'group-class':
+      return 'group class enrollment';
+    case 'package':
+      return 'credit package';
+    case 'membership':
+      return 'membership';
+  }
 }
 
 function errMsg(err: unknown): string {

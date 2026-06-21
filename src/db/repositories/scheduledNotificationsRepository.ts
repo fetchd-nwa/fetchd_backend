@@ -35,6 +35,15 @@ type Runner = Tx | typeof db;
 
 export type ScheduledNotificationStatus = 'pending' | 'sent' | 'cancelled';
 
+/**
+ * Every `notification_type` arm — what the `type` COLUMN can physically hold
+ * (derived from the schema enum so it tracks the DB). Distinct from
+ * `ScheduledNotificationType` below, which is the narrower set this queue
+ * actually ENQUEUES; the row reads the column type, the enqueue input is
+ * constrained to the schedulable arms.
+ */
+type ScheduledNotificationColumnType = (typeof scheduledNotifications.$inferSelect)['type'];
+
 export type ScheduledNotificationType =
   | 'booking-confirmed'
   | 'report-published'
@@ -42,12 +51,16 @@ export type ScheduledNotificationType =
   | 'announcement'
   | 'message-received'
   | 'booking-reminder'
-  | 'boarding-profile-check';
+  | 'boarding-profile-check'
+  // credit-expiry Phase 3: the only NEW scheduled-queue arm. `payment-failed`/
+  // `payment-succeeded` are emitted DIRECTLY to the feed by the auto-charge
+  // worker (inside its status-flip tx), never scheduled — so they're not here.
+  | 'credits-expiring';
 
 export interface ScheduledNotificationRow {
   id: string;
   ownerId: string;
-  type: ScheduledNotificationType;
+  type: ScheduledNotificationColumnType;
   trigger: string;
   dedupeKey: string | null;
   scheduledFor: string;

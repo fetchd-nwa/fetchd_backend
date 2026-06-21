@@ -21,6 +21,16 @@
  * resolution total). */
 export const DEFAULT_CREDIT_EXPIRY_MONTHS = 12;
 
+/** Code-side fallback warning-lead window: 60 days. The credits-expiring scan
+ * (`enqueueCreditExpiryWarnings`) warns an owner this many days before a lot's
+ * `expires_at`. Resolved per-location → org-default → this constant by
+ * `creditExpirySettingsRepository.resolveWarningLeadDays`, mirroring the
+ * months fallback chain. Matches the schema's seeded org-default
+ * (`credit_expiry_settings` 60d) so the resolve is a no-op swap until staff tune
+ * it; unreachable in practice (the schema seeds the org-default row), but keeps
+ * the resolver total under unexpected DB state. */
+export const DEFAULT_WARNING_LEAD_DAYS = 60;
+
 /** `from` advanced by whole months, in UTC. */
 function addMonthsUtc(from: Date, months: number): Date {
   const next = new Date(from.getTime());

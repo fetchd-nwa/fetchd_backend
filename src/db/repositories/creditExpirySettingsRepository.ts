@@ -2,7 +2,7 @@ import { sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { creditExpirySettings, type LocationKey } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
-import { DEFAULT_CREDIT_EXPIRY_MONTHS } from '../../lib/creditExpiry.js';
+import { DEFAULT_CREDIT_EXPIRY_MONTHS, DEFAULT_WARNING_LEAD_DAYS } from '../../lib/creditExpiry.js';
 
 /**
  * Data-access seam for `credit_expiry_settings` (schema.sql ~line 840). The
@@ -72,6 +72,33 @@ export const creditExpirySettingsRepository = {
     if (override !== undefined) return override.expiryWindowMonths;
     const orgDefault = rows.find((r) => r.location === null);
     return orgDefault?.expiryWindowMonths ?? DEFAULT_CREDIT_EXPIRY_MONTHS;
+  },
+
+  /**
+   * Resolve the warning-lead window (days) for a location: per-location override
+   * row → org-default row → `DEFAULT_WARNING_LEAD_DAYS`. Same fallback CHAIN and
+   * one-round-trip read as `resolveExpiryWindowMonths` — the credits-expiring
+   * scan (`enqueueCreditExpiryWarnings`) calls this to decide how far ahead of a
+   * lot's `expires_at` to warn its owner.
+   */
+  async resolveWarningLeadDays(
+    location: LocationKey,
+    runner: Tx | typeof db = db,
+  ): Promise<number> {
+    const rows = await runner
+      .select({
+        location: creditExpirySettings.location,
+        warningLeadDays: creditExpirySettings.warningLeadDays,
+      })
+      .from(creditExpirySettings)
+      .where(
+        sql`${creditExpirySettings.location} = ${location} OR ${creditExpirySettings.location} IS NULL`,
+      );
+
+    const override = rows.find((r) => r.location === location);
+    if (override !== undefined) return override.warningLeadDays;
+    const orgDefault = rows.find((r) => r.location === null);
+    return orgDefault?.warningLeadDays ?? DEFAULT_WARNING_LEAD_DAYS;
   },
 
   /**

@@ -81,6 +81,76 @@ export async function findLiveExpiringLots(
   return result.rows as unknown as LiveExpiringLot[];
 }
 
+/** A live, non-exhausted expiring lot that is WITHIN its location's warning
+ * window, plus the owner to warn. Cross-owner — drives the credits-expiring
+ * scheduled scan, not a per-dog read. */
+export interface ExpiringLotForWarning {
+  lotId: string;
+  ownerId: string;
+  dogId: string;
+  location: LocationKey;
+  mode: BookingMode;
+  /** ISO timestamp — always set (never-expiring + expired lots are excluded). */
+  expiresAt: string;
+  remaining: number;
+}
+
+/**
+ * Cross-owner scan for the credits-expiring warning: live, non-exhausted
+ * EXPIRING lots whose `expires_at` falls at-or-before their LOCATION's cutoff
+ * (now + that location's `warning_lead_days`). Reuses the canonical live-lot
+ * predicate from `findLiveExpiringLots` (delta>0, lot_id NULL, not expired, not
+ * exhausted) and adds: (a) a per-location `expires_at <= cutoff` filter — the
+ * warning window is per-location, so the caller resolves each location's cutoff
+ * and passes the map; (b) a join to `dogs.owner_id` so the scan knows who to
+ * warn, EXCLUDING staff-owned dogs (owner_id NULL — no owner to notify).
+ *
+ * `cutoffByLocation` is `{ [slug]: ISO-cutoff }`. A location absent from the map
+ * is skipped entirely (its lots are not scanned). Empty map → no rows.
+ *
+ * Pool runner (the scan reads outside any tx, mirroring the booking-reminder
+ * scan); ordered by `expires_at` ASC so the soonest-expiring is enqueued first.
+ */
+export async function findExpiringLotsForWarning(
+  runner: Tx | typeof db,
+  cutoffByLocation: Partial<Record<LocationKey, string>>,
+): Promise<ExpiringLotForWarning[]> {
+  const entries = Object.entries(cutoffByLocation) as [LocationKey, string][];
+  if (entries.length === 0) return [];
+
+  // One OR-arm per location: (location = slug AND expires_at <= its cutoff).
+  // Parameterized — slug + cutoff are bound, never interpolated.
+  const locationCutoffClauses = entries.map(
+    ([slug, cutoff]) => sql`(lot.location = ${slug} AND lot.expires_at <= ${cutoff}::timestamptz)`,
+  );
+  const cutoffClause = sql.join(locationCutoffClauses, sql` OR `);
+
+  const result = await runner.execute(sql`
+    SELECT lot.id AS "lotId", d.owner_id AS "ownerId", lot.dog_id AS "dogId",
+           lot.location, lot.mode, lot.expires_at AS "expiresAt",
+           (lot.delta + COALESCE(a.alloc, 0))::int AS remaining
+    FROM credit_ledger lot
+    JOIN dogs d ON d.id = lot.dog_id
+    LEFT JOIN (
+      SELECT lot_id, SUM(delta) AS alloc
+      FROM credit_ledger
+      WHERE lot_id IS NOT NULL
+      GROUP BY lot_id
+    ) a ON a.lot_id = lot.id
+    WHERE lot.delta > 0
+      AND lot.lot_id IS NULL
+      AND lot.expires_at IS NOT NULL
+      AND lot.expires_at > now()
+      AND d.owner_id IS NOT NULL
+      AND (lot.delta + COALESCE(a.alloc, 0)) > 0
+      AND (${cutoffClause})
+    ORDER BY lot.expires_at ASC
+  `);
+  // Raw SQL boundary: the SELECT projects exactly the ExpiringLotForWarning
+  // shape. (The Tx | db union widens .rows, so route through unknown.)
+  return result.rows as unknown as ExpiringLotForWarning[];
+}
+
 export const creditLedgerRepository = {
   /**
    * INSERT one booking-debit row (delta = -1) inside the open tx, tagged with

@@ -31,6 +31,7 @@ const FAKE_RESULT: SchedulerTickResult = {
   },
   invoiceAutoCharge: { scanned: 0, results: [] },
   mediaDerivatives: { scanned: 0, results: [] },
+  creditExpiryWarnings: { scanned: 0, enqueued: 0 },
   idempotencyKeysSwept: 0,
 };
 

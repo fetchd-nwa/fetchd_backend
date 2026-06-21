@@ -81,6 +81,8 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
         pushTicketsError: result.scheduledNotifications.pushTicketsError,
         invoicesScanned: result.invoiceAutoCharge.scanned,
         mediaDerivativesScanned: result.mediaDerivatives.scanned,
+        creditExpiryWarningsScanned: result.creditExpiryWarnings.scanned,
+        creditExpiryWarningsEnqueued: result.creditExpiryWarnings.enqueued,
         idempotencyKeysSwept: result.idempotencyKeysSwept,
       },
       'scheduler tick complete',

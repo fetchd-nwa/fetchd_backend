@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
-import { charges, invoices, paymentMethods } from '../../src/db/schema/schema.js';
+import {
+  charges,
+  invoices,
+  notificationDogs,
+  notifications,
+  paymentMethods,
+} from '../../src/db/schema/schema.js';
 import {
   MAX_AUTO_CHARGE_ATTEMPTS,
   runInvoiceAutoChargeOnce,
@@ -15,13 +21,20 @@ import { makeStripeStub } from './_stripeStub.js';
 
 registerFixtureHooks();
 
-async function seedDueInvoice(amountCents = 200_000): Promise<string> {
+async function seedDueInvoice(
+  opts: {
+    amountCents?: number;
+    purpose?: 'board-train' | 'payg' | 'group-class';
+    dogId?: string;
+  } = {},
+): Promise<string> {
   const row = await db.transaction(async (tx) =>
     invoicesRepository.createOpen(tx, {
       ownerId: FIXTURE_IDS.ownerId,
-      amountCents,
-      purpose: 'board-train',
+      amountCents: opts.amountCents ?? 200_000,
+      purpose: opts.purpose ?? 'board-train',
       paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+      dogId: opts.dogId ?? null,
       // dueAt + nextAttemptAt in the past so the worker scoops it.
       dueAt: '2026-01-01T00:00:00Z',
       nextAttemptAt: '2026-01-01T00:00:00Z',
@@ -30,9 +43,43 @@ async function seedDueInvoice(amountCents = 200_000): Promise<string> {
   return row.id;
 }
 
+/** Push a seeded invoice to one attempt short of the park cap, so the NEXT
+ *  failed attempt parks it (`scheduleNextAttempt(MAX-1) === null`). */
+async function setAttemptsToOneBeforePark(invoiceId: string): Promise<void> {
+  await db
+    .update(invoices)
+    .set({ autoChargeAttempts: MAX_AUTO_CHARGE_ATTEMPTS - 1 })
+    .where(eq(invoices.id, invoiceId));
+}
+
 async function cleanup(): Promise<void> {
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+  // The worker now writes payment-succeeded / payment-failed feed rows; drop
+  // them so a re-run starts clean (notification_dogs cascades on this delete).
+  await db
+    .delete(notifications)
+    .where(
+      and(
+        eq(notifications.ownerId, FIXTURE_IDS.ownerId),
+        inArray(notifications.type, ['payment-succeeded', 'payment-failed']),
+      ),
+    );
+}
+
+/** Count the worker's payment-* feed rows for the fixture owner, by type. */
+async function paymentNotifications(
+  type: 'payment-succeeded' | 'payment-failed',
+): Promise<{ id: string; title: string; body: string; deepLinkPath: string | null }[]> {
+  return db
+    .select({
+      id: notifications.id,
+      title: notifications.title,
+      body: notifications.body,
+      deepLinkPath: notifications.deepLinkPath,
+    })
+    .from(notifications)
+    .where(and(eq(notifications.ownerId, FIXTURE_IDS.ownerId), eq(notifications.type, type)));
 }
 
 test(
@@ -152,3 +199,107 @@ test('runInvoiceAutoChargeOnce — empty queue returns scanned=0', SKIP_WHEN_NO_
   assert.equal(result.scanned, 0);
   assert.equal(result.results.length, 0);
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// Part B (credit-expiry Phase 3) — auto-charge notifications.
+//   - payment-succeeded on a successful auto-charge (a receipt)
+//   - payment-failed ONLY when the invoice PARKS (terminal, MAX attempts)
+//   - NO notification on an intermediate retry (the anti-spam invariant)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'auto-charge notify — SUCCESS emits exactly one payment-succeeded receipt linked to the dog',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // payg purpose + a dog so the receipt copy + notification_dogs link assert.
+    await seedDueInvoice({ amountCents: 4500, purpose: 'payg', dogId: FIXTURE_IDS.dog1Id });
+    const stripe = makeStripeStub();
+
+    const result = await runInvoiceAutoChargeOnce({ stripe, limit: 5 });
+    assert.equal(result.results[0]?.outcome, 'paid');
+
+    const succeeded = await paymentNotifications('payment-succeeded');
+    assert.equal(succeeded.length, 1, 'exactly one receipt');
+    assert.equal(succeeded[0]?.title, 'Payment received');
+    assert.match(succeeded[0]!.body, /\$45 for your day program session/);
+    assert.equal(succeeded[0]?.deepLinkPath, '/account/billing');
+
+    // No payment-failed on a clean success.
+    assert.equal((await paymentNotifications('payment-failed')).length, 0);
+
+    // notification_dogs denorm links the receipt to the billed dog.
+    const dogLinks = await db
+      .select({ dogId: notificationDogs.dogId })
+      .from(notificationDogs)
+      .where(eq(notificationDogs.notificationId, succeeded[0]!.id));
+    assert.deepStrictEqual(
+      dogLinks.map((r) => r.dogId),
+      [FIXTURE_IDS.dog1Id],
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'auto-charge notify — PARK emits exactly one payment-failed (update-your-card)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedDueInvoice({ amountCents: 12000, purpose: 'group-class' });
+    // One attempt short of the cap, so this failed attempt parks the invoice.
+    await setAttemptsToOneBeforePark(invoiceId);
+    const stripe = makeStripeStub();
+    // Non-settled status → recordFailed; at attempts=MAX-1, scheduleNextAttempt
+    // returns null → PARK.
+    stripe.setNextIntentStatus('requires_payment_method');
+
+    const result = await runInvoiceAutoChargeOnce({ stripe, limit: 5 });
+    assert.equal(result.results[0]?.outcome, 'failed-parked', 'terminal park at MAX attempts');
+
+    const [inv] = await db
+      .select({ status: invoices.status, nextAttemptAt: invoices.nextAttemptAt })
+      .from(invoices)
+      .where(eq(invoices.id, invoiceId));
+    assert.equal(inv?.status, 'open', 'parked invoices stay open for staff resolution');
+    assert.equal(inv?.nextAttemptAt, null, 'parked (no further auto-attempt)');
+
+    const failed = await paymentNotifications('payment-failed');
+    assert.equal(failed.length, 1, 'exactly one failure notification on park');
+    assert.equal(failed[0]?.title, 'Payment failed');
+    assert.match(failed[0]!.body, /\$120 for your group class enrollment.*update your card/i);
+    // A park is a failure, never a receipt.
+    assert.equal((await paymentNotifications('payment-succeeded')).length, 0);
+    await cleanup();
+  },
+);
+
+test(
+  'auto-charge notify — INTERMEDIATE retry emits NO notification (anti-spam invariant)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedDueInvoice(); // attempts=0 → far from the park cap
+    const stripe = makeStripeStub();
+    stripe.setNextIntentStatus('requires_action'); // non-settled → retry scheduled
+
+    const result = await runInvoiceAutoChargeOnce({ stripe, limit: 5 });
+    assert.equal(
+      result.results[0]?.outcome,
+      'failed-retry-scheduled',
+      'a retry is scheduled, not a park',
+    );
+    assert.notEqual(result.results[0]?.nextAttemptAt, null, 'next attempt is scheduled');
+
+    const [inv] = await db
+      .select({ autoChargeAttempts: invoices.autoChargeAttempts })
+      .from(invoices)
+      .where(eq(invoices.id, invoiceId));
+    assert.equal(inv?.autoChargeAttempts, 1, 'attempt counted');
+
+    // THE INVARIANT: no notification of EITHER kind on a transient retry.
+    assert.equal((await paymentNotifications('payment-failed')).length, 0, 'no spam on retry');
+    assert.equal((await paymentNotifications('payment-succeeded')).length, 0);
+    await cleanup();
+  },
+);
