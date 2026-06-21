@@ -3,6 +3,7 @@ import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedger, type LocationKey } from '../db/schema/schema.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
+import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
@@ -213,6 +214,13 @@ async function maybeWritePurchaseLedgerRow(
     // the load-bearing fact for the audit + future reconciliation.
     return;
   }
+  // Resolve the expiry window from credit_expiry_settings (per-location →
+  // org-default → code default) inside this tx — same as the sync route, so the
+  // webhook catch-up grant stamps the same window a live purchase would have.
+  const windowMonths = await creditExpirySettingsRepository.resolveExpiryWindowMonths(
+    parsed.location,
+    tx,
+  );
   await creditLedgerRepository.creditPurchase(tx, {
     dogId: parsed.dogId,
     mode: parsed.mode,
@@ -223,7 +231,7 @@ async function maybeWritePurchaseLedgerRow(
     // Same lot-expiry stamp as the sync purchase route (this covers the catch-up
     // grant AND the orphan reconstruct, which delegates here). 1-credit packs
     // never expire (helper returns null).
-    expiresAt: resolvePurchaseExpiry(parsed.location, parsed.credits, new Date()),
+    expiresAt: resolvePurchaseExpiry(parsed.credits, windowMonths, new Date()),
   });
 }
 

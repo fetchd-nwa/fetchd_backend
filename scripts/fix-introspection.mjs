@@ -96,13 +96,16 @@ requireReplace(
   'export const LOCATION_SLUGS',
 );
 
-// 5. `.$type<LocationKey>()` on the 9 `location` slug-FK columns. Every column
+// 5. `.$type<LocationKey>()` on the 10 `location` slug-FK columns. Every column
 //    literally named `location` in the schema is a `text` FK to locations.slug
 //    (verified against the DB at regeneration time — there is no free-text
 //    `location` column), so branding by exact column-line literal is safe and
-//    hits exactly those 9 sites in two forms (notNull / nullable). The FK
+//    hits exactly those 10 sites in two forms (5 notNull / 5 nullable). The FK
 //    itself is emitted by drizzle as a table-level foreignKey() callback, so we
 //    add ONLY the brand here — no inline .references() (that would duplicate it).
+//    The nullable form grew 4 → 5 with credit_expiry_settings.location
+//    (2026-06-20): NULL = org-wide default, a slug = per-location override —
+//    still a locations.slug FK, so the same brand applies.
 repair(
   SCHEMA,
   'LocationKey brand → location text().notNull() (×5)',
@@ -111,7 +114,7 @@ repair(
 );
 repair(
   SCHEMA,
-  'LocationKey brand → location text() nullable (×4)',
+  'LocationKey brand → location text() nullable (×5)',
   'location: text(),',
   'location: text().$type<LocationKey>(),',
 );
@@ -145,7 +148,7 @@ repair(
 const schema = readFileSync(SCHEMA, 'utf8');
 const relations = readFileSync(RELATIONS, 'utf8');
 
-const LOCATION_KEY_BRAND_SITES = 10; // 9 `location` columns + 1 target_location
+const LOCATION_KEY_BRAND_SITES = 11; // 10 `location` columns + 1 target_location
 const CTA_KIND_BRAND_SITES = 1;
 const locationKeyBrands = (schema.match(/\.\$type<LocationKey>\(\)/g) ?? []).length;
 const ctaKindBrands = (schema.match(/\.\$type<'enroll' \| 'route' \| 'external'>\(\)/g) ?? [])

@@ -8,6 +8,7 @@ import { creditPackagesRepository } from '../db/repositories/creditPackagesRepos
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { invalidatePattern } from '../lib/cache.js';
+import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
 import { ApiError } from '../lib/errors.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
@@ -202,6 +203,12 @@ export function registerCreditPackagesRoute(
           });
 
           if (chargeStatus === 'succeeded') {
+            // Window from credit_expiry_settings (per-location → org-default →
+            // code default), read inside this tx and stamped onto the lot.
+            const windowMonths = await creditExpirySettingsRepository.resolveExpiryWindowMonths(
+              pkg.location,
+              tx,
+            );
             await creditLedgerRepository.creditPurchase(tx, {
               dogId: body.dog_id,
               mode: pkg.mode,
@@ -211,7 +218,7 @@ export function registerCreditPackagesRoute(
               chargeId: charge.id,
               // Stamp the lot's expiry from the then-current window (non-
               // retroactive). 1-credit packs never expire (helper returns null).
-              expiresAt: resolvePurchaseExpiry(pkg.location, pkg.credits, nowFactory()),
+              expiresAt: resolvePurchaseExpiry(pkg.credits, windowMonths, nowFactory()),
             });
           }
 

@@ -195,17 +195,27 @@ test(
   },
 );
 
-test('resolvePurchaseExpiry: 1-credit packs never expire; multi-credit packs get a 1-year window', () => {
+test('resolvePurchaseExpiry: 1-credit packs never expire; multi-credit packs get the resolved window', () => {
   const now = new Date('2026-06-18T12:00:00Z');
-  assert.equal(resolvePurchaseExpiry(FAY, 1, now), null, 'single-day pack never expires');
-  const multi = resolvePurchaseExpiry(FAY, 5, now);
+  const WINDOW_MONTHS = 12;
+  assert.equal(resolvePurchaseExpiry(1, WINDOW_MONTHS, now), null, 'single-day pack never expires');
+  const multi = resolvePurchaseExpiry(5, WINDOW_MONTHS, now);
   assert.equal(
     multi?.toISOString(),
     '2027-06-18T12:00:00.000Z',
     'multi-credit pack expires in 12 months',
   );
   // A refund mint always gets a window, even though it is 1 credit (decision #5).
-  assert.equal(resolveRefundExpiry('bentonville', now).toISOString(), '2027-06-18T12:00:00.000Z');
+  assert.equal(resolveRefundExpiry(WINDOW_MONTHS, now).toISOString(), '2027-06-18T12:00:00.000Z');
+});
+
+test('resolvePurchaseExpiry: honors a non-default resolved window (e.g. a 6-month override)', () => {
+  const now = new Date('2026-06-18T12:00:00Z');
+  const SIX_MONTHS = 6;
+  const multi = resolvePurchaseExpiry(5, SIX_MONTHS, now);
+  assert.equal(multi?.toISOString(), '2026-12-18T12:00:00.000Z', 'expires 6 months out');
+  // 1-credit still never-expire regardless of the window number.
+  assert.equal(resolvePurchaseExpiry(1, SIX_MONTHS, now), null);
 });
 
 test(

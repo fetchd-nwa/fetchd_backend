@@ -649,6 +649,31 @@ export const dogDescriptors = pgTable("dog_descriptors", {
 	}
 });
 
+export const creditExpirySettings = pgTable("credit_expiry_settings", {
+	location: text().$type<LocationKey>(),
+	expiryWindowMonths: integer("expiry_window_months").notNull(),
+	warningLeadDays: integer("warning_lead_days").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		locationUniq: uniqueIndex("credit_expiry_settings_location_uniq").using("btree", table.location.asc().nullsLast().op("text_ops")).where(sql`(location IS NOT NULL)`),
+		orgDefaultUniq: uniqueIndex("credit_expiry_settings_org_default_uniq").using("btree", sql`(location IS NULL)`).where(sql`(location IS NULL)`),
+		creditExpirySettingsLocationFkey: foreignKey({
+			columns: [table.location],
+			foreignColumns: [locations.slug],
+			name: "credit_expiry_settings_location_fkey"
+		}),
+		creditExpirySettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "credit_expiry_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+		creditExpirySettingsExpiryWindowMonthsCheck: check("credit_expiry_settings_expiry_window_months_check", sql`expiry_window_months > 0`),
+		creditExpirySettingsWarningLeadDaysCheck: check("credit_expiry_settings_warning_lead_days_check", sql`warning_lead_days >= 0`),
+	}
+});
+
 export const creditPackages = pgTable("credit_packages", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	key: text().notNull(),
@@ -945,23 +970,39 @@ export const stripeEvents = pgTable("stripe_events", {
 	}
 });
 
-export const idempotencyKeys = pgTable("idempotency_keys", {
-	key: text().primaryKey().notNull(),
-	ownerId: uuid("owner_id"),
-	endpoint: text().notNull(),
-	requestHash: text("request_hash").notNull(),
-	responseStatus: integer("response_status"),
-	responseBody: jsonb("response_body"),
+export const serviceRates = pgTable("service_rates", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	category: serviceCategory().notNull(),
+	location: text().$type<LocationKey>(),
+	amountCents: integer("amount_cents").notNull(),
+	unit: rateUnit().notNull(),
+	effectiveFrom: date("effective_from").notNull(),
+	effectiveTo: date("effective_to"),
+	note: text(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	completedAt: timestamp("completed_at", { withTimezone: true, mode: 'string' }),
+	createdByStaffId: uuid("created_by_staff_id"),
+	voidedAt: timestamp("voided_at", { withTimezone: true, mode: 'string' }),
+	voidedByStaffId: uuid("voided_by_staff_id"),
 }, (table) => {
 	return {
-		createdIdx: index("idempotency_keys_created_idx").using("btree", table.createdAt.asc().nullsLast().op("timestamptz_ops")),
-		idempotencyKeysOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "idempotency_keys_owner_id_fkey"
-		}).onDelete("cascade"),
+		lookupIdx: index("service_rates_lookup_idx").using("btree", table.category.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("date_ops"), table.effectiveFrom.desc().nullsFirst().op("enum_ops")),
+		serviceRatesLocationFkey: foreignKey({
+			columns: [table.location],
+			foreignColumns: [locations.slug],
+			name: "service_rates_location_fkey"
+		}),
+		serviceRatesCreatedByStaffIdFkey: foreignKey({
+			columns: [table.createdByStaffId],
+			foreignColumns: [staff.id],
+			name: "service_rates_created_by_staff_id_fkey"
+		}).onDelete("set null"),
+		serviceRatesVoidedByStaffIdFkey: foreignKey({
+			columns: [table.voidedByStaffId],
+			foreignColumns: [staff.id],
+			name: "service_rates_voided_by_staff_id_fkey"
+		}).onDelete("set null"),
+		serviceRatesAmountCentsCheck: check("service_rates_amount_cents_check", sql`amount_cents >= 0`),
+		serviceRatesCheck: check("service_rates_check", sql`(effective_to IS NULL) OR (effective_to > effective_from)`),
 	}
 });
 
@@ -1007,39 +1048,23 @@ export const agreementDocuments = pgTable("agreement_documents", {
 	}
 });
 
-export const serviceRates = pgTable("service_rates", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	category: serviceCategory().notNull(),
-	location: text().$type<LocationKey>(),
-	amountCents: integer("amount_cents").notNull(),
-	unit: rateUnit().notNull(),
-	effectiveFrom: date("effective_from").notNull(),
-	effectiveTo: date("effective_to"),
-	note: text(),
+export const idempotencyKeys = pgTable("idempotency_keys", {
+	key: text().primaryKey().notNull(),
+	ownerId: uuid("owner_id"),
+	endpoint: text().notNull(),
+	requestHash: text("request_hash").notNull(),
+	responseStatus: integer("response_status"),
+	responseBody: jsonb("response_body"),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	createdByStaffId: uuid("created_by_staff_id"),
-	voidedAt: timestamp("voided_at", { withTimezone: true, mode: 'string' }),
-	voidedByStaffId: uuid("voided_by_staff_id"),
+	completedAt: timestamp("completed_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
-		lookupIdx: index("service_rates_lookup_idx").using("btree", table.category.asc().nullsLast().op("enum_ops"), table.location.asc().nullsLast().op("date_ops"), table.effectiveFrom.desc().nullsFirst().op("enum_ops")),
-		serviceRatesLocationFkey: foreignKey({
-			columns: [table.location],
-			foreignColumns: [locations.slug],
-			name: "service_rates_location_fkey"
-		}),
-		serviceRatesCreatedByStaffIdFkey: foreignKey({
-			columns: [table.createdByStaffId],
-			foreignColumns: [staff.id],
-			name: "service_rates_created_by_staff_id_fkey"
-		}).onDelete("set null"),
-		serviceRatesVoidedByStaffIdFkey: foreignKey({
-			columns: [table.voidedByStaffId],
-			foreignColumns: [staff.id],
-			name: "service_rates_voided_by_staff_id_fkey"
-		}).onDelete("set null"),
-		serviceRatesAmountCentsCheck: check("service_rates_amount_cents_check", sql`amount_cents >= 0`),
-		serviceRatesCheck: check("service_rates_check", sql`(effective_to IS NULL) OR (effective_to > effective_from)`),
+		createdIdx: index("idempotency_keys_created_idx").using("btree", table.createdAt.asc().nullsLast().op("timestamptz_ops")),
+		idempotencyKeysOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "idempotency_keys_owner_id_fkey"
+		}).onDelete("cascade"),
 	}
 });
 

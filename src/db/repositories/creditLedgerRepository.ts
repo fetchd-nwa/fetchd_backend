@@ -3,6 +3,7 @@ import { db } from '../client.js';
 import { creditLedger, dogCreditBalance, type LocationKey } from '../schema/schema.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
 import { resolveRefundExpiry } from '../../lib/creditExpiry.js';
+import { creditExpirySettingsRepository } from './creditExpirySettingsRepository.js';
 import type { Tx } from '../tx.js';
 
 /**
@@ -207,8 +208,16 @@ export const creditLedgerRepository = {
     const lotAlive =
       args.lotId !== null && (args.lotExpiresAt === null || new Date(args.lotExpiresAt) > args.now);
 
+    // A fresh refund lot is needed only when the source lot died; resolve the
+    // current window (per-location → org-default → code default) for THAT case
+    // alone — skip the read on the common return-to-live-lot path.
     const expiresAt =
-      args.lotId !== null && !lotAlive ? resolveRefundExpiry(args.location, args.now) : null;
+      args.lotId !== null && !lotAlive
+        ? resolveRefundExpiry(
+            await creditExpirySettingsRepository.resolveExpiryWindowMonths(args.location, tx),
+            args.now,
+          )
+        : null;
     // Return to the original lot only when it's still alive; otherwise this row
     // is itself a source (lot_id null) — a pool restore (expiresAt null) or a
     // fresh lot (expiresAt set).
