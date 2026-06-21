@@ -1,6 +1,12 @@
 import { assertNever } from './assertNever.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { senderKind, threadCategory, staffRole } from '../db/schema/schema.js';
+import type {
+  ThreadParticipantWire,
+  ThreadWire,
+  MessageAttachmentWire,
+  MessageWire,
+} from '../contracts/wire.js';
 
 /**
  * Wire shapes for `Thread` + `Message` per DATA-CONTRACT §B (line 193-200).
@@ -24,52 +30,8 @@ export type ThreadCategory = (typeof threadCategory.enumValues)[number];
 export type SenderKind = (typeof senderKind.enumValues)[number];
 export type StaffRoleValue = (typeof staffRole.enumValues)[number];
 
-export interface ThreadParticipantWire {
-  id: string;
-  name: string;
-  role: StaffRoleValue;
-  image_path?: string;
-}
-
-export interface ThreadWire {
-  id: string;
-  category: ThreadCategory;
-  title: string;
-  sub_text: string;
-  participant: ThreadParticipantWire;
-  related_dog_ids: string[];
-  last_message: string;
-  last_message_at: string;
-  unread_count: number;
-}
-
-/**
- * One photo/video attachment on a message. `media_id` is the `media_assets`
- * row; `url` is a short-lived signed GET URL (signed in `wireManyMessages`,
- * 5-min TTL — the thread polls far faster). `width`/`height`/`blurhash` let the
- * FE lay the image out without a second round-trip; `duration_ms` is video-only.
- */
-export interface MessageAttachmentWire {
-  media_id: string;
-  kind: 'image' | 'video';
-  url: string;
-  width: number | null;
-  height: number | null;
-  blurhash: string | null;
-  duration_ms: number | null;
-}
-
-export interface MessageWire {
-  id: string;
-  thread_id: string;
-  sender_id: string;
-  sender_name?: string;
-  text: string;
-  /** Photo/video attachments, ordered as sent. Omitted when the message has none. */
-  attachments?: MessageAttachmentWire[];
-  sent_at: string;
-  is_read: boolean;
-}
+// These wire shapes are owned by the single-source contract (contracts/wire.ts).
+export type { ThreadParticipantWire, ThreadWire, MessageAttachmentWire, MessageWire };
 
 /**
  * Row shape the repo emits for thread rows (subset of the Drizzle projection).

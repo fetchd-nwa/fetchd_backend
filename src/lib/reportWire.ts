@@ -2,6 +2,7 @@ import { assertNever } from './assertNever.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { reportProgram } from '../db/schema/schema.js';
 import type { ServiceCategory } from './bookingBucket.js';
+import type { SkillResult, PracticeItem, ReportWire } from '../contracts/wire.js';
 
 /**
  * Wire shape for `Report` per DATA-CONTRACT §B Report (R2 JSONB
@@ -25,42 +26,8 @@ import type { ServiceCategory } from './bookingBucket.js';
  */
 export type ReportProgram = (typeof reportProgram.enumValues)[number];
 
-/**
- * Per-skill mark on a curriculum report. Verbatim §B Report shape (snake_
- * case from the mock JSON; the FE camel-cases on receipt). Optional `meta`
- * carries label/value chips used sparingly in Advanced for built-up Stay
- * measurements.
- */
-export interface SkillResult {
-  status: 'pass' | 'learning' | 'pending';
-  score?: string;
-  meta?: { label: string; value: string }[];
-}
-
-export interface PracticeItem {
-  text: string;
-}
-
-export interface ReportWire {
-  id: string;
-  dog_id: string;
-  date: string;
-  trainer?: string;
-  category: ServiceCategory;
-  program: ReportProgram;
-  excerpt: string;
-  full_text: string;
-  visit_count?: number;
-  verdict_headline?: string;
-  results?: Record<string, SkillResult>;
-  practice_at_home?: PracticeItem[];
-  friends_today?: string[];
-  additional_skills_completed?: string[];
-  private_lesson_content?: unknown;
-  boarding_session_content?: unknown;
-  board_train_session_content?: unknown;
-  group_class_session_content?: unknown;
-}
+// These wire shapes are owned by the single-source contract (contracts/wire.ts).
+export type { SkillResult, PracticeItem, ReportWire };
 
 /** The subset of `reports` columns the wire helper consumes. */
 export interface ReportRowForWire {

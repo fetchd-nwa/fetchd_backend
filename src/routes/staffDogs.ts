@@ -4,6 +4,7 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { dogsRepository, type StaffDogRow } from '../db/repositories/dogsRepository.js';
 import { serviceCategory } from '../db/schema/schema.js';
+import type { StaffDogWire } from '../contracts/wire.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
@@ -26,15 +27,7 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 const sessionCountParamsSchema = z.object({ dogId: z.string().uuid() });
 const sessionCountQuerySchema = z.object({ category: z.enum(pgEnumTuple(serviceCategory)) });
 
-interface StaffDogWire {
-  id: string;
-  name: string;
-  breed: string;
-  owner_id: string;
-  owner_name: string;
-  profile_image_path?: string;
-}
-
+// StaffDogWire is owned by the single-source contract (contracts/wire.ts).
 function toStaffDogWire(row: StaffDogRow): StaffDogWire {
   return {
     id: row.id,

@@ -5,6 +5,7 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { type BookingWire } from '../lib/bookingWire.js';
+import type { AttendanceWire } from '../contracts/wire.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { ApiError } from '../lib/errors.js';
 import { requireStaff } from '../lib/principalNarrows.js';
@@ -43,12 +44,7 @@ const attendanceBodySchema = z
   })
   .strict();
 
-interface AttendanceWire {
-  booking_id: string;
-  dog_id: string;
-  attendance: 'attended' | 'no-show' | 'excused';
-  checked_in_at: string;
-}
+// AttendanceWire is owned by the single-source contract (contracts/wire.ts).
 
 export interface StaffBookingsRouteOptions extends AuthRouteOptions {
   /** Stripe seam for the cancel money-back postCommit (mirrors bookings). */

@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
+import type { MediaWire } from '../contracts/wire.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import {
   mediaAssetsRepository,
@@ -106,24 +107,8 @@ const uploadQuerySchema = z
 
 type UploadQuery = z.infer<typeof uploadQuerySchema>;
 
-export interface MediaWire {
-  id: string;
-  purpose: MediaPurpose;
-  kind: MediaKind;
-  url: string;
-  expires_at: string;
-  blurhash: string | null;
-  width: number | null;
-  height: number | null;
-  duration_ms: number | null;
-  /**
-   * Derivative URLs, keyed by label ('thumb' / 'feed' / 'lightbox'). Each
-   * URL is presigned with the same TTL as the base `url`. Empty until the
-   * derivatives worker has run (the source is still readable at original
-   * size — that's `url`).
-   */
-  derivatives: Record<string, string>;
-}
+// MediaWire is owned by the single-source contract (contracts/wire.ts).
+export type { MediaWire };
 
 export interface MediaRouteOpts extends AuthRouteOptions {
   /** Override the R2 client (contract tests inject the stub). */

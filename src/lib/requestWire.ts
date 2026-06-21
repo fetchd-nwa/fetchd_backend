@@ -1,6 +1,11 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
 import type { ServiceCategory } from './bookingBucket.js';
 import { requestStatus } from '../db/schema/schema.js';
+import type {
+  PendingRequestNotesWire,
+  PendingRequestFocusWire,
+  PendingRequestWire,
+} from '../contracts/wire.js';
 
 /**
  * Wire shape for `PendingRequest` per DATA-CONTRACT §B (R1, R8). The DB
@@ -24,30 +29,8 @@ import { requestStatus } from '../db/schema/schema.js';
  */
 export type RequestStatus = (typeof requestStatus.enumValues)[number];
 
-export interface PendingRequestNotesWire {
-  per_dog?: string;
-  joint?: string;
-}
-
-export interface PendingRequestFocusWire {
-  staff_preference?: string;
-  descriptor_keys?: string[];
-}
-
-export interface PendingRequestWire {
-  id: string;
-  dog_id: string;
-  additional_dog_ids?: string[];
-  category: ServiceCategory;
-  submitted_at: string;
-  preferred_dates: string[];
-  notes?: PendingRequestNotesWire;
-  focus: PendingRequestFocusWire;
-  length_weeks?: number;
-  status: RequestStatus;
-  approved_at?: string;
-  converted_booking_id?: string;
-}
+// These wire shapes are owned by the single-source contract (contracts/wire.ts).
+export type { PendingRequestNotesWire, PendingRequestFocusWire, PendingRequestWire };
 
 /**
  * The subset of `pending_requests` columns the wire helper consumes.

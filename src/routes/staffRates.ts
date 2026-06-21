@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import type { StaffRateWire, StaffRateHistoryWire } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { withServiceRateLock } from '../db/locks.js';
 import {
@@ -8,12 +9,7 @@ import {
   type StaffRateHistoryRow,
   type StaffServiceRateRow,
 } from '../db/repositories/serviceRatesRepository.js';
-import {
-  LOCATION_SLUGS,
-  rateUnit,
-  serviceCategory,
-  type LocationKey,
-} from '../db/schema/schema.js';
+import { LOCATION_SLUGS, rateUnit, serviceCategory } from '../db/schema/schema.js';
 import { bucketChicagoToday, isValidCalendarDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
@@ -89,26 +85,8 @@ const historyQuerySchema = z.object({
 
 const uuidParamSchema = z.object({ id: z.string().uuid() });
 
-type ServiceCategory = (typeof serviceCategory.enumValues)[number];
-type RateUnit = (typeof rateUnit.enumValues)[number];
-
-interface StaffRateWire {
-  id: string;
-  category: ServiceCategory;
-  location: LocationKey | null;
-  amount_cents: number;
-  unit: RateUnit;
-  effective_from: string;
-  effective_to: string | null;
-  note: string | null;
-  created_by_staff_id: string | null;
-}
-
-interface StaffRateHistoryWire extends StaffRateWire {
-  created_at: string;
-  voided_at: string | null;
-  voided_by_staff_id: string | null;
-}
+// StaffRateWire + StaffRateHistoryWire are owned by the single-source contract
+// (contracts/wire.ts).
 
 function toStaffRateWire(row: StaffServiceRateRow): StaffRateWire {
   return {

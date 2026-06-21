@@ -1,6 +1,7 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
 import type { ServiceCategory } from './bookingBucket.js';
 import { bookingStatus, type LocationKey } from '../db/schema/schema.js';
+import type { BookingWire } from '../contracts/wire.js';
 
 /**
  * Wire shape for `Booking` per DATA-CONTRACT §B (Δ 2026-05-19 +
@@ -12,26 +13,9 @@ import { bookingStatus, type LocationKey } from '../db/schema/schema.js';
 export type BookingStatus = (typeof bookingStatus.enumValues)[number];
 export type { LocationKey };
 
-export interface BookingWire {
-  id: string;
-  dog_id: string;
-  additional_dog_ids?: string[];
-  category: ServiceCategory;
-  status: BookingStatus;
-  date: string;
-  trainer?: string;
-  duration_minutes?: number;
-  notes?: string;
-  session_report_id?: string;
-  location?: LocationKey;
-  cancelled_at?: string;
-  cancel_forfeited?: boolean;
-  // Group-class only (DATA-CONTRACT §A Amendment 2026-06-01). `cohort_id` is
-  // the stable key the FE groups weekly sessions by (one card per cohort +
-  // date, dogs stacked); `group_class_name` titles the card ("Manners 1").
-  cohort_id?: string;
-  group_class_name?: string;
-}
+// BookingWire's shape is owned by the single-source contract (contracts/wire.ts).
+// This module owns only the DB-row → wire shaping below.
+export type { BookingWire };
 
 /**
  * The subset of `bookings` columns the wire shape consumes. A structural
