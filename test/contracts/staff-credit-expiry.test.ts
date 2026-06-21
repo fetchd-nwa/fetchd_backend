@@ -5,6 +5,7 @@ import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { charges, creditExpirySettings, creditLedger } from '../../src/db/schema/schema.js';
 import { creditExpirySettingsRepository } from '../../src/db/repositories/creditExpirySettingsRepository.js';
+import { DEFAULT_CREDIT_EXPIRY_MONTHS } from '../../src/lib/creditExpiry.js';
 import { pgTimestampToIso } from '../../src/lib/pgTimestamp.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { registerStaffCreditExpiryRoute } from '../../src/routes/staffCreditExpiry.js';
@@ -294,12 +295,32 @@ test(
       'a location without an override still uses the org-default',
     );
 
-    // Delete EVERY row → code default (12) is the last resort.
+    // Move the org-default to a value DISTINCT from the code default → proves
+    // resolve reads the org-default ROW, not a baked-in constant that happens
+    // to equal the seed (12 == DEFAULT_CREDIT_EXPIRY_MONTHS would hide that).
+    const DISTINCT_ORG_DEFAULT_MONTHS = 18;
+    await db.transaction(async (tx) => {
+      await creditExpirySettingsRepository.upsert(tx, {
+        location: null,
+        expiryWindowMonths: DISTINCT_ORG_DEFAULT_MONTHS,
+        warningLeadDays: SEEDED_WARNING_LEAD_DAYS,
+        staffId: FIXTURE_IDS.staffDonavanId,
+      });
+    });
+    assert.equal(
+      await creditExpirySettingsRepository.resolveExpiryWindowMonths('bentonville'),
+      DISTINCT_ORG_DEFAULT_MONTHS,
+      'a location without an override reads the org-default ROW (18), not the code default',
+    );
+
+    // Delete EVERY row → only the code default can answer now. Asserting against
+    // the imported constant (not a literal 12) pins the deepest fallback tier
+    // unambiguously, distinct from any surviving DB row.
     await db.delete(creditExpirySettings);
     assert.equal(
       await creditExpirySettingsRepository.resolveExpiryWindowMonths('bentonville'),
-      SEEDED_WINDOW_MONTHS,
-      'code default (12) when neither override nor org-default exists',
+      DEFAULT_CREDIT_EXPIRY_MONTHS,
+      'code default (DEFAULT_CREDIT_EXPIRY_MONTHS) when neither override nor org-default exists',
     );
     await resetCreditExpirySettings();
   },

@@ -9,7 +9,7 @@ import { DEFAULT_CREDIT_EXPIRY_MONTHS } from '../../lib/creditExpiry.js';
  * staff-tunable credit-expiry config, two-tier: ONE org-default row
  * (location IS NULL) + optional per-location override rows (location = slug).
  *
- * Read pattern: `resolveExpiryWindowMonths(tx, location)` is called at every
+ * Read pattern: `resolveExpiryWindowMonths(location, runner)` is called at every
  * PURCHASE grant site to stamp `credit_ledger.expires_at` (non-retroactive —
  * the stamped value travels with the lot). Resolution is a fallback CHAIN:
  *   per-location override → org-default → `DEFAULT_CREDIT_EXPIRY_MONTHS` (12).
