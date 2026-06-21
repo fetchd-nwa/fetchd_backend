@@ -3,21 +3,26 @@ import { test } from 'node:test';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
+import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import {
   charges,
+  deviceTokens,
   invoices,
   notificationDogs,
   notifications,
   paymentMethods,
+  scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import {
   MAX_AUTO_CHARGE_ATTEMPTS,
   runInvoiceAutoChargeOnce,
   scheduleNextAttempt,
 } from '../../src/workers/invoiceAutoCharge.js';
+import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
+import { makeExpoPushStub } from './_expoPushStub.js';
 
 registerFixtureHooks();
 
@@ -52,17 +57,45 @@ async function setAttemptsToOneBeforePark(invoiceId: string): Promise<void> {
     .where(eq(invoices.id, invoiceId));
 }
 
+async function seedDeviceToken(token: string): Promise<void> {
+  await db.insert(deviceTokens).values({
+    ownerId: FIXTURE_IDS.ownerId,
+    expoPushToken: token,
+    platform: 'ios',
+  });
+}
+
+async function clearDeviceTokens(): Promise<void> {
+  await db.delete(deviceTokens).where(eq(deviceTokens.ownerId, FIXTURE_IDS.ownerId));
+}
+
 async function cleanup(): Promise<void> {
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
-  // The worker now writes payment-succeeded / payment-failed feed rows; drop
-  // them so a re-run starts clean (notification_dogs cascades on this delete).
+  // A parked invoice now enqueues a payment-failed `scheduled_notifications`
+  // row (delivered + pushed by the scheduler); a successful auto-charge writes
+  // a payment-succeeded feed row directly. Clear both so a re-run starts clean.
+  // Break the scheduled-row -> notifications FK link before deleting feed rows,
+  // then drop the scheduled rows themselves (their dedupe_key is invoice-stable,
+  // so a stale row would block the next park enqueue).
+  await db
+    .update(scheduledNotifications)
+    .set({ emittedNotificationId: null })
+    .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
   await db
     .delete(notifications)
     .where(
       and(
         eq(notifications.ownerId, FIXTURE_IDS.ownerId),
         inArray(notifications.type, ['payment-succeeded', 'payment-failed']),
+      ),
+    );
+  await db
+    .delete(scheduledNotifications)
+    .where(
+      and(
+        eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId),
+        eq(scheduledNotifications.type, 'payment-failed'),
       ),
     );
 }
@@ -228,6 +261,19 @@ test(
     // No payment-failed on a clean success.
     assert.equal((await paymentNotifications('payment-failed')).length, 0);
 
+    // payment-succeeded stays FEED-ONLY: written directly by settleInvoiceCharge,
+    // never routed through the scheduled push queue (only payment-failed is).
+    const scheduledRows = await db
+      .select({ id: scheduledNotifications.id })
+      .from(scheduledNotifications)
+      .where(
+        and(
+          eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId),
+          inArray(scheduledNotifications.type, ['payment-failed', 'payment-succeeded']),
+        ),
+      );
+    assert.equal(scheduledRows.length, 0, 'a receipt never enqueues a scheduled push');
+
     // notification_dogs denorm links the receipt to the billed dog.
     const dogLinks = await db
       .select({ dogId: notificationDogs.dogId })
@@ -242,7 +288,7 @@ test(
 );
 
 test(
-  'auto-charge notify — PARK emits exactly one payment-failed (update-your-card)',
+  'auto-charge notify — PARK enqueues a payment-failed scheduled push (not a direct feed row)',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -264,12 +310,126 @@ test(
     assert.equal(inv?.status, 'open', 'parked invoices stay open for staff resolution');
     assert.equal(inv?.nextAttemptAt, null, 'parked (no further auto-attempt)');
 
-    const failed = await paymentNotifications('payment-failed');
-    assert.equal(failed.length, 1, 'exactly one failure notification on park');
-    assert.equal(failed[0]?.title, 'Payment failed');
-    assert.match(failed[0]!.body, /\$120 for your group class enrollment.*update your card/i);
+    // The park now routes through the PUSH channel: a `scheduled_notifications`
+    // row (delivered + pushed by the scheduler), NOT a direct feed insert.
+    const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+      db,
+      `payment-failed:${invoiceId}`,
+    );
+    assert.ok(scheduled, 'park enqueued a scheduled payment-failed row');
+    assert.equal(scheduled?.type, 'payment-failed');
+    assert.equal(scheduled?.trigger, 'payment-failed');
+    assert.equal(scheduled?.status, 'pending', 'not yet delivered — awaits the scheduler tick');
+    assert.equal(scheduled?.title, 'Payment failed');
+    assert.match(scheduled!.body, /\$120 for your group class enrollment.*update your card/i);
+    assert.equal(scheduled?.deepLinkPath, '/account/billing');
+
+    // No feed row landed in the worker tx — the scheduler inserts it on delivery.
+    assert.equal(
+      (await paymentNotifications('payment-failed')).length,
+      0,
+      'feed deferred to scheduler',
+    );
     // A park is a failure, never a receipt.
     assert.equal((await paymentNotifications('payment-succeeded')).length, 0);
+    await cleanup();
+  },
+);
+
+test(
+  'auto-charge notify — scheduler delivers the parked payment-failed (feed row + push dispatched)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    await clearDeviceTokens();
+    await seedDeviceToken('ExponentPushToken[stub-park-device]');
+    const invoiceId = await seedDueInvoice({
+      amountCents: 12000,
+      purpose: 'group-class',
+      dogId: FIXTURE_IDS.dog1Id,
+    });
+    await setAttemptsToOneBeforePark(invoiceId);
+    const stripe = makeStripeStub();
+    stripe.setNextIntentStatus('requires_payment_method');
+
+    // 1) Park enqueues the scheduled row.
+    await runInvoiceAutoChargeOnce({ stripe, limit: 5 });
+
+    // 2) Scheduler delivers it: INSERT the feed row + dispatch push from tokens.
+    const expoPush = makeExpoPushStub();
+    const tick = await runSchedulerTickOnce({ expoPush });
+
+    assert.ok(tick.scheduledNotifications.sent >= 1, 'scheduler sent the parked payment-failed');
+
+    const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+      db,
+      `payment-failed:${invoiceId}`,
+    );
+    assert.equal(scheduled?.status, 'sent', 'scheduled row marked sent');
+    assert.ok(scheduled?.emittedNotificationId, 'linked to the delivered feed row');
+
+    // Feed row now exists.
+    const failed = await paymentNotifications('payment-failed');
+    assert.equal(failed.length, 1, 'exactly one delivered feed row after the tick');
+    assert.equal(failed[0]?.title, 'Payment failed');
+
+    // notification_dogs denorm links the billed dog (the invoice carried dog1Id).
+    const dogLinks = await db
+      .select({ dogId: notificationDogs.dogId })
+      .from(notificationDogs)
+      .where(eq(notificationDogs.notificationId, failed[0]!.id));
+    assert.deepStrictEqual(
+      dogLinks.map((r) => r.dogId),
+      [FIXTURE_IDS.dog1Id],
+    );
+
+    // Push was dispatched to the owner's live token.
+    const parkPushes = expoPush.calls
+      .flatMap((call) => call.messages)
+      .filter((message) => message.data?.type === 'payment-failed');
+    assert.equal(parkPushes.length, 1, 'one payment-failed push dispatched');
+    assert.equal(parkPushes[0]?.to, 'ExponentPushToken[stub-park-device]');
+    assert.equal(parkPushes[0]?.title, 'Payment failed');
+
+    await clearDeviceTokens();
+    await cleanup();
+  },
+);
+
+test(
+  'auto-charge notify — re-running the park path does NOT enqueue a second scheduled row (dedup)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedDueInvoice({ amountCents: 12000, purpose: 'group-class' });
+    await setAttemptsToOneBeforePark(invoiceId);
+
+    // First park enqueues the scheduled row.
+    const firstStripe = makeStripeStub();
+    firstStripe.setNextIntentStatus('requires_payment_method');
+    await runInvoiceAutoChargeOnce({ stripe: firstStripe, limit: 5 });
+
+    // Force the invoice back to a parkable state and re-run the park path. The
+    // invoice-stable dedupe key (`payment-failed:<invoiceId>`) must make the
+    // second enqueue an ON CONFLICT DO NOTHING no-op — one push per parked
+    // invoice, ever.
+    await db
+      .update(invoices)
+      .set({
+        status: 'open',
+        autoChargeAttempts: MAX_AUTO_CHARGE_ATTEMPTS - 1,
+        nextAttemptAt: '2026-01-01T00:00:00Z',
+      })
+      .where(eq(invoices.id, invoiceId));
+    const secondStripe = makeStripeStub();
+    secondStripe.setNextIntentStatus('requires_payment_method');
+    await runInvoiceAutoChargeOnce({ stripe: secondStripe, limit: 5 });
+
+    const rows = await db
+      .select({ id: scheduledNotifications.id })
+      .from(scheduledNotifications)
+      .where(eq(scheduledNotifications.dedupeKey, `payment-failed:${invoiceId}`));
+    assert.equal(rows.length, 1, 'exactly one scheduled row across two park attempts');
     await cleanup();
   },
 );
@@ -297,9 +457,20 @@ test(
       .where(eq(invoices.id, invoiceId));
     assert.equal(inv?.autoChargeAttempts, 1, 'attempt counted');
 
-    // THE INVARIANT: no notification of EITHER kind on a transient retry.
+    // THE INVARIANT: no notification of EITHER kind on a transient retry —
+    // neither a delivered feed row nor an enqueued scheduled push.
     assert.equal((await paymentNotifications('payment-failed')).length, 0, 'no spam on retry');
     assert.equal((await paymentNotifications('payment-succeeded')).length, 0);
+    const scheduledOnRetry = await db
+      .select({ id: scheduledNotifications.id })
+      .from(scheduledNotifications)
+      .where(
+        and(
+          eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId),
+          eq(scheduledNotifications.type, 'payment-failed'),
+        ),
+      );
+    assert.equal(scheduledOnRetry.length, 0, 'an intermediate retry enqueues no scheduled push');
     await cleanup();
   },
 );

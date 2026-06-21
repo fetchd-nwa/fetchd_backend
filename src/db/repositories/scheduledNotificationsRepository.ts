@@ -52,10 +52,12 @@ export type ScheduledNotificationType =
   | 'message-received'
   | 'booking-reminder'
   | 'boarding-profile-check'
-  // credit-expiry Phase 3: the only NEW scheduled-queue arm. `payment-failed`/
-  // `payment-succeeded` are emitted DIRECTLY to the feed by the auto-charge
-  // worker (inside its status-flip tx), never scheduled — so they're not here.
-  | 'credits-expiring';
+  | 'credits-expiring'
+  // `payment-failed` (a PARKED invoice — terminal auto-charge failure) routes
+  // through the scheduled queue so it gets the PUSH channel: it's action-
+  // required (the owner must fix their card). `payment-succeeded` (a receipt)
+  // stays feed-only — emitted directly by `settleInvoiceCharge`, never here.
+  | 'payment-failed';
 
 export interface ScheduledNotificationRow {
   id: string;

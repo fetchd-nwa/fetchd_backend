@@ -1,4 +1,4 @@
-import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
+import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
@@ -158,7 +158,7 @@ async function processOne(
       { invoiceId: invoice.id, paymentMethodId: invoice.paymentMethodId },
       'invoice auto-charge: payment method missing; parking invoice',
     );
-    await recordFailed(invoice, null);
+    await recordFailed(invoice, null, now);
     return { invoiceId: invoice.id, outcome: 'skipped-pm-missing', nextAttemptAt: null };
   }
 
@@ -168,7 +168,7 @@ async function processOne(
       { invoiceId: invoice.id, ownerId: invoice.ownerId },
       'invoice auto-charge: stripe_customers row missing; parking invoice',
     );
-    await recordFailed(invoice, null);
+    await recordFailed(invoice, null, now);
     return { invoiceId: invoice.id, outcome: 'skipped-customer-missing', nextAttemptAt: null };
   }
 
@@ -218,7 +218,7 @@ async function processOne(
       'invoice auto-charge: Stripe call failed',
     );
     const nextAttemptAt = scheduleNextAttempt(invoice.autoChargeAttempts, now);
-    await recordFailed(invoice, nextAttemptAt);
+    await recordFailed(invoice, nextAttemptAt, now);
     return {
       invoiceId: invoice.id,
       outcome: nextAttemptAt === null ? 'failed-parked' : 'failed-retry-scheduled',
@@ -247,7 +247,7 @@ async function processOne(
     );
   }
   const nextAttemptAt = scheduleNextAttempt(invoice.autoChargeAttempts, now);
-  await recordFailed(invoice, nextAttemptAt);
+  await recordFailed(invoice, nextAttemptAt, now);
   return {
     invoiceId: invoice.id,
     outcome: nextAttemptAt === null ? 'failed-parked' : 'failed-retry-scheduled',
@@ -335,27 +335,43 @@ async function fireDuplicateRefund(
 /**
  * Short record tx: increment attempts + reschedule (or `null` to park). When
  * the invoice PARKS (`nextAttemptAt === null` — the terminal state at MAX
- * attempts, or a missing card/customer), emit ONE `payment-failed`
+ * attempts, or a missing card/customer), enqueue ONE `payment-failed`
  * notification inside the SAME tx. NOTIFY-ON-PARK-ONLY is the anti-spam
  * invariant: an intermediate retry (a non-null `nextAttemptAt`) never notifies,
  * so the owner hears once — when there's nothing left to retry and they must
- * act — not on every transient decline. Co-locating the INSERT with the
- * status flip means a notification is never emitted for an attempt that rolls
- * back.
+ * act — not on every transient decline. Co-locating the enqueue with the status
+ * flip means a notification is never emitted for an attempt that rolls back.
+ *
+ * A parked invoice is ACTION-REQUIRED (the owner must fix their card), so it
+ * goes out via the PUSH channel: instead of a direct feed insert, we enqueue a
+ * `scheduled_notifications` row with `scheduled_for = now`. The scheduler's
+ * delivery phase (`deliverOne`) then INSERTs the feed `notifications` row AND
+ * dispatches Expo push from the owner's live tokens on its next tick — feed +
+ * push, delivered together. The trade vs. the old direct insert: the feed entry
+ * now lands on the next scheduler tick rather than instantly in this worker tx.
+ * `dedupe_key = payment-failed:<invoiceId>` (the `scheduled_notifications.
+ * dedupe_key` UNIQUE) makes it one push per parked invoice, ever.
  */
-async function recordFailed(invoice: InvoiceRow, nextAttemptAt: string | null): Promise<void> {
+async function recordFailed(
+  invoice: InvoiceRow,
+  nextAttemptAt: string | null,
+  now: Date,
+): Promise<void> {
   await withActor(WORKER_ACTOR, async (tx) => {
     await invoicesRepository.recordFailedAttempt(tx, { id: invoice.id, nextAttemptAt });
     if (nextAttemptAt !== null) return; // retry scheduled — do NOT notify (anti-spam)
-    await notificationsRepository.enqueue(tx, {
+    await scheduledNotificationsRepository.enqueueIdempotent(tx, {
       ownerId: invoice.ownerId,
       type: 'payment-failed',
+      trigger: 'payment-failed',
+      dedupeKey: `payment-failed:${invoice.id}`,
+      scheduledFor: now, // immediate — delivered on the next scheduler tick
       title: 'Payment failed',
       body: `We couldn't process your payment of ${formatDollars(
         invoice.amountCents,
       )} for your ${purposeLabel(invoice.purpose)}. Please update your card.`,
       deepLinkPath: '/account/billing',
-      dogIds: invoice.dogId ? [invoice.dogId] : [],
+      dogId: invoice.dogId,
     });
   });
 }
