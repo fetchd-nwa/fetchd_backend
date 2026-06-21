@@ -1,5 +1,67 @@
 import { relations } from "drizzle-orm/relations";
-import { owners, dogs, staff, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, bookings, afterSchoolOptins, pendingRequests, cancelWindowSettings, creditLedger, creditPackages, charges, paymentMethods, stripeCustomers, invoices, memberships, agreementSignatures, agreementDocuments, refunds, idempotencyKeys, threads, notifications, messages, messageAttachments, eventSeries, events, eventRsvps, scheduledNotifications, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, bookingDogs } from "./schema.js";
+import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, memberships, refunds, idempotencyKeys, agreementSignatures, agreementDocuments, serviceRates, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs } from "./schema.js";
+
+export const ownersRelations = relations(owners, ({one, many}) => ({
+	location: one(locations, {
+		fields: [owners.location],
+		references: [locations.slug]
+	}),
+	dogs: many(dogs),
+	mediaAssets: many(mediaAssets),
+	bookings: many(bookings),
+	afterSchoolOptins: many(afterSchoolOptins),
+	pendingRequests: many(pendingRequests),
+	stripeCustomers: many(stripeCustomers),
+	paymentMethods: many(paymentMethods),
+	charges: many(charges),
+	invoices: many(invoices),
+	memberships: many(memberships),
+	refunds: many(refunds),
+	idempotencyKeys: many(idempotencyKeys),
+	agreementSignatures: many(agreementSignatures),
+	threads: many(threads),
+	messages: many(messages),
+	eventRsvps: many(eventRsvps),
+	notifications: many(notifications),
+	scheduledNotifications: many(scheduledNotifications),
+	deviceTokens: many(deviceTokens),
+}));
+
+export const locationsRelations = relations(locations, ({many}) => ({
+	owners: many(owners),
+	staff: many(staff),
+	cohorts: many(cohorts),
+	bookings: many(bookings),
+	creditPackages: many(creditPackages),
+	creditLedgers: many(creditLedger),
+	serviceRates: many(serviceRates),
+	announcements: many(announcements),
+	dayCapacities: many(dayCapacity),
+}));
+
+export const staffRelations = relations(staff, ({one, many}) => ({
+	location: one(locations, {
+		fields: [staff.location],
+		references: [locations.slug]
+	}),
+	dogs: many(dogs),
+	reports: many(reports),
+	bookings: many(bookings),
+	pendingRequests: many(pendingRequests),
+	intakeFieldSettings: many(intakeFieldSettings),
+	cancelWindowSettings: many(cancelWindowSettings),
+	dogDescriptors: many(dogDescriptors),
+	serviceRates_createdByStaffId: many(serviceRates, {
+		relationName: "serviceRates_createdByStaffId_staff_id"
+	}),
+	serviceRates_voidedByStaffId: many(serviceRates, {
+		relationName: "serviceRates_voidedByStaffId_staff_id"
+	}),
+	threads: many(threads),
+	messages: many(messages),
+	notifications: many(notifications),
+	bookingDogs: many(bookingDogs),
+}));
 
 export const dogsRelations = relations(dogs, ({one, many}) => ({
 	owner: one(owners, {
@@ -24,46 +86,14 @@ export const dogsRelations = relations(dogs, ({one, many}) => ({
 	afterSchoolOptins: many(afterSchoolOptins),
 	pendingRequests: many(pendingRequests),
 	creditLedgers: many(creditLedger),
+	charges: many(charges),
+	invoices: many(invoices),
 	memberships: many(memberships),
 	scheduledNotifications: many(scheduledNotifications),
 	notificationDogs: many(notificationDogs),
 	threadDogs: many(threadDogs),
 	eventRsvpDogs: many(eventRsvpDogs),
 	pendingRequestDogs: many(pendingRequestDogs),
-	bookingDogs: many(bookingDogs),
-}));
-
-export const ownersRelations = relations(owners, ({many}) => ({
-	dogs: many(dogs),
-	mediaAssets: many(mediaAssets),
-	bookings: many(bookings),
-	afterSchoolOptins: many(afterSchoolOptins),
-	pendingRequests: many(pendingRequests),
-	paymentMethods: many(paymentMethods),
-	stripeCustomers: many(stripeCustomers),
-	charges: many(charges),
-	invoices: many(invoices),
-	memberships: many(memberships),
-	agreementSignatures: many(agreementSignatures),
-	refunds: many(refunds),
-	idempotencyKeys: many(idempotencyKeys),
-	threads: many(threads),
-	notifications: many(notifications),
-	messages: many(messages),
-	eventRsvps: many(eventRsvps),
-	scheduledNotifications: many(scheduledNotifications),
-	deviceTokens: many(deviceTokens),
-}));
-
-export const staffRelations = relations(staff, ({many}) => ({
-	dogs: many(dogs),
-	reports: many(reports),
-	bookings: many(bookings),
-	pendingRequests: many(pendingRequests),
-	cancelWindowSettings: many(cancelWindowSettings),
-	threads: many(threads),
-	notifications: many(notifications),
-	messages: many(messages),
 	bookingDogs: many(bookingDogs),
 }));
 
@@ -120,13 +150,6 @@ export const classPrereqOptionsRelations = relations(classPrereqOptions, ({one})
 	}),
 }));
 
-export const classResourcesRelations = relations(classResources, ({one}) => ({
-	groupClass: one(groupClasses, {
-		fields: [classResources.classKey],
-		references: [groupClasses.key]
-	}),
-}));
-
 export const groupClassesRelations = relations(groupClasses, ({many}) => ({
 	classPrereqOptions_classKey: many(classPrereqOptions, {
 		relationName: "classPrereqOptions_classKey_groupClasses_key"
@@ -138,12 +161,24 @@ export const groupClassesRelations = relations(groupClasses, ({many}) => ({
 	cohorts: many(cohorts),
 }));
 
+export const classResourcesRelations = relations(classResources, ({one}) => ({
+	groupClass: one(groupClasses, {
+		fields: [classResources.classKey],
+		references: [groupClasses.key]
+	}),
+}));
+
 export const cohortsRelations = relations(cohorts, ({one, many}) => ({
 	groupClass: one(groupClasses, {
 		fields: [cohorts.classKey],
 		references: [groupClasses.key]
 	}),
+	location: one(locations, {
+		fields: [cohorts.location],
+		references: [locations.slug]
+	}),
 	bookings: many(bookings),
+	charges: many(charges),
 	invoices: many(invoices),
 }));
 
@@ -179,7 +214,15 @@ export const mediaAssetsRelations = relations(mediaAssets, ({one, many}) => ({
 		fields: [mediaAssets.reportId],
 		references: [reports.id]
 	}),
+	mediaDerivativeJobs: many(mediaDerivativeJobs),
 	messageAttachments: many(messageAttachments),
+}));
+
+export const mediaDerivativeJobsRelations = relations(mediaDerivativeJobs, ({one}) => ({
+	mediaAsset: one(mediaAssets, {
+		fields: [mediaDerivativeJobs.mediaAssetId],
+		references: [mediaAssets.id]
+	}),
 }));
 
 export const bookingsRelations = relations(bookings, ({one, many}) => ({
@@ -208,6 +251,10 @@ export const bookingsRelations = relations(bookings, ({one, many}) => ({
 		fields: [bookings.sessionReportId],
 		references: [reports.id],
 		relationName: "bookings_sessionReportId_reports_id"
+	}),
+	location: one(locations, {
+		fields: [bookings.location],
+		references: [locations.slug]
 	}),
 	afterSchoolOptins: many(afterSchoolOptins),
 	pendingRequests: many(pendingRequests),
@@ -256,6 +303,13 @@ export const pendingRequestsRelations = relations(pendingRequests, ({one, many})
 	pendingRequestPreferredDates: many(pendingRequestPreferredDates),
 }));
 
+export const intakeFieldSettingsRelations = relations(intakeFieldSettings, ({one}) => ({
+	staff: one(staff, {
+		fields: [intakeFieldSettings.updatedByStaffId],
+		references: [staff.id]
+	}),
+}));
+
 export const cancelWindowSettingsRelations = relations(cancelWindowSettings, ({one}) => ({
 	staff: one(staff, {
 		fields: [cancelWindowSettings.updatedByStaffId],
@@ -263,10 +317,29 @@ export const cancelWindowSettingsRelations = relations(cancelWindowSettings, ({o
 	}),
 }));
 
-export const creditLedgerRelations = relations(creditLedger, ({one}) => ({
+export const dogDescriptorsRelations = relations(dogDescriptors, ({one}) => ({
+	staff: one(staff, {
+		fields: [dogDescriptors.updatedByStaffId],
+		references: [staff.id]
+	}),
+}));
+
+export const creditPackagesRelations = relations(creditPackages, ({one, many}) => ({
+	location: one(locations, {
+		fields: [creditPackages.location],
+		references: [locations.slug]
+	}),
+	creditLedgers: many(creditLedger),
+}));
+
+export const creditLedgerRelations = relations(creditLedger, ({one, many}) => ({
 	dog: one(dogs, {
 		fields: [creditLedger.dogId],
 		references: [dogs.id]
+	}),
+	location: one(locations, {
+		fields: [creditLedger.location],
+		references: [locations.slug]
 	}),
 	booking: one(bookings, {
 		fields: [creditLedger.bookingId],
@@ -276,14 +349,18 @@ export const creditLedgerRelations = relations(creditLedger, ({one}) => ({
 		fields: [creditLedger.packageId],
 		references: [creditPackages.id]
 	}),
+	creditLedger: one(creditLedger, {
+		fields: [creditLedger.lotId],
+		references: [creditLedger.id],
+		relationName: "creditLedger_lotId_creditLedger_id"
+	}),
+	creditLedgers: many(creditLedger, {
+		relationName: "creditLedger_lotId_creditLedger_id"
+	}),
 	charge: one(charges, {
 		fields: [creditLedger.chargeId],
 		references: [charges.id]
 	}),
-}));
-
-export const creditPackagesRelations = relations(creditPackages, ({many}) => ({
-	creditLedgers: many(creditLedger),
 }));
 
 export const chargesRelations = relations(charges, ({one, many}) => ({
@@ -308,19 +385,19 @@ export const chargesRelations = relations(charges, ({one, many}) => ({
 	refunds: many(refunds),
 }));
 
+export const stripeCustomersRelations = relations(stripeCustomers, ({one}) => ({
+	owner: one(owners, {
+		fields: [stripeCustomers.ownerId],
+		references: [owners.id]
+	}),
+}));
+
 export const paymentMethodsRelations = relations(paymentMethods, ({one, many}) => ({
 	owner: one(owners, {
 		fields: [paymentMethods.ownerId],
 		references: [owners.id]
 	}),
 	invoices: many(invoices),
-}));
-
-export const stripeCustomersRelations = relations(stripeCustomers, ({one}) => ({
-	owner: one(owners, {
-		fields: [stripeCustomers.ownerId],
-		references: [owners.id]
-	}),
 }));
 
 export const invoicesRelations = relations(invoices, ({one}) => ({
@@ -365,21 +442,6 @@ export const membershipsRelations = relations(memberships, ({one}) => ({
 	}),
 }));
 
-export const agreementSignaturesRelations = relations(agreementSignatures, ({one}) => ({
-	owner: one(owners, {
-		fields: [agreementSignatures.ownerId],
-		references: [owners.id]
-	}),
-	agreementDocument: one(agreementDocuments, {
-		fields: [agreementSignatures.documentKey],
-		references: [agreementDocuments.key]
-	}),
-}));
-
-export const agreementDocumentsRelations = relations(agreementDocuments, ({many}) => ({
-	agreementSignatures: many(agreementSignatures),
-}));
-
 export const refundsRelations = relations(refunds, ({one}) => ({
 	owner: one(owners, {
 		fields: [refunds.ownerId],
@@ -402,6 +464,38 @@ export const idempotencyKeysRelations = relations(idempotencyKeys, ({one}) => ({
 	}),
 }));
 
+export const agreementSignaturesRelations = relations(agreementSignatures, ({one}) => ({
+	owner: one(owners, {
+		fields: [agreementSignatures.ownerId],
+		references: [owners.id]
+	}),
+	agreementDocument: one(agreementDocuments, {
+		fields: [agreementSignatures.documentKey],
+		references: [agreementDocuments.key]
+	}),
+}));
+
+export const agreementDocumentsRelations = relations(agreementDocuments, ({many}) => ({
+	agreementSignatures: many(agreementSignatures),
+}));
+
+export const serviceRatesRelations = relations(serviceRates, ({one}) => ({
+	location: one(locations, {
+		fields: [serviceRates.location],
+		references: [locations.slug]
+	}),
+	staff_createdByStaffId: one(staff, {
+		fields: [serviceRates.createdByStaffId],
+		references: [staff.id],
+		relationName: "serviceRates_createdByStaffId_staff_id"
+	}),
+	staff_voidedByStaffId: one(staff, {
+		fields: [serviceRates.voidedByStaffId],
+		references: [staff.id],
+		relationName: "serviceRates_voidedByStaffId_staff_id"
+	}),
+}));
+
 export const threadsRelations = relations(threads, ({one, many}) => ({
 	owner: one(owners, {
 		fields: [threads.ownerId],
@@ -413,19 +507,6 @@ export const threadsRelations = relations(threads, ({one, many}) => ({
 	}),
 	messages: many(messages),
 	threadDogs: many(threadDogs),
-}));
-
-export const notificationsRelations = relations(notifications, ({one, many}) => ({
-	owner: one(owners, {
-		fields: [notifications.ownerId],
-		references: [owners.id]
-	}),
-	staff: one(staff, {
-		fields: [notifications.senderStaffId],
-		references: [staff.id]
-	}),
-	scheduledNotifications: many(scheduledNotifications),
-	notificationDogs: many(notificationDogs),
 }));
 
 export const messagesRelations = relations(messages, ({one, many}) => ({
@@ -479,6 +560,19 @@ export const eventRsvpsRelations = relations(eventRsvps, ({one, many}) => ({
 	eventRsvpDogs: many(eventRsvpDogs),
 }));
 
+export const notificationsRelations = relations(notifications, ({one, many}) => ({
+	owner: one(owners, {
+		fields: [notifications.ownerId],
+		references: [owners.id]
+	}),
+	staff: one(staff, {
+		fields: [notifications.senderStaffId],
+		references: [staff.id]
+	}),
+	scheduledNotifications: many(scheduledNotifications),
+	notificationDogs: many(notificationDogs),
+}));
+
 export const scheduledNotificationsRelations = relations(scheduledNotifications, ({one}) => ({
 	owner: one(owners, {
 		fields: [scheduledNotifications.ownerId],
@@ -499,6 +593,13 @@ export const scheduledNotificationsRelations = relations(scheduledNotifications,
 	notification: one(notifications, {
 		fields: [scheduledNotifications.emittedNotificationId],
 		references: [notifications.id]
+	}),
+}));
+
+export const announcementsRelations = relations(announcements, ({one}) => ({
+	location: one(locations, {
+		fields: [announcements.targetLocation],
+		references: [locations.slug]
 	}),
 }));
 
@@ -557,6 +658,13 @@ export const pendingRequestPreferredDatesRelations = relations(pendingRequestPre
 	pendingRequest: one(pendingRequests, {
 		fields: [pendingRequestPreferredDates.requestId],
 		references: [pendingRequests.id]
+	}),
+}));
+
+export const dayCapacityRelations = relations(dayCapacity, ({one}) => ({
+	location: one(locations, {
+		fields: [dayCapacity.location],
+		references: [locations.slug]
 	}),
 }));
 
