@@ -120,6 +120,9 @@ export const SESSION_PROGRAMS = [
 ] as const satisfies readonly ReportProgram[];
 
 export function isSessionProgram(program: ReportProgram): boolean {
+  // `as` only widens the narrow `as const` tuple to the general union so
+  // `.includes` accepts any ReportProgram — a provably-safe widening, never a
+  // narrowing, so no runtime risk.
   return (SESSION_PROGRAMS as readonly ReportProgram[]).includes(program);
 }
 
