@@ -1,10 +1,11 @@
-import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
+import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
 import { withActor } from '../db/tx.js';
+import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import {
   defaultStripeClient,
   stripeIntentStatusToChargeStatus,
@@ -87,7 +88,10 @@ export interface InvoiceAutoChargeAttemptResult {
     | 'failed-retry-scheduled'
     | 'failed-parked'
     | 'skipped-pm-missing'
-    | 'skipped-customer-missing';
+    | 'skipped-customer-missing'
+    // The pre-charge re-check found the invoice already settled (or voided) by
+    // a concurrent path during the lease window — no Stripe call was made.
+    | 'skipped-already-settled';
   chargeId?: string;
   nextAttemptAt?: string | null;
 }
@@ -168,6 +172,25 @@ async function processOne(
     return { invoiceId: invoice.id, outcome: 'skipped-customer-missing', nextAttemptAt: null };
   }
 
+  // Cheap pre-Stripe re-check: the lease scooped this row as open, but a
+  // concurrent manual `POST /invoices/:id/pay` (or a webhook) may have settled
+  // it during the lease window. Re-read and bail BEFORE charging to shrink the
+  // double-charge window (mirrors the manual route's pre-Stripe `status ===
+  // 'open'` guard). This is an optimization, NOT the guarantee: the conditional
+  // `markPaid` claim in `settleInvoiceCharge` + the lost-race refund close the
+  // residual window where both paths pass their re-check then both charge.
+  const fresh = await invoicesRepository.findByIdForOwner(db, {
+    id: invoice.id,
+    ownerId: invoice.ownerId,
+  });
+  if (fresh === undefined || fresh.status !== 'open') {
+    log.info(
+      { invoiceId: invoice.id, status: fresh?.status ?? 'gone' },
+      'invoice auto-charge: invoice no longer open at pre-charge re-check; skipping',
+    );
+    return { invoiceId: invoice.id, outcome: 'skipped-already-settled' };
+  }
+
   // Idempotency-keyed on the attempt index so a retry of THIS attempt (incl.
   // a crash-recovery re-lease) re-uses the same PI; a fresh attempt mints one.
   const attemptKey = `auto-charge:${invoice.id}:${invoice.autoChargeAttempts}`;
@@ -206,7 +229,7 @@ async function processOne(
   const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
 
   if (chargeStatus === 'succeeded') {
-    const chargeId = await recordPaid(invoice, intent.id);
+    const chargeId = await recordPaid(invoice, intent.id, intent.amountCents, stripe, log);
     return { invoiceId: invoice.id, outcome: 'paid', chargeId };
   }
 
@@ -233,38 +256,80 @@ async function processOne(
 }
 
 /**
- * Short record tx: a succeeded charge + flip the invoice paid + emit the
- * `payment-succeeded` receipt notification, all atomically. The notification
- * INSERT lives INSIDE this tx so a charge that rolls back never leaves a
- * "we charged you" receipt behind (transaction-boundary invariant).
+ * Short record tx via the shared `settleInvoiceCharge` primitive: INSERT the
+ * succeeded charge + conditionally `markPaid` (the atomic open->paid claim) +
+ * (on win) emit the `payment-succeeded` receipt, all atomically. The
+ * notification INSERT lives INSIDE the tx so a charge that rolls back never
+ * leaves a "we charged you" receipt behind (transaction-boundary invariant).
+ *
+ * Returns the `charges` row id either way (the worker's contract). On a LOST
+ * settle race (a concurrent manual `/pay` flipped the invoice first), the
+ * primitive wrote a 'pending' refund row for this duplicate charge and we fire
+ * the Stripe refund POST-COMMIT here -- the worker owns its own short tx, so
+ * this mirrors the cancel route's `withMutation.postCommit` refund firing:
+ * no Stripe call inside a tx, and a refund-API failure leaves the 'pending'
+ * row for the webhook's race-recovery / admin retry (logged, never swallowed
+ * silently into a paid-but-unrefunded double charge).
  */
-async function recordPaid(invoice: InvoiceRow, paymentIntentId: string): Promise<string> {
-  return withActor(WORKER_ACTOR, async (tx) => {
-    const charge = await chargesRepository.create(tx, {
-      ownerId: invoice.ownerId,
-      amountCents: invoice.amountCents,
-      status: 'succeeded',
+async function recordPaid(
+  invoice: InvoiceRow,
+  paymentIntentId: string,
+  amountCents: number,
+  stripe: StripeClient,
+  log: WorkerLogger,
+): Promise<string> {
+  const result = await withActor(WORKER_ACTOR, (tx) =>
+    settleInvoiceCharge(tx, {
+      invoice,
+      paymentIntentId,
+      amountCents,
       purpose: invoice.purpose,
-      stripePaymentIntentId: paymentIntentId,
-      bookingId: invoice.bookingId,
-      // Carry the enrollment identity so a group-class withdraw after the
-      // auto-charge can still find + refund this dog's payment.
-      cohortId: invoice.cohortId,
-      dogId: invoice.dogId,
-    });
-    await invoicesRepository.markPaid(tx, { id: invoice.id, paidChargeId: charge.id });
-    await notificationsRepository.enqueue(tx, {
-      ownerId: invoice.ownerId,
-      type: 'payment-succeeded',
-      title: 'Payment received',
-      body: `We charged your card ${formatDollars(invoice.amountCents)} for your ${purposeLabel(
-        invoice.purpose,
-      )}.`,
-      deepLinkPath: '/account/billing',
-      dogIds: invoice.dogId ? [invoice.dogId] : [],
-    });
-    return charge.id;
-  });
+      notifyOwner: true,
+    }),
+  );
+
+  if (result.outcome === 'refunded') {
+    await fireDuplicateRefund(invoice.id, result.pendingStripeRefund, stripe, log);
+  }
+  return result.chargeId;
+}
+
+/**
+ * Post-commit Stripe refund for a lost-race duplicate charge (mirrors the
+ * cancel route's postCommit). Fires `stripe.createRefund` against the
+ * duplicate PI then persists the `re_*` id so the `charge.refund.updated`
+ * webhook matches deterministically. A failure here is LOGGED and the
+ * 'pending' refund row remains for retry/visibility -- never swallowed into a
+ * silent double charge.
+ */
+async function fireDuplicateRefund(
+  invoiceId: string,
+  pending: PendingDuplicateRefund | undefined,
+  stripe: StripeClient,
+  log: WorkerLogger,
+): Promise<void> {
+  if (pending === undefined) return; // defensive zero-refund case: nothing to send back
+  try {
+    const refund = await stripe.createRefund(
+      {
+        paymentIntentId: pending.paymentIntentId,
+        amountCents: pending.amountCents,
+        reason: 'requested_by_customer',
+      },
+      `dup-settle-refund:${pending.refundId}`,
+    );
+    await refundsRepository.markStripeId({ id: pending.refundId, stripeRefundId: refund.id });
+  } catch (err) {
+    log.error(
+      {
+        invoiceId,
+        refundId: pending.refundId,
+        paymentIntentId: pending.paymentIntentId,
+        err: errMsg(err),
+      },
+      'invoice auto-charge: lost-race duplicate refund failed to fire; pending row left for retry',
+    );
+  }
 }
 
 /**

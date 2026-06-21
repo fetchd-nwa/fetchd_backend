@@ -7,10 +7,12 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { chargesRepository, type ChargeStatus } from '../db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { ledgerRepository } from '../db/repositories/ledgerRepository.js';
+import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { toLedgerEntryWire, type LedgerEntryWire } from '../lib/ledgerWire.js';
 import { ApiError } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
+import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import {
   defaultStripeClient,
   stripeIntentStatusToChargeStatus,
@@ -53,6 +55,16 @@ export interface InvoicePayWire {
   stripe_payment_intent_id: string;
   client_secret: string | null;
   invoice_status: 'open' | 'paid' | 'void';
+  /**
+   * True when this charge succeeded at Stripe but LOST the settle race against
+   * a concurrent worker auto-charge (or webhook) -- the invoice is already
+   * `paid` by that path, so this duplicate charge is being refunded post-commit
+   * (a 'pending' refund row was written in-tx; Stripe + webhook reconcile it).
+   * The owner's card nets exactly one charge. Honest signal so the client
+   * never renders "payment complete" for money that's on its way back. False
+   * on the clean win and on the 3DS / requires_action path.
+   */
+  charge_refunded: boolean;
 }
 
 const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
@@ -134,6 +146,13 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
       );
       const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
 
+      // Closure-captured handle for the post-commit Stripe refund. Set inside
+      // the withMutation body ONLY when this succeeded charge LOST the settle
+      // race (a concurrent worker auto-charge / webhook flipped the invoice
+      // first); read by the postCommit below. Stays undefined on the clean win
+      // and on the 3DS / requires_action path (postCommit no-ops).
+      let pendingStripeRefund: PendingDuplicateRefund | undefined;
+
       // ── DB writes (inside withMutation; idempotency-keyed) ──
       const outcome = await withMutation<InvoicePayWire>(
         {
@@ -142,45 +161,85 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           endpoint: 'POST /invoices/:id/pay',
           requestHash,
           // cache-noop — invoices aren't cached today.
+          // Post-commit Stripe refund for a lost-race duplicate charge. Fires
+          // once per non-replayed outcome; failure is logged + swallowed by the
+          // withMutation seam (the 'pending' refund row is the commitment, the
+          // webhook reconciles terminal status). Mirrors the cancel route.
+          postCommit: async () => {
+            if (pendingStripeRefund === undefined) return;
+            const refund = await stripe.createRefund(
+              {
+                paymentIntentId: pendingStripeRefund.paymentIntentId,
+                amountCents: pendingStripeRefund.amountCents,
+                reason: 'requested_by_customer',
+              },
+              `${idempotencyKey}:dup-settle-refund`,
+            );
+            await refundsRepository.markStripeId({
+              id: pendingStripeRefund.refundId,
+              stripeRefundId: refund.id,
+            });
+          },
         },
         async (tx) => {
-          const charge = await chargesRepository.create(tx, {
-            ownerId: principal.ownerId,
+          // 3DS / async path: Stripe didn't settle synchronously. INSERT the
+          // charge at its non-succeeded status and leave the invoice open; the
+          // webhook (or the owner's next /pay attempt) settles it. No race to
+          // resolve — nothing was actually captured yet.
+          if (chargeStatus !== 'succeeded') {
+            const charge = await chargesRepository.create(tx, {
+              ownerId: principal.ownerId,
+              amountCents: intent.amountCents,
+              status: chargeStatus,
+              purpose: invoiceRow.purpose,
+              stripePaymentIntentId: intent.id,
+              bookingId: invoiceRow.bookingId,
+              cohortId: invoiceRow.cohortId,
+              dogId: invoiceRow.dogId,
+            });
+            return {
+              status: 201,
+              body: {
+                charge_id: charge.id,
+                charge_status: chargeStatus,
+                stripe_payment_intent_id: intent.id,
+                client_secret: intent.clientSecret,
+                invoice_status: 'open',
+                charge_refunded: false,
+              },
+            };
+          }
+
+          // Succeeded path: the shared settle primitive INSERTs the charge,
+          // conditionally claims the invoice (open->paid), and on a lost race
+          // writes a 'pending' refund row for this duplicate. notifyOwner=false:
+          // the owner initiated and gets THIS response — a push receipt would
+          // be redundant.
+          const settle = await settleInvoiceCharge(tx, {
+            invoice: invoiceRow,
+            paymentIntentId: intent.id,
             amountCents: intent.amountCents,
-            status: chargeStatus,
             purpose: invoiceRow.purpose,
-            stripePaymentIntentId: intent.id,
-            bookingId: invoiceRow.bookingId,
-            // Δ 2026-06-09: propagate enrollment identity (group-class pay-later
-            // settled manually) so a later withdraw can find + refund it.
-            cohortId: invoiceRow.cohortId,
-            dogId: invoiceRow.dogId,
+            notifyOwner: false,
           });
 
-          let invoiceStatus: 'open' | 'paid' | 'void' = 'open';
-          if (chargeStatus === 'succeeded') {
-            const flipped = await invoicesRepository.markPaid(tx, {
-              id: invoiceRow.id,
-              paidChargeId: charge.id,
-            });
-            if (flipped > 0) {
-              invoiceStatus = 'paid';
-            } else {
-              // Race: a concurrent worker auto-charge or webhook already
-              // settled the invoice. The charges row still belongs to
-              // this request; the invoice is just already-paid.
-              invoiceStatus = 'paid';
-            }
+          if (settle.outcome === 'refunded') {
+            // Lost the race: the invoice is paid (by the winner) and this
+            // duplicate charge is being reversed. Hand the refund to postCommit;
+            // the response carries charge_refunded=true so the client never
+            // claims a clean payment for money on its way back.
+            pendingStripeRefund = settle.pendingStripeRefund;
           }
 
           return {
             status: 201,
             body: {
-              charge_id: charge.id,
-              charge_status: chargeStatus,
+              charge_id: settle.chargeId,
+              charge_status: 'succeeded',
               stripe_payment_intent_id: intent.id,
               client_secret: intent.clientSecret,
-              invoice_status: invoiceStatus,
+              invoice_status: 'paid',
+              charge_refunded: settle.outcome === 'refunded',
             },
           };
         },
