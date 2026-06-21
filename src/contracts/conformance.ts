@@ -1,0 +1,69 @@
+/**
+ * Compile-time conformance: the literal enum unions in `wire.ts` MUST equal the
+ * canonical Drizzle enums (`schema.sql` → `pgEnum`). This file is API-only — it
+ * imports Drizzle, so it is never copied to the portal. If `schema.sql` adds or
+ * removes an enum value, `db:introspect` regenerates the Drizzle enum and the
+ * matching `Equal<…>` below flips to `false`, turning `Expect<false>` into a
+ * `tsc` error until `wire.ts` is brought back in line. That is the whole point:
+ * drift between the DB and the wire contract becomes a build failure.
+ *
+ * (We assert rather than rewire `pgEnum(...)` to import `wire.ts` tuples because
+ * `schema.ts` is drizzle-introspection-generated — a `db:introspect` pull would
+ * clobber any hand-wired import.)
+ */
+import {
+  serviceCategory,
+  bookingStatus,
+  requestStatus,
+  threadCategory,
+  reportProgram,
+  rateUnit,
+  staffRole,
+  bookingAttendance,
+  mediaPurpose,
+  mediaKind,
+  LOCATION_SLUGS,
+} from '../db/schema/schema.js';
+import type {
+  ServiceCategory,
+  BookingStatus,
+  RequestStatus,
+  ThreadCategory,
+  ReportProgram,
+  RateUnit,
+  StaffRole,
+  AttendanceStatus,
+  MediaPurpose,
+  MediaKind,
+  LocationKey,
+} from './wire.js';
+
+type Expect<T extends true> = T;
+// Invariant (bidirectional) equality — `extends` alone would miss a wire union
+// that is a strict subset/superset of the DB enum.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+
+type DrizzleEnum<E extends { enumValues: readonly string[] }> = E['enumValues'][number];
+
+/**
+ * One entry per shared enum. A `false` anywhere fails this type, which fails the
+ * build. Exported so it counts as used (and so the failing member is named in
+ * the error). `AttendanceStatus` excludes the never-an-action `'pending'`
+ * default; `LocationKey` is backed by the `LOCATION_SLUGS` text tuple, not a
+ * `pgEnum`; `ComfortLevel` is intentionally absent (no DB enum — it was retired
+ * in favour of `descriptor_keys`).
+ */
+export type ContractEnumConformance = [
+  Expect<Equal<ServiceCategory, DrizzleEnum<typeof serviceCategory>>>,
+  Expect<Equal<BookingStatus, DrizzleEnum<typeof bookingStatus>>>,
+  Expect<Equal<RequestStatus, DrizzleEnum<typeof requestStatus>>>,
+  Expect<Equal<ThreadCategory, DrizzleEnum<typeof threadCategory>>>,
+  Expect<Equal<ReportProgram, DrizzleEnum<typeof reportProgram>>>,
+  Expect<Equal<RateUnit, DrizzleEnum<typeof rateUnit>>>,
+  Expect<Equal<StaffRole, DrizzleEnum<typeof staffRole>>>,
+  Expect<Equal<MediaPurpose, DrizzleEnum<typeof mediaPurpose>>>,
+  Expect<Equal<MediaKind, DrizzleEnum<typeof mediaKind>>>,
+  Expect<Equal<AttendanceStatus, Exclude<DrizzleEnum<typeof bookingAttendance>, 'pending'>>>,
+  Expect<Equal<LocationKey, (typeof LOCATION_SLUGS)[number]>>,
+];
