@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { isSessionProgram } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
@@ -46,15 +47,6 @@ import { toReportWire, type ReportProgram, type ReportWire } from '../lib/report
 
 const SERVICE_CATEGORY_VALUES = pgEnumTuple(serviceCategory);
 const REPORT_PROGRAM_VALUES = pgEnumTuple(reportProgram);
-
-/** Programs that carry a `content` variant doc (REQUIRED); the rest are
- * curriculum programs that carry a `results` envelope and no content. */
-const SESSION_PROGRAMS: ReadonlySet<ReportProgram> = new Set([
-  'private-lesson',
-  'boarding-session',
-  'board-train-session',
-  'group-class-session',
-]);
 
 const MAX_EXCERPT_LEN = 2000;
 const MAX_FULL_TEXT_LEN = 20000;
@@ -225,7 +217,7 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
           // Re-validate content against the STORED program: curriculum
           // reports can't grow a content doc; session reports can't drop it.
           if (body.content !== undefined) {
-            const isSession = SESSION_PROGRAMS.has(existing.program);
+            const isSession = isSessionProgram(existing.program);
             if (!isSession && body.content !== null) {
               throw new ApiError(
                 'invalid_payload',
@@ -281,7 +273,7 @@ async function wireOneReport(
  * backstop; this is the clean 422.
  */
 function assertContentByProgram(program: ReportProgram, content: unknown): void {
-  const isSession = SESSION_PROGRAMS.has(program);
+  const isSession = isSessionProgram(program);
   if (isSession && content === undefined) {
     throw new ApiError('invalid_payload', `content is required for the session program ${program}`);
   }
