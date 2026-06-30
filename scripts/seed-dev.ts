@@ -351,6 +351,42 @@ async function seed(): Promise<void> {
       label: 'Day Care Package',
       isPopular: false,
     },
+    // Day Care tiers mirroring the Day School lineup so over-credits / top-up
+    // works the same for day care (single-day to fill an exact gap, weekly packs).
+    // Priced at the $35/visit rate the 10-pack implies — launch placeholders,
+    // staff adjust via the portal.
+    {
+      key: 'daycare-single-day',
+      mode: 'daycare',
+      credits: 1,
+      priceCents: 3500,
+      label: 'Single Day Care',
+      isPopular: false,
+    },
+    {
+      key: 'daycare-2x-weekly',
+      mode: 'daycare',
+      credits: 8,
+      priceCents: 28000,
+      label: '2x Weekly Day Care',
+      isPopular: false,
+    },
+    {
+      key: 'daycare-3x-weekly',
+      mode: 'daycare',
+      credits: 12,
+      priceCents: 42000,
+      label: '3x Weekly Day Care',
+      isPopular: true,
+    },
+    {
+      key: 'daycare-5x-weekly',
+      mode: 'daycare',
+      credits: 20,
+      priceCents: 70000,
+      label: '5x Weekly Day Care',
+      isPopular: false,
+    },
     {
       key: 'school-single-day',
       mode: 'school',
