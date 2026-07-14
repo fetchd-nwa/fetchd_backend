@@ -1,0 +1,10 @@
+# Keep the build context small + reproducible. NOTE: `certs/` is intentionally
+# NOT ignored — the Dockerfile COPYs the Supabase CA cert into the image.
+node_modules
+dist
+.env
+.env.*
+test
+*.log
+.DS_Store
+npm-debug.log*
