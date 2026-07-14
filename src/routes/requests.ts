@@ -281,17 +281,22 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
             }
           }
 
-          // 2b. Duplicate guard (Day-19d) — block a second OPEN request of
-          //     the same category for a dog that already has one in flight.
-          //     Once the prior request converts or cancels, re-requesting is
-          //     allowed. Roster-matched (lead or additional).
-          const alreadyRequested = await requestsRepository.findOpenByDogsAndCategory(
-            tx,
-            parsed.allDogIds,
-            parsed.category,
-          );
-          if (alreadyRequested.length > 0) {
-            throw alreadyRequestedError({ category: parsed.category, dog_ids: alreadyRequested });
+          // 2b. Duplicate guard (Day-19d; scoped to residential Δ 2026-07-09) —
+          //     a dog can't have two overlapping multi-week stays in flight, so
+          //     block a second OPEN board-and-train / boarding request for it.
+          //     Once the prior converts or cancels, re-requesting is allowed.
+          //     Roster-matched (lead or additional). Private-lesson requests are
+          //     EXEMPT: they're short staff-scheduled slots, and an owner may
+          //     legitimately keep several pending at once (per Allison).
+          if (parsed.category === 'board-and-train' || parsed.category === 'boarding') {
+            const alreadyRequested = await requestsRepository.findOpenByDogsAndCategory(
+              tx,
+              parsed.allDogIds,
+              parsed.category,
+            );
+            if (alreadyRequested.length > 0) {
+              throw alreadyRequestedError({ category: parsed.category, dog_ids: alreadyRequested });
+            }
           }
 
           // 3. INSERT pending_requests row.

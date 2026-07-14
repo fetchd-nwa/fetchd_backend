@@ -1,6 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { ApiError } from '../lib/errors.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
+import { invalidatePattern } from '../lib/cache.js';
+import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { stripeEventsRepository } from '../db/repositories/stripeEventsRepository.js';
 import { dispatchStripeEvent } from '../webhooks/stripeEventHandlers.js';
 
@@ -91,6 +93,22 @@ export function registerStripeWebhookRoute(
       try {
         const result = await dispatchStripeEvent(event, { stripe });
         await stripeEventsRepository.markProcessed(event.id);
+        // Post-commit credit-balance cache wipe when the event moved a dog's
+        // balance (async purchase grant / payment_failed reversal). Best-effort:
+        // the DB is already committed + marked processed, so a Redis blip here
+        // must NOT 500 (that would make Stripe redeliver → dedupe → no re-run,
+        // leaving the cache to self-heal via TTL either way). Swallow + log,
+        // mirroring `withMutation`'s post-commit invalidation policy.
+        if (result.creditsDogId !== undefined) {
+          await invalidatePattern(creditsInvalidationPattern(result.creditsDogId)).catch(
+            (invErr) => {
+              request.log.error(
+                { stripeEventId: event.id, dogId: result.creditsDogId, invErr },
+                'stripe webhook post-commit credits invalidation failed',
+              );
+            },
+          );
+        }
         request.log.info(
           {
             stripeEventId: event.id,

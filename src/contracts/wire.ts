@@ -140,6 +140,12 @@ export interface BookingWire {
   notes?: string;
   session_report_id?: string;
   location?: LocationKey;
+  // The instant the free-cancel window closes (Δ 2026-07-08). Stamped at
+  // creation from the active `cancel_window_settings` policy; omitted when null
+  // (legacy-import rows pre-Day-10). The client reads it to warn, BEFORE a
+  // cancel confirms, that cancelling now forfeits the credit/charge — powering
+  // the booking-overlap "cancel it to book this" flow.
+  cancel_deadline_at?: string;
   cancelled_at?: string;
   cancel_forfeited?: boolean;
   // Group-class only (DATA-CONTRACT §A Amendment 2026-06-01). `cohort_id` is the

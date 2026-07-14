@@ -8,6 +8,7 @@
   "duration_minutes": 540,
   "notes": "Owner cancelled — family emergency",
   "location": "fayetteville",
+  "cancel_deadline_at": "2026-05-21T13:00:00.000Z",
   "cancelled_at": "2026-05-18T20:00:00.000Z",
   "cancel_forfeited": false
 }

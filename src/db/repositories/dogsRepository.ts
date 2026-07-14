@@ -8,6 +8,7 @@ import {
   dogMedications,
   dogFeeding,
   dogCompletedClasses,
+  dogCompletedPrograms,
   type evaluationStatus,
 } from '../schema/schema.js';
 import { live } from '../softExpire.js';
@@ -48,6 +49,8 @@ export interface AssembledDog {
   medications: (typeof dogMedications.$inferSelect)[];
   feeding: typeof dogFeeding.$inferSelect | null;
   completedClasses: (typeof dogCompletedClasses.$inferSelect)[];
+  /** §J.3: live day-school curriculum completions — all 5 present ⇒ alumni. */
+  completedPrograms: (typeof dogCompletedPrograms.$inferSelect)[];
 }
 
 export interface NewDogValues {
@@ -84,7 +87,7 @@ async function findManyByOwner(ownerId: string): Promise<AssembledDog[]> {
 
   const dogIds = dogRows.map((r) => r.dog.id);
 
-  const [vaccineRows, medicationRows, feedingRows, completedRows] = await Promise.all([
+  const [vaccineRows, medicationRows, feedingRows, completedRows, programRows] = await Promise.all([
     db
       .select()
       .from(dogVaccines)
@@ -104,12 +107,18 @@ async function findManyByOwner(ownerId: string): Promise<AssembledDog[]> {
       .from(dogCompletedClasses)
       .where(and(inArray(dogCompletedClasses.dogId, dogIds), live(dogCompletedClasses)))
       .orderBy(dogCompletedClasses.completedAt, dogCompletedClasses.id),
+    db
+      .select()
+      .from(dogCompletedPrograms)
+      .where(and(inArray(dogCompletedPrograms.dogId, dogIds), live(dogCompletedPrograms)))
+      .orderBy(dogCompletedPrograms.completedAt, dogCompletedPrograms.id),
   ]);
 
   const vaccinesByDog = bucketBy(vaccineRows, (v) => v.dogId);
   const medicationsByDog = bucketBy(medicationRows, (m) => m.dogId);
   const feedingByDog = new Map(feedingRows.map((f) => [f.dogId, f] as const));
   const completedByDog = bucketBy(completedRows, (c) => c.dogId);
+  const programsByDog = bucketBy(programRows, (p) => p.dogId);
 
   return dogRows.map(({ dog, vet }) => ({
     dog,
@@ -118,6 +127,7 @@ async function findManyByOwner(ownerId: string): Promise<AssembledDog[]> {
     medications: medicationsByDog.get(dog.id) ?? [],
     feeding: feedingByDog.get(dog.id) ?? null,
     completedClasses: completedByDog.get(dog.id) ?? [],
+    completedPrograms: programsByDog.get(dog.id) ?? [],
   }));
 }
 
@@ -174,6 +184,11 @@ async function findById(
     .from(dogCompletedClasses)
     .where(and(eq(dogCompletedClasses.dogId, id), live(dogCompletedClasses)))
     .orderBy(dogCompletedClasses.completedAt, dogCompletedClasses.id);
+  const programRows = await runner
+    .select()
+    .from(dogCompletedPrograms)
+    .where(and(eq(dogCompletedPrograms.dogId, id), live(dogCompletedPrograms)))
+    .orderBy(dogCompletedPrograms.completedAt, dogCompletedPrograms.id);
 
   return {
     dog: dogRow.dog,
@@ -182,6 +197,7 @@ async function findById(
     medications: medicationRows,
     feeding: feedingRow ?? null,
     completedClasses: completedRows,
+    completedPrograms: programRows,
   };
 }
 
@@ -314,6 +330,69 @@ async function softExpire(tx: Tx, id: string): Promise<Dog | undefined> {
 }
 
 /**
+ * §J.3 attendance-flag stamp. `WHERE ... IS NULL` makes the stamp
+ * first-write-wins: a dog already flagged (say, last month's flag staff
+ * haven't cleared yet) keeps its ORIGINAL flag timestamp — the flag
+ * records "since when has this dog needed a re-check", not "most recent
+ * miss". Returns true when this call set it.
+ */
+async function setAlumniAttendanceFlag(tx: Tx, dogId: string, now: Date): Promise<boolean> {
+  const rows = await tx
+    .update(dogs)
+    .set({ alumniAttendanceFlaggedAt: now.toISOString() })
+    .where(and(eq(dogs.id, dogId), sql`${dogs.alumniAttendanceFlaggedAt} IS NULL`, live(dogs)))
+    .returning({ id: dogs.id });
+  return rows.length > 0;
+}
+
+/**
+ * §J.3 staff clear — after the re-check/eval, staff clear the flag and
+ * the dog books normally again. Idempotent: clearing an already-clear
+ * flag is a no-op (the staff verb returns 200 either way).
+ */
+async function clearAlumniAttendanceFlag(tx: Tx, dogId: string): Promise<void> {
+  await tx
+    .update(dogs)
+    .set({ alumniAttendanceFlaggedAt: null })
+    .where(and(eq(dogs.id, dogId), live(dogs)));
+}
+
+/**
+ * Cross-owner (staff) read of one live dog's §J.3 alumni-flag state.
+ * `undefined` = missing/expired → the staff route's 404. The completed-
+ * programs list itself comes from `dogProgramsRepository`; this covers
+ * the half that lives on the `dogs` row.
+ */
+async function findAlumniFlagForStaff(
+  dogId: string,
+  runner: Runner = db,
+): Promise<{ alumniAttendanceFlaggedAt: string | null } | undefined> {
+  const [row] = await runner
+    .select({ alumniAttendanceFlaggedAt: dogs.alumniAttendanceFlaggedAt })
+    .from(dogs)
+    .where(and(eq(dogs.id, dogId), live(dogs)))
+    .limit(1);
+  return row;
+}
+
+/**
+ * Serialize §J.3 completed-program writes per dog: two concurrent staff
+ * recording programs #4 and #5 would each count 4 live rows under READ
+ * COMMITTED and NEITHER would fire the became-alumni lot clear. Locking the
+ * dogs row first makes the second tx wait, re-count 5, and clear. Returns
+ * false when the dog is missing/expired (the route's 404).
+ */
+async function lockForAlumniUpdate(tx: Tx, dogId: string): Promise<boolean> {
+  const rows = await tx
+    .select({ id: dogs.id })
+    .from(dogs)
+    .where(and(eq(dogs.id, dogId), live(dogs)))
+    .limit(1)
+    .for('update');
+  return rows.length > 0;
+}
+
+/**
  * Resolve a live dog's `owner_id` inside a tx, cross-owner (staff
  * context). `undefined` if the dog doesn't exist / is expired. The
  * Day-19 report-authoring verb needs the owner to address the
@@ -385,8 +464,12 @@ export const dogsRepository = {
   findOwnedExists,
   findEvaluationStatusInTx,
   findOwnerIdInTx,
+  findAlumniFlagForStaff,
+  lockForAlumniUpdate,
   findAllLiveForStaff,
   create,
   update,
   softExpire,
+  setAlumniAttendanceFlag,
+  clearAlumniAttendanceFlag,
 };

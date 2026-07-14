@@ -4,6 +4,7 @@ import { creditLedger, type LocationKey } from '../db/schema/schema.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
 import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
+import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
@@ -49,6 +50,14 @@ export interface WebhookHandlerResult {
     | 'noop';
   /** Optional human-readable note for the log line. */
   note?: string;
+  /**
+   * Set when this event moved a dog's credit balance (async purchase grant or
+   * the payment_failed reversal). The receiver wipes the dog's
+   * `credits:{dogId}:*` display cache post-commit — the webhook doesn't run
+   * through `withMutation`, so invalidation is reported up rather than fired
+   * inline (keeps handlers pure DB).
+   */
+  creditsDogId?: string;
 }
 
 /**
@@ -123,7 +132,12 @@ async function handlePaymentIntentSucceeded(
         amountCents: event.amountCents,
         metadata: event.metadata,
       });
-      if (reconstructed) return { outcome: 'reconstructed-package-purchase' };
+      if (reconstructed.reconstructed) {
+        return {
+          outcome: 'reconstructed-package-purchase',
+          creditsDogId: reconstructed.creditsDogId,
+        };
+      }
       return {
         outcome: 'orphan-event',
         note: `no charges row for PI ${event.paymentIntentId} (no package metadata to reconstruct)`,
@@ -138,14 +152,15 @@ async function handlePaymentIntentSucceeded(
 
     await chargesRepository.markStatus(tx, { id: charge.id, status: 'succeeded' });
 
+    let creditsDogId: string | undefined;
     if (charge.purpose === 'package') {
-      await maybeWritePurchaseLedgerRow(tx, {
+      creditsDogId = await maybeWritePurchaseLedgerRow(tx, {
         chargeId: charge.id,
         metadata: event.metadata,
       });
     }
 
-    return { outcome: 'flipped-charge-succeeded' };
+    return { outcome: 'flipped-charge-succeeded', creditsDogId };
   });
 }
 
@@ -169,6 +184,14 @@ interface PackagePurchaseMetadata {
 function parsePackagePurchaseMetadata(
   metadata: Record<string, string>,
 ): PackagePurchaseMetadata | undefined {
+  // §J.1: a membership month-1 PI carries the SAME package fields (dog_id /
+  // package_id / credits / mode / location) plus `purpose: 'membership'` —
+  // it must NEVER be treated as a one-time package purchase (the reconstruct
+  // arm would grant a windowed 'purchase' lot with no membership behind it,
+  // and the owner's POST /memberships retry would then collide on the
+  // charges PI unique). Skip; membership creation has no async-reconcile arm
+  // by design (the POST's idempotent retry is the recovery path).
+  if (metadata.purpose === 'membership') return undefined;
   const dogId = metadata.dog_id;
   const packageId = metadata.package_id;
   const credits = Number(metadata.credits);
@@ -195,32 +218,43 @@ function parsePackagePurchaseMetadata(
  * deliberately deferred this write to the webhook (Day-14 known caveat) —
  * here we catch it up using the PI metadata. Idempotent: a duplicate
  * call finds an existing row and is a no-op.
+ *
+ * Returns the granted dog id when it actually wrote a grant (so the receiver
+ * can wipe that dog's credit display cache), or `undefined` on a no-op
+ * (grant already present) or non-package metadata (nothing to invalidate).
  */
 async function maybeWritePurchaseLedgerRow(
   tx: Tx,
   args: { chargeId: string; metadata: Record<string, string> },
-): Promise<void> {
+): Promise<string | undefined> {
   const existing = await tx
     .select({ id: creditLedger.id })
     .from(creditLedger)
     .where(and(eq(creditLedger.chargeId, args.chargeId), eq(creditLedger.reason, 'purchase')))
     .limit(1);
-  if (existing.length > 0) return;
+  if (existing.length > 0) return undefined;
 
   const parsed = parsePackagePurchaseMetadata(args.metadata);
   if (parsed === undefined) {
     // Metadata missing/malformed (a charge minted by something other than
     // the credit-purchase route). Skip the grant; the charge row's status is
     // the load-bearing fact for the audit + future reconciliation.
-    return;
+    return undefined;
   }
-  // Resolve the expiry window from credit_expiry_settings (per-location →
-  // org-default → code default) inside this tx — same as the sync route, so the
-  // webhook catch-up grant stamps the same window a live purchase would have.
-  const windowMonths = await creditExpirySettingsRepository.resolveExpiryWindowMonths(
-    parsed.location,
-    tx,
-  );
+  // §J.3: an alumni dog's lot never expires. Otherwise resolve the expiry
+  // window from credit_expiry_settings (per-location → org-default → code
+  // default) inside this tx — same as the sync route, so the webhook catch-up
+  // grant stamps the same window a live purchase would have. This covers the
+  // catch-up grant AND the orphan reconstruct (which delegates here); 1-credit
+  // packs never expire (helper returns null).
+  const dogIsAlumni = await dogProgramsRepository.isAlumni(parsed.dogId, tx);
+  const expiresAt = dogIsAlumni
+    ? null
+    : resolvePurchaseExpiry(
+        parsed.credits,
+        await creditExpirySettingsRepository.resolveExpiryWindowMonths(parsed.location, tx),
+        new Date(),
+      );
   await creditLedgerRepository.creditPurchase(tx, {
     dogId: parsed.dogId,
     mode: parsed.mode,
@@ -228,33 +262,32 @@ async function maybeWritePurchaseLedgerRow(
     delta: parsed.credits,
     packageId: parsed.packageId,
     chargeId: args.chargeId,
-    // Same lot-expiry stamp as the sync purchase route (this covers the catch-up
-    // grant AND the orphan reconstruct, which delegates here). 1-credit packs
-    // never expire (helper returns null).
-    expiresAt: resolvePurchaseExpiry(parsed.credits, windowMonths, new Date()),
+    expiresAt,
   });
+  return parsed.dogId;
 }
 
 /**
  * Rebuild a missing credit-package purchase from the PaymentIntent metadata
  * after a sync-path DB failure left Stripe holding the money with no record.
- * Returns true when it reconstructed (the PI was a package purchase), false
- * when the metadata isn't a package purchase (a genuine orphan the caller
- * reports as such). Idempotent: the charge insert is `ON CONFLICT DO NOTHING`
- * on the unique PI, and the grant is the same `maybeWritePurchaseLedgerRow`
- * no-op-if-present write — so a concurrent client retry and this path can't
- * double-charge or double-grant.
+ * Returns `{ reconstructed: true, creditsDogId }` when it reconstructed (the PI
+ * was a package purchase; `creditsDogId` set when the grant actually wrote),
+ * or `{ reconstructed: false }` when the metadata isn't a package purchase (a
+ * genuine orphan the caller reports as such). Idempotent: the charge insert is
+ * `ON CONFLICT DO NOTHING` on the unique PI, and the grant is the same
+ * `maybeWritePurchaseLedgerRow` no-op-if-present write — so a concurrent client
+ * retry and this path can't double-charge or double-grant.
  */
 async function maybeReconstructOrphanedPackagePurchase(
   tx: Tx,
   args: { paymentIntentId: string; amountCents: number; metadata: Record<string, string> },
-): Promise<boolean> {
+): Promise<{ reconstructed: boolean; creditsDogId?: string }> {
   const parsed = parsePackagePurchaseMetadata(args.metadata);
-  if (parsed === undefined) return false;
+  if (parsed === undefined) return { reconstructed: false };
   // The reconstruct builds the charge from scratch, so it additionally needs
   // the owner (the grant path above gets it from the existing charge row).
   const ownerId = args.metadata.owner_id;
-  if (typeof ownerId !== 'string' || ownerId.length === 0) return false;
+  if (typeof ownerId !== 'string' || ownerId.length === 0) return { reconstructed: false };
 
   const { charge } = await chargesRepository.insertIfAbsentByPaymentIntent(tx, {
     ownerId,
@@ -263,8 +296,11 @@ async function maybeReconstructOrphanedPackagePurchase(
     purpose: 'package',
     stripePaymentIntentId: args.paymentIntentId,
   });
-  await maybeWritePurchaseLedgerRow(tx, { chargeId: charge.id, metadata: args.metadata });
-  return true;
+  const creditsDogId = await maybeWritePurchaseLedgerRow(tx, {
+    chargeId: charge.id,
+    metadata: args.metadata,
+  });
+  return { reconstructed: true, creditsDogId };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -305,6 +341,7 @@ async function handlePaymentIntentFailed(
 
     // Reverse any provisional purchase ledger row. Defensive: Day-14's
     // sync path only writes the ledger on 'succeeded', so this is rare.
+    let creditsDogId: string | undefined;
     const existing = await tx
       .select({ id: creditLedger.id, delta: creditLedger.delta })
       .from(creditLedger)
@@ -333,10 +370,11 @@ async function handlePaymentIntentFailed(
           chargeId: charge.id,
           note: 'reverse provisional purchase grant on Stripe payment_failed',
         });
+        creditsDogId = orig.dogId;
       }
     }
 
-    return { outcome: 'flipped-charge-failed' };
+    return { outcome: 'flipped-charge-failed', creditsDogId };
   });
 }
 

@@ -24,6 +24,7 @@ function row(overrides: Partial<BookingRowForWire> = {}): BookingRowForWire {
     location: 'fayetteville',
     cancelledAt: null,
     cancelForfeited: false,
+    cancelDeadlineAt: null,
     cohortId: 'cohort-1',
     ...overrides,
   };
@@ -52,4 +53,17 @@ test('toBookingWire omits group_class_name when the name is empty/absent', () =>
   const wire = toBookingWire(row(), DOG_IDS, null, undefined);
   assert.equal(wire.cohort_id, 'cohort-1');
   assert.equal('group_class_name' in wire, false);
+});
+
+test('toBookingWire emits cancel_deadline_at as ISO when set, omits it when null', () => {
+  const withDeadline = toBookingWire(
+    row({ cancelDeadlineAt: '2026-07-10 15:00:00+00' }),
+    DOG_IDS,
+    null,
+    undefined,
+  );
+  assert.equal(withDeadline.cancel_deadline_at, '2026-07-10T15:00:00.000Z');
+
+  const withoutDeadline = toBookingWire(row({ cancelDeadlineAt: null }), DOG_IDS, null, undefined);
+  assert.equal('cancel_deadline_at' in withoutDeadline, false);
 });

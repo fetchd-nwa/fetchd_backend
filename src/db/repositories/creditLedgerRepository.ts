@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, gt, isNotNull, isNull, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { creditLedger, dogCreditBalance, type LocationKey } from '../schema/schema.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
@@ -273,6 +273,8 @@ export const creditLedgerRepository = {
       lotId: string | null;
       lotExpiresAt: string | null;
       now: Date;
+      /** §J.3: an alumni dog's freshly-minted refund lot never expires. */
+      dogIsAlumni: boolean;
     },
   ): Promise<void> {
     const lotAlive =
@@ -280,9 +282,10 @@ export const creditLedgerRepository = {
 
     // A fresh refund lot is needed only when the source lot died; resolve the
     // current window (per-location → org-default → code default) for THAT case
-    // alone — skip the read on the common return-to-live-lot path.
+    // alone — skip the read on the common return-to-live-lot path. Alumni dogs
+    // (§J.3) skip the window entirely: their re-mint is never-expire.
     const expiresAt =
-      args.lotId !== null && !lotAlive
+      args.lotId !== null && !lotAlive && !args.dogIsAlumni
         ? resolveRefundExpiry(
             await creditExpirySettingsRepository.resolveExpiryWindowMonths(args.location, tx),
             args.now,
@@ -324,6 +327,9 @@ export const creditLedgerRepository = {
       packageId: string;
       chargeId: string;
       expiresAt: Date | null;
+      /** §J.1: a subscription month's grant is 'membership-grant'; one-time
+       * purchases (the default) stay 'purchase'. Same lot semantics either way. */
+      reason?: 'purchase' | 'membership-grant';
     },
   ): Promise<void> {
     await tx.insert(creditLedger).values({
@@ -331,11 +337,64 @@ export const creditLedgerRepository = {
       mode: args.mode,
       location: args.location,
       delta: args.delta,
-      reason: 'purchase',
+      reason: args.reason ?? 'purchase',
       packageId: args.packageId,
       chargeId: args.chargeId,
       expiresAt: args.expiresAt === null ? null : args.expiresAt.toISOString(),
     });
+  },
+
+  /**
+   * §J.1 pause-resume: move a membership-grant lot's expiry with the shifted
+   * period. The paid month's lot was stamped `expires_at = current_period_end`
+   * at grant; when staff resume a paused membership the period end shifts
+   * forward by the pause gap, and the lot must follow — otherwise the paid
+   * credits die at the ORIGINAL boundary while the membership is officially
+   * paused ("the clock stops" must cover the credits, not just the billing).
+   * Matched by the exact old expiry so only the shifted period's lot moves
+   * (alumni lots are NULL and never match). Returns the lots touched.
+   */
+  async shiftMembershipGrantExpiry(
+    tx: Tx,
+    args: { dogId: string; fromExpiresAt: string; to: Date },
+  ): Promise<number> {
+    const rows = await tx
+      .update(creditLedger)
+      .set({ expiresAt: args.to.toISOString() })
+      .where(
+        and(
+          eq(creditLedger.dogId, args.dogId),
+          eq(creditLedger.reason, 'membership-grant'),
+          isNull(creditLedger.lotId),
+          gt(creditLedger.delta, 0),
+          eq(creditLedger.expiresAt, args.fromExpiresAt),
+        ),
+      )
+      .returning({ id: creditLedger.id });
+    return rows.length;
+  },
+
+  /**
+   * §J.3 became-alumni effect: clear `expires_at` on the dog's live, not-yet-
+   * expired lots — "if you are alumni, no expiration date" covers credits the
+   * dog already holds, not just future grants. Already-EXPIRED lots stay dead
+   * (alumni doesn't resurrect spent windows). Returns the lots touched.
+   */
+  async clearExpiryForDog(tx: Tx, dogId: string, now: Date): Promise<number> {
+    const rows = await tx
+      .update(creditLedger)
+      .set({ expiresAt: null })
+      .where(
+        and(
+          eq(creditLedger.dogId, dogId),
+          isNull(creditLedger.lotId),
+          gt(creditLedger.delta, 0),
+          isNotNull(creditLedger.expiresAt),
+          gt(creditLedger.expiresAt, now.toISOString()),
+        ),
+      )
+      .returning({ id: creditLedger.id });
+    return rows.length;
   },
 };
 

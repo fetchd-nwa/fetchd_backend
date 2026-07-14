@@ -10,6 +10,13 @@
     "relationship": "spouse",
     "phone": "555-0002"
   },
+  "address": {
+    "line1": "",
+    "line2": "",
+    "city": "",
+    "state": "",
+    "zip": ""
+  },
   "push_notifications_enabled": true,
   "push_notification_categories": { "booking": true, "message": true },
   "email_notifications_enabled": true,

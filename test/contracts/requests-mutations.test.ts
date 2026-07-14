@@ -246,12 +246,15 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
 });
 
 test(
-  'POST /requests — dog with an open same-category request → 422 already_requested (Day-19d guard)',
+  'POST /requests — private-lesson requests STACK; residential stays are one-at-a-time (Day-19d guard, scoped Δ 2026-07-09)',
   SKIP_WHEN_NO_DB,
   async () => {
     await clearOpenRequestsForDogs([FIXTURE_IDS.dog1Id]);
     const { app } = requestsApp();
-    const first = await postRequest({
+
+    // Private lessons are short, staff-scheduled slots — a dog may keep several
+    // open requests at once, so a second one still 201s (no duplicate guard).
+    const firstPrivate = await postRequest({
       app,
       idempotencyKey: `pr-dup-1-${randomUUID()}`,
       payload: {
@@ -260,9 +263,8 @@ test(
         preferred_dates: [PREFERRED_1, PREFERRED_2],
       },
     });
-    assert.equal(first.statusCode, 201, first.body);
-
-    const second = await postRequest({
+    assert.equal(firstPrivate.statusCode, 201, firstPrivate.body);
+    const secondPrivate = await postRequest({
       app,
       idempotencyKey: `pr-dup-2-${randomUUID()}`,
       payload: {
@@ -271,15 +273,40 @@ test(
         preferred_dates: [PREFERRED_3],
       },
     });
-    assert.equal(second.statusCode, 422, second.body);
-    const dup = second.json() as {
+    assert.equal(secondPrivate.statusCode, 201, secondPrivate.body);
+
+    // Residential is different: a dog can't have two overlapping multi-week
+    // stays in flight, so a second OPEN board-and-train request 422s.
+    const firstStay = await postRequest({
+      app,
+      idempotencyKey: `pr-dup-bnt-1-${randomUUID()}`,
+      payload: {
+        category: 'board-and-train',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: [PREFERRED_1, PREFERRED_2],
+        length_weeks: 2,
+      },
+    });
+    assert.equal(firstStay.statusCode, 201, firstStay.body);
+    const secondStay = await postRequest({
+      app,
+      idempotencyKey: `pr-dup-bnt-2-${randomUUID()}`,
+      payload: {
+        category: 'board-and-train',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: [PREFERRED_3],
+        length_weeks: 2,
+      },
+    });
+    assert.equal(secondStay.statusCode, 422, secondStay.body);
+    const dup = secondStay.json() as {
       error: { code: string; details: { kind: string; category: string; dog_ids: string[] } };
     };
     assert.equal(dup.error.code, 'already_requested');
-    assert.equal(dup.error.details.category, 'private-lesson');
+    assert.equal(dup.error.details.category, 'board-and-train');
     assert.deepEqual(dup.error.details.dog_ids, [FIXTURE_IDS.dog1Id]);
 
-    // Clean up so a later private-lesson test for this dog isn't tripped.
+    // Clean up so later tests for this dog aren't tripped.
     await clearOpenRequestsForDogs([FIXTURE_IDS.dog1Id]);
   },
 );

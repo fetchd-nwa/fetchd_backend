@@ -46,6 +46,13 @@ function ownerProfile(row: typeof owners.$inferSelect) {
       relationship: row.emergencyRelationship ?? '',
       phone: row.emergencyPhone ?? '',
     },
+    address: {
+      line1: row.addressLine1 ?? '',
+      line2: row.addressLine2 ?? '',
+      city: row.addressCity ?? '',
+      state: row.addressState ?? '',
+      zip: row.addressZip ?? '',
+    },
     push_notifications_enabled: row.pushNotificationsEnabled,
     push_notification_categories: row.pushNotificationCategories,
     email_notifications_enabled: row.emailNotificationsEnabled,
@@ -85,6 +92,13 @@ const patchMeSchema = z
       relationship: z.string(),
       phone: z.string(),
     }),
+    address: z.object({
+      line1: z.string(),
+      line2: z.string(),
+      city: z.string(),
+      state: z.string(),
+      zip: z.string(),
+    }),
     push_notifications_enabled: z.boolean(),
     push_notification_categories: z.record(z.unknown()),
     email_notifications_enabled: z.boolean(),
@@ -104,6 +118,13 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
     set.emergencyName = patch.emergency_contact.name;
     set.emergencyRelationship = patch.emergency_contact.relationship;
     set.emergencyPhone = patch.emergency_contact.phone;
+  }
+  if (patch.address !== undefined) {
+    set.addressLine1 = patch.address.line1;
+    set.addressLine2 = patch.address.line2;
+    set.addressCity = patch.address.city;
+    set.addressState = patch.address.state;
+    set.addressZip = patch.address.zip;
   }
   if (patch.push_notifications_enabled !== undefined)
     set.pushNotificationsEnabled = patch.push_notifications_enabled;

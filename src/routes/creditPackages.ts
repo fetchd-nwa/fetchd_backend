@@ -5,6 +5,7 @@ import { db } from '../db/client.js';
 import { chargesRepository, type ChargeStatus } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
+import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { invalidatePattern } from '../lib/cache.js';
@@ -203,12 +204,18 @@ export function registerCreditPackagesRoute(
           });
 
           if (chargeStatus === 'succeeded') {
-            // Window from credit_expiry_settings (per-location → org-default →
-            // code default), read inside this tx and stamped onto the lot.
-            const windowMonths = await creditExpirySettingsRepository.resolveExpiryWindowMonths(
-              pkg.location,
-              tx,
-            );
+            // §J.3: an alumni dog's lot never expires — skip the window read
+            // entirely. Otherwise stamp from credit_expiry_settings
+            // (per-location → org-default → code default), read inside this tx.
+            // 1-credit packs never expire either (helper returns null).
+            const dogIsAlumni = await dogProgramsRepository.isAlumni(body.dog_id, tx);
+            const expiresAt = dogIsAlumni
+              ? null
+              : resolvePurchaseExpiry(
+                  pkg.credits,
+                  await creditExpirySettingsRepository.resolveExpiryWindowMonths(pkg.location, tx),
+                  nowFactory(),
+                );
             await creditLedgerRepository.creditPurchase(tx, {
               dogId: body.dog_id,
               mode: pkg.mode,
@@ -216,9 +223,8 @@ export function registerCreditPackagesRoute(
               delta: pkg.credits,
               packageId: pkg.id,
               chargeId: charge.id,
-              // Stamp the lot's expiry from the then-current window (non-
-              // retroactive). 1-credit packs never expire (helper returns null).
-              expiresAt: resolvePurchaseExpiry(pkg.credits, windowMonths, nowFactory()),
+              // Stamped once at purchase (non-retroactive).
+              expiresAt,
             });
           }
 

@@ -4,7 +4,9 @@ import { test } from 'node:test';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';
+import { creditsInvalidationPattern } from '../../src/db/repositories/creditsRepository.js';
 import { withDogModeLock } from '../../src/db/locks.js';
+import { invalidatePattern } from '../../src/lib/cache.js';
 import { creditLedger } from '../../src/db/schema/schema.js';
 import { resolvePurchaseExpiry, resolveRefundExpiry } from '../../src/lib/creditExpiry.js';
 import { registerCreditsRoute } from '../../src/routes/credits.js';
@@ -39,6 +41,12 @@ function isoIn(days: number): string {
 /** Clear every ledger row for the fixture dog so each test starts clean. */
 async function resetDog1Ledger(): Promise<void> {
   await db.delete(creditLedger).where(eq(creditLedger.dogId, DOG));
+  // Out-of-band (direct-SQL) ledger reset: the API's post-commit cache
+  // invalidation never fires here, so drop this dog's cached balance + lots by
+  // hand — exactly as a `credit_ledger` mutation through the API would. Without
+  // it, a prior test's `GET /credits` read bleeds into the next (Redis is
+  // flushed once per file, not per test).
+  await invalidatePattern(creditsInvalidationPattern(DOG));
 }
 
 /** Insert a source lot (`purchase`, delta>0, lot_id NULL) and return its id. */
@@ -242,7 +250,17 @@ test(
     assert.equal(wire.expiring_lots.length, 1, 'only the expiring lot is listed');
     assert.equal(wire.expiring_lots[0]?.mode, 'school');
     assert.equal(wire.expiring_lots[0]?.remaining, 4);
-    assert.ok(new Date(wire.expiring_lots[0]!.expires_at) > new Date());
+    const expiresAt = wire.expiring_lots[0]!.expires_at;
+    assert.ok(new Date(expiresAt) > new Date());
+    // Wire ISO-8601 ('…THH:MM:SS[.mmm]Z'), NOT PG's raw space-separated `+00`
+    // form. V8 (this Node test) parses both leniently, but Hermes (RN) only
+    // parses ISO — the raw form throws "Invalid time value" in the app. Guards
+    // the pgTimestampToIso conversion in creditsRepository.findExpiringLots.
+    assert.match(
+      expiresAt,
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/,
+      `expires_at must be wire ISO-8601, got '${expiresAt}'`,
+    );
   },
 );
 

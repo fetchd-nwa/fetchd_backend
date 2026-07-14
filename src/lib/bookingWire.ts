@@ -21,9 +21,10 @@ export type { BookingWire };
  * The subset of `bookings` columns the wire shape consumes. A structural
  * type kept narrow so the query layer doesn't accidentally couple the wire
  * helper to columns it doesn't need (confirmed_at, cancellation_reason,
- * cancel_deadline_at, dropoff_at, pickup_at, external_ref, source — all
- * internal state, none on the §B wire today). `cohortId` joined the wire
- * Day-19d so the FE can group + title group-class bookings.
+ * dropoff_at, pickup_at, external_ref, source — all internal state, none on
+ * the §B wire today). `cohortId` joined the wire Day-19d so the FE can group +
+ * title group-class bookings; `cancelDeadlineAt` joined Δ 2026-07-08 so the FE
+ * can warn before a cancel forfeits (booking-overlap flow).
  */
 export interface BookingRowForWire {
   id: string;
@@ -36,6 +37,7 @@ export interface BookingRowForWire {
   location: LocationKey | null;
   cancelledAt: string | null;
   cancelForfeited: boolean;
+  cancelDeadlineAt: string | null;
   cohortId: string | null;
 }
 
@@ -76,6 +78,9 @@ export function toBookingWire(
   if (row.notes !== null && row.notes !== '') wire.notes = row.notes;
   if (row.sessionReportId !== null) wire.session_report_id = row.sessionReportId;
   if (row.location !== null) wire.location = row.location;
+  if (row.cancelDeadlineAt !== null) {
+    wire.cancel_deadline_at = pgTimestampToIso(row.cancelDeadlineAt);
+  }
   if (row.cohortId !== null) wire.cohort_id = row.cohortId;
   if (groupClassName !== undefined && groupClassName !== '') {
     wire.group_class_name = groupClassName;

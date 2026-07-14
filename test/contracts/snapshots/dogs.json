@@ -36,6 +36,7 @@
     "special_notes": "Eager learner; loves water.",
     "evaluation_status": "passed",
     "boarding_enabled": false,
+    "is_alumni": false,
     "evaluation_date": "2024-03-01T15:00:00.000Z",
     "completed_class_keys": ["manners-1"],
     "vet": {
@@ -77,6 +78,7 @@
     "special_notes": "",
     "evaluation_status": "passed",
     "boarding_enabled": true,
+    "is_alumni": false,
     "evaluation_date": "2024-06-01T15:00:00.000Z"
   }
 ]

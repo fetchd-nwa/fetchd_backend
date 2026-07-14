@@ -16,6 +16,7 @@ import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
 import { registerInvoicesRoute } from './routes/invoices.js';
 import { registerMediaRoute } from './routes/media.js';
+import { registerMembershipsRoute } from './routes/memberships.js';
 import { registerMeRoute } from './routes/me.js';
 import { registerNotificationsRoute } from './routes/notifications.js';
 import { registerPaymentMethodsRoute } from './routes/paymentMethods.js';
@@ -24,10 +25,12 @@ import { registerReportsRoute } from './routes/reports.js';
 import { registerRequestConfirmPaymentRoute } from './routes/requestConfirmPayment.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
+import { registerStaffAlumniRoute } from './routes/staffAlumni.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffCreditExpiryRoute } from './routes/staffCreditExpiry.js';
 import { registerStaffInvoicesRoute } from './routes/staffInvoices.js';
+import { registerStaffMembershipsRoute } from './routes/staffMemberships.js';
 import { registerStaffDogsRoute } from './routes/staffDogs.js';
 import { registerStaffRatesRoute } from './routes/staffRates.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
@@ -73,6 +76,8 @@ export function buildApp(): FastifyInstance {
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
   registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
   registerStaffCreditExpiryRoute(app); // [staff] — staff-tunable credit-expiry settings (2026-06-20)
+  registerStaffAlumniRoute(app); // [staff] — §J.3 completed-programs record + alumni-flag clear
+  registerStaffMembershipsRoute(app); // [staff] — §J.1 pause / resume (staff-mediated)
   registerStaffInvoicesRoute(app); // [staff] — parked-invoice worklist (credit-expiry Phase 3)
   registerStaffRatesRoute(app); // [staff] — per-location service-rate editor (2026-06-20)
   registerStaffDogsRoute(app); // [staff] — Day-19b portal dog directory (name resolution)
@@ -88,6 +93,7 @@ export function buildApp(): FastifyInstance {
   registerPaymentMethodsRoute(app); // [auth] — owner-only
   registerDeviceTokensRoute(app); // [auth] — owner-only (Day-18c push registration)
   registerInvoicesRoute(app); // [auth, $] — Day-15 invoice settlement
+  registerMembershipsRoute(app); // [auth, $] — §J.1 credit-package subscriptions
   registerRequestConfirmPaymentRoute(app); // [auth, $] — Day-15 B&T conversion
   registerUploadsSignRoute(app); // [auth] — Day-17 presigned R2 PUT
   registerMediaRoute(app); // [auth] — Day-17 register/read/soft-expire media

@@ -37,12 +37,14 @@ import {
   creditLedger,
   creditPackages,
   dogCompletedClasses,
+  dogCompletedPrograms,
   dogs,
   eventRsvpDogs,
   eventRsvps,
   events,
   groupClasses,
   invoices,
+  memberships,
   messages,
   notificationDogs,
   notifications,
@@ -59,6 +61,7 @@ import {
   threadDogs,
   threads,
 } from '../src/db/schema/schema.js';
+import { CURRICULUM_PROGRAMS } from '../src/lib/alumni.js';
 
 function assertLocalDb(): void {
   const url = env.DATABASE_URL;
@@ -155,6 +158,19 @@ function daysFromNow(days: number, hour = 14): string {
   return d.toISOString();
 }
 
+// Day school and day care run Mon–Fri only, so their seeded rows must never
+// land on a weekend. Takes the raw offset then nudges forward off any Sat/Sun.
+// (`hour` is a morning-UTC drop-off — 13–15 UTC is 8–10am Chicago, same
+// calendar day, so the UTC weekday equals the Chicago weekday here.)
+function weekdayFromNow(days: number, hour = 14): string {
+  const d = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) {
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  d.setUTCHours(hour, 0, 0, 0);
+  return d.toISOString();
+}
+
 // Human Chicago weekday+date label (e.g. "Friday, June 6") computed off the
 // seed run so closure copy never references a stale hardcoded calendar date.
 function chicagoDateLabel(daysAhead: number): string {
@@ -186,8 +202,10 @@ async function wipe(): Promise<void> {
   await db.delete(eventRsvps);
   await db.delete(events);
   await db.delete(notificationDogs);
-  await db.delete(notifications);
+  // scheduled_notifications.emitted_notification_id → notifications.id, so the
+  // child (scheduled) must be deleted before the parent (notifications).
   await db.delete(scheduledNotifications);
+  await db.delete(notifications);
   await db.delete(messages);
   await db.delete(threadDogs);
   await db.delete(threads);
@@ -199,6 +217,9 @@ async function wipe(): Promise<void> {
   // (invoices.payment_method_id).
   await db.delete(refunds);
   await db.delete(invoices);
+  // memberships RESTRICT-reference payment_methods + credit_packages + dogs —
+  // delete them before any of those parents.
+  await db.delete(memberships);
   await db.delete(creditLedger);
   await db.delete(creditPackages);
   await db.delete(charges);
@@ -213,6 +234,7 @@ async function wipe(): Promise<void> {
   await db.delete(paymentMethods);
   await db.delete(stripeCustomers);
   await db.delete(dogCompletedClasses);
+  await db.delete(dogCompletedPrograms);
   await db.delete(dogs);
   await db.delete(owners);
   await db.delete(staff);
@@ -262,6 +284,11 @@ async function seed(): Promise<void> {
       email: 'allison@example.com',
       phone: '479-555-0101',
       location: 'fayetteville',
+      addressLine1: '123 W Dickson St',
+      addressLine2: 'Apt 4',
+      addressCity: 'Fayetteville',
+      addressState: 'AR',
+      addressZip: '72701',
     },
     {
       id: SEED.ownerJordanId,
@@ -270,6 +297,11 @@ async function seed(): Promise<void> {
       email: 'jordan@example.com',
       phone: '479-555-0102',
       location: 'bentonville',
+      addressLine1: '456 SE 8th St',
+      addressLine2: '',
+      addressCity: 'Bentonville',
+      addressState: 'AR',
+      addressZip: '72712',
     },
   ]);
 
@@ -675,6 +707,16 @@ async function seed(): Promise<void> {
   // hasn't → enrolling Waffles in Manners 2 fires the prereq gate. Demos both
   // sides of the R7 eligibility check for Allison.
   await db.insert(dogCompletedClasses).values([{ dogId: SEED.dogLolaId, classKey: 'manners-1' }]);
+  // §J.3 alumni demo: Waffles has all 5 day-school curriculum programs →
+  // alumni is DERIVED true, her grants never expire (her seeded 10-credit lot
+  // already carries NULL expiry), and the dog-profile hero shows the badge.
+  await db.insert(dogCompletedPrograms).values(
+    CURRICULUM_PROGRAMS.map((program) => ({
+      dogId: SEED.dogWafflesId,
+      program,
+      completedByStaffId: SEED.staffShanthiId,
+    })),
+  );
 
   await db.insert(bookings).values([
     {
@@ -683,7 +725,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogWafflesId,
       category: 'day-school',
       status: 'upcoming',
-      scheduledAt: daysFromNow(2, 13),
+      scheduledAt: weekdayFromNow(2, 13),
       durationMinutes: 540,
       trainerStaffId: SEED.staffDonavanId,
       location: 'fayetteville',
@@ -725,7 +767,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogBrodieId,
       category: 'day-care',
       status: 'upcoming',
-      scheduledAt: daysFromNow(1, 14),
+      scheduledAt: weekdayFromNow(1, 14),
       durationMinutes: 480,
       trainerStaffId: null,
       location: 'bentonville',

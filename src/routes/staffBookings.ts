@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
+import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { type BookingWire } from '../lib/bookingWire.js';
 import type { AttendanceWire } from '../contracts/wire.js';
@@ -144,6 +145,7 @@ export function registerStaffBookingsRoute(
       let pendingStripeRefund:
         | { refundId: string; paymentIntentId: string; amountCents: number }
         | undefined;
+      let creditRefundedDogIds: string[] = [];
 
       const outcome = await withMutation<BookingWire>(
         {
@@ -152,11 +154,18 @@ export function registerStaffBookingsRoute(
           endpoint: 'POST /staff/bookings/:id/cancel',
           requestHash: hashRequestBody({ id }),
           // Day-13 cache invalidation: drop the freed seat's availability
-          // range cache. Mirrors the owner cancel route.
-          patternsToInvalidate: (body) =>
-            body.location !== undefined && body.location !== null
-              ? [`avail:${body.location}:*`]
-              : [],
+          // range cache plus each credited-back dog's balance cache. Mirrors
+          // the owner cancel route.
+          patternsToInvalidate: (body) => {
+            const patterns: string[] = [];
+            if (body.location !== undefined && body.location !== null) {
+              patterns.push(`avail:${body.location}:*`);
+            }
+            for (const dogId of creditRefundedDogIds) {
+              patterns.push(creditsInvalidationPattern(dogId));
+            }
+            return patterns;
+          },
           postCommit: async () => {
             if (pendingStripeRefund === undefined) return;
             const result = await stripe.createRefund(
@@ -176,6 +185,7 @@ export function registerStaffBookingsRoute(
         async (tx) => {
           const result = await cancelBookingInTx(tx, { id, requireOwnerId: null });
           pendingStripeRefund = result.pendingStripeRefund;
+          creditRefundedDogIds = result.creditRefundedDogIds;
           return { status: 200, body: result.wire };
         },
       );

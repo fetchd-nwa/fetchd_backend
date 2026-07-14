@@ -40,6 +40,8 @@ export interface InvoiceRow {
   cohortId: string | null;
   dogId: string | null;
   requestId: string | null;
+  /** §J.1: set on purpose='membership' rows — the subscription month billed. */
+  membershipId: string | null;
   paymentMethodId: string;
   paidChargeId: string | null;
   dueAt: string;
@@ -58,6 +60,7 @@ const INVOICE_PROJECTION = {
   cohortId: invoices.cohortId,
   dogId: invoices.dogId,
   requestId: invoices.requestId,
+  membershipId: invoices.membershipId,
   paymentMethodId: invoices.paymentMethodId,
   paidChargeId: invoices.paidChargeId,
   dueAt: invoices.dueAt,
@@ -107,6 +110,7 @@ export const invoicesRepository = {
       cohortId?: string | null;
       dogId?: string | null;
       requestId?: string | null;
+      membershipId?: string | null;
     },
   ): Promise<InvoiceRow> {
     const [row] = await tx
@@ -122,6 +126,7 @@ export const invoicesRepository = {
         cohortId: args.cohortId ?? null,
         dogId: args.dogId ?? null,
         requestId: args.requestId ?? null,
+        membershipId: args.membershipId ?? null,
       })
       .returning(INVOICE_PROJECTION);
     if (!row) {
@@ -337,6 +342,21 @@ export const invoicesRepository = {
       .select(INVOICE_PROJECTION)
       .from(invoices)
       .where(and(eq(invoices.status, 'open'), lte(invoices.dueAt, now.toISOString())));
+  },
+
+  /**
+   * §J.1 roll accounting: every invoice ever created for this membership,
+   * REGARDLESS of status. `1 (sync month-1 charge) + this count` = periods
+   * billed — the roll phase's term-exhaustion check. Counting all statuses
+   * keeps the term deterministic under status churn (a void/park never
+   * silently extends or shortens the term).
+   */
+  async countForMembership(tx: Tx, membershipId: string): Promise<number> {
+    const [row] = await tx
+      .select({ count: sql<number>`count(*)::int` })
+      .from(invoices)
+      .where(eq(invoices.membershipId, membershipId));
+    return row?.count ?? 0;
   },
 
   /**

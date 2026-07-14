@@ -1,4 +1,6 @@
 import { and, asc, desc, eq, gt, isNull, lte, or } from 'drizzle-orm';
+import { z } from 'zod';
+import { readThrough } from '../../lib/cache.js';
 import { db } from '../client.js';
 import { bookingMode, creditPackages, type LocationKey } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -49,6 +51,35 @@ const PACKAGE_PROJECTION = {
   is_popular: creditPackages.isPopular,
 } as const;
 
+/**
+ * Read-through cache for the purchasable catalog. Reference data (rates +
+ * packages), shared across every owner at a location, re-read on every
+ * booking/credits screen — the classic cache-worthy shape. The key is
+ * effective-dated by `today`, so it rolls over on its own at the Chicago
+ * midnight boundary; a mid-day repricing (close-the-window + insert, rare)
+ * is stale only until the TTL. No mutation lives in `api/` today, so there's
+ * no explicit invalidation — the daily key + short TTL are the whole story.
+ * (The staff-portal package editor lives in a separate repo; when it lands it
+ * should `invalidatePattern('creditpackages:{location}:*')` on a reprice.)
+ */
+const CREDIT_PACKAGES_TTL_SEC = 300;
+
+const CREDIT_PACKAGE_ROW_SCHEMA: z.ZodType<CreditPackageRow> = z.object({
+  key: z.string(),
+  location: z.enum(['fayetteville', 'bentonville']),
+  mode: z.enum(['school', 'daycare']),
+  credits: z.number(),
+  price_cents: z.number(),
+  label: z.string(),
+  is_popular: z.boolean(),
+});
+const CREDIT_PACKAGE_ROWS_SCHEMA = CREDIT_PACKAGE_ROW_SCHEMA.array();
+
+/** Cache key for the active catalog at one (location, day). */
+export function creditPackagesCacheKey(location: LocationKey, today: string): string {
+  return `creditpackages:${location}:${today}`;
+}
+
 /** A row whose `[effective_from, effective_to)` window contains `today`. */
 function effectiveAt(today: string) {
   return and(
@@ -70,26 +101,33 @@ export const creditPackagesRepository = {
    * by enum mode + credits for the wire.
    */
   async findActive(location: LocationKey, today: string): Promise<CreditPackageRow[]> {
-    const current = db
-      .selectDistinctOn([creditPackages.key], PACKAGE_PROJECTION)
-      .from(creditPackages)
-      .where(and(eq(creditPackages.location, location), effectiveAt(today)))
-      .orderBy(asc(creditPackages.key), desc(creditPackages.effectiveFrom))
-      .as('current_packages');
+    return readThrough(
+      creditPackagesCacheKey(location, today),
+      CREDIT_PACKAGES_TTL_SEC,
+      CREDIT_PACKAGE_ROWS_SCHEMA,
+      async () => {
+        const current = db
+          .selectDistinctOn([creditPackages.key], PACKAGE_PROJECTION)
+          .from(creditPackages)
+          .where(and(eq(creditPackages.location, location), effectiveAt(today)))
+          .orderBy(asc(creditPackages.key), desc(creditPackages.effectiveFrom))
+          .as('current_packages');
 
-    const rows = await db
-      .select({
-        key: current.key,
-        location: current.location,
-        mode: current.mode,
-        credits: current.credits,
-        price_cents: current.price_cents,
-        label: current.label,
-        is_popular: current.is_popular,
-      })
-      .from(current)
-      .orderBy(asc(current.mode), asc(current.credits));
-    return rows;
+        const rows = await db
+          .select({
+            key: current.key,
+            location: current.location,
+            mode: current.mode,
+            credits: current.credits,
+            price_cents: current.price_cents,
+            label: current.label,
+            is_popular: current.is_popular,
+          })
+          .from(current)
+          .orderBy(asc(current.mode), asc(current.credits));
+        return rows;
+      },
+    );
   },
 
   /**
@@ -115,6 +153,21 @@ export const creditPackagesRepository = {
         and(eq(creditPackages.key, key), eq(creditPackages.location, location), effectiveAt(today)),
       )
       .orderBy(desc(creditPackages.effectiveFrom))
+      .limit(1);
+    return row;
+  },
+
+  /**
+   * §J.1 — lookup by surrogate id, NO effective-window filter: a membership
+   * pins the exact priced version it bills (`memberships.package_id`), and a
+   * later repricing/retirement must not change what an in-flight subscription
+   * delivers. The roll phase + the membership settle branch read this.
+   */
+  async findById(runner: Runner, id: string): Promise<CreditPackageWithId | undefined> {
+    const [row] = await runner
+      .select(PACKAGE_PROJECTION)
+      .from(creditPackages)
+      .where(eq(creditPackages.id, id))
       .limit(1);
     return row;
   },

@@ -6,9 +6,14 @@ import {
 } from '../db/repositories/scheduledNotificationsRepository.js';
 import { sweepExpiredIdempotencyKeys } from '../db/idempotency.js';
 import {
+  enqueueAlumniAttendanceFlags,
+  type AlumniAttendanceScanResult,
+} from '../lib/alumniAttendanceScan.js';
+import {
   enqueueCreditExpiryWarnings,
   type EnqueueCreditExpiryWarningsResult,
 } from '../lib/enqueueCreditExpiryWarnings.js';
+import { rollDueMemberships, type MembershipRollResult } from '../lib/membershipRoll.js';
 import { withActor, type Tx } from '../db/tx.js';
 import {
   defaultExpoPushClient,
@@ -17,6 +22,7 @@ import {
   type ExpoPushTicket,
 } from '../lib/expoPush.js';
 import type { R2Client } from '../lib/r2.js';
+import type { StripeClient } from '../lib/stripe.js';
 import { runInvoiceAutoChargeOnce, type InvoiceAutoChargeTickResult } from './invoiceAutoCharge.js';
 import { runMediaDerivativesOnce, type MediaDerivativesTickResult } from './mediaDerivatives.js';
 
@@ -31,7 +37,7 @@ interface WorkerLogger {
  * via pg_cron + pg_net hitting `/workers/tick`; tests call it directly
  * with a fixed `now` for determinism.
  *
- * Three phases per tick, composed in order:
+ * Phases per tick, composed in order:
  *
  *   1. **`scheduled_notifications` claim + deliver.** Claim due 'pending'
  *      rows under `FOR UPDATE SKIP LOCKED` so concurrent ticks don't
@@ -40,12 +46,25 @@ interface WorkerLogger {
  *      `emitted_notification_id`. Push attempts are queued in-memory
  *      and dispatched post-commit (best-effort; DB is source of truth).
  *
- *   2. **Invoice auto-charge.** Compose Day-15's
+ *   2. **§J.1 membership roll.** Open each due subscription's next month
+ *      (advance period + card-backed invoice) or hard-stop at term end.
+ *      Before the charge pass so a rolled invoice charges this tick.
+ *
+ *   3. **Invoice auto-charge.** Compose Day-15's
  *      `runInvoiceAutoChargeOnce` so one cron firing handles BOTH
  *      outbound notifications AND invoice dunning — fewer moving parts
  *      operationally.
  *
- *   3. **`idempotency_keys` TTL sweep.** Prune rows older than the
+ *   4. **Media derivatives** (Day 17). Claim → sharp → settle per job.
+ *
+ *   5. **Credit-expiry warnings** (credit-expiry Phase 3). Enqueue
+ *      `credits-expiring` per lot inside its location's warning window.
+ *
+ *   6. **§J.3 alumni attendance** (monthly, self-gated on the 1st
+ *      Chicago). Flag + notify alumni dogs under 2 attended qualifying
+ *      sessions in the just-closed month.
+ *
+ *   7. **`idempotency_keys` TTL sweep.** Prune rows older than the
  *      retry-safety window (24h default) per schema.sql lines ~918-920.
  *      One Postgres DELETE; runs on the pool runner outside any tx.
  *
@@ -70,6 +89,11 @@ export interface SchedulerTickOpts {
   expoPush?: ExpoPushClient;
   /** R2 client for the media-derivatives phase (Day 17). */
   r2?: R2Client;
+  /** Stripe client for the invoice auto-charge phase. Defaults to the
+   *  production client inside `runInvoiceAutoChargeOnce`; the §J lifecycle
+   *  integration test injects the stub to drive roll → charge → settle
+   *  through one composed tick. */
+  stripe?: StripeClient;
   /** Per-tick batch size for the scheduled_notifications scan. Default 50. */
   notificationsLimit?: number;
   /** Per-tick batch size for the invoice auto-charge scan. Default 50. */
@@ -92,9 +116,11 @@ export interface ScheduledNotificationsTickResult {
 
 export interface SchedulerTickResult {
   scheduledNotifications: ScheduledNotificationsTickResult;
+  membershipRoll: MembershipRollResult;
   invoiceAutoCharge: InvoiceAutoChargeTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
   creditExpiryWarnings: EnqueueCreditExpiryWarningsResult;
+  alumniAttendance: AlumniAttendanceScanResult;
   idempotencyKeysSwept: number;
 }
 
@@ -124,7 +150,36 @@ export async function runSchedulerTickOnce(
     now,
   );
 
+  // Phase 2 — §J.1 membership roll. Runs BEFORE the invoice auto-charge so a
+  // freshly-rolled month's invoice (due_at = period start ≤ now) is scooped
+  // by THIS tick's charge pass rather than waiting a full tick. Own tx, own
+  // log-and-swallow boundary so a roll failure can't block dunning.
+  let membershipRollResult: MembershipRollResult = { scanned: 0, rolled: 0, completed: 0 };
+  try {
+    membershipRollResult = await withActor(SCHEDULER_ACTOR, (tx) => rollDueMemberships(tx, now));
+    log.info(
+      {
+        workerTick: 'scheduler',
+        phase: 'membership-roll',
+        scanned: membershipRollResult.scanned,
+        rolled: membershipRollResult.rolled,
+        completed: membershipRollResult.completed,
+      },
+      'membership roll complete',
+    );
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'membership-roll',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'membership-roll phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
   const invoiceResult = await runInvoiceAutoChargeOnce({
+    ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
     limit: opts.invoiceLimit,
     now,
     log,
@@ -153,7 +208,7 @@ export async function runSchedulerTickOnce(
     mediaDerivativesResult = { scanned: 0, results: [] };
   }
 
-  // Phase 5 — credit-expiry warnings (credit-expiry Phase 3). Scan live,
+  // Phase 5 — credit-expiry warnings (credit-expiry lane, its Phase 3). Scan live,
   // non-exhausted credit lots within their location's warning window and
   // enqueue a `credits-expiring` scheduled notification per lot (dedup-keyed
   // on the lot id so a lot is warned exactly once across ticks). The enqueued
@@ -185,6 +240,45 @@ export async function runSchedulerTickOnce(
     );
   }
 
+  // Phase 6 — §J.3 alumni attendance (monthly). Self-gated on the 1st
+  // (Chicago) inside the scan; every other day it returns `ran: false` at the
+  // cost of one Intl format. Enqueues `alumni-attendance` notifications +
+  // stamps `dogs.alumni_attendance_flagged_at` for alumni dogs that attended
+  // <2 qualifying sessions in the just-closed month. Own tx, own
+  // log-and-swallow boundary.
+  let alumniAttendanceResult: AlumniAttendanceScanResult = {
+    ran: false,
+    scanned: 0,
+    enqueued: 0,
+    flagged: 0,
+  };
+  try {
+    alumniAttendanceResult = await withActor(SCHEDULER_ACTOR, (tx) =>
+      enqueueAlumniAttendanceFlags(tx, now),
+    );
+    if (alumniAttendanceResult.ran) {
+      log.info(
+        {
+          workerTick: 'scheduler',
+          phase: 'alumni-attendance',
+          scanned: alumniAttendanceResult.scanned,
+          enqueued: alumniAttendanceResult.enqueued,
+          flagged: alumniAttendanceResult.flagged,
+        },
+        'alumni-attendance monthly scan complete',
+      );
+    }
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'alumni-attendance',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'alumni-attendance phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
   const sweepCutoff = new Date(now.getTime() - IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000);
   let idempotencyKeysSwept = 0;
   try {
@@ -206,9 +300,11 @@ export async function runSchedulerTickOnce(
 
   return {
     scheduledNotifications: notificationsResult,
+    membershipRoll: membershipRollResult,
     invoiceAutoCharge: invoiceResult,
     mediaDerivatives: mediaDerivativesResult,
     creditExpiryWarnings: creditExpiryWarningsResult,
+    alumniAttendance: alumniAttendanceResult,
     idempotencyKeysSwept,
   };
 }

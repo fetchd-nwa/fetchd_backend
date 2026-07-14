@@ -5,6 +5,7 @@ import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepos
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
 import { withActor } from '../db/tx.js';
+import { invalidatePattern } from '../lib/cache.js';
 import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import {
   defaultStripeClient,
@@ -229,7 +230,7 @@ async function processOne(
   const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
 
   if (chargeStatus === 'succeeded') {
-    const chargeId = await recordPaid(invoice, intent.id, intent.amountCents, stripe, log);
+    const chargeId = await recordPaid(invoice, intent.id, intent.amountCents, stripe, log, now);
     return { invoiceId: invoice.id, outcome: 'paid', chargeId };
   }
 
@@ -277,6 +278,7 @@ async function recordPaid(
   amountCents: number,
   stripe: StripeClient,
   log: WorkerLogger,
+  now: Date,
 ): Promise<string> {
   const result = await withActor(WORKER_ACTOR, (tx) =>
     settleInvoiceCharge(tx, {
@@ -285,11 +287,25 @@ async function recordPaid(
       amountCents,
       purpose: invoice.purpose,
       notifyOwner: true,
+      now,
     }),
   );
 
   if (result.outcome === 'refunded') {
     await fireDuplicateRefund(invoice.id, result.pendingStripeRefund, stripe, log);
+  } else if (invoice.purpose === 'membership' && invoice.dogId !== null) {
+    // §J.1: the winning settle granted the month's credit lot inside the tx
+    // — drop the per-dog credit cache (§3 map). Best-effort, post-commit,
+    // mirroring the withMutation swallow-and-log policy: the cache self-heals
+    // via TTL and the DB grant already landed.
+    try {
+      await invalidatePattern(`credits:${invoice.dogId}:*`);
+    } catch (err) {
+      log.warn(
+        { invoiceId: invoice.id, dogId: invoice.dogId, err: errMsg(err) },
+        'invoice auto-charge: membership-grant credits cache wipe failed (TTL self-heals)',
+      );
+    }
   }
   return result.chargeId;
 }

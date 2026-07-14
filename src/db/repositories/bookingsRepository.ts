@@ -39,20 +39,21 @@ export interface BookingRow {
   location: LocationKey | null;
   cancelledAt: string | null;
   cancelForfeited: boolean;
+  cancelDeadlineAt: string | null;
   pickupAt: string | null;
   trainerStaffId: string | null;
   cohortId: string | null;
 }
 
 /**
- * Full row with `ownerId` and `cancelDeadlineAt` — fields the route layer
- * needs for cross-owner defense + cancel-window math, but the public wire
- * shape doesn't carry. Day-13 cancel txn reads this projection.
+ * Full row with `ownerId` — a field the route layer needs for cross-owner
+ * defense, but the public wire shape doesn't carry. Day-13 cancel txn reads
+ * this projection. (`cancelDeadlineAt` graduated to the base `BookingRow`
+ * Δ 2026-07-08 — it's now on the wire for the overlap-cancel forfeit warning.)
  */
 export interface BookingFullRow extends BookingRow {
   ownerId: string;
   leadDogId: string;
-  cancelDeadlineAt: string | null;
   expiredAt: string | null;
 }
 
@@ -79,6 +80,7 @@ const BOOKING_PROJECTION = {
   location: bookings.location,
   cancelledAt: bookings.cancelledAt,
   cancelForfeited: bookings.cancelForfeited,
+  cancelDeadlineAt: bookings.cancelDeadlineAt,
   pickupAt: bookings.pickupAt,
   trainerStaffId: bookings.trainerStaffId,
   cohortId: bookings.cohortId,
@@ -88,8 +90,6 @@ const BOOKING_FULL_PROJECTION = {
   ...BOOKING_PROJECTION,
   ownerId: bookings.ownerId,
   leadDogId: bookings.leadDogId,
-  cancelDeadlineAt: bookings.cancelDeadlineAt,
-  cohortId: bookings.cohortId,
   expiredAt: bookings.expiredAt,
 } as const;
 
@@ -183,33 +183,80 @@ export const bookingsRepository = {
   },
 
   /**
-   * Day-19d duplicate guard (day programs). Live (non-cancelled) `scheduled_at`
-   * timestamps for this dog in this category — matched on the `booking_dogs`
-   * roster (lead OR additional), since a day-program booking can carry several
-   * dogs. Run inside the booking txn under the day-mode lock; the route buckets
-   * each to its Chicago day and intersects with the requested days — a
-   * collision means the dog is already booked that day. Cancelled rows are
-   * excluded so a re-book after cancel is allowed.
+   * Candidate live (non-cancelled) bookings a new day program on `chicagoDates`
+   * could conflict with, matched on the `booking_dogs` roster (lead OR
+   * additional). Feeds the `POST /bookings` time-overlap guard
+   * (`lib/bookingConflicts.dayProgramConflictsWith`), which applies the exact
+   * FE rules to each candidate. Two shapes:
+   *   • sessional — day-school / day-care / private-lesson / evaluation whose
+   *     Chicago day is one of `chicagoDates` (a day program only occupies its
+   *     own day, so only same-day sessions can overlap). Group classes are
+   *     excluded — they never conflict.
+   *   • residential — boarding / board-and-train stays whose [drop-off, pick-up]
+   *     day range can cover a target day. Kept when the stay hasn't ended before
+   *     the earliest target (unbounded stays — no pick-up yet — always kept);
+   *     the JS coverage check narrows to exact days.
+   *
+   * Run inside the booking txn under the (location, date) capacity lock so a
+   * concurrent create on the same bucket can't slip an overlap past the check.
    */
-  async findLiveScheduledAtForDogCategory(
+  async findConflictCandidatesForDog(
     tx: Tx,
     dogId: string,
-    category: ServiceCategory,
-  ): Promise<string[]> {
-    const rows = await tx
-      .select({ scheduledAt: bookings.scheduledAt })
+    chicagoDates: string[],
+  ): Promise<
+    {
+      category: ServiceCategory;
+      scheduledAt: string;
+      durationMinutes: number | null;
+      pickupAt: string | null;
+    }[]
+  > {
+    if (chicagoDates.length === 0) return [];
+    const minDate = chicagoDates[0]!;
+    const maxDate = chicagoDates[chicagoDates.length - 1]!;
+    const projection = {
+      category: bookings.category,
+      scheduledAt: bookings.scheduledAt,
+      durationMinutes: bookings.durationMinutes,
+      pickupAt: bookings.pickupAt,
+    } as const;
+
+    const sessional = await tx
+      .select(projection)
       .from(bookings)
       .innerJoin(bookingDogs, eq(bookingDogs.bookingId, bookings.id))
       .where(
         and(
           eq(bookingDogs.dogId, dogId),
           live(bookingDogs),
-          eq(bookings.category, category),
+          inArray(bookings.category, ['day-school', 'day-care', 'private-lesson', 'evaluation']),
           ne(bookings.status, 'cancelled'),
           live(bookings),
+          inArray(
+            sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date`,
+            chicagoDates,
+          ),
         ),
       );
-    return rows.map((r) => r.scheduledAt);
+
+    const residential = await tx
+      .select(projection)
+      .from(bookings)
+      .innerJoin(bookingDogs, eq(bookingDogs.bookingId, bookings.id))
+      .where(
+        and(
+          eq(bookingDogs.dogId, dogId),
+          live(bookingDogs),
+          inArray(bookings.category, ['boarding', 'board-and-train']),
+          ne(bookings.status, 'cancelled'),
+          live(bookings),
+          sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date <= ${maxDate}`,
+          sql`(${bookings.pickupAt} IS NULL OR (${bookings.pickupAt} AT TIME ZONE 'America/Chicago')::date >= ${minDate})`,
+        ),
+      );
+
+    return [...sessional, ...residential];
   },
 
   /**

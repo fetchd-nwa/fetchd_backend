@@ -1,6 +1,7 @@
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
@@ -24,6 +25,12 @@ export interface CancelBookingResult {
    * seam). Undefined for forfeit / credit-back / free-service paths.
    */
   pendingStripeRefund?: PendingStripeRefund;
+  /**
+   * Distinct dog ids that received a credit-back on this cancel. The route
+   * wipes each dog's `credits:{dogId}:*` display cache post-commit. Empty on
+   * every non-credit-back path (forfeit / money-back / PAYG-void / free).
+   */
+  creditRefundedDogIds: string[];
 }
 
 /**
@@ -84,13 +91,22 @@ export async function cancelBookingInTx(
 
   // 4. Refund branching — within the cancel window only.
   let pendingStripeRefund: PendingStripeRefund | undefined;
+  const creditRefundedDogIds = new Set<string>();
   if (!updated.cancelForfeited) {
     const debits = await creditLedgerRepository.findDebitsForBooking(tx, id);
     if (debits.length > 0) {
       // CREDIT-BACK: one +1 refund row per original debit, routed back to the
       // lot it drew from (or a fresh lot if that lot has since expired).
+      // §J.3: an alumni dog's fresh re-mint never expires — one status read
+      // per distinct dog, memoized across this booking's debits.
       const now = new Date();
+      const alumniByDogId = new Map<string, boolean>();
       for (const debit of debits) {
+        let dogIsAlumni = alumniByDogId.get(debit.dogId);
+        if (dogIsAlumni === undefined) {
+          dogIsAlumni = await dogProgramsRepository.isAlumni(debit.dogId, tx);
+          alumniByDogId.set(debit.dogId, dogIsAlumni);
+        }
         await creditLedgerRepository.refundForBooking(tx, {
           dogId: debit.dogId,
           mode: debit.mode,
@@ -99,7 +115,9 @@ export async function cancelBookingInTx(
           lotId: debit.lotId,
           lotExpiresAt: debit.lotExpiresAt,
           now,
+          dogIsAlumni,
         });
+        creditRefundedDogIds.add(debit.dogId);
       }
     } else {
       const charge = await chargesRepository.findSucceededForBooking(tx, id);
@@ -161,7 +179,7 @@ export async function cancelBookingInTx(
   if (wire === undefined) {
     throw new Error(`cancelBooking ${id}: wire assembly returned no row`);
   }
-  return { wire, pendingStripeRefund };
+  return { wire, pendingStripeRefund, creditRefundedDogIds: [...creditRefundedDogIds] };
 }
 
 /**

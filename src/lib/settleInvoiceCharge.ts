@@ -1,10 +1,16 @@
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
+import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
+import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import type { InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
+import { membershipsRepository } from '../db/repositories/membershipsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import type { Tx } from '../db/tx.js';
+import { nextMonthlyPeriodEnd } from './membershipBilling.js';
+import { pgTimestampToDate } from './pgTimestamp.js';
 
 /**
  * The post-Stripe handle the caller fires after commit (mirrors
@@ -52,6 +58,10 @@ export interface SettleInvoiceChargeArgs {
    * The refund (lost-race) branch never notifies under either caller.
    */
   notifyOwner: boolean;
+  /** Settle instant — the §J.1 membership grant's late-settle floor reads it
+   * (see `grantMembershipMonth`). Defaults to wall clock; workers/tests pass
+   * their pinned `now`. */
+  now?: Date;
 }
 
 /**
@@ -86,6 +96,7 @@ export async function settleInvoiceCharge(
   args: SettleInvoiceChargeArgs,
 ): Promise<SettleInvoiceChargeResult> {
   const { invoice, paymentIntentId, amountCents, purpose, notifyOwner } = args;
+  const now = args.now ?? new Date();
 
   const charge = await chargesRepository.create(tx, {
     ownerId: invoice.ownerId,
@@ -106,6 +117,9 @@ export async function settleInvoiceCharge(
   });
 
   if (flipped > 0) {
+    if (invoice.purpose === 'membership' && invoice.membershipId !== null) {
+      await grantMembershipMonth(tx, { invoice, chargeId: charge.id, now });
+    }
     if (notifyOwner) {
       await notificationsRepository.enqueue(tx, {
         ownerId: invoice.ownerId,
@@ -145,6 +159,59 @@ export async function settleInvoiceCharge(
     chargeId: charge.id,
     pendingStripeRefund: { refundId: refund.id, paymentIntentId, amountCents: maxRefund },
   };
+}
+
+/**
+ * §J.1 — the WINNING settle of a `purpose='membership'` invoice grants that
+ * month's credit lot (`reason='membership-grant'`). Expiry (alumni dogs NULL,
+ * §J.3) is the end of the period THIS INVOICE billed — recomputed from
+ * `invoice.due_at` (the period start the roll stamped), NOT the membership's
+ * live `current_period_end`: a parked invoice can settle via the manual
+ * `POST /invoices/:id/pay` months later, after further rolls moved (or a
+ * completion froze) `current_period_end`, which would stamp the wrong
+ * period — including one already past, a lot dead at birth.
+ *
+ * Late-settle floor: when the billed period has ALREADY ended at settle
+ * time, the owner is paying a full month's price for it — grant a fresh
+ * clamped month from `now` instead of dead credits. The period-scoped expiry
+ * is what makes the "X days left to use X credits" reminder ride the
+ * existing credits-expiring scan.
+ *
+ * The loads throw on missing rows rather than skip: a membership invoice
+ * whose membership/package can't be resolved is corrupt state, and silently
+ * settling it would take the owner's money without granting credits. The
+ * throw rolls back this settle; the invoice stays open for retry/park and
+ * the staff worklist surfaces it.
+ */
+async function grantMembershipMonth(
+  tx: Tx,
+  args: { invoice: InvoiceRow; chargeId: string; now: Date },
+): Promise<void> {
+  const { invoice, chargeId, now } = args;
+  if (invoice.membershipId === null) {
+    throw new Error(`settleInvoiceCharge: invoice ${invoice.id} has no membership_id`);
+  }
+  const membership = await membershipsRepository.findById(tx, invoice.membershipId);
+  if (membership === undefined) {
+    throw new Error(`settleInvoiceCharge: membership ${invoice.membershipId} not found`);
+  }
+  const pkg = await creditPackagesRepository.findById(tx, membership.packageId);
+  if (pkg === undefined) {
+    throw new Error(`settleInvoiceCharge: credit package ${membership.packageId} not found`);
+  }
+  const billedPeriodEnd = nextMonthlyPeriodEnd(pgTimestampToDate(invoice.dueAt));
+  const expiresAt = billedPeriodEnd > now ? billedPeriodEnd : nextMonthlyPeriodEnd(now);
+  const dogIsAlumni = await dogProgramsRepository.isAlumni(membership.dogId, tx);
+  await creditLedgerRepository.creditPurchase(tx, {
+    dogId: membership.dogId,
+    mode: pkg.mode,
+    location: pkg.location,
+    delta: pkg.credits,
+    packageId: pkg.id,
+    chargeId,
+    expiresAt: dogIsAlumni ? null : expiresAt,
+    reason: 'membership-grant',
+  });
 }
 
 /** Whole-dollar-aware USD formatter for receipt copy. Stripe amounts are cents;

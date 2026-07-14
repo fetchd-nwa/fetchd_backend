@@ -31,6 +31,9 @@ import { redis } from '../redis.js';
  * | Group-class by key         | `groupclasses:byKey:{classKey}`          | catalog edit (Day 19 portal)     | (covered by `groupclasses:*` wipe above)                    |
  * | Group-class prereqs        | `groupclasses:prereqs:{classKey}`        | prereq-options edit (Day 19)     | (covered by `groupclasses:*` wipe above)                    |
  * | Availability range         | `avail:{location}:{from}:{to}`           | `day_capacity` write (Day 9+)    | `invalidatePattern('avail:{location}:*')` (single date hits many ranges) |
+ * | Credit-packages catalog    | `creditpackages:{location}:{today}`      | reprice (staff portal, ext repo) | daily key + 5-min TTL; portal should `invalidatePattern('creditpackages:{location}:*')` on reprice |
+ * | Credit balance (display)   | `credits:{dogId}:{ownerId}:balance:{loc}`| `credit_ledger` write            | `invalidatePattern('credits:{dogId}:*')` — purchase (sync+webhook), booking debit, cancel credit-refund, payment_failed reversal |
+ * | Credit expiring-lots       | `credits:{dogId}:lots:{location}`        | `credit_ledger` write            | (covered by the `credits:{dogId}:*` wipe above)             |
  *
  * Adding a new cached entity? Three rules: (1) every key has an entity
  * prefix; (2) every mutation that touches the underlying table updates

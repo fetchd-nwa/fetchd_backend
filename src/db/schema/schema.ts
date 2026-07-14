@@ -19,7 +19,7 @@ export type LocationKey = (typeof LOCATION_SLUGS)[number];
 export const mediaDerivativeJobStatus = pgEnum("media_derivative_job_status", ['pending', 'processing', 'done', 'failed'])
 export const mediaKind = pgEnum("media_kind", ['image', 'video'])
 export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avatar', 'report-photo', 'report-video', 'message-attachment'])
-export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded'])
+export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'alumni-attendance', 'membership-ended'])
 export const rateUnit = pgEnum("rate_unit", ['per-day', 'per-night', 'per-session', 'per-week', 'flat'])
 export const recordSource = pgEnum("record_source", ['app', 'gingr', 'seed'])
 export const refundStatus = pgEnum("refund_status", ['pending', 'succeeded', 'failed'])
@@ -54,6 +54,11 @@ export const owners = pgTable("owners", {
 	emergencyName: text("emergency_name"),
 	emergencyRelationship: text("emergency_relationship"),
 	emergencyPhone: text("emergency_phone"),
+	addressLine1: text("address_line1"),
+	addressLine2: text("address_line2"),
+	addressCity: text("address_city"),
+	addressState: text("address_state"),
+	addressZip: text("address_zip"),
 	pushNotificationsEnabled: boolean("push_notifications_enabled").default(true).notNull(),
 	pushNotificationCategories: jsonb("push_notification_categories").default({}).notNull(),
 	emailNotificationsEnabled: boolean("email_notifications_enabled").default(true).notNull(),
@@ -110,6 +115,9 @@ export const dogs = pgTable("dogs", {
 	evaluationStatus: evaluationStatus("evaluation_status").default('not-evaluated').notNull(),
 	evaluationDate: timestamp("evaluation_date", { withTimezone: true, mode: 'string' }),
 	boardingEnabled: boolean("boarding_enabled").default(false).notNull(),
+	// §J.3: set by the monthly alumni attendance scan (<2 qualifying sessions
+	// in the closed Chicago month); cleared by staff after the re-check.
+	alumniAttendanceFlaggedAt: timestamp("alumni_attendance_flagged_at", { withTimezone: true, mode: 'string' }),
 	fieldOverrides: jsonb("field_overrides").default({}).notNull(),
 	primaryVetId: uuid("primary_vet_id"),
 	capacityExempt: boolean("capacity_exempt").generatedAlwaysAs(sql`(staff_owner_id IS NOT NULL)`),
@@ -242,6 +250,32 @@ export const dogCompletedClasses = pgTable("dog_completed_classes", {
 			foreignColumns: [dogs.id],
 			name: "dog_completed_classes_dog_id_fkey"
 		}).onDelete("cascade"),
+	}
+});
+
+// §J.3 (2026-07-09): the "5 day-school courses" a dog completed — the 5
+// curriculum report_program values. Staff-authored; alumni = all 5 live rows.
+export const dogCompletedPrograms = pgTable("dog_completed_programs", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	dogId: uuid("dog_id").notNull(),
+	program: reportProgram().notNull(),
+	completedAt: timestamp("completed_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	completedByStaffId: uuid("completed_by_staff_id"),
+	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+}, (table) => {
+	return {
+		uidx: uniqueIndex("dog_completed_programs_uidx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.program.asc().nullsLast().op("enum_ops")).where(sql`(expired_at IS NULL)`),
+		dogCompletedProgramsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "dog_completed_programs_dog_id_fkey"
+		}).onDelete("cascade"),
+		dogCompletedProgramsStaffFkey: foreignKey({
+			columns: [table.completedByStaffId],
+			foreignColumns: [staff.id],
+			name: "dog_completed_programs_completed_by_staff_id_fkey"
+		}).onDelete("restrict"),
+		dogCompletedProgramsProgramCheck: check("dog_completed_programs_program_check", sql`program IN ('foundation', 'advanced', 'loose-leash', 'house-manners', 'cgc')`),
 	}
 });
 
@@ -843,6 +877,8 @@ export const invoices = pgTable("invoices", {
 	cohortId: uuid("cohort_id"),
 	dogId: uuid("dog_id"),
 	requestId: uuid("request_id"),
+	// §J.1: set on purpose='membership' rows — the subscription month billed.
+	membershipId: uuid("membership_id"),
 	paymentMethodId: uuid("payment_method_id").notNull(),
 	paidChargeId: uuid("paid_charge_id"),
 	issuedAt: timestamp("issued_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
@@ -881,6 +917,11 @@ export const invoices = pgTable("invoices", {
 			foreignColumns: [pendingRequests.id],
 			name: "invoices_request_id_fkey"
 		}).onDelete("set null"),
+		invoicesMembershipIdFkey: foreignKey({
+			columns: [table.membershipId],
+			foreignColumns: [memberships.id],
+			name: "invoices_membership_id_fkey"
+		}).onDelete("set null"),
 		invoicesPaymentMethodIdFkey: foreignKey({
 			columns: [table.paymentMethodId],
 			foreignColumns: [paymentMethods.id],
@@ -897,18 +938,29 @@ export const invoices = pgTable("invoices", {
 	}
 });
 
+// §J.1 ACTIVATED 2026-07-09: a membership is a credit-package subscription —
+// self-billed monthly via the invoice auto-charge lane (NOT Stripe Billing;
+// stripe_subscription_id stays NULL), hard-stopping at ends_at. See schema.sql.
 export const memberships = pgTable("memberships", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	ownerId: uuid("owner_id").notNull(),
 	dogId: uuid("dog_id"),
 	mode: bookingMode().notNull(),
+	packageId: uuid("package_id"),
+	termMonths: integer("term_months"),
+	paymentMethodId: uuid("payment_method_id"),
 	stripeSubscriptionId: text("stripe_subscription_id"),
 	status: text().default('active').notNull(),
 	startedAt: timestamp("started_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	currentPeriodStart: timestamp("current_period_start", { withTimezone: true, mode: 'string' }),
 	currentPeriodEnd: timestamp("current_period_end", { withTimezone: true, mode: 'string' }),
+	endsAt: timestamp("ends_at", { withTimezone: true, mode: 'string' }),
+	pausedAt: timestamp("paused_at", { withTimezone: true, mode: 'string' }),
+	pausedByStaffId: uuid("paused_by_staff_id"),
 }, (table) => {
 	return {
 		ownerIdx: index("memberships_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
+		activeRollIdx: index("memberships_active_roll_idx").using("btree", table.currentPeriodEnd.asc().nullsLast().op("timestamptz_ops")).where(sql`(status = 'active'::text)`),
 		membershipsOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
@@ -919,7 +971,23 @@ export const memberships = pgTable("memberships", {
 			foreignColumns: [dogs.id],
 			name: "memberships_dog_id_fkey"
 		}).onDelete("restrict"),
+		membershipsPackageIdFkey: foreignKey({
+			columns: [table.packageId],
+			foreignColumns: [creditPackages.id],
+			name: "memberships_package_id_fkey"
+		}).onDelete("restrict"),
+		membershipsPaymentMethodIdFkey: foreignKey({
+			columns: [table.paymentMethodId],
+			foreignColumns: [paymentMethods.id],
+			name: "memberships_payment_method_id_fkey"
+		}).onDelete("restrict"),
+		membershipsPausedByStaffIdFkey: foreignKey({
+			columns: [table.pausedByStaffId],
+			foreignColumns: [staff.id],
+			name: "memberships_paused_by_staff_id_fkey"
+		}).onDelete("restrict"),
 		membershipsStripeSubscriptionIdKey: unique("memberships_stripe_subscription_id_key").on(table.stripeSubscriptionId),
+		membershipsTermMonthsCheck: check("memberships_term_months_check", sql`term_months IN (3, 6, 9, 12)`),
 	}
 });
 

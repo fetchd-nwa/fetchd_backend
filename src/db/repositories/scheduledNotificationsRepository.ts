@@ -57,7 +57,11 @@ export type ScheduledNotificationType =
   // through the scheduled queue so it gets the PUSH channel: it's action-
   // required (the owner must fix their card). `payment-succeeded` (a receipt)
   // stays feed-only — emitted directly by `settleInvoiceCharge`, never here.
-  | 'payment-failed';
+  | 'payment-failed'
+  // §J.3 monthly attendance scan: an alumni dog attended <2 qualifying
+  // sessions in the just-closed Chicago month. Dedupe key doubles as the
+  // once-per-month-per-dog guard (`alumni-attendance:<dogId>:<YYYY-MM>`).
+  | 'alumni-attendance';
 
 export interface ScheduledNotificationRow {
   id: string;

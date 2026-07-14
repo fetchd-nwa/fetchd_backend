@@ -1,6 +1,7 @@
 import type { evaluationStatus, groupClassKey } from '../db/schema/schema.js';
 import type { AssembledDog } from '../db/repositories/dogsRepository.js';
 import { ageInMonths } from './ageMonths.js';
+import { CURRICULUM_PROGRAMS } from './alumni.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { toVetWire, type VetWire } from './vetWire.js';
 
@@ -62,13 +63,20 @@ export interface DogWire {
   special_notes: string;
   evaluation_status: EvaluationStatus;
   boarding_enabled: boolean;
+  /** §J.3: derived — the dog has all 5 live day-school curriculum completions. */
+  is_alumni: boolean;
   evaluation_date?: string;
   completed_class_keys?: GroupClassKey[];
   vet?: VetWire;
+  /** §J.3 attendance flag (omit-on-null): set when an alumni dog attended <2
+   * qualifying sessions in a Chicago month — staff re-check before the next
+   * booking. Soft surface only in v1 (no booking 422). */
+  alumni_attendance_flagged_at?: string;
 }
 
 export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
-  const { dog, vet, vaccines, medications, feeding, completedClasses } = assembled;
+  const { dog, vet, vaccines, medications, feeding, completedClasses, completedPrograms } =
+    assembled;
 
   const wire: DogWire = {
     id: dog.id,
@@ -86,9 +94,13 @@ export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
     special_notes: dog.specialNotes,
     evaluation_status: dog.evaluationStatus,
     boarding_enabled: dog.boardingEnabled,
+    is_alumni: completedPrograms.length === CURRICULUM_PROGRAMS.length,
   };
 
   if (dog.evaluationDate !== null) wire.evaluation_date = pgTimestampToIso(dog.evaluationDate);
+  if (dog.alumniAttendanceFlaggedAt !== null) {
+    wire.alumni_attendance_flagged_at = pgTimestampToIso(dog.alumniAttendanceFlaggedAt);
+  }
 
   const completedKeys = completedClasses.map((c) => c.classKey);
   if (completedKeys.length > 0) wire.completed_class_keys = completedKeys;

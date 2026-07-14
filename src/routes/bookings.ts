@@ -6,6 +6,7 @@ import { withCapacityLocks, withDogModeLocks } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
@@ -15,6 +16,7 @@ import { serviceRatesRepository } from '../db/repositories/serviceRatesRepositor
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import type { Tx } from '../db/tx.js';
 import { isInView } from '../lib/bookingBucket.js';
+import { dayProgramConflictsWith } from '../lib/bookingConflicts.js';
 import {
   alreadyBookedError,
   insufficientCreditsError,
@@ -24,11 +26,7 @@ import {
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
-import {
-  bucketChicagoToday,
-  bucketToChicagoDate,
-  isValidCalendarDate,
-} from '../lib/chicagoDate.js';
+import { bucketChicagoToday, isValidCalendarDate } from '../lib/chicagoDate.js';
 import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
 import {
   DEFAULT_DROPOFF_TIME,
@@ -320,13 +318,22 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       const body = parseOrThrow(postBookingBodySchema, request.body, 'body');
       const parsed = validateBookingBody(body, nowFactory());
 
+      // Closure-captured (same pattern as the cancel route's
+      // `pendingStripeRefund`): the credits branch debits every dog, PAYG
+      // debits none. `patternsToInvalidate` reads this post-commit to wipe
+      // only the dogs whose balance actually moved.
+      const creditDebitedDogIds = new Set<string>();
+
       const outcome = await withMutation<BookingWire[]>(
         {
           principal,
           idempotencyKey,
           endpoint: 'POST /bookings',
           requestHash: hashRequestBody(body),
-          patternsToInvalidate: () => [`avail:${parsed.location}:*`],
+          patternsToInvalidate: () => [
+            `avail:${parsed.location}:*`,
+            ...[...creditDebitedDogIds].map(creditsInvalidationPattern),
+          ],
         },
         async (tx) => {
           // 1. Ownership gate — every dog must belong to the principal.
@@ -384,26 +391,35 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                   if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
                 }
 
-                // Duplicate guard (Day-19d) — block re-booking a day the dog
-                // already attends in this category. Cancelled bookings are
-                // excluded, so a cancelled day can be re-booked. Checked under
-                // the day-mode lock, so a concurrent insert can't slip a
-                // duplicate past this.
-                const dupConflicts: AlreadyBookedConflict[] = [];
+                // Time-overlap guard (booking-overlap) — the authoritative
+                // backstop for the FE conflict engine. Rejects a new day program
+                // that collides with a live session the dog already has: another
+                // day program that day (school + care included), a private /
+                // evaluation whose slot falls inside the day-program window
+                // (a 3:30pm private conflicts, a 6pm private does not), or a
+                // residential stay covering that day (a boarding dog can't also
+                // attend day school). Group classes never conflict. The exact
+                // rules live in `lib/bookingConflicts` (mirrors
+                // `mobile/src/lib/bookingConflicts.ts`, Δ 2026-07-09). Cancelled
+                // rows are excluded (a cancelled day can be re-booked). Runs
+                // under the (location, date) capacity lock, so a concurrent
+                // create on the same bucket can't slip an overlap past this.
+                const conflicts: AlreadyBookedConflict[] = [];
                 for (const dogId of parsed.allDogIds) {
-                  const existing = await bookingsRepository.findLiveScheduledAtForDogCategory(
+                  const candidates = await bookingsRepository.findConflictCandidatesForDog(
                     tx,
                     dogId,
-                    parsed.category,
+                    parsed.sortedDates,
                   );
-                  const bookedDays = new Set(existing.map(bucketToChicagoDate));
                   for (const date of parsed.sortedDates) {
-                    if (bookedDays.has(date)) {
-                      dupConflicts.push({ dog_id: dogId, category: parsed.category, date });
+                    for (const candidate of candidates) {
+                      if (dayProgramConflictsWith(date, candidate)) {
+                        conflicts.push({ dog_id: dogId, category: candidate.category, date });
+                      }
                     }
                   }
                 }
-                if (dupConflicts.length > 0) throw alreadyBookedError(dupConflicts);
+                if (conflicts.length > 0) throw alreadyBookedError(conflicts);
 
                 // Per-date: capacity → INSERT booking + booking_dogs → money
                 // write (PAYG invoice schedule, or credit-ledger debits).
@@ -479,6 +495,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
                         location: parsed.location,
                         bookingId: inserted.id,
                       });
+                      creditDebitedDogIds.add(dogId);
                     }
                   }
 
@@ -568,6 +585,9 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       let pendingStripeRefund:
         | { refundId: string; paymentIntentId: string; amountCents: number }
         | undefined;
+      // Dogs credited back on this cancel (empty on every non-credit-back
+      // path); post-commit we wipe each dog's `credits:{dogId}:*` display cache.
+      let creditRefundedDogIds: string[] = [];
 
       const outcome = await withMutation<BookingWire>(
         {
@@ -577,11 +597,18 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           requestHash: hashRequestBody({ id }),
           // Day-13 cache invalidation: drop the per-location availability
           // range cache so the freed seat surfaces in the next /availability
-          // read. Booking reads themselves aren't cached today.
-          patternsToInvalidate: (body) =>
-            body.location !== undefined && body.location !== null
-              ? [`avail:${body.location}:*`]
-              : [],
+          // read, plus each credited-back dog's balance cache. Booking reads
+          // themselves aren't cached today.
+          patternsToInvalidate: (body) => {
+            const patterns: string[] = [];
+            if (body.location !== undefined && body.location !== null) {
+              patterns.push(`avail:${body.location}:*`);
+            }
+            for (const dogId of creditRefundedDogIds) {
+              patterns.push(creditsInvalidationPattern(dogId));
+            }
+            return patterns;
+          },
           // Day-14: post-commit Stripe refund. Fires only on new (non-
           // replayed) money-back branches via the closure-captured handle
           // (the response body — a BookingWire — doesn't carry refund
@@ -624,6 +651,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             requireOwnerId: principal.ownerId,
           });
           pendingStripeRefund = result.pendingStripeRefund;
+          creditRefundedDogIds = result.creditRefundedDogIds;
           return { status: 200, body: result.wire };
         },
       );

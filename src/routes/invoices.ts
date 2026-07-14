@@ -160,7 +160,16 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           idempotencyKey,
           endpoint: 'POST /invoices/:id/pay',
           requestHash,
-          // cache-noop — invoices aren't cached today.
+          // Invoices aren't cached, but a §J.1 MEMBERSHIP settle grants a
+          // credit lot inside `settleInvoiceCharge` — the per-dog credit
+          // cache is stale the moment that lands (§3 map: credit_ledger
+          // write → credits:{dogId}:* wipe).
+          patternsToInvalidate: (body) =>
+            body.invoice_status === 'paid' &&
+            invoiceRow.purpose === 'membership' &&
+            invoiceRow.dogId !== null
+              ? [`credits:${invoiceRow.dogId}:*`]
+              : [],
           // Post-commit Stripe refund for a lost-race duplicate charge. Fires
           // once per non-replayed outcome; failure is logged + swallowed by the
           // withMutation seam (the 'pending' refund row is the commitment, the

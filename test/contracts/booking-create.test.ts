@@ -14,6 +14,7 @@ import {
   pendingRequests,
 } from '../../src/db/schema/schema.js';
 import { redis } from '../../src/redis.js';
+import { chicagoWallTimeToUtc } from '../../src/lib/chicagoDate.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
 import {
@@ -169,7 +170,10 @@ test(
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
     const { app } = bookingApp();
-    const date = futureDate(7);
+    // futureDate(41)=06-29, a weekday no other test books dog1 into and clear of
+    // every fixture session — the time-overlap guard rejects a day program that
+    // shares a day (in time) with any existing timed session for the dog.
+    const date = futureDate(41);
     const res = await postBooking({
       app,
       idempotencyKey: `bk-1-${randomUUID()}`,
@@ -300,6 +304,160 @@ test(
   },
 );
 
+// ──────────────────────────────────────────────────────────────────────────
+// Time-overlap guard (booking-overlap) — cross-category conflicts by TIME,
+// not merely same-day; residential stays excluded (a boarding dog attends
+// day school).
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /bookings — day program overlapping an existing timed session (cross-category) → 422 already_booked naming the existing session',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
+    const { app } = bookingApp();
+    // Fixture booking3 is a live private lesson for dog1 on 05-26. A day
+    // school there occupies 07:30–17:30, so it overlaps that session in TIME
+    // even though it's a different category — the guard must reject it.
+    const date = futureDate(7); // 2026-05-26 (weekday)
+    const res = await postBooking({
+      app,
+      idempotencyKey: `bk-overlap-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json() as {
+      error: {
+        code: string;
+        details: { conflicts: Array<{ dog_id: string; category: string; date: string }> };
+      };
+    };
+    assert.equal(body.error.code, 'already_booked');
+    assert.deepEqual(body.error.details.conflicts, [
+      { dog_id: FIXTURE_IDS.dog1Id, category: 'private-lesson', date },
+    ]);
+  },
+);
+
+test(
+  'POST /bookings — day school DURING an existing boarding stay → 422 (residential conflicts)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
+    const { app } = bookingApp();
+    // Fixture booking4 boards dog1 06-15 → 06-20. A day school inside the stay
+    // conflicts — a boarding dog is on-site all day, so it can't also attend
+    // day school (locked rule 2026-07-09, mirrors the FE engine).
+    const date = futureDate(31); // 2026-06-19 (Fri, inside the boarding stay)
+    const res = await postBooking({
+      app,
+      idempotencyKey: `bk-board-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    const body = res.json() as {
+      error: { code: string; details: { conflicts: Array<{ category: string; date: string }> } };
+    };
+    assert.equal(body.error.code, 'already_booked');
+    assert.deepEqual(body.error.details.conflicts, [
+      { dog_id: FIXTURE_IDS.dog1Id, category: 'boarding', date },
+    ]);
+  },
+);
+
+test(
+  'POST /bookings — day care on a day the dog already has day school → 422 (day programs conflict)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'daycare', 5);
+    const { app } = bookingApp();
+    const date = futureDate(44); // 2026-07-02 (Thu), clear of fixtures + other tests
+    const school = await postBooking({
+      app,
+      idempotencyKey: `bk-sc-1-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(school.statusCode, 201, school.body);
+
+    // Day care the same day — both day programs occupy 07:00–17:00, so the dog
+    // can't be in both (day-school ↔ day-care conflict).
+    const care = await postBooking({
+      app,
+      idempotencyKey: `bk-sc-2-${randomUUID()}`,
+      payload: {
+        category: 'day-care',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(care.statusCode, 422, care.body);
+    const body = care.json() as {
+      error: { code: string; details: { conflicts: Array<{ category: string; date: string }> } };
+    };
+    assert.equal(body.error.code, 'already_booked');
+    assert.deepEqual(body.error.details.conflicts, [
+      { dog_id: FIXTURE_IDS.dog1Id, category: 'day-school', date },
+    ]);
+  },
+);
+
+test(
+  'POST /bookings — a private lesson OUTSIDE the day-program window (6pm) does NOT conflict',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
+    const { app } = bookingApp();
+    const date = futureDate(34); // 2026-06-22 (Mon), clear of fixtures
+    // Seed a 6pm private for dog1 (no owner route creates privates). Its
+    // window [18:00, 19:00] is after the day-program pick-up close (17:30),
+    // so a day school that day overlaps in the SAME DAY but not in TIME.
+    const privateId = randomUUID();
+    await db.insert(bookingsTable).values({
+      id: privateId,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: FIXTURE_IDS.dog1Id,
+      category: 'private-lesson',
+      status: 'upcoming',
+      scheduledAt: chicagoWallTimeToUtc(date, 18, 0).toISOString(),
+      durationMinutes: 60,
+      trainerStaffId: FIXTURE_IDS.staffRachelId,
+      location: null,
+    });
+    await db
+      .insert(bookingDogsTable)
+      .values({ bookingId: privateId, dogId: FIXTURE_IDS.dog1Id, isLead: true });
+
+    const res = await postBooking({
+      app,
+      idempotencyKey: `bk-6pm-ok-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        dates: [date],
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+  },
+);
+
 test(
   'POST /bookings — multi-dog day-care → additional_dog_ids + 2 debits per booking',
   SKIP_WHEN_NO_DB,
@@ -339,9 +497,10 @@ test(
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
     const { app } = bookingApp();
-    // Three consecutive weekdays — futureWeekday skips Sat/Sun, so capacity
-    // defaults to 3/3 on each.
-    const dates = [futureWeekday(5), futureWeekday(6), futureWeekday(7)];
+    // Three weekdays (Mon–Wed, 3/3 capacity) well clear of every fixture
+    // session + other tests' dog1 bookings — the time-overlap guard rejects a
+    // day program that shares a day with any existing session for the dog.
+    const dates = [futureDate(48), futureDate(49), futureDate(50)];
     const res = await postBooking({
       app,
       idempotencyKey: `bk-multidate-${randomUUID()}`,
@@ -829,7 +988,9 @@ test(
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     const { app } = bookingApp();
-    const date = futureWeekday(18);
+    // futureWeekday(18)=06-15 fell inside the fixture boarding stay (06-15→20),
+    // which now conflicts; use a clean weekday clear of every fixture session.
+    const date = futureDate(55);
     const key = `bk-idemp-${randomUUID()}`;
     const payload = {
       category: 'day-school',
