@@ -248,6 +248,48 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
 });
 
 test(
+  'POST /requests — private-lesson lesson_setting round-trips on the wire (Δ 2026-07-14)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearOpenRequestsForDogs([FIXTURE_IDS.dog1Id]);
+    const { app } = requestsApp();
+    const res = await postRequest({
+      app,
+      idempotencyKey: `pr-pl-setting-${randomUUID()}`,
+      payload: {
+        category: 'private-lesson',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: [PREFERRED_1, PREFERRED_2, PREFERRED_3],
+        lesson_setting: 'home',
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as { lesson_setting?: string };
+    assert.equal(body.lesson_setting, 'home');
+  },
+);
+
+test(
+  'POST /requests — lesson_setting on a non-private category → 422 (private-lesson-only field)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearOpenRequestsForDogs([FIXTURE_IDS.dog1Id]);
+    const { app } = requestsApp();
+    const res = await postRequest({
+      app,
+      idempotencyKey: `pr-boarding-setting-${randomUUID()}`,
+      payload: {
+        category: 'boarding',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: [PREFERRED_1],
+        lesson_setting: 'public',
+      },
+    });
+    assert.equal(res.statusCode, 422, res.body);
+  },
+);
+
+test(
   'POST /requests — private-lesson requests STACK; residential stays are one-at-a-time (Day-19d guard, scoped Δ 2026-07-09)',
   SKIP_WHEN_NO_DB,
   async () => {

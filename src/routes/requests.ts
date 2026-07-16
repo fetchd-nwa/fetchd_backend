@@ -134,6 +134,8 @@ const postRequestBodySchema = z
     notes: notesBodySchema.optional(),
     focus: focusBodySchema.optional(),
     length_weeks: z.number().int().min(1).max(MAX_LENGTH_WEEKS).optional(),
+    // Δ 2026-07-14: private-lesson only — where the lesson happens.
+    lesson_setting: z.enum(['home', 'public']).optional(),
   })
   .strict();
 
@@ -145,6 +147,7 @@ const patchRequestBodySchema = z
     notes: notesBodySchema.nullable().optional(),
     focus: focusBodySchema.nullable().optional(),
     length_weeks: z.number().int().min(1).max(MAX_LENGTH_WEEKS).nullable().optional(),
+    lesson_setting: z.enum(['home', 'public']).nullable().optional(),
     // Identity fields explicitly accepted in the schema so Zod's strict
     // mode doesn't catch them with "unrecognized key" before the
     // validator can map them to a clearer 422. The post-parse check
@@ -322,6 +325,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
             staffPreference: parsed.staffPreference,
             descriptorKeys: parsed.descriptorKeys,
             lengthWeeks: parsed.lengthWeeks,
+            lessonSetting: parsed.lessonSetting,
           });
 
           // 4. INSERT join rows.
@@ -399,12 +403,22 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
           //    dates. UPDATE before the preferred-dates replace so the
           //    pending_requests audit row captures the prior scalar
           //    state alongside the date-replacement audit rows.
+          // lesson_setting stays private-lesson-only on edit too (the POST
+          // guard's PATCH twin — checked against the loaded row's category).
+          if (parsed.lessonSetting !== undefined && row.category !== 'private-lesson') {
+            throw new ApiError(
+              'invalid_payload',
+              `lesson_setting is only valid for private-lesson requests, not ${row.category}`,
+            );
+          }
+
           await requestsRepository.update(tx, id, {
             notesPerDog: parsed.notesPerDog,
             notesJoint: parsed.notesJoint,
             staffPreference: parsed.staffPreference,
             descriptorKeys: parsed.descriptorKeys,
             lengthWeeks: parsed.lengthWeeks,
+            lessonSetting: parsed.lessonSetting,
           });
           if (parsed.preferredDates !== undefined) {
             await requestsRepository.replacePreferredDates(tx, id, parsed.preferredDates);
@@ -538,6 +552,7 @@ interface ValidatedPostRequestBody {
   staffPreference: string | null;
   descriptorKeys: string[];
   lengthWeeks: number | null;
+  lessonSetting: 'home' | 'public' | null;
 }
 
 /**
@@ -585,6 +600,15 @@ function validatePostRequestBody(body: PostRequestBody, now: Date): ValidatedPos
     );
   }
 
+  // Δ 2026-07-14: lesson_setting is private-lesson-only (mirrors the
+  // length_weeks per-category guard above).
+  if (body.lesson_setting !== undefined && body.category !== 'private-lesson') {
+    throw new ApiError(
+      'invalid_payload',
+      `lesson_setting is only valid for private-lesson requests, not ${body.category}`,
+    );
+  }
+
   assertPreferredDatesWithinWindow(body.preferred_dates, now);
 
   return {
@@ -598,6 +622,7 @@ function validatePostRequestBody(body: PostRequestBody, now: Date): ValidatedPos
     staffPreference: normalizeNullableString(body.focus?.staff_preference),
     descriptorKeys: body.focus?.descriptor_keys ?? [],
     lengthWeeks: body.length_weeks ?? null,
+    lessonSetting: body.lesson_setting ?? null,
   };
 }
 
@@ -608,6 +633,7 @@ interface ValidatedPatchRequestBody {
   // text[] is NOT NULL, so "clear" = []; undefined = leave unchanged (no null state).
   descriptorKeys: string[] | undefined;
   lengthWeeks: number | null | undefined;
+  lessonSetting: 'home' | 'public' | null | undefined;
   preferredDates: string[] | undefined;
 }
 
@@ -638,6 +664,7 @@ function validatePatchRequestBody(body: PatchRequestBody, now: Date): ValidatedP
     staffPreference: extractPatchScalar(body.focus, 'staff_preference'),
     descriptorKeys: extractPatchDescriptorKeys(body.focus),
     lengthWeeks: body.length_weeks === undefined ? undefined : (body.length_weeks ?? null),
+    lessonSetting: body.lesson_setting,
     preferredDates: body.preferred_dates,
   };
 }

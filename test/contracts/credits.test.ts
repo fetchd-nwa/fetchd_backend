@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { eq } from 'drizzle-orm';
+import { db } from '../../src/db/client.js';
+import { creditExpirySettings } from '../../src/db/schema/schema.js';
+import { creditExpirySettingsRepository } from '../../src/db/repositories/creditExpirySettingsRepository.js';
+import { withActor } from '../../src/db/tx.js';
 import { registerCreditsRoute } from '../../src/routes/credits.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -127,5 +132,36 @@ test(
     assert.equal(res.statusCode, 400);
     const body = res.json() as { error?: { code?: string } };
     assert.equal(body.error?.code, 'bad_request');
+  },
+);
+
+test(
+  'GET /dogs/:id/credits carries the staff-tuned warning lead for its location (Δ 2026-07-16)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditsRoute(app, { authenticate });
+
+    await withActor('system:scheduler', (tx) =>
+      creditExpirySettingsRepository.upsert(tx, {
+        location: 'fayetteville',
+        expiryWindowMonths: 12,
+        warningLeadDays: 14,
+        staffId: FIXTURE_IDS.staffDonavanId,
+      }),
+    );
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/dogs/${FIXTURE_IDS.dog1Id}/credits?location=fayetteville`,
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      const body = res.json() as { warning_lead_days: number };
+      assert.equal(body.warning_lead_days, 14, 'per-location override rides the credits wire');
+    } finally {
+      await db
+        .delete(creditExpirySettings)
+        .where(eq(creditExpirySettings.location, 'fayetteville'));
+    }
   },
 );

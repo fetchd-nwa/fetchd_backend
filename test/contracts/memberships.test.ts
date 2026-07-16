@@ -352,12 +352,17 @@ test(
     const created = await postMembership(app); // term 3 ⇒ month-1 sync + 2 rolled invoices
     const membershipId = created.membership.id;
 
-    // Simulate months 2 and 3 already billed.
+    // Simulate months 2 and 3 already billed AND settled. `status: 'paid'`
+    // matters since the roll-while-parked ruling (2026-07-16): an OPEN
+    // invoice now freezes the roll entirely (see membership-roll-parked
+    // tests), so only settled months exercise the pure count-based stop.
     await db.insert(invoices).values(
       [1, 2].map(() => ({
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 1000,
         purpose: 'membership' as const,
+        status: 'paid' as const,
+        paidAt: '2026-07-19T17:00:00Z', // DDL: paid implies paid_at
         paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
         dueAt: '2026-07-19T17:00:00Z',
         membershipId,

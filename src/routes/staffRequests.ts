@@ -280,6 +280,9 @@ export function registerStaffRequestsRoute(
               notes: parsed.notes,
               cancelDeadlineAt,
               additionalDogIds: allDogIds.additionalDogIds,
+              // Δ 2026-07-14: the private lesson's home/public setting rides
+              // the conversion so the owner's bookings card can label it.
+              lessonSetting: row.lessonSetting,
             });
 
             // Boarding carries a real pick-up timestamp; PL does not.

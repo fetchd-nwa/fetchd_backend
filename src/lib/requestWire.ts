@@ -48,6 +48,7 @@ export interface PendingRequestRowForWire {
   staffPreference: string | null;
   descriptorKeys: string[];
   lengthWeeks: number | null;
+  lessonSetting: 'home' | 'public' | null;
   approvedAt: string | null;
   convertedBookingId: string | null;
   // Day-program divert columns (Shanthi 2026-07-14); NULL/empty on the
@@ -102,6 +103,7 @@ export function toRequestWire(
   const notes = buildNotes(row);
   if (notes !== undefined) wire.notes = notes;
   if (row.lengthWeeks !== null) wire.length_weeks = row.lengthWeeks;
+  if (row.lessonSetting !== null) wire.lesson_setting = row.lessonSetting;
   if (row.approvedAt !== null) wire.approved_at = pgTimestampToIso(row.approvedAt);
   if (row.convertedBookingId !== null) wire.converted_booking_id = row.convertedBookingId;
   // Day-program divert fields — omit-on-null keeps every classic request's

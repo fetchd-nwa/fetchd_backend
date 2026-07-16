@@ -37,6 +37,7 @@ export interface BookingRow {
   notes: string | null;
   sessionReportId: string | null;
   location: LocationKey | null;
+  lessonSetting: 'home' | 'public' | null;
   cancelledAt: string | null;
   cancelForfeited: boolean;
   cancelDeadlineAt: string | null;
@@ -78,6 +79,7 @@ const BOOKING_PROJECTION = {
   notes: bookings.notes,
   sessionReportId: bookings.sessionReportId,
   location: bookings.location,
+  lessonSetting: bookings.lessonSetting,
   cancelledAt: bookings.cancelledAt,
   cancelForfeited: bookings.cancelForfeited,
   cancelDeadlineAt: bookings.cancelDeadlineAt,
@@ -401,6 +403,8 @@ export const bookingsRepository = {
       additionalDogIds: readonly string[];
       cohortId?: string | null;
       sessionReportId?: string | null;
+      // Δ 2026-07-14: private-lesson only — copied from the request at approve.
+      lessonSetting?: 'home' | 'public' | null;
     },
   ): Promise<BookingRow> {
     const [bookingRow] = await tx
@@ -415,6 +419,7 @@ export const bookingsRepository = {
         cancelDeadlineAt: values.cancelDeadlineAt.toISOString(),
         cohortId: values.cohortId ?? null,
         sessionReportId: values.sessionReportId ?? null,
+        lessonSetting: values.lessonSetting ?? null,
         // status defaults to 'upcoming' (schema), durationMinutes/trainer*/
         // report_id/confirmed*/dropoff*/pickup*/cancelled*/source all
         // remain at their schema defaults (NULL / 'app' / false).

@@ -74,6 +74,7 @@ const PENDING_REQUEST_PROJECTION = {
   staffPreference: pendingRequests.staffPreference,
   descriptorKeys: pendingRequests.descriptorKeys,
   lengthWeeks: pendingRequests.lengthWeeks,
+  lessonSetting: pendingRequests.lessonSetting,
   approvedAt: pendingRequests.approvedAt,
   convertedBookingId: pendingRequests.convertedBookingId,
   // Day-program divert columns (Shanthi 2026-07-14).
@@ -297,6 +298,8 @@ export const requestsRepository = {
       staffPreference: string | null;
       descriptorKeys: string[];
       lengthWeeks: number | null;
+      // Δ 2026-07-14: private-lesson only — where the lesson happens.
+      lessonSetting?: 'home' | 'public' | null;
       // Day-program divert fields (Shanthi 2026-07-14) — omitted by the
       // classic POST /requests categories.
       location?: 'fayetteville' | 'bentonville';
@@ -316,6 +319,7 @@ export const requestsRepository = {
         staffPreference: values.staffPreference,
         descriptorKeys: values.descriptorKeys,
         lengthWeeks: values.lengthWeeks,
+        lessonSetting: values.lessonSetting ?? null,
         location: values.location ?? null,
         payment: values.payment ?? null,
         paymentMethodId: values.paymentMethodId ?? null,
@@ -383,6 +387,7 @@ export const requestsRepository = {
       staffPreference?: string | null;
       descriptorKeys?: string[];
       lengthWeeks?: number | null;
+      lessonSetting?: 'home' | 'public' | null;
     },
   ): Promise<void> {
     // Drop undefined keys so they don't appear in the SET clause as

@@ -41,10 +41,9 @@ export interface LiveExpiringLot {
  * Live expiring lots for a (dog, location[, mode]), soonest-expiry first, with
  * `remaining` = the lot's grant plus every allocation (debit−/refund+) tagged
  * to it. Excludes expired lots, never-expiring (pool) lots, and exhausted lots
- * (remaining ≤ 0). The single source for both FIFO debit selection
- * (`debitForBooking` takes the first row) and the public `GET /credits`
- * expiring-lots read (`creditsRepository.findExpiringLots`) — so the
- * "live expiring lot with capacity" predicate lives in exactly one place.
+ * (remaining ≤ 0). Feeds the public `GET /credits` expiring-lots read
+ * (`creditsRepository.findExpiringLots`) and the expiry-warning scan; debit
+ * selection has its own priority order — see `findNextDebitLot`.
  *
  * Polymorphic runner: pass the booking Tx to see in-tx debits under the
  * (dog,mode,location) advisory lock (so a multi-debit loop walks the lots
@@ -79,6 +78,53 @@ export async function findLiveExpiringLots(
   // so the row shape is known. (The `Tx | db` union widens `.rows` to
   // Record<string, unknown>, so the cast routes through `unknown`.)
   return result.rows as unknown as LiveExpiringLot[];
+}
+
+/**
+ * The lot the NEXT booking debit should draw from — subscription credits
+ * first (RULED 2026-07-14, Allison: "use subscription credits first before
+ * normal credits"), then everything else soonest-expiry first, never-expiring
+ * purchase lots last (the untagged pool). Priority:
+ *
+ *   1. `membership-grant` lots, soonest-expiry first; an alumni membership
+ *      lot (expires_at NULL) sorts after that dog's expiring membership lots
+ *      but still ahead of every non-membership lot,
+ *   2. other live expiring lots, soonest-expiry first (unchanged FIFO),
+ *   3. no row → the never-expiring pool (caller tags the debit lot_id NULL).
+ *
+ * `created_at ASC` breaks expiry ties deterministically. Caller must hold
+ * `withDogModeLock` (same contract as `debitForBooking`).
+ */
+async function findNextDebitLot(
+  tx: Tx,
+  args: { dogId: string; location: LocationKey; mode: BookingMode },
+): Promise<{ id: string } | undefined> {
+  const result = await tx.execute(sql`
+    SELECT lot.id
+    FROM credit_ledger lot
+    LEFT JOIN (
+      SELECT lot_id, SUM(delta) AS alloc
+      FROM credit_ledger
+      WHERE lot_id IS NOT NULL
+      GROUP BY lot_id
+    ) a ON a.lot_id = lot.id
+    WHERE lot.dog_id = ${args.dogId}
+      AND lot.location = ${args.location}
+      AND lot.mode = ${args.mode}
+      AND lot.delta > 0
+      AND lot.lot_id IS NULL
+      AND (
+        (lot.expires_at IS NOT NULL AND lot.expires_at > now())
+        OR (lot.expires_at IS NULL AND lot.reason = 'membership-grant')
+      )
+      AND (lot.delta + COALESCE(a.alloc, 0)) > 0
+    ORDER BY (lot.reason = 'membership-grant') DESC,
+             lot.expires_at ASC NULLS LAST,
+             lot.created_at ASC
+    LIMIT 1
+  `);
+  // Raw SQL boundary: the SELECT projects exactly { id }.
+  return (result.rows as unknown as { id: string }[])[0];
 }
 
 /** A live, non-exhausted expiring lot that is WITHIN its location's warning
@@ -154,8 +200,8 @@ export async function findExpiringLotsForWarning(
 export const creditLedgerRepository = {
   /**
    * INSERT one booking-debit row (delta = -1) inside the open tx, tagged with
-   * the FIFO source lot (or NULL for the never-expiring pool). Caller must hold
-   * `withDogModeLock(tx, dogId, mode, location)` first — without it, two
+   * the priority source lot (or NULL for the never-expiring pool). Caller must
+   * hold `withDogModeLock(tx, dogId, mode, location)` first — without it, two
    * concurrent bookSession txns could each pass the pre-check against a
    * snapshot that hadn't seen the other's debit, or pick the same lot twice.
    *
@@ -171,9 +217,9 @@ export const creditLedgerRepository = {
       bookingId: string;
     },
   ): Promise<void> {
-    // FIFO: tag the soonest-expiry live lot with capacity; null = the
-    // never-expiring pool (no live expiring lot has room).
-    const [lot] = await findLiveExpiringLots(tx, {
+    // Subscription credits first, then soonest-expiry, pool last — see
+    // findNextDebitLot for the full priority order.
+    const lot = await findNextDebitLot(tx, {
       dogId: args.dogId,
       location: args.location,
       mode: args.mode,

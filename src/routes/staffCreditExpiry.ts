@@ -25,9 +25,11 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  * (non-retroactive — already-stamped lots keep their expires_at). A POST
  * changes FUTURE grants only.
  *
- * `warning_lead_days` is staff-tunable here today but has NO consumer in
- * Phase 2; its reader is the Phase-3 expiry-warning notification. The field is
- * stored now so P3 needs no second migration.
+ * `warning_lead_days` has two consumers: the credits-expiring push scan
+ * (`enqueueCreditExpiryWarnings`, Phase 3) and — Δ 2026-07-16 — the owner
+ * app's "expiring soon" chip, which reads the resolved per-location value
+ * off `GET /dogs/:id/credits` (`warning_lead_days`), so both warning
+ * surfaces move together when staff tune this.
  *
  * Wire shape per row:
  *   { location, expiry_window_months, warning_lead_days, updated_at,

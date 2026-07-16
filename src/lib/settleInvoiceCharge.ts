@@ -177,6 +177,16 @@ export async function settleInvoiceCharge(
  * is what makes the "X days left to use X credits" reminder ride the
  * existing credits-expiring scan.
  *
+ * The late settle ALSO re-aligns the membership clock (roll-while-parked
+ * ruling, 2026-07-16): while this invoice sat open the roll skipped the
+ * membership (`lockDueForRoll`'s open-invoice predicate), so
+ * `current_period_end` froze in the past. `alignPeriodAfterLateSettle` moves
+ * the current period onto the freshly-granted month so the next roll bills
+ * when THIS month is used up — never a catch-up cascade over the parked gap.
+ * The verb self-filters to active + un-paused rows; a completed/canceled
+ * clock stays frozen (the grant still lands — the owner paid) and a
+ * staff-paused one is `resume`'s gap-shift to move.
+ *
  * The loads throw on missing rows rather than skip: a membership invoice
  * whose membership/package can't be resolved is corrupt state, and silently
  * settling it would take the owner's money without granting credits. The
@@ -200,7 +210,8 @@ async function grantMembershipMonth(
     throw new Error(`settleInvoiceCharge: credit package ${membership.packageId} not found`);
   }
   const billedPeriodEnd = nextMonthlyPeriodEnd(pgTimestampToDate(invoice.dueAt));
-  const expiresAt = billedPeriodEnd > now ? billedPeriodEnd : nextMonthlyPeriodEnd(now);
+  const isLateSettle = billedPeriodEnd <= now;
+  const expiresAt = isLateSettle ? nextMonthlyPeriodEnd(now) : billedPeriodEnd;
   const dogIsAlumni = await dogProgramsRepository.isAlumni(membership.dogId, tx);
   await creditLedgerRepository.creditPurchase(tx, {
     dogId: membership.dogId,
@@ -212,6 +223,13 @@ async function grantMembershipMonth(
     expiresAt: dogIsAlumni ? null : expiresAt,
     reason: 'membership-grant',
   });
+  if (isLateSettle) {
+    await membershipsRepository.alignPeriodAfterLateSettle(tx, {
+      id: membership.id,
+      periodStart: now,
+      periodEnd: nextMonthlyPeriodEnd(now),
+    });
+  }
 }
 
 /** Whole-dollar-aware USD formatter for receipt copy. Stripe amounts are cents;

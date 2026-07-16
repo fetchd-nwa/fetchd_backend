@@ -14,6 +14,8 @@ import {
   membershipsRepository,
   type MembershipRow,
 } from '../db/repositories/membershipsRepository.js';
+import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import { withMembershipCreateLock } from '../db/locks.js';
 import { LOCATION_SLUGS, type LocationKey } from '../db/schema/schema.js';
 import type { BookingMode } from '../lib/bookingMode.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
@@ -21,6 +23,7 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { ApiError } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { firstPeriod, membershipEndsAt } from '../lib/membershipBilling.js';
+import type { PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
@@ -49,6 +52,15 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *
  * Pause is staff-mediated only (§J.1) — no owner pause verb here; the FE
  * carries "reach out to staff to pause".
+ *
+ * Uniqueness (ruled 2026-07-16): one ACTIVE membership per (dog, mode) —
+ * day-school + daycare may coexist on a dog; two of the same mode may not.
+ * Enforced in three layers: a pre-Stripe probe (friendly 409 before money
+ * moves), an in-tx re-check under `withMembershipCreateLock` (a concurrent
+ * subscribe that slipped past both pre-checks during the Stripe round-trip
+ * gets its duplicate charge refunded, settle-lost-race style, and receives
+ * the winner's membership with `charge_refunded: true`), and the partial
+ * unique index `memberships_one_active_per_dog_mode` as the constraint floor.
  */
 
 export interface MembershipWire {
@@ -76,6 +88,15 @@ export interface MembershipCreateWire {
   charge_status: 'succeeded';
   stripe_payment_intent_id: string;
   credits_granted: number;
+  /**
+   * True only on the uniqueness lost-race branch: a concurrent subscribe for
+   * the same (dog, mode) won during THIS request's Stripe round-trip, so this
+   * charge is a duplicate being refunded post-commit. `membership` then
+   * carries the WINNER's row (the dog IS subscribed) and `credits_granted` is
+   * 0 (only the winning charge granted). Mirrors the invoice-pay wire's
+   * honest lost-race signal.
+   */
+  charge_refunded: boolean;
 }
 
 export function toMembershipWire(row: MembershipRow, pkg: CreditPackageWithId): MembershipWire {
@@ -175,6 +196,20 @@ export function registerMembershipsRoute(
       if (!dogOwned) {
         throw new ApiError('not_found', `dog ${body.dog_id} not found`);
       }
+      // Uniqueness probe BEFORE the charge (ruled 2026-07-16): one active
+      // membership per (dog, mode). Catching it here means no money moves on
+      // the everyday case; the in-tx re-check below covers the concurrent
+      // race this pool read can't see.
+      const alreadySubscribed = await membershipsRepository.findActiveForDogMode(db, {
+        dogId: body.dog_id,
+        mode: pkg.mode,
+      });
+      if (alreadySubscribed !== undefined) {
+        throw new ApiError(
+          'conflict',
+          `this dog already has an active ${pkg.mode} membership — a dog holds at most one membership per program`,
+        );
+      }
       const stripeCtx = await loadStripePaymentContext({
         ownerId: principal.ownerId,
         paymentMethodId: body.payment_method_id,
@@ -218,6 +253,11 @@ export function registerMembershipsRoute(
         );
       }
 
+      // Closure-captured handle for the post-commit Stripe refund — set only
+      // on the uniqueness lost-race branch below (mirrors the invoice-pay
+      // route's duplicate-settle refund seam).
+      let pendingStripeRefund: PendingDuplicateRefund | undefined;
+
       // ── DB writes (inside withMutation; idempotency-keyed) ──
       const outcome = await withMutation<MembershipCreateWire>(
         {
@@ -225,59 +265,122 @@ export function registerMembershipsRoute(
           idempotencyKey,
           endpoint: 'POST /memberships',
           requestHash: hashRequestBody(body),
-          // The month-1 grant landed — per-dog credit reads are stale (§3 map).
-          patternsToInvalidate: () => [`credits:${body.dog_id}:*`],
+          // The month-1 grant landed — per-dog credit reads are stale (§3
+          // map). The lost-race branch grants nothing, so nothing to wipe.
+          patternsToInvalidate: (body) =>
+            body.credits_granted > 0 ? [`credits:${body.membership.dog_id}:*`] : [],
+          postCommit: async () => {
+            if (pendingStripeRefund === undefined) return;
+            const refund = await stripe.createRefund(
+              {
+                paymentIntentId: pendingStripeRefund.paymentIntentId,
+                amountCents: pendingStripeRefund.amountCents,
+                reason: 'requested_by_customer',
+              },
+              `${idempotencyKey}:dup-subscribe-refund`,
+            );
+            await refundsRepository.markStripeId({
+              id: pendingStripeRefund.refundId,
+              stripeRefundId: refund.id,
+            });
+          },
         },
-        async (tx) => {
-          const charge = await chargesRepository.create(tx, {
-            ownerId: principal.ownerId,
-            amountCents: intent.amountCents,
-            status: 'succeeded',
-            purpose: 'membership',
-            stripePaymentIntentId: intent.id,
-            dogId: body.dog_id,
-          });
+        async (tx) =>
+          withMembershipCreateLock(tx, body.dog_id, pkg.mode, async () => {
+            // Uniqueness re-check under the lock: the pre-Stripe probe races
+            // the seconds-wide charge round-trip of a concurrent subscribe.
+            // A winner here means THIS charge double-bills — record it, hand
+            // the refund to postCommit, and return the winner's membership
+            // with the honest charge_refunded flag (the dog IS subscribed;
+            // the owner's card nets exactly one charge).
+            const winner = await membershipsRepository.findActiveForDogMode(tx, {
+              dogId: body.dog_id,
+              mode: pkg.mode,
+            });
+            if (winner !== undefined) {
+              const duplicateCharge = await chargesRepository.create(tx, {
+                ownerId: principal.ownerId,
+                amountCents: intent.amountCents,
+                status: 'succeeded',
+                purpose: 'membership',
+                stripePaymentIntentId: intent.id,
+                dogId: body.dog_id,
+              });
+              const refund = await refundsRepository.createPending(tx, {
+                ownerId: principal.ownerId,
+                chargeId: duplicateCharge.id,
+                bookingId: null,
+                amountCents: intent.amountCents,
+                reason: 'duplicate-membership-subscribe',
+              });
+              pendingStripeRefund = {
+                refundId: refund.id,
+                paymentIntentId: intent.id,
+                amountCents: intent.amountCents,
+              };
+              return {
+                status: 201,
+                body: {
+                  membership: toMembershipWire(winner, await loadMembershipPackage(winner, tx)),
+                  charge_id: duplicateCharge.id,
+                  charge_status: 'succeeded' as const,
+                  stripe_payment_intent_id: intent.id,
+                  credits_granted: 0,
+                  charge_refunded: true,
+                },
+              };
+            }
 
-          const period = firstPeriod(now);
-          const membership = await membershipsRepository.createActive(tx, {
-            ownerId: principal.ownerId,
-            dogId: body.dog_id,
-            mode: pkg.mode,
-            packageId: pkg.id,
-            termMonths: body.term_months,
-            paymentMethodId: body.payment_method_id,
-            startedAt: now,
-            currentPeriodStart: period.start,
-            currentPeriodEnd: period.end,
-            endsAt: membershipEndsAt(now, body.term_months),
-          });
+            const charge = await chargesRepository.create(tx, {
+              ownerId: principal.ownerId,
+              amountCents: intent.amountCents,
+              status: 'succeeded',
+              purpose: 'membership',
+              stripePaymentIntentId: intent.id,
+              dogId: body.dog_id,
+            });
 
-          // §J.1: the month's lot expires at the period's end — that IS the
-          // "X days left to use X credits" reminder, via the existing
-          // credits-expiring scan. §J.3: alumni dogs never expire.
-          const dogIsAlumni = await dogProgramsRepository.isAlumni(body.dog_id, tx);
-          await creditLedgerRepository.creditPurchase(tx, {
-            dogId: body.dog_id,
-            mode: pkg.mode,
-            location: pkg.location,
-            delta: pkg.credits,
-            packageId: pkg.id,
-            chargeId: charge.id,
-            expiresAt: dogIsAlumni ? null : period.end,
-            reason: 'membership-grant',
-          });
+            const period = firstPeriod(now);
+            const membership = await membershipsRepository.createActive(tx, {
+              ownerId: principal.ownerId,
+              dogId: body.dog_id,
+              mode: pkg.mode,
+              packageId: pkg.id,
+              termMonths: body.term_months,
+              paymentMethodId: body.payment_method_id,
+              startedAt: now,
+              currentPeriodStart: period.start,
+              currentPeriodEnd: period.end,
+              endsAt: membershipEndsAt(now, body.term_months),
+            });
 
-          return {
-            status: 201,
-            body: {
-              membership: toMembershipWire(membership, pkg),
-              charge_id: charge.id,
-              charge_status: 'succeeded' as const,
-              stripe_payment_intent_id: intent.id,
-              credits_granted: pkg.credits,
-            },
-          };
-        },
+            // §J.1: the month's lot expires at the period's end — that IS the
+            // "X days left to use X credits" reminder, via the existing
+            // credits-expiring scan. §J.3: alumni dogs never expire.
+            const dogIsAlumni = await dogProgramsRepository.isAlumni(body.dog_id, tx);
+            await creditLedgerRepository.creditPurchase(tx, {
+              dogId: body.dog_id,
+              mode: pkg.mode,
+              location: pkg.location,
+              delta: pkg.credits,
+              packageId: pkg.id,
+              chargeId: charge.id,
+              expiresAt: dogIsAlumni ? null : period.end,
+              reason: 'membership-grant',
+            });
+
+            return {
+              status: 201,
+              body: {
+                membership: toMembershipWire(membership, pkg),
+                charge_id: charge.id,
+                charge_status: 'succeeded' as const,
+                stripe_payment_intent_id: intent.id,
+                credits_granted: pkg.credits,
+                charge_refunded: false,
+              },
+            };
+          }),
       );
 
       reply.code(outcome.status);

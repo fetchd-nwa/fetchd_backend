@@ -1,6 +1,6 @@
-import { and, asc, desc, eq, isNotNull, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, isNotNull, isNull, notExists, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { memberships } from '../schema/schema.js';
+import { invoices, memberships } from '../schema/schema.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
 import type { Tx } from '../tx.js';
 
@@ -184,6 +184,34 @@ export const membershipsRepository = {
     return row === undefined ? undefined : narrowRow(row);
   },
 
+  /**
+   * The dog's ACTIVE membership for one mode, if any — the uniqueness probe
+   * (ruled 2026-07-16: one active membership per (dog, mode); day-school +
+   * daycare may coexist on a dog, two of the same mode may not). Paused rows
+   * still block — they're `status='active'` and resume into the same slot.
+   * Polymorphic runner: the route pre-checks on the pool (friendly 409 before
+   * the Stripe charge) and re-checks inside its mutation tx under
+   * `withMembershipCreateLock` (the race-loser detection).
+   */
+  async findActiveForDogMode(
+    runner: Runner,
+    args: { dogId: string; mode: BookingMode },
+  ): Promise<MembershipRow | undefined> {
+    const [row] = await runner
+      .select(MEMBERSHIP_PROJECTION)
+      .from(memberships)
+      .where(
+        and(
+          eq(memberships.dogId, args.dogId),
+          eq(memberships.mode, args.mode),
+          eq(memberships.status, 'active'),
+          hasSubscriptionColumns(),
+        ),
+      )
+      .limit(1);
+    return row === undefined ? undefined : narrowRow(row);
+  },
+
   /** One membership by id + owner — the 404-collapse read for owner verbs. */
   async findByIdForOwner(
     runner: Runner,
@@ -208,6 +236,15 @@ export const membershipsRepository = {
    * under FOR UPDATE SKIP LOCKED so concurrent ticks divide the queue.
    * Paused rows are skipped ENTIRELY (§J.1: pause = skip rolling); the
    * `memberships_active_roll_idx` partial index serves the status filter.
+   *
+   * Roll-while-parked ruling (2026-07-16): a membership with ANY open invoice
+   * — mid-dunning or parked (`next_attempt_at IS NULL`) — is also skipped, so
+   * an unpaid month never stacks debt by opening the next one. Zero-cost on
+   * the happy path (a rolled invoice settles minutes later, a month before
+   * the next roll is due). The membership resumes automatically: settling the
+   * open invoice clears the predicate, and a LATE settle re-aligns the frozen
+   * clock via `alignPeriodAfterLateSettle` so ticks never catch-up-bill the
+   * parked gap.
    */
   async lockDueForRoll(tx: Tx, args: { limit?: number; now: Date }): Promise<MembershipRow[]> {
     const limit = args.limit ?? 50;
@@ -220,6 +257,12 @@ export const membershipsRepository = {
           isNull(memberships.pausedAt),
           hasSubscriptionColumns(),
           sql`${memberships.currentPeriodEnd} <= ${args.now.toISOString()}::timestamptz`,
+          notExists(
+            tx
+              .select({ one: sql`1` })
+              .from(invoices)
+              .where(and(eq(invoices.membershipId, memberships.id), eq(invoices.status, 'open'))),
+          ),
         ),
       )
       .orderBy(asc(memberships.currentPeriodEnd))
@@ -312,6 +355,46 @@ export const membershipsRepository = {
           eq(memberships.id, args.id),
           eq(memberships.status, 'active'),
           isNotNull(memberships.pausedAt),
+        ),
+      )
+      .returning({ id: memberships.id });
+    return updated.length;
+  },
+
+  /**
+   * Roll-while-parked auto-resume (ruled 2026-07-16). A LATE invoice settle
+   * (billed period already over — the same condition as the grant's
+   * late-settle floor) means the roll has been skipping this membership while
+   * its invoice sat open, freezing `current_period_end` in the past. Re-align
+   * the current period with the freshly-granted month ([settle-now,
+   * now + 1 clamped month)) and shift `ends_at` by the same delta — SQL SET
+   * expressions read the pre-UPDATE row, so the delta uses the old end.
+   * Without this, the next ticks would roll every elapsed month at once:
+   * catch-up debt for months of no service.
+   *
+   * Filtered to active + un-paused + forward-only: a completed/canceled clock
+   * is frozen by design, and a staff-paused one belongs to `resume`'s
+   * gap-shift (shifting both would double-count the overlap). Term exhaustion
+   * is COUNT-based, so the shift never changes how many months get billed.
+   */
+  async alignPeriodAfterLateSettle(
+    tx: Tx,
+    args: { id: string; periodStart: Date; periodEnd: Date },
+  ): Promise<number> {
+    const periodEndIso = args.periodEnd.toISOString();
+    const updated = await tx
+      .update(memberships)
+      .set({
+        endsAt: sql`ends_at + (${periodEndIso}::timestamptz - current_period_end)`,
+        currentPeriodStart: args.periodStart.toISOString(),
+        currentPeriodEnd: periodEndIso,
+      })
+      .where(
+        and(
+          eq(memberships.id, args.id),
+          eq(memberships.status, 'active'),
+          isNull(memberships.pausedAt),
+          sql`current_period_end < ${periodEndIso}::timestamptz`,
         ),
       )
       .returning({ id: memberships.id });

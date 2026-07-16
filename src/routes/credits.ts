@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
+import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import { creditsRepository } from '../db/repositories/creditsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import type { BookingMode } from '../lib/bookingMode.js';
@@ -46,6 +47,14 @@ export interface CreditsWire {
    * Δ 2026-06-18 (credit-expiry lot model).
    */
   expiring_lots: CreditLotWire[];
+  /**
+   * The staff-tuned warning lead for THIS location (per-location override →
+   * org default → server default), in days. The app's "expiring soon" chip
+   * uses the same window the server's `credits-expiring` push scan does, so
+   * the two surfaces warn in lockstep. Δ 2026-07-16 (closes the "no client
+   * consumer" note on `staffCreditExpiry`).
+   */
+  warning_lead_days: number;
 }
 
 export function registerCreditsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
@@ -70,6 +79,7 @@ export function registerCreditsRoute(app: FastifyInstance, opts: AuthRouteOption
         throw new ApiError('not_found', `dog ${dogId} not found`);
       }
       const lots = await creditsRepository.findExpiringLots(dogId, location);
+      const warningLeadDays = await creditExpirySettingsRepository.resolveWarningLeadDays(location);
       return {
         dog_id: dogId,
         location,
@@ -80,6 +90,7 @@ export function registerCreditsRoute(app: FastifyInstance, opts: AuthRouteOption
           remaining: lot.remaining,
           expires_at: lot.expiresAt,
         })),
+        warning_lead_days: warningLeadDays,
       };
     },
   );

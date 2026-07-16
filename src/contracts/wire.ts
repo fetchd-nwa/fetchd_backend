@@ -152,7 +152,14 @@ export interface BookingWire {
   // stable key the FE groups weekly sessions by; `group_class_name` titles the card.
   cohort_id?: string;
   group_class_name?: string;
+  // Private-lesson only (Δ 2026-07-14): where the lesson happens — 'home'
+  // (client's home) or 'public' (public spot). Owner-picked at request time,
+  // copied onto the booking at approve; omitted on every other category.
+  lesson_setting?: LessonSetting;
 }
+
+/** Δ 2026-07-14 — where a private lesson happens. */
+export type LessonSetting = 'home' | 'public';
 
 /** POST /staff/bookings/:id/attendance response (§A clarification 2026-05-28). */
 export interface AttendanceWire {
@@ -196,6 +203,8 @@ export interface PendingRequestWire {
   location?: LocationKey;
   payment?: 'credits' | 'payg';
   divert_reasons?: string[];
+  // Private-lesson only (Δ 2026-07-14): where the lesson should happen.
+  lesson_setting?: LessonSetting;
 }
 
 /**

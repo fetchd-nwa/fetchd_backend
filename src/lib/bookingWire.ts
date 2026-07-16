@@ -35,6 +35,7 @@ export interface BookingRowForWire {
   notes: string | null;
   sessionReportId: string | null;
   location: LocationKey | null;
+  lessonSetting: 'home' | 'public' | null;
   cancelledAt: string | null;
   cancelForfeited: boolean;
   cancelDeadlineAt: string | null;
@@ -78,6 +79,7 @@ export function toBookingWire(
   if (row.notes !== null && row.notes !== '') wire.notes = row.notes;
   if (row.sessionReportId !== null) wire.session_report_id = row.sessionReportId;
   if (row.location !== null) wire.location = row.location;
+  if (row.lessonSetting !== null) wire.lesson_setting = row.lessonSetting;
   if (row.cancelDeadlineAt !== null) {
     wire.cancel_deadline_at = pgTimestampToIso(row.cancelDeadlineAt);
   }

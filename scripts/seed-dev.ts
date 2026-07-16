@@ -757,6 +757,7 @@ async function seed(): Promise<void> {
       trainerStaffId: SEED.staffRachelId,
       notes: 'Leash reactivity — bikes.',
       location: 'fayetteville',
+      lessonSetting: 'home',
     },
     {
       id: SEED.bookingBrodieBoardingId,
@@ -958,6 +959,7 @@ async function seed(): Promise<void> {
       submittedAt: daysFromNow(-1, 16),
       notesPerDog: 'Waffles needs leash polish.',
       staffPreference: 'rachel',
+      lessonSetting: 'public',
       descriptorKeys: ['high-energy', 'food-motivated'],
     },
     {

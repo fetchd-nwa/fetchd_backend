@@ -12,6 +12,7 @@ import {
   dogVaccines,
   dogs,
   invoices,
+  pendingRequestDogs,
   pendingRequests,
   requiredVaccines,
   scheduledNotifications,
@@ -910,5 +911,67 @@ test(
       .from(pendingRequests)
       .where(eq(pendingRequests.id, requestId));
     assert.equal(row?.status, 'submitted');
+  },
+);
+
+test(
+  'POST /bookings — multi-dog roster: ONE stale dog diverts the WHOLE request (full roster on it, no bookings, no debits)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { ownerApp } = buildApps();
+    const freshLead = await createTestDog({ freshAnchor: true, spayedNeutered: true });
+    const freshExtra = await createTestDog({ freshAnchor: true, spayedNeutered: true });
+    const staleExtra = await createTestDog({ spayedNeutered: true }); // never attended
+    await topUpCredits(freshLead, 'school', 5);
+    await topUpCredits(freshExtra, 'school', 5);
+    await topUpCredits(staleExtra, 'school', 5);
+
+    const res = await postBooking(ownerApp, {
+      category: 'day-school',
+      lead_dog_id: freshLead,
+      additional_dog_ids: [freshExtra, staleExtra],
+      dates: [futureWeekday(20)],
+      location: 'fayetteville',
+    });
+    assert.equal(res.statusCode, 202, JSON.stringify(res.json()));
+    const body = res.json() as DivertedBody;
+    assert.equal(body.diverted, true);
+    assert.deepEqual(body.divert_reasons, ['reevaluation-stale']);
+
+    // The request carries the FULL roster — the approve conversion books all
+    // three together, never a partial split.
+    const requestDogs = await db
+      .select({ dogId: pendingRequestDogs.dogId })
+      .from(pendingRequestDogs)
+      .where(eq(pendingRequestDogs.requestId, body.request.id));
+    assert.deepStrictEqual(
+      requestDogs.map((r) => r.dogId).sort(),
+      [freshLead, freshExtra, staleExtra].sort(),
+      'lead + both additional dogs ride the pending request',
+    );
+
+    // Nothing booked, nothing debited — for ANY dog on the roster. (The
+    // freshAnchor PAST sessions exist by construction; only an UPCOMING row
+    // would mean the divert leaked a real booking.)
+    const bookingRows = await db
+      .select({ id: bookings.id })
+      .from(bookings)
+      .where(
+        and(
+          inArray(bookings.leadDogId, [freshLead, freshExtra, staleExtra]),
+          eq(bookings.status, 'upcoming'),
+        ),
+      );
+    assert.equal(bookingRows.length, 0, 'no upcoming booking for any roster dog');
+    const debits = await db
+      .select({ id: creditLedger.id })
+      .from(creditLedger)
+      .where(
+        and(
+          inArray(creditLedger.dogId, [freshLead, freshExtra, staleExtra]),
+          eq(creditLedger.reason, 'booking-debit'),
+        ),
+      );
+    assert.equal(debits.length, 0, 'no debit for any roster dog');
   },
 );

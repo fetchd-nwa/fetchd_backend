@@ -67,6 +67,33 @@ export async function withServiceRateLock<T>(
 }
 
 /**
+ * Per-(dog, mode) transaction-scoped advisory lock — the membership-create
+ * serializer (`POST /memberships`, uniqueness ruling 2026-07-16: one ACTIVE
+ * membership per (dog, mode)). The route pre-checks before the Stripe charge
+ * (friendly 409, no money moves), but that read races the seconds-wide Stripe
+ * round-trip of a concurrent subscribe: both calls can pass the pre-check,
+ * both charge, and both insert. This lock + an in-tx re-check serialize the
+ * insert decision so the loser detects the winner's row and refunds its
+ * duplicate charge instead of double-subscribing. The partial unique index
+ * (`memberships_one_active_per_dog_mode`) is the constraint floor beneath
+ * both.
+ *
+ * Key: `hashtext('membership:<dogId>:<mode>')`. The prefix keeps this
+ * namespace disjoint from the booking (`<dogId>:<mode>:<location>`) and
+ * `service-rate:` locks; int4 hash collisions only cause spurious
+ * serialization, never incorrect behavior.
+ */
+export async function withMembershipCreateLock<T>(
+  tx: Tx,
+  dogId: string,
+  mode: BookingMode,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`membership:${dogId}:${mode}`}))`);
+  return fn();
+}
+
+/**
  * Row-lock a cohort for the duration of the transaction — the
  * `enrollInGroupClass` capacity-ceiling primitive (`schema.sql` Transaction
  * contract notes, `enrollInGroupClass` ~line 1276). Concurrent enrollment

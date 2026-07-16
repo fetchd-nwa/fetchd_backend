@@ -28,6 +28,9 @@ export const requestStatus = pgEnum("request_status", ['submitted', 'approved', 
 export const scheduledStatus = pgEnum("scheduled_status", ['pending', 'sent', 'cancelled'])
 export const senderKind = pgEnum("sender_kind", ['owner', 'staff'])
 export const serviceCategory = pgEnum("service_category", ['day-school', 'day-care', 'group-class', 'private-lesson', 'board-and-train', 'boarding', 'evaluation'])
+// Δ 2026-07-14: where a PRIVATE LESSON happens — owner-picked at request time,
+// copied onto the booking at approve. NULL on every other category.
+export const lessonSetting = pgEnum("lesson_setting", ['home', 'public'])
 export const staffRole = pgEnum("staff_role", ['owner-shanthi', 'trainer', 'office'])
 export const threadCategory = pgEnum("thread_category", ['sessions', 'billing', 'enrollment', 'other'])
 
@@ -492,6 +495,7 @@ export const bookings = pgTable("bookings", {
 	durationMinutes: integer("duration_minutes"),
 	trainerStaffId: uuid("trainer_staff_id"),
 	notes: text(),
+	lessonSetting: lessonSetting("lesson_setting"),
 	cohortId: uuid("cohort_id"),
 	reportId: uuid("report_id"),
 	sessionReportId: uuid("session_report_id"),
@@ -604,6 +608,7 @@ export const pendingRequests = pgTable("pending_requests", {
 	notesPerDog: text("notes_per_dog"),
 	notesJoint: text("notes_joint"),
 	staffPreference: text("staff_preference"),
+	lessonSetting: lessonSetting("lesson_setting"),
 	descriptorKeys: text("descriptor_keys").array().default([]).notNull(),
 	lengthWeeks: integer("length_weeks"),
 	// Day-program divert (Shanthi 2026-07-14): what the approve conversion

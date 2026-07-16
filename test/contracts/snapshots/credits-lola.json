@@ -3,5 +3,6 @@
   "location": "fayetteville",
   "school": 0,
   "daycare": 0,
-  "expiring_lots": []
+  "expiring_lots": [],
+  "warning_lead_days": 60
 }

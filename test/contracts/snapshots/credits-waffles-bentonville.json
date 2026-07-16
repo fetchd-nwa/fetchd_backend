@@ -3,5 +3,6 @@
   "location": "bentonville",
   "school": 0,
   "daycare": 2,
-  "expiring_lots": []
+  "expiring_lots": [],
+  "warning_lead_days": 60
 }

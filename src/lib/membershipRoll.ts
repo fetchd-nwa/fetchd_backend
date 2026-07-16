@@ -11,8 +11,14 @@ import { pgTimestampToDate } from './pgTimestamp.js';
 
 /**
  * §J.1 membership ROLL — the scheduler phase that opens each subscription's
- * next month. For every ACTIVE, un-paused membership whose
- * `current_period_end <= now` (claimed under FOR UPDATE SKIP LOCKED):
+ * next month. For every ACTIVE, un-paused membership with NO open invoice
+ * whose `current_period_end <= now` (claimed under FOR UPDATE SKIP LOCKED —
+ * the open-invoice skip is the roll-while-parked ruling, 2026-07-16: an
+ * unpaid month freezes the subscription instead of stacking debt; a late
+ * settle re-aligns the clock and resumes it, see
+ * `membershipsRepository.alignPeriodAfterLateSettle`. Known edge: no staff
+ * verb VOIDS a membership invoice today — if one ever lands, it must re-align
+ * the clock the same way, or the next ticks catch-up-bill the frozen gap):
  *
  *   - **Term exhausted** ⇒ `status='completed'` + a `membership-ended` feed
  *     notification (the §J.1 HARD STOP — no auto-renew, no month-to-month
