@@ -189,6 +189,25 @@ export interface PendingRequestWire {
   status: RequestStatus;
   approved_at?: string;
   converted_booking_id?: string;
+  // Day-program divert (Shanthi 2026-07-14): present only on diverted
+  // day-school / day-care submissions. `divert_reasons` tells the staff
+  // queue WHY this needs eyes ('reevaluation-stale' | 'not-spayed-neutered');
+  // `location` + `payment` ride so the approve conversion books verbatim.
+  location?: LocationKey;
+  payment?: 'credits' | 'payg';
+  divert_reasons?: string[];
+}
+
+/**
+ * `POST /bookings` 202 response (Shanthi 2026-07-14): the submission tripped
+ * an approval rule (3-month re-eval staleness / intact dog) and was parked as
+ * a pending request instead of booking instantly. The 201 arm remains
+ * `BookingWire[]` — clients branch on the status code.
+ */
+export interface DivertedBookingWire {
+  diverted: true;
+  divert_reasons: string[];
+  request: PendingRequestWire;
 }
 
 // ---- threadWire.ts ---------------------------------------------------------

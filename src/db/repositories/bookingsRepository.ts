@@ -183,6 +183,31 @@ export const bookingsRepository = {
   },
 
   /**
+   * When NWA last SAW this dog for the 3-month re-evaluation staleness rule
+   * (Shanthi 2026-07-14): the latest day-school / day-care session the dog
+   * actually ATTENDED (per-dog `booking_dogs.attendance = 'attended'` —
+   * bookings created but no-showed don't count, and per Allison's ruling
+   * group classes / private lessons / stays don't reset the clock either).
+   * `undefined` = never attended a day program.
+   */
+  async findLastAttendedDayProgramAt(tx: Tx, dogId: string): Promise<Date | undefined> {
+    const [row] = await tx
+      .select({ lastAt: sql<string | null>`max(${bookings.scheduledAt})` })
+      .from(bookings)
+      .innerJoin(bookingDogs, eq(bookingDogs.bookingId, bookings.id))
+      .where(
+        and(
+          eq(bookingDogs.dogId, dogId),
+          eq(bookingDogs.attendance, 'attended'),
+          live(bookingDogs),
+          inArray(bookings.category, ['day-school', 'day-care']),
+          live(bookings),
+        ),
+      );
+    return row?.lastAt == null ? undefined : new Date(row.lastAt);
+  },
+
+  /**
    * Candidate live (non-cancelled) bookings a new day program on `chicagoDates`
    * could conflict with, matched on the `booking_dogs` roster (lead OR
    * additional). Feeds the `POST /bookings` time-overlap guard

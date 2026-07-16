@@ -39,6 +39,10 @@ type LocationKey = (typeof LOCATION_KEYS)[number];
  * and async-settled paths return early with the client_secret and let
  * the Day-15 webhook reconcile the terminal status.
  *
+ * Optional `quantity` (1–100, default 1) buys N units of the package in
+ * one charge / one ledger lot — the app's "choose your own amount"
+ * option sends N × the single-day pack.
+ *
  * Catalog endpoint: both owner and staff principals get the same data
  * (rates + packages are reference data, not user data). Retirement is
  * `active = false` on the row — never DELETE; the wire filter is
@@ -87,11 +91,19 @@ const keyParamSchema = z.object({
 // by school). The owner app passes its selected location.
 const packagesQuerySchema = z.object({ location: z.enum(LOCATION_KEYS) });
 
+// Upper bound for a single purchase's unit count — matches the app's
+// "choose your own amount" wheel (1–100 of the single-day pack).
+const PURCHASE_QUANTITY_MAX = 100;
+
 const purchaseBodySchema = z
   .object({
     dog_id: z.string().uuid('dog_id must be a UUID'),
     payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
     location: z.enum(LOCATION_KEYS),
+    // Buy N units of the package in ONE charge: quantity × price_cents,
+    // quantity × credits granted. Powers the app's custom-amount option
+    // (N × the single-day pack). Absent = 1 = the classic package purchase.
+    quantity: z.number().int().min(1).max(PURCHASE_QUANTITY_MAX).default(1),
   })
   .strict();
 
@@ -151,13 +163,18 @@ export function registerCreditPackagesRoute(
         today: bucketChicagoToday(nowFactory()),
       });
       const pkg = purchaseContext.pkg;
+      // Quantity multiplies the whole purchase: one charge, one ledger lot.
+      // Metadata carries the TOTAL so the Day-15 webhook's reconcile path
+      // (which grants straight from metadata.credits) needs no quantity
+      // awareness at all.
+      const grantCredits = pkg.credits * body.quantity;
 
       // ── Stripe call (outside the tx; idempotency-keyed) ──
       const intent = await stripe.createAndConfirmPaymentIntent(
         {
           customerId: purchaseContext.stripeCustomerId,
           paymentMethodId: purchaseContext.stripePaymentMethodId,
-          amountCents: pkg.price_cents,
+          amountCents: pkg.price_cents * body.quantity,
           currency: 'usd',
           metadata: {
             owner_id: principal.ownerId,
@@ -167,7 +184,8 @@ export function registerCreditPackagesRoute(
             // dashboard reconciliation.
             package_id: pkg.id,
             package_key: pkg.key,
-            credits: String(pkg.credits),
+            credits: String(grantCredits),
+            quantity: String(body.quantity),
             mode: pkg.mode,
             location: pkg.location,
           },
@@ -209,10 +227,12 @@ export function registerCreditPackagesRoute(
             // (per-location → org-default → code default), read inside this tx.
             // 1-credit packs never expire either (helper returns null).
             const dogIsAlumni = await dogProgramsRepository.isAlumni(body.dog_id, tx);
+            // Expiry keys off the TOTAL granted: 10 × the never-expiring
+            // single-day pack is a bulk buy and gets the multi-credit window.
             const expiresAt = dogIsAlumni
               ? null
               : resolvePurchaseExpiry(
-                  pkg.credits,
+                  grantCredits,
                   await creditExpirySettingsRepository.resolveExpiryWindowMonths(pkg.location, tx),
                   nowFactory(),
                 );
@@ -220,7 +240,7 @@ export function registerCreditPackagesRoute(
               dogId: body.dog_id,
               mode: pkg.mode,
               location: pkg.location,
-              delta: pkg.credits,
+              delta: grantCredits,
               packageId: pkg.id,
               chargeId: charge.id,
               // Stamped once at purchase (non-retroactive).
@@ -235,7 +255,7 @@ export function registerCreditPackagesRoute(
               charge_status: chargeStatus,
               stripe_payment_intent_id: intent.id,
               client_secret: intent.clientSecret,
-              credits_granted: chargeStatus === 'succeeded' ? pkg.credits : 0,
+              credits_granted: chargeStatus === 'succeeded' ? grantCredits : 0,
             },
           };
         },

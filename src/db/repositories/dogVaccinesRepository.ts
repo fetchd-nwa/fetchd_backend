@@ -121,15 +121,23 @@ async function findMissingForCategory(
   tx: Tx,
   dogId: string,
   category: ServiceCategory,
+  /** Group-class only: the cohort's class key — requirements listing it in
+   * `exempt_class_keys` are skipped (Shanthi 2026-07-14: puppy classes don't
+   * require rabies). Mirrors the trigger's exemption clause exactly. */
+  groupClassKey?: string,
 ): Promise<{ requirement_key: string; label: string }[]> {
   // Live required_vaccines whose gates_categories includes this category
   // AND for which no live, in-date dog_vaccines row exists on this dog.
   // Single query via correlated NOT EXISTS, same shape as the trigger.
+  const exemptionClause =
+    groupClassKey !== undefined
+      ? sql` AND NOT (${groupClassKey}::group_class_key = ANY (rv.exempt_class_keys))`
+      : sql``;
   const rows = await tx.execute(sql`
     SELECT rv.key AS requirement_key, rv.label AS label
     FROM ${requiredVaccines} rv
     WHERE rv.expired_at IS NULL
-      AND ${category}::service_category = ANY (rv.gates_categories)
+      AND ${category}::service_category = ANY (rv.gates_categories)${exemptionClause}
       AND NOT EXISTS (
         SELECT 1
         FROM ${dogVaccines} dv

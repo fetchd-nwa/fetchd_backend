@@ -19,7 +19,7 @@ export type LocationKey = (typeof LOCATION_SLUGS)[number];
 export const mediaDerivativeJobStatus = pgEnum("media_derivative_job_status", ['pending', 'processing', 'done', 'failed'])
 export const mediaKind = pgEnum("media_kind", ['image', 'video'])
 export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avatar', 'report-photo', 'report-video', 'message-attachment'])
-export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'alumni-attendance', 'membership-ended'])
+export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'alumni-attendance', 'membership-ended', 'spay-neuter-reminder'])
 export const rateUnit = pgEnum("rate_unit", ['per-day', 'per-night', 'per-session', 'per-week', 'flat'])
 export const recordSource = pgEnum("record_source", ['app', 'gingr', 'seed'])
 export const refundStatus = pgEnum("refund_status", ['pending', 'succeeded', 'failed'])
@@ -118,6 +118,10 @@ export const dogs = pgTable("dogs", {
 	// §J.3: set by the monthly alumni attendance scan (<2 qualifying sessions
 	// in the closed Chicago month); cleared by staff after the re-check.
 	alumniAttendanceFlaggedAt: timestamp("alumni_attendance_flagged_at", { withTimezone: true, mode: 'string' }),
+	// Shanthi 2026-07-14: profile question, never a hard block. NULL =
+	// unanswered; FALSE diverts day-program bookings to the approval lane.
+	spayedNeutered: boolean("spayed_neutered"),
+	spayNeuterPlannedOn: date("spay_neuter_planned_on"),
 	fieldOverrides: jsonb("field_overrides").default({}).notNull(),
 	primaryVetId: uuid("primary_vet_id"),
 	capacityExempt: boolean("capacity_exempt").generatedAlwaysAs(sql`(staff_owner_id IS NOT NULL)`),
@@ -198,6 +202,9 @@ export const requiredVaccines = pgTable("required_vaccines", {
 	key: text().primaryKey().notNull(),
 	label: text().notNull(),
 	gatesCategories: serviceCategory("gates_categories").array().notNull(),
+	// Shanthi 2026-07-14: group-class bookings whose cohort's class_key is
+	// listed here skip this vaccine (puppy classes don't require rabies).
+	exemptClassKeys: groupClassKey("exempt_class_keys").array().default([]).notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 });
 
@@ -599,6 +606,13 @@ export const pendingRequests = pgTable("pending_requests", {
 	staffPreference: text("staff_preference"),
 	descriptorKeys: text("descriptor_keys").array().default([]).notNull(),
 	lengthWeeks: integer("length_weeks"),
+	// Day-program divert (Shanthi 2026-07-14): what the approve conversion
+	// needs to create the day-school/day-care bookings. NULL/empty on the
+	// classic request categories.
+	location: text().$type<LocationKey>(),
+	payment: text().$type<'credits' | 'payg'>(),
+	paymentMethodId: uuid("payment_method_id"),
+	divertReasons: text("divert_reasons").array().default([]).notNull(),
 	approvedAt: timestamp("approved_at", { withTimezone: true, mode: 'string' }),
 	approvedByStaffId: uuid("approved_by_staff_id"),
 	convertedBookingId: uuid("converted_booking_id"),

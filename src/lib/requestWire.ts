@@ -1,5 +1,6 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
 import type { ServiceCategory } from './bookingBucket.js';
+import type { LocationKey } from './bookingWire.js';
 import { requestStatus } from '../db/schema/schema.js';
 import type {
   PendingRequestNotesWire,
@@ -49,6 +50,11 @@ export interface PendingRequestRowForWire {
   lengthWeeks: number | null;
   approvedAt: string | null;
   convertedBookingId: string | null;
+  // Day-program divert columns (Shanthi 2026-07-14); NULL/empty on the
+  // classic request categories.
+  location: LocationKey | null;
+  payment: 'credits' | 'payg' | null;
+  divertReasons: string[];
 }
 
 /** Lead + additional dog ids for one request, sorted for snapshot stability. */
@@ -98,6 +104,11 @@ export function toRequestWire(
   if (row.lengthWeeks !== null) wire.length_weeks = row.lengthWeeks;
   if (row.approvedAt !== null) wire.approved_at = pgTimestampToIso(row.approvedAt);
   if (row.convertedBookingId !== null) wire.converted_booking_id = row.convertedBookingId;
+  // Day-program divert fields — omit-on-null keeps every classic request's
+  // wire byte-identical to pre-divert (snapshots unchanged).
+  if (row.location !== null) wire.location = row.location;
+  if (row.payment !== null) wire.payment = row.payment;
+  if (row.divertReasons.length > 0) wire.divert_reasons = row.divertReasons;
   return wire;
 }
 

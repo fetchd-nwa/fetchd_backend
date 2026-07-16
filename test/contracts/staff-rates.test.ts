@@ -6,7 +6,7 @@ import { db } from '../../src/db/client.js';
 import { invoices as invoicesTable, serviceRates } from '../../src/db/schema/schema.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffRatesRoute } from '../../src/routes/staffRates.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { futureWeekday, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
@@ -36,8 +36,6 @@ import {
 
 registerFixtureHooks();
 
-const FIXTURE_TODAY_MS = FIXTURE_TODAY.getTime();
-const ONE_DAY_MS = 86_400_000;
 const STAFF_ID = FIXTURE_IDS.staffDonavanId;
 
 function staffApp(principal = FIXTURE_STAFF_PRINCIPAL): {
@@ -107,22 +105,6 @@ async function rowsForTrack(category: string, location: string) {
         eq(serviceRates.location, location as 'fayetteville'),
       ),
     );
-}
-
-function futureWeekday(nth: number): string {
-  let count = 0;
-  let offset = 1;
-  for (;;) {
-    const d = new Date(FIXTURE_TODAY_MS + offset * ONE_DAY_MS);
-    const dow = d.getUTCDay();
-    if (dow !== 0 && dow !== 6) {
-      if (count === nth) {
-        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-      }
-      count += 1;
-    }
-    offset += 1;
-  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

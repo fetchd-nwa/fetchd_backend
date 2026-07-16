@@ -17,7 +17,7 @@ import {
 import { registerRequestsRoute } from '../../src/routes/requests.js';
 import { registerStaffRequestsRoute } from '../../src/routes/staffRequests.js';
 import type { Principal } from '../../src/auth/principal.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -49,8 +49,10 @@ import {
 
 registerFixtureHooks();
 
-// Real "now" is ~2026-05-24 per the system clock; pick preferred_dates
-// safely in the future of any real run (well within the 92-day cap).
+// The requests route takes the injected FIXTURE_NOW clock (Δ 2026-07-15 —
+// the old Date.now() validation made these hardcoded dates a time bomb).
+// Relative to FIXTURE_TODAY (2026-05-19) these sit ~57-71 days out, inside
+// the 92-day lookahead cap.
 const PREFERRED_1 = '2026-07-15T15:00:00Z';
 const PREFERRED_2 = '2026-07-22T15:00:00Z';
 const PREFERRED_3 = '2026-07-29T15:00:00Z';
@@ -62,7 +64,7 @@ function requestsApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL): {
   app: ReturnType<typeof makeContractApp>['app'];
 } {
   const { app, authenticate } = makeContractApp(principal);
-  registerRequestsRoute(app, { authenticate });
+  registerRequestsRoute(app, { authenticate, now: FIXTURE_NOW });
   registerStaffRequestsRoute(app, { authenticate });
   return { app };
 }

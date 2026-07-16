@@ -28,6 +28,7 @@ import {
   type MedicationWire,
   type VaccineWire,
 } from '../lib/dogWire.js';
+import { syncSpayNeuterReminder } from '../lib/enqueueSpayNeuterReminder.js';
 import { assertOwnedImagePath, buildProfileImageUrlResolver } from '../lib/profileImageUrls.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
 import { ApiError } from '../lib/errors.js';
@@ -144,6 +145,12 @@ const postDogBodySchema = z
     special_notes: optionalText.optional(),
     evaluation_status: z.enum(EVALUATION_STATUSES).optional(),
     evaluation_date: optionalEvaluationDate.optional(),
+    // Shanthi 2026-07-14: profile question (never a hard gate). Omitted =
+    // unanswered. An explicit false diverts day-program bookings to the
+    // staff-approval lane; `spay_neuter_planned_on` schedules the "is it
+    // done yet?" reminder for that date.
+    spayed_neutered: z.boolean().nullable().optional(),
+    spay_neuter_planned_on: isoDate.nullable().optional(),
   })
   .strict()
   .refine((body) => body.birthdate !== undefined || body.age_months_override !== undefined, {
@@ -163,9 +170,31 @@ const patchDogBodySchema = z
     // tx guards that a UUID is the owner's own dog-profile media; the read
     // resolver turns it into a signed URL (lib/profileImageUrls).
     profile_image_path: z.string(),
+    spayed_neutered: z.boolean().nullable(),
+    spay_neuter_planned_on: isoDate.nullable(),
   })
   .strict()
   .partial();
+
+/**
+ * Cross-field floor for the spay pair, mirroring the dogs CHECK
+ * `(spay_neuter_planned_on IS NULL OR spayed_neutered IS NOT TRUE)`: a
+ * planned date only makes sense on a dog explicitly answered "not yet".
+ * Requiring the pair IN THE SAME BODY keeps the friendly 4xx here instead
+ * of a raw check_violation when the stored value disagrees.
+ */
+function assertSpayFieldsCoherent(body: {
+  spayed_neutered?: boolean | null;
+  spay_neuter_planned_on?: string | null;
+}): void {
+  if (body.spay_neuter_planned_on == null) return;
+  if (body.spayed_neutered !== false) {
+    throw new ApiError(
+      'invalid_payload',
+      'spay_neuter_planned_on requires spayed_neutered: false in the same request',
+    );
+  }
+}
 
 const postVaccineBodySchema = z
   .object({
@@ -268,6 +297,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const body = parseOrThrow(postDogBodySchema, request.body, 'dog payload');
+    assertSpayFieldsCoherent(body);
     const primaryVetId = body.primary_vet_id ?? null;
     const values = {
       ownerId: principal.ownerId,
@@ -279,6 +309,8 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
       specialNotes: normalizeOptional(body.special_notes) ?? '',
       evaluationStatus: body.evaluation_status ?? 'not-evaluated',
       evaluationDate: body.evaluation_date ?? null,
+      spayedNeutered: body.spayed_neutered ?? null,
+      spayNeuterPlannedOn: body.spay_neuter_planned_on ?? null,
     };
 
     const outcome = await withMutation<DogWire>(
@@ -303,6 +335,15 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
           }
         }
         const created = await dogsRepository.create(tx, values);
+        // Schedule the "is it done yet?" reminder for an intact dog with a
+        // planned date (no-op otherwise; rolls back with the insert).
+        await syncSpayNeuterReminder(tx, {
+          dogId: created.id,
+          ownerId: principal.ownerId,
+          dogName: created.name,
+          spayedNeutered: created.spayedNeutered,
+          plannedOn: created.spayNeuterPlannedOn,
+        });
         const assembled = await dogsRepository.findById(created.id, principal.ownerId, tx);
         if (!assembled) {
           // Defense in depth: a just-created row matched on (id, ownerId, live)
@@ -326,6 +367,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
     const { id: dogId } = parseOrThrow(paramsSchema, request.params, 'dog id');
     const body = parseOrThrow(patchDogBodySchema, request.body, 'dog patch');
+    assertSpayFieldsCoherent(body);
 
     const set: DogUpdate = {};
     if (body.name !== undefined) set.name = body.name;
@@ -339,6 +381,17 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
     if (body.evaluation_status !== undefined) set.evaluationStatus = body.evaluation_status;
     if (body.evaluation_date !== undefined) set.evaluationDate = body.evaluation_date;
     if (body.profile_image_path !== undefined) set.profileImagePath = body.profile_image_path;
+    if (body.spayed_neutered !== undefined) {
+      set.spayedNeutered = body.spayed_neutered;
+      // Answering "yes, fixed" clears any stale planned date in the same
+      // write — otherwise the dogs CHECK (planned requires not-true) trips.
+      if (body.spayed_neutered !== false && body.spay_neuter_planned_on === undefined) {
+        set.spayNeuterPlannedOn = null;
+      }
+    }
+    if (body.spay_neuter_planned_on !== undefined) {
+      set.spayNeuterPlannedOn = body.spay_neuter_planned_on;
+    }
 
     if (Object.keys(set).length === 0) {
       throw new ApiError('bad_request', 'no updatable fields in request body');
@@ -377,6 +430,17 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
           // inside the same tx, which no current trigger does. Map to 404 so
           // the client retry-loop terminates rather than spinning.
           throw new ApiError('not_found', 'dog not found');
+        }
+        // Re-sync the planned-date reminder whenever either spay field moved:
+        // cancel a superseded one, (re)schedule against the row's new state.
+        if (set.spayedNeutered !== undefined || set.spayNeuterPlannedOn !== undefined) {
+          await syncSpayNeuterReminder(tx, {
+            dogId,
+            ownerId: principal.ownerId,
+            dogName: updated.name,
+            spayedNeutered: updated.spayedNeutered,
+            plannedOn: updated.spayNeuterPlannedOn,
+          });
         }
         const assembled = await dogsRepository.findById(dogId, principal.ownerId, tx);
         if (!assembled) {

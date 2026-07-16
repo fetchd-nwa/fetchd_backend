@@ -104,6 +104,14 @@ const SEED = {
   bookingLolaLessonId: 'b0070000-0000-4000-8000-000000000002',
   bookingBrodieBoardingId: 'b0070000-0000-4000-8000-000000000003',
   bookingGroupWalkId: 'b0070000-0000-4000-8000-000000000004',
+  // Past ATTENDED day programs — one per dog, ~2 weeks back. These are what
+  // keep the seeded dogs "fresh" under the 3-month re-evaluation staleness
+  // rule (Shanthi 2026-07-14): without a recent attended day-school/day-care
+  // session, every demo booking would divert into the staff-approval queue.
+  bookingWafflesPastSchoolId: 'b0070000-0000-4000-8000-000000000005',
+  bookingLolaPastSchoolId: 'b0070000-0000-4000-8000-000000000006',
+  bookingBrodiePastCareId: 'b0070000-0000-4000-8000-000000000007',
+  bookingOlliePastCareId: 'b0070000-0000-4000-8000-000000000008',
 
   // Submitted requests (approve / deny queue).
   requestWafflesLessonId: '9e510000-0000-4000-8000-000000000001',
@@ -305,12 +313,14 @@ async function seed(): Promise<void> {
     },
   ]);
 
-  // Stripe customer + payment method per owner — the payment-guarantee
-  // trigger rejects any owner booking without a live payment method.
-  await db.insert(stripeCustomers).values([
-    { ownerId: SEED.ownerAllisonId, stripeCustomerId: 'cus_seed_allison' },
-    { ownerId: SEED.ownerJordanId, stripeCustomerId: 'cus_seed_jordan' },
-  ]);
+  // Payment method per owner — the payment-guarantee trigger rejects any
+  // owner booking without a live payment method. Deliberately NO
+  // stripe_customers rows (Δ 2026-07-14): a fake `cus_seed_*` id made
+  // `POST /payment-methods/setup-intent` 500 against real Stripe ("no such
+  // customer") and blocked the add-card flow. The route lazily provisions a
+  // REAL test-mode customer on first add-card instead; the seeded pm rows
+  // below satisfy the booking gate but are not live Stripe objects (real
+  // purchases need a card added through the app).
   await db.insert(paymentMethods).values([
     {
       id: SEED.paymentMethodAllisonId,
@@ -493,6 +503,9 @@ async function seed(): Promise<void> {
       // show; the other seed dogs' don't).
       boardingEnabled: true,
       profileImagePath: 'dogs/waffles/waffles-pfp.jpg',
+      // Shanthi 2026-07-14: all seed dogs are fixed so the intact-dog
+      // approval divert never fires in demos (flip via PATCH to demo it).
+      spayedNeutered: true,
     },
     {
       id: SEED.dogLolaId,
@@ -504,6 +517,7 @@ async function seed(): Promise<void> {
       evaluationStatus: 'passed',
       evaluationDate: '2024-06-01T15:00:00Z',
       profileImagePath: 'dogs/lola/lola-pfp.jpg',
+      spayedNeutered: true,
     },
     {
       id: SEED.dogBrodieId,
@@ -515,6 +529,7 @@ async function seed(): Promise<void> {
       evaluationStatus: 'passed',
       evaluationDate: '2024-02-15T15:00:00Z',
       profileImagePath: 'dogs/brodie/brodie-pfp.jpg',
+      spayedNeutered: true,
     },
     {
       id: SEED.dogOllieId,
@@ -526,6 +541,7 @@ async function seed(): Promise<void> {
       evaluationStatus: 'passed',
       evaluationDate: '2024-05-01T15:00:00Z',
       profileImagePath: 'dogs/ollie/ollie-pfp.jpeg',
+      spayedNeutered: true,
     },
   ]);
 
@@ -772,6 +788,57 @@ async function seed(): Promise<void> {
       trainerStaffId: null,
       location: 'bentonville',
     },
+    // Past ATTENDED day programs (Shanthi 2026-07-14 staleness rule): each
+    // dog's most recent "NWA saw them" anchor, ~2 weeks back, so demo
+    // bookings stay instant instead of diverting to the approval queue.
+    {
+      id: SEED.bookingWafflesPastSchoolId,
+      ownerId: SEED.ownerAllisonId,
+      leadDogId: SEED.dogWafflesId,
+      category: 'day-school',
+      status: 'past',
+      scheduledAt: weekdayFromNow(-14, 13),
+      durationMinutes: 540,
+      trainerStaffId: SEED.staffDonavanId,
+      confirmedAt: daysFromNow(-15, 15),
+      location: 'fayetteville',
+    },
+    {
+      id: SEED.bookingLolaPastSchoolId,
+      ownerId: SEED.ownerAllisonId,
+      leadDogId: SEED.dogLolaId,
+      category: 'day-school',
+      status: 'past',
+      scheduledAt: weekdayFromNow(-10, 13),
+      durationMinutes: 540,
+      trainerStaffId: SEED.staffRachelId,
+      confirmedAt: daysFromNow(-11, 15),
+      location: 'fayetteville',
+    },
+    {
+      id: SEED.bookingBrodiePastCareId,
+      ownerId: SEED.ownerJordanId,
+      leadDogId: SEED.dogBrodieId,
+      category: 'day-care',
+      status: 'past',
+      scheduledAt: weekdayFromNow(-12, 14),
+      durationMinutes: 480,
+      trainerStaffId: null,
+      confirmedAt: daysFromNow(-13, 15),
+      location: 'bentonville',
+    },
+    {
+      id: SEED.bookingOlliePastCareId,
+      ownerId: SEED.ownerJordanId,
+      leadDogId: SEED.dogOllieId,
+      category: 'day-care',
+      status: 'past',
+      scheduledAt: weekdayFromNow(-8, 14),
+      durationMinutes: 480,
+      trainerStaffId: null,
+      confirmedAt: daysFromNow(-9, 15),
+      location: 'bentonville',
+    },
   ]);
 
   await db.insert(bookingDogs).values([
@@ -780,6 +847,39 @@ async function seed(): Promise<void> {
     { bookingId: SEED.bookingBrodieBoardingId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogOllieId, isLead: false },
+    // The staleness anchors — per-dog attendance actually marked 'attended'.
+    {
+      bookingId: SEED.bookingWafflesPastSchoolId,
+      dogId: SEED.dogWafflesId,
+      isLead: true,
+      attendance: 'attended',
+      checkedInAt: weekdayFromNow(-14, 13),
+      checkedInByStaffId: SEED.staffDonavanId,
+    },
+    {
+      bookingId: SEED.bookingLolaPastSchoolId,
+      dogId: SEED.dogLolaId,
+      isLead: true,
+      attendance: 'attended',
+      checkedInAt: weekdayFromNow(-10, 13),
+      checkedInByStaffId: SEED.staffRachelId,
+    },
+    {
+      bookingId: SEED.bookingBrodiePastCareId,
+      dogId: SEED.dogBrodieId,
+      isLead: true,
+      attendance: 'attended',
+      checkedInAt: weekdayFromNow(-12, 14),
+      checkedInByStaffId: SEED.staffShanthiId,
+    },
+    {
+      bookingId: SEED.bookingOlliePastCareId,
+      dogId: SEED.dogOllieId,
+      isLead: true,
+      attendance: 'attended',
+      checkedInAt: weekdayFromNow(-8, 14),
+      checkedInByStaffId: SEED.staffShanthiId,
+    },
   ]);
 
   // Billing ledger for Allison — populates the owner app's Invoices tab in

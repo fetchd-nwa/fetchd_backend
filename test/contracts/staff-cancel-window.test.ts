@@ -6,7 +6,7 @@ import { db } from '../../src/db/client.js';
 import { bookings as bookingsTable, cancelWindowSettings } from '../../src/db/schema/schema.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffCancelWindowRoute } from '../../src/routes/staffCancelWindow.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
+import { futureWeekday, FIXTURE_IDS, FIXTURE_NOW, topUpCredits } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -27,8 +27,6 @@ import {
 
 registerFixtureHooks();
 
-const FIXTURE_TODAY_MS = FIXTURE_TODAY.getTime();
-const ONE_DAY_MS = 86_400_000;
 const ONE_HOUR_MS = 3_600_000;
 
 function staffApp(principal = FIXTURE_STAFF_PRINCIPAL): {
@@ -44,22 +42,6 @@ function staffApp(principal = FIXTURE_STAFF_PRINCIPAL): {
  * all categories) so PATCH tests don't bleed into each other. */
 async function resetCancelWindowSettings(): Promise<void> {
   await db.update(cancelWindowSettings).set({ hoursBefore: 48, updatedByStaffId: null });
-}
-
-function futureWeekday(nth: number): string {
-  let count = 0;
-  let offset = 1;
-  for (;;) {
-    const d = new Date(FIXTURE_TODAY_MS + offset * ONE_DAY_MS);
-    const dow = d.getUTCDay();
-    if (dow !== 0 && dow !== 6) {
-      if (count === nth) {
-        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-      }
-      count += 1;
-    }
-    offset += 1;
-  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

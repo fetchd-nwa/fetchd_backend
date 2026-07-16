@@ -63,6 +63,9 @@ export interface NewDogValues {
   specialNotes: string;
   evaluationStatus: EvaluationStatus;
   evaluationDate: string | null;
+  // Shanthi 2026-07-14: profile question. null = unanswered.
+  spayedNeutered: boolean | null;
+  spayNeuterPlannedOn: string | null;
 }
 
 export interface DogUpdate {
@@ -73,6 +76,8 @@ export interface DogUpdate {
   evaluationStatus?: EvaluationStatus;
   evaluationDate?: string | null;
   profileImagePath?: string;
+  spayedNeutered?: boolean | null;
+  spayNeuterPlannedOn?: string | null;
 }
 
 async function findManyByOwner(ownerId: string): Promise<AssembledDog[]> {
@@ -249,6 +254,8 @@ async function create(tx: Tx, values: NewDogValues): Promise<Dog> {
       specialNotes: values.specialNotes,
       evaluationStatus: values.evaluationStatus,
       evaluationDate: values.evaluationDate,
+      spayedNeutered: values.spayedNeutered,
+      spayNeuterPlannedOn: values.spayNeuterPlannedOn,
     })
     .returning();
   if (!row) {
@@ -318,6 +325,28 @@ async function findEvaluationStatusInTx(
     .from(dogs)
     .where(and(inArray(dogs.id, [...dogIds]), live(dogs)));
   return rows;
+}
+
+/**
+ * Batched lookup for the day-program approval-divert rules (Shanthi
+ * 2026-07-14, `lib/bookingApprovalDivert.ts`): staff-owned dogs are exempt
+ * from the divert entirely; `spayedNeutered === false` (explicitly answered
+ * "no", any age) is one of the two divert reasons. Same trust model as
+ * `findEvaluationStatusInTx` — ownership is gated upstream.
+ */
+async function findApprovalDivertFieldsInTx(
+  tx: Tx,
+  dogIds: readonly string[],
+): Promise<{ dogId: string; staffOwnerId: string | null; spayedNeutered: boolean | null }[]> {
+  if (dogIds.length === 0) return [];
+  return tx
+    .select({
+      dogId: dogs.id,
+      staffOwnerId: dogs.staffOwnerId,
+      spayedNeutered: dogs.spayedNeutered,
+    })
+    .from(dogs)
+    .where(and(inArray(dogs.id, [...dogIds]), live(dogs)));
 }
 
 async function softExpire(tx: Tx, id: string): Promise<Dog | undefined> {
@@ -463,6 +492,7 @@ export const dogsRepository = {
   findById,
   findOwnedExists,
   findEvaluationStatusInTx,
+  findApprovalDivertFieldsInTx,
   findOwnerIdInTx,
   findAlumniFlagForStaff,
   lockForAlumniUpdate,

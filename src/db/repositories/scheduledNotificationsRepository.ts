@@ -1,4 +1,4 @@
-import { and, asc, eq, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, like, lte, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { scheduledNotifications } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -61,7 +61,10 @@ export type ScheduledNotificationType =
   // §J.3 monthly attendance scan: an alumni dog attended <2 qualifying
   // sessions in the just-closed Chicago month. Dedupe key doubles as the
   // once-per-month-per-dog guard (`alumni-attendance:<dogId>:<YYYY-MM>`).
-  | 'alumni-attendance';
+  | 'alumni-attendance'
+  // Shanthi 2026-07-14: fires on the owner's stated spay/neuter planned
+  // date, prompting a profile update (`spay-neuter:<dogId>:<date>`).
+  | 'spay-neuter-reminder';
 
 export interface ScheduledNotificationRow {
   id: string;
@@ -194,6 +197,52 @@ export const scheduledNotificationsRepository = {
       })
       .where(
         and(eq(scheduledNotifications.id, args.id), eq(scheduledNotifications.status, 'pending')),
+      )
+      .returning({ id: scheduledNotifications.id });
+    return updated.length;
+  },
+
+  /**
+   * Cancel every still-PENDING row whose dedupe_key starts with `prefix`.
+   * Used by mutations that supersede an earlier enqueue — e.g. the
+   * spay/neuter planned-date reminder (`spay-neuter:<dogId>:`) when the
+   * owner moves the date or marks the dog fixed. Sent rows are history
+   * and stay untouched; the append-only queue records the supersession
+   * as 'cancelled', never a DELETE.
+   */
+  async cancelPendingByDedupePrefix(tx: Tx, prefix: string): Promise<number> {
+    const updated = await tx
+      .update(scheduledNotifications)
+      .set({ status: 'cancelled' })
+      .where(
+        and(
+          eq(scheduledNotifications.status, 'pending'),
+          like(scheduledNotifications.dedupeKey, `${prefix}%`),
+        ),
+      )
+      .returning({ id: scheduledNotifications.id });
+    return updated.length;
+  },
+
+  /**
+   * Revive a previously-CANCELLED row under the same dedupe_key — the
+   * "set date A → change to B → back to A" case, where `enqueueIdempotent`
+   * hits the unique dedupe_key and DO-NOTHINGs. Sent rows stay sent (a
+   * reminder that already fired is history, not re-sendable). Returns the
+   * number of rows revived (0 or 1).
+   */
+  async revivePendingByDedupeKey(
+    tx: Tx,
+    args: { dedupeKey: string; scheduledFor: Date },
+  ): Promise<number> {
+    const updated = await tx
+      .update(scheduledNotifications)
+      .set({ status: 'pending', scheduledFor: args.scheduledFor.toISOString() })
+      .where(
+        and(
+          eq(scheduledNotifications.dedupeKey, args.dedupeKey),
+          eq(scheduledNotifications.status, 'cancelled'),
+        ),
       )
       .returning({ id: scheduledNotifications.id });
     return updated.length;

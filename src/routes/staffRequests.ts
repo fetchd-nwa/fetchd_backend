@@ -8,11 +8,18 @@ import {
   type PendingRequestFullRow,
 } from '../db/repositories/requestsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
+import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { LOCATION_SLUGS, requestStatus } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
+import { bucketToChicagoDate } from '../lib/chicagoDate.js';
+import {
+  createDayProgramBookings,
+  type DayProgramPaymentPlan,
+  type DayProgramSession,
+} from '../lib/createDayProgramBookings.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
@@ -137,15 +144,24 @@ export function registerStaffRequestsRoute(
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(approveBodySchema, request.body ?? {}, 'body');
 
+      // Closure-captured by the day-program conversion arm: which dogs'
+      // credit balances moved + where, for the post-commit cache wipes
+      // (mirrors POST /bookings).
+      let creditDebitedDogIds = new Set<string>();
+      let bookedLocation: LocationKey | null = null;
+
       const outcome = await withMutation<PendingRequestWire>(
         {
           principal,
           idempotencyKey,
           endpoint: 'POST /staff/requests/:id/approve',
           requestHash: hashRequestBody({ id, ...body }),
-          // No cache key wipes today — request reads aren't cached.
-          // Day-19 staff portal queue caching would add `staff:requests:*`.
-          keysToInvalidate: () => [],
+          // Request reads aren't cached; the day-program conversion arm
+          // invalidates availability + moved credit balances.
+          patternsToInvalidate: () => [
+            ...(bookedLocation !== null ? [`avail:${bookedLocation}:*`] : []),
+            ...[...creditDebitedDogIds].map(creditsInvalidationPattern),
+          ],
         },
         async (tx) => {
           // 1. Row-lock the pending_request — serializes concurrent
@@ -170,6 +186,77 @@ export function registerStaffRequestsRoute(
           if (row.category === 'board-and-train') {
             await requestsRepository.markApprovedAwaitingPayment(tx, id, {
               approvedByStaffId: principal.staffId,
+            });
+          } else if (row.category === 'day-school' || row.category === 'day-care') {
+            // Day-program divert conversion (Shanthi 2026-07-14). The request
+            // row carries everything POST /bookings validated at submit —
+            // location, payment plan, exact session instants (preferred_dates)
+            // — so approval takes NO body fields and runs the SAME creation
+            // core the direct booking path uses: gates, credit debits / PAYG
+            // invoice, capacity, overlap guard, reminders. A bounce here
+            // (credits spent meanwhile, capacity filled, new conflict) is a
+            // typed 422 back to the portal; the request stays 'submitted'.
+            const { leadDogId, additionalDogIds } = await readRequestDogIds(tx, id);
+            if (row.location === null) {
+              throw new Error(`day-program request ${id} has no location — divert-create bug`);
+            }
+            const preferred = await requestsRepository.findPreferredDatesByRequestIds([id], tx);
+            if (preferred.length === 0) {
+              throw new Error(`day-program request ${id} has no preferred dates`);
+            }
+            const sessions: DayProgramSession[] = preferred
+              .map((p) => {
+                const scheduledAt = new Date(p.preferredAt);
+                return { date: bucketToChicagoDate(scheduledAt), scheduledAt };
+              })
+              .sort((a, b) => a.date.localeCompare(b.date));
+            const firstSession = sessions[0];
+            if (firstSession === undefined) {
+              throw new Error(`day-program request ${id} has no sessions after mapping`);
+            }
+            let payment: DayProgramPaymentPlan;
+            if (row.payment === 'payg') {
+              if (row.paymentMethodId === null) {
+                throw new Error(`payg request ${id} has no payment_method_id — divert-create bug`);
+              }
+              payment = { kind: 'payg', paymentMethodId: row.paymentMethodId };
+            } else {
+              payment = { kind: 'credits' };
+            }
+
+            const result = await createDayProgramBookings(tx, {
+              ownerId: row.ownerId,
+              category: row.category,
+              leadDogId,
+              additionalDogIds,
+              sessions,
+              location: row.location,
+              notes: row.notesJoint,
+              payment,
+              now: new Date(),
+            });
+            creditDebitedDogIds = result.creditDebitedDogIds;
+            bookedLocation = row.location;
+
+            const firstBooking = result.wires[0];
+            if (firstBooking === undefined) {
+              throw new Error(`day-program conversion ${id} created no bookings`);
+            }
+            // Multi-session conversions create N bookings; the single FK
+            // records the first (earliest date) as the anchor the owner's
+            // request card links to. All N appear in their bookings list.
+            await requestsRepository.markConverted(tx, id, {
+              approvedByStaffId: principal.staffId,
+              convertedBookingId: firstBooking.id,
+            });
+
+            await notificationsRepository.enqueue(tx, {
+              ownerId: row.ownerId,
+              type: 'booking-confirmed',
+              title: 'Booking confirmed',
+              body: notificationBodyFor(row.category, firstSession.scheduledAt),
+              deepLinkPath: `/bookings/${firstBooking.id}`,
+              dogIds: [leadDogId, ...additionalDogIds],
             });
           } else {
             // PL / boarding: validate body, gate pre-check, INSERT
@@ -451,9 +538,15 @@ function notificationBodyFor(
   if (category === 'private-lesson') {
     return `Your private lesson on ${when} is confirmed.`;
   }
-  // Other categories don't currently reach this helper (B&T parks at
-  // awaiting-payment; group-class/day-program use POST /enrollments
-  // and /bookings); the default keeps the fallback honest.
+  if (category === 'day-school') {
+    return `Your Day School booking starting ${when} is approved and confirmed.`;
+  }
+  if (category === 'day-care') {
+    return `Your Day Care booking starting ${when} is approved and confirmed.`;
+  }
+  // Remaining categories don't reach this helper (B&T parks at
+  // awaiting-payment; group-class uses POST /enrollments); the default
+  // keeps the fallback honest.
   return `Your session on ${when} is confirmed.`;
 }
 

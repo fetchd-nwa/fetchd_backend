@@ -89,6 +89,10 @@ export async function checkBookingGates(
     ownerId: string;
     dogIds: readonly string[];
     category: ServiceCategory;
+    /** Group-class only: the cohort's class key, threaded into the vaccine
+     * gate so class-key-exempt requirements are skipped (Shanthi 2026-07-14:
+     * puppy classes don't require rabies). Mirrors the trigger's clause. */
+    groupClassKey?: string;
   },
 ): Promise<void> {
   // 1. Payment — owner has a live payment_methods row. Anti-scam floor
@@ -120,7 +124,12 @@ export async function checkBookingGates(
   //    one round-trip.
   const vaccineGaps: VaccineGap[] = [];
   for (const dogId of args.dogIds) {
-    const missing = await dogVaccinesRepository.findMissingForCategory(tx, dogId, args.category);
+    const missing = await dogVaccinesRepository.findMissingForCategory(
+      tx,
+      dogId,
+      args.category,
+      args.groupClassKey,
+    );
     for (const m of missing) {
       vaccineGaps.push({
         dog_id: dogId,

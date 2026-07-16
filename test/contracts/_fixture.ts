@@ -103,6 +103,11 @@ export const FIXTURE_IDS = {
   booking8Id: '77777777-7777-4777-8777-777777777778',
   booking9Id: '77777777-7777-4777-8777-777777777779',
   bookingDstId: '77777777-7777-4777-8777-77777777777a',
+  // Δ 2026-07-14 staleness anchors: booking6 (dog1 past day-school) is marked
+  // ATTENDED on its roster row, and this past day-care gives dog2 the same —
+  // without a recent attended day program every POST /bookings in this suite
+  // would divert into the approval queue (Shanthi's 3-month re-eval rule).
+  bookingDog2PastCareId: '77777777-7777-4777-8777-77777777777b',
   // Day-5b: credit_packages catalog keys + credit_ledger ids + service_rates
   // ids. Packages use `test-*` text prefixes for the same reason as the
   // catalog rows above (no collision with a future production seed).
@@ -647,6 +652,22 @@ export async function seedFixture(): Promise<void> {
       notes: null,
       location: 'fayetteville',
     },
+    {
+      // Δ 2026-07-14: dog2's staleness anchor — a recently-ATTENDED day-care
+      // (roster row below carries attendance='attended'). Keeps dog2 "fresh"
+      // under the 3-month re-eval divert so pre-existing POST /bookings tests
+      // book instantly; the divert suite builds its own stale dogs.
+      id: FIXTURE_IDS.bookingDog2PastCareId,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: FIXTURE_IDS.dog2Id,
+      category: 'day-care',
+      status: 'past',
+      scheduledAt: '2026-05-11T13:00:00Z',
+      durationMinutes: 540,
+      trainerStaffId: null,
+      notes: null,
+      location: 'bentonville',
+    },
   ]);
 
   // Day-5b catalog, effective-dated since Δ 2026-06-08 (parity with
@@ -870,11 +891,29 @@ export async function seedFixture(): Promise<void> {
     { bookingId: FIXTURE_IDS.booking3Id, dogId: FIXTURE_IDS.dog2Id, isLead: false },
     { bookingId: FIXTURE_IDS.booking4Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking5Id, dogId: FIXTURE_IDS.dog2Id, isLead: true },
-    { bookingId: FIXTURE_IDS.booking6Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
+    // Δ 2026-07-14: the two staleness anchors — dog1's past day-school and
+    // dog2's past day-care are ATTENDED so the fixture dogs book instantly
+    // under the 3-month re-eval divert rule.
+    {
+      bookingId: FIXTURE_IDS.booking6Id,
+      dogId: FIXTURE_IDS.dog1Id,
+      isLead: true,
+      attendance: 'attended' as const,
+      checkedInAt: '2026-05-12T13:05:00Z',
+      checkedInByStaffId: FIXTURE_IDS.staffDonavanId,
+    },
     { bookingId: FIXTURE_IDS.booking7Id, dogId: FIXTURE_IDS.dog2Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking8Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking9Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.bookingDstId, dogId: FIXTURE_IDS.dog1Id, isLead: true },
+    {
+      bookingId: FIXTURE_IDS.bookingDog2PastCareId,
+      dogId: FIXTURE_IDS.dog2Id,
+      isLead: true,
+      attendance: 'attended' as const,
+      checkedInAt: '2026-05-11T13:05:00Z',
+      checkedInByStaffId: FIXTURE_IDS.staffDonavanId,
+    },
   ]);
 
   // Day-5b: credit_ledger entries for Waffles only (Lola has zero ledger
@@ -1777,4 +1816,30 @@ export async function teardownFixture(): Promise<void> {
   // robust to re-seeding mid-run.
   await db.delete(staff).where(eq(staff.id, FIXTURE_IDS.staffDonavanId));
   await db.delete(staff).where(eq(staff.id, FIXTURE_IDS.staffRachelId));
+}
+
+/**
+ * YYYY-MM-DD for the `nth` weekday strictly after FIXTURE_TODAY (n=0 is the
+ * next weekday). Booking-surface tests want weekdays because the default
+ * `day_capacity` for weekends is {school:0, daycare:0} (closed) — a weekend
+ * date 422s on insufficient_capacity before the behavior under test runs.
+ * Extracted 2026-07-15 (the 6th per-file copy tripped the duplication bar);
+ * booking-payg keeps its local dual-anchor variant (it also derives weekdays
+ * from REAL now for the PAYG due-at math).
+ */
+export function futureWeekday(nth: number): string {
+  const ONE_DAY = 86_400_000;
+  let count = 0;
+  let offset = 1;
+  for (;;) {
+    const d = new Date(FIXTURE_TODAY.getTime() + offset * ONE_DAY);
+    const dow = d.getUTCDay();
+    if (dow !== 0 && dow !== 6) {
+      if (count === nth) {
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      }
+      count += 1;
+    }
+    offset += 1;
+  }
 }

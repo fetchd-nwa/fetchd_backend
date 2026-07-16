@@ -2,30 +2,18 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
-import { withCapacityLocks, withDogModeLocks } from '../db/locks.js';
+import { withDogModeLocks } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
-import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
-import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
-import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
-import { serviceRatesRepository } from '../db/repositories/serviceRatesRepository.js';
+import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
-import type { Tx } from '../db/tx.js';
+import type { DivertedBookingWire } from '../contracts/wire.js';
 import { isInView } from '../lib/bookingBucket.js';
-import { dayProgramConflictsWith } from '../lib/bookingConflicts.js';
-import {
-  alreadyBookedError,
-  insufficientCreditsError,
-  type AlreadyBookedConflict,
-  type CreditGap,
-} from '../lib/bookingErrors.js';
+import { resolveApprovalDivert } from '../lib/bookingApprovalDivert.js';
+import { alreadyRequestedError } from '../lib/bookingErrors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
-import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
-import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { bucketChicagoToday, isValidCalendarDate } from '../lib/chicagoDate.js';
 import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
 import {
@@ -36,10 +24,16 @@ import {
   parseDropoffTime,
   type DayProgramCategory,
 } from '../lib/bookingSchedule.js';
-import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
+import type { BookingWire } from '../lib/bookingWire.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
+import {
+  createDayProgramBookings,
+  resolvePaygPlan,
+  type DayProgramPaymentPlan,
+  type DayProgramSession,
+} from '../lib/createDayProgramBookings.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
-import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
+import { wireOneRequest } from '../lib/wireOneRequest.js';
 import { ApiError } from '../lib/errors.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
@@ -109,15 +103,6 @@ const MAX_DATES_PER_REQUEST = 30;
 const MAX_DOGS_PER_REQUEST = 5;
 const MAX_LOOKAHEAD_DAYS = 92;
 const ONE_DAY_MS = 86_400_000;
-
-/**
- * PAYG auto-charge timing — the open `'payg'` invoice is due one hour before
- * the booking's scheduled drop-off, so the worker bills the card just ahead of
- * the session (matching the DATA-CONTRACT 2026-06-19 amendment's "~1h before
- * scheduled_at"). The free-cancel window for day programs is wider than this,
- * so a within-window cancel always voids the invoice before it charges.
- */
-const PAYG_DUE_BEFORE_DROPOFF_MS = 60 * 60 * 1000;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const LOCATION_KEYS = LOCATION_SLUGS;
@@ -311,7 +296,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   app.post(
     '/bookings',
     { preHandler: [authHook] },
-    async (request, reply): Promise<BookingWire[]> => {
+    async (request, reply): Promise<BookingWire[] | DivertedBookingWire> => {
       const principal = requirePrincipal(request);
       requireOwner(principal, 'create a booking');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
@@ -320,11 +305,11 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
 
       // Closure-captured (same pattern as the cancel route's
       // `pendingStripeRefund`): the credits branch debits every dog, PAYG
-      // debits none. `patternsToInvalidate` reads this post-commit to wipe
-      // only the dogs whose balance actually moved.
-      const creditDebitedDogIds = new Set<string>();
+      // and the divert branch debit none. `patternsToInvalidate` reads this
+      // post-commit to wipe only the dogs whose balance actually moved.
+      let creditDebitedDogIds = new Set<string>();
 
-      const outcome = await withMutation<BookingWire[]>(
+      const outcome = await withMutation<BookingWire[] | DivertedBookingWire>(
         {
           principal,
           idempotencyKey,
@@ -344,192 +329,127 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             }
           }
 
-          // 2-6. Locks → gates → capacity/insert/debit.
-          const bookingsWire = await withDogModeLocks(
-            tx,
-            parsed.allDogIds,
-            parsed.mode,
-            parsed.location,
-            () =>
-              withCapacityLocks(tx, parsed.location, parsed.sortedDates, async () => {
-                // Gates (payment → vaccine → agreement) above the DB
-                // trigger floor. See `lib/bookingGatePreCheck.ts` for the
-                // sequence rationale; first failure aborts with full
-                // structured details for that category.
+          // The exact session instants — shared by both branches below.
+          const sessions: DayProgramSession[] = parsed.sortedDates.map((date) => ({
+            date,
+            scheduledAt: computeDayProgramScheduledAt(parsed.category, date, parsed.dropoff),
+          }));
+
+          // 2. Approval divert (Shanthi 2026-07-14, `lib/bookingApprovalDivert`):
+          //    a stale (>3 months since last attended day program, non-alumni)
+          //    or intact dog parks the WHOLE submission as a pending request
+          //    for staff approval instead of booking instantly. Money never
+          //    moves here — credits debit / PAYG invoicing happen at the
+          //    approve conversion, which runs this same creation core.
+          const divertReasons = await resolveApprovalDivert(tx, {
+            dogIds: parsed.allDogIds,
+            now: nowFactory(),
+          });
+          if (divertReasons.length > 0) {
+            // The whole divert branch runs under the SAME (dog, mode) advisory
+            // locks the booking core takes — two concurrent submissions for
+            // the same stale dog serialize here, so the duplicate guard below
+            // can't be raced past (both-pass → two open requests). Same
+            // canonical acquisition order as `createDayProgramBookings`, so
+            // a concurrent instant-book on the same dog serializes too.
+            const requestWire = await withDogModeLocks(
+              tx,
+              parsed.allDogIds,
+              parsed.mode,
+              parsed.location,
+              async () => {
+                // Everything ELSE about the submission must be valid before we
+                // park it in the staff queue — gates + (for PAYG) the card/rate —
+                // so staff never approve into a guaranteed bounce and the owner
+                // fixes real blockers NOW, not after a wasted approval round-trip.
                 await checkBookingGates(tx, {
                   ownerId: principal.ownerId,
                   dogIds: parsed.allDogIds,
                   category: parsed.category,
                 });
+                await resolvePaygPlan(tx, {
+                  payment: parsed.payment,
+                  category: parsed.category,
+                  location: parsed.location,
+                  ownerId: principal.ownerId,
+                  now: nowFactory(),
+                });
 
-                // Payment branch (Δ 2026-06-19). PAYG validates the card + the
-                // active per-day rate up front and SKIPS the credit pre-check;
-                // 'credits' runs the per-dog balance check. `paygPlan` (set only
-                // for PAYG) decides the per-booking money write in the loop:
-                // schedule a card auto-charge vs. debit the credit ledger.
-                const paygPlan = await resolvePaygPlan(tx, parsed, principal.ownerId, nowFactory());
-                if (paygPlan === null) {
-                  // Credit pre-check — every dog needs >= dates.length credits in `mode`.
-                  const creditGaps: CreditGap[] = [];
-                  for (const dogId of parsed.allDogIds) {
-                    const balance =
-                      (await creditLedgerRepository.balanceForDogInTx(
-                        tx,
-                        dogId,
-                        parsed.mode,
-                        parsed.location,
-                      )) ?? 0;
-                    if (balance < parsed.sortedDates.length) {
-                      creditGaps.push({
-                        dog_id: dogId,
-                        mode: parsed.mode,
-                        balance,
-                        required: parsed.sortedDates.length,
-                      });
-                    }
-                  }
-                  if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
-                }
-
-                // Time-overlap guard (booking-overlap) — the authoritative
-                // backstop for the FE conflict engine. Rejects a new day program
-                // that collides with a live session the dog already has: another
-                // day program that day (school + care included), a private /
-                // evaluation whose slot falls inside the day-program window
-                // (a 3:30pm private conflicts, a 6pm private does not), or a
-                // residential stay covering that day (a boarding dog can't also
-                // attend day school). Group classes never conflict. The exact
-                // rules live in `lib/bookingConflicts` (mirrors
-                // `mobile/src/lib/bookingConflicts.ts`, Δ 2026-07-09). Cancelled
-                // rows are excluded (a cancelled day can be re-booked). Runs
-                // under the (location, date) capacity lock, so a concurrent
-                // create on the same bucket can't slip an overlap past this.
-                const conflicts: AlreadyBookedConflict[] = [];
-                for (const dogId of parsed.allDogIds) {
-                  const candidates = await bookingsRepository.findConflictCandidatesForDog(
-                    tx,
-                    dogId,
-                    parsed.sortedDates,
-                  );
-                  for (const date of parsed.sortedDates) {
-                    for (const candidate of candidates) {
-                      if (dayProgramConflictsWith(date, candidate)) {
-                        conflicts.push({ dog_id: dogId, category: candidate.category, date });
-                      }
-                    }
-                  }
-                }
-                if (conflicts.length > 0) throw alreadyBookedError(conflicts);
-
-                // Per-date: capacity → INSERT booking + booking_dogs → money
-                // write (PAYG invoice schedule, or credit-ledger debits).
-                const wires: BookingWire[] = [];
-                for (const date of parsed.sortedDates) {
-                  await dayCapacityRepository.assertCapacityWithinLock(tx, {
-                    location: parsed.location,
-                    date,
-                    mode: parsed.mode,
-                    requestedCount: parsed.allDogIds.length,
-                  });
-
-                  const scheduledAt = computeDayProgramScheduledAt(
-                    parsed.category,
-                    date,
-                    parsed.dropoff,
-                  );
-                  // Resolve the active free-cancel hours from `cancel_window_
-                  // settings` (Day 13 — staff-tunable from the portal). The
-                  // resolved deadline is stamped on the row at creation; a
-                  // later policy change does NOT retroactively re-stamp
-                  // existing bookings.
-                  const hours = await cancelWindowSettingsRepository.resolveHoursFor(
-                    parsed.category,
-                    tx,
-                  );
-                  const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAt, hours);
-
-                  const inserted = await insertBookingWithGateMapping(tx, {
-                    ownerId: principal.ownerId,
-                    leadDogId: parsed.leadDogId,
+                // Duplicate guard — same rule as POST /requests (Day-19d): one
+                // OPEN request per (dog, category) at a time; re-submit once the
+                // pending one resolves.
+                const alreadyRequested = await requestsRepository.findOpenByDogsAndCategory(
+                  tx,
+                  parsed.allDogIds,
+                  parsed.category,
+                );
+                if (alreadyRequested.length > 0) {
+                  throw alreadyRequestedError({
                     category: parsed.category,
-                    scheduledAt,
-                    location: parsed.location,
-                    notes: parsed.notes,
-                    cancelDeadlineAt,
-                    additionalDogIds: parsed.additionalDogIds,
+                    dog_ids: alreadyRequested,
                   });
-
-                  if (paygPlan !== null) {
-                    // PAYG: no credit debit. Schedule a card auto-charge 1h
-                    // before drop-off; the invoiceAutoCharge worker (Day-15)
-                    // bills the open invoice at due_at. A within-window cancel
-                    // voids it (see cancelBookingService).
-                    //
-                    // Amount is the per-day rate × the booking's roster size —
-                    // one combined charge for all dogs on the booking (one
-                    // statement line, one Stripe fee), mirroring the credits
-                    // path's one-debit-per-dog total. dog count is bounded by
-                    // MAX_DOGS_PER_REQUEST.
-                    //
-                    // Cancel-void safety: `cancelDeadlineAt = scheduledAt −
-                    // hours_before`, and the `cancel_window_settings_hours_
-                    // before_check` CHECK (hours_before > 0, integer ⇒ ≥ 1h)
-                    // guarantees `cancelDeadlineAt ≤ dueAt = scheduledAt − 1h`.
-                    // So a within-window cancel always lands before the auto-
-                    // charge and can void the invoice — enforced at the schema
-                    // floor, no app-level guard needed.
-                    const dueAt = new Date(scheduledAt.getTime() - PAYG_DUE_BEFORE_DROPOFF_MS);
-                    await invoicesRepository.createOpen(tx, {
-                      ownerId: principal.ownerId,
-                      amountCents: paygPlan.amountCents * parsed.allDogIds.length,
-                      purpose: 'payg',
-                      paymentMethodId: paygPlan.paymentMethodId,
-                      dueAt: dueAt.toISOString(),
-                      bookingId: inserted.id,
-                    });
-                  } else {
-                    for (const dogId of parsed.allDogIds) {
-                      await creditLedgerRepository.debitForBooking(tx, {
-                        dogId,
-                        mode: parsed.mode,
-                        location: parsed.location,
-                        bookingId: inserted.id,
-                      });
-                      creditDebitedDogIds.add(dogId);
-                    }
-                  }
-
-                  // Day-16: enqueue the scheduled reminder rows for this
-                  // booking. UNIQUE on dedupe_key makes an idempotent replay
-                  // safe; the schedule rows roll back with the booking on
-                  // any later in-tx failure.
-                  await enqueueBookingReminders(tx, {
-                    bookingId: inserted.id,
-                    ownerId: principal.ownerId,
-                    leadDogId: parsed.leadDogId,
-                    category: parsed.category,
-                    scheduledAt,
-                  });
-
-                  // `inserted` IS the BookingRow projection (`bookingsRepository.create`
-                  // RETURNING ...BOOKING_PROJECTION). No re-fetch needed — the route
-                  // assembles the wire shape directly off the inserted row.
-                  wires.push(
-                    toBookingWire(
-                      inserted,
-                      {
-                        lead: parsed.leadDogId,
-                        additional: [...parsed.additionalDogIds].sort(),
-                      },
-                      null /* day programs carry no trainer */,
-                    ),
-                  );
                 }
-                return wires;
-              }),
-          );
 
-          return { status: 201, body: bookingsWire };
+                const { id: requestId } = await requestsRepository.create(tx, {
+                  ownerId: principal.ownerId,
+                  leadDogId: parsed.leadDogId,
+                  category: parsed.category,
+                  notesPerDog: null,
+                  notesJoint: parsed.notes,
+                  staffPreference: null,
+                  descriptorKeys: [],
+                  lengthWeeks: null,
+                  location: parsed.location,
+                  payment: parsed.payment.kind,
+                  ...(parsed.payment.kind === 'payg'
+                    ? { paymentMethodId: parsed.payment.paymentMethodId }
+                    : {}),
+                  divertReasons,
+                });
+                await requestsRepository.addDogs(tx, requestId, {
+                  lead: parsed.leadDogId,
+                  additional: parsed.additionalDogIds,
+                });
+                // The exact session instants ride in preferred_dates — the
+                // approve conversion books them verbatim (no recompute).
+                await requestsRepository.addPreferredDates(
+                  tx,
+                  requestId,
+                  sessions.map((s) => s.scheduledAt.toISOString()),
+                );
+
+                const full = await requestsRepository.findFullByIdInTx(tx, requestId);
+                if (full === undefined) {
+                  throw new Error(`divert ${requestId}: row vanished before re-fetch`);
+                }
+                return wireOneRequest(tx, full);
+              },
+            );
+            return {
+              status: 202,
+              body: { diverted: true, divert_reasons: divertReasons, request: requestWire },
+            };
+          }
+
+          // 3. Fresh dog(s) — book instantly, exactly as before the ruling.
+          //    Locks → gates → payment plan → overlap guard → per-session
+          //    capacity/INSERT/money/reminders all live in the shared core
+          //    (`lib/createDayProgramBookings`, also run by the staff
+          //    approve conversion).
+          const result = await createDayProgramBookings(tx, {
+            ownerId: principal.ownerId,
+            category: parsed.category,
+            leadDogId: parsed.leadDogId,
+            additionalDogIds: parsed.additionalDogIds,
+            sessions,
+            location: parsed.location,
+            notes: parsed.notes,
+            payment: parsed.payment,
+            now: nowFactory(),
+          });
+          creditDebitedDogIds = result.creditDebitedDogIds;
+
+          return { status: 201, body: result.wires };
         },
       );
 
@@ -695,14 +615,6 @@ function parseUuidParam(params: unknown): { id: string } {
  * shape. The route handler doesn't touch the raw Zod-parsed body after
  * this point.
  */
-/**
- * How the group is paid (Δ 2026-06-19). A tagged union so `paymentMethodId`
- * exists *only* on the PAYG arm — `'credits'` carries no card, `'payg'` always
- * carries one (the cross-field requirement is enforced in `validateBookingBody`,
- * not modeled as an optional that downstream code has to re-check).
- */
-type PaymentPlan = { kind: 'credits' } | { kind: 'payg'; paymentMethodId: string };
-
 interface ValidatedBookingBody {
   category: DayProgramCategory;
   leadDogId: string;
@@ -713,7 +625,9 @@ interface ValidatedBookingBody {
   location: (typeof LOCATION_KEYS)[number];
   notes: string | null;
   mode: ReturnType<typeof dayProgramCategoryToMode>;
-  payment: PaymentPlan;
+  // Tagged union (Δ 2026-06-19) — `paymentMethodId` exists only on the PAYG
+  // arm; the cross-field requirement is enforced in `resolvePaymentPlan`.
+  payment: DayProgramPaymentPlan;
 }
 
 function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBookingBody {
@@ -784,75 +698,18 @@ function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBooking
 }
 
 /**
- * Resolve the body's payment fields into the tagged `PaymentPlan`. Default is
- * `'credits'` (omitted `payment`). PAYG requires `payment_method_id` — the
- * card's ownership + liveness is validated in-tx (here we only enforce
- * presence). A `payment_method_id` sent on a `'credits'` group is ignored
- * (additive, backward-compatible).
+ * Resolve the body's payment fields into the tagged `DayProgramPaymentPlan`.
+ * Default is `'credits'` (omitted `payment`). PAYG requires
+ * `payment_method_id` — the card's ownership + liveness is validated in-tx
+ * (`resolvePaygPlan`); here we only enforce presence. A `payment_method_id`
+ * sent on a `'credits'` group is ignored (additive, backward-compatible).
  */
-function resolvePaymentPlan(body: PostBookingBody): PaymentPlan {
+function resolvePaymentPlan(body: PostBookingBody): DayProgramPaymentPlan {
   if ((body.payment ?? 'credits') === 'credits') return { kind: 'credits' };
   if (body.payment_method_id === undefined) {
     throw new ApiError('invalid_payload', 'payment_method_id is required when payment is payg');
   }
   return { kind: 'payg', paymentMethodId: body.payment_method_id };
-}
-
-/** The PAYG money plan resolved in-tx: the validated card + the per-session amount. */
-interface PaygPlan {
-  paymentMethodId: string;
-  amountCents: number;
-}
-
-/**
- * In-tx PAYG validation. Returns `null` for a `'credits'` group (the route runs
- * the credit pre-check instead). For a `'payg'` group, verifies the card is
- * owned + live and resolves the active per-day rate — both 404 on miss
- * (card 404 mirrors `loadStripePaymentContext`'s collapse of not-found /
- * not-yours / soft-expired; rate 404 mirrors `GET /rates`). The returned
- * `amountCents` is the charge per booking date.
- */
-async function resolvePaygPlan(
-  tx: Tx,
-  parsed: ValidatedBookingBody,
-  ownerId: string,
-  now: Date,
-): Promise<PaygPlan | null> {
-  if (parsed.payment.kind !== 'payg') return null;
-
-  const card = await paymentMethodsRepository.findLiveByIdForOwner(tx, {
-    id: parsed.payment.paymentMethodId,
-    ownerId,
-  });
-  if (card === undefined) {
-    throw new ApiError('not_found', `payment method ${parsed.payment.paymentMethodId} not found`);
-  }
-
-  const today = bucketChicagoToday(now);
-  const rate = await serviceRatesRepository.findActiveRate(
-    parsed.category,
-    parsed.location,
-    today,
-    tx,
-  );
-  if (rate === undefined) {
-    throw new ApiError(
-      'not_found',
-      `no active rate for category=${parsed.category} location=${parsed.location} on ${today}`,
-    );
-  }
-
-  // Defense-in-depth (#7): PAYG charges one booking DATE off `amount_cents`, so
-  // the rate MUST be per-day. The staff editor enforces this for day programs,
-  // but a seed/SQL row could bypass it — refuse to charge rather than silently
-  // bill a weekly/flat figure as a daily one. Config invariant → 500 (loud).
-  if (rate.unit !== 'per-day') {
-    throw new Error(
-      `PAYG rate for ${parsed.category} @ ${parsed.location} has unit '${rate.unit}', expected 'per-day' — refusing to charge to avoid mis-billing`,
-    );
-  }
-
-  return { paymentMethodId: parsed.payment.paymentMethodId, amountCents: rate.amount_cents };
 }
 
 /**

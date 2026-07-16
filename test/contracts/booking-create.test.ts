@@ -16,7 +16,13 @@ import {
 import { redis } from '../../src/redis.js';
 import { chicagoWallTimeToUtc } from '../../src/lib/chicagoDate.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
+import {
+  futureWeekday,
+  FIXTURE_IDS,
+  FIXTURE_NOW,
+  FIXTURE_TODAY,
+  topUpCredits,
+} from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -70,29 +76,6 @@ function futureDate(daysAhead: number): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-/**
- * YYYY-MM-DD for the `nth` weekday strictly after FIXTURE_TODAY (n=0 is
- * the next weekday, n=1 is the weekday after that, etc.). Used by every
- * happy-path test so capacity assertions see the weekday default
- * (3 school / 3 daycare openings) rather than the weekend default (0/0).
- */
-function futureWeekday(nth: number): string {
-  let count = 0;
-  let offset = 1;
-  for (;;) {
-    const ms = FIXTURE_TODAY_MS + offset * ONE_DAY_MS;
-    const d = new Date(ms);
-    const dow = d.getUTCDay();
-    if (dow !== 0 && dow !== 6) {
-      if (count === nth) {
-        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-      }
-      count += 1;
-    }
-    offset += 1;
-  }
-}
-
 /** Wipe every `credit_ledger` row for a fixture dog so a test starts
  * from a known balance of zero. Append-only-by-design — the route never
  * deletes ledger rows in normal flow — but this hard-DELETE is test-only
@@ -125,6 +108,30 @@ async function clearDogBookings(dogId: string): Promise<void> {
     await tx.delete(creditLedger).where(inArray(creditLedger.bookingId, ids));
     await tx.delete(bookingDogsTable).where(inArray(bookingDogsTable.bookingId, ids));
     await tx.delete(bookingsTable).where(inArray(bookingsTable.id, ids));
+
+    // Δ 2026-07-14: the wipe just deleted the dog's ATTENDED staleness anchor
+    // (fixture booking6 / bookingDog2PastCareId), which would flip the next
+    // POST /bookings into the approval divert (202) instead of booking (201).
+    // Re-plant a fresh anchor so this helper keeps meaning "isolate bookings",
+    // not "make the dog stale" — the divert suite builds stale dogs its own way.
+    const anchorId = randomUUID();
+    await tx.insert(bookingsTable).values({
+      id: anchorId,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: dogId,
+      category: 'day-school',
+      status: 'past',
+      scheduledAt: '2026-05-12T13:00:00Z',
+      durationMinutes: 540,
+      location: 'fayetteville',
+    });
+    await tx.insert(bookingDogsTable).values({
+      bookingId: anchorId,
+      dogId,
+      isLead: true,
+      attendance: 'attended',
+      checkedInAt: '2026-05-12T13:05:00Z',
+    });
   });
 }
 

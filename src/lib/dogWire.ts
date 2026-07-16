@@ -72,6 +72,12 @@ export interface DogWire {
    * qualifying sessions in a Chicago month — staff re-check before the next
    * booking. Soft surface only in v1 (no booking 422). */
   alumni_attendance_flagged_at?: string;
+  /** Shanthi 2026-07-14 (omit-on-null = unanswered): explicit false diverts
+   * day-program bookings to the staff-approval lane. */
+  spayed_neutered?: boolean;
+  /** YYYY-MM-DD (omit-on-null): the owner's stated spay/neuter date — a
+   * reminder to update the profile fires that morning. */
+  spay_neuter_planned_on?: string;
 }
 
 export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
@@ -101,6 +107,8 @@ export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
   if (dog.alumniAttendanceFlaggedAt !== null) {
     wire.alumni_attendance_flagged_at = pgTimestampToIso(dog.alumniAttendanceFlaggedAt);
   }
+  if (dog.spayedNeutered !== null) wire.spayed_neutered = dog.spayedNeutered;
+  if (dog.spayNeuterPlannedOn !== null) wire.spay_neuter_planned_on = dog.spayNeuterPlannedOn;
 
   const completedKeys = completedClasses.map((c) => c.classKey);
   if (completedKeys.length > 0) wire.completed_class_keys = completedKeys;

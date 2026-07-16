@@ -18,7 +18,13 @@ import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
 import { registerStaffRequestsRoute } from '../../src/routes/staffRequests.js';
 import type { Principal } from '../../src/auth/principal.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
+import {
+  futureWeekday,
+  FIXTURE_IDS,
+  FIXTURE_NOW,
+  FIXTURE_TODAY,
+  topUpCredits,
+} from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -56,9 +62,10 @@ registerFixtureHooks();
 const FIXTURE_TODAY_MS = FIXTURE_TODAY.getTime();
 const ONE_DAY_MS = 86_400_000;
 
-// Real "now" for the requests routes (which use Date.now() for date
-// validation, not the FIXTURE_NOW factory) — pick preferred_dates well
-// in the future of any real run, well within the 92-day cap.
+// The requests route now takes the injected FIXTURE_NOW clock (Δ 2026-07-15
+// — the old Date.now() validation made these hardcoded "far future" dates a
+// time bomb that went off when the real calendar caught up). Relative to
+// FIXTURE_TODAY (2026-05-19) these sit ~57-71 days out, inside the 92-day cap.
 const PREFERRED_1 = '2026-07-15T15:00:00Z';
 const PREFERRED_2 = '2026-07-22T15:00:00Z';
 const APPROVE_SCHEDULED_AT = '2026-07-20T15:00:00Z';
@@ -71,25 +78,6 @@ function futureDate(daysAhead: number): string {
   const ms = FIXTURE_TODAY_MS + daysAhead * ONE_DAY_MS;
   const d = new Date(ms);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-
-/** YYYY-MM-DD for the `nth` weekday strictly after FIXTURE_TODAY (default
- * day_capacity for weekends is {school:0, daycare:0}). */
-function futureWeekday(nth: number): string {
-  let count = 0;
-  let offset = 1;
-  for (;;) {
-    const ms = FIXTURE_TODAY_MS + offset * ONE_DAY_MS;
-    const d = new Date(ms);
-    const dow = d.getUTCDay();
-    if (dow !== 0 && dow !== 6) {
-      if (count === nth) {
-        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-      }
-      count += 1;
-    }
-    offset += 1;
-  }
 }
 
 /** Flip a dog's evaluation_status for the duration of `body`, restoring
@@ -123,7 +111,7 @@ function bookingApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL) {
 
 function requestsApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL) {
   const { app, authenticate } = makeContractApp(principal);
-  registerRequestsRoute(app, { authenticate });
+  registerRequestsRoute(app, { authenticate, now: FIXTURE_NOW });
   registerStaffRequestsRoute(app, { authenticate });
   return { app };
 }

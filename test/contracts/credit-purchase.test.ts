@@ -334,3 +334,154 @@ test(
     await db.delete(charges).where(eq(charges.id, result.chargeId));
   },
 );
+
+// ── quantity (Δ 2026-07-14: N units in one charge / one lot) ──────────────
+
+test(
+  'POST /credit-packages/:key/purchase — quantity 3 → 3× charge amount, 3× credits, one ledger lot WITH expiry',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': `cp-qty-${randomUUID()}` },
+      payload: {
+        dog_id: FIXTURE_IDS.dog1Id,
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
+        quantity: 3,
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as { charge_status: string; credits_granted: number };
+    assert.equal(body.charge_status, 'succeeded');
+    // Fixture school-5 = 5 credits @ 25_000¢ (current window) → ×3.
+    assert.equal(body.credits_granted, 15);
+
+    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    assert.equal(piCalls.length, 1);
+    const piArgs = piCalls[0]!.args as { amountCents: number; metadata: Record<string, string> };
+    assert.equal(piArgs.amountCents, 75_000, 'charged quantity × price_cents');
+    assert.equal(piArgs.metadata.credits, '15', 'metadata carries the TOTAL for the webhook path');
+    assert.equal(piArgs.metadata.quantity, '3');
+
+    // ONE ledger lot for the whole quantity, with the multi-credit expiry
+    // window stamped (total > 1 even though the base pack could be 1-credit).
+    const ledger = await db
+      .select()
+      .from(creditLedger)
+      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+    assert.equal(ledger.length, 1);
+    assert.equal(ledger[0]!.delta, 15);
+    assert.ok(ledger[0]!.expiresAt !== null, 'bulk lot carries an expiry window');
+
+    await cleanupChargesAndLedger();
+  },
+);
+
+test(
+  'POST /credit-packages/:key/purchase — quantity 0 / 101 / non-integer → 400, no Stripe call',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    for (const quantity of [0, 101, 1.5]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+        headers: { 'idempotency-key': `cp-qty-bad-${randomUUID()}` },
+        payload: {
+          dog_id: FIXTURE_IDS.dog1Id,
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          location: 'fayetteville',
+          quantity,
+        },
+      });
+      assert.equal(res.statusCode, 400, `quantity ${quantity} must 400`);
+    }
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+      0,
+      'validation rejects before Stripe',
+    );
+  },
+);
+
+test(
+  'POST /credit-packages/:key/purchase — quantity 3 + declined/unactioned card → 201 requires_payment, ZERO credits, no ledger lot',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentStatus('requires_action');
+    const res = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': `cp-qty-declined-${randomUUID()}` },
+      payload: {
+        dog_id: FIXTURE_IDS.dog1Id,
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
+        quantity: 3,
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as { charge_status: string; credits_granted: number };
+    assert.equal(body.charge_status, 'requires_payment');
+    assert.equal(body.credits_granted, 0, 'no credits on an unsettled quantity charge');
+    const ledger = await db
+      .select()
+      .from(creditLedger)
+      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+    assert.equal(ledger.length, 0, 'no ledger lot until the charge settles');
+    await cleanupChargesAndLedger();
+  },
+);
+
+test(
+  'POST /credit-packages/:key/purchase — quantity replay with same key → identical body, ONE charge, ONE 15-credit lot',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    const key = `cp-qty-replay-${randomUUID()}`;
+    const payload = {
+      dog_id: FIXTURE_IDS.dog1Id,
+      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      location: 'fayetteville' as const,
+      quantity: 3,
+    };
+    const first = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': key },
+      payload,
+    });
+    assert.equal(first.statusCode, 201, first.body);
+    const replay = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': key },
+      payload,
+    });
+    assert.equal(replay.statusCode, 201);
+    assert.deepEqual(replay.json(), first.json());
+    // The Stripe call sits OUTSIDE withMutation by design, so the retry
+    // re-calls it — but under the SAME `${key}:payment-intent` idempotency
+    // key, so Stripe returns the SAME intent (the deepEqual above proves the
+    // PI id matched). What must never double is the DB half below.
+    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    assert.equal(piCalls.length, 2);
+    assert.equal(piCalls[0]!.idempotencyKey, piCalls[1]!.idempotencyKey);
+    const chargesRows = await db
+      .select()
+      .from(charges)
+      .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+    assert.equal(chargesRows.length, 1);
+    const ledger = await db
+      .select()
+      .from(creditLedger)
+      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+    assert.equal(ledger.length, 1);
+    assert.equal(ledger[0]!.delta, 15);
+    await cleanupChargesAndLedger();
+  },
+);

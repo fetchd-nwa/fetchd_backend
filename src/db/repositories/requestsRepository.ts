@@ -60,6 +60,8 @@ export interface PendingRequestFullRow extends PendingRequestRow {
   leadDogId: string;
   approvedByStaffId: string | null;
   expiredAt: string | null;
+  /** PAYG divert requests carry the card to auto-charge; never on the wire. */
+  paymentMethodId: string | null;
 }
 
 const PENDING_REQUEST_PROJECTION = {
@@ -74,6 +76,10 @@ const PENDING_REQUEST_PROJECTION = {
   lengthWeeks: pendingRequests.lengthWeeks,
   approvedAt: pendingRequests.approvedAt,
   convertedBookingId: pendingRequests.convertedBookingId,
+  // Day-program divert columns (Shanthi 2026-07-14).
+  location: pendingRequests.location,
+  payment: pendingRequests.payment,
+  divertReasons: pendingRequests.divertReasons,
 } as const;
 
 const PENDING_REQUEST_FULL_PROJECTION = {
@@ -82,6 +88,7 @@ const PENDING_REQUEST_FULL_PROJECTION = {
   leadDogId: pendingRequests.leadDogId,
   approvedByStaffId: pendingRequests.approvedByStaffId,
   expiredAt: pendingRequests.expiredAt,
+  paymentMethodId: pendingRequests.paymentMethodId,
 } as const;
 
 // A request is "open" (still in flight) in these states — the Day-19d
@@ -290,6 +297,12 @@ export const requestsRepository = {
       staffPreference: string | null;
       descriptorKeys: string[];
       lengthWeeks: number | null;
+      // Day-program divert fields (Shanthi 2026-07-14) — omitted by the
+      // classic POST /requests categories.
+      location?: 'fayetteville' | 'bentonville';
+      payment?: 'credits' | 'payg';
+      paymentMethodId?: string;
+      divertReasons?: string[];
     },
   ): Promise<{ id: string }> {
     const [row] = await tx
@@ -303,6 +316,10 @@ export const requestsRepository = {
         staffPreference: values.staffPreference,
         descriptorKeys: values.descriptorKeys,
         lengthWeeks: values.lengthWeeks,
+        location: values.location ?? null,
+        payment: values.payment ?? null,
+        paymentMethodId: values.paymentMethodId ?? null,
+        divertReasons: values.divertReasons ?? [],
         // status defaults to 'submitted' (schema); submittedAt /
         // createdAt / updatedAt default to now(); source defaults to
         // 'app'; expiredAt remains NULL (live).

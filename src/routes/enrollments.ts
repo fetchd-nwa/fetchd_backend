@@ -278,6 +278,9 @@ export function registerEnrollmentsRoute(
             ownerId: principal.ownerId,
             dogIds: parsed.dogIds,
             category: 'group-class',
+            // Threads the cohort's class into the vaccine gate so class-key-
+            // exempt requirements are skipped (puppy classes: no rabies yet).
+            groupClassKey: cohortRow.classKey,
           });
 
           // 7. Materialize per-week scheduled_at (DST-preserving Chicago

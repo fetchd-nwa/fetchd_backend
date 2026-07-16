@@ -157,8 +157,21 @@ const patchRequestBodySchema = z
 
 type PatchRequestBody = z.infer<typeof patchRequestBodySchema>;
 
-export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
+export interface RequestsRouteOptions extends AuthRouteOptions {
+  /**
+   * Injectable clock for the preferred-date window validation (in-the-future
+   * + 92-day lookahead). Contract tests inject the frozen fixture clock so
+   * date fixtures never expire as the real calendar advances — this seam's
+   * absence was a literal time bomb: hardcoded "far future" test dates
+   * (2026-07-15) started failing the day the calendar caught up. Default =
+   * `() => new Date()`.
+   */
+  now?: () => Date;
+}
+
+export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
+  const nowFactory = opts.now ?? ((): Date => new Date());
 
   // --- GET /requests?status= ----------------------------------------------
   app.get(
@@ -228,7 +241,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
       requireOwner(principal, 'submit a request');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postRequestBodySchema, request.body, 'body');
-      const parsed = validatePostRequestBody(body);
+      const parsed = validatePostRequestBody(body, nowFactory());
 
       const outcome = await withMutation<PendingRequestWire>(
         {
@@ -354,7 +367,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: AuthRouteOptio
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(patchRequestBodySchema, request.body, 'body');
-      const parsed = validatePatchRequestBody(body);
+      const parsed = validatePatchRequestBody(body, nowFactory());
 
       const outcome = await withMutation<PendingRequestWire>(
         {
@@ -492,8 +505,8 @@ function parseUuidParam(params: unknown): { id: string } {
  * Preferred-date invariants shared by POST + PATCH: distinct, in the future,
  * and within MAX_LOOKAHEAD_DAYS. Throws invalid_payload on the first offender.
  */
-function assertPreferredDatesWithinWindow(dates: readonly string[]): void {
-  const nowMs = Date.now();
+function assertPreferredDatesWithinWindow(dates: readonly string[], now: Date): void {
+  const nowMs = now.getTime();
   const lookAheadMs = nowMs + MAX_LOOKAHEAD_DAYS * ONE_DAY_MS;
   const seen = new Set<string>();
   for (const iso of dates) {
@@ -538,7 +551,7 @@ interface ValidatedPostRequestBody {
  *   - Dog ids distinct; lead not in additionals; all preferred dates
  *     in the future + within MAX_LOOKAHEAD_DAYS.
  */
-function validatePostRequestBody(body: PostRequestBody): ValidatedPostRequestBody {
+function validatePostRequestBody(body: PostRequestBody, now: Date): ValidatedPostRequestBody {
   const additionalDogIds = body.additional_dog_ids ?? [];
   const allDogIds = [body.lead_dog_id, ...additionalDogIds];
 
@@ -572,7 +585,7 @@ function validatePostRequestBody(body: PostRequestBody): ValidatedPostRequestBod
     );
   }
 
-  assertPreferredDatesWithinWindow(body.preferred_dates);
+  assertPreferredDatesWithinWindow(body.preferred_dates, now);
 
   return {
     category: body.category,
@@ -598,7 +611,7 @@ interface ValidatedPatchRequestBody {
   preferredDates: string[] | undefined;
 }
 
-function validatePatchRequestBody(body: PatchRequestBody): ValidatedPatchRequestBody {
+function validatePatchRequestBody(body: PatchRequestBody, now: Date): ValidatedPatchRequestBody {
   // Identity fields are locked — reject before the repo. Cross-owner
   // re-target via PATCH would be a privilege-escalation if it landed.
   if (body.category !== undefined) {
@@ -613,7 +626,7 @@ function validatePatchRequestBody(body: PatchRequestBody): ValidatedPatchRequest
 
   // Preferred dates — same future-window check as POST.
   if (body.preferred_dates !== undefined) {
-    assertPreferredDatesWithinWindow(body.preferred_dates);
+    assertPreferredDatesWithinWindow(body.preferred_dates, now);
   }
 
   // Notes / focus / length_weeks — undefined = leave unchanged; null =
