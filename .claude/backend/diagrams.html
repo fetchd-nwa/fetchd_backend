@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NWA Backend — Diagrams</title>
+<!--
+  GENERATED VIEWER. Source of truth = .claude/backend/schema.sql and
+  .claude/backend/DIAGRAMS.md. This file just renders the same Mermaid in a
+  browser so you can open it directly (no install) and Print → Save as PDF or
+  screenshot for sharing. If schema.sql / DIAGRAMS.md change, regenerate this.
+  Needs internet on first open (Mermaid loads from CDN, then browser-caches).
+-->
+<style>
+  :root { --navy:#21356A; --bg:#eef1f8; --card:#ffffff; --muted:#6a85b0; --border:#d4dcec; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--navy);
+         font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { background:var(--navy); color:#fff; padding:22px 28px; }
+  header h1 { margin:0 0 4px; font-size:22px; }
+  header p  { margin:0; opacity:.8; font-size:13px; }
+  main { max-width:1200px; margin:0 auto; padding:24px; }
+  section { background:var(--card); border:1px solid var(--border);
+            border-radius:14px; padding:20px 22px; margin:0 0 22px;
+            box-shadow:0 4px 16px rgba(33,53,106,.06); }
+  section h2 { margin:0 0 4px; font-size:18px; }
+  section .sub { color:var(--muted); font-size:13px; margin:0 0 14px; }
+  .mermaid { overflow-x:auto; text-align:center; }
+  footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
+  @media print {
+    body { background:#fff; }
+    header { background:#fff; color:var(--navy); border-bottom:2px solid var(--navy); }
+    section { box-shadow:none; break-inside:avoid; page-break-after:always; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>NWA School for Dogs — Phase&nbsp;3 Backend</h1>
+  <p>Rendered from schema.sql / DIAGRAMS.md · Print → Save as PDF for a shareable copy</p>
+</header>
+<main>
+
+  <section>
+    <h2>1 · System topology</h2>
+    <p class="sub">Clients → Supabase Auth → Node API → Postgres / Redis / Stripe / Expo</p>
+    <pre class="mermaid">
+flowchart TD
+  subgraph CLIENTS[Clients]
+    RN["RN owner app<br/>(Expo · iOS/Android)<br/>TanStack Query cache"]
+    PORTAL["Staff portal<br/>(minimal web · 4 verbs)"]
+  end
+  SUPA["Supabase Auth<br/>(owners + staff · role claim)<br/>— ONLY Supabase service"]
+  subgraph NODE["Node.js API — all domain logic"]
+    MW["Middleware:<br/>verify Supabase JWT (JWKS)<br/>resolve owners/staff mirror row<br/>enforce role/ownership"]
+    SVC["Services (ported from src/services)"]
+    DAL["DB access layer"]
+  end
+  PG[("Postgres<br/>self-hosted")]
+  REDIS[("Redis<br/>cache · rate-limit · sessions")]
+  STRIPE["Stripe<br/>(secret key in Node env)"]
+  R2[("Cloudflare R2<br/>media object store (private)")]
+  EXPO["Expo Push"]
+  RN -->|"email/pw → JWT"| SUPA
+  PORTAL -->|"role:staff → JWT"| SUPA
+  RN -->|"HTTPS + Bearer JWT"| MW
+  PORTAL -->|"HTTPS + Bearer JWT"| MW
+  MW --> SVC --> DAL --> PG
+  SVC <-->|"read-through / invalidate"| REDIS
+  SVC -->|"PaymentIntent / Subscription"| STRIPE
+  STRIPE -->|"signed webhook"| MW
+  SVC -->|"push events"| EXPO
+  EXPO -->|"APNs / FCM"| RN
+  SUPA -.->|"Auth webhook → upsert mirror row"| MW
+    </pre>
+  </section>
+
+  <section>
+    <h2>2 · Full entity-relationship diagram</h2>
+    <p class="sub">Every table in schema.sql · keys + relationships (full columns live in schema.sql)</p>
+    <pre class="mermaid">
+erDiagram
+  owners { uuid id PK
+    uuid supabase_uid UK
+    text email
+    text external_ref
+    record_source source }
+  staff { uuid id PK
+    uuid supabase_uid UK
+    staff_role role }
+  dogs { uuid id PK
+    uuid owner_id FK
+    uuid staff_owner_id FK
+    uuid primary_vet_id FK
+    boolean capacity_exempt
+    text name
+    date birthdate
+    timestamptz expired_at
+    text external_ref }
+  vets { uuid id PK
+    text name
+    text phone
+    text email
+    text address }
+  audit_log { bigint id PK
+    text table_name
+    text row_pk
+    text op
+    jsonb before
+    timestamptz at }
+  required_vaccines { text key PK
+    service_category gates_categories }
+  dog_vaccines { uuid id PK
+    uuid dog_id FK
+    text requirement_key FK }
+  dog_medications { uuid id PK
+    uuid dog_id FK }
+  dog_feeding { uuid dog_id PK_FK }
+  dog_completed_classes { uuid id PK
+    uuid dog_id FK
+    group_class_key class_key }
+  group_classes { group_class_key key PK
+    integer capacity
+    group_class_key prereq_class_key FK }
+  cohorts { uuid id PK
+    group_class_key class_key FK
+    integer capacity
+    integer filled }
+  reports { uuid id PK
+    uuid dog_id FK
+    uuid trainer_staff_id FK
+    report_program program
+    jsonb results
+    jsonb content }
+  media_assets { uuid id PK
+    uuid owner_id FK
+    uuid dog_id FK
+    uuid report_id FK
+    media_kind kind
+    media_purpose purpose
+    text object_key
+    jsonb derivatives }
+  bookings { uuid id PK
+    uuid owner_id FK
+    uuid lead_dog_id FK
+    service_category category
+    location_key location
+    boolean cancel_forfeited
+    uuid cohort_id FK
+    uuid report_id FK
+    uuid session_report_id FK }
+  booking_dogs { uuid booking_id PK_FK
+    uuid dog_id PK_FK
+    boolean is_lead
+    booking_attendance attendance }
+  after_school_optins { uuid id PK
+    uuid booking_id FK
+    service_category booking_category
+    uuid dog_id FK
+    integer school_day_count }
+  pending_requests { uuid id PK
+    uuid owner_id FK
+    uuid lead_dog_id FK
+    request_status status
+    uuid approved_by_staff_id FK
+    uuid converted_booking_id FK }
+  pending_request_dogs { uuid request_id PK_FK
+    uuid dog_id PK_FK }
+  pending_request_preferred_dates { uuid request_id PK_FK
+    smallint ordinal PK }
+  day_capacity { location_key location PK
+    date date PK
+    integer school_openings
+    integer daycare_openings }
+  credit_packages { text key PK
+    booking_mode mode
+    integer credits }
+  credit_ledger { uuid id PK
+    uuid dog_id FK
+    booking_mode mode
+    integer delta
+    ledger_reason reason
+    uuid booking_id FK
+    text package_key FK
+    uuid charge_id FK }
+  stripe_customers { uuid owner_id PK_FK
+    text stripe_customer_id UK }
+  payment_methods { uuid id PK
+    uuid owner_id FK
+    text stripe_payment_method_id UK
+    boolean is_default }
+  charges { uuid id PK
+    uuid owner_id FK
+    text stripe_payment_intent_id UK
+    charge_purpose purpose
+    uuid booking_id FK }
+  memberships { uuid id PK
+    uuid owner_id FK
+    uuid dog_id FK
+    booking_mode mode }
+  refunds { uuid id PK
+    uuid owner_id FK
+    uuid charge_id FK
+    uuid booking_id FK
+    refund_status status }
+  service_rates { uuid id PK
+    service_category category
+    location_key location
+    rate_unit unit
+    date effective_from
+    date effective_to }
+  agreement_documents { text key PK
+    integer current_version
+    service_category applies_to }
+  agreement_signatures { uuid id PK
+    uuid owner_id FK
+    text document_key FK
+    integer version }
+  idempotency_keys { text key PK
+    uuid owner_id FK
+    text endpoint }
+  threads { uuid id PK
+    uuid owner_id FK
+    uuid participant_staff_id FK
+    thread_category category }
+  thread_dogs { uuid thread_id PK_FK
+    uuid dog_id PK_FK }
+  messages { uuid id PK
+    uuid thread_id FK
+    sender_kind sender_kind
+    uuid sender_owner_id FK
+    uuid sender_staff_id FK }
+  event_series { uuid id PK
+    text name
+    text cadence
+    boolean is_active }
+  events { uuid id PK
+    text name
+    integer capacity }
+  event_rsvps { uuid id PK
+    uuid event_id FK
+    uuid owner_id FK }
+  event_rsvp_dogs { uuid rsvp_id PK_FK
+    uuid dog_id PK_FK }
+  invoices { uuid id PK
+    uuid owner_id FK
+    integer amount_cents
+    invoice_status status
+    charge_purpose purpose
+    uuid payment_method_id FK
+    uuid paid_charge_id FK }
+  scheduled_notifications { uuid id PK
+    uuid owner_id FK
+    notification_type type
+    text trigger
+    timestamptz scheduled_for
+    scheduled_status status
+    uuid booking_id FK }
+  notifications { uuid id PK
+    uuid owner_id FK
+    notification_type type
+    uuid sender_staff_id FK }
+  notification_dogs { uuid notification_id PK_FK
+    uuid dog_id PK_FK }
+  announcements { uuid id PK
+    announcement_category category
+    boolean is_pinned }
+  device_tokens { uuid id PK
+    uuid owner_id FK
+    text expo_push_token }
+
+  owners ||--o{ dogs : owns
+  owners ||--o{ media_assets : uploads
+  dogs ||--o{ media_assets : has
+  reports ||--o{ media_assets : has
+  owners ||--o{ bookings : "owns (denorm)"
+  owners ||--o{ pending_requests : submits
+  owners ||--o{ threads : participates
+  owners ||--o{ payment_methods : has
+  owners ||--o{ charges : billed
+  owners ||--o{ memberships : subscribes
+  owners ||--o{ notifications : receives
+  owners ||--o| stripe_customers : maps
+  owners ||--o{ event_rsvps : rsvps
+  owners ||--o{ device_tokens : registers
+  owners ||--o{ refunds : refunded
+  owners ||--o{ agreement_signatures : signs
+  owners ||--o{ idempotency_keys : "dedupes (transport)"
+  staff ||--o{ reports : authors
+  staff ||--o{ bookings : trains
+  staff ||--o{ pending_requests : approves
+  staff ||--o{ threads : participant
+  staff ||--o{ messages : sends
+  vets ||--o{ dogs : "primary vet"
+  required_vaccines ||--o{ dog_vaccines : "satisfied by"
+  dogs ||--o{ dog_vaccines : has
+  dogs ||--o{ dog_medications : has
+  dogs ||--|| dog_feeding : has
+  dogs ||--o{ dog_completed_classes : completed
+  dogs ||--o{ booking_dogs : on
+  dogs ||--o{ pending_request_dogs : on
+  dogs ||--o{ reports : about
+  dogs ||--o{ credit_ledger : "credits for"
+  dogs ||--o{ thread_dogs : about
+  dogs ||--o{ event_rsvp_dogs : attends
+  dogs ||--o{ notification_dogs : about
+  dogs ||--o{ memberships : covered
+  group_classes ||--o{ cohorts : runs
+  group_classes ||--o{ dog_completed_classes : credited
+  group_classes ||--o| group_classes : prereq
+  cohorts ||--o{ bookings : "weekly rows"
+  reports ||--o{ bookings : "session_report_id"
+  bookings ||--o{ booking_dogs : includes
+  bookings ||--o{ after_school_optins : "after-school (day-school only)"
+  dogs ||--o{ after_school_optins : opts-in
+  bookings ||--o| reports : "report_id (1:1)"
+  bookings ||--o{ credit_ledger : debits
+  bookings ||--o{ charges : "pays (payg)"
+  pending_requests ||--o{ pending_request_dogs : includes
+  pending_requests ||--o{ pending_request_preferred_dates : ranks
+  pending_requests ||--o| bookings : converted
+  credit_packages ||--o{ credit_ledger : grants
+  charges ||--o{ credit_ledger : "funds (purchase)"
+  charges ||--o{ refunds : "refunded by"
+  bookings ||--o{ refunds : "cancellation refund"
+  agreement_documents ||--o{ agreement_signatures : "signed at version"
+  threads ||--o{ thread_dogs : about
+  threads ||--o{ messages : contains
+  event_series ||--o{ events : occurrences
+  events ||--o{ event_rsvps : has
+  event_rsvps ||--o{ event_rsvp_dogs : includes
+  notifications ||--o{ notification_dogs : about
+  owners ||--o{ scheduled_notifications : queued
+  bookings ||--o{ scheduled_notifications : triggers
+  owners ||--o{ invoices : owes
+  bookings ||--o| invoices : "pay-later"
+  cohorts ||--o{ invoices : "pay-later"
+    </pre>
+  </section>
+
+  <section>
+    <h2>3 · Auth + request lifecycle</h2>
+    <p class="sub">JWT → mirror-row resolve → cache/DB → response</p>
+    <pre class="mermaid">
+sequenceDiagram
+  participant C as Client (RN or portal)
+  participant S as Supabase Auth
+  participant N as Node API (middleware)
+  participant DB as Postgres
+  participant R as Redis
+  C->>S: sign in (email/pw)
+  S-->>C: session JWT (sub, role)
+  C->>N: request + Bearer JWT
+  N->>S: verify signature (JWKS, cached)
+  N->>DB: resolve sub → owners/staff mirror row (upsert on first sight)
+  N->>N: enforce role + ownership (no RLS)
+  alt cache hit
+    N->>R: GET cached read
+    R-->>N: value
+  else miss / mutation
+    N->>DB: query / transaction
+    N->>R: set / invalidate keys
+  end
+  N-->>C: JSON (DATA-CONTRACT.md wire shape)
+    </pre>
+  </section>
+
+  <section>
+    <h2>4 · Group-class enrollment transaction</h2>
+    <p class="sub">One-transaction-or-nothing (request-approval &amp; credit-debited booking follow the same shape)</p>
+    <pre class="mermaid">
+flowchart TD
+  A["POST /enrollments<br/>{ cohortId, dogIds[] }"] --> B{"BEGIN txn"}
+  B --> C["SELECT cohorts WHERE id=$1 FOR UPDATE"]
+  C --> D{"filled + len(dogIds) ≤ capacity ?"}
+  D -- no --> E["ROLLBACK → 409 capacity"]
+  D -- yes --> F["INSERT len(dogIds) × weeks bookings<br/>(+ booking_dogs, cohort_id, session_report_id)"]
+  F --> G["UPDATE cohorts SET filled = filled + len(dogIds)"]
+  G --> H["COMMIT"]
+  H --> I["invalidate Redis cohorts:{classKey} + enqueue notifications"]
+    </pre>
+  </section>
+
+  <section>
+    <h2>5 · Booking-creation gates</h2>
+    <p class="sub">Three unbypassable BEFORE-INSERT trigger floors on every bookings row · staff-owned dogs exempt</p>
+    <pre class="mermaid">
+flowchart TD
+  A["INSERT INTO bookings<br/>(enroll · book · request→convert)"] --> S{"lead dog<br/>staff-owned?"}
+  S -- yes --> OK["row inserted<br/>(staff exempt)"]
+  S -- no --> P{"owner has a LIVE<br/>card on file?"}
+  P -- no --> X1["RAISE → API 4xx<br/>'add a card' (anti-scam)"]
+  P -- yes --> V{"lead dog current on<br/>required vaccines?<br/>(America/Chicago)"}
+  V -- no --> X2["RAISE → API 422<br/>'vaccine due'"]
+  V -- yes --> G{"owner signed current<br/>required agreements?"}
+  G -- no --> X3["RAISE → API 422<br/>'sign waiver'"]
+  G -- yes --> OK
+    </pre>
+  </section>
+
+</main>
+<footer>Source of truth: <code>.claude/backend/schema.sql</code> + <code>DIAGRAMS.md</code>. Regenerate this viewer when they change.</footer>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral', securityLevel: 'loose' });
+</script>
+</body>
+</html>
