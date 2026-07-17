@@ -1,0 +1,98 @@
+# Local-dev stack for the Phase-3 Node API. CI parity: same `postgres:16`
+# image, same schema-load step — only the orchestration differs (CI uses
+# the GitHub-Actions services block; local uses this compose file).
+#
+# Two pg containers, isolated:
+#   - `db` (fetchd-db, port 5432) — DEV data, source of truth. What
+#     `npm run dev` and a SQL client point at. Persistent volume.
+#   - `db-test` (fetchd-db-test, port 5433) — TEST target. What `npm test`
+#     points at. Contract tests hard-DELETE their fixture rows on
+#     teardown — keeping that out of the dev DB means no risk of test
+#     scaffolding ever clobbering work you're mid-flight on.
+# Both ship the same schema (the same `.claude/backend/schema.sql` mount).
+#
+# Quickstart:
+#   docker compose up -d           # spin up db + redis (dev stack)
+#   cp .env.local.example .env.local             # point env at dev pg
+#   npm test                       # auto-spins db-test, runs against it
+#
+# Schema bootstrap: `.claude/backend/schema.sql` is mounted into each pg
+# image's docker-entrypoint-initdb.d, which runs each .sql file exactly
+# ONCE — on the FIRST start against an empty data volume. To force a
+# re-init after editing schema.sql, drop the relevant volume:
+#   docker compose down -v && docker compose up -d           # everything
+#   docker volume rm fetchd-pg-test-data                     # just test
+#
+# Volumes are named (not anonymous) so `docker compose down` preserves
+# data across normal restarts; only `down -v` nukes them.
+
+services:
+  db:
+    image: postgres:16
+    container_name: fetchd-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - fetchd-pg-data:/var/lib/postgresql/data
+      # The canonical DDL. Auto-loaded on first init. The DEV-RESET preamble
+      # (commented DROP SCHEMA at the top) stays commented in git — the
+      # api-ci `schema-load` job asserts this, and a stray uncomment would
+      # wipe the volume here on next re-init too.
+      - ./.claude/backend/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgres']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: fetchd-redis
+    ports:
+      - '6379:6379'
+    # Day-5 read surface doesn't yet USE Redis (Day 8 wires the cache),
+    # but `REDIS_URL` is required at boot — keeping a real local Redis
+    # means the env validation always points at something live. Both
+    # services live and die together: `docker compose up -d` brings up
+    # the full stack, `docker compose down` tears it all down.
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ----- TEST PG --------------------------------------------------------
+  # Same image, same schema mount as `db`, but isolated volume + port. The
+  # contract-test suite (`npm test`) points DATABASE_URL at this on 5433;
+  # dev tooling continues to use `db` on 5432. The fixture's hard-DELETE
+  # teardown writes only ever land here. NOT started by `docker compose
+  # up -d` by default — `npm test` auto-spins it via the `pretest` hook.
+  db-test:
+    image: postgres:16
+    container_name: fetchd-db-test
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - '5433:5432'
+    volumes:
+      - fetchd-pg-test-data:/var/lib/postgresql/data
+      - ./.claude/backend/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    profiles:
+      - test
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgres']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  fetchd-pg-data:
+    name: fetchd-pg-data
+  fetchd-pg-test-data:
+    name: fetchd-pg-test-data

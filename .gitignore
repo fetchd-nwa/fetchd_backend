@@ -5,6 +5,12 @@ dist/
 !.env.example
 !.env.local.example
 
+# macOS
+.DS_Store
+
+# Claude Code per-machine permission grants
+.claude/settings.local.json
+
 # drizzle-kit pull regenerates these migration-tooling byproducts every run.
 # Day-0 locks #1/#5: Drizzle is query-only, schema.sql is the canonical DDL —
 # only the typed query surface (schema.ts / relations.ts) is committed.
