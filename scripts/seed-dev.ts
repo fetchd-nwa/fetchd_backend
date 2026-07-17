@@ -24,6 +24,8 @@
  *
  * Re-runnable: wipes the managed tables in child→parent FK order, then inserts.
  */
+import { and, inArray, like, not } from 'drizzle-orm';
+
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
 import {
@@ -246,6 +248,68 @@ async function wipe(): Promise<void> {
   await db.delete(dogs);
   await db.delete(owners);
   await db.delete(staff);
+}
+
+// Real Stripe rows survive a re-seed (Δ 2026-07-16). The wipe has to clear
+// stripe_customers + payment_methods (FK order), but those tables can hold
+// LIVE test-mode objects: the lazily-provisioned customer and any card added
+// through the app. Wiping them cost Allison her real test card on every
+// re-seed. Only rows for the seeded owners can be carried across — the wipe
+// drops every other owner id. Lingering `cus_seed_%` / `pm_seed_%` fakes from
+// pre-2026-07-14 seeds are deliberately NOT preserved.
+const SEEDED_OWNER_IDS = [SEED.ownerAllisonId, SEED.ownerJordanId];
+
+type RealStripeRows = {
+  customers: (typeof stripeCustomers.$inferSelect)[];
+  cards: (typeof paymentMethods.$inferSelect)[];
+};
+
+async function captureRealStripeRows(): Promise<RealStripeRows> {
+  const customers = await db
+    .select()
+    .from(stripeCustomers)
+    .where(
+      and(
+        inArray(stripeCustomers.ownerId, SEEDED_OWNER_IDS),
+        not(like(stripeCustomers.stripeCustomerId, 'cus_seed_%')),
+      ),
+    );
+  const cards = await db
+    .select()
+    .from(paymentMethods)
+    .where(
+      and(
+        inArray(paymentMethods.ownerId, SEEDED_OWNER_IDS),
+        not(like(paymentMethods.stripePaymentMethodId, 'pm_seed_%')),
+      ),
+    );
+  return { customers, cards };
+}
+
+async function restoreRealStripeRows({ customers, cards }: RealStripeRows): Promise<void> {
+  if (customers.length > 0) {
+    await db.insert(stripeCustomers).values(customers);
+  }
+  if (cards.length === 0) return;
+  // A restored real card keeps its default flag — it's the card the owner
+  // actually pays with. The `payment_methods_one_default` partial index
+  // allows one live default per owner, so demote that owner's seeded
+  // placeholder before inserting.
+  const ownersWithRealDefault = [
+    ...new Set(cards.filter((c) => c.isDefault && c.expiredAt === null).map((c) => c.ownerId)),
+  ];
+  if (ownersWithRealDefault.length > 0) {
+    await db
+      .update(paymentMethods)
+      .set({ isDefault: false })
+      .where(
+        and(
+          inArray(paymentMethods.ownerId, ownersWithRealDefault),
+          like(paymentMethods.stripePaymentMethodId, 'pm_seed_%'),
+        ),
+      );
+  }
+  await db.insert(paymentMethods).values(cards);
 }
 
 async function seed(): Promise<void> {
@@ -1195,11 +1259,14 @@ async function seed(): Promise<void> {
 
 async function main(): Promise<void> {
   assertLocalDb();
+  const preserved = await captureRealStripeRows();
   await wipe();
   await seed();
+  await restoreRealStripeRows(preserved);
   console.log(
     `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 4 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
       `2 threads, 4 group classes + 7 cohorts, billing ledger, 6 announcements, 1 event. ` +
+      `Preserved real Stripe rows: ${preserved.customers.length} customer(s), ${preserved.cards.length} card(s). ` +
       `Portal principal: staff:${SEED.staffShanthiId}:owner-shanthi`,
   );
   process.exit(0);
