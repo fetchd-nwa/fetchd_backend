@@ -1,8 +1,16 @@
 import { and, eq, sql } from 'drizzle-orm';
-import { bookingMode, cohorts, dayCapacity, events, type LocationKey } from './schema/schema.js';
+import {
+  bookingMode,
+  cohorts,
+  dayCapacity,
+  events,
+  serviceCategory,
+  type LocationKey,
+} from './schema/schema.js';
 import type { Tx } from './tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
+type ServiceCategory = (typeof serviceCategory.enumValues)[number];
 
 /**
  * Per-(dog, mode) transaction-scoped advisory lock — the booking
@@ -267,6 +275,30 @@ export async function withDogModeLocks<T>(
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}:${location}`}))`,
     );
+  }
+  return fn();
+}
+
+/**
+ * Location-agnostic serialization for the approval-divert duplicate guard
+ * (Δ 2026-07-16). The (dog, mode, location) booking locks do NOT serialize
+ * the same dog diverting at two schools concurrently — the owner app submits
+ * each location as its own POST — but "one OPEN request per (dog, category)"
+ * is location-agnostic, so its guard needs a location-agnostic key or both
+ * transactions pass it and commit duplicate open requests.
+ *
+ * Deadlock-safe by canonical order: every divert transaction acquires this
+ * BEFORE `withDogModeLocks`, and instant-book transactions never take it.
+ */
+export async function withDivertRequestLocks<T>(
+  tx: Tx,
+  dogIds: readonly string[],
+  category: ServiceCategory,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const sortedIds = [...dogIds].sort();
+  for (const dogId of sortedIds) {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:divert:${category}`}))`);
   }
   return fn();
 }

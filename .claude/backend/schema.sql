@@ -768,7 +768,9 @@ CREATE TABLE pending_requests (
   -- empty on the classic request categories (PL / B&T / boarding).
   location            text REFERENCES locations(slug),
   payment             text CHECK (payment IN ('credits','payg')),
-  payment_method_id   uuid REFERENCES payment_methods(id),
+  -- FK added AFTER payment_methods is created (below) — an inline REFERENCES
+  -- here forward-references a table defined later and breaks fresh initdb.
+  payment_method_id   uuid,
   divert_reasons      text[] NOT NULL DEFAULT '{}',    -- 'reevaluation-stale' | 'not-spayed-neutered'
   -- Approval lifecycle (real, produced by the minimal staff portal — not auto)
   approved_at         timestamptz,
@@ -1069,6 +1071,13 @@ CREATE INDEX payment_methods_owner_idx ON payment_methods (owner_id);
 -- At most one default *live* card per owner.
 CREATE UNIQUE INDEX payment_methods_one_default
   ON payment_methods (owner_id) WHERE is_default AND expired_at IS NULL;
+
+-- pending_requests.payment_method_id FK, deferred to here: pending_requests
+-- (the 2026-07-14 approval-divert amendment) is created before this table
+-- exists, so the constraint can't ride inline there.
+ALTER TABLE pending_requests
+  ADD CONSTRAINT pending_requests_payment_method_id_fkey
+  FOREIGN KEY (payment_method_id) REFERENCES payment_methods(id);
 
 CREATE TABLE charges (
   id                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),

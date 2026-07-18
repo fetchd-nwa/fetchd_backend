@@ -820,6 +820,39 @@ test(
 );
 
 test(
+  'race: same stale dog at BOTH schools concurrently → exactly one open request (the divert lock is location-agnostic; the (dog, mode, location) locks alone would let both pass the duplicate guard)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { ownerApp } = buildApps();
+    const dogId = await createTestDog();
+    await topUpCredits(dogId, 'school', 10);
+
+    const [a, b] = await Promise.all([
+      postBooking(ownerApp, {
+        category: 'day-school',
+        lead_dog_id: dogId,
+        dates: [futureWeekday(48)],
+        location: 'fayetteville',
+      }),
+      postBooking(ownerApp, {
+        category: 'day-school',
+        lead_dog_id: dogId,
+        dates: [futureWeekday(49)],
+        location: 'bentonville',
+      }),
+    ]);
+    const statuses = [a.statusCode, b.statusCode].sort();
+    assert.deepEqual(statuses, [202, 422], `got ${statuses.join(',')}`);
+
+    const open = await db
+      .select()
+      .from(pendingRequests)
+      .where(and(eq(pendingRequests.leadDogId, dogId), eq(pendingRequests.status, 'submitted')));
+    assert.equal(open.length, 1, 'exactly one open request survives the cross-location race');
+  },
+);
+
+test(
   'collision: capacity fills between divert and approval → approve 422 insufficient_capacity; request stays submitted',
   SKIP_WHEN_NO_DB,
   async () => {
@@ -973,5 +1006,112 @@ test(
         ),
       );
     assert.equal(debits.length, 0, 'no debit for any roster dog');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /bookings/preview — read-only divert pre-check (Δ 2026-07-17)
+// The owner app calls this before submitting so it can ask "some dogs need
+// staff approval; book the rest, request them too, or cancel?" up front. It
+// re-runs the SAME resolveApprovalDivert per dog, with no writes.
+// ──────────────────────────────────────────────────────────────────────────
+
+interface PreviewBody {
+  dogs: { dog_id: string; divert_reasons: string[] }[];
+}
+
+async function postPreview(
+  app: ReturnType<typeof makeContractApp>['app'],
+  dogIds: string[],
+): Promise<{ statusCode: number; json: () => unknown }> {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/bookings/preview',
+    payload: { dog_ids: dogIds },
+  });
+  return { statusCode: res.statusCode, json: () => res.json() };
+}
+
+test(
+  'POST /bookings/preview — mixed roster returns per-dog reasons (fresh=empty, intact=not-spayed-neutered)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { ownerApp } = buildApps();
+    const fresh = await createTestDog({ freshAnchor: true });
+    const intact = await createTestDog({ freshAnchor: true, spayedNeutered: false });
+
+    const res = await postPreview(ownerApp, [fresh, intact]);
+    assert.equal(res.statusCode, 200, JSON.stringify(res.json()));
+    const body = res.json() as PreviewBody;
+    const byId = new Map(body.dogs.map((d) => [d.dog_id, d.divert_reasons]));
+    assert.deepEqual(byId.get(fresh), [], 'fresh dog books instantly');
+    assert.deepEqual(byId.get(intact), ['not-spayed-neutered'], 'intact dog is held');
+    // Order + count mirror the input roster exactly.
+    assert.deepEqual(
+      body.dogs.map((d) => d.dog_id),
+      [fresh, intact],
+    );
+  },
+);
+
+test(
+  'POST /bookings/preview — is read-only (no bookings, requests, or debits created)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { ownerApp } = buildApps();
+    // Anchor-free dogs so the ONLY rows that could exist afterward would be
+    // ones preview created (freshAnchor would plant a past booking of its own).
+    const stale = await createTestDog();
+    const intact = await createTestDog({ spayedNeutered: false });
+
+    await postPreview(ownerApp, [stale, intact]);
+
+    const bookingRows = await db
+      .select({ id: bookings.id })
+      .from(bookings)
+      .where(inArray(bookings.leadDogId, [stale, intact]));
+    assert.equal(bookingRows.length, 0, 'no bookings');
+    const requestRows = await db
+      .select({ id: pendingRequests.id })
+      .from(pendingRequests)
+      .where(inArray(pendingRequests.leadDogId, [stale, intact]));
+    assert.equal(requestRows.length, 0, 'no pending requests');
+    const debits = await db
+      .select({ id: creditLedger.id })
+      .from(creditLedger)
+      .where(
+        and(inArray(creditLedger.dogId, [stale, intact]), eq(creditLedger.reason, 'booking-debit')),
+      );
+    assert.equal(debits.length, 0, 'no debits');
+  },
+);
+
+test(
+  "POST /bookings/preview — a dog the owner doesn't own → 404 (no cross-owner id leak)",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { ownerApp } = buildApps();
+    const mine = await createTestDog({ freshAnchor: true });
+    const notMine = randomUUID();
+
+    const res = await postPreview(ownerApp, [mine, notMine]);
+    assert.equal(res.statusCode, 404);
+  },
+);
+
+test(
+  'POST /bookings/preview — staff principal is rejected (owner-only)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const staff = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+    registerBookingsRoute(staff.app, { authenticate: staff.authenticate, now: FIXTURE_NOW });
+    const dogId = await createTestDog({ freshAnchor: true });
+
+    const res = await staff.app.inject({
+      method: 'POST',
+      url: '/bookings/preview',
+      payload: { dog_ids: [dogId] },
+    });
+    assert.equal(res.statusCode, 403);
   },
 );

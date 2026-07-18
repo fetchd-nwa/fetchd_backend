@@ -219,6 +219,23 @@ export interface DivertedBookingWire {
   request: PendingRequestWire;
 }
 
+/**
+ * `POST /bookings/preview` response (Δ 2026-07-17): a read-only pre-check of
+ * the approval-divert rules for a roster, so the owner app can ask up front —
+ * "some dogs need staff approval; book the rest, request them too, or cancel?"
+ * — BEFORE anything commits. Advisory only: POST /bookings re-runs the
+ * authoritative check. One entry per requested dog; empty `divert_reasons`
+ * means the dog books instantly.
+ */
+export interface BookingDivertPreviewDogWire {
+  dog_id: string;
+  divert_reasons: string[];
+}
+
+export interface BookingDivertPreviewWire {
+  dogs: BookingDivertPreviewDogWire[];
+}
+
 // ---- threadWire.ts ---------------------------------------------------------
 
 export interface ThreadParticipantWire {

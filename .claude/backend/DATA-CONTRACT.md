@@ -881,18 +881,29 @@ api 825/825, mobile jest 260/260):**
   seed dogs — without them every demo/test booking would divert. Seed also
   STOPPED planting fake `cus_seed_*` stripe_customers (they 500'd the
   add-card flow; the route lazily provisions real test-mode customers).
-- **FE (minimal this round):** the booking repository maps the 202 to a
-  typed `BookingDivertedToApprovalError` → gate kind `'approval_pending'` →
-  `<BookingGateModal>` renders "Sent to the school for approval" (no retry).
+- **FE:** ~~minimal this round: the 202 rides the gate lane into a
+  `<BookingGateModal>` "Sent to the school for approval" arm~~ **(SUPERSEDED
+  — full pending-approval phase BUILT 2026-07-16 later round.** The flow now
+  catches `BookingDivertedToApprovalError` BEFORE gate parsing and enters a
+  first-class `'diverted'` phase (`SentRequestView`, navy/gold by mode,
+  mixed-outcome aware: "your other N sessions are booked"); the
+  `approval_pending` gate arm was deleted. Mobile now CONSUMES the wire's
+  optional `location` / `payment` / `divert_reasons` (`PendingRequest`
+  domain fields) and the 202 body's `request.id`. New read-only detail
+  route `/request-detail/day-program` (reasons card, session list,
+  location/payment meta, owner withdraw via POST /requests/:id/cancel);
+  pending filter chips grew day-school/day-care; new `/bookings/[id]`
+  route ALIASES the API's notification `deep_link_path` convention onto
+  the Bookings tab's `openBooking` quick-info lane — previously every
+  real-mode booking-confirmed/reminder/cancel tap dead-ended unmatched.)
   Still open FE work: ~~the DogForm spay/neuter question + planned-date
   input~~ (BUILT 2026-07-16: the form question already existed —
   `FixedChipRow` — and is now WIRED end-to-end on the manage path: `Dog` +
   `RawDog` + `DogPatch` carry the pair, `fixedFromDog`/`spayPatchFrom` are
   the two mapping directions, jest-covered; the SIGNUP path still persists
   nothing — that's go-live blocker #5, POST /dogs unwired, and the form
-  values are ready for it), a day-school/day-care pending-request card
-  detail route (full pending-approval phase approved 2026-07-16, queued),
-  and the portal queue's divert-reason badge.
+  values are ready for it), and the portal queue's divert-reason badge
+  (other repo).
 - **Tests:** `booking-approval-divert.test.ts` (17) — divert/instant/alumni/
   intact/both-reasons/dup-guard, approve conversion incl. PAYG + the full
   divert→approve→attend→instant loop, bounce-stays-submitted (credits spent /
