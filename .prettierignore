@@ -1,3 +1,11 @@
 dist/
 node_modules/
 src/db/schema/
+
+# Prose/spec docs and editor config: reference material kept in lockstep with
+# the monorepo, which never prettier-checked them (api-ci ran with
+# working-directory: api). Formatting them here would churn 900+ lines and
+# diverge from the monorepo copies. Code (src/test/scripts/*.mjs/*.json) is
+# still checked.
+.claude/
+.vscode/

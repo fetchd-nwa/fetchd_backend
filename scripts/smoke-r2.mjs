@@ -44,9 +44,7 @@ if (env.R2_ACCOUNT_ID === 'placeholder' || env.R2_ACCESS_KEY_ID === 'placeholder
 }
 
 const testKey = `smoke/owner-test/${randomUUID()}.bin`;
-const testBytes = new TextEncoder().encode(
-  `r2-smoke-${new Date().toISOString()}-${randomUUID()}`,
-);
+const testBytes = new TextEncoder().encode(`r2-smoke-${new Date().toISOString()}-${randomUUID()}`);
 const expectedContentType = 'application/octet-stream';
 
 info(`bucket=${env.R2_BUCKET} key=${testKey} bytes=${testBytes.byteLength}`);
