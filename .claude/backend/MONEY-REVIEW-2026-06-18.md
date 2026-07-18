@@ -4,6 +4,41 @@ Outcome of the schema + money-path audit. **Four code fixes shipped + tested
 (703/703, tsc + eslint clean); four items deferred because they need a business
 or design decision, not a patch.** No commit yet.
 
+---
+
+## Addendum 2026-07-18 — group-class enrollment money-path fixes (adversarial audit)
+
+A later multi-agent audit found `POST /enrollments` captured the card BEFORE the
+enroll tx but did NOT undo it if the tx rolled back — real money stranded with no
+charge row and no refund. Three fixes shipped (`src/routes/enrollments.ts`), all
+tested against db-test (enrollment suite 29/29):
+
+- **Stranded pay-now money (HIGH).** Pay-now confirms one PaymentIntent per dog
+  pre-tx; any in-tx failure (cohort filled in the race, a gate flip, a trigger)
+  rolled back with no charge row and no refund. Fix: `unwindCapturedIntents` —
+  the charge + not-succeeded guard + the enroll tx are wrapped so any post-charge
+  failure REFUNDS succeeded intents (and CANCELS unsettled ones), then re-raises
+  the original 4xx. `chargeEachDogNow` also self-unwinds a partial multi-dog
+  charge (dog 1 captured, dog 2 declines). Test: 2 dogs pay-now into a capacity-1
+  cohort → 422 cohort_full, **both cards refunded**, no bookings, no charge rows.
+- **Not-succeeded intent still enrolled (MED).** A confirm that returned
+  `requires_action`/`processing` (off-session, can't settle unattended) wrote a
+  non-succeeded charge row and enrolled anyway. Fix: guard `status === 'succeeded'`
+  before the tx; otherwise unwind + `payment_required`. Test: `requires_action`
+  → payment_required, intent cancelled, dog not enrolled.
+- **Withdraw void-count race (MED).** The withdraw settle voided the open invoice
+  but discarded `markVoid`'s return; if the auto-charge worker settled it between
+  findOpen and markVoid (0 voided), the now-charged card was left un-refunded.
+  Fix: fall through to the refund path when `voidedCount === 0`.
+
+**Residual (documented, not fixed):** a client that retries with the SAME
+idempotency key after a *transient* (non-business) tx failure re-confirms the
+same now-refunded PI and could enroll on refunded money — rare, NWA-side. The
+complete fix is manual-capture (authorize pre-tx, capture in postCommit, cancel
+on rollback); deferred as a larger change.
+
+---
+
 ## Shipped (verified)
 
 ### #1 — Orphaned package purchase is reconstructed by the webhook

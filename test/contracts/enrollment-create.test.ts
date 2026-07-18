@@ -994,3 +994,86 @@ test(
     await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohort.id));
   },
 );
+
+// ──────────────────────────────────────────────────────────────────────────
+// Money is never stranded (Δ 2026-07-18) — pay-now captures the card BEFORE
+// the enroll tx, so any post-charge failure must unwind the captured money.
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /enrollments — pay-now into a FULL cohort → 422 cohort_full AND every captured card is refunded (no stranded money, no bookings, no charge rows)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // capacity 1, two dogs → filled(0)+requested(2) > 1 → cohort_full IN the tx,
+    // AFTER both cards already charged pre-tx. Both must be refunded.
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 1, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-full-paynow-${randomUUID()}`,
+      payload: {
+        cohort_id: cohort.id,
+        dog_ids: [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id],
+        pay_later: false,
+      },
+    });
+    assert.equal(res.statusCode, 422);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'cohort_full');
+
+    // Both cards were charged pre-tx, then BOTH refunded when the tx rolled back.
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+      2,
+      'both dogs charged pre-tx',
+    );
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createRefund').length,
+      2,
+      'both captured charges refunded — money is not stranded',
+    );
+
+    // The tx rolled back cleanly: no bookings, no charge rows.
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, 0, 'no bookings created');
+    const chargeRows = await db
+      .select({ id: chargesTable.id })
+      .from(chargesTable)
+      .where(eq(chargesTable.cohortId, cohort.id));
+    assert.equal(chargeRows.length, 0, 'no charge rows (tx rolled back)');
+  },
+);
+
+test(
+  'POST /enrollments — pay-now intent that does NOT reach succeeded (off-session 3DS) → payment_required, dog NOT enrolled, intent cancelled (not charged)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    // A stored-card off-session confirm that can't settle unattended.
+    stripe.setNextIntentStatus('requires_action');
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-unsettled-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+    });
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'payment_required');
+
+    // A non-succeeded intent never captured money → it's CANCELLED, not refunded,
+    // and nothing is enrolled or recorded.
+    assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 1);
+    assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 0);
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, 0, 'dog NOT enrolled on an unsettled charge');
+    const chargeRows = await db
+      .select({ id: chargesTable.id })
+      .from(chargesTable)
+      .where(eq(chargesTable.cohortId, cohort.id));
+    assert.equal(chargeRows.length, 0, 'no charge row for a non-succeeded intent');
+  },
+);
