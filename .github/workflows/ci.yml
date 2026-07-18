@@ -7,8 +7,11 @@ on:
 
 jobs:
   schema-load:
-    # Day-1 Exit gate: schema.sql loads 45/45 into a FRESH EMPTY ephemeral
-    # Postgres, and the destructive DEV-RESET preamble stays commented in git.
+    # Schema-load gate: schema.sql loads cleanly into a FRESH EMPTY ephemeral
+    # Postgres with the expected table count, and the destructive DEV-RESET
+    # preamble stays commented in git. Bump EXPECTED_TABLES below whenever a
+    # CREATE TABLE is added/removed (started at 45 on Day 1; 56 as of the
+    # 2026-07 approval-divert round).
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -25,7 +28,7 @@ jobs:
     env:
       PGURL: postgres://postgres:postgres@localhost:5432/postgres
       SCHEMA: .claude/backend/schema.sql
-      EXPECTED_TABLES: '45'
+      EXPECTED_TABLES: '56'
     steps:
       - uses: actions/checkout@v4
 
