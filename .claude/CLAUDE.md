@@ -46,5 +46,6 @@ backend-specific.
 - Wire-contract changes ripple to the portal (`sync-contracts.mjs`) and to
   the mobile app's repository layer. Flag both in the handoff when you
   change `src/contracts/wire.ts`.
-- The monorepo still holds a **reference-only snapshot** of the pre-split
-  `api/` — it is not the live backend. This repo is.
+- The monorepo's `api/` folder was **removed 2026-07-18** — the extraction is
+  complete and this repo is the only backend. (The monorepo still carries a
+  stale duplicate of `.claude/backend/*`; canonical is this repo's copy.)

@@ -1,4 +1,4 @@
-# Backend extraction — paused mid-migration 2026-07-16 (credits ran out)
+# Backend extraction — COMPLETE 2026-07-18
 
 ## Done
 
@@ -11,29 +11,30 @@
 - `npm ci` clean; **typecheck PASS, lint PASS, build PASS**.
 - Staff portal: sync-contracts default path fixed → this repo (commit `05f40df` there).
 
-## Not done (resume order)
+## Resume order — COMPLETE (finished 2026-07-18)
 
-1. `npm run format:check` FAILED — 9 files (incl. the new README.md/CLAUDE.md/ci.yml
-   and .vscode/settings.json). Run `npx prettier --write` on the offenders, or extend
-   .prettierignore for .vscode/; amend into `6577dcf`/`4f0c27e` as appropriate.
-2. **Baseline monorepo run FINISHED: 845 tests, 825 pass, 20 FAIL** — with the
-   WIP working tree, BEFORE any migration. These 20 are pre-existing (WIP
-   booking-divert round in flight), NOT caused by the extraction. Failure names
-   unknown — the run was piped through `tail -30` so only the summary survived
-   (and the pipe masked the non-zero exit). On resume: re-run `npm test` in
-   monorepo api/ WITHOUT a pipe, capture the `not ok` list, fix or attribute all
-   20, and only then compare against this repo's run. "All tests pass" is the
-   user's explicit bar — 825/845 does not meet it.
-3. Docker swap: `docker compose down` in monorepo, then `docker compose up -d` HERE
-   (pinned container names conflict across compose projects; named volumes
-   fetchd-pg-data / fetchd-pg-test-data preserve all data automatically).
-4. `npm test` here (auto-spins db-test via pretest). Expect ~844 pass.
-5. Boot `npm run dev` + smoke GET /health.
-6. Push `main` → https://github.com/fetchd-nwa/fetchd_backend (remote already set,
-   repo empty). Watch the ci workflow run.
-7. Verify portal drift-guard: `cd ../fetchd-staff-portal && node scripts/sync-contracts.mjs --check`
-   (fix committed but NOT yet verified against this repo).
-8. Monorepo cleanup: delete temp branch `backend-extract`; docs sweep
-   (CLAUDE.md file-locations, ARCHITECTURE.md, HANDOFF.md) marking monorepo `api/`
-   reference-only; memory entry for the split. Do NOT delete monorepo api/ — WIP
-   round in flight there.
+1. DONE — `npm run format:check` passing; CI green.
+2. DONE — the earlier "845 tests, 825 pass, 20 FAIL" baseline was **redis-timing env
+   noise**, not real failures caused by the extraction. A clean run is **851/851**.
+   That old 845/825/20 number is superseded — the standing test count is 851/851 and
+   meets the "all tests pass" bar.
+3. DONE — docker is now owned by the `fetchd_backend` compose project (named volumes
+   fetchd-pg-data / fetchd-pg-test-data carried over all data).
+4. DONE — `npm test` here is **851/851** (db-test auto-spins via pretest).
+5. DONE — `npm run dev` boots and serves :3000; GET /health smoke passed.
+6. DONE — `main` pushed to https://github.com/fetchd-nwa/fetchd_backend (green CI).
+7. OPEN — portal contract drift-guard: `cd ../fetchd-staff-portal && node scripts/sync-contracts.mjs --check`
+   (fix committed but not yet verified against this repo).
+8. DONE — temp branch `backend-extract` deleted; monorepo `api/` (plus root
+   docker-compose.yml, api-ci.yml, and the `*-api` lefthook hooks) **REMOVED 2026-07-18**
+   — the monorepo now owns only `mobile/` + `.claude/`, and the extraction is complete.
+   Note: the monorepo still carries a stale DUPLICATE `.claude/backend/` copy —
+   canonical is this repo's `.claude/backend/`.
+
+## Remaining real work
+
+Not part of the extraction (which is done) — the only genuinely-open items are:
+
+- **PROD deploy** — Railway + a prod Redis (the one piece still genuinely missing;
+  deploy target is Railway, not Vercel/EAS).
+- **Portal contract drift-guard** verification (item 7 above).

@@ -1,31 +1,40 @@
 # What this repo needs from the monorepo
 
-Companion to [RESUME-MIGRATION.md](./RESUME-MIGRATION.md). This catalogs
-**every dependency `fetchd_backend` still has on the monorepo**
+> **Extraction COMPLETE (2026-07-18).** The monorepo `api/` folder + backend
+> infra (root `docker-compose.yml`, `api-ci.yml`, the `*-api` lefthook hooks)
+> were removed; `fetchd_backend` builds, tests, and deploys on its own. The only
+> real work left is the **prod deploy** (Railway + prod Redis) and the **staff-
+> portal contract drift-guard**. Everything else below is either done or kept as
+> historical record.
+
+Companion to [RESUME-MIGRATION.md](./RESUME-MIGRATION.md). This catalogs the
+dependencies `fetchd_backend` had on the monorepo
 (`~/Desktop/fetchd_client_mobile_app`) — code, env/secrets, infra, tooling,
-deploy wiring, and ongoing cross-repo coordination — so the extraction can be
-finished and this repo can build, test, and deploy on its own.
+deploy wiring, and ongoing cross-repo coordination — kept as a record of the
+extraction and the remaining prod-side work.
 
 Compiled 2026-07-18 from a cross-repo audit + direct verification.
 
 ## TL;DR
 
 **The code is fully extracted and healthy.** The `src/`, `test/`, config, and
-`certs/` trees are byte-identical to the monorepo `api/` folder; the WIP
-booking-divert round is applied. Verified locally on this repo:
+`certs/` trees are the canonical home for the backend (the monorepo `api/`
+folder was removed 2026-07-18); the booking-divert round is applied. Verified
+locally on this repo:
 
-| Check                   | Result                                                     |
-| ----------------------- | ---------------------------------------------------------- |
-| `npm run typecheck`     | ✅ pass                                                    |
-| `npm run lint`          | ✅ pass                                                    |
-| `npm run build`         | ✅ pass                                                    |
-| `npm test` (full suite) | ✅ **845 / 845 pass, 0 fail**                              |
-| `npm run format:check`  | ⚠️ 10 files unformatted (all docs/config, no `src`/`test`) |
+| Check                   | Result                        |
+| ----------------------- | ----------------------------- |
+| `npm run typecheck`     | ✅ pass                       |
+| `npm run lint`          | ✅ pass                       |
+| `npm run build`         | ✅ pass                       |
+| `npm test` (full suite) | ✅ **851 / 851 pass, 0 fail** |
+| `npm run format:check`  | ✅ pass (prettier sweep done) |
 
-So "does it all work?" — **the backend itself works.** What is _not_ done is the
-environment hand-off: the local Docker project swap, prod deploy wiring on a new
-Railway service, and the cross-repo contract obligations to the staff portal and
-mobile app. Those are the items below.
+So "does it all work?" — **yes, the backend works and runs on its own.** The
+local Docker project swap is done (this repo's compose owns the containers) and
+`main` is pushed with green CI. What remains is the **prod deploy wiring** on a
+new Railway service and the **staff-portal contract drift-guard**. Those are the
+items below.
 
 **Nothing here requires copying more application code from the monorepo.** The
 remaining needs are configuration, secrets, deploy setup, and coordination.
@@ -40,28 +49,22 @@ remaining needs are configuration, secrets, deploy setup, and coordination.
 
 ---
 
-## 0. Finish-the-migration checklist (do these in order)
+## 0. Migration checklist — ✅ COMPLETE (prod deploy + portal drift-guard remain)
 
 Carried forward from `RESUME-MIGRATION.md`, corrected against what's verified:
 
-1. 🔴 **[local] Docker project swap.** `npm test`'s `pretest` hook fails today —
-   the running `fetchd-db` / `fetchd-db-test` / `fetchd-redis` containers are
-   still owned by the **old monorepo compose project** (`docker inspect` label
-   `com.docker.compose.project=fetchd_client_mobile_app`), and this repo's
-   compose pins the same `container_name`s, so it can't stand up its own.
-   Fix: `docker compose down` in the monorepo, then `docker compose up -d` here.
-   Named volumes (`fetchd-pg-data`, `fetchd-pg-test-data`) are global, so
-   **no data is lost.** (Tests pass — I confirmed 845/845 by pointing directly
-   at the already-running container.)
-2. 🟠 **Prettier sweep.** `npm run format` (or `npx prettier --write` on the 10
-   offenders). This is a **push blocker, not cosmetic**: CI's `check` job runs
-   `format:check` over the whole repo (`.prettierignore` only excludes `dist/`,
-   `node_modules/`, `src/db/schema/`), so the unformatted `.claude/*.md` +
-   `.vscode/settings.json` + `scripts/smoke-r2.mjs` would turn CI red on push.
-3. 🟠 **Push `main`** → `github.com/fetchd-nwa/fetchd_backend` (remote set, repo
-   still empty), watch CI.
+1. ✅ **[local] Docker project swap — DONE.** The `fetchd-db` / `fetchd-db-test`
+   / `fetchd-redis` containers are now owned by **this repo's** compose project;
+   the old monorepo compose was torn down and this repo stood up its own. Named
+   volumes (`fetchd-pg-data`, `fetchd-pg-test-data`) are global, so **no data
+   was lost.** Full suite runs 851/851 here.
+2. ✅ **Prettier sweep — DONE.** The offenders were formatted; CI's `check` job
+   (`format:check` over the whole repo) is green.
+3. ✅ **Push `main` — DONE.** `main` is on `github.com/fetchd-nwa/fetchd_backend`
+   with green CI.
 4. 🟡 **Portal drift-guard handoff** (§F.1 — the guard currently _fails_).
-5. 🟡 **Monorepo cleanup** (§H — delete `backend-extract` branch, etc.).
+5. ✅ **Monorepo cleanup — DONE** (§H — `backend-extract` branch deleted, monorepo
+   `api/` folder removed).
 
 Everything below is the detailed catalog behind these.
 
@@ -69,20 +72,21 @@ Everything below is the detailed catalog behind these.
 
 ## A. Application code & config — ✅ already carried over
 
-All present and verified byte-identical (`diff -rq` against monorepo `api/`).
+All present and verified byte-identical against the monorepo `api/` folder at
+extraction (`diff -rq`; that folder has since been removed).
 **No action needed** — listed so the parity is on record.
 
 | Item                                                                                                                                        | Status               | Note                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/` (auth, contracts, db, lib, routes, webhooks, workers, index/server/env/redis)                                                        | present              | byte-identical; no imports escape the old `api/` root                                                                                                                                                     |
-| `test/` (unit + contract + `snapshots/*.json`)                                                                                              | present              | byte-identical; passes 845/845 here                                                                                                                                                                       |
+| `test/` (unit + contract + `snapshots/*.json`)                                                                                              | present              | passes 851/851 here                                                                                                                                                                       |
 | Build/lint config (`Dockerfile`, `railway.json`, `drizzle.config.ts`, `eslint.config.js`, `tsconfig*.json`, `.prettierrc`, `.dockerignore`) | present              | `tsconfig.build.json` self-contained, no monorepo parent                                                                                                                                                  |
 | `package.json` / `package-lock.json`                                                                                                        | present              | **correctly rewired**: `db:*` scripts dropped the monorepo's `-f ../docker-compose.yml` because compose now lives in this repo root (commit `6577dcf`). No `workspace:` deps → `npm ci` is self-contained |
 | `certs/supabase-ca.crt`                                                                                                                     | present              | not gitignored, so the subtree split preserved it; `DATABASE_SSL_CA` points here                                                                                                                          |
 | `docker-compose.yml`                                                                                                                        | present              | **new in this repo** — a faithful extract of the backend services (db/db-test/redis) from the monorepo _root_ compose                                                                                     |
 | `.env` / `.env.local` (dev/test)                                                                                                            | present              | gitignored → **manually copied** during extraction (a subtree split does not carry them)                                                                                                                  |
 | `src/db/schema/meta/` + `*.sql`                                                                                                             | intentionally absent | gitignored in both repos (Drizzle is query-only; regenerated by `npm run db:introspect`). Committed typed surface (`schema.ts`, `relations.ts`) is present                                                |
-| stray `api/api/` folder in monorepo                                                                                                         | n/a                  | empty untracked cruft — correctly not carried; delete it in monorepo cleanup                                                                                                                              |
+| stray `api/api/` folder in monorepo                                                                                                         | n/a                  | was empty untracked cruft — correctly not carried; removed with the monorepo `api/` folder                                                                                                                |
 
 ---
 
@@ -90,7 +94,7 @@ All present and verified byte-identical (`diff -rq` against monorepo `api/`).
 
 | #   | Item                                                        | Sev        | Status                  | What's needed                                                                                                                                                                                                                                    |
 | --- | ----------------------------------------------------------- | ---------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| B.1 | **Docker container/volume ownership**                       | 🔴 [local] | present-but-conflicting | The running containers belong to the monorepo compose project; the pinned `container_name`s collide with this repo's. See checklist #1. Until swapped, use `db:test:*` scripts or run tests against the live container directly                  |
+| B.1 | **Docker container/volume ownership**                       | ⚪         | resolved                | The `fetchd-db` / `fetchd-db-test` / `fetchd-redis` containers are now owned by **this repo's** compose project (see checklist #1). Full suite runs 851/851 here                                                                                 |
 | B.2 | Dev DB seed (`npm run db:dev:seed` → `scripts/seed-dev.ts`) | 🟡         | present                 | Runs, but carries two hidden couplings (see §G.4): a hardcoded Shanthi staff-id that must match the portal's default principal, and `captureRealStripeRows` logic tied to the shared Stripe **test** account. Re-verify after the container swap |
 | B.3 | Redis (local)                                               | ⚪         | present                 | `redis:7-alpine` in this repo's compose; required at boot even though the read surface doesn't use it yet                                                                                                                                        |
 
@@ -115,7 +119,7 @@ secrets** on the new deploy target (§E) — staging/prod never read `.env`.
 | `SUPABASE_JWKS_URL`, `SUPABASE_JWT_AUD`, `SUPABASE_JWT_ISS`              | JWT verification (JWKS auth)                                                                       | ✅ present                            | 🟠 inject                                               |
 | `SUPABASE_AUTH_WEBHOOK_SECRET`                                           | verifies user-created provisioning webhook                                                         | ⚠️ placeholder                        | 🟠 real secret + Supabase dashboard hook → deployed URL |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`                             | payments + signed webhook                                                                          | ✅ **test-mode** keys in `.env.local` | 🟠 live keys + Stripe dashboard webhook → deployed URL  |
-| `SCHEDULER_WEBHOOK_SECRET`                                               | bearer for `/workers/tick` cron                                                                    | ⚠️ placeholder                        | 🟡 real secret + pg_cron SQL (§D)                       |
+| `SCHEDULER_WEBHOOK_SECRET`                                               | bearer for `/workers/tick` cron                                                                    | ✅ present                            | 🟡 real secret + pg_cron SQL (§D)                       |
 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` | Cloudflare R2 private media                                                                        | ✅ **dev bucket** creds in `.env`     | 🟠 prod bucket + prod creds                             |
 | `NODE_ENV`, `PORT`, `LOG_LEVEL`, `BYPASS_HEADER_ENABLED`                 | runtime; `BYPASS_HEADER_ENABLED` gates the dev auth bypass (forced off when `NODE_ENV=production`) | ✅ present                            | ⚪ set per environment                                  |
 
@@ -132,12 +136,12 @@ Each has a working **dev/test** binding already; the gap is **production**.
 
 | Service                   | Sev       | Status                   | Prod need                                                                                                                                                                                                                   |
 | ------------------------- | --------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Supabase Postgres**     | 🟠        | partial                  | Prod DB + `DATABASE_URL`; load `schema.sql` (45 tables) into it                                                                                                                                                             |
+| **Supabase Postgres**     | 🟠        | partial                  | Prod DB + `DATABASE_URL`; load `schema.sql` (56 tables) into it                                                                                                                                                             |
 | **Supabase Auth (JWKS)**  | 🟠        | partial                  | Prod JWKS URL / aud / iss injected                                                                                                                                                                                          |
 | **Supabase Auth webhook** | 🟠        | partial                  | Dashboard webhook → `<api-url>/webhooks/...` + `SUPABASE_AUTH_WEBHOOK_SECRET`. Without it, new users `403 not_provisioned`                                                                                                  |
 | **Stripe**                | 🟠        | partial                  | Live keys + dashboard webhook → `<api-url>/webhooks/stripe`. Note the seed's shared-test-account coupling (§G.4)                                                                                                            |
 | **Cloudflare R2**         | 🟠        | partial                  | Prod bucket (e.g. `nwa-media`) + prod creds. `npm run smoke:r2` does a live round-trip check                                                                                                                                |
-| **Production Redis**      | 🔴 [prod] | **missing (both repos)** | No prod Redis config exists anywhere — the monorepo didn't have one either. Railway must provision Redis (or Upstash) and inject `REDIS_URL`, or `/health` fails in prod                                                    |
+| **Production Redis**      | 🔴 [prod] | **missing**              | No prod Redis config exists yet — this is the one genuinely-missing piece for prod. Railway must provision Redis (or Upstash) and inject `REDIS_URL`, or `/health` fails in prod                                            |
 | **Scheduler cron**        | 🟡        | partial                  | Supabase `pg_cron` + `pg_net` running `net.http_post` → `<api-url>/workers/tick` with the bearer secret. SQL is docs-only in `IMPLEMENTATION.md` (Day-16), applied by hand in Supabase — deliberately _not_ in `schema.sql` |
 | **Expo Push**             | ⚪        | present                  | None — public endpoint, per-device token auth. Nothing to configure                                                                                                                                                         |
 
@@ -150,7 +154,7 @@ identical). The outstanding work is **platform-side wiring**, not files.
 
 | #   | Item                                                                                 | Sev       | Status                 |
 | --- | ------------------------------------------------------------------------------------ | --------- | ---------------------- |
-| E.1 | Push `main` to `github.com/fetchd-nwa/fetchd_backend`                                | 🟠        | remote set, repo empty |
+| E.1 | Push `main` to `github.com/fetchd-nwa/fetchd_backend`                                | ✅        | done (green CI)        |
 | E.2 | Create a Railway **service** linked to the new GitHub repo                           | 🔴 [prod] | coordination-only      |
 | E.3 | Configure Railway's **host-injected env store** with the §C prod contract (~18 vars) | 🔴 [prod] | coordination-only      |
 | E.4 | Provision prod **Redis** (see §D)                                                    | 🔴 [prod] | missing                |
@@ -167,7 +171,7 @@ identical). The outstanding work is **platform-side wiring**, not files.
 
 | #   | Item                                         | Sev | Status      | Detail                                                                                                                                                                                                                                                                                                                                                                                                      |
 | --- | -------------------------------------------- | --- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| F.1 | **CI workflow** (`.github/workflows/ci.yml`) | ⚪  | present     | Faithful port of the monorepo's `api-ci.yml`: `schema-load` (loads `schema.sql`, asserts **45 tables** + DROP-SCHEMA-commented) and `check` (typecheck/lint/format). **Neither runs `npm test`** — same as the monorepo, by design (tests run locally against the docker DB). Pins **node 20** while the Docker runtime uses **node 22** (`engines: >=20`) — pre-existing, harmless, worth aligning someday |
+| F.1 | **CI workflow** (`.github/workflows/ci.yml`) | ⚪  | present     | Faithful port of the (now-removed) monorepo `api-ci.yml`: `schema-load` (loads `schema.sql`, asserts **56 tables** + DROP-SCHEMA-commented) and `check` (typecheck/lint/format). **Neither runs `npm test`** — same as the monorepo, by design (tests run locally against the docker DB). Pins **node 20** while the Docker runtime uses **node 22** (`engines: >=20`) — pre-existing, harmless, worth aligning someday |
 | F.2 | **lefthook pre-commit gate**                 | 🟠  | **missing** | The monorepo's `lefthook.yml` ran `typecheck-api` / `lint-api` / `format-api` on staged backend files. **This repo has no `lefthook.yml`** — nothing enforces format/lint pre-commit locally, which is how the 10 unformatted files slipped in. Add a repo-local lefthook (or a pre-commit hook) running the same three checks                                                                              |
 | F.3 | Stripe agent **skills** + `skills-lock.json` | 🟡  | missing     | Monorepo-root Claude skills used during backend work; not carried. Nice-to-have for workflow parity                                                                                                                                                                                                                                                                                                         |
 
@@ -211,7 +215,9 @@ elsewhere, set `FETCHD_API_WIRE` to this repo's `wire.ts`.
 
 The mobile app (`~/Desktop/fetchd_client_mobile_app/mobile`) consumes the
 backend purely over **HTTP** — there is no `wire.ts` import. Stable coupling
-points to preserve: base URL (`apiBaseUrl`, default `http://localhost:3000`),
+points to preserve: base URL (`apiBaseUrl`; dev defaults to
+`http://localhost:3000`, while staging/prod have no default and **throw at
+startup** if `EXPO_PUBLIC_API_BASE_URL` is unset — fail-loud, HTTP-only),
 Supabase Bearer JWT + `X-Dev-Principal` dev bypass, the `Idempotency-Key`
 requirement on all mutations, and the `{ error: { code, message, details? } }`
 envelope. Mobile hand-maintains camelCase mirrors of the wire shapes in
@@ -234,17 +240,17 @@ lockstep.
 | --- | -------------------------------------- | --- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | H.1 | Backend **RUNBOOK**                    | 🟡  | missing           | The only runbook is the monorepo's mobile-centric `RUNBOOK.md`, whose backend entries name the **wrong secret stores** (references EAS / "Supabase, Vercel" — should be **Railway** for this repo). Author a backend runbook here (Railway redeploy, prod schema-load, secret rotation)                                    |
 | H.2 | `README.md` "Deploy" section           | ⚪  | present-but-thin  | Points back at the monorepo's `BUILDING.md` (mobile ship steps). Fold the essentials into the new runbook                                                                                                                                                                                                                  |
-| H.3 | Backend spec docs (`.claude/backend/`) | ⚪  | present           | Copied at extraction; source of truth for schema/wire/architecture                                                                                                                                                                                                                                                         |
-| H.4 | Monorepo post-extraction hygiene       | 🟡  | coordination-only | Delete the `backend-extract` temp branch (safe once `main` is pushed — history now lives here); confirm `.claude/ARCHITECTURE.md` + `HANDOFF.md` mark `api/` reference-only (`.claude/CLAUDE.md` already does); add a memory entry for the split. **Do not delete monorepo `api/`** — a WIP round is still in flight there |
+| H.3 | Backend spec docs (`.claude/backend/`) | ⚪  | present           | Copied at extraction; **canonical** source of truth for schema/wire/architecture. Note: the monorepo still carries a **stale duplicate** `.claude/backend/` copy                                                                                                                                                            |
+| H.4 | Monorepo post-extraction hygiene       | ✅  | done              | `backend-extract` temp branch deleted (history lives here); monorepo `api/` folder + backend infra removed. Remaining monorepo-side note: its `.claude/backend/` copy is now a stale duplicate of this repo's canonical set                                                                                                  |
 
 ---
 
 ## Appendix: minimal path to each goal
 
-- **Run the test suite cleanly on this machine** → checklist #1 (Docker swap).
-  That's the only real blocker; the code already passes 845/845.
-- **Get CI green on push** → #1 is irrelevant to CI (CI spins its own Postgres);
-  you need the **prettier sweep** (#2) so `format:check` passes, then push (#3).
+- **Run the test suite cleanly on this machine** → done; this repo's compose owns
+  the containers and the full suite passes 851/851.
+- **Get CI green on push** → done; the prettier sweep landed and `main` is pushed
+  green.
 - **Deploy to production** → §E (Railway service + env store) + §D (prod Redis is
   the one genuinely-missing piece) + load `schema.sql` into the prod DB.
 - **Keep the frontends working** → §G.1 (portal: run `sync:contracts` + commit)

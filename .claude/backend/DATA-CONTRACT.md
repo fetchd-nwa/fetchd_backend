@@ -236,7 +236,7 @@ required }[] }`.
      the single-gate-at-a-time shape ships today.
 
 5. **`bookings.cancel_deadline_at` set at creation, per-category rule in
-   `api/src/lib/cancelWindow.ts`.** §I lock honored ("cancel_deadline_at
+   `src/lib/cancelWindow.ts`.** §I lock honored ("cancel_deadline_at
    is set at creation"). Per-category hours-before-scheduled-at:
    - day-school / day-care / private-lesson / evaluation → 24h
    - group-class → 48h (cohort capacity reserved)
@@ -250,7 +250,7 @@ required }[] }`.
      the default rule).
 
 6. **`scheduled_at` composition for day programs lives in
-   `api/src/lib/bookingSchedule.ts`** — combines the body's `dropoff_time`
+   `src/lib/bookingSchedule.ts`** — combines the body's `dropoff_time`
    (default 07:30, must be within `DAY_PROGRAM_DROPOFF_WINDOW` 07:30-09:00
    inclusive) with `chicagoWallTimeToUtc` so the create-side date math
    matches the read-side bucket math (`lib/bookingBucket.sessionEndTime`)
@@ -429,7 +429,7 @@ cohort_id, capacity, filled, requested }`.
    ids don't enumerate across soft-expire boundaries.
 
 5. **Weekly cadence preserves Chicago wall time across DST.** New
-   helper `api/src/lib/cohortSchedule.ts:computeCohortSessionDates`
+   helper `src/lib/cohortSchedule.ts:computeCohortSessionDates`
    reads the cohort's `start_date` as Chicago wall parts (via new
    `chicagoWallPartsAt` paired with the Day-10 DST-fixed
    `chicagoWallTimeToUtc`), advances the calendar date by `k × 7`
@@ -667,11 +667,11 @@ ordinal)` PK is NOT partial-on-expired — surfaced + worked around at
 
 6. **Rule-of-three extractions (Day-10 + Day-11 + Day-12 all reuse).** Two
    new pure helpers landed:
-   - `api/src/lib/insertBookingWithGateMapping.ts` — the try/catch wrapper
+   - `src/lib/insertBookingWithGateMapping.ts` — the try/catch wrapper
      mapping trigger `check_violation` to typed `ApiError`. `routes/bookings.ts`
      - `routes/enrollments.ts` retrofitted to use it; `routes/staffRequests.ts`
        consumes it for PL/boarding approves.
-   - `api/src/lib/bookingGatePreCheck.ts` — the `payment → vaccine
+   - `src/lib/bookingGatePreCheck.ts` — the `payment → vaccine
   (per-dog accumulate) → agreement` sequence above the trigger floor.
      Same retrofit. Day-12b's `evaluation_required` gate will slot in
      between payment and vaccine via a single-file edit when it lands.
@@ -707,11 +707,11 @@ deltas remain pending as **Day 12b2** (Claude-owned next thread).
    to 4 floors with priority-order narration
    (`payment → evaluation → vaccine → agreement`).
 
-2. **Typed error code (`api/src/lib/errors.ts`):** `ApiErrorCode` union
+2. **Typed error code (`src/lib/errors.ts`):** `ApiErrorCode` union
    gains `'evaluation_required'` (422). Additive to the Day-10
    gate-error family.
 
-3. **Typed details (`api/src/lib/bookingErrors.ts`):**
+3. **Typed details (`src/lib/bookingErrors.ts`):**
    `EvaluationGap = { dog_id, evaluation_status }` joins the
    discriminated `details` union as
    `{ kind: 'evaluation_required', missing: EvaluationGap[] }`.
@@ -721,7 +721,7 @@ deltas remain pending as **Day 12b2** (Claude-owned next thread).
    `gateTriggerErrorToApiError` extends with the
    `text.startsWith('evaluation gate:')` branch (race-window fallback).
 
-4. **Gate priority order (`api/src/lib/bookingGatePreCheck.ts`):**
+4. **Gate priority order (`src/lib/bookingGatePreCheck.ts`):**
    `payment → evaluation → vaccine → agreement`. The eval gate slots
    between payment and vaccine; only fires when
    `category ∈ EVAL_GATED_CATEGORIES` (the same set the trigger
@@ -731,7 +731,7 @@ deltas remain pending as **Day 12b2** (Claude-owned next thread).
    booking_dogs surface yields the complete picture in one round-trip
    (same shape as the vaccine gate's per-dog accumulate).
 
-5. **Request boundary (`api/src/routes/requests.ts`):** `POST /requests`
+5. **Request boundary (`src/routes/requests.ts`):** `POST /requests`
    for `category ∈ ('board-and-train','boarding')` adds a LEAD-only
    eval pre-check between the ownership gate (step 2) and the
    `requestsRepository.create` (step 4). Per §A Amendment 2026-05-23
@@ -752,7 +752,7 @@ deltas remain pending as **Day 12b2** (Claude-owned next thread).
    finally-restore. `snapshots/dogs.json` updated to match (now emits
    `evaluation_date` for Lola — additive).
 
-8. **Test coverage (`api/test/contracts/evaluation-gate.test.ts`).** 13
+8. **Test coverage (`test/contracts/evaluation-gate.test.ts`).** 13
    new contract tests cover: pre-check at POST /bookings (single-dog
    - multi-dog accumulation), pre-check at POST /requests (B&T +
      boarding), POST /staff/requests/:id/approve race for boarding;
@@ -1048,7 +1048,7 @@ stripe-webhook', tx)` (Day-2 system-actor precedent). Success →
    so Stripe's retry re-enters dispatch). Process crash leaves row at
    `processed_at IS NULL` — admin replay surface lands Day-19 / Day-20.
 
-3. **Narrow `StripeWebhookEvent` type (`api/src/lib/stripe.ts`).** Five
+3. **Narrow `StripeWebhookEvent` type (`src/lib/stripe.ts`).** Five
    arms: `payment_intent.succeeded` / `payment_intent.payment_failed` /
    `setup_intent.succeeded` / `charge.refund.updated` / `unhandled`.
    The seam's `constructWebhookEvent` returns this narrow union;
@@ -1082,7 +1082,7 @@ pickup_at, location, notes?, pay_later?, due_at? }`. Pay-now
      The FE NEVER passes the amount — anti-scam parity with §G ("payment
      guarantee").
 
-6. **Invoice auto-charge worker (`api/src/workers/invoiceAutoCharge.ts`).**
+6. **Invoice auto-charge worker (`src/workers/invoiceAutoCharge.ts`).**
    `runInvoiceAutoChargeOnce(opts)` claims a due batch via
    `invoicesRepository.lockDueOpenForUpdate` (`FOR UPDATE SKIP LOCKED`).
    Per-invoice: Stripe `paymentIntents.create+confirm` (idempotency-
@@ -1094,7 +1094,7 @@ now()+backoff(attempts))`. **Backoff schedule**: 1m / 1h / 24h / 72h
    Day-16 wires the scheduler trigger; today the function is one-shot
    (CLI / test hook).
 
-7. **`peekCompletedIdempotency` helper (`api/src/db/idempotency.ts`).**
+7. **`peekCompletedIdempotency` helper (`src/db/idempotency.ts`).**
    New pool-level peek for completed idempotency records. The
    state-mutating-route pattern: routes whose pre-validation checks a
    field the mutation writes (invoice.status open → paid) call this
@@ -1117,7 +1117,7 @@ amount, status='pending', stripe_refund_id IS NULL)`) for the rare
 succeeded` handler to find which owner the new card belongs to.
    Polymorphic-runner shape (Tx | typeof db).
 
-10. **Test coverage (`api/test/contracts/`).** 25 new contract tests
+10. **Test coverage (`test/contracts/`).** 25 new contract tests
     bringing the suite to **520/520 green** (495 prior + 25):
     `stripe-webhook.test.ts` (12: signature 400 / duplicate dedupe /
     succeeded flip + ledger write / idempotent re-process / failed
@@ -1151,7 +1151,7 @@ shape + repo extensions + a new signed HTTP entrypoint.
    confirmation without inferring intent from the title. Additive
    only; tables count unchanged (48).
 
-2. **Scheduler worker (`api/src/workers/scheduler.ts`).**
+2. **Scheduler worker (`src/workers/scheduler.ts`).**
    `runSchedulerTickOnce(opts) → SchedulerTickResult` composes three
    phases under `withActor('system:scheduler', tx)`: (a)
    `scheduled_notifications` claim + INSERT `notifications` +
@@ -1168,7 +1168,7 @@ shape + repo extensions + a new signed HTTP entrypoint.
    makes re-enqueue idempotent — an Idempotency-Key replay of a
    booking-creation tx ON CONFLICT DO NOTHING's the schedule rows.
 
-4. **`Booking → schedule rows` trigger (`api/src/lib/enqueueBookingReminders.ts`).**
+4. **`Booking → schedule rows` trigger (`src/lib/enqueueBookingReminders.ts`).**
    Called from all 4 booking-creation paths (`routes/bookings.ts`
    day-program, `routes/enrollments.ts` cohort,
    `routes/staffRequests.ts` approve PL+boarding,
@@ -1187,7 +1187,7 @@ shape + repo extensions + a new signed HTTP entrypoint.
      gets the reminder near-immediately (doubles as confirmation; the
      distinct type differentiates it from `'booking-confirmed'`).
 
-5. **Expo push seam (`api/src/lib/expoPush.ts`).** `ExpoPushClient`
+5. **Expo push seam (`src/lib/expoPush.ts`).** `ExpoPushClient`
    interface mirrors `StripeClient` (Day-14). `defaultExpoPushClient`
    POSTs `https://exp.host/--/api/v2/push/send`; the `_expoPushStub`
    contract-test impl records calls without network. Owner with
@@ -1206,7 +1206,7 @@ shape + repo extensions + a new signed HTTP entrypoint.
    pg_net extensions are prod-only ops; contract tests call the
    worker function directly).
 
-7. **`idempotency_keys` TTL sweep (`api/src/db/idempotency.ts`).**
+7. **`idempotency_keys` TTL sweep (`src/db/idempotency.ts`).**
    `sweepExpiredIdempotencyKeys({olderThan})` deletes rows
    older than the retry-safety window (24h default). Composed
    into the scheduler tick; failure is logged-and-swallowed (next
@@ -1227,7 +1227,7 @@ shape + repo extensions + a new signed HTTP entrypoint.
    webhook + the Day-15 invoice worker which reuses
    `system:stripe-webhook`).
 
-10. **Test coverage (`api/test/contracts/`).** 18 new tests bringing
+10. **Test coverage (`test/contracts/`).** 18 new tests bringing
     the suite to **538/538 green** (520 prior + 18):
     `scheduler-worker.test.ts` (13: empty queue / single due flips
     - INSERTs notification + dispatches push / multi-row + multi-
@@ -1260,7 +1260,7 @@ amendment, no table changes, no existing wire shape changes.
    regenerates the enum verbatim — no fix-script rule (a pure DB enum, not a
    local brand).
 
-2. **Auto-charge notifications (`api/src/workers/invoiceAutoCharge.ts`).** The
+2. **Auto-charge notifications (`src/workers/invoiceAutoCharge.ts`).** The
    worker's status-flip txns now also emit the owner-facing receipt/failure:
    - **SUCCEEDED auto-charge** → `payment-succeeded` ("We charged your card
      $X for your {purpose label}."), INSERTed inside the SAME tx as the
@@ -1289,7 +1289,7 @@ amendment, no table changes, no existing wire shape changes.
      totality). Both notifications deep-link `/account/billing` and link the
      billed dog via `notification_dogs` when the invoice carries a `dog_id`.
 
-3. **`credits-expiring` scheduled scan (`api/src/lib/enqueueCreditExpiryWarnings.ts`).**
+3. **`credits-expiring` scheduled scan (`src/lib/enqueueCreditExpiryWarnings.ts`).**
    A 5th scheduler-tick phase (own tx, own log-and-swallow boundary). Per tick:
    resolve each location's `warning_lead_days` (per-location override →
    org-default → `DEFAULT_WARNING_LEAD_DAYS = 60`), compute that location's
@@ -1310,7 +1310,7 @@ amendment, no table changes, no existing wire shape changes.
    `DEFAULT_WARNING_LEAD_DAYS` (60), one-round-trip read. The field was stored
    since Phase 2 with no consumer; this is its reader.
 
-5. **`GET /staff/invoices?parked` `[staff]` (`api/src/routes/staffInvoices.ts`).**
+5. **`GET /staff/invoices?parked` `[staff]` (`src/routes/staffInvoices.ts`).**
    The parked-invoice worklist. `requireStaff` (owner → 403); inline wire type
    (NOT portal-mirrored, matching `staffCreditExpiry`/`staffCancelWindow`).
    PARKED = `status='open'` AND `next_attempt_at IS NULL` — the single signal
@@ -1322,7 +1322,7 @@ amendment, no table changes, no existing wire shape changes.
    `{ id, owner_id, amount_cents, status, purpose, dog_id, due_at,
    auto_charge_attempts }`; ordered by `due_at` ASC (longest-overdue first).
 
-6. **Test coverage (`api/test/contracts/`).** 13 new tests, full suite
+6. **Test coverage (`test/contracts/`).** 13 new tests, full suite
    **765/765 green** (at the P3 landing; later settle-harden + payment-failed-push
    raised it to 772): `invoice-auto-charge-worker.test.ts` +3 (payment-succeeded
    on success / payment-failed on PARK / NO notification on an intermediate
@@ -1351,7 +1351,7 @@ wire shape changes.
    `touch_updated_at`) — failed rows are parked, not deleted; status
    flips pending → processing → done | failed are the lifecycle.
 
-2. **Routes (`api/src/routes/`).** Three new auth-gated routes plus
+2. **Routes (`src/routes/`).** Three new auth-gated routes plus
    one signed PUT-only catalog stub:
    - **`POST /uploads/sign`** → presigned R2 PUT URL + server-
      generated key (`{purpose}/{owner-or-staff-scope}/{uuid}.{ext}`),
@@ -1381,7 +1381,7 @@ width, height, duration_ms, derivatives: { label → url } }`.
    derivatives worker all support both purposes today; Day-19 adds
    the staff route arm + the `report_id → owner_id` join logic.
 
-4. **R2 client seam (`api/src/lib/r2.ts`).** `R2Client` interface
+4. **R2 client seam (`src/lib/r2.ts`).** `R2Client` interface
    (`signPutUrl/signGetUrl/headObject/getObjectBytes/putObjectBytes`)
    - `defaultR2Client` (AWS SDK v3 via `@aws-sdk/client-s3` +
      `@aws-sdk/s3-request-presigner`, `region:'auto'`, R2 endpoint URL
@@ -1392,7 +1392,7 @@ width, height, duration_ms, derivatives: { label → url } }`.
      Map + `seedObject/setNextHeadObjectMissing/throwOnNextPutObject`
      knobs).
 
-5. **Derivatives worker (`api/src/workers/mediaDerivatives.ts`).**
+5. **Derivatives worker (`src/workers/mediaDerivatives.ts`).**
    `runMediaDerivativesOnce(opts) → MediaDerivativesTickResult`
    composed as the 4th phase of `runSchedulerTickOnce` under the
    same `system:scheduler` actor. **NEW 3-tx-scope pattern**
@@ -1457,7 +1457,7 @@ idempotencyKeysSwept }`. `mediaDerivatives:
     sweep `media_assets WHERE expired_at < now() - 30 d`'s
     `object_key` from the bucket.
 
-12. **Test coverage (`api/test/contracts/`).** 24 new tests bringing
+12. **Test coverage (`test/contracts/`).** 24 new tests bringing
     the suite to **562/562 green** (538 prior + 24):
     `uploads-sign.test.ts` (6: image purpose happy / 3 image-
     accepting purposes / video→image-purpose 400 / image→video-
