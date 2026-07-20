@@ -838,7 +838,7 @@ observable behavior, not "looks right."
   `{ cohort_id, dog_ids[] }`** — NOT `{lead_dog_id, additional_dog_ids[]}`
   (the HANDOFF said the latter; the contract wins; each dog becomes a
   lead in its own per-week bookings). **New files:**
-  `api/src/routes/enrollments.ts`, `api/src/lib/cohortSchedule.ts`
+  `src/routes/enrollments.ts`, `src/lib/cohortSchedule.ts`
   (DST-preserving weekly cadence — `computeCohortSessionDates`).
   **Extended files:** `chicagoDate.ts` (+`chicagoWallPartsAt` paired
   with Day-10's `chicagoWallTimeToUtc`); `errors.ts` (+2 typed codes —
@@ -964,11 +964,11 @@ observable behavior, not "looks right."
     documented semantic gap; the `approved_by_staff_id` field is the actor
     discriminator vs owner self-cancel).
   **Rule-of-three extractions** (Day-10 + Day-11 + Day-12 all use these now):
-  - `api/src/lib/insertBookingWithGateMapping.ts` (NEW) — the try/catch wrapper
+  - `src/lib/insertBookingWithGateMapping.ts` (NEW) — the try/catch wrapper
     that maps trigger `check_violation` back to typed `ApiError`. Day-10 +
     Day-11 had inline copies; Day-12 made the third use, extracted to one file.
     `routes/bookings.ts` + `routes/enrollments.ts` retrofitted to consume it.
-  - `api/src/lib/bookingGatePreCheck.ts` (NEW) — the payment → vaccine
+  - `src/lib/bookingGatePreCheck.ts` (NEW) — the payment → vaccine
     (per-dog accumulate) → agreement sequence above the trigger floor. Same
     retrofit across both prior routes; signature is `(tx, {ownerId, dogIds,
     category})`. When Day-12b's `evaluation_required` lands, the priority
@@ -992,7 +992,7 @@ observable behavior, not "looks right."
   doesn't relitigate; flagged in HANDOFF for a future amendment IF Day-19
   staff-portal UX requires distinguishing copy.
 - **Exit:** ☑ 432/432 tests green (408 prior + 24 Day-12); typecheck + lint +
-  format clean. Day-12 contract test file (`api/test/contracts/requests-
+  format clean. Day-12 contract test file (`test/contracts/requests-
   mutations.test.ts`) covers every §4.5 Exit branch + 5 additional edge cases
   (idempotency replay assert by `converted_booking_id`; race on
   `pending_requests` row lock — two concurrent approves → exactly one 200 +
@@ -1067,19 +1067,19 @@ observable behavior, not "looks right."
     covers the other §H gates. The `evaluation` category bypasses the gate
     by construction (chicken-and-egg). Trigger raises `check_violation`
     with a structured ERRCODE the API maps to `evaluation_required`.
-  - **api/src/lib/bookingErrors.ts** — extend `ApiErrorCode` union with
+  - **src/lib/bookingErrors.ts** — extend `ApiErrorCode` union with
     `evaluation_required`; extend the gate-error `details` discriminator
     with `kind: 'evaluation_required', missing: { dog_id,
     evaluation_status }[]`; map the new check_violation ERRCODE to it.
-  - **api/src/routes/bookings.ts (Day 10 POST /bookings)** — add an eval
+  - **src/routes/bookings.ts (Day 10 POST /bookings)** — add an eval
     pre-check above the DB floor: walk lead + `additional_dog_ids`, build
     `missing[]` from any dog whose `evaluation_status !== 'passed'`,
     return 422 `evaluation_required` before opening the txn (friendly
     error, no orphan idempotency_keys row).
-  - **api/src/routes/enrollments.ts** — group-class is NOT gated by eval
+  - **src/routes/enrollments.ts** — group-class is NOT gated by eval
     (R7 prereq system instead). No change needed; gate priority order
     update is doc-only for group/private.
-  - **api/src/routes/requests.ts (Day 12 POST /requests)** — for
+  - **src/routes/requests.ts (Day 12 POST /requests)** — for
     `category ∈ ('board-and-train','boarding')`, pre-check the lead dog's
     `evaluation_status` and return `evaluation_required` at the request
     boundary so owners can't submit a request for an un-evaluated dog
@@ -1104,31 +1104,31 @@ observable behavior, not "looks right."
     'evaluation' category + staff-owned dogs bypass); BOOKING GATES
     transaction-contract comment renumbered to 4 floors with priority-
     order narration (payment → evaluation → vaccine → agreement).
-  - `api/src/lib/errors.ts` — `ApiErrorCode` union gains
+  - `src/lib/errors.ts` — `ApiErrorCode` union gains
     `'evaluation_required'` (422). Additive — no existing wire shape
     changed.
-  - `api/src/lib/bookingErrors.ts` — `EvaluationGap` interface +
+  - `src/lib/bookingErrors.ts` — `EvaluationGap` interface +
     `UnpassedEvaluationStatus` narrow type + `evaluationRequiredError`
     constructor + `gateTriggerErrorToApiError` branch for the
     `'evaluation gate:'` text prefix.
-  - `api/src/db/repositories/dogsRepository.ts` — new
+  - `src/db/repositories/dogsRepository.ts` — new
     `findEvaluationStatusInTx(tx, dogIds)` batched lookup
     (polymorphic-runner shape).
-  - `api/src/lib/bookingGatePreCheck.ts` — eval gate slots between
+  - `src/lib/bookingGatePreCheck.ts` — eval gate slots between
     payment and vaccine; `EVAL_GATED_CATEGORIES` set (`day-school`,
     `day-care`, `board-and-train`, `boarding`) mirrors the trigger
     predicate. PL / group-class / evaluation skip by category whitelist.
-  - `api/src/routes/requests.ts` — `POST /requests` adds a lead-only
+  - `src/routes/requests.ts` — `POST /requests` adds a lead-only
     eval pre-check for board-and-train + boarding (step 3 in the
     transactional flow). PL still bypasses at this boundary
     (staff-curated). Step comments renumbered.
-  - `api/test/contracts/_fixture.ts` — Lola's `evaluationStatus` bumped
+  - `test/contracts/_fixture.ts` — Lola's `evaluationStatus` bumped
     from `'not-evaluated'` → `'passed'` so the pre-existing booking2 /
     booking5 (Lola-led day-care + boarding) seed cleanly under the new
     trigger; `evaluation-gate.test.ts` flips her status per-test with
     finally-restore (same shape as the vaccine-gate test's
     expire+restore). `snapshots/dogs.json` updated to match.
-  - `api/test/contracts/evaluation-gate.test.ts` — 13 new tests (pre-
+  - `test/contracts/evaluation-gate.test.ts` — 13 new tests (pre-
     check API, bypass arms, schema floor, staff-dog exemption,
     gate priority, trigger-fallback mapping).
 - **Design choices logged in Day 12b1 (don't relitigate):**
@@ -1945,7 +1945,7 @@ real-sized chunks:
 - **Day 18c — Device-token verbs** (Claude, ☑ 2026-05-28). Backend
   additive on the Day-16 `device_tokens` table (no §A amendment — DDL
   already in place; §A gained a wire-shape *clarification* for the two
-  paths). `api/src/routes/device-tokens.ts`: `POST /device-tokens
+  paths). `src/routes/device-tokens.ts`: `POST /device-tokens
   [auth, owner-only]` UPSERTs against the partial-unique
   `device_tokens_uidx` (re-register re-touches the live row preserving
   `created_at`; revoked token re-inserts) and `DELETE

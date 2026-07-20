@@ -89,7 +89,7 @@ through Expo.
    Shanthi's ~100 known clients; there is no open public signup endpoint. The
    app's "signup" screens become accept-invite / first-login.
 7. **The `app.actor` per-txn primitive** (`withActor(actor, fn)` in
-   `api/src/db/tx.ts`): opens a Drizzle transaction and, as its first
+   `src/db/tx.ts`): opens a Drizzle transaction and, as its first
    statement, runs `set_config('app.actor', actor, true)` —
    `is_local = true` scopes the GUC to that transaction (which is exactly
    why Day-0 lock #3 mandates the direct/session connection, never the txn
@@ -218,7 +218,7 @@ schema/transaction design deliberately corrects:
    `capacity_exempt` generated column + enum-array columns) — no whole-table
    hand-mapping needed. It has deterministic codegen defects on this schema
    (mangled empty-string / empty enum-array defaults; extensionless relations
-   import) repaired by `api/scripts/fix-introspection.mjs`, wired into
+   import) repaired by `scripts/fix-introspection.mjs`, wired into
    `npm run db:introspect` with a fail-loud assertion. Generated `default()`
    values are not authoritative (never generate DDL); `schema.sql` is.
 2. **JWT verify → JWKS endpoint**, keys cached (Redis or in-memory).
@@ -235,7 +235,7 @@ schema/transaction design deliberately corrects:
    TLS:* Supabase's direct connection presents a Supabase-CA-signed cert
    (not in Node's trust store). Resolved with **CA-verified TLS** —
    `ssl: { ca: <supabase root CA>, rejectUnauthorized: true }` via the
-   `DATABASE_SSL_CA` env (cert committed at `api/certs/supabase-ca.crt`,
+   `DATABASE_SSL_CA` env (cert committed at `certs/supabase-ca.crt`,
    it is public) — **never `rejectUnauthorized:false`**. `DATABASE_URL`
    carries no `?sslmode=` (TLS is code-driven). Use the **direct or session**
    connection (5432), never the transaction pooler (6543) — Day-2
@@ -384,7 +384,7 @@ Landed with the credit-expiry P2/P3 lane, the double-settle hardening, and the
 ### Unified invoice settlement — `settleInvoiceCharge` + refund-the-loser
 
 Both settle paths (the auto-charge worker and the owner-initiated `POST
-/invoices/:id/pay`) route through ONE primitive, `api/src/lib/settleInvoiceCharge.ts`.
+/invoices/:id/pay`) route through ONE primitive, `src/lib/settleInvoiceCharge.ts`.
 The atomic claim is a conditional `markPaid` — `UPDATE invoices SET status='paid'
 WHERE id=? AND status='open' RETURNING id` — so under concurrency exactly one
 caller's UPDATE matches a row; the loser sees 0 rows. The Stripe PaymentIntent is
@@ -418,10 +418,10 @@ instantly — same deferral the `credits-expiring` scan accepts.
 
 ### Shared wire contract single-source + compile-time conformance (#5)
 
-`api/src/contracts/wire.ts` single-sources every shared API↔portal wire type. It
+`src/contracts/wire.ts` single-sources every shared API↔portal wire type. It
 is **dependency-free by construction** — zero imports, enum unions declared as
 string literals — so it is browser-safe and can be copied verbatim into the portal
-bundle without dragging in Drizzle/server code. `api/src/contracts/conformance.ts`
+bundle without dragging in Drizzle/server code. `src/contracts/conformance.ts`
 (API-only) ties each literal union to its Drizzle `pgEnum` via `Expect<Equal<…>>`
 type-asserts; drift between a wire literal and its DB enum is a COMPILE failure
 (proven load-bearing — dropping an enum member breaks `tsc` at the assert line).
