@@ -41,8 +41,18 @@ backend-specific.
 - Dev/test config comes from `.env` + `.env.local` (dotenv, dev/test only —
   staging/prod use host-injected env exclusively). Never commit either.
 
-## Cross-repo coordination
+## Cross-repo coordination (orchestrator model, adopted 2026-07-20)
 
+- `src/contracts/wire.ts` is THE versioned API contract for all three repos.
+  Every edit to it bumps `WIRE_CONTRACT_VERSION` (semver: major =
+  remove/rename/retype, minor = additive, patch = doc-only), adds an entry to
+  `src/contracts/CHANGELOG.md`, and requires resyncing BOTH generated clients —
+  staff portal and mobile app, each via its own `npm run sync:contracts`, in
+  their own repos' commits — plus a row in the orchestrator's `STATUS.md`.
+- The operating manual is
+  `~/Desktop/fetchd_client_mobile_app/.claude/ORCHESTRATOR.md`; the shared
+  alignment log is `.claude/STATUS.md` next to it. Read STATUS.md at session
+  start when doing contract-touching work; update it at session end.
 - Wire-contract changes ripple to the portal (`sync-contracts.mjs`) and to
   the mobile app's repository layer. Flag both in the handoff when you
   change `src/contracts/wire.ts`.
