@@ -2,9 +2,11 @@
 
 This is the standalone backend repo for Fetch'd (NWA School for Dogs),
 extracted from the client-app monorepo's `api/` folder on 2026-07-16 with full
-history. Both frontends depend on it: the client mobile app
-(`~/Desktop/fetchd_client_mobile_app`, RN/Expo) and the staff portal
-(`~/Desktop/fetchd-staff-portal`, React/Vite).
+history. Both frontends depend on it: the client mobile app (the sibling
+`fetchd_client_mobile_app` repo, RN/Expo) and the staff portal (the sibling
+`fetchd-staff-portal` repo, React/Vite). All three repos sit side-by-side
+under one umbrella folder; folder names are load-bearing (the clients' sync
+scripts resolve `src/contracts/wire.ts` sibling-relative).
 
 The monorepo's `.claude/CLAUDE.md` identity and engineering principles apply
 here unchanged — senior engineer, honest names, functions do one thing,
@@ -49,10 +51,10 @@ backend-specific.
   `src/contracts/CHANGELOG.md`, and requires resyncing BOTH generated clients —
   staff portal and mobile app, each via its own `npm run sync:contracts`, in
   their own repos' commits — plus a row in the orchestrator's `STATUS.md`.
-- The operating manual is
-  `~/Desktop/fetchd_client_mobile_app/.claude/ORCHESTRATOR.md`; the shared
-  alignment log is `.claude/STATUS.md` next to it. Read STATUS.md at session
-  start when doing contract-touching work; update it at session end.
+- The operating manual is the sibling `fetchd_client_mobile_app` repo's
+  `.claude/ORCHESTRATOR.md`; the shared alignment log is `.claude/STATUS.md`
+  next to it. Read STATUS.md at session start when doing contract-touching
+  work; update it at session end.
 - Wire-contract changes ripple to the portal (`sync-contracts.mjs`) and to
   the mobile app's repository layer. Flag both in the handoff when you
   change `src/contracts/wire.ts`.
