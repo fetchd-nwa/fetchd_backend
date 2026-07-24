@@ -1468,8 +1468,12 @@ CREATE TABLE event_rsvp_dogs (
 -- ----------------------------------------------------------------------------
 -- Notifications + announcements + push tokens
 -- ----------------------------------------------------------------------------
--- notifications is an append-only delivered feed (immutable by nature; no
--- expired_at — a notification was either delivered or it wasn't).
+-- notifications is a delivered in-app feed. Content is immutable (a
+-- notification was either delivered or it wasn't), but two state columns are
+-- mutable: read_at (NULL = unread) and dismissed_at (NULL = live). Dismiss is
+-- a soft-delete tombstone — the owner "deletes" a notification by hiding it;
+-- the row is retained for audit (matching device_tokens.expired_at), never
+-- destroyed. Feed reads and the unread count filter dismissed_at IS NULL.
 CREATE TABLE notifications (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_id        uuid NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
@@ -1478,6 +1482,7 @@ CREATE TABLE notifications (
   body            text NOT NULL,
   received_at     timestamptz NOT NULL DEFAULT now(),
   read_at         timestamptz,                          -- NULL = unread
+  dismissed_at    timestamptz,                          -- NULL = live; soft-delete tombstone (owner dismiss)
   deep_link_path  text,                                 -- producer writes this
   sender_staff_id uuid REFERENCES staff(id),            -- message-received only
   created_at      timestamptz NOT NULL DEFAULT now()

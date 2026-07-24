@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
@@ -104,6 +105,93 @@ export function registerNotificationsRoute(
       return response;
     },
   );
+
+  // --- POST /notifications/:id/read ---------------------------------------
+  // Mark one notification read. Owner-only, idempotent, 204 No Content. The
+  // owner app fires this on tap. 0 affected rows (missing or another owner's)
+  // → 404 (owner_id is in the UPDATE WHERE — anti-enumeration, no separate
+  // ownership SELECT). Mirrors POST /threads/:id/read.
+  app.post('/notifications/:id/read', { preHandler: [authHook] }, async (request, reply) => {
+    const principal = requirePrincipal(request);
+    const { id } = parseUuidParam(request.params);
+    if (principal.kind !== 'owner') {
+      throw new ApiError('not_found', `notification ${id} not found`);
+    }
+    const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    const outcome = await withMutation<null>(
+      {
+        principal,
+        idempotencyKey,
+        endpoint: 'POST /notifications/:id/read',
+        requestHash: hashRequestBody({ notificationId: id }),
+      },
+      async (tx) => {
+        const affected = await notificationsRepository.markReadForOwner(tx, id, principal.ownerId);
+        if (affected === 0) {
+          throw new ApiError('not_found', `notification ${id} not found`);
+        }
+        return { status: 204, body: null };
+      },
+    );
+    reply.code(outcome.status);
+    return outcome.body;
+  });
+
+  // --- POST /notifications/read-all ---------------------------------------
+  // Mark every unread notification read for the owner. Owner-only, idempotent,
+  // 204. Staff have no feed → 204 no-op (soft-empty convention, like the GETs).
+  app.post('/notifications/read-all', { preHandler: [authHook] }, async (request, reply) => {
+    const principal = requirePrincipal(request);
+    if (principal.kind !== 'owner') {
+      reply.code(204);
+      return null;
+    }
+    const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    const outcome = await withMutation<null>(
+      {
+        principal,
+        idempotencyKey,
+        endpoint: 'POST /notifications/read-all',
+        requestHash: hashRequestBody({}),
+      },
+      async (tx) => {
+        await notificationsRepository.markAllReadForOwner(tx, principal.ownerId);
+        return { status: 204, body: null };
+      },
+    );
+    reply.code(outcome.status);
+    return outcome.body;
+  });
+
+  // --- DELETE /notifications/:id ------------------------------------------
+  // Dismiss (soft-delete) one notification — sets dismissed_at so it drops out
+  // of the feed + unread count, row retained for audit. Owner-only, idempotent,
+  // 204. 0 affected rows → 404.
+  app.delete('/notifications/:id', { preHandler: [authHook] }, async (request, reply) => {
+    const principal = requirePrincipal(request);
+    const { id } = parseUuidParam(request.params);
+    if (principal.kind !== 'owner') {
+      throw new ApiError('not_found', `notification ${id} not found`);
+    }
+    const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    const outcome = await withMutation<null>(
+      {
+        principal,
+        idempotencyKey,
+        endpoint: 'DELETE /notifications/:id',
+        requestHash: hashRequestBody({ notificationId: id }),
+      },
+      async (tx) => {
+        const affected = await notificationsRepository.dismissForOwner(tx, id, principal.ownerId);
+        if (affected === 0) {
+          throw new ApiError('not_found', `notification ${id} not found`);
+        }
+        return { status: 204, body: null };
+      },
+    );
+    reply.code(outcome.status);
+    return outcome.body;
+  });
 }
 
 // ---- query parsing -------------------------------------------------------
@@ -112,6 +200,16 @@ function parseListQuery(query: unknown): { cursor?: string; limit: number } {
   const parsed = listQuerySchema.safeParse(query);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid query: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data;
+}
+
+const uuidParamSchema = z.object({ id: z.string().uuid() });
+
+function parseUuidParam(params: unknown): { id: string } {
+  const parsed = uuidParamSchema.safeParse(params);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid id: ${formatZodIssues(parsed.error)}`);
   }
   return parsed.data;
 }

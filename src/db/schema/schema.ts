@@ -1306,6 +1306,7 @@ export const notifications = pgTable("notifications", {
 	body: text().notNull(),
 	receivedAt: timestamp("received_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	readAt: timestamp("read_at", { withTimezone: true, mode: 'string' }),
+	dismissedAt: timestamp("dismissed_at", { withTimezone: true, mode: 'string' }),
 	deepLinkPath: text("deep_link_path"),
 	senderStaffId: uuid("sender_staff_id"),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),

@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, inArray, isNull, lt, or } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { notificationDogs, notifications } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -68,7 +68,13 @@ export const notificationsRepository = {
     return db
       .select(NOTIFICATION_PROJECTION)
       .from(notifications)
-      .where(and(eq(notifications.ownerId, ownerId), cursorCondition))
+      .where(
+        and(
+          eq(notifications.ownerId, ownerId),
+          isNull(notifications.dismissedAt),
+          cursorCondition,
+        ),
+      )
       .orderBy(desc(notifications.receivedAt), desc(notifications.id))
       .limit(limit);
   },
@@ -81,7 +87,13 @@ export const notificationsRepository = {
     const rows = await db
       .select({ unreadCount: count(notifications.id) })
       .from(notifications)
-      .where(and(eq(notifications.ownerId, ownerId), isNull(notifications.readAt)));
+      .where(
+        and(
+          eq(notifications.ownerId, ownerId),
+          isNull(notifications.readAt),
+          isNull(notifications.dismissedAt),
+        ),
+      );
     const first = rows[0];
     if (first === undefined) return 0;
     return typeof first.unreadCount === 'string' ? Number(first.unreadCount) : first.unreadCount;
@@ -108,10 +120,51 @@ export const notificationsRepository = {
   },
 
   /**
+   * Mark a single notification read (idempotent). `COALESCE` preserves the
+   * original read instant on repeat calls; the matched-row count is the
+   * existence signal — 0 ⇒ not found or not this owner's ⇒ the route 404s
+   * (anti-enumeration: owner_id is in the WHERE, no separate ownership SELECT).
+   */
+  async markReadForOwner(tx: Tx, id: string, ownerId: string): Promise<number> {
+    const rows = await tx
+      .update(notifications)
+      .set({ readAt: sql`COALESCE(${notifications.readAt}, now())` })
+      .where(and(eq(notifications.id, id), eq(notifications.ownerId, ownerId)))
+      .returning({ id: notifications.id });
+    return rows.length;
+  },
+
+  /**
+   * Mark every unread notification read for the owner (the "mark all read"
+   * verb). Bulk, always succeeds (204) — no existence signal needed.
+   */
+  async markAllReadForOwner(tx: Tx, ownerId: string): Promise<void> {
+    await tx
+      .update(notifications)
+      .set({ readAt: sql`now()` })
+      .where(and(eq(notifications.ownerId, ownerId), isNull(notifications.readAt)));
+  },
+
+  /**
+   * Dismiss (soft-delete) a single notification. `dismissed_at` is a tombstone
+   * — feed reads + the unread count filter `dismissed_at IS NULL`, so a
+   * dismissed row disappears from the app but is retained for audit. Idempotent
+   * via `COALESCE`; 0 matched rows ⇒ 404 (same anti-enumeration as read).
+   */
+  async dismissForOwner(tx: Tx, id: string, ownerId: string): Promise<number> {
+    const rows = await tx
+      .update(notifications)
+      .set({ dismissedAt: sql`COALESCE(${notifications.dismissedAt}, now())` })
+      .where(and(eq(notifications.id, id), eq(notifications.ownerId, ownerId)))
+      .returning({ id: notifications.id });
+    return rows.length;
+  },
+
+  /**
    * INSERT a notifications row (+ optional notification_dogs join
-   * rows). Append-only by schema (no `expired_at`); a "delete
-   * notification" verb would set `read_at` or hide it FE-side, never
-   * destroy the row.
+   * rows). The feed is content-immutable; the only mutations are read
+   * (`markReadForOwner` / `markAllReadForOwner`) and dismiss
+   * (`dismissForOwner`, a soft tombstone) — the row is never destroyed.
    *
    * Day 12 added the first write path: the staff approve verb enqueues
    * a `booking-confirmed` notification when a non-B&T request converts
