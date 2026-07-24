@@ -118,6 +118,7 @@ export function registerNotificationsRoute(
       throw new ApiError('not_found', `notification ${id} not found`);
     }
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    // cache-noop: the notifications feed isn't in the §3 cache map (reads aren't cached).
     const outcome = await withMutation<null>(
       {
         principal,
@@ -147,6 +148,7 @@ export function registerNotificationsRoute(
       return null;
     }
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    // cache-noop: the notifications feed isn't in the §3 cache map (reads aren't cached).
     const outcome = await withMutation<null>(
       {
         principal,
@@ -174,6 +176,7 @@ export function registerNotificationsRoute(
       throw new ApiError('not_found', `notification ${id} not found`);
     }
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    // cache-noop: the notifications feed isn't in the §3 cache map (reads aren't cached).
     const outcome = await withMutation<null>(
       {
         principal,

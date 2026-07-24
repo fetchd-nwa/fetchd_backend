@@ -159,6 +159,28 @@ specifying the page shape. Pinned at Day 7b:
   bad payload shape) returns 400 `bad_request` — never a silent fallback
   to page 1, which would mask client bugs.
 
+**Amendment 2026-07-24 (Notifications Phase 1 — read/dismiss mutation verbs +
+`dismissed_at` soft-tombstone).** The notifications feed gained three bodyless
+mutation verbs (see §C) and a `notifications.dismissed_at timestamptz` column
+(NULL = live), modeled on `device_tokens.expired_at`. No wire-shape or contract
+change — all three verbs return **204 No Content** and `NotificationWire` is
+unchanged (`dismissed_at` is server-internal, never emitted).
+
+- **Read state** — `POST /notifications/:id/read` marks one row read
+  (`read_at = COALESCE(read_at, now())`, idempotent); `POST /notifications/read-all`
+  marks every unread row read. Both owner-only. A read row **stays in the feed**,
+  now flagged `is_read: true`, and drops out of `unread-count`.
+- **Dismiss = soft-tombstone** — `DELETE /notifications/:id` sets `dismissed_at`
+  (idempotent via `COALESCE`); the row is **retained for audit** but filtered out
+  of both `GET /notifications` and `GET /notifications/unread-count`
+  (`dismissed_at IS NULL` on both reads). Dismiss ≠ read: a read row still shows,
+  a dismissed one does not. No undo, no trash UI (Apple-style swipe-away),
+  consistent across the owner's devices.
+- **Anti-enumeration** — `owner_id` is in the UPDATE `WHERE`; 0 matched rows
+  (missing, dismissed-already-is-fine via COALESCE, or another owner's) → 404,
+  no separate ownership SELECT. Staff principals → 404 on `:id/read` / `DELETE`
+  (read-all is a 204 no-op, matching the soft-empty-feed convention of the GETs).
+
 **Amendment 2026-05-22 (Day 9d — VaccineWire grows `id` + `requirement_key?`).**
 The §B Dog `vaccines:[{name,expires_at}]` sub-shape was forced open by
 Day-9d's `PATCH /dogs/:id/vaccines/:vid` and `DELETE
@@ -2089,7 +2111,7 @@ invisible to the repository layer.
 
 **Notifications & announcements**
 
-- `GET /notifications` · `GET /notifications/unread-count` · `POST /notifications/:id/read` · `POST /notifications/read-all` · `DELETE /notifications/:id`
+- `GET /notifications` · `GET /notifications/unread-count` · `POST /notifications/:id/read` · `POST /notifications/read-all` · `DELETE /notifications/:id` — **Notifications Phase 1 (2026-07-24)**: the three mutation verbs are owner-only, idempotent, bodyless **204**. `:id/read` / `read-all` set `read_at` (a read row stays in the feed, flagged `is_read`, and drops from `unread-count`); `DELETE` is a **soft-tombstone** (`dismissed_at`) — the row is retained for audit but filtered out of the feed + unread-count. 0-affected-rows (not-yours/unknown/staff) → 404; `read-all` for staff is a 204 no-op. See §A Amendment 2026-07-24.
 - `GET /announcements?location=`
 
 **Payments** [$] — built day one; Stripe **test mode** in dev/staging, **live** in prod (env split)
