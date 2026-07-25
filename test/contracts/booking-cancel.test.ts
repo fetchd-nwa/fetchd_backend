@@ -10,6 +10,7 @@ import {
   creditLedger,
   notifications,
   refunds,
+  scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
@@ -678,6 +679,38 @@ test(
         ),
       );
     assert.equal(notifRows.length, 1, 'booking-cancelled notification enqueued');
+  },
+);
+
+test(
+  'POST /bookings/:id/cancel — flips a pending booking-reminder scheduled row to cancelled (D4)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = cancelApp();
+    // POST /bookings enqueues a pending `booking-reminder:<bookingId>` schedule
+    // row via the shared booking-creation core — the natural fixture for the
+    // cancel-on-cancel path, so no hand-seeding of scheduled_notifications.
+    const bookingId = await createCreditPaidBooking({ app, date: realFutureWeekday(11) });
+
+    const reminderKey = `booking-reminder:${bookingId}`;
+    const [before] = await db
+      .select({ status: scheduledNotifications.status })
+      .from(scheduledNotifications)
+      .where(eq(scheduledNotifications.dedupeKey, reminderKey));
+    assert.equal(before?.status, 'pending', 'reminder enqueued pending pre-cancel');
+
+    const res = await postCancel({
+      app,
+      bookingId,
+      idempotencyKey: `cn-d4-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+
+    const [after] = await db
+      .select({ status: scheduledNotifications.status })
+      .from(scheduledNotifications)
+      .where(eq(scheduledNotifications.dedupeKey, reminderKey));
+    assert.equal(after?.status, 'cancelled', 'cancel supersedes the pending reminder');
   },
 );
 

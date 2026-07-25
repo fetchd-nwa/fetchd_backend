@@ -103,13 +103,24 @@ async function cleanup(): Promise<void> {
 /** Count the worker's payment-* feed rows for the fixture owner, by type. */
 async function paymentNotifications(
   type: 'payment-succeeded' | 'payment-failed',
-): Promise<{ id: string; title: string; body: string; deepLinkPath: string | null }[]> {
+): Promise<
+  {
+    id: string;
+    title: string;
+    body: string;
+    deepLinkPath: string | null;
+    deepLinkKind: string | null;
+    deepLinkId: string | null;
+  }[]
+> {
   return db
     .select({
       id: notifications.id,
       title: notifications.title,
       body: notifications.body,
       deepLinkPath: notifications.deepLinkPath,
+      deepLinkKind: notifications.deepLinkKind,
+      deepLinkId: notifications.deepLinkId,
     })
     .from(notifications)
     .where(and(eq(notifications.ownerId, FIXTURE_IDS.ownerId), eq(notifications.type, type)));
@@ -246,7 +257,11 @@ test(
   async () => {
     await cleanup();
     // payg purpose + a dog so the receipt copy + notification_dogs link assert.
-    await seedDueInvoice({ amountCents: 4500, purpose: 'payg', dogId: FIXTURE_IDS.dog1Id });
+    const invoiceId = await seedDueInvoice({
+      amountCents: 4500,
+      purpose: 'payg',
+      dogId: FIXTURE_IDS.dog1Id,
+    });
     const stripe = makeStripeStub();
 
     const result = await runInvoiceAutoChargeOnce({ stripe, limit: 5 });
@@ -256,7 +271,9 @@ test(
     assert.equal(succeeded.length, 1, 'exactly one receipt');
     assert.equal(succeeded[0]?.title, 'Payment received');
     assert.match(succeeded[0]!.body, /\$45 for your day program session/);
-    assert.equal(succeeded[0]?.deepLinkPath, '/account/billing');
+    assert.equal(succeeded[0]?.deepLinkPath, '/account/invoices');
+    assert.equal(succeeded[0]?.deepLinkKind, 'invoice');
+    assert.equal(succeeded[0]?.deepLinkId, invoiceId);
 
     // No payment-failed on a clean success.
     assert.equal((await paymentNotifications('payment-failed')).length, 0);
@@ -322,7 +339,9 @@ test(
     assert.equal(scheduled?.status, 'pending', 'not yet delivered — awaits the scheduler tick');
     assert.equal(scheduled?.title, 'Payment failed');
     assert.match(scheduled!.body, /\$120 for your group class enrollment.*update your card/i);
-    assert.equal(scheduled?.deepLinkPath, '/account/billing');
+    assert.equal(scheduled?.deepLinkPath, '/account/invoices');
+    assert.equal(scheduled?.deepLinkKind, 'invoice');
+    assert.equal(scheduled?.deepLinkId, invoiceId);
 
     // No feed row landed in the worker tx — the scheduler inserts it on delivery.
     assert.equal(

@@ -188,17 +188,26 @@ test(
 
     // Owner notified.
     const notes = await db
-      .select({ type: notificationsTable.type, senderStaffId: notificationsTable.senderStaffId })
+      .select({
+        type: notificationsTable.type,
+        senderStaffId: notificationsTable.senderStaffId,
+        deepLinkKind: notificationsTable.deepLinkKind,
+        deepLinkId: notificationsTable.deepLinkId,
+      })
       .from(notificationsTable)
       .where(
         and(
           eq(notificationsTable.ownerId, FIXTURE_IDS.ownerId),
-          eq(notificationsTable.deepLinkPath, `/messages/${FIXTURE_IDS.thread1Id}`),
+          eq(notificationsTable.deepLinkPath, `/chat/${FIXTURE_IDS.thread1Id}`),
         ),
       );
     assert.ok(
       notes.some(
-        (n) => n.type === 'message-received' && n.senderStaffId === FIXTURE_IDS.staffDonavanId,
+        (n) =>
+          n.type === 'message-received' &&
+          n.senderStaffId === FIXTURE_IDS.staffDonavanId &&
+          n.deepLinkKind === 'thread' &&
+          n.deepLinkId === FIXTURE_IDS.thread1Id,
       ),
       'message-received notification enqueued to the owner with the staff actor',
     );

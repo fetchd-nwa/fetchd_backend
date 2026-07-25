@@ -14,6 +14,7 @@ import {
   scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
+import type { NotificationDeepLinkKind } from '../../src/lib/notificationWire.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
 import { makeExpoPushStub } from './_expoPushStub.js';
@@ -61,6 +62,8 @@ async function seedDueScheduledRow(opts: {
   scheduledFor: Date;
   dedupeKey?: string;
   title?: string;
+  deepLinkKind?: NotificationDeepLinkKind;
+  deepLinkId?: string;
 }): Promise<string> {
   const row = await db.transaction(async (tx) =>
     scheduledNotificationsRepository.enqueueIdempotent(tx, {
@@ -72,6 +75,8 @@ async function seedDueScheduledRow(opts: {
       title: opts.title ?? 'Reminder: Day School tomorrow',
       body: 'Your booking is coming up.',
       deepLinkPath: `/bookings/${BOOKING_ID}`,
+      deepLinkKind: opts.deepLinkKind ?? null,
+      deepLinkId: opts.deepLinkId ?? null,
       bookingId: BOOKING_ID,
       dogId: DOG_ID,
     }),
@@ -103,6 +108,8 @@ test(
     await seedDeviceToken('ExponentPushToken[stub-device-1]');
     const scheduledId = await seedDueScheduledRow({
       scheduledFor: new Date('2026-01-01T00:00:00Z'),
+      deepLinkKind: 'booking',
+      deepLinkId: BOOKING_ID,
     });
     const expoPush = makeExpoPushStub();
 
@@ -129,18 +136,24 @@ test(
     assert.ok(scheduled?.sentAt);
     assert.ok(scheduled?.emittedNotificationId);
 
-    // delivered notifications row landed
+    // delivered notifications row landed — deliverOne carries the structured
+    // deep-link ref (kind + id) from the schedule row through to the feed row,
+    // not just the hand-written path.
     const [delivered] = await db
       .select({
         type: notifications.type,
         title: notifications.title,
         deepLinkPath: notifications.deepLinkPath,
+        deepLinkKind: notifications.deepLinkKind,
+        deepLinkId: notifications.deepLinkId,
       })
       .from(notifications)
       .where(eq(notifications.id, scheduled!.emittedNotificationId!));
     assert.equal(delivered?.type, 'booking-reminder');
     assert.equal(delivered?.title, 'Reminder: Day School tomorrow');
     assert.equal(delivered?.deepLinkPath, `/bookings/${BOOKING_ID}`);
+    assert.equal(delivered?.deepLinkKind, 'booking');
+    assert.equal(delivered?.deepLinkId, BOOKING_ID);
 
     // notification_dogs denorm populated
     const dogRows = await db
@@ -373,6 +386,12 @@ test(
     assert.ok(reminder);
     assert.ok(boarding24h, 'boarding-profile-check enqueued for board-and-train');
     assert.equal(boarding24h?.type, 'boarding-profile-check');
+    // Decision 5: the profile-check copy asks the owner to verify vaccines/
+    // meds/feeding, so it deep-links to the dog edit form (dog-manage), keyed
+    // on the lead dog — NOT the booking detail.
+    assert.equal(boarding24h?.deepLinkPath, `/dog-manage/${DOG_ID}`);
+    assert.equal(boarding24h?.deepLinkKind, 'dog-manage');
+    assert.equal(boarding24h?.deepLinkId, DOG_ID);
     // Anchored on dropoffAt, not scheduledAt
     assert.equal(
       new Date(boarding24h!.scheduledFor).getTime(),

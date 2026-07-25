@@ -181,6 +181,73 @@ unchanged (`dismissed_at` is server-internal, never emitted).
   no separate ownership SELECT. Staff principals → 404 on `:id/read` / `DELETE`
   (read-all is a 204 no-op, matching the soft-empty-feed convention of the GETs).
 
+**Amendment 2026-07-24 (Notifications Phase 2 — structured entity ref
+(`deep_link_kind`/`deep_link_id`) + producer `deep_link_path` corrections +
+cancel-time schedule teardown).** Companion to the Phase-1 amendment above; all
+backend-side and wire-invisible this phase — no `WIRE_CONTRACT_VERSION` bump. The
+two new columns stay server-internal until the Phase-3 contract bump derives the
+path from them.
+
+- **Structured entity ref (decision 3).** `notifications` and
+  `scheduled_notifications` each gained `deep_link_kind text` + `deep_link_id
+  uuid` (both nullable) — the entity a tap targets, carried as a (kind, id) pair
+  instead of only a hand-written `deep_link_path` string. `NotificationWire` is
+  UNCHANGED (neither column is emitted yet); producers still hand-write the path
+  this phase. Phase 3 bumps the contract to emit the structured ref and derive
+  the path from it via a shared `deepLinkToPath()` helper — correct-by-
+  construction, which kills the mis-parse class below at the root.
+
+- **Producer `deep_link_path` corrections.** Six of the twelve producers were
+  emitting a path with no matching FE route (dead-ended on Unmatched) or the
+  wrong segment binding. Canonical (kind, id, path) for all twelve as of this
+  phase:
+
+  | type | kind | id | canonical path |
+  | --- | --- | --- | --- |
+  | booking-confirmed | `booking` | bookingId | `/bookings/:bookingId` |
+  | booking-cancelled | `booking` | bookingId | `/bookings/:bookingId` |
+  | booking-reminder | `booking` | bookingId | `/bookings/:bookingId` |
+  | boarding-profile-check | `dog-manage` | leadDogId | `/dog-manage/:leadDogId` ← |
+  | report-published | `report` | reportId | `/report-card/:dogId?reportId=:reportId` ← |
+  | message-received | `thread` | threadId | `/chat/:threadId` ← |
+  | payment-succeeded | `invoice` | invoiceId | `/account/invoices` ← |
+  | payment-failed | `invoice` | invoiceId | `/account/invoices` ← |
+  | membership-ended | `membership` | membershipId | `/account/memberships` |
+  | credits-expiring | `dog-profile` | lot.dogId | `/dog-profile/:dogId` ← |
+  | alumni-attendance | `dog-profile` | dogId | `/dog-profile/:dogId` |
+  | spay-neuter-reminder | `dog-manage` | dogId | `/dog-manage/:dogId` |
+
+  `←` marks the six changed this phase. WHY each moved:
+  - **boarding-profile-check** `/bookings/:id` → `/dog-manage/:leadDogId`
+    (decision 5) — the old alias opened booking detail, but the CTA is the
+    pre-stay profile/vaccine/feeding intake, which lives on the dog-manage edit
+    form. Producer resolves booking → lead dog.
+  - **report-published** `/reports/:reportId` →
+    `/report-card/:dogId?reportId=:reportId` — the old path dead-ended: the RN
+    route `app/reports/[dogId]` binds the segment as `dogId`, so a report id fed
+    there resolved no dog + an empty list. Producer now threads `body.dog_id`
+    (the report id rides the query string).
+  - **message-received** `/messages/:threadId` → `/chat/:threadId` — no
+    `/messages/:id` route exists (the thread screen is `app/chat/[threadId]`);
+    the old path landed on Unmatched.
+  - **payment-succeeded / payment-failed** `/account/billing` →
+    `/account/invoices` — no `/account/billing` route exists (`app/account`
+    carries only `invoices` + `memberships`); both dead-ended. payment-failed is
+    the only action-required push, so this one is high-impact.
+  - **credits-expiring** `/credits` → `/dog-profile/:dogId` (decision 4) — no
+    `/credits` route exists anywhere; the credit balance lives on the dog
+    profile. Producer resolves lot → dog (`lot.dogId`); one notification per
+    expiring lot.
+
+  Reserved kinds with no producer yet: `credits`, `announcement`.
+
+- **D4 — cancel-time schedule teardown.** Booking cancel now cancels the
+  booking's pending `scheduled_notifications` — the `booking-reminder:<bookingId>`
+  row (all categories) and, for boarding / board-and-train, the
+  `boarding-24h:<bookingId>` row — in the SAME transaction as the cancel, so a
+  cancelled booking never fires a stale reminder or profile-check. (The enqueue
+  side is the §A Day-16 amendment; this closes the loop on cancel.)
+
 **Amendment 2026-05-22 (Day 9d — VaccineWire grows `id` + `requirement_key?`).**
 The §B Dog `vaccines:[{name,expires_at}]` sub-shape was forced open by
 Day-9d's `PATCH /dogs/:id/vaccines/:vid` and `DELETE
@@ -1308,8 +1375,9 @@ amendment, no table changes, no existing wire shape changes.
    - Copy varies by `charge_purpose` via a pure `purposeLabel` helper (payg →
      "day program session", board-train → "Board & Train program",
      group-class → "group class enrollment", package/membership covered for
-     totality). Both notifications deep-link `/account/billing` and link the
-     billed dog via `notification_dogs` when the invoice carries a `dog_id`.
+     totality). Both notifications deep-link `/account/invoices` (kind `invoice`,
+     id = invoiceId; corrected in the §A Notifications Phase 2 amendment) and link
+     the billed dog via `notification_dogs` when the invoice carries a `dog_id`.
 
 3. **`credits-expiring` scheduled scan (`src/lib/enqueueCreditExpiryWarnings.ts`).**
    A 5th scheduler-tick phase (own tx, own log-and-swallow boundary). Per tick:
@@ -1548,7 +1616,7 @@ bookings/:id/confirm [staff]` → stamps `confirmed_at` only when NULL
   `ThreadWire[]`. `POST /staff/threads/:id/messages [staff]` → body
   `{ text }`, INSERTs a `sender_kind='staff'` message, bumps
   `threads.last_message`/`last_message_at`, enqueues a `message-received`
-  notification to the owner (`deep_link_path: /messages/:threadId`,
+  notification to the owner (`deep_link_path: /chat/:threadId`,
   `sender_staff_id` = actor). Returns 201 `MessageWire`. First message-WRITE
   path in the codebase.
 - **Verb 2 — report authoring.** `POST /staff/reports [staff]` → base row
@@ -1561,8 +1629,9 @@ bookings/:id/confirm [staff]` → stamps `confirmed_at` only when NULL
   `house-manners`, `cgc`) FORBID it (422; schema `reports_check` is the
   backstop). Optional `link_booking_id` back-links ONE booking's
   `session_report_id` (booking's lead dog must match). Enqueues a
-  `report-published` notification (`deep_link_path: /reports/:reportId`,
-  `dog_ids: [dog_id]`). Returns 201 `ReportWire`. `PATCH /staff/reports/:id
+  `report-published` notification (`deep_link_path:
+  /report-card/:dogId?reportId=:reportId`, `dog_ids: [dog_id]`). Returns 201
+  `ReportWire`. `PATCH /staff/reports/:id
 [staff]` edits content fields (identity columns locked; no re-notify).
 - **Still DEFERRED past 19a (→ 19b):** `report-photo`/`report-video` media
   POSTs remain 422 `media-staff-upload-deferred` (the staff-author media

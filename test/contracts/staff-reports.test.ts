@@ -172,16 +172,25 @@ test(
     assert.equal(rows.length, 1, 'report row persisted');
 
     const notes = await db
-      .select({ type: notificationsTable.type })
+      .select({
+        type: notificationsTable.type,
+        deepLinkKind: notificationsTable.deepLinkKind,
+        deepLinkId: notificationsTable.deepLinkId,
+      })
       .from(notificationsTable)
       .where(
         and(
           eq(notificationsTable.ownerId, FIXTURE_IDS.ownerId),
-          eq(notificationsTable.deepLinkPath, `/reports/${body.id}`),
+          eq(notificationsTable.deepLinkPath, `/report-card/${body.dog_id}?reportId=${body.id}`),
         ),
       );
     assert.ok(
-      notes.some((n) => n.type === 'report-published'),
+      notes.some(
+        (n) =>
+          n.type === 'report-published' &&
+          n.deepLinkKind === 'report' &&
+          n.deepLinkId === body.id,
+      ),
       'report-published notification enqueued',
     );
   },

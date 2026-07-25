@@ -631,6 +631,8 @@ test(
         id: notificationsTable.id,
         type: notificationsTable.type,
         deepLinkPath: notificationsTable.deepLinkPath,
+        deepLinkKind: notificationsTable.deepLinkKind,
+        deepLinkId: notificationsTable.deepLinkId,
       })
       .from(notificationsTable)
       .where(
@@ -641,6 +643,8 @@ test(
         ),
       );
     assert.equal(notifs.length, 1, 'one booking-confirmed notification enqueued');
+    assert.equal(notifs[0]?.deepLinkKind, 'booking');
+    assert.equal(notifs[0]?.deepLinkId, body.converted_booking_id);
 
     // pending_requests.approved_by_staff_id stamped with the staff actor.
     const [pr] = await db

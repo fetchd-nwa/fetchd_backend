@@ -79,12 +79,29 @@ async function clearScanState(lotIds: string[]): Promise<void> {
   }
 }
 
-async function scheduledForLot(lotId: string): Promise<{ count: number; type: string | null }> {
+async function scheduledForLot(lotId: string): Promise<{
+  count: number;
+  type: string | null;
+  deepLinkPath: string | null;
+  deepLinkKind: string | null;
+  deepLinkId: string | null;
+}> {
   const rows = await db
-    .select({ type: scheduledNotifications.type })
+    .select({
+      type: scheduledNotifications.type,
+      deepLinkPath: scheduledNotifications.deepLinkPath,
+      deepLinkKind: scheduledNotifications.deepLinkKind,
+      deepLinkId: scheduledNotifications.deepLinkId,
+    })
     .from(scheduledNotifications)
     .where(eq(scheduledNotifications.dedupeKey, `credits-expiring:${lotId}`));
-  return { count: rows.length, type: rows[0]?.type ?? null };
+  return {
+    count: rows.length,
+    type: rows[0]?.type ?? null,
+    deepLinkPath: rows[0]?.deepLinkPath ?? null,
+    deepLinkKind: rows[0]?.deepLinkKind ?? null,
+    deepLinkId: rows[0]?.deepLinkId ?? null,
+  };
 }
 
 test(
@@ -94,7 +111,14 @@ test(
     await resetCreditExpirySettings();
     const lotId = randomUUID();
     await clearScanState([lotId]);
-    const now = new Date('2026-06-20T12:00:00Z');
+    // Anchor `now` on the REAL clock, not a hardcoded literal. The production
+    // scan's live-lot floor is `expires_at > now()` in Postgres (real time),
+    // which we cannot change — so a fixed past `now` lets the lot's now+30d
+    // expiry fall behind the real clock and drop out of the scan (the rot).
+    // A real-clock anchor keeps the 30d-out lot inside BOTH that floor and the
+    // 60d window ceiling (now + lead) on every calendar day, and the single
+    // captured instant flows to both the seed and the enqueue call.
+    const now = new Date();
     // Expiry 30 days out — inside the 60-day org-default window.
     await seedLot({ lotId, expiresAt: new Date(now.getTime() + 30 * ONE_DAY_MS), credits: 5 });
 
@@ -105,6 +129,10 @@ test(
     const afterFirst = await scheduledForLot(lotId);
     assert.equal(afterFirst.count, 1, 'exactly one scheduled row for the lot');
     assert.equal(afterFirst.type, 'credits-expiring');
+    // Decision 4: credits UI lives on the dog profile, keyed on the lot's dog.
+    assert.equal(afterFirst.deepLinkPath, `/dog-profile/${FIXTURE_IDS.dog1Id}`);
+    assert.equal(afterFirst.deepLinkKind, 'dog-profile');
+    assert.equal(afterFirst.deepLinkId, FIXTURE_IDS.dog1Id);
 
     // Second tick — the lot is still in-window, but the dedupe key blocks re-enqueue.
     const second = await withActor(SCAN_ACTOR, (tx) => enqueueCreditExpiryWarnings(tx, now));
