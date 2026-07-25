@@ -256,6 +256,8 @@ export function registerStaffRequestsRoute(
               title: 'Booking confirmed',
               body: notificationBodyFor(row.category, firstSession.scheduledAt),
               deepLinkPath: `/bookings/${firstBooking.id}`,
+              deepLinkKind: 'booking',
+              deepLinkId: firstBooking.id,
               dogIds: [leadDogId, ...additionalDogIds],
             });
           } else {
@@ -323,6 +325,8 @@ export function registerStaffRequestsRoute(
               title: 'Booking confirmed',
               body: notificationBodyFor(row.category, parsed.scheduledAt),
               deepLinkPath: `/bookings/${inserted.id}`,
+              deepLinkKind: 'booking',
+              deepLinkId: inserted.id,
               dogIds: [row.leadDogId, ...allDogIds.additionalDogIds],
             });
           }

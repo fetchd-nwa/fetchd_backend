@@ -82,7 +82,6 @@ export async function enqueueBookingReminders(
   args: EnqueueBookingRemindersArgs,
 ): Promise<void> {
   const human = categoryHuman(args.category);
-  const deepLinkPath = `/bookings/${args.bookingId}`;
 
   const reminderFor = new Date(args.scheduledAt.getTime() - ONE_DAY_MS);
   await scheduledNotificationsRepository.enqueueIdempotent(tx, {
@@ -93,7 +92,9 @@ export async function enqueueBookingReminders(
     scheduledFor: reminderFor,
     title: `Reminder: ${human} tomorrow`,
     body: `Your ${human} is coming up — we'll see you soon.`,
-    deepLinkPath,
+    deepLinkPath: `/bookings/${args.bookingId}`,
+    deepLinkKind: 'booking',
+    deepLinkId: args.bookingId,
     bookingId: args.bookingId,
     dogId: args.leadDogId,
   });
@@ -109,7 +110,11 @@ export async function enqueueBookingReminders(
       scheduledFor: profileCheckFor,
       title: `Heads up: ${human} drop-off tomorrow`,
       body: `Drop-off is in 24 hours. A quick check that vaccines, meds, and feeding notes are up to date.`,
-      deepLinkPath,
+      // The copy asks the owner to verify vaccines/meds/feeding, so it lands on
+      // the dog edit form (decision 5) rather than the booking detail.
+      deepLinkPath: `/dog-manage/${args.leadDogId}`,
+      deepLinkKind: 'dog-manage',
+      deepLinkId: args.leadDogId,
       bookingId: args.bookingId,
       dogId: args.leadDogId,
     });

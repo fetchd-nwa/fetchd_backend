@@ -382,6 +382,8 @@ async function deliverOne(
     title: row.title,
     body: row.body,
     deepLinkPath: row.deepLinkPath,
+    deepLinkKind: row.deepLinkKind,
+    deepLinkId: row.deepLinkId,
     dogIds: row.dogId ? [row.dogId] : [],
   });
 

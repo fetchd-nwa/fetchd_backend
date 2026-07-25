@@ -2,7 +2,7 @@ import { and, asc, count, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle
 import { db } from '../client.js';
 import { notificationDogs, notifications } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
-import type { NotificationRowForWire } from '../../lib/notificationWire.js';
+import type { NotificationDeepLinkKind, NotificationRowForWire } from '../../lib/notificationWire.js';
 
 type NotificationType = (typeof notifications.$inferInsert)['type'] extends infer T
   ? T & string
@@ -177,6 +177,9 @@ export const notificationsRepository = {
    * (Day-16); leave undefined for booking-flow notifications. `dogIds`
    * optional — empty/undefined produces no `notification_dogs` rows
    * (the bell row falls back to its category icon).
+   *
+   * `deepLinkKind`/`deepLinkId` are the structured deep-link ref (decision 3);
+   * the hand-written `deepLinkPath` stays until Phase 3 derives it.
    */
   async enqueue(
     tx: Tx,
@@ -186,6 +189,8 @@ export const notificationsRepository = {
       title: string;
       body: string;
       deepLinkPath?: string | null;
+      deepLinkKind?: NotificationDeepLinkKind | null;
+      deepLinkId?: string | null;
       senderStaffId?: string | null;
       dogIds?: readonly string[];
     },
@@ -198,6 +203,8 @@ export const notificationsRepository = {
         title: values.title,
         body: values.body,
         deepLinkPath: values.deepLinkPath ?? null,
+        deepLinkKind: values.deepLinkKind ?? null,
+        deepLinkId: values.deepLinkId ?? null,
         senderStaffId: values.senderStaffId ?? null,
         // receivedAt / createdAt default to now(); readAt remains NULL
         // (unread sentinel).

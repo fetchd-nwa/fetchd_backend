@@ -68,6 +68,8 @@ export async function rollDueMemberships(tx: Tx, now: Date): Promise<MembershipR
         title: 'Your subscription has ended',
         body: endedBody(membership),
         deepLinkPath: '/account/memberships',
+        deepLinkKind: 'membership',
+        deepLinkId: membership.id,
         dogIds: [membership.dogId],
       });
       completed += 1;

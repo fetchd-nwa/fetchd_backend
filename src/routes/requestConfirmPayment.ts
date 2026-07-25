@@ -290,6 +290,8 @@ export function registerRequestConfirmPaymentRoute(
               day: 'numeric',
             })}`,
             deepLinkPath: `/bookings/${inserted.id}`,
+            deepLinkKind: 'booking',
+            deepLinkId: inserted.id,
             dogIds: [grouped.lead, ...grouped.additional],
           });
 

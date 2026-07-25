@@ -386,7 +386,9 @@ async function recordFailed(
       body: `We couldn't process your payment of ${formatDollars(
         invoice.amountCents,
       )} for your ${purposeLabel(invoice.purpose)}. Please update your card.`,
-      deepLinkPath: '/account/billing',
+      deepLinkPath: '/account/invoices',
+      deepLinkKind: 'invoice',
+      deepLinkId: invoice.id,
       dogId: invoice.dogId,
     });
   });

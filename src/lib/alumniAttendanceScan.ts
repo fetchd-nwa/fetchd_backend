@@ -77,6 +77,8 @@ export async function enqueueAlumniAttendanceFlags(
       title: 'Alumni check-in needed',
       body: attendanceBody(dog),
       deepLinkPath: `/dog-profile/${dog.dogId}`,
+      deepLinkKind: 'dog-profile',
+      deepLinkId: dog.dogId,
       dogId: dog.dogId,
     });
     // `undefined` = dedupe fired (this month already handled for this dog) —

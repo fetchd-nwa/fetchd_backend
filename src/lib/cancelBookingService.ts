@@ -5,6 +5,7 @@ import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
 import type { ServiceCategory } from './bookingBucket.js';
 import type { BookingWire } from './bookingWire.js';
@@ -171,8 +172,15 @@ export async function cancelBookingInTx(
     title: 'Booking cancelled',
     body: cancellationBody(row.category, row.scheduledAt, updated.cancelForfeited),
     deepLinkPath: `/bookings/${id}`,
+    deepLinkKind: 'booking',
+    deepLinkId: id,
     dogIds,
   });
+
+  // D4: a cancelled booking must never push "reminder tomorrow" / "drop-off
+  // tomorrow" — cancel any still-pending reminder rows for it in the same tx.
+  await scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `booking-reminder:${id}`);
+  await scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `boarding-24h:${id}`);
 
   // 6. Wire the updated row for the response.
   const [wire] = await wireManyBookings([updated]);

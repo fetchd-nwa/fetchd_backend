@@ -2,6 +2,7 @@ import { and, asc, eq, like, lte, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { scheduledNotifications } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
+import type { NotificationDeepLinkKind } from '../../lib/notificationWire.js';
 
 /** Polymorphic runner — pool for pre/post-tx reads, Tx for in-mutation work. */
 type Runner = Tx | typeof db;
@@ -77,6 +78,8 @@ export interface ScheduledNotificationRow {
   title: string;
   body: string;
   deepLinkPath: string | null;
+  deepLinkKind: NotificationDeepLinkKind | null;
+  deepLinkId: string | null;
   bookingId: string | null;
   reportId: string | null;
   dogId: string | null;
@@ -95,6 +98,8 @@ const SCHEDULED_NOTIFICATION_PROJECTION = {
   title: scheduledNotifications.title,
   body: scheduledNotifications.body,
   deepLinkPath: scheduledNotifications.deepLinkPath,
+  deepLinkKind: scheduledNotifications.deepLinkKind,
+  deepLinkId: scheduledNotifications.deepLinkId,
   bookingId: scheduledNotifications.bookingId,
   reportId: scheduledNotifications.reportId,
   dogId: scheduledNotifications.dogId,
@@ -126,6 +131,8 @@ export const scheduledNotificationsRepository = {
       title: string;
       body: string;
       deepLinkPath?: string | null;
+      deepLinkKind?: NotificationDeepLinkKind | null;
+      deepLinkId?: string | null;
       bookingId?: string | null;
       reportId?: string | null;
       dogId?: string | null;
@@ -142,6 +149,8 @@ export const scheduledNotificationsRepository = {
         title: values.title,
         body: values.body,
         deepLinkPath: values.deepLinkPath ?? null,
+        deepLinkKind: values.deepLinkKind ?? null,
+        deepLinkId: values.deepLinkId ?? null,
         bookingId: values.bookingId ?? null,
         reportId: values.reportId ?? null,
         dogId: values.dogId ?? null,

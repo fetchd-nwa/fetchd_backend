@@ -23,7 +23,7 @@ import { defaultR2Client, type R2Client } from '../lib/r2.js';
  * WRITE path in the codebase — it INSERTs a staff message, bumps the
  * thread's last_message preview + last_message_at, and enqueues a
  * `message-received` notification to the thread's owner (deep link
- * `/messages/:threadId`, matching the fixture convention).
+ * `/chat/:threadId` + structured ref kind='thread'/id=threadId).
  */
 
 const MAX_MESSAGE_LEN = 4000;
@@ -123,7 +123,9 @@ export function registerStaffThreadsRoute(
             type: 'message-received',
             title: 'New message',
             body: text.length > 140 ? `${text.slice(0, 137)}…` : text,
-            deepLinkPath: `/messages/${id}`,
+            deepLinkPath: `/chat/${id}`,
+            deepLinkKind: 'thread',
+            deepLinkId: id,
             senderStaffId: principal.staffId,
           });
 

@@ -1,5 +1,6 @@
 import { pgTable, text, doublePrecision, boolean, timestamp, uniqueIndex, foreignKey, unique, uuid, jsonb, index, check, date, integer, smallint, bigint, primaryKey, pgView, pgEnum } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
+import type { NotificationDeepLinkKind } from "../../lib/notificationWire.js"
 
 export const announcementCategory = pgEnum("announcement_category", ['urgent', 'team', 'class', 'event', 'promo', 'report'])
 export const bookingAttendance = pgEnum("booking_attendance", ['pending', 'attended', 'no-show', 'excused'])
@@ -1308,6 +1309,8 @@ export const notifications = pgTable("notifications", {
 	readAt: timestamp("read_at", { withTimezone: true, mode: 'string' }),
 	dismissedAt: timestamp("dismissed_at", { withTimezone: true, mode: 'string' }),
 	deepLinkPath: text("deep_link_path"),
+	deepLinkKind: text("deep_link_kind").$type<NotificationDeepLinkKind>(),
+	deepLinkId: uuid("deep_link_id"),
 	senderStaffId: uuid("sender_staff_id"),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 }, (table) => {
@@ -1337,6 +1340,8 @@ export const scheduledNotifications = pgTable("scheduled_notifications", {
 	title: text().notNull(),
 	body: text().notNull(),
 	deepLinkPath: text("deep_link_path"),
+	deepLinkKind: text("deep_link_kind").$type<NotificationDeepLinkKind>(),
+	deepLinkId: uuid("deep_link_id"),
 	bookingId: uuid("booking_id"),
 	reportId: uuid("report_id"),
 	dogId: uuid("dog_id"),

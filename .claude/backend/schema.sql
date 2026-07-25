@@ -1484,6 +1484,8 @@ CREATE TABLE notifications (
   read_at         timestamptz,                          -- NULL = unread
   dismissed_at    timestamptz,                          -- NULL = live; soft-delete tombstone (owner dismiss)
   deep_link_path  text,                                 -- producer writes this
+  deep_link_kind  text,                                 -- structured deep-link ref (decision 3, 2026-07-24): entity kind…
+  deep_link_id    uuid,                                 -- …+ entity id; path derivation moves to wire.ts deepLinkToPath() in Phase 3
   sender_staff_id uuid REFERENCES staff(id),            -- message-received only
   created_at      timestamptz NOT NULL DEFAULT now()
 );
@@ -1514,6 +1516,8 @@ CREATE TABLE scheduled_notifications (
   title          text NOT NULL,
   body           text NOT NULL,
   deep_link_path text,
+  deep_link_kind text,                     -- deliverOne propagates both to the emitted feed row
+  deep_link_id   uuid,
   booking_id     uuid REFERENCES bookings(id) ON DELETE CASCADE,
   report_id      uuid REFERENCES reports(id) ON DELETE CASCADE,
   dog_id         uuid REFERENCES dogs(id) ON DELETE CASCADE,

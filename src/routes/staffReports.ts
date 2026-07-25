@@ -172,7 +172,9 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
             type: 'report-published',
             title: 'New report card',
             body: body.excerpt,
-            deepLinkPath: `/reports/${id}`,
+            deepLinkPath: `/report-card/${body.dog_id}?reportId=${id}`,
+            deepLinkKind: 'report',
+            deepLinkId: id,
             dogIds: [body.dog_id],
           });
 

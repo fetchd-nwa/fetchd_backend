@@ -25,6 +25,20 @@ import { notificationType } from '../db/schema/schema.js';
 
 export type NotificationType = (typeof notificationType.enumValues)[number];
 
+// Backend-local pin of the deep-link vocabulary (decision 3); migrates into
+// wire.ts as NOTIFICATION_DEEP_LINK_KIND in Phase 3. 'credits'/'announcement'
+// are reserved arms with no producer.
+export type NotificationDeepLinkKind =
+  | 'booking'
+  | 'report'
+  | 'thread'
+  | 'invoice'
+  | 'membership'
+  | 'dog-profile'
+  | 'dog-manage'
+  | 'credits'
+  | 'announcement';
+
 export interface NotificationWire {
   id: string;
   type: NotificationType;

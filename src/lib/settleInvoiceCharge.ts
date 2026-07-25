@@ -128,7 +128,9 @@ export async function settleInvoiceCharge(
         body: `We charged your card ${formatDollars(amountCents)} for your ${purposeLabel(
           purpose,
         )}.`,
-        deepLinkPath: '/account/billing',
+        deepLinkPath: '/account/invoices',
+        deepLinkKind: 'invoice',
+        deepLinkId: invoice.id,
         dogIds: invoice.dogId ? [invoice.dogId] : [],
       });
     }

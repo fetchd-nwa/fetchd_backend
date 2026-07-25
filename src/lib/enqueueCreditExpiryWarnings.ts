@@ -84,7 +84,10 @@ export async function enqueueCreditExpiryWarnings(
       scheduledFor: now,
       title: 'Your credits are expiring soon',
       body: expiryWarningBody(lot),
-      deepLinkPath: '/credits',
+      // Credits UI lives on the dog profile (decision 4).
+      deepLinkPath: `/dog-profile/${lot.dogId}`,
+      deepLinkKind: 'dog-profile',
+      deepLinkId: lot.dogId,
       dogId: lot.dogId,
     });
     // `undefined` = ON CONFLICT fired (already warned on a prior tick) — not a

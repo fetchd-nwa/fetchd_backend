@@ -53,6 +53,8 @@ export async function syncSpayNeuterReminder(
     title: `Is ${args.dogName} spayed/neutered yet?`,
     body: `You planned to have ${args.dogName} spayed/neutered around today — once it's done, update their profile so our records stay current.`,
     deepLinkPath: `/dog-manage/${args.dogId}`,
+    deepLinkKind: 'dog-manage',
+    deepLinkId: args.dogId,
     dogId: args.dogId,
   });
   if (enqueued === undefined) {
