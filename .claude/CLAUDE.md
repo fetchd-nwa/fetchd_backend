@@ -4,7 +4,7 @@ This is the standalone backend repo for Fetch'd (NWA School for Dogs),
 extracted from the client-app monorepo's `api/` folder on 2026-07-16 with full
 history. Both frontends depend on it: the client mobile app (the sibling
 `fetchd_client_mobile_app` repo, RN/Expo) and the staff portal (the sibling
-`fetchd-staff-portal` repo, React/Vite). All three repos sit side-by-side
+`fetchd_staff_portal_desktop` repo, React 19/Vite; branch of record `scaffold/phase-1`). All three repos sit side-by-side
 under one umbrella folder; folder names are load-bearing (the clients' sync
 scripts resolve `src/contracts/wire.ts` sibling-relative).
 
@@ -33,10 +33,12 @@ backend-specific.
   db:introspect` refreshes the typed query surface afterward.
 - The DEV-RESET `DROP SCHEMA` preamble in `schema.sql` stays **commented** in
   git — CI asserts this before every schema load.
-- `src/contracts/wire.ts` is dependency-free by construction: the staff
-  portal copies it verbatim via its `sync-contracts.mjs` (env override
+- `src/contracts/wire.ts` is dependency-free by construction (it is copied
+  verbatim into client bundles). Today only the mobile app generates from it;
+  the canonical portal (`fetchd_staff_portal_desktop`) has no
+  `sync-contracts.mjs` yet — when built it copies wire.ts verbatim (env override
   `FETCHD_API_WIRE`). Changing a wire shape means editing it HERE and
-  re-running the portal's sync — never editing the portal's generated copy.
+  re-running each client's sync — never editing a generated copy.
 - Tests are `node:test`, sequential (`--test-concurrency=1`), against the
   isolated `db-test` container on 5433. Contract tests hard-DELETE their
   fixtures on teardown — that is why they never point at the dev DB.
@@ -48,16 +50,14 @@ backend-specific.
 - `src/contracts/wire.ts` is THE versioned API contract for all three repos.
   Every edit to it bumps `WIRE_CONTRACT_VERSION` (semver: major =
   remove/rename/retype, minor = additive, patch = doc-only), adds an entry to
-  `src/contracts/CHANGELOG.md`, and requires resyncing BOTH generated clients —
-  staff portal and mobile app, each via its own `npm run sync:contracts`, in
-  their own repos' commits — plus a row in the orchestrator's `STATUS.md`.
+  `src/contracts/CHANGELOG.md`, and requires resyncing every generated client — today the mobile app via `npm run sync:contracts` (the portal joins once its sync exists — to-build), in their own repos' commits — plus a row in the orchestrator's `STATUS.md`.
 - The operating manual is the sibling `fetchd_client_mobile_app` repo's
   `.claude/ORCHESTRATOR.md`; the shared alignment log is `.claude/STATUS.md`
   next to it. Read STATUS.md at session start when doing contract-touching
   work; update it at session end.
-- Wire-contract changes ripple to the portal (`sync-contracts.mjs`) and to
-  the mobile app's repository layer. Flag both in the handoff when you
-  change `src/contracts/wire.ts`.
+- Wire-contract changes ripple to the mobile app's repository layer today, and
+  to the portal once its `sync-contracts.mjs` exists (to-build). Flag both in
+  the handoff when you change `src/contracts/wire.ts`.
 - The monorepo's `api/` folder was **removed 2026-07-18** — the extraction is
   complete and this repo is the only backend. (The monorepo still carries a
   stale duplicate of `.claude/backend/*`; canonical is this repo's copy.)
