@@ -22,6 +22,7 @@ import {
   bookingAttendance,
   mediaPurpose,
   mediaKind,
+  notificationType,
   LOCATION_SLUGS,
 } from '../db/schema/schema.js';
 import type {
@@ -35,6 +36,7 @@ import type {
   AttendanceStatus,
   MediaPurpose,
   MediaKind,
+  NotificationType,
   LocationKey,
 } from './wire.js';
 
@@ -64,6 +66,7 @@ export type ContractEnumConformance = [
   Expect<Equal<StaffRole, DrizzleEnum<typeof staffRole>>>,
   Expect<Equal<MediaPurpose, DrizzleEnum<typeof mediaPurpose>>>,
   Expect<Equal<MediaKind, DrizzleEnum<typeof mediaKind>>>,
+  Expect<Equal<NotificationType, DrizzleEnum<typeof notificationType>>>,
   Expect<Equal<AttendanceStatus, Exclude<DrizzleEnum<typeof bookingAttendance>, 'pending'>>>,
   Expect<Equal<LocationKey, (typeof LOCATION_SLUGS)[number]>>,
 ];

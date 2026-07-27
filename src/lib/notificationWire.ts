@@ -1,55 +1,32 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
-import { notificationType } from '../db/schema/schema.js';
 
 /**
- * Wire shapes for `Notification` per DATA-CONTRACT §B (line 289-292 — "wire
- * keys exactly as the current `toX()` translators read them") + the FE
- * `notificationRepository.ts` Raw type.
+ * Backend adapter for the Notification wire shape. As of contract 1.1.0 the wire
+ * types themselves — `NotificationType`, `NotificationWire`, and the deep-link
+ * vocabulary — live in `src/contracts/wire.ts` (their single source of truth,
+ * generated verbatim into both clients). This module re-exports them so existing
+ * importers keep their `../lib/notificationWire.js` path, and adds the two
+ * backend-only pieces the contract has no home for: the camelCase DB-row
+ * projection (`NotificationRowForWire`) and the `toNotificationWire` shaper.
  *
- * Conventions (Day-5a/4a wire-shape rules):
- *   - Required keys (no `?` in FE Raw): always emit. `is_read` is DERIVED
- *     from `read_at IS NOT NULL` — the DB carries the timestamp, the wire
- *     carries the boolean (FE doesn't care WHEN it was read for the list,
- *     just whether).
- *   - Optional `?` keys: omit when null/empty. `deep_link_path` is declared
- *     as `string | null` in the FE Raw type but consumed via the spread-
- *     when-truthy pattern, which handles both forms; we pick OMIT for
- *     consistency with the rest of the optional-`?` keys.
- *   - `dog_ids?` and `sender_staff_id?` are both omit-when-empty/null per
- *     the same convention.
+ * Wire-shape rules (Day-5a/4a) that `toNotificationWire` implements:
+ *   - Required keys always emit. `is_read` is DERIVED from `read_at IS NOT NULL`
+ *     — the DB carries the timestamp, the wire carries the boolean.
+ *   - Optional `?` keys (`deep_link_path`, `dog_ids`, `sender_staff_id`) are
+ *     OMITTED when null/empty rather than emitted as null.
  *
  * `notifications` has NO `expired_at` column (append-only delivered feed —
  * schema comment line 984-985). Every row reads; the route does not apply
  * `live()`.
  */
 
-export type NotificationType = (typeof notificationType.enumValues)[number];
+export type {
+  NotificationType,
+  NotificationWire,
+  NotificationDeepLinkKind,
+} from '../contracts/wire.js';
 
-// Backend-local pin of the deep-link vocabulary (decision 3); migrates into
-// wire.ts as NOTIFICATION_DEEP_LINK_KIND in Phase 3. 'credits'/'announcement'
-// are reserved arms with no producer.
-export type NotificationDeepLinkKind =
-  | 'booking'
-  | 'report'
-  | 'thread'
-  | 'invoice'
-  | 'membership'
-  | 'dog-profile'
-  | 'dog-manage'
-  | 'credits'
-  | 'announcement';
-
-export interface NotificationWire {
-  id: string;
-  type: NotificationType;
-  title: string;
-  body: string;
-  received_at: string;
-  is_read: boolean;
-  deep_link_path?: string;
-  dog_ids?: string[];
-  sender_staff_id?: string;
-}
+import type { NotificationType, NotificationWire } from '../contracts/wire.js';
 
 /**
  * Subset of `notifications` columns the wire helper consumes. Structural

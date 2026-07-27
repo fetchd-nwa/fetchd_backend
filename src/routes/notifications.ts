@@ -5,7 +5,12 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
-import { toNotificationWire, type NotificationWire } from '../lib/notificationWire.js';
+import { toNotificationWire } from '../lib/notificationWire.js';
+import type {
+  NotificationWire,
+  NotificationListResponse,
+  UnreadCountResponse,
+} from '../contracts/wire.js';
 import {
   notificationsRepository,
   type NotificationCursor,
@@ -39,15 +44,6 @@ const listQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(LIMIT_MAX).optional().default(LIMIT_DEFAULT),
 });
-
-export interface NotificationListResponse {
-  items: NotificationWire[];
-  next_cursor?: string;
-}
-
-export interface UnreadCountResponse {
-  unread_count: number;
-}
 
 export function registerNotificationsRoute(
   app: FastifyInstance,
