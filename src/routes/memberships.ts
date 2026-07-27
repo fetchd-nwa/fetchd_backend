@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
+import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import {
   creditPackagesRepository,
@@ -80,6 +81,12 @@ export interface MembershipWire {
   ends_at: string;
   /** Omit-on-null: present ⇒ staff-paused (rolls skip until staff resume). */
   paused_at?: string;
+  /**
+   * §J.1: the card this subscription's rolled invoices bill (memberships pin
+   * their payment method at POST). Omitted when the bound card is no longer
+   * live — the dunning lane owns that state, the list stays honest.
+   */
+  payment_method?: { brand: string; last4: string };
 }
 
 export interface MembershipCreateWire {
@@ -99,7 +106,11 @@ export interface MembershipCreateWire {
   charge_refunded: boolean;
 }
 
-export function toMembershipWire(row: MembershipRow, pkg: CreditPackageWithId): MembershipWire {
+export function toMembershipWire(
+  row: MembershipRow,
+  pkg: CreditPackageWithId,
+  paymentMethod?: { brand: string; last4: string },
+): MembershipWire {
   const wire: MembershipWire = {
     id: row.id,
     dog_id: row.dogId,
@@ -117,6 +128,9 @@ export function toMembershipWire(row: MembershipRow, pkg: CreditPackageWithId): 
     ends_at: pgTimestampToIso(row.endsAt),
   };
   if (row.pausedAt !== null) wire.paused_at = pgTimestampToIso(row.pausedAt);
+  if (paymentMethod !== undefined) {
+    wire.payment_method = { brand: paymentMethod.brand, last4: paymentMethod.last4 };
+  }
   return wire;
 }
 
@@ -397,9 +411,18 @@ export function registerMembershipsRoute(
       requireOwner(principal, 'read memberships');
       const rows = await membershipsRepository.findByOwner(db, principal.ownerId);
       // Owner membership lists are tiny (a dog or three) — per-row package
-      // resolution beats a bespoke join for now.
+      // resolution beats a bespoke join for now. One owner-scoped card fetch
+      // covers every row's billing-card display (§J.1 pin).
+      const cards = await paymentMethodsRepository.findLiveByOwner(principal.ownerId);
+      const cardById = new Map(cards.map((c) => [c.id, { brand: c.brand, last4: c.last4 }]));
       return Promise.all(
-        rows.map(async (row) => toMembershipWire(row, await loadMembershipPackage(row))),
+        rows.map(async (row) =>
+          toMembershipWire(
+            row,
+            await loadMembershipPackage(row),
+            row.paymentMethodId !== null ? cardById.get(row.paymentMethodId) : undefined,
+          ),
+        ),
       );
     },
   );

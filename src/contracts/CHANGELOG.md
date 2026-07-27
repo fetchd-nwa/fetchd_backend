@@ -12,6 +12,26 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.2.0] — 2026-07-27
+
+Additive: entity-specific deep-link destinations (Notifications Phase 4b, per
+Allison's sim-QA rulings 2026-07-27). Grammar change only — no interface or enum
+shape moves. Old persisted paths remain valid; the clients' `parseNotificationDeepLink`
+allowlist keeps accepting them, so only NEW emissions carry the new grammar.
+
+### Changed
+
+- `deepLinkToPath` `invoice` arm — now embeds the invoice id:
+  `/account/invoices?invoiceId=:id` (was the fixed `/account/invoices`). Powers
+  the pop-up-modal, per-invoice view (Allison decision 1). Producers already pass
+  `link.id` (since Phase 2), so no producer changes.
+- `deepLinkToPath` `membership` arm — now params-driven (Allison decision 4,
+  send-time routing): `params.dogId` present ⇒ `/dog-subscriptions/:dogId` (a lone
+  membership ending routes to that dog's subscriptions page); absent ⇒ the fixed
+  `/account/memberships` overview (the simultaneous-endings case — the same owner
+  has multiple memberships completing in one worker tick). `membershipRoll` decides
+  which at emit time.
+
 ## [1.1.0] — 2026-07-25
 
 Additive: the notifications surface enters the contract (it was hand-mirrored

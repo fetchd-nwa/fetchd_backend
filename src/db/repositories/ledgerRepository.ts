@@ -21,6 +21,14 @@ export interface LedgerEntryRow {
   dogId: string | null;
   category: ServiceCategory | null;
   mode: LedgerMode | null;
+  /**
+   * For charge-sourced entries: the invoice this charge settled
+   * (`invoices.paid_charge_id` back-reference), when one exists. Payment
+   * notifications deep-link by INVOICE id, so the ledger must carry it for
+   * the client to match a paid entry. NULL for open-invoice entries (their
+   * `id` already IS the invoice id) and for non-invoice charges.
+   */
+  settledInvoiceId: string | null;
 }
 
 // A charge is a ledger line only when it represents a completed money event.
@@ -84,10 +92,12 @@ export const ledgerRepository = {
         bookingLeadDog: bookings.leadDogId,
         packDogId: creditLedger.dogId,
         packMode: creditLedger.mode,
+        settledInvoiceId: invoices.id,
       })
       .from(charges)
       .leftJoin(bookings, eq(bookings.id, charges.bookingId))
       .leftJoin(creditLedger, eq(creditLedger.chargeId, charges.id))
+      .leftJoin(invoices, eq(invoices.paidChargeId, charges.id))
       .where(and(eq(charges.ownerId, ownerId), inArray(charges.status, LEDGER_CHARGE_STATUSES)));
 
     const chargeEntries: LedgerEntryRow[] = chargeRows.map((row) => {
@@ -102,6 +112,7 @@ export const ledgerRepository = {
         dogId: isPackage ? row.packDogId : row.bookingLeadDog,
         category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
         mode: isPackage ? row.packMode : null,
+        settledInvoiceId: row.settledInvoiceId,
       };
     });
 
@@ -130,6 +141,7 @@ export const ledgerRepository = {
         dogId: isPackage ? null : row.bookingLeadDog,
         category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
         mode: null,
+        settledInvoiceId: null,
       };
     });
 

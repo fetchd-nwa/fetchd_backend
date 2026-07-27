@@ -53,22 +53,49 @@ export interface MembershipRollResult {
 export async function rollDueMemberships(tx: Tx, now: Date): Promise<MembershipRollResult> {
   const due = await membershipsRepository.lockDueForRoll(tx, { now });
 
-  let rolled = 0;
-  let completed = 0;
+  // Same-tick grouping pre-pass (membership-ended routing, Allison 2026-07-27,
+  // decision 4): the deep-link target depends on how many of THIS tick's due
+  // memberships hit the hard stop for the SAME owner — a lone ending links to
+  // that dog's subscriptions page; simultaneous endings link to the account
+  // overview. We can't know that mid-loop, so resolve each due membership's
+  // billed-period count once here (the loop below reuses it — no re-query) and
+  // tally completions per owner before emitting any notification.
+  const plans: { membership: MembershipRow; periodsBilled: number }[] = [];
+  const completionsByOwner = new Map<string, number>();
   for (const membership of due) {
     const invoicedPeriods = await invoicesRepository.countForMembership(tx, membership.id);
     const periodsBilled = 1 + invoicedPeriods;
+    plans.push({ membership, periodsBilled });
+    if (periodsBilled >= membership.termMonths) {
+      completionsByOwner.set(
+        membership.ownerId,
+        (completionsByOwner.get(membership.ownerId) ?? 0) + 1,
+      );
+    }
+  }
+
+  let rolled = 0;
+  let completed = 0;
+  for (const { membership, periodsBilled } of plans) {
     if (periodsBilled >= membership.termMonths) {
       await membershipsRepository.complete(tx, membership.id);
       // §J.1: the subscribe page promises "we'll let you know when your
       // subscription ends" — the hard stop keeps it. Feed-only (like the
-      // payment-succeeded receipt): informational, nothing to act on.
+      // payment-succeeded receipt): informational, nothing to act on. The tap
+      // target is decided AT SEND TIME (decision 4): a lone ending for this owner
+      // deep-links to the dog's subscriptions page (`params.dogId`); simultaneous
+      // endings drop the param so `deepLinkToPath` lands on the account overview.
+      const simultaneousEndings = (completionsByOwner.get(membership.ownerId) ?? 0) > 1;
       await notificationsRepository.enqueue(tx, {
         ownerId: membership.ownerId,
         type: 'membership-ended',
         title: 'Your subscription has ended',
         body: endedBody(membership),
-        deepLinkPath: deepLinkToPath({ kind: 'membership', id: membership.id }),
+        deepLinkPath: deepLinkToPath({
+          kind: 'membership',
+          id: membership.id,
+          params: simultaneousEndings ? undefined : { dogId: membership.dogId },
+        }),
         deepLinkKind: 'membership',
         deepLinkId: membership.id,
         dogIds: [membership.dogId],

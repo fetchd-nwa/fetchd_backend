@@ -19,6 +19,12 @@ export interface LedgerEntryWire {
   dog_id?: string;
   category?: ServiceCategory;
   mode?: 'school' | 'daycare';
+  /**
+   * The invoice a paid entry settled (charge-sourced entries only). Payment
+   * notifications deep-link by invoice id — the client matches a ledger row
+   * on `id` OR this.
+   */
+  invoice_id?: string;
 }
 
 export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
@@ -32,5 +38,6 @@ export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
   if (row.dogId !== null) wire.dog_id = row.dogId;
   if (row.category !== null) wire.category = row.category;
   if (row.mode !== null) wire.mode = row.mode;
+  if (row.settledInvoiceId !== null) wire.invoice_id = row.settledInvoiceId;
   return wire;
 }
