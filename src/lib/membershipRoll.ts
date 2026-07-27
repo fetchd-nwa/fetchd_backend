@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import {
@@ -67,7 +68,7 @@ export async function rollDueMemberships(tx: Tx, now: Date): Promise<MembershipR
         type: 'membership-ended',
         title: 'Your subscription has ended',
         body: endedBody(membership),
-        deepLinkPath: '/account/memberships',
+        deepLinkPath: deepLinkToPath({ kind: 'membership', id: membership.id }),
         deepLinkKind: 'membership',
         deepLinkId: membership.id,
         dogIds: [membership.dogId],

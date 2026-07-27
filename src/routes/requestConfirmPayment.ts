@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { deepLinkToPath } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
@@ -289,7 +290,7 @@ export function registerRequestConfirmPaymentRoute(
               month: 'short',
               day: 'numeric',
             })}`,
-            deepLinkPath: `/bookings/${inserted.id}`,
+            deepLinkPath: deepLinkToPath({ kind: 'booking', id: inserted.id }),
             deepLinkKind: 'booking',
             deepLinkId: inserted.id,
             dogIds: [grouped.lead, ...grouped.additional],

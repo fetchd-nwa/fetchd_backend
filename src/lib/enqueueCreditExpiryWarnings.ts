@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import {
   findExpiringLotsForWarning,
@@ -85,7 +86,7 @@ export async function enqueueCreditExpiryWarnings(
       title: 'Your credits are expiring soon',
       body: expiryWarningBody(lot),
       // Credits UI lives on the dog profile (decision 4).
-      deepLinkPath: `/dog-profile/${lot.dogId}`,
+      deepLinkPath: deepLinkToPath({ kind: 'dog-profile', id: lot.dogId }),
       deepLinkKind: 'dog-profile',
       deepLinkId: lot.dogId,
       dogId: lot.dogId,

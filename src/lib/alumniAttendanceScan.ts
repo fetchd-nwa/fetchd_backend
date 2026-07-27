@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import {
   dogProgramsRepository,
   type AlumniDogAttendance,
@@ -76,7 +77,7 @@ export async function enqueueAlumniAttendanceFlags(
       scheduledFor: now,
       title: 'Alumni check-in needed',
       body: attendanceBody(dog),
-      deepLinkPath: `/dog-profile/${dog.dogId}`,
+      deepLinkPath: deepLinkToPath({ kind: 'dog-profile', id: dog.dogId }),
       deepLinkKind: 'dog-profile',
       deepLinkId: dog.dogId,
       dogId: dog.dogId,

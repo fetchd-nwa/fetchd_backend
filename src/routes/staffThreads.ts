@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { deepLinkToPath } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { messagesRepository } from '../db/repositories/messagesRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
@@ -123,7 +124,7 @@ export function registerStaffThreadsRoute(
             type: 'message-received',
             title: 'New message',
             body: text.length > 140 ? `${text.slice(0, 137)}…` : text,
-            deepLinkPath: `/chat/${id}`,
+            deepLinkPath: deepLinkToPath({ kind: 'thread', id }),
             deepLinkKind: 'thread',
             deepLinkId: id,
             senderStaffId: principal.staffId,

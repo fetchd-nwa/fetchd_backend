@@ -1,9 +1,12 @@
 import { deviceTokensRepository } from '../db/repositories/deviceTokensRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
+import { ownersRepository } from '../db/repositories/ownersRepository.js';
 import {
   scheduledNotificationsRepository,
   type ScheduledNotificationRow,
 } from '../db/repositories/scheduledNotificationsRepository.js';
+import { shouldSkipPush } from '../lib/pushPreferences.js';
+import type { NotificationPushData } from '../contracts/wire.js';
 import { sweepExpiredIdempotencyKeys } from '../db/idempotency.js';
 import {
   enqueueAlumniAttendanceFlags,
@@ -366,11 +369,15 @@ async function runScheduledNotificationsTick(
 }
 
 /**
- * Per-row: INSERT the notifications row (links the dog as `notification_dogs`
- * when set), look up the owner's live push tokens, and build outbound
- * push messages. The tokens lookup happens inside the tx — the result
- * is a snapshot at this moment; tokens registered between commit and
- * dispatch don't get this push (they'll get the next one).
+ * Per-row: INSERT the notifications feed row (links the dog as
+ * `notification_dogs` when set) — this ALWAYS happens; the in-app feed is the
+ * source of truth. The PUSH channel is then gated by the owner's D3 preferences
+ * (master switch + per-category mute), read in-tx for a snapshot consistent with
+ * the feed INSERT: an owner who muted pushes — or this notification's category —
+ * still gets the feed entry but zero push messages. Otherwise we look up the
+ * owner's live push tokens and build one message per device. The tokens lookup
+ * happens inside the tx — a snapshot at this moment; tokens registered between
+ * commit and dispatch get the next push, not this one.
  */
 async function deliverOne(
   tx: Tx,
@@ -387,18 +394,30 @@ async function deliverOne(
     dogIds: row.dogId ? [row.dogId] : [],
   });
 
+  // D3: the feed entry has landed; consult push preferences before fanning out.
+  // Absent an explicit opt-out we send (jsonb defaults to '{}', so "no
+  // preference" means "notify") — only an owner who turned pushes off or muted
+  // this category gets zero messages.
+  const prefs = await ownersRepository.findPushPrefs(tx, row.ownerId);
+  if (prefs !== undefined && shouldSkipPush(row.type, prefs)) {
+    return { notificationId: inserted.id, pushMessages: [] };
+  }
+
   const tokens = await deviceTokensRepository.findLiveByOwner(tx, row.ownerId);
-  const pushMessages: ExpoPushMessage[] = tokens.map((token) => ({
-    to: token.expoPushToken,
-    title: row.title,
-    body: row.body,
-    sound: 'default',
-    data: {
+  const pushMessages: ExpoPushMessage[] = tokens.map((token) => {
+    const data = {
       type: row.type,
-      ...(row.deepLinkPath ? { deep_link_path: row.deepLinkPath } : {}),
       notification_id: inserted.id,
-    },
-  }));
+      ...(row.deepLinkPath ? { deep_link_path: row.deepLinkPath } : {}),
+    } satisfies NotificationPushData;
+    return {
+      to: token.expoPushToken,
+      title: row.title,
+      body: row.body,
+      sound: 'default',
+      data,
+    };
+  });
 
   return { notificationId: inserted.id, pushMessages };
 }

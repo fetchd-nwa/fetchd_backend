@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
@@ -128,7 +129,7 @@ export async function settleInvoiceCharge(
         body: `We charged your card ${formatDollars(amountCents)} for your ${purposeLabel(
           purpose,
         )}.`,
-        deepLinkPath: '/account/invoices',
+        deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
         deepLinkKind: 'invoice',
         deepLinkId: invoice.id,
         dogIds: invoice.dogId ? [invoice.dogId] : [],

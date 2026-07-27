@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import { isSessionProgram } from '../contracts/wire.js';
+import { deepLinkToPath, isSessionProgram } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
@@ -172,7 +172,7 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
             type: 'report-published',
             title: 'New report card',
             body: body.excerpt,
-            deepLinkPath: `/report-card/${body.dog_id}?reportId=${id}`,
+            deepLinkPath: deepLinkToPath({ kind: 'report', id, params: { dogId: body.dog_id } }),
             deepLinkKind: 'report',
             deepLinkId: id,
             dogIds: [body.dog_id],

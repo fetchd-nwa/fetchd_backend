@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
@@ -171,7 +172,7 @@ export async function cancelBookingInTx(
     type: 'booking-cancelled',
     title: 'Booking cancelled',
     body: cancellationBody(row.category, row.scheduledAt, updated.cancelForfeited),
-    deepLinkPath: `/bookings/${id}`,
+    deepLinkPath: deepLinkToPath({ kind: 'booking', id }),
     deepLinkKind: 'booking',
     deepLinkId: id,
     dogIds,

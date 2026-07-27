@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
@@ -386,7 +387,7 @@ async function recordFailed(
       body: `We couldn't process your payment of ${formatDollars(
         invoice.amountCents,
       )} for your ${purposeLabel(invoice.purpose)}. Please update your card.`,
-      deepLinkPath: '/account/invoices',
+      deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
       deepLinkKind: 'invoice',
       deepLinkId: invoice.id,
       dogId: invoice.dogId,

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { deepLinkToPath } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import {
@@ -255,7 +256,7 @@ export function registerStaffRequestsRoute(
               type: 'booking-confirmed',
               title: 'Booking confirmed',
               body: notificationBodyFor(row.category, firstSession.scheduledAt),
-              deepLinkPath: `/bookings/${firstBooking.id}`,
+              deepLinkPath: deepLinkToPath({ kind: 'booking', id: firstBooking.id }),
               deepLinkKind: 'booking',
               deepLinkId: firstBooking.id,
               dogIds: [leadDogId, ...additionalDogIds],
@@ -324,7 +325,7 @@ export function registerStaffRequestsRoute(
               type: 'booking-confirmed',
               title: 'Booking confirmed',
               body: notificationBodyFor(row.category, parsed.scheduledAt),
-              deepLinkPath: `/bookings/${inserted.id}`,
+              deepLinkPath: deepLinkToPath({ kind: 'booking', id: inserted.id }),
               deepLinkKind: 'booking',
               deepLinkId: inserted.id,
               dogIds: [row.leadDogId, ...allDogIds.additionalDogIds],

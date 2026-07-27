@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
 import { chicagoWallTimeToUtc } from './chicagoDate.js';
@@ -52,7 +53,7 @@ export async function syncSpayNeuterReminder(
     scheduledFor,
     title: `Is ${args.dogName} spayed/neutered yet?`,
     body: `You planned to have ${args.dogName} spayed/neutered around today — once it's done, update their profile so our records stay current.`,
-    deepLinkPath: `/dog-manage/${args.dogId}`,
+    deepLinkPath: deepLinkToPath({ kind: 'dog-manage', id: args.dogId }),
     deepLinkKind: 'dog-manage',
     deepLinkId: args.dogId,
     dogId: args.dogId,

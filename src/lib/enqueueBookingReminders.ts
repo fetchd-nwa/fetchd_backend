@@ -1,3 +1,4 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
 import type { ServiceCategory } from './bookingBucket.js';
@@ -92,7 +93,7 @@ export async function enqueueBookingReminders(
     scheduledFor: reminderFor,
     title: `Reminder: ${human} tomorrow`,
     body: `Your ${human} is coming up — we'll see you soon.`,
-    deepLinkPath: `/bookings/${args.bookingId}`,
+    deepLinkPath: deepLinkToPath({ kind: 'booking', id: args.bookingId }),
     deepLinkKind: 'booking',
     deepLinkId: args.bookingId,
     bookingId: args.bookingId,
@@ -112,7 +113,7 @@ export async function enqueueBookingReminders(
       body: `Drop-off is in 24 hours. A quick check that vaccines, meds, and feeding notes are up to date.`,
       // The copy asks the owner to verify vaccines/meds/feeding, so it lands on
       // the dog edit form (decision 5) rather than the booking detail.
-      deepLinkPath: `/dog-manage/${args.leadDogId}`,
+      deepLinkPath: deepLinkToPath({ kind: 'dog-manage', id: args.leadDogId }),
       deepLinkKind: 'dog-manage',
       deepLinkId: args.leadDogId,
       bookingId: args.bookingId,
