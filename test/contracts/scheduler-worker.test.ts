@@ -3,7 +3,10 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { eq, lt, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
-import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
+import {
+  scheduledNotificationsRepository,
+  type ScheduledNotificationType,
+} from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import { withActor } from '../../src/db/tx.js';
 import { enqueueBookingReminders } from '../../src/lib/enqueueBookingReminders.js';
 import {
@@ -11,6 +14,7 @@ import {
   idempotencyKeys,
   notificationDogs,
   notifications,
+  owners,
   scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
@@ -61,19 +65,22 @@ async function seedDeviceToken(token: string): Promise<void> {
 async function seedDueScheduledRow(opts: {
   scheduledFor: Date;
   dedupeKey?: string;
+  type?: ScheduledNotificationType;
+  trigger?: string;
   title?: string;
+  body?: string;
   deepLinkKind?: NotificationDeepLinkKind;
   deepLinkId?: string;
 }): Promise<string> {
   const row = await db.transaction(async (tx) =>
     scheduledNotificationsRepository.enqueueIdempotent(tx, {
       ownerId: OWNER_ID,
-      type: 'booking-reminder',
-      trigger: 'booking-reminder',
+      type: opts.type ?? 'booking-reminder',
+      trigger: opts.trigger ?? 'booking-reminder',
       dedupeKey: opts.dedupeKey ?? `test:${randomUUID()}`,
       scheduledFor: opts.scheduledFor,
       title: opts.title ?? 'Reminder: Day School tomorrow',
-      body: 'Your booking is coming up.',
+      body: opts.body ?? 'Your booking is coming up.',
       deepLinkPath: `/bookings/${BOOKING_ID}`,
       deepLinkKind: opts.deepLinkKind ?? null,
       deepLinkId: opts.deepLinkId ?? null,
@@ -85,6 +92,40 @@ async function seedDueScheduledRow(opts: {
     throw new Error('seedDueScheduledRow: expected INSERT to succeed but ON CONFLICT fired');
   }
   return row.id;
+}
+
+/**
+ * The fixture owner's seeded push-preference baseline (see `_fixture.ts`):
+ * master switch ON, and a categories map that carries NO scheduler push
+ * category key — so every push-capable type falls through to "send" by default.
+ * The D3 tests mutate one of these and MUST restore this exact pair on teardown,
+ * or a leaked `false` would silence pushes for every later test in this file
+ * (the fixture `before` hook re-seeds once per file, not per test).
+ */
+const OWNER_PUSH_DEFAULTS = {
+  pushNotificationsEnabled: true,
+  pushNotificationCategories: { booking: true, message: true },
+} as const;
+
+async function setOwnerPushPrefs(prefs: {
+  pushNotificationsEnabled?: boolean;
+  pushNotificationCategories?: Record<string, boolean>;
+}): Promise<void> {
+  await db
+    .update(owners)
+    .set({
+      ...(prefs.pushNotificationsEnabled !== undefined
+        ? { pushNotificationsEnabled: prefs.pushNotificationsEnabled }
+        : {}),
+      ...(prefs.pushNotificationCategories !== undefined
+        ? { pushNotificationCategories: prefs.pushNotificationCategories }
+        : {}),
+    })
+    .where(eq(owners.id, OWNER_ID));
+}
+
+async function restoreOwnerPushPrefs(): Promise<void> {
+  await db.update(owners).set(OWNER_PUSH_DEFAULTS).where(eq(owners.id, OWNER_ID));
 }
 
 test(
@@ -574,5 +615,190 @@ test(
     assert.ok(swept >= 1);
     // Make sure leftover from earlier failures don't poison this test
     await db.delete(idempotencyKeys).where(lt(idempotencyKeys.createdAt, sql`now()`));
+  },
+);
+
+// ---- D3: push-preference enforcement in deliverOne -------------------------
+//
+// The feed INSERT is unconditional (DB is source of truth); only the PUSH
+// channel is gated by the owner's account toggles. Each test mutates one
+// owner-pref column and restores the seeded baseline in `finally` so a failed
+// assertion can't silence pushes for the rest of the file.
+
+test(
+  'deliverOne — master switch OFF: feed row lands, zero push dispatched',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearScheduled();
+    await seedDeviceToken('ExponentPushToken[stub-d3-master-off]');
+    await seedDueScheduledRow({
+      scheduledFor: new Date('2026-01-01T00:00:00Z'),
+      dedupeKey: 'test:d3-master-off',
+    });
+    const expoPush = makeExpoPushStub();
+    try {
+      await setOwnerPushPrefs({ pushNotificationsEnabled: false });
+
+      const result = await runSchedulerTickOnce({
+        expoPush,
+        now: new Date('2026-05-26T12:00:00Z'),
+      });
+
+      // Feed row still delivered: the schedule row flipped to sent...
+      assert.equal(result.scheduledNotifications.scanned, 1);
+      assert.equal(result.scheduledNotifications.sent, 1);
+      // ...but the push channel is fully muted: no batch, no tickets.
+      assert.equal(result.scheduledNotifications.pushTicketsOk, 0);
+      assert.equal(result.scheduledNotifications.pushTicketsError, 0);
+      assert.equal(expoPush.calls.length, 0, 'master switch off ⇒ no push batch dispatched');
+
+      // The in-app feed entry is the invariant — assert it actually landed.
+      const feed = await db
+        .select({ id: notifications.id })
+        .from(notifications)
+        .where(eq(notifications.ownerId, OWNER_ID));
+      assert.equal(feed.length, 1, 'in-app feed entry inserted despite muted push');
+    } finally {
+      await restoreOwnerPushPrefs();
+      await clearScheduled();
+    }
+  },
+);
+
+test(
+  'deliverOne — per-category mute: muted category is feed-only; a different category still pushes',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearScheduled();
+    await seedDeviceToken('ExponentPushToken[stub-d3-category]');
+    // booking-reminder maps to category 'booking-reminders' (muted below).
+    await seedDueScheduledRow({
+      scheduledFor: new Date('2026-01-01T00:00:00Z'),
+      dedupeKey: 'test:d3-cat-reminder',
+      type: 'booking-reminder',
+      trigger: 'booking-reminder',
+      title: 'Reminder: Day School tomorrow',
+    });
+    // payment-failed maps to category 'urgent-updates' (NOT muted) → still pushes.
+    await seedDueScheduledRow({
+      scheduledFor: new Date('2026-01-01T00:00:00Z'),
+      dedupeKey: 'test:d3-cat-payment',
+      type: 'payment-failed',
+      trigger: 'invoice-parked',
+      title: 'Payment failed — update your card',
+    });
+    const expoPush = makeExpoPushStub();
+    try {
+      await setOwnerPushPrefs({ pushNotificationCategories: { 'booking-reminders': false } });
+
+      const result = await runSchedulerTickOnce({
+        expoPush,
+        now: new Date('2026-05-26T12:00:00Z'),
+      });
+
+      // Both feed rows delivered.
+      assert.equal(result.scheduledNotifications.scanned, 2);
+      assert.equal(result.scheduledNotifications.sent, 2);
+
+      // Only payment-failed pushed: one batch, one message (1 device × 1 type).
+      assert.equal(expoPush.calls.length, 1);
+      assert.equal(
+        expoPush.calls[0]?.messages.length,
+        1,
+        'muted booking-reminder produced no push; only urgent payment-failed pushed',
+      );
+      assert.equal(expoPush.calls[0]?.messages[0]?.data?.type, 'payment-failed');
+      assert.equal(result.scheduledNotifications.pushTicketsOk, 1);
+      assert.equal(result.scheduledNotifications.pushTicketsError, 0);
+    } finally {
+      await restoreOwnerPushPrefs();
+      await clearScheduled();
+    }
+  },
+);
+
+test(
+  'deliverOne — missing category key defaults to enabled: push is sent',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearScheduled();
+    await seedDeviceToken('ExponentPushToken[stub-d3-missing-key]');
+    await seedDueScheduledRow({
+      scheduledFor: new Date('2026-01-01T00:00:00Z'),
+      dedupeKey: 'test:d3-missing-key',
+      type: 'booking-reminder',
+    });
+    const expoPush = makeExpoPushStub();
+    try {
+      // An UNRELATED category is explicitly muted; the booking-reminders key is
+      // absent → jsonb-default semantics say "send" (only an explicit false opts
+      // out). Proves a present-but-unrelated false doesn't suppress this push.
+      await setOwnerPushPrefs({ pushNotificationCategories: { 'urgent-updates': false } });
+
+      const result = await runSchedulerTickOnce({
+        expoPush,
+        now: new Date('2026-05-26T12:00:00Z'),
+      });
+
+      assert.equal(result.scheduledNotifications.sent, 1);
+      assert.equal(expoPush.calls.length, 1);
+      assert.equal(expoPush.calls[0]?.messages.length, 1);
+      assert.equal(expoPush.calls[0]?.messages[0]?.data?.type, 'booking-reminder');
+      assert.equal(result.scheduledNotifications.pushTicketsOk, 1);
+      assert.equal(result.scheduledNotifications.pushTicketsError, 0);
+    } finally {
+      await restoreOwnerPushPrefs();
+      await clearScheduled();
+    }
+  },
+);
+
+// ---- D2: push `data` envelope shape pin ------------------------------------
+//
+// The Expo `data` payload must carry EXACTLY the snake_case wire keys the FE
+// reads on tap — `type`, `deep_link_path`, `notification_id`. Pinning the exact
+// key set server-side guards the D2 mismatch (a camelCase drift or stray key)
+// forever.
+
+test(
+  'deliverOne — push data envelope carries exactly type + deep_link_path + notification_id',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await clearScheduled();
+    await seedDeviceToken('ExponentPushToken[stub-envelope]');
+    const scheduledId = await seedDueScheduledRow({
+      scheduledFor: new Date('2026-01-01T00:00:00Z'),
+      dedupeKey: 'test:envelope-pin',
+      deepLinkKind: 'booking',
+      deepLinkId: BOOKING_ID,
+    });
+    const expoPush = makeExpoPushStub();
+
+    const result = await runSchedulerTickOnce({
+      expoPush,
+      now: new Date('2026-05-26T12:00:00Z'),
+    });
+    assert.equal(result.scheduledNotifications.sent, 1);
+
+    // The push must reference the notifications row deliverOne inserted.
+    const [scheduled] = await db
+      .select({ emittedNotificationId: scheduledNotifications.emittedNotificationId })
+      .from(scheduledNotifications)
+      .where(eq(scheduledNotifications.id, scheduledId));
+    const notificationId = scheduled?.emittedNotificationId;
+    assert.ok(notificationId, 'schedule row linked to an emitted notification');
+
+    const data = expoPush.calls[0]?.messages[0]?.data;
+    assert.ok(data, 'push message carries a data envelope');
+    // Exact key set — snake_case, no camelCase drift, no extra keys.
+    assert.deepStrictEqual(
+      Object.keys(data).sort(),
+      ['deep_link_path', 'notification_id', 'type'],
+    );
+    assert.equal(data.type, 'booking-reminder');
+    assert.equal(data.deep_link_path, `/bookings/${BOOKING_ID}`);
+    assert.equal(data.notification_id, notificationId);
+
+    await clearScheduled();
   },
 );

@@ -1,0 +1,87 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { deepLinkToPath, type NotificationDeepLink } from '../src/contracts/wire.js';
+
+/**
+ * Unit coverage for `deepLinkToPath` — THE deep-link path grammar (contract
+ * 1.1.0). Pure function, no DB: every producer computes its persisted
+ * `deep_link_path` through here, so these expected strings ARE the wire
+ * contract the FE route table must match. One assertion per `kind` (all 9),
+ * plus the `report` params contract and its fail-loud-on-missing-dogId throw.
+ */
+
+// One resolvable case per NotificationDeepLinkKind arm.
+
+test('deepLinkToPath: booking → /bookings/:id', () => {
+  assert.equal(deepLinkToPath({ kind: 'booking', id: 'bk-123' }), '/bookings/bk-123');
+});
+
+test('deepLinkToPath: report → /report-card/:dogId?reportId=:id (params.dogId supplied)', () => {
+  const link: NotificationDeepLink = {
+    kind: 'report',
+    id: 'rep-9',
+    params: { dogId: 'dog-7' },
+  };
+  assert.equal(deepLinkToPath(link), '/report-card/dog-7?reportId=rep-9');
+});
+
+test('deepLinkToPath: thread → /chat/:id', () => {
+  assert.equal(deepLinkToPath({ kind: 'thread', id: 't-1' }), '/chat/t-1');
+});
+
+test('deepLinkToPath: invoice → /account/invoices (id ignored — a fixed route)', () => {
+  assert.equal(deepLinkToPath({ kind: 'invoice', id: 'inv-1' }), '/account/invoices');
+});
+
+test('deepLinkToPath: membership → /account/memberships (id ignored — a fixed route)', () => {
+  assert.equal(deepLinkToPath({ kind: 'membership', id: 'm-1' }), '/account/memberships');
+});
+
+test('deepLinkToPath: dog-profile → /dog-profile/:id', () => {
+  assert.equal(deepLinkToPath({ kind: 'dog-profile', id: 'dog-7' }), '/dog-profile/dog-7');
+});
+
+test('deepLinkToPath: dog-manage → /dog-manage/:id', () => {
+  assert.equal(deepLinkToPath({ kind: 'dog-manage', id: 'dog-7' }), '/dog-manage/dog-7');
+});
+
+test('deepLinkToPath: credits → /dog-profile/:id (aliases dog-profile per decision 4)', () => {
+  assert.equal(deepLinkToPath({ kind: 'credits', id: 'dog-7' }), '/dog-profile/dog-7');
+});
+
+test('deepLinkToPath: announcement → /announcement/:id', () => {
+  assert.equal(deepLinkToPath({ kind: 'announcement', id: 'ann-3' }), '/announcement/ann-3');
+});
+
+// The `credits` alias must be byte-identical to `dog-profile` for the same id —
+// pins the decision-4 aliasing so a future edit can't quietly diverge them.
+test('deepLinkToPath: credits and dog-profile resolve to the same path for the same id', () => {
+  assert.equal(
+    deepLinkToPath({ kind: 'credits', id: 'dog-7' }),
+    deepLinkToPath({ kind: 'dog-profile', id: 'dog-7' }),
+  );
+});
+
+// report's params contract: a missing OR empty dogId fails LOUD at emit time
+// rather than persisting a broken /report-card/undefined?... path.
+
+test('deepLinkToPath: report without params throws (fails loud at emit time)', () => {
+  assert.throws(
+    () => deepLinkToPath({ kind: 'report', id: 'rep-9' }),
+    /report link requires params\.dogId/,
+  );
+});
+
+test('deepLinkToPath: report with params but no dogId key throws', () => {
+  assert.throws(
+    () => deepLinkToPath({ kind: 'report', id: 'rep-9', params: { reportId: 'x' } }),
+    /report link requires params\.dogId/,
+  );
+});
+
+test('deepLinkToPath: report with empty-string dogId throws', () => {
+  assert.throws(
+    () => deepLinkToPath({ kind: 'report', id: 'rep-9', params: { dogId: '' } }),
+    /report link requires params\.dogId/,
+  );
+});

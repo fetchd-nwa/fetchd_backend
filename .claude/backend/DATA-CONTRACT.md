@@ -193,8 +193,10 @@ path from them.
   uuid` (both nullable) — the entity a tap targets, carried as a (kind, id) pair
   instead of only a hand-written `deep_link_path` string. `NotificationWire` is
   UNCHANGED (neither column is emitted yet); producers still hand-write the path
-  this phase. Phase 3 bumps the contract to emit the structured ref and derive
-  the path from it via a shared `deepLinkToPath()` helper — correct-by-
+  this phase. Phase 3 (landed 2026-07-25, amendment below) bumps the contract to
+  move the notification wire SHAPES into `wire.ts` and derive the path from the
+  structured (kind, id) pair via a shared `deepLinkToPath()` helper — the two
+  columns stay server-internal, NOT emitted on `NotificationWire` — correct-by-
   construction, which kills the mis-parse class below at the root.
 
 - **Producer `deep_link_path` corrections.** Six of the twelve producers were
@@ -247,6 +249,99 @@ path from them.
   `boarding-24h:<bookingId>` row — in the SAME transaction as the cancel, so a
   cancelled booking never fires a stale reminder or profile-check. (The enqueue
   side is the §A Day-16 amendment; this closes the loop on cancel.)
+
+**Amendment 2026-07-25 (Notifications Phase 3 — notification surface enters the
+contract (wire 1.1.0) + D3 push-preference enforcement + producer path
+derivation).** Companion to the Phase-1/Phase-2 amendments above and the first
+`WIRE_CONTRACT_VERSION` bump of the notifications work — **1.0.0 → 1.1.0**
+(additive; `CHANGELOG.md` [1.1.0]). Fulfills the Phase-2 promise that the
+structured deep-link ref "migrates in Phase 3": the wire SHAPES move into
+`src/contracts/wire.ts`, and every producer Phase 2 touched now DERIVES
+`deep_link_path` instead of hand-writing it. The persisted `deep_link_path`
+VALUES are byte-identical to Phase 2 — the existing tests pin them, and that
+identity is the proof the derive is equivalence-preserving, not a behavior
+change. The notification surface is no longer hand-mirrored per-repo: it is
+contract-guarded and generated verbatim into both clients.
+
+1. **Notification wire surface now lives in `wire.ts` (contract-guarded).** Nine
+   additive additions, no removals or retypes:
+   - `NotificationType` — 13-arm union mirroring the `notification_type` pgEnum
+     (`src/db/schema/schema.ts`), pinned by `Expect<Equal<NotificationType,
+DrizzleEnum<typeof notificationType>>>` in `conformance.ts` (following the
+     existing enum-conformance rows) so the wire union and the DB enum can never
+     drift.
+   - `NotificationWire` `{ id, type, title, body, received_at, is_read,
+deep_link_path?, dog_ids?, sender_staff_id? }` — **moved** from
+     `src/lib/notificationWire.ts`, which now RE-EXPORTS it (plus
+     `NotificationType` + `NotificationDeepLinkKind`) so every
+     `../lib/notificationWire.js` importer is untouched; that module keeps only
+     its backend-only pieces (`NotificationRowForWire` projection +
+     `toNotificationWire` shaper). Its Phase-2 local `NotificationDeepLinkKind`
+     pin (the "migrates in Phase 3" comment) is deleted — now fulfilled.
+   - `NotificationListResponse` `{ items, next_cursor? }` + `UnreadCountResponse`
+     `{ unread_count }` — **moved** from the inline shapes in
+     `src/routes/notifications.ts` (the Day-7b cursor envelope, now typed by the
+     contract); the route consumes the contract envelopes instead of its locals.
+   - `NotificationPushData` `{ type, deep_link_path?, notification_id }` — pins
+     the snake_case Expo push `data` keys IN the contract, next to the wire the FE
+     reads on tap, so the D2 push/wire key mismatch (`deep_link_path` sent vs
+     `deepLinkPath` read) can never recur.
+   - `NotificationDeepLinkKind` (9-arm union) + `NOTIFICATION_DEEP_LINK_KINDS`
+     readonly value tuple, `NotificationDeepLink` `{ kind, id, params? }`, and the
+     pure helper `deepLinkToPath(link)`.
+   - The Phase-2 `notifications` / `scheduled_notifications` `deep_link_kind` /
+     `deep_link_id` columns STAY server-internal — they are NOT emitted on
+     `NotificationWire`. The wire still carries only the derived `deep_link_path`;
+     the structured (kind, id) pair is the producer's INPUT to `deepLinkToPath`,
+     not an FE-visible field. (This is the correction to the Phase-2 forward
+     reference above, which had said Phase 3 would "emit the structured ref": it
+     doesn't — it contracts the shapes and derives the path.)
+
+2. **`deepLinkToPath` is the single path grammar (decision 8).** Every emit site
+   Phase 2 touched now computes `deep_link_path = deepLinkToPath({ kind, id,
+params? })` from the contract instead of hand-writing a string. The grammar,
+   in one place, correct-by-construction over the whole 9-arm kind vocabulary:
+   `booking` → `/bookings/:id`; `report` →
+   `/report-card/:params.dogId?reportId=:id` (**throws** `Error` when
+   `params.dogId` is missing/empty — fails loud at emit time, never ships a
+   dead-end path); `thread` → `/chat/:id`; `invoice` → `/account/invoices`;
+   `membership` → `/account/memberships`; `dog-profile` → `/dog-profile/:id`;
+   `dog-manage` → `/dog-manage/:id`; `credits` → `/dog-profile/:id` (alias of
+   `dog-profile`, decision 4); `announcement` → `/announcement/:id`. `credits` +
+   `announcement` stay reserved (no producer today). The Phase-2 canonical (type,
+   kind, id, path) table above is unchanged — this amendment moves WHERE the path
+   is computed, not WHAT it resolves to.
+
+3. **D3 — push-preference enforcement (`src/lib/pushPreferences.ts:shouldSkipPush`,
+   consulted in `src/workers/scheduler.ts:deliverOne`).** The feed INSERT ALWAYS
+   happens — the DB is the source of truth, and `deliverOne` writes the
+   `notifications` row before it looks at any preference. The PUSH is then skipped
+   (zero Expo messages, feed entry intact) when EITHER:
+   - `owners.push_notifications_enabled = false` — the master switch mutes every
+     push; OR
+   - `push_notification_categories[category] === false` for this notification's
+     category.
+     MISSING key = enabled: the `push_notification_categories` jsonb defaults to
+     `'{}'`, so ONLY an explicit boolean `false` opts out (a missing key, a
+     non-boolean, or `true` all fall through to "send"). Only six scheduled types
+     ever reach the push channel today, so the type→category map is written TOTAL
+     over exactly those six (`Record<PushCapableType, PushCategoryKey>`):
+
+   | notification type | push category |
+   | --- | --- |
+   | booking-reminder | booking-reminders |
+   | boarding-profile-check | booking-reminders |
+   | alumni-attendance | booking-reminders |
+   | payment-failed | urgent-updates |
+   | credits-expiring | urgent-updates |
+   | spay-neuter-reminder | urgent-updates |
+
+   The two category keys (`booking-reminders`, `urgent-updates`) are the mobile
+   `NotificationCategoryKey` values (`mobile/src/types/user.ts`, the account-screen
+   `NotificationCategoryPanel` toggles). The map is backend-local (NOT in
+   `wire.ts`) — it is an enforcement detail, not a wire shape. Every other
+   `NotificationType` arm is feed-only (or never enqueued to
+   `scheduled_notifications`), so no per-category toggle governs it.
 
 **Amendment 2026-05-22 (Day 9d — VaccineWire grows `id` + `requirement_key?`).**
 The §B Dog `vaccines:[{name,expires_at}]` sub-shape was forced open by
@@ -2093,7 +2188,11 @@ repo-extraction digest for the verbatim per-key maps). No shape changes
 beyond R5 (absolute dates) and R6 (uuid ids). Δ 2026-06-01 (Day 19e):
 **Announcement** grew `cta?: { label, kind, target }`; **Event** grew
 `spots_filled` + `capacity?` (additive; see §A "Amendment 2026-06-01 (Day
-19e)").
+19e)"). Δ 2026-07-25 (Notifications Phase 3): **Notification** is now a
+contract-guarded shape — `NotificationWire` (+ the `NotificationListResponse` /
+`UnreadCountResponse` envelopes, `NotificationPushData`, and the
+`NotificationDeepLink` / `deepLinkToPath` deep-link vocabulary) live in `wire.ts`
+v1.1.0, not hand-mirrored per-repo; see §A "Amendment 2026-07-25".
 
 ## C. Mutation / endpoint surface
 
