@@ -250,6 +250,23 @@ path from them.
   cancelled booking never fires a stale reminder or profile-check. (The enqueue
   side is the §A Day-16 amendment; this closes the loop on cancel.)
 
+**Amendment 2026-07-27 (Notifications Phase 4b — entity-specific deep-link
+destinations, wire 1.1.0 → 1.2.0).** Per Allison's sim-QA rulings: (1) the
+`deepLinkToPath` `invoice` arm now emits `/account/invoices?invoiceId=:id` so a
+payment notification opens the SPECIFIC invoice (client renders a detail modal;
+paid = green Paid, open = outstanding + pay CTA); (2) the `membership` arm is
+params-driven — `params.dogId` → `/dog-subscriptions/:dogId` (new owner-app
+page), absent → `/account/memberships`; `membershipRoll` decides AT SEND TIME:
+an owner with MULTIPLE memberships completing in the same tick gets the
+overview target, a lone completion gets the dog's page. Old persisted paths
+remain valid (client parser accepts both). Supporting additive reads, neither
+in wire.ts (both are hand-mirrored surfaces): `LedgerEntryWire.invoice_id?` —
+paid ledger entries are charge-keyed, so `GET /invoices` now exposes the
+settled invoice via the `invoices.paid_charge_id` back-reference (the client's
+match key for notification taps); `MembershipWire.payment_method?` `{ brand,
+last4 }` — the §J.1 pinned billing card, joined live-only, omitted when the
+bound card is no longer live.
+
 **Amendment 2026-07-25 (Notifications Phase 3 — notification surface enters the
 contract (wire 1.1.0) + D3 push-preference enforcement + producer path
 derivation).** Companion to the Phase-1/Phase-2 amendments above and the first

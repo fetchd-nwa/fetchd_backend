@@ -4,10 +4,12 @@ import { deepLinkToPath, type NotificationDeepLink } from '../src/contracts/wire
 
 /**
  * Unit coverage for `deepLinkToPath` — THE deep-link path grammar (contract
- * 1.1.0). Pure function, no DB: every producer computes its persisted
+ * 1.2.0). Pure function, no DB: every producer computes its persisted
  * `deep_link_path` through here, so these expected strings ARE the wire
  * contract the FE route table must match. One assertion per `kind` (all 9),
- * plus the `report` params contract and its fail-loud-on-missing-dogId throw.
+ * plus the entity-specific arms that branch on params: `report` (fail-loud on a
+ * missing dogId), `invoice` (embeds the id), and `membership` (send-time routing
+ * — dogId present ⇒ the dog page, absent ⇒ the account overview).
  */
 
 // One resolvable case per NotificationDeepLinkKind arm.
@@ -29,12 +31,22 @@ test('deepLinkToPath: thread → /chat/:id', () => {
   assert.equal(deepLinkToPath({ kind: 'thread', id: 't-1' }), '/chat/t-1');
 });
 
-test('deepLinkToPath: invoice → /account/invoices (id ignored — a fixed route)', () => {
-  assert.equal(deepLinkToPath({ kind: 'invoice', id: 'inv-1' }), '/account/invoices');
+test('deepLinkToPath: invoice → /account/invoices?invoiceId=:id (the specific invoice)', () => {
+  assert.equal(
+    deepLinkToPath({ kind: 'invoice', id: 'inv-1' }),
+    '/account/invoices?invoiceId=inv-1',
+  );
 });
 
-test('deepLinkToPath: membership → /account/memberships (id ignored — a fixed route)', () => {
+test('deepLinkToPath: membership without params → /account/memberships (overview)', () => {
   assert.equal(deepLinkToPath({ kind: 'membership', id: 'm-1' }), '/account/memberships');
+});
+
+test('deepLinkToPath: membership with params.dogId → /dog-subscriptions/:dogId (lone ending)', () => {
+  assert.equal(
+    deepLinkToPath({ kind: 'membership', id: 'm-1', params: { dogId: 'dog-7' } }),
+    '/dog-subscriptions/dog-7',
+  );
 });
 
 test('deepLinkToPath: dog-profile → /dog-profile/:id', () => {

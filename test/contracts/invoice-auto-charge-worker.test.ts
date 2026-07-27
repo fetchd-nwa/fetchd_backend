@@ -271,7 +271,7 @@ test(
     assert.equal(succeeded.length, 1, 'exactly one receipt');
     assert.equal(succeeded[0]?.title, 'Payment received');
     assert.match(succeeded[0]!.body, /\$45 for your day program session/);
-    assert.equal(succeeded[0]?.deepLinkPath, '/account/invoices');
+    assert.equal(succeeded[0]?.deepLinkPath, `/account/invoices?invoiceId=${invoiceId}`);
     assert.equal(succeeded[0]?.deepLinkKind, 'invoice');
     assert.equal(succeeded[0]?.deepLinkId, invoiceId);
 
@@ -339,7 +339,7 @@ test(
     assert.equal(scheduled?.status, 'pending', 'not yet delivered — awaits the scheduler tick');
     assert.equal(scheduled?.title, 'Payment failed');
     assert.match(scheduled!.body, /\$120 for your group class enrollment.*update your card/i);
-    assert.equal(scheduled?.deepLinkPath, '/account/invoices');
+    assert.equal(scheduled?.deepLinkPath, `/account/invoices?invoiceId=${invoiceId}`);
     assert.equal(scheduled?.deepLinkKind, 'invoice');
     assert.equal(scheduled?.deepLinkId, invoiceId);
 

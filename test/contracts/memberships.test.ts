@@ -132,6 +132,17 @@ async function clearMembershipGrantLots(): Promise<void> {
     );
 }
 
+/** Drop dog2's membership grants — the shared cleanup is dog1-scoped, so the
+ *  simultaneous-endings test (which subscribes dog2 too) clears these itself,
+ *  BEFORE the FK-ordered teardown drops the referenced membership charges. */
+async function clearDog2GrantLots(): Promise<void> {
+  await db
+    .delete(creditLedger)
+    .where(
+      and(eq(creditLedger.dogId, FIXTURE_IDS.dog2Id), eq(creditLedger.reason, 'membership-grant')),
+    );
+}
+
 test('addMonthsAnchored — end-of-month starts re-snap to the anchor, never drift', () => {
   const jan31 = new Date('2026-01-31T17:00:00Z');
   const feb = addMonthsAnchored(jan31, 1, 31);
@@ -239,6 +250,8 @@ test('GET /memberships — owner list; staff → 403', SKIP_WHEN_NO_DB, async ()
   assert.equal(list.length, 1);
   assert.equal(list[0]!.credits_per_month, 5);
   assert.equal(list[0]!.location, 'fayetteville');
+  // §J.1 billing-card display: the list joins the pinned live card.
+  assert.deepEqual(list[0]!.payment_method, { brand: 'visa', last4: '4242' });
 
   const staffRes = await membershipApp({ principal: FIXTURE_STAFF_PRINCIPAL as never }).app.inject({
     method: 'GET',
@@ -395,7 +408,12 @@ test(
     // §J.1: the hard stop keeps the subscribe page's promise — the owner is
     // told the subscription ended.
     const ended = await db
-      .select({ id: notifications.id })
+      .select({
+        id: notifications.id,
+        deepLinkPath: notifications.deepLinkPath,
+        deepLinkKind: notifications.deepLinkKind,
+        deepLinkId: notifications.deepLinkId,
+      })
       .from(notifications)
       .where(
         and(
@@ -404,7 +422,86 @@ test(
         ),
       );
     assert.equal(ended.length, 1, 'one membership-ended feed notification');
+    // Send-time routing (decision 4): a LONE ending for the owner deep-links to
+    // that dog's subscriptions page (the structured ref still carries the
+    // membership id/kind — only the path target is dog-scoped).
+    assert.equal(ended[0]?.deepLinkPath, `/dog-subscriptions/${FIXTURE_IDS.dog1Id}`);
+    assert.equal(ended[0]?.deepLinkKind, 'membership');
+    assert.equal(ended[0]?.deepLinkId, membershipId);
 
+    await cleanupMemberships();
+  },
+);
+
+test(
+  'roll — simultaneous endings for one owner route to the account overview, not per-dog',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanupMemberships();
+    // dog2's month-1 grant lot isn't covered by the dog1-scoped shared cleanup;
+    // clear any leftover so the FK-ordered teardown can drop the membership charges.
+    await clearDog2GrantLots();
+
+    // Two memberships, same owner, DIFFERENT dogs (uniqueness is per dog+mode, so
+    // two school subs on two dogs coexist). Both term-3, both about to hard-stop.
+    const { app } = membershipApp();
+    const m1 = (await postMembership(app)).membership; // dog1
+    const m2 = (await postMembership(app, { dog_id: FIXTURE_IDS.dog2Id })).membership; // dog2
+
+    // Bring each to the exhausting boundary: 1 sync + 2 settled invoices = 3 =
+    // term, and the period is due (mirrors the single-completion hard-stop test).
+    for (const m of [m1, m2]) {
+      await db.insert(invoices).values(
+        [1, 2].map(() => ({
+          ownerId: FIXTURE_IDS.ownerId,
+          amountCents: 1000,
+          purpose: 'membership' as const,
+          status: 'paid' as const,
+          paidAt: '2026-07-19T17:00:00Z',
+          paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+          dueAt: '2026-07-19T17:00:00Z',
+          membershipId: m.id,
+          dogId: m.dog_id,
+        })),
+      );
+      await db
+        .update(memberships)
+        .set({ currentPeriodEnd: '2026-08-19T17:00:00Z' })
+        .where(eq(memberships.id, m.id));
+    }
+
+    // ONE tick claims BOTH due memberships → both hard-stop simultaneously.
+    const result = await withActor(WORKER_ACTOR, (tx) =>
+      rollDueMemberships(tx, new Date('2026-08-19T18:00:00Z')),
+    );
+    assert.equal(result.completed, 2, 'both memberships hit the §J.1 hard stop this tick');
+    assert.equal(result.rolled, 0);
+
+    // Both membership-ended notifications target the OVERVIEW — the send-time
+    // rule drops the dogId param when the owner has multiple simultaneous endings.
+    const ended = await db
+      .select({ deepLinkPath: notifications.deepLinkPath, deepLinkId: notifications.deepLinkId })
+      .from(notifications)
+      .where(
+        and(
+          eq(notifications.ownerId, FIXTURE_IDS.ownerId),
+          eq(notifications.type, 'membership-ended'),
+        ),
+      );
+    assert.equal(ended.length, 2, 'one notification per completed membership (unchanged)');
+    assert.ok(
+      ended.every((n) => n.deepLinkPath === '/account/memberships'),
+      `simultaneous endings → account overview, not per-dog — got ${JSON.stringify(
+        ended.map((n) => n.deepLinkPath),
+      )}`,
+    );
+    // The structured ref still points at each distinct membership id.
+    assert.deepStrictEqual(
+      [...ended.map((n) => n.deepLinkId)].sort(),
+      [m1.id, m2.id].sort(),
+    );
+
+    await clearDog2GrantLots();
     await cleanupMemberships();
   },
 );

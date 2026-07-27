@@ -28,6 +28,7 @@ const LEDGER = {
   chargeGroupRefundedId: 'aaaa1111-0000-4000-8000-000000000004',
   chargePendingId: 'aaaa1111-0000-4000-8000-000000000005',
   invoiceOpenId: 'aaaa2222-0000-4000-8000-000000000001',
+  invoiceSettledId: 'aaaa2222-0000-4000-8000-000000000002',
 } as const;
 
 function buildApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL) {
@@ -102,6 +103,21 @@ async function seedLedger(): Promise<void> {
       issuedAt: '2026-04-18T15:00:00.000Z',
       dueAt: '2026-05-02T15:00:00.000Z',
     },
+    {
+      // Settled by the payg charge — its ledger entry must expose invoice_id
+      // (payment notifications deep-link by INVOICE id; the paid row is
+      // charge-keyed, so the back-reference is the client's match key).
+      id: LEDGER.invoiceSettledId,
+      ownerId: FIXTURE_IDS.ownerId,
+      amountCents: 9_000,
+      status: 'paid',
+      purpose: 'payg',
+      paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+      paidChargeId: LEDGER.chargePaygId,
+      paidAt: '2026-04-10T15:00:00.000Z', // schema CHECK #7: paid implies paid_at
+      issuedAt: '2026-04-10T14:00:00.000Z',
+      dueAt: '2026-04-10T15:00:00.000Z',
+    },
   ]);
 }
 
@@ -140,7 +156,8 @@ test(
       mode: 'school',
     });
 
-    // Payg charge → category + dog resolved from the linked booking (day-school).
+    // Payg charge → category + dog resolved from the linked booking (day-school),
+    // and invoice_id from the invoices.paid_charge_id back-reference.
     assert.deepEqual(entries.get(LEDGER.chargePaygId), {
       id: LEDGER.chargePaygId,
       kind: 'payg',
@@ -149,6 +166,7 @@ test(
       date: '2026-04-10T15:00:00.000Z',
       dog_id: FIXTURE_IDS.dog1Id,
       category: 'day-school',
+      invoice_id: LEDGER.invoiceSettledId,
     });
 
     // Membership charge → no dog, no category.
