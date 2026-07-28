@@ -14,6 +14,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
+import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
 import { FIXTURE_IDS, FIXTURE_NOW, topUpCredits } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import {
@@ -90,6 +91,13 @@ function cancelApp(principal = FIXTURE_OWNER_PRINCIPAL): {
   const stripe = makeStripeStub();
   registerBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe });
   return { app, stripe };
+}
+
+/** Staff-principal app for the cross-owner `POST /staff/bookings/:id/cancel`. */
+function staffCancelApp(): { app: ReturnType<typeof makeContractApp>['app'] } {
+  const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  registerStaffBookingsRoute(app, { authenticate, stripe: makeStripeStub() });
+  return { app };
 }
 
 async function postCancel(opts: {
@@ -795,5 +803,106 @@ test(
     });
     assert.equal(res.statusCode, 200);
     assert.equal(await redis.exists(sentinelKey), 0, 'avail:fayetteville:* wiped on cancel');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// R5 — cancelled_by + cancel_reason (WHO/WHY)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /bookings/:id/cancel — owner self-cancel stamps cancelled_by=owner (no reason) + wire emits it',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
+    const bookingId = await seedRawBooking({
+      category: 'private-lesson',
+      scheduledAt,
+      cancelDeadlineAt,
+      location: null,
+    });
+
+    const { app } = cancelApp();
+    const res = await postCancel({ app, bookingId, idempotencyKey: `cn-owner-by-${randomUUID()}` });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { cancelled_by?: string; cancel_reason?: string };
+    assert.equal(body.cancelled_by, 'owner', 'wire carries cancelled_by=owner');
+    assert.equal('cancel_reason' in body, false, 'owner cancel has no reason line');
+
+    const [row] = await db
+      .select({ cancelledBy: bookingsTable.cancelledBy, cancelReason: bookingsTable.cancelReason })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.id, bookingId));
+    assert.equal(row?.cancelledBy, 'owner');
+    assert.equal(row?.cancelReason, null);
+  },
+);
+
+test(
+  'POST /staff/bookings/:id/cancel — staff cancel with reason stamps cancelled_by=staff + cancel_reason + wire emits both',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
+    const bookingId = await seedRawBooking({
+      category: 'private-lesson',
+      scheduledAt,
+      cancelDeadlineAt,
+      location: null,
+    });
+
+    const { app } = staffCancelApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/staff/bookings/${bookingId}/cancel`,
+      headers: { 'idempotency-key': `cx-reason-${randomUUID()}` },
+      payload: { reason: 'Trainer out sick — rescheduling' },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { cancelled_by?: string; cancel_reason?: string };
+    assert.equal(body.cancelled_by, 'staff');
+    assert.equal(body.cancel_reason, 'Trainer out sick — rescheduling');
+
+    const [row] = await db
+      .select({ cancelledBy: bookingsTable.cancelledBy, cancelReason: bookingsTable.cancelReason })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.id, bookingId));
+    assert.equal(row?.cancelledBy, 'staff');
+    assert.equal(row?.cancelReason, 'Trainer out sick — rescheduling');
+  },
+);
+
+test(
+  'POST /staff/bookings/:id/cancel — staff cancel WITHOUT a reason stamps cancelled_by=staff, omits cancel_reason',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
+    const bookingId = await seedRawBooking({
+      category: 'private-lesson',
+      scheduledAt,
+      cancelDeadlineAt,
+      location: null,
+    });
+
+    const { app } = staffCancelApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/staff/bookings/${bookingId}/cancel`,
+      headers: { 'idempotency-key': `cx-noreason-${randomUUID()}` },
+      payload: {},
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as { cancelled_by?: string; cancel_reason?: string };
+    assert.equal(body.cancelled_by, 'staff');
+    assert.equal('cancel_reason' in body, false, 'no reason supplied → field omitted');
+
+    const [row] = await db
+      .select({ cancelledBy: bookingsTable.cancelledBy, cancelReason: bookingsTable.cancelReason })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.id, bookingId));
+    assert.equal(row?.cancelledBy, 'staff');
+    assert.equal(row?.cancelReason, null);
   },
 );

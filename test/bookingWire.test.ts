@@ -25,10 +25,42 @@ function row(overrides: Partial<BookingRowForWire> = {}): BookingRowForWire {
     cancelledAt: null,
     cancelForfeited: false,
     cancelDeadlineAt: null,
+    cancelledBy: null,
+    cancelReason: null,
     cohortId: 'cohort-1',
     ...overrides,
   };
 }
+
+test('toBookingWire emits cancelled_by + cancel_reason only on a cancelled booking (R5)', () => {
+  const owner = toBookingWire(
+    row({ status: 'cancelled', cancelledAt: '2026-07-10 15:00:00+00', cancelledBy: 'owner' }),
+    DOG_IDS,
+    null,
+    undefined,
+  );
+  assert.equal(owner.cancelled_by, 'owner');
+  assert.equal('cancel_reason' in owner, false);
+
+  const staff = toBookingWire(
+    row({
+      status: 'cancelled',
+      cancelledAt: '2026-07-10 15:00:00+00',
+      cancelledBy: 'staff',
+      cancelReason: 'Trainer out sick',
+    }),
+    DOG_IDS,
+    null,
+    undefined,
+  );
+  assert.equal(staff.cancelled_by, 'staff');
+  assert.equal(staff.cancel_reason, 'Trainer out sick');
+
+  // Not cancelled → neither field emits even if the columns somehow carry values.
+  const live = toBookingWire(row({ cancelledBy: 'owner', cancelReason: 'x' }), DOG_IDS, null, undefined);
+  assert.equal('cancelled_by' in live, false);
+  assert.equal('cancel_reason' in live, false);
+});
 
 test('toBookingWire emits cohort_id + group_class_name for a group-class booking', () => {
   const wire = toBookingWire(row(), DOG_IDS, 'Rachel', 'Manners 1');

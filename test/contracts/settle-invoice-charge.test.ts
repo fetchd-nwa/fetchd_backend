@@ -7,7 +7,14 @@ import {
   type InvoiceRow,
 } from '../../src/db/repositories/invoicesRepository.js';
 import { refundsRepository } from '../../src/db/repositories/refundsRepository.js';
-import { charges, invoices, notifications, refunds } from '../../src/db/schema/schema.js';
+import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
+import {
+  charges,
+  invoices,
+  notifications,
+  refunds,
+  scheduledNotifications,
+} from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
 import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
 import { FIXTURE_IDS } from './_fixture.js';
@@ -33,6 +40,9 @@ async function cleanup(): Promise<void> {
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+  await db
+    .delete(scheduledNotifications)
+    .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
   await db
     .delete(notifications)
     .where(
@@ -213,6 +223,41 @@ test(
     assert.equal(inv?.status, 'paid');
     // Manual settle: the owner gets the HTTP response, not a push receipt.
     assert.equal(await countPaymentSucceeded(), 0, 'manual settle emits no payment-succeeded push');
+    await cleanup();
+  },
+);
+
+test(
+  'settleInvoiceCharge — settling an in-person invoice cancels its pending payment-due reminder (R3)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoice = await seedOpenInvoice();
+    // The owner had elected cash/check: flag pay-in-person + enqueue the
+    // "bring $… at drop-off" reminder, exactly as the pay-in-person route does.
+    await withActor(ACTOR, async (tx) => {
+      await invoicesRepository.markPayInPerson(tx, { id: invoice.id });
+      await scheduledNotificationsRepository.enqueueIdempotent(tx, {
+        ownerId: invoice.ownerId,
+        type: 'payment-due',
+        trigger: 'payment-due',
+        dedupeKey: `payment-due:${invoice.id}`,
+        scheduledFor: new Date('2026-06-15T00:00:00Z'),
+        title: 'Payment due at drop-off',
+        body: 'Please bring $2000 for your Board & Train when you drop off.',
+      });
+    });
+
+    // Owner reverts to paying on the card — the settle must tear the reminder down
+    // so it can't fire "bring $…" after the money is already collected.
+    const result = await settle(invoice, 'pi_test_inperson_settle', /* notifyOwner */ false);
+    assert.equal(result.outcome, 'settled');
+
+    const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+      db,
+      `payment-due:${invoice.id}`,
+    );
+    assert.equal(scheduled?.status, 'cancelled', 'pending payment-due reminder cancelled on settle');
     await cleanup();
   },
 );

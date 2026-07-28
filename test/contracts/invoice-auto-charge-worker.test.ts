@@ -244,6 +244,44 @@ test('runInvoiceAutoChargeOnce — empty queue returns scanned=0', SKIP_WHEN_NO_
   assert.equal(result.results.length, 0);
 });
 
+test(
+  'runInvoiceAutoChargeOnce — a pay-in-person invoice past due is never leased or charged (R3)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // A due invoice (next_attempt_at in the past) the owner elected to pay in
+    // person: flip payment_expected → 'in-person' via the real repository verb.
+    const invoiceId = await seedDueInvoice();
+    await db.transaction((tx) => invoicesRepository.markPayInPerson(tx, { id: invoiceId }));
+
+    const stripe = makeStripeStub();
+    const result = await runInvoiceAutoChargeOnce({ stripe, limit: 5 });
+
+    // The due-batch queries filter payment_expected='card', so the in-person
+    // invoice is invisible to the worker — nothing scanned, nothing charged.
+    assert.equal(result.scanned, 0, 'in-person invoice is excluded from the due batch');
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+      0,
+      'no card charge for a cash/check invoice',
+    );
+
+    const [inv] = await db
+      .select({ status: invoices.status, paymentExpected: invoices.paymentExpected })
+      .from(invoices)
+      .where(eq(invoices.id, invoiceId));
+    assert.equal(inv?.status, 'open', 'invoice untouched — still open, awaiting drop-off');
+    assert.equal(inv?.paymentExpected, 'in-person');
+
+    const chargeRows = await db
+      .select({ id: charges.id })
+      .from(charges)
+      .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+    assert.equal(chargeRows.length, 0, 'no charge row written');
+    await cleanup();
+  },
+);
+
 // ──────────────────────────────────────────────────────────────────────────
 // Part B (credit-expiry Phase 3) — auto-charge notifications.
 //   - payment-succeeded on a successful auto-charge (a receipt)

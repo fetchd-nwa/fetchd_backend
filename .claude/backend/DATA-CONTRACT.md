@@ -250,6 +250,25 @@ path from them.
   cancelled booking never fires a stale reminder or profile-check. (The enqueue
   side is the §A Day-16 amendment; this closes the loop on cancel.)
 
+**Amendment 2026-07-27/28 (Notifications Phase 4c — cancel attribution,
+pay-in-person + payment-due, wire 1.2.0 → 1.3.0).** Per Allison's second
+sim-QA round: (1) `bookings` gains `cancelled_by` (`'owner'|'staff'`, CHECK) +
+`cancel_reason` (text, staff-supplied, optional) — every `cancelBookingInTx`
+caller passes the actor; the staff cancel body accepts an optional trimmed
+1–500-char `reason` (folded into the idempotency hash); `BookingWire`
+additively emits both (omit-on-null, cancelled bookings only). (2) `invoices`
+gains `payment_expected` (`'card'|'in-person'`, NOT NULL default `'card'`);
+new **`POST /invoices/:id/pay-in-person`** (owner-only, idempotent, bodyless
+204) flips it and, in the same tx, enqueues the new **`payment-due`** scheduled
+notification (14th `notification_type` arm; dedupe `payment-due:<invoiceId>`;
+`scheduled_for` = linked booking's drop-off else `due_at`, minus 1h, past-due
+clamped to now; category `urgent-updates`). Charges NOTHING — the checkout
+hard-stop remains portal-side per the adjudications. `GET /invoices` ledger
+additively exposes `payment_expected` on open entries (an in-person invoice
+renders non-payable in the app — card-paying it would double-bill drop-off).
+Receipt copy helpers unified in `src/lib/invoiceReceiptCopy.ts`
+(settle + auto-charge + pay-in-person all import; private copies deleted).
+
 **Amendment 2026-07-27 (Notifications Phase 4b — entity-specific deep-link
 destinations, wire 1.1.0 → 1.2.0).** Per Allison's sim-QA rulings: (1) the
 `deepLinkToPath` `invoice` arm now emits `/account/invoices?invoiceId=:id` so a
@@ -266,6 +285,47 @@ settled invoice via the `invoices.paid_charge_id` back-reference (the client's
 match key for notification taps); `MembershipWire.payment_method?` `{ brand,
 last4 }` — the §J.1 pinned billing card, joined live-only, omitted when the
 bound card is no longer live.
+
+**Amendment 2026-07-27 (Notifications Phase 4c — pay-in-person + cancel
+attribution, wire 1.2.0 → 1.3.0).** Allison's second sim-QA round (R1–R6);
+additive only (`CHANGELOG.md` [1.3.0]). Three DDL adds, applied via ALTER on
+BOTH running DBs (dev :5432 + test :5433) and mirrored in `schema.sql` + the
+hand-patched Drizzle `src/db/schema/schema.ts`:
+
+- **R5 — WHO/WHY on a cancelled booking.** `bookings.cancelled_by text CHECK
+  ('owner'|'staff')` + `bookings.cancel_reason text` (both nullable; NULL on
+  legacy/not-cancelled rows; distinct from the still-unused
+  `cancellation_reason`). Stamped by `bookingsRepository.markCancelled` — owner
+  self-cancel (`POST /bookings/:id/cancel`, group-class withdraw) → `'owner'`,
+  staff cancel (`POST /staff/bookings/:id/cancel`) → `'staff'` + the optional
+  reason. That staff route now accepts a body `{ reason?: string }` (trimmed,
+  1–500 chars, strict; reason rides the idempotency request hash so a replay
+  with a different reason 422s as a mismatch). Wire: `BookingWire.cancelled_by?
+  ('owner'|'staff')` + `cancel_reason? (string)` — emitted only on a cancelled
+  booking, omit-on-null like `cancelled_at`. Owner app renders "You cancelled
+  this on …" / "The school cancelled this on …" + the reason line in the
+  booking modal's cancelled banner.
+- **R3 — cash/check ("in person") pay is real.** `invoices.payment_expected
+  text NOT NULL DEFAULT 'card' CHECK ('card'|'in-person')`. New verb **`POST
+  /invoices/:id/pay-in-person`** `[auth, owner]` — Idempotency-Key required,
+  bodyless **204**; charges NOTHING. Flips `payment_expected → 'in-person'`
+  (filtered on `status='open' AND payment_expected='card'`, so a repeat call
+  under a new key — or a paid/void target — 409s; same-key replay returns the
+  stored 204 via the peek-first pattern) and, in the same tx, enqueues a
+  **`payment-due`** scheduled notification (dedupe `payment-due:<invoiceId>`,
+  one per invoice) anchored **~1h before the linked booking's drop-off**
+  (`dropoff_at`, falling back to `scheduled_at` for non-stay categories) or ~1h
+  before the invoice's `due_at` when no booking is linked; a past anchor clamps
+  to now. Deep-links `invoice`/`/account/invoices?invoiceId=:id`; tags the
+  booking's lead dog (else the invoice's `dog_id`). `notification_type` pgEnum
+  += `'payment-due'` (**14 arms**, `NotificationType` pinned in
+  `conformance.ts`); push-capable under the `urgent-updates` category. Copy
+  helpers (`formatDollars`/`purposeLabel`) extracted to
+  `src/lib/invoiceReceiptCopy.ts`, shared with the `payment-succeeded` receipt.
+  Known deferrals, documented in-code: the auto-charge worker is NOT yet
+  stopped for in-person invoices (`next_attempt_at` untouched), and
+  `LedgerEntryWire` does not yet carry `payment_expected` (the client's
+  in-person state is optimistic until it lands on the wire).
 
 **Amendment 2026-07-25 (Notifications Phase 3 — notification surface enters the
 contract (wire 1.1.0) + D3 push-preference enforcement + producer path
@@ -2340,6 +2400,7 @@ invisible to the repository layer.
   The DELETE does NOT re-stamp lot expiries (documented in the route).
 - `POST /webhooks/stripe` [public, signed] — **Day 15** — receives `payment_intent.succeeded`/`.payment_failed`/`setup_intent.succeeded`/`charge.refund.updated`. Dedupes via `stripe_events` table; runs under `system:stripe-webhook` actor. Other event types collapse to `unhandled`+200 (future-proof).
 - `GET /invoices` · `POST /invoices/:id/pay` [$] — **Day 15** for `POST /pay` (pay-later settlement, mirrors credit-purchase shape). `GET /invoices` deferred to Day-19 staff portal (no current FE consumer; `invoicesRepository.findOpenByOwner` is ready when needed).
+- `POST /invoices/:id/pay-in-person` — **Notifications Phase 4c (2026-07-27, R3)**: owner elects cash/check at drop-off. Charges nothing — flips `invoices.payment_expected` → 'in-person' + enqueues the `payment-due` reminder (~1h before the linked booking's drop-off, else the invoice's `due_at`; past → now) in one tx. Bodyless 204; repeat under a new key → 409. See §A Amendment 2026-07-27 (Phase 4c).
 - `POST /requests/:id/confirm-payment` — **Day 15** — B&T `approved-awaiting-payment` → `converted`. Server-authoritative pricing via `lib/boardTrainPricing.ts`. Pay-now (charges row + booking) or pay-later (open invoice + booking).
 - `GET /refunds` — refund history; refunds are created by the cancel txn (`POST /bookings/:id/cancel`), not a direct client endpoint. Past the `cancel_deadline_at` window the booking is `cancel_forfeited` (no refund); within it → credit `cancel-refund` (credit bookings) or a `refunds` row + Stripe refund (money bookings). **Day 14**: cancel route's money-back branch now fires `stripe.createRefund` post-commit (Day-13 stubbed the seam).
 - `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**7 phases as of §J 2026-07-14**: `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / `idempotency_keys` TTL sweep). Worker runs under `system:scheduler` actor.

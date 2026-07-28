@@ -198,6 +198,9 @@ test(
       amount_cents: 18_000,
       date: '2026-04-18T15:00:00.000Z',
       category: 'board-and-train',
+      // Open entries expose how the owner will settle (default 'card'); the
+      // pay-in-person flow flips this so the app renders the row non-payable.
+      payment_expected: 'card',
     });
 
     // Newest first across the seeded rows.

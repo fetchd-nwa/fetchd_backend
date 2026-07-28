@@ -7,8 +7,11 @@ import {
   bookings as bookingsTable,
   creditLedger,
   invoices as invoicesTable,
+  scheduledNotifications,
   serviceRates,
 } from '../../src/db/schema/schema.js';
+import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
+import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
@@ -122,6 +125,14 @@ async function bookingDebitsFor(bookingId: string) {
     .select({ delta: creditLedger.delta, reason: creditLedger.reason })
     .from(creditLedger)
     .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'booking-debit')));
+}
+
+async function paygInvoiceIdFor(bookingId: string): Promise<string> {
+  const [row] = await db
+    .select({ id: invoicesTable.id })
+    .from(invoicesTable)
+    .where(eq(invoicesTable.bookingId, bookingId));
+  return row!.id;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
