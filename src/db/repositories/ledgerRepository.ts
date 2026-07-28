@@ -29,6 +29,13 @@ export interface LedgerEntryRow {
    * `id` already IS the invoice id) and for non-invoice charges.
    */
   settledInvoiceId: string | null;
+  /**
+   * Open-invoice entries only: how the owner said they'll settle it. An
+   * 'in-person' invoice must render non-payable in the app (paying it by
+   * card after flagging cash/check would double-bill the drop-off). NULL
+   * for charge-sourced (already-settled) entries.
+   */
+  paymentExpected: 'card' | 'in-person' | null;
 }
 
 // A charge is a ledger line only when it represents a completed money event.
@@ -113,6 +120,7 @@ export const ledgerRepository = {
         category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
         mode: isPackage ? row.packMode : null,
         settledInvoiceId: row.settledInvoiceId,
+        paymentExpected: null,
       };
     });
 
@@ -124,6 +132,7 @@ export const ledgerRepository = {
         date: invoices.issuedAt,
         bookingCategory: bookings.category,
         bookingLeadDog: bookings.leadDogId,
+        paymentExpected: invoices.paymentExpected,
       })
       .from(invoices)
       .leftJoin(bookings, eq(bookings.id, invoices.bookingId))
@@ -142,6 +151,7 @@ export const ledgerRepository = {
         category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
         mode: null,
         settledInvoiceId: null,
+        paymentExpected: row.paymentExpected,
       };
     });
 

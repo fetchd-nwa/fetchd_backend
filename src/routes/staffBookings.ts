@@ -45,6 +45,18 @@ const attendanceBodySchema = z
   })
   .strict();
 
+/**
+ * Staff cancel body (R5, Allison sim-QA 2026-07-27). The only field is an
+ * OPTIONAL reason the school can attach — surfaced under "The school cancelled
+ * this on …" in the owner app. Trimmed + capped so a runaway paste can't bloat
+ * the banner; omitted when the staff cancels without a note.
+ */
+const cancelBodySchema = z
+  .object({
+    reason: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
 // AttendanceWire is owned by the single-source contract (contracts/wire.ts).
 
 export interface StaffBookingsRouteOptions extends AuthRouteOptions {
@@ -141,6 +153,7 @@ export function registerStaffBookingsRoute(
       requireStaff(principal, 'cancel a booking');
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+      const reason = parseCancelReason(request.body);
 
       let pendingStripeRefund:
         | { refundId: string; paymentIntentId: string; amountCents: number }
@@ -152,7 +165,9 @@ export function registerStaffBookingsRoute(
           principal,
           idempotencyKey,
           endpoint: 'POST /staff/bookings/:id/cancel',
-          requestHash: hashRequestBody({ id }),
+          // Reason rides the hash so a replay under the same key with a DIFFERENT
+          // reason is caught as a mismatch, not silently ignored.
+          requestHash: hashRequestBody({ id, reason }),
           // Day-13 cache invalidation: drop the freed seat's availability
           // range cache plus each credited-back dog's balance cache. Mirrors
           // the owner cancel route.
@@ -183,7 +198,14 @@ export function registerStaffBookingsRoute(
           },
         },
         async (tx) => {
-          const result = await cancelBookingInTx(tx, { id, requireOwnerId: null });
+          // Staff cancel → "The school cancelled this on …" (R5), with the
+          // reason line when the caller supplied one.
+          const result = await cancelBookingInTx(tx, {
+            id,
+            requireOwnerId: null,
+            cancelledBy: 'staff',
+            ...(reason !== undefined ? { cancelReason: reason } : {}),
+          });
           pendingStripeRefund = result.pendingStripeRefund;
           creditRefundedDogIds = result.creditRefundedDogIds;
           return { status: 200, body: result.wire };
@@ -270,4 +292,13 @@ function parseAttendanceBody(body: unknown): z.infer<typeof attendanceBodySchema
     throw new ApiError('invalid_payload', `invalid body: ${parsed.error.message}`);
   }
   return parsed.data;
+}
+
+/** Optional staff cancel reason. Tolerates an absent body (`{}` / undefined). */
+function parseCancelReason(body: unknown): string | undefined {
+  const parsed = cancelBodySchema.safeParse(body ?? {});
+  if (!parsed.success) {
+    throw new ApiError('invalid_payload', `invalid body: ${parsed.error.message}`);
+  }
+  return parsed.data.reason;
 }

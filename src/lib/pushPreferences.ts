@@ -19,7 +19,7 @@ import type { NotificationType } from '../contracts/wire.js';
  * `NotificationCategoryPanel`: booking-confirmations, booking-reminders,
  * report-cards, session-photos, urgent-updates, announcements. Only two of them
  * gate a scheduled type the worker actually pushes today, so `PUSH_TYPE_CATEGORY`
- * below is total over exactly the six push-capable scheduled types and no others.
+ * below is total over exactly the seven push-capable scheduled types and no others.
  */
 type PushCategoryKey = 'booking-reminders' | 'urgent-updates';
 
@@ -33,6 +33,7 @@ type PushCapableType =
   | 'boarding-profile-check'
   | 'alumni-attendance'
   | 'payment-failed'
+  | 'payment-due'
   | 'credits-expiring'
   | 'spay-neuter-reminder';
 
@@ -41,6 +42,8 @@ const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'boarding-profile-check': 'booking-reminders',
   'alumni-attendance': 'booking-reminders',
   'payment-failed': 'urgent-updates',
+  // R3: the cash/check "bring payment at drop-off" reminder is action-required.
+  'payment-due': 'urgent-updates',
   'credits-expiring': 'urgent-updates',
   'spay-neuter-reminder': 'urgent-updates',
 };

@@ -56,9 +56,16 @@ export interface CancelBookingResult {
  */
 export async function cancelBookingInTx(
   tx: Tx,
-  args: { id: string; requireOwnerId: string | null },
+  args: {
+    id: string;
+    requireOwnerId: string | null;
+    /** WHO cancelled — 'owner' (self-cancel) or 'staff' (the school). R5. */
+    cancelledBy: 'owner' | 'staff';
+    /** Optional staff-supplied reason line; owner self-cancels omit it. */
+    cancelReason?: string;
+  },
 ): Promise<CancelBookingResult> {
-  const { id, requireOwnerId } = args;
+  const { id, requireOwnerId, cancelledBy, cancelReason } = args;
 
   // 1. Row-lock; serialize concurrent cancels. 404 collapses not-found,
   //    expired, and (owner route only) not-yours into one response.
@@ -82,7 +89,8 @@ export async function cancelBookingInTx(
 
   // 2. Soft-cancel. `cancelForfeited` is computed in SQL against the
   //    stamped `cancel_deadline_at`; the resolved value lands on commit.
-  await bookingsRepository.markCancelled(tx, id);
+  //    `cancelledBy` + `cancelReason` (R5) record WHO/WHY for the banner.
+  await bookingsRepository.markCancelled(tx, { id, cancelledBy, cancelReason });
 
   // 3. Re-read so the refund branch reads the resolved `cancelForfeited`
   //    (not the pre-update snapshot).
@@ -90,6 +98,12 @@ export async function cancelBookingInTx(
   if (updated === undefined) {
     throw new Error(`cancelBooking ${id}: row vanished after mark-cancelled`);
   }
+
+  // The booking's open PAYG invoice, if any — its pending auto-charge is voided
+  // on a within-window cancel (below), and its pay-in-person reminder is torn
+  // down in step 5 (R3). Read once now: the void flips it to 'void', so the id
+  // must be captured before then to survive the teardown lookup.
+  const linkedOpenInvoice = await invoicesRepository.findOpenForBooking(tx, { bookingId: id });
 
   // 4. Refund branching — within the cancel window only.
   let pendingStripeRefund: PendingStripeRefund | undefined;
@@ -154,9 +168,8 @@ export async function cancelBookingInTx(
         // drop-off, inside the cancel window), so the open invoice is the
         // only money artifact. A genuinely free service (no invoice) is a
         // no-op — the status flip is the full effect.
-        const openInvoice = await invoicesRepository.findOpenForBooking(tx, { bookingId: id });
-        if (openInvoice !== undefined) {
-          await invoicesRepository.markVoid(tx, { id: openInvoice.id });
+        if (linkedOpenInvoice !== undefined) {
+          await invoicesRepository.markVoid(tx, { id: linkedOpenInvoice.id });
         }
       }
     }
@@ -182,6 +195,15 @@ export async function cancelBookingInTx(
   // tomorrow" — cancel any still-pending reminder rows for it in the same tx.
   await scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `booking-reminder:${id}`);
   await scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `boarding-24h:${id}`);
+  // R3: same rule for a pay-in-person invoice linked to this booking — with no
+  // drop-off left, its "bring $… at drop-off" reminder is stale. Keyed by
+  // invoice id (`payment-due:<invoiceId>`), so cancel by the captured invoice.
+  if (linkedOpenInvoice !== undefined) {
+    await scheduledNotificationsRepository.cancelPendingByDedupePrefix(
+      tx,
+      `payment-due:${linkedOpenInvoice.id}`,
+    );
+  }
 
   // 6. Wire the updated row for the response.
   const [wire] = await wireManyBookings([updated]);

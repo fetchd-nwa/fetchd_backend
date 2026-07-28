@@ -20,7 +20,7 @@ export type LocationKey = (typeof LOCATION_SLUGS)[number];
 export const mediaDerivativeJobStatus = pgEnum("media_derivative_job_status", ['pending', 'processing', 'done', 'failed'])
 export const mediaKind = pgEnum("media_kind", ['image', 'video'])
 export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avatar', 'report-photo', 'report-video', 'message-attachment'])
-export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'alumni-attendance', 'membership-ended', 'spay-neuter-reminder'])
+export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'alumni-attendance', 'membership-ended', 'spay-neuter-reminder', 'payment-due'])
 export const rateUnit = pgEnum("rate_unit", ['per-day', 'per-night', 'per-session', 'per-week', 'flat'])
 export const recordSource = pgEnum("record_source", ['app', 'gingr', 'seed'])
 export const refundStatus = pgEnum("refund_status", ['pending', 'succeeded', 'failed'])
@@ -508,6 +508,8 @@ export const bookings = pgTable("bookings", {
 	cancellationReason: text("cancellation_reason"),
 	cancelDeadlineAt: timestamp("cancel_deadline_at", { withTimezone: true, mode: 'string' }),
 	cancelForfeited: boolean("cancel_forfeited").default(false).notNull(),
+	cancelledBy: text("cancelled_by").$type<'owner' | 'staff'>(),
+	cancelReason: text("cancel_reason"),
 	externalRef: text("external_ref"),
 	source: recordSource().default('app').notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
@@ -900,6 +902,7 @@ export const invoices = pgTable("invoices", {
 	// §J.1: set on purpose='membership' rows — the subscription month billed.
 	membershipId: uuid("membership_id"),
 	paymentMethodId: uuid("payment_method_id").notNull(),
+	paymentExpected: text("payment_expected").$type<'card' | 'in-person'>().default('card').notNull(),
 	paidChargeId: uuid("paid_charge_id"),
 	issuedAt: timestamp("issued_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	dueAt: timestamp("due_at", { withTimezone: true, mode: 'string' }).notNull(),

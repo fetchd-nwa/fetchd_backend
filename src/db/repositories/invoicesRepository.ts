@@ -43,6 +43,8 @@ export interface InvoiceRow {
   /** §J.1: set on purpose='membership' rows — the subscription month billed. */
   membershipId: string | null;
   paymentMethodId: string;
+  /** R3: 'card' (default auto-charge) or 'in-person' (cash/check due at drop-off). */
+  paymentExpected: 'card' | 'in-person';
   paidChargeId: string | null;
   dueAt: string;
   nextAttemptAt: string | null;
@@ -62,6 +64,7 @@ const INVOICE_PROJECTION = {
   requestId: invoices.requestId,
   membershipId: invoices.membershipId,
   paymentMethodId: invoices.paymentMethodId,
+  paymentExpected: invoices.paymentExpected,
   paidChargeId: invoices.paidChargeId,
   dueAt: invoices.dueAt,
   nextAttemptAt: invoices.nextAttemptAt,
@@ -177,6 +180,34 @@ export const invoicesRepository = {
   },
 
   /**
+   * R3 flag flip: mark an OPEN, card-backed invoice as pay-in-person
+   * (cash/check due at drop-off). Filtered on `status='open' AND
+   * payment_expected='card'` so a second call — or a call against a paid/void
+   * or already-in-person invoice — is a no-op (returns 0); the route reads that
+   * count to 409. `next_attempt_at` is left live (NOT parked to null): the
+   * auto-charge worker's due-batch scans (`leaseDueOpen` / `lockDueOpenForUpdate`)
+   * filter on `payment_expected='card'`, so an in-person invoice is never leased
+   * or charged — the R3 "don't charge the card when they chose cash/check" rule —
+   * while `next_attempt_at` staying non-null keeps it OUT of the parked-invoice
+   * staff worklist (`findParked`, which keys on `next_attempt_at IS NULL`). An
+   * in-person invoice is awaiting a drop-off payment, not stuck.
+   */
+  async markPayInPerson(tx: Tx, args: { id: string }): Promise<number> {
+    const updated = await tx
+      .update(invoices)
+      .set({ paymentExpected: 'in-person' })
+      .where(
+        and(
+          eq(invoices.id, args.id),
+          eq(invoices.status, 'open'),
+          eq(invoices.paymentExpected, 'card'),
+        ),
+      )
+      .returning({ id: invoices.id });
+    return updated.length;
+  },
+
+  /**
    * The open group-class invoice for one (cohort, dog) enrollment, if any —
    * the withdraw verb's "is this dog's enrollment an unpaid pay-later?" probe.
    * Only `status='open'` (a paid one is a charge-refund, not a void).
@@ -248,7 +279,16 @@ export const invoicesRepository = {
     return tx
       .select(INVOICE_PROJECTION)
       .from(invoices)
-      .where(and(eq(invoices.status, 'open'), isNotNull(invoices.nextAttemptAt), cutoff))
+      .where(
+        and(
+          eq(invoices.status, 'open'),
+          // R3: never auto-charge a cash/check ('in-person') invoice — the owner
+          // pays it at drop-off, not on the bound card.
+          eq(invoices.paymentExpected, 'card'),
+          isNotNull(invoices.nextAttemptAt),
+          cutoff,
+        ),
+      )
       .orderBy(asc(invoices.nextAttemptAt))
       .limit(limit)
       .for('update', { skipLocked: true });
@@ -280,7 +320,15 @@ export const invoicesRepository = {
     const due = await tx
       .select({ id: invoices.id })
       .from(invoices)
-      .where(and(eq(invoices.status, 'open'), isNotNull(invoices.nextAttemptAt), cutoff))
+      .where(
+        and(
+          eq(invoices.status, 'open'),
+          // R3: skip cash/check ('in-person') invoices — never auto-charged.
+          eq(invoices.paymentExpected, 'card'),
+          isNotNull(invoices.nextAttemptAt),
+          cutoff,
+        ),
+      )
       .orderBy(asc(invoices.nextAttemptAt))
       .limit(limit)
       .for('update', { skipLocked: true });

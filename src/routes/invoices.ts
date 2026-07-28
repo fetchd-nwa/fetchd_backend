@@ -1,16 +1,22 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { deepLinkToPath } from '../contracts/wire.js';
 import { db } from '../db/client.js';
 import { peekCompletedIdempotency } from '../db/idempotency.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository, type ChargeStatus } from '../db/repositories/chargesRepository.js';
-import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
+import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import { ledgerRepository } from '../db/repositories/ledgerRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
+import type { Tx } from '../db/tx.js';
 import { toLedgerEntryWire, type LedgerEntryWire } from '../lib/ledgerWire.js';
 import { ApiError } from '../lib/errors.js';
+import { formatDollars, purposeLabel } from '../lib/invoiceReceiptCopy.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
+import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import {
@@ -258,6 +264,129 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
       return outcome.body;
     },
   );
+
+  // `POST /invoices/:id/pay-in-person` `[auth]` — R3 cash/check flag flip.
+  //
+  // The owner elects to settle this OPEN, card-backed invoice IN PERSON (cash
+  // or check at drop-off) rather than on the card. It charges nothing: it flips
+  // `payment_expected` → 'in-person' and, in the same tx, schedules a
+  // `payment-due` reminder ~1h before the linked booking's drop-off (or ~1h
+  // before the invoice's due time when no booking is linked). Bodyless 204 on
+  // success (flag-flip convention, like POST /notifications/:id/read).
+  //
+  // Shape mirrors `/pay`: peek for an idempotent replay FIRST (this route flips
+  // `payment_expected`, which the pre-validation reads — a replay would 409
+  // before the idempotency layer could replay the stored 204), then pre-validate
+  // on the pool (a cross-owner id 404s BEFORE any `idempotency_keys` write, so
+  // the owner FK never trips), then the mutation tx does the flip + enqueue.
+  app.post('/invoices/:id/pay-in-person', { preHandler: [authHook] }, async (request, reply) => {
+    const principal = requirePrincipal(request);
+    requireOwner(principal, 'pay an invoice in person');
+    const { id } = parseIdParam(request.params);
+    const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    const requestHash = hashRequestBody({ id });
+    const now = new Date();
+
+    const replay = await peekCompletedIdempotency<null>(
+      idempotencyKey,
+      'POST /invoices/:id/pay-in-person',
+      requestHash,
+    );
+    if (replay !== undefined) {
+      reply.code(replay.status);
+      return replay.body;
+    }
+
+    const invoiceRow = await invoicesRepository.findByIdForOwner(db, {
+      id,
+      ownerId: principal.ownerId,
+    });
+    if (invoiceRow === undefined) {
+      throw new ApiError('not_found', `invoice ${id} not found`);
+    }
+    if (invoiceRow.status !== 'open') {
+      throw new ApiError('conflict', `invoice ${id} is ${invoiceRow.status}, not open`);
+    }
+    if (invoiceRow.paymentExpected !== 'card') {
+      throw new ApiError('conflict', `invoice ${id} is already flagged pay-in-person`);
+    }
+
+    const outcome = await withMutation<null>(
+      {
+        principal,
+        idempotencyKey,
+        endpoint: 'POST /invoices/:id/pay-in-person',
+        requestHash,
+        // cache-noop: only the §3 `credits:{dogId}:*` family is read-through
+        // cached, and it's keyed off `credit_ledger` writes. This flips
+        // `invoices.payment_expected` (invoices aren't cached) and enqueues a
+        // `scheduled_notifications` row (not cached) — no credit grant, so
+        // nothing in the cache map goes stale.
+      },
+      async (tx) => {
+        const flipped = await invoicesRepository.markPayInPerson(tx, { id });
+        if (flipped === 0) {
+          // A concurrent flip won between the pre-check and here — same
+          // row-visibility guard the pay route leans on for `markPaid`. Honest 409.
+          throw new ApiError('conflict', `invoice ${id} is no longer open + card-backed`);
+        }
+
+        // Anchor the reminder ~1h before drop-off; past-due → now (R3) so the
+        // worker fires it on the next tick, same convention as booking reminders.
+        const anchor = await resolvePaymentDueAnchor(tx, invoiceRow);
+        const scheduledForMs = anchor.at.getTime() - PAYMENT_DUE_LEAD_MS;
+        const scheduledFor = scheduledForMs < now.getTime() ? now : new Date(scheduledForMs);
+
+        await scheduledNotificationsRepository.enqueueIdempotent(tx, {
+          ownerId: invoiceRow.ownerId,
+          type: 'payment-due',
+          trigger: 'payment-due',
+          dedupeKey: `payment-due:${id}`,
+          scheduledFor,
+          title: 'Payment due at drop-off',
+          body: `Please bring ${formatDollars(invoiceRow.amountCents)} for your ${purposeLabel(
+            invoiceRow.purpose,
+          )} when you drop off.`,
+          deepLinkPath: deepLinkToPath({ kind: 'invoice', id }),
+          deepLinkKind: 'invoice',
+          deepLinkId: id,
+          ...(anchor.leadDogId !== null ? { dogId: anchor.leadDogId } : {}),
+        });
+
+        return { status: 204, body: null };
+      },
+    );
+
+    reply.code(outcome.status);
+    return outcome.body;
+  });
+}
+
+/** Lead time for the pay-in-person reminder: ~1h before the drop-off anchor. */
+const PAYMENT_DUE_LEAD_MS = 60 * 60 * 1000;
+
+/**
+ * Resolve the payment-due reminder anchor for a cash/check invoice: the linked
+ * booking's drop-off (or its `scheduled_at` when the category has no drop-off),
+ * else the invoice's own `due_at`. Also surfaces the dog to tag on the
+ * notification — the booking's lead dog when linked, otherwise the invoice's
+ * `dog_id` (if any). A `booking_id` that no longer resolves (ON DELETE SET NULL
+ * race) degrades to the due-date fallback rather than throwing.
+ */
+async function resolvePaymentDueAnchor(
+  tx: Tx,
+  invoice: InvoiceRow,
+): Promise<{ at: Date; leadDogId: string | null }> {
+  if (invoice.bookingId !== null) {
+    const booking = await bookingsRepository.findScheduleAnchorById(tx, invoice.bookingId);
+    if (booking !== undefined) {
+      return {
+        at: pgTimestampToDate(booking.dropoffAt ?? booking.scheduledAt),
+        leadDogId: booking.leadDogId,
+      };
+    }
+  }
+  return { at: pgTimestampToDate(invoice.dueAt), leadDogId: invoice.dogId };
 }
 
 function parseIdParam(params: unknown): { id: string } {

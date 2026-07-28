@@ -25,6 +25,12 @@ export interface LedgerEntryWire {
    * on `id` OR this.
    */
   invoice_id?: string;
+  /**
+   * Open invoices only: how the owner said they'll settle it. 'in-person'
+   * rows render non-payable in the app (card-paying a flagged invoice would
+   * double-bill the drop-off).
+   */
+  payment_expected?: 'card' | 'in-person';
 }
 
 export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
@@ -39,5 +45,6 @@ export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
   if (row.category !== null) wire.category = row.category;
   if (row.mode !== null) wire.mode = row.mode;
   if (row.settledInvoiceId !== null) wire.invoice_id = row.settledInvoiceId;
+  if (row.paymentExpected !== null) wire.payment_expected = row.paymentExpected;
   return wire;
 }

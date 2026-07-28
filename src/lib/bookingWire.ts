@@ -39,6 +39,8 @@ export interface BookingRowForWire {
   cancelledAt: string | null;
   cancelForfeited: boolean;
   cancelDeadlineAt: string | null;
+  cancelledBy: 'owner' | 'staff' | null;
+  cancelReason: string | null;
   cohortId: string | null;
 }
 
@@ -90,6 +92,12 @@ export function toBookingWire(
   if (row.status === 'cancelled') {
     if (row.cancelledAt !== null) wire.cancelled_at = pgTimestampToIso(row.cancelledAt);
     wire.cancel_forfeited = row.cancelForfeited;
+    // R5: WHO/WHY, omit-on-null like `cancelled_at`. Legacy cancelled rows
+    // (pre-2026-07-27) carry NULL here, so the banner falls back gracefully.
+    if (row.cancelledBy !== null) wire.cancelled_by = row.cancelledBy;
+    if (row.cancelReason !== null && row.cancelReason !== '') {
+      wire.cancel_reason = row.cancelReason;
+    }
   }
   return wire;
 }

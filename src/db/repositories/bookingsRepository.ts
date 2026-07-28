@@ -41,6 +41,8 @@ export interface BookingRow {
   cancelledAt: string | null;
   cancelForfeited: boolean;
   cancelDeadlineAt: string | null;
+  cancelledBy: 'owner' | 'staff' | null;
+  cancelReason: string | null;
   pickupAt: string | null;
   trainerStaffId: string | null;
   cohortId: string | null;
@@ -83,6 +85,8 @@ const BOOKING_PROJECTION = {
   cancelledAt: bookings.cancelledAt,
   cancelForfeited: bookings.cancelForfeited,
   cancelDeadlineAt: bookings.cancelDeadlineAt,
+  cancelledBy: bookings.cancelledBy,
+  cancelReason: bookings.cancelReason,
   pickupAt: bookings.pickupAt,
   trainerStaffId: bookings.trainerStaffId,
   cohortId: bookings.cohortId,
@@ -484,11 +488,37 @@ export const bookingsRepository = {
   },
 
   /**
+   * The drop-off / scheduled anchor + lead dog for one booking. Backs the
+   * pay-in-person payment-due reminder (R3): it schedules ~1h before the
+   * stay's drop-off (`dropoffAt`), falling back to `scheduledAt` for the
+   * non-stay categories that carry no drop-off. Deliberately narrow — no
+   * `live()` filter, no ownership scope (the caller already validated the
+   * invoice that references this booking).
+   */
+  async findScheduleAnchorById(
+    runner: Tx | typeof db,
+    id: string,
+  ): Promise<{ dropoffAt: string | null; scheduledAt: string; leadDogId: string } | undefined> {
+    const [row] = await runner
+      .select({
+        dropoffAt: bookings.dropoffAt,
+        scheduledAt: bookings.scheduledAt,
+        leadDogId: bookings.leadDogId,
+      })
+      .from(bookings)
+      .where(eq(bookings.id, id))
+      .limit(1);
+    return row;
+  },
+
+  /**
    * Soft-cancel one booking. Sets `status='cancelled'`, `cancelledAt =
-   * now()`, and `cancelForfeited` per the per-row deadline check. The
-   * `cancellation_reason` text column is reserved for a future Day-14+
-   * surface (owner cancel-reason picker, staff "force cancel" reason);
-   * Day-13 leaves it NULL.
+   * now()`, `cancelForfeited` per the per-row deadline check, and — R5
+   * (Allison sim-QA 2026-07-27) — `cancelledBy` ('owner' | 'staff') plus
+   * the optional `cancelReason` staff supplies. These drive the owner
+   * app's cancelled-booking banner ("You cancelled this…" vs "The school
+   * cancelled this…" + the reason line). (The older `cancellation_reason`
+   * column stays unused — the new `cancel_reason` supersedes it.)
    *
    * `cancelForfeited` is computed in SQL against `cancel_deadline_at`
    * (`now() > cancel_deadline_at`). Doing the check in SQL means a
@@ -501,15 +531,20 @@ export const bookingsRepository = {
    * cancellation is a status flip, not a row-expire. Audit row captures
    * the prior status.
    */
-  async markCancelled(tx: Tx, id: string): Promise<void> {
+  async markCancelled(
+    tx: Tx,
+    args: { id: string; cancelledBy: 'owner' | 'staff'; cancelReason?: string | null },
+  ): Promise<void> {
     await tx
       .update(bookings)
       .set({
         status: 'cancelled',
         cancelledAt: sql`now()`,
         cancelForfeited: sql`COALESCE(now() > ${bookings.cancelDeadlineAt}, false)`,
+        cancelledBy: args.cancelledBy,
+        cancelReason: args.cancelReason ?? null,
       })
-      .where(eq(bookings.id, id));
+      .where(eq(bookings.id, args.id));
   },
 
   // -------------------------------------------------------------------

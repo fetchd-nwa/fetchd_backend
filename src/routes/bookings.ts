@@ -628,6 +628,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           const result = await cancelBookingInTx(tx, {
             id,
             requireOwnerId: principal.ownerId,
+            // Owner self-cancel → "You cancelled this on …" (R5). No reason line.
+            cancelledBy: 'owner',
           });
           pendingStripeRefund = result.pendingStripeRefund;
           creditRefundedDogIds = result.creditRefundedDogIds;

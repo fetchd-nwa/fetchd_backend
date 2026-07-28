@@ -1,7 +1,7 @@
 import { deepLinkToPath } from '../contracts/wire.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
-import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
+import { formatDollars, purposeLabel } from '../lib/invoiceReceiptCopy.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
@@ -393,35 +393,6 @@ async function recordFailed(
       dogId: invoice.dogId,
     });
   });
-}
-
-/** Whole-dollar-aware USD formatter for receipt copy. Stripe amounts are cents;
- *  `$120` reads better than `$120.00` for round amounts, but cents show when
- *  present. */
-function formatDollars(amountCents: number): string {
-  const dollars = amountCents / 100;
-  return `$${Number.isInteger(dollars) ? dollars.toString() : dollars.toFixed(2)}`;
-}
-
-/**
- * Human label for the thing being charged, varied by `charge_purpose`, for the
- * receipt + failure copy. Day-program (`payg`), `board-train`, and
- * `group-class` are the auto-charged invoice purposes today; `package` /
- * `membership` are covered for totality (an invoice can carry any purpose).
- */
-function purposeLabel(purpose: ChargePurpose): string {
-  switch (purpose) {
-    case 'payg':
-      return 'day program session';
-    case 'board-train':
-      return 'Board & Train program';
-    case 'group-class':
-      return 'group class enrollment';
-    case 'package':
-      return 'credit package';
-    case 'membership':
-      return 'membership';
-  }
 }
 
 function errMsg(err: unknown): string {

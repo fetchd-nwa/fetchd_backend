@@ -65,7 +65,11 @@ export type ScheduledNotificationType =
   | 'alumni-attendance'
   // Shanthi 2026-07-14: fires on the owner's stated spay/neuter planned
   // date, prompting a profile update (`spay-neuter:<dogId>:<date>`).
-  | 'spay-neuter-reminder';
+  | 'spay-neuter-reminder'
+  // R3 2026-07-27: the cash/check invoice reminder (`payment-due:<invoiceId>`)
+  // enqueued by `POST /invoices/:id/pay-in-person`. Push-capable (urgent-
+  // updates) so the owner is reminded to bring payment ~1h before drop-off.
+  | 'payment-due';
 
 export interface ScheduledNotificationRow {
   id: string;

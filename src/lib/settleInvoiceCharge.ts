@@ -9,7 +9,9 @@ import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { membershipsRepository } from '../db/repositories/membershipsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
+import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
 import { nextMonthlyPeriodEnd } from './membershipBilling.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
 
@@ -118,6 +120,14 @@ export async function settleInvoiceCharge(
   });
 
   if (flipped > 0) {
+    // The invoice is settled — any pending pay-in-person reminder ("bring $… at
+    // drop-off") is now stale money-already-collected noise. Tear it down in the
+    // settle tx (D4's in-tx reminder-teardown precedent). A no-op for a plain
+    // card invoice (no `payment-due:` row was ever enqueued).
+    await scheduledNotificationsRepository.cancelPendingByDedupePrefix(
+      tx,
+      `payment-due:${invoice.id}`,
+    );
     if (invoice.purpose === 'membership' && invoice.membershipId !== null) {
       await grantMembershipMonth(tx, { invoice, chargeId: charge.id, now });
     }
@@ -232,34 +242,5 @@ async function grantMembershipMonth(
       periodStart: now,
       periodEnd: nextMonthlyPeriodEnd(now),
     });
-  }
-}
-
-/** Whole-dollar-aware USD formatter for receipt copy. Stripe amounts are cents;
- *  `$120` reads better than `$120.00` for round amounts, but cents show when
- *  present. */
-function formatDollars(amountCents: number): string {
-  const dollars = amountCents / 100;
-  return `$${Number.isInteger(dollars) ? dollars.toString() : dollars.toFixed(2)}`;
-}
-
-/**
- * Human label for the thing being charged, varied by `charge_purpose`, for the
- * receipt copy. Day-program (`payg`), `board-train`, and `group-class` are the
- * auto-charged invoice purposes today; `package` / `membership` are covered
- * for totality (an invoice can carry any purpose).
- */
-function purposeLabel(purpose: ChargePurpose): string {
-  switch (purpose) {
-    case 'payg':
-      return 'day program session';
-    case 'board-train':
-      return 'Board & Train program';
-    case 'group-class':
-      return 'group class enrollment';
-    case 'package':
-      return 'credit package';
-    case 'membership':
-      return 'membership';
   }
 }

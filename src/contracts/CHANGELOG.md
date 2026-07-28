@@ -12,6 +12,23 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.3.0] — 2026-07-27
+
+Additive (Notifications Phase 4c, Allison's second sim-QA round 2026-07-27). No
+existing field or enum member moves; both clients resync but nothing breaks.
+
+### Added
+
+- `NotificationType` enum — new arm `'payment-due'` (14 arms total). The
+  cash/check invoice reminder: `POST /invoices/:id/pay-in-person` schedules it to
+  fire ~1h before the linked booking's drop-off, or ~1h before the invoice's due
+  time when no booking is linked. Mirrors the `notification_type` pgEnum;
+  `conformance.ts` pins the two in lockstep (R3).
+- `BookingWire.cancelled_by` (`'owner' | 'staff'`) + `BookingWire.cancel_reason`
+  (`string`) — WHO cancelled a booking and the optional staff-supplied reason,
+  surfaced in the owner app's cancelled-booking banner. Emitted only on a
+  cancelled booking, omitted when null (same convention as `cancelled_at`) (R5).
+
 ## [1.2.0] — 2026-07-27
 
 Additive: entity-specific deep-link destinations (Notifications Phase 4b, per

@@ -129,7 +129,11 @@ CREATE TYPE notification_type  AS ENUM (
   'membership-ended',
   -- Shanthi ruling 2026-07-14: fires on the owner's stated spay/neuter
   -- planned date, prompting them to update the dog's profile.
-  'spay-neuter-reminder'
+  'spay-neuter-reminder',
+  -- R3 (Allison sim-QA 2026-07-27): the cash/check invoice reminder. Fires ~1h
+  -- before the linked booking's drop-off (or ~1h before the invoice's due time
+  -- when no booking is linked), telling the owner to bring payment at drop-off.
+  'payment-due'
 );
 CREATE TYPE announcement_category AS ENUM ('urgent','team','class','event','promo','report');
 CREATE TYPE staff_role         AS ENUM ('owner-shanthi', 'trainer', 'office');
@@ -665,6 +669,14 @@ CREATE TABLE bookings (
   cancellation_reason text,
   cancel_deadline_at  timestamptz,
   cancel_forfeited    boolean NOT NULL DEFAULT false,
+  -- R5 (Allison sim-QA 2026-07-27): WHO cancelled + WHY, surfaced in the owner
+  -- app's cancelled-booking banner. cancelled_by = 'owner' (self-cancel) or
+  -- 'staff' (the school cancelled it); cancel_reason is the optional free-text
+  -- a staff caller supplies ("The school cancelled this on Jul 17" + the reason
+  -- line). Both NULL on legacy-import + not-yet-cancelled rows. Distinct from the
+  -- older, still-unused `cancellation_reason` column above.
+  cancelled_by        text CHECK (cancelled_by IN ('owner','staff')),
+  cancel_reason       text,
   external_ref      text,
   source            record_source NOT NULL DEFAULT 'app',
   created_at        timestamptz NOT NULL DEFAULT now(),
@@ -1132,6 +1144,12 @@ CREATE TABLE invoices (
   -- auto-charges at due_at (retrying via next_attempt_at/auto_charge_attempts),
   -- so a client cannot defer-and-ghost the way Gingr allowed.
   payment_method_id uuid NOT NULL REFERENCES payment_methods(id) ON DELETE RESTRICT,
+  -- R3 (Allison sim-QA 2026-07-27): how the owner intends to settle. 'card' =
+  -- the default card-backed auto-charge described above; 'in-person' = cash/check
+  -- due at drop-off (POST /invoices/:id/pay-in-person flips it + schedules a
+  -- payment-due reminder). Adjudicated "cash/check invoices due by drop-off"; the
+  -- drop-off flagging + auto-charge stop are portal-side, later.
+  payment_expected text NOT NULL DEFAULT 'card' CHECK (payment_expected IN ('card','in-person')),
   paid_charge_id uuid REFERENCES charges(id),
   issued_at      timestamptz NOT NULL DEFAULT now(),
   due_at         timestamptz NOT NULL,

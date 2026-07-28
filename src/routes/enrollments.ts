@@ -523,8 +523,9 @@ export function registerEnrollmentsRoute(
           }
 
           // 5. Soft-cancel every weekly booking + release the cohort seat.
+          //    Owner self-serve withdraw → cancelledBy 'owner' (R5).
           for (const booking of enrolledBookings) {
-            await bookingsRepository.markCancelled(tx, booking.id);
+            await bookingsRepository.markCancelled(tx, { id: booking.id, cancelledBy: 'owner' });
           }
           await cohortsRepository.bumpFilled(tx, cohortId, -1);
 
