@@ -1,6 +1,6 @@
 import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../client.js';
-import { bookings, charges, creditLedger, invoices } from '../schema/schema.js';
+import { bookings, charges, creditLedger, invoices, paymentMethods } from '../schema/schema.js';
 import type { ChargePurpose, ChargeStatus } from './chargesRepository.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { Tx } from '../tx.js';
@@ -36,6 +36,27 @@ export interface LedgerEntryRow {
    * for charge-sourced (already-settled) entries.
    */
   paymentExpected: 'card' | 'in-person' | null;
+  /**
+   * Paid entries only: how the entry settled. Every settled charge today is a
+   * Stripe card charge, so this is 'card' for a charge-sourced PAID entry.
+   * 'cash'/'check' are reserved for a future staff mark-paid flow (none exists
+   * yet — never emitted today). NULL for open and refunded entries.
+   */
+  settledMethod: 'card' | 'cash' | 'check' | null;
+  /**
+   * Paid entries only: the card that settled the entry, recoverable ONLY when
+   * the paid charge back-references an invoice carrying a live payment_method
+   * (`invoices.paid_charge_id` + `invoices.payment_method_id`). NULL for direct
+   * package/membership charges (no invoice link, no card) and for non-paid
+   * entries.
+   */
+  settledCard: { brand: string; last4: string } | null;
+  /**
+   * Paid entries only: the precise settle timestamp (full timestamptz, with
+   * time). Prefers `invoices.paid_at` when invoice-linked, else the charge's
+   * own `created_at`. NULL for open and refunded entries.
+   */
+  settledAt: string | null;
 }
 
 // A charge is a ledger line only when it represents a completed money event.
@@ -82,10 +103,12 @@ export const ledgerRepository = {
    *     real billing model, not the prototype's per-session fabrication.
    *   - dog/mode come from `credit_ledger` for package purchases; dog/category
    *     come from the linked `booking` for payg/board-train/group-class.
-   *   - Card brand/last4 is intentionally absent: `charges` carries no
-   *     payment_method link (only `stripe_payment_intent_id`), so the FE
-   *     renders no card chip rather than a fabricated one. Adding it would
-   *     need a `charges.payment_method_id` column (frozen schema).
+   *   - Card brand/last4 is recovered for a paid charge that SETTLED an invoice
+   *     (`invoices.paid_charge_id` back-reference → `invoices.payment_method_id`
+   *     → `payment_methods`). `charges` itself carries no payment_method link
+   *     (only `stripe_payment_intent_id`), so a DIRECT package/membership charge
+   *     — with no invoice link — still renders no card chip rather than a
+   *     fabricated one.
    */
   async listForOwner(runner: Runner, ownerId: string): Promise<LedgerEntryRow[]> {
     const chargeRows = await runner
@@ -100,20 +123,26 @@ export const ledgerRepository = {
         packDogId: creditLedger.dogId,
         packMode: creditLedger.mode,
         settledInvoiceId: invoices.id,
+        invoicePaidAt: invoices.paidAt,
+        cardBrand: paymentMethods.brand,
+        cardLast4: paymentMethods.last4,
       })
       .from(charges)
       .leftJoin(bookings, eq(bookings.id, charges.bookingId))
       .leftJoin(creditLedger, eq(creditLedger.chargeId, charges.id))
       .leftJoin(invoices, eq(invoices.paidChargeId, charges.id))
+      .leftJoin(paymentMethods, eq(paymentMethods.id, invoices.paymentMethodId))
       .where(and(eq(charges.ownerId, ownerId), inArray(charges.status, LEDGER_CHARGE_STATUSES)));
 
     const chargeEntries: LedgerEntryRow[] = chargeRows.map((row) => {
       const kind = kindForPurpose(row.purpose);
       const isPackage = kind === 'credit-pack';
+      const status: LedgerStatus = row.status === 'refunded' ? 'refunded' : 'paid';
+      const isPaid = status === 'paid';
       return {
         id: row.id,
         kind,
-        status: row.status === 'refunded' ? 'refunded' : 'paid',
+        status,
         amountCents: row.amountCents,
         date: row.date,
         dogId: isPackage ? row.packDogId : row.bookingLeadDog,
@@ -121,6 +150,17 @@ export const ledgerRepository = {
         mode: isPackage ? row.packMode : null,
         settledInvoiceId: row.settledInvoiceId,
         paymentExpected: null,
+        // Every settled charge today is a Stripe card charge; refunds carry no
+        // settle detail.
+        settledMethod: isPaid ? 'card' : null,
+        // Card only when the paid charge settled an invoice with a live method.
+        settledCard:
+          isPaid && row.cardBrand !== null && row.cardLast4 !== null
+            ? { brand: row.cardBrand, last4: row.cardLast4 }
+            : null,
+        // Precise settle time: the invoice's paid_at when linked, else the
+        // charge's own created_at.
+        settledAt: isPaid ? (row.invoicePaidAt ?? row.date) : null,
       };
     });
 
@@ -152,6 +192,9 @@ export const ledgerRepository = {
         mode: null,
         settledInvoiceId: null,
         paymentExpected: row.paymentExpected,
+        settledMethod: null,
+        settledCard: null,
+        settledAt: null,
       };
     });
 

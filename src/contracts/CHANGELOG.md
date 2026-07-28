@@ -12,6 +12,34 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.4.0] — 2026-07-28
+
+Additive (Notifications Phase 4d, Allison's third sim-QA round 2026-07-28). No
+existing field or enum member moves; both clients resync but nothing breaks. Old
+persisted membership paths without `?highlight` still parse (backward-compat).
+
+### Added
+
+- `LedgerEntryWire.settled_method` (`'card' | 'cash' | 'check'`),
+  `LedgerEntryWire.settled_card` (`{ brand; last4 }`), `LedgerEntryWire.settled_at`
+  (`string`) — settle detail for a PAID ledger entry (R1). `settled_method` is
+  `'card'` for every settled charge today (`'cash'`/`'check'` reserved for a future
+  staff mark-paid flow, never emitted yet); `settled_card` is the settling card,
+  present only when the paid charge back-references an invoice with a live
+  payment_method (direct package/membership charges carry none); `settled_at` is
+  the precise settle timestamp (`invoices.paid_at` when invoice-linked, else the
+  charge's `created_at`). All omitted on open/refunded entries.
+
+### Changed
+
+- `deepLinkToPath` `membership` arm — the `params.dogId`-present branch now emits
+  `/dog-subscriptions/:dogId?highlight=:membershipId` (was the query-less
+  `/dog-subscriptions/:dogId`), so the app one-shot flashes the SPECIFIC ended
+  subscription card (Allison 2026-07-28, R4). `link.id` is the membership id
+  (`membershipRoll` already passes it — no producer change). Absent `dogId` still
+  routes to `/account/memberships`. Historical rows persist the highlight-less path;
+  the clients' parser keeps accepting them.
+
 ## [1.3.0] — 2026-07-27
 
 Additive (Notifications Phase 4c, Allison's second sim-QA round 2026-07-27). No
