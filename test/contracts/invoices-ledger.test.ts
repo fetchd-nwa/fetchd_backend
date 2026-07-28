@@ -146,6 +146,8 @@ test(
     assert.equal(entries.has(LEDGER.chargePendingId), false);
 
     // Package charge → credit-pack with dog + mode from the credit_ledger grant.
+    // A DIRECT paid charge (no invoice link): settled by card, settle time is
+    // the charge's own created_at, and NO card chip is recoverable.
     assert.deepEqual(entries.get(LEDGER.chargePackageId), {
       id: LEDGER.chargePackageId,
       kind: 'credit-pack',
@@ -154,10 +156,14 @@ test(
       date: '2026-04-01T15:00:00.000Z',
       dog_id: FIXTURE_IDS.dog1Id,
       mode: 'school',
+      settled_method: 'card',
+      settled_at: '2026-04-01T15:00:00.000Z',
     });
 
     // Payg charge → category + dog resolved from the linked booking (day-school),
-    // and invoice_id from the invoices.paid_charge_id back-reference.
+    // and invoice_id from the invoices.paid_charge_id back-reference. It SETTLED
+    // an invoice carrying a live payment_method, so the settling card (fixture
+    // Visa ••4242) and the invoice's precise paid_at surface.
     assert.deepEqual(entries.get(LEDGER.chargePaygId), {
       id: LEDGER.chargePaygId,
       kind: 'payg',
@@ -167,19 +173,26 @@ test(
       dog_id: FIXTURE_IDS.dog1Id,
       category: 'day-school',
       invoice_id: LEDGER.invoiceSettledId,
+      settled_method: 'card',
+      settled_card: { brand: 'visa', last4: '4242' },
+      settled_at: '2026-04-10T15:00:00.000Z', // invoices.paid_at, not the charge time
     });
 
-    // Membership charge → no dog, no category.
+    // Membership charge → no dog, no category. Direct charge: card method, settle
+    // time from created_at, no card chip.
     assert.deepEqual(entries.get(LEDGER.chargeMembershipId), {
       id: LEDGER.chargeMembershipId,
       kind: 'membership',
       status: 'paid',
       amount_cents: 7_900,
       date: '2026-04-15T15:00:00.000Z',
+      settled_method: 'card',
+      settled_at: '2026-04-15T15:00:00.000Z',
     });
 
     // Refunded group-class charge with no booking → session, purpose-derived
-    // category, no dog.
+    // category, no dog. A refund is not a settlement: no settle detail at all
+    // (the deepEqual's exactness already forbids the three keys).
     assert.deepEqual(entries.get(LEDGER.chargeGroupRefundedId), {
       id: LEDGER.chargeGroupRefundedId,
       kind: 'session',
@@ -201,7 +214,23 @@ test(
       // Open entries expose how the owner will settle (default 'card'); the
       // pay-in-person flow flips this so the app renders the row non-payable.
       payment_expected: 'card',
+      // Not settled yet → no settle detail (the deepEqual's exactness forbids
+      // the three keys).
     });
+
+    // Settle detail is emitted ONLY for paid entries — open and refunded rows
+    // carry none of the three keys (belt-and-braces over the deepEqual exactness).
+    for (const id of [LEDGER.invoiceOpenId, LEDGER.chargeGroupRefundedId]) {
+      const entry = entries.get(id)!;
+      assert.equal('settled_method' in entry, false);
+      assert.equal('settled_card' in entry, false);
+      assert.equal('settled_at' in entry, false);
+    }
+
+    // Direct paid charges (no invoice link) settle by card but expose no card chip.
+    for (const id of [LEDGER.chargePackageId, LEDGER.chargeMembershipId]) {
+      assert.equal('settled_card' in entries.get(id)!, false);
+    }
 
     // Newest first across the seeded rows.
     const seededOrder = rows.filter((r) => r.id.startsWith('aaaa')).map((r) => r.date);

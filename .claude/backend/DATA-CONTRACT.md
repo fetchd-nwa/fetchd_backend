@@ -250,6 +250,37 @@ path from them.
   cancelled booking never fires a stale reminder or profile-check. (The enqueue
   side is the §A Day-16 amendment; this closes the loop on cancel.)
 
+**Amendment 2026-07-28 (Notifications Phase 4d — ledger settle detail +
+per-card membership-ended highlight, wire 1.3.0 → 1.4.0).** Allison's third
+sim-QA round; additive only (`CHANGELOG.md` [1.4.0]). No DDL — both surfaces
+read from existing columns.
+
+- **R1 — settle detail on a PAID ledger entry.** `GET /invoices` (the
+  hand-mirrored `LedgerEntryWire` in `src/lib/ledgerWire.ts`, NOT in wire.ts)
+  additively emits three fields on charge-sourced PAID entries, all
+  omitted-on-null and absent on open/refunded rows: `settled_method`
+  (`'card'|'cash'|'check'`) — `'card'` for every settled charge today
+  (`'cash'`/`'check'` are reserved for a FUTURE staff mark-paid flow, none
+  exists yet, so they are never emitted — no fabricated data); `settled_card?`
+  (`{ brand, last4 }`) — the settling card, recovered ONLY when the paid charge
+  back-references an invoice carrying a live payment_method
+  (`invoices.paid_charge_id` → `invoices.payment_method_id` → `payment_methods`,
+  a new left-join in `ledgerRepository.listForOwner`); a DIRECT package/membership
+  charge has no invoice link and therefore no card chip (renders none rather than
+  a fabricated one); `settled_at?` (full ISO, WITH time) — the precise settle
+  instant, `invoices.paid_at` when invoice-linked else the charge's own
+  `created_at`. The client shows the settling card + day for a card settlement,
+  and day + exact time for a future cash/check one.
+- **R4 — per-card membership-ended highlight.** `deepLinkToPath` `membership`
+  arm: the `params.dogId`-present branch now emits
+  `/dog-subscriptions/:dogId?highlight=:membershipId` (the `?highlight` value is
+  `link.id`, the ending membership; `membershipRoll` already passes it — no
+  producer change) so the owner app one-shot flashes the SPECIFIC ended
+  subscription card. Absent `dogId` still routes to `/account/memberships`.
+  Backward-compat: historical rows persist the query-less
+  `/dog-subscriptions/:dogId` (and `/account/memberships`); both client parsers
+  keep accepting the highlight-less form, so the query is purely opt-in.
+
 **Amendment 2026-07-27/28 (Notifications Phase 4c — cancel attribution,
 pay-in-person + payment-due, wire 1.2.0 → 1.3.0).** Per Allison's second
 sim-QA round: (1) `bookings` gains `cancelled_by` (`'owner'|'staff'`, CHECK) +

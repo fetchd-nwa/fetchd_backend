@@ -423,9 +423,13 @@ test(
       );
     assert.equal(ended.length, 1, 'one membership-ended feed notification');
     // Send-time routing (decision 4): a LONE ending for the owner deep-links to
-    // that dog's subscriptions page (the structured ref still carries the
-    // membership id/kind — only the path target is dog-scoped).
-    assert.equal(ended[0]?.deepLinkPath, `/dog-subscriptions/${FIXTURE_IDS.dog1Id}`);
+    // that dog's subscriptions page, carrying ?highlight=<membershipId> so the
+    // app one-shot-flashes the specific ended card (R4, 2026-07-28). The
+    // structured ref carries the same membership id/kind.
+    assert.equal(
+      ended[0]?.deepLinkPath,
+      `/dog-subscriptions/${FIXTURE_IDS.dog1Id}?highlight=${membershipId}`,
+    );
     assert.equal(ended[0]?.deepLinkKind, 'membership');
     assert.equal(ended[0]?.deepLinkId, membershipId);
 

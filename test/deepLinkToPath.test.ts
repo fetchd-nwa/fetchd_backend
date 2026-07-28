@@ -4,12 +4,13 @@ import { deepLinkToPath, type NotificationDeepLink } from '../src/contracts/wire
 
 /**
  * Unit coverage for `deepLinkToPath` — THE deep-link path grammar (contract
- * 1.2.0). Pure function, no DB: every producer computes its persisted
+ * 1.4.0). Pure function, no DB: every producer computes its persisted
  * `deep_link_path` through here, so these expected strings ARE the wire
  * contract the FE route table must match. One assertion per `kind` (all 9),
  * plus the entity-specific arms that branch on params: `report` (fail-loud on a
  * missing dogId), `invoice` (embeds the id), and `membership` (send-time routing
- * — dogId present ⇒ the dog page, absent ⇒ the account overview).
+ * — dogId present ⇒ the dog page with `?highlight=<membershipId>`, absent ⇒ the
+ * account overview).
  */
 
 // One resolvable case per NotificationDeepLinkKind arm.
@@ -42,10 +43,12 @@ test('deepLinkToPath: membership without params → /account/memberships (overvi
   assert.equal(deepLinkToPath({ kind: 'membership', id: 'm-1' }), '/account/memberships');
 });
 
-test('deepLinkToPath: membership with params.dogId → /dog-subscriptions/:dogId (lone ending)', () => {
+test('deepLinkToPath: membership with params.dogId → /dog-subscriptions/:dogId?highlight=:id (lone ending)', () => {
+  // R4 (2026-07-28): the dog page carries ?highlight=<membershipId> (link.id) so
+  // the app one-shot flashes the SPECIFIC ended subscription card.
   assert.equal(
     deepLinkToPath({ kind: 'membership', id: 'm-1', params: { dogId: 'dog-7' } }),
-    '/dog-subscriptions/dog-7',
+    '/dog-subscriptions/dog-7?highlight=m-1',
   );
 });
 
