@@ -6,7 +6,7 @@ register_ stays `.claude/backend/DATA-CONTRACT.md` (cross-reference its dated
 `Δ`/`§` entries). After any bump, resync both generated clients — staff portal
 and mobile app — each via its own `npm run sync:contracts`, in their own repos'
 commits, and update the orchestrator's `STATUS.md`
-(`fetchd_client_mobile_app/.claude/STATUS.md`).
+(`<umbrella>/STATUS.md`).
 
 Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref

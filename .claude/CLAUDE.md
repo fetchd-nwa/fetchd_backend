@@ -8,11 +8,13 @@ history. Both frontends depend on it: the client mobile app (the sibling
 under one umbrella folder; folder names are load-bearing (the clients' sync
 scripts resolve `src/contracts/wire.ts` sibling-relative).
 
-The monorepo's `.claude/CLAUDE.md` identity and engineering principles apply
-here unchanged — senior engineer, honest names, functions do one thing,
-errors are values, YAGNI, surgical edits, "I would hire the person who wrote
-this" bar. Read that file when in doubt; this file covers only what is
-backend-specific.
+The `fetchd_client_mobile_app/.claude/CLAUDE.md` identity and engineering
+principles apply here unchanged — senior engineer, honest names, functions do
+one thing, errors are values, YAGNI, surgical edits, "I would hire the person
+who wrote this" bar. Read that file when in doubt; this file covers only what
+is backend-specific. (Those principles are repo-agnostic but still live in a
+client repo — a candidate for extraction to the umbrella alongside
+`ORCHESTRATOR.md`/`STATUS.md`.)
 
 ## Reading order
 
@@ -51,10 +53,10 @@ backend-specific.
   Every edit to it bumps `WIRE_CONTRACT_VERSION` (semver: major =
   remove/rename/retype, minor = additive, patch = doc-only), adds an entry to
   `src/contracts/CHANGELOG.md`, and requires resyncing every generated client — today the mobile app via `npm run sync:contracts` (the portal joins once its sync exists — to-build), in their own repos' commits — plus a row in the orchestrator's `STATUS.md`.
-- The operating manual is the sibling `fetchd_client_mobile_app` repo's
-  `.claude/ORCHESTRATOR.md`; the shared alignment log is `.claude/STATUS.md`
-  next to it. Read STATUS.md at session start when doing contract-touching
-  work; update it at session end.
+- The operating manual is `<umbrella>/ORCHESTRATOR.md`; the shared alignment
+  log is `<umbrella>/STATUS.md` next to it — both live in the umbrella repo.
+  Read STATUS.md at session start when doing contract-touching work; update it
+  at session end.
 - Wire-contract changes ripple to the mobile app's repository layer today, and
   to the portal once its `sync-contracts.mjs` exists (to-build). Flag both in
   the handoff when you change `src/contracts/wire.ts`.
