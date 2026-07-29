@@ -35,7 +35,9 @@ type PushCapableType =
   | 'payment-failed'
   | 'payment-due'
   | 'credits-expiring'
-  | 'spay-neuter-reminder';
+  | 'spay-neuter-reminder'
+  | 'invoice-overdue'
+  | 'card-expiring';
 
 const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'booking-reminder': 'booking-reminders',
@@ -46,6 +48,10 @@ const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'payment-due': 'urgent-updates',
   'credits-expiring': 'urgent-updates',
   'spay-neuter-reminder': 'urgent-updates',
+  // Allison 2026-07-29: both mean money is about to stop moving and only the
+  // owner can fix it — the definition of urgent-updates.
+  'invoice-overdue': 'urgent-updates',
+  'card-expiring': 'urgent-updates',
 };
 
 const PUSH_CAPABLE_TYPES: ReadonlySet<string> = new Set(Object.keys(PUSH_TYPE_CATEGORY));

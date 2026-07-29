@@ -435,4 +435,67 @@ export const invoicesRepository = {
       .where(and(eq(invoices.status, 'open'), isNull(invoices.nextAttemptAt)))
       .orderBy(asc(invoices.dueAt));
   },
+
+  /**
+   * Card-backed invoices still open well past their due date that the owner has
+   * NOT already been told about — the `invoice-overdue` safety-net scan
+   * (Allison 2026-07-29). Three predicates carry the whole design:
+   *
+   *  - `payment_expected = 'card'` — an in-person (cash/check) invoice stays
+   *    open until a human marks it paid, and no staff mark-paid flow exists
+   *    yet, so EVERY in-person invoice would trip an overdue alarm the moment
+   *    its grace elapsed. Warning an owner about cash they already handed over
+   *    at drop-off would be false by construction. Bring in-person into scope
+   *    when the staff mark-paid verb ships.
+   *  - `due_at < cutoff` — cutoff is `now - INVOICE_OVERDUE_GRACE_DAYS`.
+   *  - no `payment-failed:<id>` already queued — a terminally parked invoice
+   *    ALREADY produced an action-required notification naming this exact
+   *    invoice. Firing a second one is nagging, not a safety net. What survives
+   *    this filter is the real gap: an invoice past due that nothing else has
+   *    told the owner about (still mid-retry, or missed by the charge worker).
+   *
+   * Ordered `due_at` ASC — longest overdue first, so a capped tick warns the
+   * worst cases. Tx runner (the scan enqueues in the same transaction).
+   */
+  async findOverdueForWarning(
+    args: { cutoff: Date },
+    runner: Runner = db,
+  ): Promise<OverdueInvoiceForWarning[]> {
+    const rows = await runner.execute(sql`
+      SELECT i.id, i.owner_id, i.dog_id, i.amount_cents, i.due_at
+      FROM ${invoices} i
+      WHERE i.status = 'open'
+        AND i.payment_expected = 'card'
+        AND i.due_at < ${args.cutoff.toISOString()}
+        AND NOT EXISTS (
+          SELECT 1 FROM scheduled_notifications sn
+          WHERE sn.dedupe_key = 'payment-failed:' || i.id::text
+        )
+      ORDER BY i.due_at ASC
+    `);
+    return (
+      rows.rows as {
+        id: string;
+        owner_id: string;
+        dog_id: string | null;
+        amount_cents: number;
+        due_at: string;
+      }[]
+    ).map((r) => ({
+      invoiceId: r.id,
+      ownerId: r.owner_id,
+      dogId: r.dog_id,
+      amountCents: Number(r.amount_cents),
+      dueAt: r.due_at,
+    }));
+  },
 };
+
+/** One row of the `invoice-overdue` scan (`findOverdueForWarning`). */
+export interface OverdueInvoiceForWarning {
+  invoiceId: string;
+  ownerId: string;
+  dogId: string | null;
+  amountCents: number;
+  dueAt: string;
+}

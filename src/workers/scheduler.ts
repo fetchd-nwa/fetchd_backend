@@ -16,6 +16,14 @@ import {
   enqueueCreditExpiryWarnings,
   type EnqueueCreditExpiryWarningsResult,
 } from '../lib/enqueueCreditExpiryWarnings.js';
+import {
+  enqueueInvoiceOverdueWarnings,
+  type EnqueueInvoiceOverdueWarningsResult,
+} from '../lib/enqueueInvoiceOverdueWarnings.js';
+import {
+  enqueueCardExpiryWarnings,
+  type EnqueueCardExpiryWarningsResult,
+} from '../lib/enqueueCardExpiryWarnings.js';
 import { rollDueMemberships, type MembershipRollResult } from '../lib/membershipRoll.js';
 import { withActor, type Tx } from '../db/tx.js';
 import {
@@ -120,6 +128,8 @@ export interface ScheduledNotificationsTickResult {
 export interface SchedulerTickResult {
   scheduledNotifications: ScheduledNotificationsTickResult;
   membershipRoll: MembershipRollResult;
+  invoiceOverdue: EnqueueInvoiceOverdueWarningsResult;
+  cardExpiry: EnqueueCardExpiryWarningsResult;
   invoiceAutoCharge: InvoiceAutoChargeTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
   creditExpiryWarnings: EnqueueCreditExpiryWarningsResult;
@@ -282,6 +292,62 @@ export async function runSchedulerTickOnce(
     );
   }
 
+  // Phase 7 — overdue invoices (Allison 2026-07-29). The safety net beneath the
+  // auto-charge lane: a card-backed invoice still open past its grace window
+  // that nothing else has told the owner about. Own tx, own log-and-swallow
+  // boundary, same as every scan phase above.
+  let invoiceOverdueResult: EnqueueInvoiceOverdueWarningsResult = { scanned: 0, enqueued: 0 };
+  try {
+    invoiceOverdueResult = await withActor(SCHEDULER_ACTOR, (tx) =>
+      enqueueInvoiceOverdueWarnings(tx, now),
+    );
+    log.info(
+      {
+        workerTick: 'scheduler',
+        phase: 'invoice-overdue',
+        scanned: invoiceOverdueResult.scanned,
+        enqueued: invoiceOverdueResult.enqueued,
+      },
+      'invoice-overdue scan complete',
+    );
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'invoice-overdue',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'invoice-overdue phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 8 — expiring default cards (Allison 2026-07-29). Warns before the
+  // card that backs every auto-charge lapses, and once more after it has.
+  let cardExpiryResult: EnqueueCardExpiryWarningsResult = { scanned: 0, enqueued: 0 };
+  try {
+    cardExpiryResult = await withActor(SCHEDULER_ACTOR, (tx) =>
+      enqueueCardExpiryWarnings(tx, now),
+    );
+    log.info(
+      {
+        workerTick: 'scheduler',
+        phase: 'card-expiry',
+        scanned: cardExpiryResult.scanned,
+        enqueued: cardExpiryResult.enqueued,
+      },
+      'card-expiry scan complete',
+    );
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'card-expiry',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'card-expiry phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
   const sweepCutoff = new Date(now.getTime() - IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000);
   let idempotencyKeysSwept = 0;
   try {
@@ -308,6 +374,8 @@ export async function runSchedulerTickOnce(
     mediaDerivatives: mediaDerivativesResult,
     creditExpiryWarnings: creditExpiryWarningsResult,
     alumniAttendance: alumniAttendanceResult,
+    invoiceOverdue: invoiceOverdueResult,
+    cardExpiry: cardExpiryResult,
     idempotencyKeysSwept,
   };
 }

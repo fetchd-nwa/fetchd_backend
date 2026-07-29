@@ -69,7 +69,14 @@ export type ScheduledNotificationType =
   // R3 2026-07-27: the cash/check invoice reminder (`payment-due:<invoiceId>`)
   // enqueued by `POST /invoices/:id/pay-in-person`. Push-capable (urgent-
   // updates) so the owner is reminded to bring payment ~1h before drop-off.
-  | 'payment-due';
+  | 'payment-due'
+  // Allison 2026-07-29. Both are scheduled-scan arms (no single triggering
+  // event) and both are push-capable under 'urgent-updates' — each one means
+  // money is about to stop moving and only the owner can fix it.
+  // `invoice-overdue:<invoiceId>` fires once per invoice;
+  // `card-expiring:<pmId>:warn|lapsed` fires at most twice per card.
+  | 'invoice-overdue'
+  | 'card-expiring';
 
 export interface ScheduledNotificationRow {
   id: string;

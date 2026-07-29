@@ -12,6 +12,35 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.5.0] — 2026-07-29
+
+Additive (Allison's notification sweep, 2026-07-29). Three new `NotificationType`
+arms, one new deep-link kind, and one changed emission for an existing kind. No
+field or enum member is removed or retyped; both clients resync and nothing
+breaks. Historical `credits` rows persisted the query-less `/dog-profile/:dogId`
+and still parse (backward-compat rule) — only NEW emissions carry `?highlight`.
+
+### Added
+
+- `NotificationType` arms `'invoice-overdue'`, `'card-expiring'`,
+  `'waitlist-spot-open'` (pgEnum `notification_type` ALTERed on both DBs; the
+  `conformance.ts` `Equal<>` pin holds). `invoice-overdue` is the settle-failure
+  safety net (an invoice still open 3 days past due; fires once).
+  `card-expiring` warns a week before the card on file lapses. `waitlist-spot-open`
+  fires when a seat opens for a waitlisted entry — an OFFER the owner accepts or
+  declines, with payment on accept; nothing is booked or charged when it fires
+  (Allison 2026-07-29). No producer yet; the waitlist feature is not built.
+- `NotificationDeepLinkKind` arm `'payment-method'` →
+  `/payment-methods?highlight=<paymentMethodId>`, so a card warning points at
+  the card rather than at the wallet page.
+
+### Changed
+
+- `deepLinkToPath` `credits` arm now emits `/dog-profile/:dogId?highlight=credits`
+  (was the bare `/dog-profile/:dogId`). `highlight=credits` is a SENTINEL, not an
+  id — the credits card is a singular surface on that page — and it makes the
+  card one-shot flash so a credit-expiry alert lands on the thing it is about.
+
 ## [1.4.0] — 2026-07-28
 
 Additive (Notifications Phase 4d, Allison's third sim-QA round 2026-07-28). No

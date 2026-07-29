@@ -19,6 +19,7 @@
     "db:introspect": "drizzle-kit pull && node scripts/fix-introspection.mjs",
     "db:up": "docker compose up -d --wait",
     "db:dev:seed": "tsx scripts/seed-dev.ts",
+    "db:dev:seed:notifs": "tsx scripts/seed-notifications-qa.ts",
     "db:down": "docker compose down",
     "db:nuke": "docker compose down -v",
     "db:test:up": "docker compose --profile test up -d db-test --wait",

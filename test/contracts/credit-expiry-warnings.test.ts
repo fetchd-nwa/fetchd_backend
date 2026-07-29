@@ -130,8 +130,11 @@ test(
     assert.equal(afterFirst.count, 1, 'exactly one scheduled row for the lot');
     assert.equal(afterFirst.type, 'credits-expiring');
     // Decision 4: credits UI lives on the dog profile, keyed on the lot's dog.
-    assert.equal(afterFirst.deepLinkPath, `/dog-profile/${FIXTURE_IDS.dog1Id}`);
-    assert.equal(afterFirst.deepLinkKind, 'dog-profile');
+    // Since 1.5.0 the producer emits the `credits` KIND rather than the plain
+    // `dog-profile` one, so the path carries `?highlight=credits` and the card
+    // one-shot flashes on arrival (Allison 2026-07-29).
+    assert.equal(afterFirst.deepLinkPath, `/dog-profile/${FIXTURE_IDS.dog1Id}?highlight=credits`);
+    assert.equal(afterFirst.deepLinkKind, 'credits');
     assert.equal(afterFirst.deepLinkId, FIXTURE_IDS.dog1Id);
 
     // Second tick — the lot is still in-window, but the dedupe key blocks re-enqueue.

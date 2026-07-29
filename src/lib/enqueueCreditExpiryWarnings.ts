@@ -85,9 +85,14 @@ export async function enqueueCreditExpiryWarnings(
       scheduledFor: now,
       title: 'Your credits are expiring soon',
       body: expiryWarningBody(lot),
-      // Credits UI lives on the dog profile (decision 4).
-      deepLinkPath: deepLinkToPath({ kind: 'dog-profile', id: lot.dogId }),
-      deepLinkKind: 'dog-profile',
+      // Credits UI lives on the dog profile (decision 4). The `credits` KIND —
+      // not the plain `dog-profile` one it used through 1.4.0 — so the emitted
+      // path carries `?highlight=credits` and the card one-shot flashes on
+      // arrival (Allison 2026-07-29). Same route either way; the kind is what
+      // distinguishes "this alert is about the credits card" from "go to the
+      // dog", which is exactly the distinction the arm exists to make.
+      deepLinkPath: deepLinkToPath({ kind: 'credits', id: lot.dogId }),
+      deepLinkKind: 'credits',
       deepLinkId: lot.dogId,
       dogId: lot.dogId,
     });

@@ -54,7 +54,68 @@ const PAYMENT_METHOD_INTERNAL_PROJECTION = {
   stripePaymentMethodId: paymentMethods.stripePaymentMethodId,
 } as const;
 
+/**
+ * One row of the `card-expiring` scan. `expiresAt` is the instant the card stops
+ * being chargeable — the START of the month AFTER `exp_month/exp_year`, since a
+ * card is good through the last day of its printed month.
+ */
+export interface ExpiringCardForWarning {
+  paymentMethodId: string;
+  ownerId: string;
+  brand: string;
+  last4: string;
+  expiresAt: string;
+}
+
 export const paymentMethodsRepository = {
+  /**
+   * Live DEFAULT cards at or past their warning threshold — the `card-expiring`
+   * scan (Allison 2026-07-29). Returns both the not-yet-expired (inside the
+   * warning window) and the already-lapsed; the producer classifies each by
+   * comparing `expiresAt` to now, because the two states get different copy and
+   * different dedupe keys.
+   *
+   * DEFAULT only: a lapsing secondary card breaks nothing (nothing charges it),
+   * so warning about it would be noise. The expiry instant is evaluated in
+   * America/Chicago, matching every other calendar boundary in this schema (the
+   * vaccine gate, the alumni month roll) — a card is good through the last day
+   * of its printed month, local time.
+   */
+  async findExpiringDefaults(
+    args: { warnCutoff: Date },
+    runner: Runner = db,
+  ): Promise<ExpiringCardForWarning[]> {
+    const rows = await runner.execute(sql`
+      SELECT pm.id,
+             pm.owner_id,
+             pm.brand,
+             pm.last4,
+             ((make_date(pm.exp_year::int, pm.exp_month::int, 1) + interval '1 month')
+               AT TIME ZONE 'America/Chicago') AS expires_at
+      FROM ${paymentMethods} pm
+      WHERE pm.expired_at IS NULL
+        AND pm.is_default = true
+        AND ((make_date(pm.exp_year::int, pm.exp_month::int, 1) + interval '1 month')
+              AT TIME ZONE 'America/Chicago') <= ${args.warnCutoff.toISOString()}
+      ORDER BY expires_at ASC
+    `);
+    return (
+      rows.rows as {
+        id: string;
+        owner_id: string;
+        brand: string;
+        last4: string;
+        expires_at: string;
+      }[]
+    ).map((r) => ({
+      paymentMethodId: r.id,
+      ownerId: r.owner_id,
+      brand: r.brand,
+      last4: r.last4,
+      expiresAt: new Date(r.expires_at).toISOString(),
+    }));
+  },
+
   /**
    * Owner's live cards. Default emits first (single hero slot in the FE),
    * then oldest-first as the secondary order — predictable for the FE

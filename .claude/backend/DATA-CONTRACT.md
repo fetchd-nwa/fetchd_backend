@@ -317,6 +317,64 @@ match key for notification taps); `MembershipWire.payment_method?` `{ brand,
 last4 }` — the §J.1 pinned billing card, joined live-only, omitted when the
 bound card is no longer live.
 
+**Amendment 2026-07-29 (Notification sweep — Apple-rule routing + 3 new types,
+wire 1.4.0 → 1.5.0).** Allison asked for the notification system to be judged
+against "what would Apple do." The modal-first rework scoped in the prior
+session was DROPPED — Apple takes you straight to the content; the notification
+row already IS the summary, so an in-app modal restating it is a toll booth. The
+governing rule, now the standard for any new type:
+
+> **Tapping a notification opens the thing.** A sheet where the thing is
+> naturally a sheet (invoice, booking); navigate where it's a screen. No
+> interstitials.
+
+Additive only (`CHANGELOG.md` [1.5.0]). One DDL change, applied via ALTER on
+BOTH running DBs (dev :5432 + test :5433) and mirrored in `schema.sql` + the
+hand-patched Drizzle `src/db/schema/schema.ts`:
+
+- **`notification_type` gains three arms** (14 → 17): `invoice-overdue`,
+  `card-expiring`, `waitlist-accepted`. The `conformance.ts` `Equal<>` pin
+  against the wire union holds.
+- **`invoice-overdue`** — the safety net beneath the auto-charge lane. Fires
+  once per invoice (`invoice-overdue:<invoiceId>`) when an invoice is still open
+  `INVOICE_OVERDUE_GRACE_DAYS` (3) past `due_at`. Two suppressions are
+  load-bearing and deliberate: **card-only** (`payment_expected='card'` — an
+  in-person invoice stays open until a human marks it paid and NO staff
+  mark-paid flow exists, so every one would false-alarm about cash already
+  handed over; widen when that verb ships) and **not already flagged** (no
+  `payment-failed:<invoiceId>` in `scheduled_notifications` — a terminally
+  parked invoice already produced an action-required notification naming it).
+  What survives is the real gap: past due and nothing has told the owner.
+  Scheduler phase 7; `enqueueInvoiceOverdueWarnings`.
+- **`card-expiring`** — the DEFAULT live card only (a lapsing secondary card
+  charges nothing, so warning about it is noise). Fires at most twice per card,
+  on distinct dedupe keys `card-expiring:<pmId>:warn|lapsed`:
+  `CARD_EXPIRY_WARNING_DAYS` (7) before expiry, then on the first tick at or
+  after it. Expiry = start of the month AFTER `exp_month/exp_year`, evaluated in
+  America/Chicago (matching the vaccine gate + alumni roll). Replacing the
+  default soft-expires the old row, which drops it from the scan before the
+  second fire. Scheduler phase 8; `enqueueCardExpiryWarnings`.
+- **`waitlist-accepted`** — enum arm + QA row only; the waitlist feature is NOT
+  built, so nothing emits it yet.
+- Both new push-capable arms sit under `urgent-updates` in
+  `pushPreferences.PUSH_TYPE_CATEGORY` (money is about to stop moving and only
+  the owner can fix it).
+
+Deep-link grammar (`deepLinkToPath`), both "point at the row, not the page":
+
+- **New kind `payment-method`** → `/payment-methods?highlight=<paymentMethodId>`.
+- **Changed emission, `credits`** → `/dog-profile/:dogId?highlight=credits` (was
+  the bare `/dog-profile/:dogId`). `highlight=credits` is a SENTINEL, not an id —
+  the credits card is a singular surface on that page. `enqueueCreditExpiryWarnings`
+  now emits `kind: 'credits'`; through 1.4.0 it emitted `dog-profile`, which left
+  the `credits` arm dead code. Pre-1.5.0 persisted paths still parse
+  (backward-compat rule); three pinning tests were updated for the deliberate change.
+
+QA reproducibility: `scripts/seed-notifications-qa.ts` (`npm run
+db:dev:seed:notifs`) seeds ONE notification per `notification_type` with deep
+links derived through `deepLinkToPath`, and **fails the run** if the live pgEnum
+grows an arm it doesn't cover.
+
 **Amendment 2026-07-27 (Notifications Phase 4c — pay-in-person + cancel
 attribution, wire 1.2.0 → 1.3.0).** Allison's second sim-QA round (R1–R6);
 additive only (`CHANGELOG.md` [1.3.0]). Three DDL adds, applied via ALTER on

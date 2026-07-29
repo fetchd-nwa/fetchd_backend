@@ -133,7 +133,19 @@ CREATE TYPE notification_type  AS ENUM (
   -- R3 (Allison sim-QA 2026-07-27): the cash/check invoice reminder. Fires ~1h
   -- before the linked booking's drop-off (or ~1h before the invoice's due time
   -- when no booking is linked), telling the owner to bring payment at drop-off.
-  'payment-due'
+  'payment-due',
+  -- Allison 2026-07-29 (notification sweep). `invoice-overdue` is the safety
+  -- net — an invoice still open INVOICE_OVERDUE_GRACE_DAYS past its due date.
+  -- Every other payment path (auto-charge, pay-in-person at drop-off) should
+  -- have settled it well before this fires, which is exactly the point: it's a
+  -- precaution, not a dunning ladder, and it fires ONCE per invoice.
+  'invoice-overdue',
+  -- The owner's default card is within CARD_EXPIRY_WARNING_DAYS of lapsing (or
+  -- lapsed yesterday), so auto-charges don't start failing silently.
+  'card-expiring',
+  -- A waitlisted request got a seat — either one opened up or staff overrode
+  -- the cap. Deep-links to the booking that was just created.
+  'waitlist-spot-open'
 );
 CREATE TYPE announcement_category AS ENUM ('urgent','team','class','event','promo','report');
 CREATE TYPE staff_role         AS ENUM ('owner-shanthi', 'trainer', 'office');
