@@ -55,6 +55,17 @@ const PAYMENT_METHOD_INTERNAL_PROJECTION = {
 } as const;
 
 /**
+ * THE card-expiry instant, as SQL: the start of the month AFTER
+ * `exp_month/exp_year` (a card is good through the last day of its printed
+ * month), evaluated in America/Chicago like every other calendar boundary in
+ * this schema. Defined once because TWO callers depend on it agreeing —
+ * `findExpiringDefaults` (what to warn about) and `resolveChargeableForOwner`
+ * (what to skip). If they drifted we'd warn about one card and decline another.
+ */
+const CARD_EXPIRES_AT_SQL = sql`((make_date(pm.exp_year::int, pm.exp_month::int, 1)
+  + interval '1 month') AT TIME ZONE 'America/Chicago')`;
+
+/**
  * One row of the `card-expiring` scan. `expiresAt` is the instant the card stops
  * being chargeable — the START of the month AFTER `exp_month/exp_year`, since a
  * card is good through the last day of its printed month.
@@ -90,13 +101,11 @@ export const paymentMethodsRepository = {
              pm.owner_id,
              pm.brand,
              pm.last4,
-             ((make_date(pm.exp_year::int, pm.exp_month::int, 1) + interval '1 month')
-               AT TIME ZONE 'America/Chicago') AS expires_at
+             ${CARD_EXPIRES_AT_SQL} AS expires_at
       FROM ${paymentMethods} pm
       WHERE pm.expired_at IS NULL
         AND pm.is_default = true
-        AND ((make_date(pm.exp_year::int, pm.exp_month::int, 1) + interval '1 month')
-              AT TIME ZONE 'America/Chicago') <= ${args.warnCutoff.toISOString()}
+        AND ${CARD_EXPIRES_AT_SQL} <= ${args.warnCutoff.toISOString()}
       ORDER BY expires_at ASC
     `);
     return (
@@ -114,6 +123,64 @@ export const paymentMethodsRepository = {
       last4: r.last4,
       expiresAt: new Date(r.expires_at).toISOString(),
     }));
+  },
+
+  /**
+   * The card to actually charge, given the one an invoice is bound to (Allison
+   * 2026-07-29: "if one credit card is expired and there's another card on
+   * file, charge the next card in line").
+   *
+   * Returns the PREFERRED card when it is live and not past its printed expiry.
+   * Otherwise the next live, unexpired card in the owner's standing order —
+   * default first, then oldest — the same order the wallet renders, so "next in
+   * line" means the same thing to the code and to the owner looking at the
+   * screen. `undefined` when there is no chargeable card at all; the caller
+   * parks the invoice exactly as it did before this fallback existed.
+   *
+   * Expiry here is the PRINTED date, not a Stripe decline: a cheap pre-flight so
+   * an unattended charge doesn't burn a dunning attempt on a card the calendar
+   * already disqualified. A live-looking card can still decline; that path is
+   * unchanged.
+   */
+  async resolveChargeableForOwner(
+    args: { ownerId: string; preferredId: string },
+    runner: Runner = db,
+  ): Promise<PaymentMethodInternalRow | undefined> {
+    const rows = await runner.execute(sql`
+      SELECT pm.id, pm.brand, pm.last4, pm.exp_month, pm.exp_year, pm.cardholder_name,
+             pm.is_default, pm.owner_id, pm.stripe_payment_method_id
+      FROM ${paymentMethods} pm
+      WHERE pm.owner_id = ${args.ownerId}
+        AND pm.expired_at IS NULL
+        AND ${CARD_EXPIRES_AT_SQL} > now()
+      ORDER BY (pm.id = ${args.preferredId}) DESC, pm.is_default DESC, pm.created_at ASC
+      LIMIT 1
+    `);
+    const row = (
+      rows.rows as {
+        id: string;
+        brand: string;
+        last4: string;
+        exp_month: number;
+        exp_year: number;
+        cardholder_name: string;
+        is_default: boolean;
+        owner_id: string;
+        stripe_payment_method_id: string;
+      }[]
+    )[0];
+    if (row === undefined) return undefined;
+    return {
+      id: row.id,
+      brand: row.brand,
+      last4: row.last4,
+      expMonth: Number(row.exp_month),
+      expYear: Number(row.exp_year),
+      cardholderName: row.cardholder_name,
+      isDefault: row.is_default,
+      ownerId: row.owner_id,
+      stripePaymentMethodId: row.stripe_payment_method_id,
+    };
   },
 
   /**

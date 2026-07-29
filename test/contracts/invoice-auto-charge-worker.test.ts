@@ -531,3 +531,115 @@ test(
     await cleanup();
   },
 );
+
+// ── Expired-card fallback (Allison 2026-07-29) ────────────────────────────────
+// "If one credit card is expired and there's another card on file, charge the
+// next card in line." The receipt is the subtle part: `settled_card` derives
+// from `invoices.payment_method_id`, so a fallback that didn't rebind the
+// invoice would name a card that was never charged.
+
+const EXPIRED_CARD_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9';
+
+/** Expire the fixture's default card and add a live second card behind it. */
+async function seedExpiredDefaultPlusLiveBackup(): Promise<void> {
+  await db
+    .update(paymentMethods)
+    .set({ expMonth: 1, expYear: 2020 })
+    .where(eq(paymentMethods.id, FIXTURE_IDS.paymentMethod1Id));
+  await db.insert(paymentMethods).values({
+    id: EXPIRED_CARD_ID,
+    ownerId: FIXTURE_IDS.ownerId,
+    stripePaymentMethodId: 'pm_fixture_backup_visa',
+    brand: 'visa',
+    last4: '1881',
+    expMonth: 12,
+    expYear: 2035,
+    cardholderName: 'Allison Fixture',
+    isDefault: false,
+  });
+}
+
+async function restoreFixtureCards(): Promise<void> {
+  await db.delete(paymentMethods).where(eq(paymentMethods.id, EXPIRED_CARD_ID));
+  await db
+    .update(paymentMethods)
+    .set({ expMonth: 12, expYear: 2030 })
+    .where(eq(paymentMethods.id, FIXTURE_IDS.paymentMethod1Id));
+}
+
+test(
+  'auto-charge falls back to the next live card when the bound card is past expiry, and rebinds the invoice so the receipt names what actually paid',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await seedExpiredDefaultPlusLiveBackup();
+    const invoiceId = await seedDueInvoice();
+    const stripe = makeStripeStub();
+
+    try {
+      const result = await runInvoiceAutoChargeOnce({ stripe, limit: 1 });
+      assert.equal(result.results[0]?.outcome, 'paid', 'settled on the backup card');
+
+      // Charged the BACKUP card's Stripe handle, not the expired default's.
+      const intentCalls = stripe.calls.filter(
+        (c) => c.method === 'createAndConfirmPaymentIntent',
+      );
+      assert.equal(intentCalls.length, 1, 'exactly one charge attempt');
+      assert.equal(
+        intentCalls[0]?.method === 'createAndConfirmPaymentIntent'
+          ? intentCalls[0].args.paymentMethodId
+          : undefined,
+        'pm_fixture_backup_visa',
+        'the expired card was skipped',
+      );
+
+      // The invoice is rebound, so `settled_card` (derived from
+      // invoices.payment_method_id) names the card that actually paid.
+      const [settled] = await db
+        .select({ paymentMethodId: invoices.paymentMethodId, status: invoices.status })
+        .from(invoices)
+        .where(eq(invoices.id, invoiceId));
+      assert.equal(settled?.status, 'paid');
+      assert.equal(
+        settled?.paymentMethodId,
+        EXPIRED_CARD_ID,
+        'invoice rebound to the settling card — otherwise the receipt lies',
+      );
+    } finally {
+      await cleanup();
+      await restoreFixtureCards();
+    }
+  },
+);
+
+test(
+  'auto-charge parks the invoice when EVERY card on file is past expiry',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await db
+      .update(paymentMethods)
+      .set({ expMonth: 1, expYear: 2020 })
+      .where(eq(paymentMethods.id, FIXTURE_IDS.paymentMethod1Id));
+    const invoiceId = await seedDueInvoice();
+    const stripe = makeStripeStub();
+
+    try {
+      const result = await runInvoiceAutoChargeOnce({ stripe, limit: 1 });
+      assert.equal(result.results[0]?.outcome, 'skipped-pm-missing');
+      assert.equal(
+        stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+        0,
+        'no Stripe call on a dead wallet',
+      );
+
+      const [parked] = await db
+        .select({ nextAttemptAt: invoices.nextAttemptAt, status: invoices.status })
+        .from(invoices)
+        .where(eq(invoices.id, invoiceId));
+      assert.equal(parked?.status, 'open');
+      assert.equal(parked?.nextAttemptAt, null, 'parked — no further attempts');
+    } finally {
+      await cleanup();
+      await restoreFixtureCards();
+    }
+  },
+);

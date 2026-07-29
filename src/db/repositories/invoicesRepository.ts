@@ -491,6 +491,27 @@ export const invoicesRepository = {
   },
 };
 
+/**
+ * Rebind an invoice to the card that is actually going to settle it — used when
+ * the auto-charge falls back off an expired card (Allison 2026-07-29).
+ *
+ * This is NOT bookkeeping neatness. `LedgerEntryWire.settled_card` (the
+ * "Visa ••4242" on the paid-invoice modal) is derived from
+ * `invoices.payment_method_id`, so without this the receipt would name a card
+ * that was never charged — silently wrong money data. Repointing in the same tx
+ * that records the settle keeps the receipt correct BY CONSTRUCTION, with no
+ * change to the receipt derivation.
+ */
+export async function repointPaymentMethod(
+  tx: Tx,
+  args: { id: string; paymentMethodId: string },
+): Promise<void> {
+  await tx
+    .update(invoices)
+    .set({ paymentMethodId: args.paymentMethodId })
+    .where(eq(invoices.id, args.id));
+}
+
 /** One row of the `invoice-overdue` scan (`findOverdueForWarning`). */
 export interface OverdueInvoiceForWarning {
   invoiceId: string;

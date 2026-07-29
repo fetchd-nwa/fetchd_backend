@@ -1,6 +1,10 @@
 import { deepLinkToPath } from '../contracts/wire.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
-import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
+import {
+  invoicesRepository,
+  repointPaymentMethod,
+  type InvoiceRow,
+} from '../db/repositories/invoicesRepository.js';
 import { formatDollars, purposeLabel } from '../lib/invoiceReceiptCopy.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
@@ -151,17 +155,28 @@ async function processOne(
   log: WorkerLogger,
 ): Promise<InvoiceAutoChargeAttemptResult> {
   // Pool reads — no tx needed; the lease already reserved the row.
-  const pm = await paymentMethodsRepository.findLiveByIdForOwner(db, {
-    id: invoice.paymentMethodId,
-    ownerId: invoice.ownerId,
-  });
+  // Resolve the card to charge rather than blindly using the invoice's bound
+  // one: if that card has passed its printed expiry, fall through to the next
+  // live card in the owner's wallet order (Allison 2026-07-29). Charging a
+  // calendar-dead card just burns a dunning attempt and ends in a decline.
+  const pm = await paymentMethodsRepository.resolveChargeableForOwner(
+    { ownerId: invoice.ownerId, preferredId: invoice.paymentMethodId },
+    db,
+  );
   if (pm === undefined) {
     log.warn(
       { invoiceId: invoice.id, paymentMethodId: invoice.paymentMethodId },
-      'invoice auto-charge: payment method missing; parking invoice',
+      'invoice auto-charge: no chargeable card on file; parking invoice',
     );
     await recordFailed(invoice, null, now);
     return { invoiceId: invoice.id, outcome: 'skipped-pm-missing', nextAttemptAt: null };
+  }
+  const didFallBack = pm.id !== invoice.paymentMethodId;
+  if (didFallBack) {
+    log.info(
+      { invoiceId: invoice.id, boundPaymentMethodId: invoice.paymentMethodId, chargingId: pm.id },
+      'invoice auto-charge: bound card is past expiry; falling back to the next card on file',
+    );
   }
 
   const customer = await stripeCustomersRepository.findByOwner(db, invoice.ownerId);
@@ -231,7 +246,15 @@ async function processOne(
   const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
 
   if (chargeStatus === 'succeeded') {
-    const chargeId = await recordPaid(invoice, intent.id, intent.amountCents, stripe, log, now);
+    const chargeId = await recordPaid(
+      invoice,
+      intent.id,
+      intent.amountCents,
+      stripe,
+      log,
+      now,
+      ...(didFallBack ? [pm.id] : []),
+    );
     return { invoiceId: invoice.id, outcome: 'paid', chargeId };
   }
 
@@ -280,17 +303,24 @@ async function recordPaid(
   stripe: StripeClient,
   log: WorkerLogger,
   now: Date,
+  /** Set when the charge fell back off the invoice's bound card — the invoice
+   *  is rebound to it in the SAME tx so `settled_card` names what actually
+   *  paid (see `repointPaymentMethod`). */
+  settledByPaymentMethodId?: string,
 ): Promise<string> {
-  const result = await withActor(WORKER_ACTOR, (tx) =>
-    settleInvoiceCharge(tx, {
+  const result = await withActor(WORKER_ACTOR, async (tx) => {
+    if (settledByPaymentMethodId !== undefined) {
+      await repointPaymentMethod(tx, { id: invoice.id, paymentMethodId: settledByPaymentMethodId });
+    }
+    return settleInvoiceCharge(tx, {
       invoice,
       paymentIntentId,
       amountCents,
       purpose: invoice.purpose,
       notifyOwner: true,
       now,
-    }),
-  );
+    });
+  });
 
   if (result.outcome === 'refunded') {
     await fireDuplicateRefund(invoice.id, result.pendingStripeRefund, stripe, log);
