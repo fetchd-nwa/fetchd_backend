@@ -10,6 +10,7 @@ import { registerCreditPackagesRoute } from './routes/creditPackages.js';
 import { registerCreditsRoute } from './routes/credits.js';
 import { registerDogsRoute } from './routes/dogs.js';
 import { registerEnrollmentsRoute } from './routes/enrollments.js';
+import { registerWaitlistRoutes } from './routes/waitlist.js';
 import { registerEventsRoute } from './routes/events.js';
 import { registerDeviceTokensRoute } from './routes/device-tokens.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
@@ -36,6 +37,7 @@ import { registerStaffRatesRoute } from './routes/staffRates.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
 import { registerStaffThreadsRoute } from './routes/staffThreads.js';
+import { registerStaffWaitlistRoutes } from './routes/staffWaitlist.js';
 import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
 import { registerThreadsRoute } from './routes/threads.js';
 import { registerUploadsSignRoute } from './routes/uploadsSign.js';
@@ -68,6 +70,7 @@ export function buildApp(): FastifyInstance {
   registerAgreementsRoute(app); // [auth]
   registerBookingsRoute(app); // [auth]
   registerEnrollmentsRoute(app); // [auth] — group-class enrollment (owner-only)
+  registerWaitlistRoutes(app); // [auth] — join/see/leave a full session's queue (owner-only)
   registerAvailabilityRoute(app); // [auth] — catalog (owner + staff)
   registerCreditsRoute(app); // [auth] — owner-only (per-dog)
   registerCreditPackagesRoute(app); // [auth] — catalog (owner + staff)
@@ -84,6 +87,7 @@ export function buildApp(): FastifyInstance {
   registerStaffBookingsRoute(app); // [staff] — Day-19 portal verb 4 (confirm / cancel / attendance)
   registerStaffThreadsRoute(app); // [staff] — Day-19 portal verb 3 (thread queue + staff reply)
   registerStaffReportsRoute(app); // [staff] — Day-19 portal verb 2 (report authoring)
+  registerStaffWaitlistRoutes(app); // [staff] — queue triage + the cap override (2026-07-30)
   registerGroupClassesRoute(app); // [auth] — catalogs (owner+staff); eligibility owner-only
   registerReportsRoute(app); // [auth] — owner-only (scoped via dog FK)
   registerThreadsRoute(app); // [auth] — owner-only

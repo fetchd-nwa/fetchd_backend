@@ -45,7 +45,8 @@ import { insertBookingWithGateMapping } from './insertBookingWithGateMapping.js'
  *   3. Payment plan: PAYG validates card + per-day rate and skips the credit
  *      pre-check; credits runs the per-dog balance check.
  *   4. Time-overlap guard against live sessions (`lib/bookingConflicts`).
- *   5. Per-session (date ASC): capacity assert → INSERT booking +
+ *   5. Per-session (date ASC): capacity assert (skipped only under
+ *      `allowOverCapacity`, the staff cap override) → INSERT booking +
  *      booking_dogs → money write (PAYG open invoice / credit debits) →
  *      scheduled reminders.
  */
@@ -85,6 +86,27 @@ export interface CreateDayProgramBookingsArgs {
   notes: string | null;
   payment: DayProgramPaymentPlan;
   now: Date;
+  /**
+   * Staff cap override (Allison 2026-07-30 ruling 2, "staff can override the
+   * cap"). Skips the `day_capacity` ceiling — and nothing else. Every gate
+   * still runs, because an override is about CAPACITY, not safety, and the
+   * (location, date) lock is still held, so concurrent creates still serialize.
+   *
+   * The only caller that sets it is the waitlist accept, from
+   * `waitlist_entries.offered_by_staff_id` — a column only
+   * `POST /staff/waitlist/:id/offer` writes, under `requireStaff`. No route
+   * body schema parses this field, so an owner cannot ask for it; both callers
+   * build this args object field by field, so it can't ride in on a spread.
+   */
+  allowOverCapacity?: boolean;
+  /**
+   * The 'offered' waitlist entry this booking is converting, if any. An
+   * outstanding offer HOLDS its dogs' seats, and accept books BEFORE it flips
+   * the entry to 'accepted' — so without naming the entry here, the accepting
+   * owner would be counted against their own hold and refused their own seat.
+   * See `DayCapacityQuery.convertingWaitlistEntryId`.
+   */
+  convertingWaitlistEntryId?: string;
 }
 
 export interface CreateDayProgramBookingsResult {
@@ -220,12 +242,21 @@ export async function createDayProgramBookings(
       // (PAYG invoice schedule, or credit-ledger debits) → reminders.
       const created: BookingWire[] = [];
       for (const session of args.sessions) {
-        await dayCapacityRepository.assertCapacityWithinLock(tx, {
-          location: args.location,
-          date: session.date,
-          mode,
-          requestedCount: allDogIds.length,
-        });
+        // A staff cap override is the one thing that books past the ceiling
+        // (R2). Skipping the assert is the WHOLE override: the day is still
+        // locked, the gates above still ran, and `day_capacity` has no DB-side
+        // ceiling to fall back on — the count is dynamic, asserted only here.
+        if (args.allowOverCapacity !== true) {
+          await dayCapacityRepository.assertCapacityWithinLock(tx, {
+            location: args.location,
+            date: session.date,
+            mode,
+            requestedCount: allDogIds.length,
+            ...(args.convertingWaitlistEntryId === undefined
+              ? {}
+              : { convertingWaitlistEntryId: args.convertingWaitlistEntryId }),
+          });
+        }
 
         // Resolve the active free-cancel hours from `cancel_window_settings`
         // (Day 13 — staff-tunable). Stamped at creation; a later policy

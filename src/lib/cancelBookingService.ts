@@ -1,5 +1,5 @@
 import { deepLinkToPath } from '../contracts/wire.js';
-import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
+import { bookingsRepository, type BookingFullRow } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
@@ -7,10 +7,14 @@ import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
+import type { WaitlistTarget } from '../db/repositories/waitlistRepository.js';
 import type { Tx } from '../db/tx.js';
 import type { ServiceCategory } from './bookingBucket.js';
+import { dayProgramCategoryToMode } from './bookingMode.js';
 import type { BookingWire } from './bookingWire.js';
+import { bucketToChicagoDate } from './chicagoDate.js';
 import { ApiError } from './errors.js';
+import { promoteFreedSeat } from './waitlistPromotion.js';
 import { wireManyBookings } from './wireManyBookings.js';
 
 export interface PendingStripeRefund {
@@ -205,12 +209,50 @@ export async function cancelBookingInTx(
     );
   }
 
-  // 6. Wire the updated row for the response.
+  // 6. The seat this cancellation just freed rolls to the waitlist, in the
+  //    same transaction that freed it — a queue nobody is ever promoted from
+  //    is the whole feature failing silently. `promoteFreedSeat` takes its own
+  //    per-queue lock and cannot fail this cancel; see its doc for why.
+  const freedQueue = dayProgramQueueOf(row);
+  if (freedQueue !== undefined) {
+    await promoteFreedSeat(tx, freedQueue, new Date());
+  }
+
+  // 7. Wire the updated row for the response.
   const [wire] = await wireManyBookings([updated]);
   if (wire === undefined) {
     throw new Error(`cancelBooking ${id}: wire assembly returned no row`);
   }
   return { wire, pendingStripeRefund, creditRefundedDogIds: [...creditRefundedDogIds] };
+}
+
+/**
+ * The waitlist queue whose seat this booking occupies, or `undefined` when
+ * cancelling it frees nothing anyone can be waiting for.
+ *
+ * Only day school and day care have a capacity model: boarding, board & train,
+ * private lessons and evaluations are staff-scheduled with no per-day openings
+ * count, so `POST /waitlist` refuses to queue for them and there is nothing to
+ * promote. Group class cancels through the cohort withdraw path instead (the
+ * guard at the top of `cancelBookingInTx` rejects it here).
+ *
+ * The date is `bucketToChicagoDate` for the same reason the capacity count is
+ * `(scheduled_at AT TIME ZONE 'America/Chicago')::date` — the queue and the
+ * openings must agree on which calendar day a booking sits in.
+ */
+function dayProgramQueueOf(row: BookingFullRow): WaitlistTarget | undefined {
+  if (row.category !== 'day-school' && row.category !== 'day-care') return undefined;
+  // A day program is always booked at a school; a null location would mean the
+  // seat can't be attributed to any day's openings, so there is no queue to
+  // promote rather than a guess to make.
+  if (row.location === null) return undefined;
+  return {
+    kind: 'day-program',
+    category: row.category,
+    sessionDate: bucketToChicagoDate(row.scheduledAt),
+    location: row.location,
+    mode: dayProgramCategoryToMode(row.category),
+  };
 }
 
 /**

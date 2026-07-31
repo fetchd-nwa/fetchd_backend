@@ -19,7 +19,7 @@ import type { NotificationType } from '../contracts/wire.js';
  * `NotificationCategoryPanel`: booking-confirmations, booking-reminders,
  * report-cards, session-photos, urgent-updates, announcements. Only two of them
  * gate a scheduled type the worker actually pushes today, so `PUSH_TYPE_CATEGORY`
- * below is total over exactly the seven push-capable scheduled types and no others.
+ * below is total over exactly the ten push-capable scheduled types and no others.
  */
 type PushCategoryKey = 'booking-reminders' | 'urgent-updates';
 
@@ -37,7 +37,8 @@ type PushCapableType =
   | 'credits-expiring'
   | 'spay-neuter-reminder'
   | 'invoice-overdue'
-  | 'card-expiring';
+  | 'card-expiring'
+  | 'waitlist-spot-open';
 
 const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'booking-reminder': 'booking-reminders',
@@ -52,6 +53,11 @@ const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   // owner can fix it — the definition of urgent-updates.
   'invoice-overdue': 'urgent-updates',
   'card-expiring': 'urgent-updates',
+  // Allison 2026-07-30: an offered seat is on a clock — miss the deadline and
+  // it goes to the next family. 'urgent-updates' rather than
+  // 'booking-reminders': there is no booking yet, and the owner must ACT, which
+  // is the line between the two categories.
+  'waitlist-spot-open': 'urgent-updates',
 };
 
 const PUSH_CAPABLE_TYPES: ReadonlySet<string> = new Set(Object.keys(PUSH_TYPE_CATEGORY));

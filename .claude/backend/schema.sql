@@ -1176,6 +1176,140 @@ CREATE TABLE invoices (
 CREATE INDEX invoices_owner_idx  ON invoices (owner_id);
 CREATE INDEX invoices_open_idx   ON invoices (status) WHERE status = 'open';
 
+-- ----------------------------------------------------------------------------
+-- Waitlist (Allison 2026-07-29). "If all spots are full people should be
+-- allowed to enter a waitlist, or be overridden manually by staff, and then
+-- you'd get a message saying you were accepted."
+--
+-- The lifecycle is an OFFER, not an auto-booking (Allison 2026-07-30 clarified
+-- point 1): a freed seat moves the entry to 'offered' and notifies the owner,
+-- who ACCEPTS or DECLINES. Money moves only on accept, through the normal
+-- payment flow — nothing is charged when the seat opens. This mirrors the
+-- approval-divert rule that money never moves at submit.
+--
+-- Scope: day-school, day-care and group-class ONLY. Boarding and board-and-train
+-- have NO capacity model in this backend (no cap, no check, no error — see
+-- BUSINESS-LOGIC/DISCREPANCIES.md D7), so there is nothing for them to be full
+-- of and nothing for a waitlist to trigger on. They join once the adjudicated
+-- per-campus boarding cap (Allison 2026-07-27: default 15, per-date/range staff
+-- overrides) is built; the entry model here is already category-generic.
+CREATE TYPE waitlist_status AS ENUM (
+  'waiting',    -- in the queue
+  'offered',    -- a seat opened; awaiting the owner's accept/decline
+  'accepted',   -- owner accepted; `booking_id` is the booking it became
+  'declined',   -- owner declined the offer
+  'expired',    -- the offer lapsed unanswered (see `offer_expires_at`)
+  'cancelled'   -- owner left the queue, or the session passed while waiting
+);
+
+CREATE TABLE waitlist_entries (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id      uuid NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  -- The lead dog, mirroring `bookings.lead_dog_id`. Every dog on the entry
+  -- (including this one) also gets a `waitlist_entry_dogs` row, because a
+  -- multi-dog submission is what got bounced and promotion needs ALL of them
+  -- to fit — one free seat does not satisfy a two-dog entry.
+  lead_dog_id   uuid NOT NULL REFERENCES dogs(id) ON DELETE CASCADE,
+  category      service_category NOT NULL,
+  status        waitlist_status NOT NULL DEFAULT 'waiting',
+
+  -- Day-program target (day-school / day-care): a specific date at a specific
+  -- school on a specific credits axis — the same tuple `day_capacity` counts.
+  session_date  date,
+  location      text REFERENCES locations(slug),
+  mode          booking_mode,
+
+  -- Group-class target: the cohort whose `filled` hit `capacity`.
+  cohort_id     uuid REFERENCES cohorts(id) ON DELETE CASCADE,
+
+  -- Offer lifecycle. `offer_expires_at` is load-bearing: without a deadline one
+  -- unanswered offer stalls everyone behind it forever.
+  offered_at        timestamptz,
+  offer_expires_at  timestamptz,
+  resolved_at       timestamptz,
+  -- Set on 'accepted' — the booking the acceptance created.
+  booking_id    uuid REFERENCES bookings(id) ON DELETE SET NULL,
+  -- Staff cap-override provenance (Allison 2026-07-30: "staff can override the
+  -- cap"). NULL on an organic promotion (a seat genuinely freed).
+  offered_by_staff_id uuid REFERENCES staff(id),
+  -- Gate-aware promotion (Allison 2026-07-31). Gates block the JOIN, but they
+  -- can go stale while an entry waits — a vaccine lapses, a card is removed. So
+  -- promotion re-checks, and an entry that no longer passes is flagged here
+  -- instead of being offered a seat it could not use: "the request goes to staff
+  -- ONLY if they don't pass ALL gates; if they do, they auto get offered."
+  --
+  -- The flag also drives QUEUE ORDER. Ranking is (gate_blocked_at IS NOT NULL,
+  -- created_at, id) — anyone who currently passes every gate sorts above anyone
+  -- who doesn't, which is Allison's "if there's someone who passes all gates,
+  -- they get moved to the top of the waitlist". Clearing the gate clears this
+  -- column and the entry returns to its original created_at place; the demotion
+  -- lasts exactly as long as the problem does.
+  gate_blocked_at     timestamptz,
+  -- Which gate failed, for the staff worklist ('vaccine_missing' etc — the
+  -- ApiErrorCode of the blocking gate). NULL iff gate_blocked_at IS NULL.
+  gate_blocked_reason text,
+  CONSTRAINT waitlist_gate_block_paired
+    CHECK ((gate_blocked_at IS NULL) = (gate_blocked_reason IS NULL)),
+
+  created_at    timestamptz NOT NULL DEFAULT now(),
+
+  -- Only the three categories that HAVE a capacity model.
+  CONSTRAINT waitlist_supported_category
+    CHECK (category IN ('day-school','day-care','group-class')),
+  -- Exactly one target shape, matching the category.
+  CONSTRAINT waitlist_target_shape CHECK (
+    (category IN ('day-school','day-care')
+      AND session_date IS NOT NULL AND location IS NOT NULL AND mode IS NOT NULL
+      AND cohort_id IS NULL)
+    OR
+    (category = 'group-class'
+      AND cohort_id IS NOT NULL
+      AND session_date IS NULL AND location IS NULL AND mode IS NULL)
+  ),
+  -- An offer without a deadline is the deadlock this column exists to prevent.
+  CONSTRAINT waitlist_offer_has_deadline
+    CHECK (status <> 'offered' OR (offered_at IS NOT NULL AND offer_expires_at IS NOT NULL)),
+  -- 'accepted' implies the booking it became.
+  CONSTRAINT waitlist_accepted_has_booking
+    CHECK (status <> 'accepted' OR booking_id IS NOT NULL)
+);
+
+-- Every dog on the entry, lead included. Promotion needs the full count.
+CREATE TABLE waitlist_entry_dogs (
+  waitlist_entry_id uuid NOT NULL REFERENCES waitlist_entries(id) ON DELETE CASCADE,
+  dog_id            uuid NOT NULL REFERENCES dogs(id) ON DELETE CASCADE,
+  is_lead           boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (waitlist_entry_id, dog_id)
+);
+
+-- FIFO is `created_at ASC` within a target; these back the promotion scan.
+CREATE INDEX waitlist_day_queue_idx
+  ON waitlist_entries (session_date, location, mode, status, created_at)
+  WHERE status = 'waiting';
+CREATE INDEX waitlist_cohort_queue_idx
+  ON waitlist_entries (cohort_id, status, created_at)
+  WHERE status = 'waiting';
+CREATE INDEX waitlist_owner_idx ON waitlist_entries (owner_id, status);
+-- The staff worklist of gate-blocked entries (R6: "the request goes to staff"),
+-- and the (gate_blocked_at IS NOT NULL, created_at, id) queue ordering of R7.
+CREATE INDEX waitlist_gate_blocked_idx
+  ON waitlist_entries (gate_blocked_at)
+  WHERE gate_blocked_at IS NOT NULL;
+-- Sweeping lapsed offers back into the queue.
+CREATE INDEX waitlist_offer_expiry_idx
+  ON waitlist_entries (offer_expires_at)
+  WHERE status = 'offered';
+
+-- One LIVE entry per dog per target. A dog already waiting (or holding an
+-- offer) can't stack a second place in the same queue; resolved entries don't
+-- block a genuine re-join later.
+CREATE UNIQUE INDEX waitlist_day_one_live_uidx
+  ON waitlist_entries (lead_dog_id, session_date, location, mode)
+  WHERE status IN ('waiting','offered');
+CREATE UNIQUE INDEX waitlist_cohort_one_live_uidx
+  ON waitlist_entries (lead_dog_id, cohort_id)
+  WHERE status IN ('waiting','offered');
+
 -- The 3 Day School payment modes from the DS: PAYG (charges.purpose='payg'),
 -- packages (credit_packages + credit_ledger), memberships (below).
 --

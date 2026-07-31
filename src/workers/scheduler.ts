@@ -25,6 +25,12 @@ import {
   type EnqueueCardExpiryWarningsResult,
 } from '../lib/enqueueCardExpiryWarnings.js';
 import { rollDueMemberships, type MembershipRollResult } from '../lib/membershipRoll.js';
+import {
+  cancelEntriesForStartedSessions,
+  sweepLapsedOffers,
+  type WaitlistSessionExpiryResult,
+  type WaitlistSweepResult,
+} from '../lib/waitlistPromotion.js';
 import { withActor, type Tx } from '../db/tx.js';
 import {
   defaultExpoPushClient,
@@ -75,7 +81,21 @@ interface WorkerLogger {
  *      Chicago). Flag + notify alumni dogs under 2 attended qualifying
  *      sessions in the just-closed month.
  *
- *   7. **`idempotency_keys` TTL sweep.** Prune rows older than the
+ *   7. **Overdue invoices.** Enqueue `invoice-overdue` for card-backed
+ *      invoices still open past their grace window.
+ *
+ *   8. **Expiring default cards.** Enqueue `card-expiring` before the
+ *      card that backs every auto-charge lapses, and once after.
+ *
+ *   9. **Waitlist session expiry** (Allison 2026-07-30 ruling 4). Live
+ *      entries whose session has started are resolved 'cancelled'.
+ *      Before the sweep so it never promotes into a started session.
+ *
+ *  10. **Waitlist lapsed-offer sweep.** Unanswered offers past their
+ *      deadline resolve 'expired', then their queues are re-promoted so
+ *      the held seat rolls to the next in line on THIS tick.
+ *
+ *  11. **`idempotency_keys` TTL sweep.** Prune rows older than the
  *      retry-safety window (24h default) per schema.sql lines ~918-920.
  *      One Postgres DELETE; runs on the pool runner outside any tx.
  *
@@ -134,6 +154,8 @@ export interface SchedulerTickResult {
   mediaDerivatives: MediaDerivativesTickResult;
   creditExpiryWarnings: EnqueueCreditExpiryWarningsResult;
   alumniAttendance: AlumniAttendanceScanResult;
+  waitlistSessionExpiry: WaitlistSessionExpiryResult;
+  waitlistSweep: WaitlistSweepResult;
   idempotencyKeysSwept: number;
 }
 
@@ -325,9 +347,7 @@ export async function runSchedulerTickOnce(
   // card that backs every auto-charge lapses, and once more after it has.
   let cardExpiryResult: EnqueueCardExpiryWarningsResult = { scanned: 0, enqueued: 0 };
   try {
-    cardExpiryResult = await withActor(SCHEDULER_ACTOR, (tx) =>
-      enqueueCardExpiryWarnings(tx, now),
-    );
+    cardExpiryResult = await withActor(SCHEDULER_ACTOR, (tx) => enqueueCardExpiryWarnings(tx, now));
     log.info(
       {
         workerTick: 'scheduler',
@@ -345,6 +365,66 @@ export async function runSchedulerTickOnce(
         err: err instanceof Error ? err.message : String(err),
       },
       'card-expiry phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 9 — waitlist session expiry (Allison 2026-07-30 ruling 4: "the entry
+  // dies when the session starts"). Runs BEFORE the sweep so a queue whose
+  // session has already begun is empty by the time promotion looks at it —
+  // `promoteForTarget` refuses started sessions anyway, but a tick that leaves
+  // dead entries behind for the sweep to reason about is one more thing to get
+  // wrong. Own tx, own log-and-swallow boundary.
+  let waitlistSessionExpiryResult: WaitlistSessionExpiryResult = { scanned: 0, cancelled: 0 };
+  try {
+    waitlistSessionExpiryResult = await withActor(SCHEDULER_ACTOR, (tx) =>
+      cancelEntriesForStartedSessions(tx, now),
+    );
+    log.info(
+      {
+        workerTick: 'scheduler',
+        phase: 'waitlist-session-expiry',
+        scanned: waitlistSessionExpiryResult.scanned,
+        cancelled: waitlistSessionExpiryResult.cancelled,
+      },
+      'waitlist session-expiry scan complete',
+    );
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'waitlist-session-expiry',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'waitlist-session-expiry phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 10 — waitlist lapsed-offer sweep (Allison 2026-07-30 ruling 1). An
+  // 'offered' entry holds its seats against every later promotion pass, so one
+  // owner who never opens the app would stall their queue forever. Expiring the
+  // offer and re-promoting the same target in the same tx is what unsticks it.
+  // Own tx, own log-and-swallow boundary.
+  let waitlistSweepResult: WaitlistSweepResult = { lapsed: 0, expired: 0, promoted: 0 };
+  try {
+    waitlistSweepResult = await withActor(SCHEDULER_ACTOR, (tx) => sweepLapsedOffers(tx, now));
+    log.info(
+      {
+        workerTick: 'scheduler',
+        phase: 'waitlist-sweep',
+        lapsed: waitlistSweepResult.lapsed,
+        expired: waitlistSweepResult.expired,
+        promoted: waitlistSweepResult.promoted,
+      },
+      'waitlist lapsed-offer sweep complete',
+    );
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'waitlist-sweep',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'waitlist-sweep phase threw at the worker boundary; will retry next tick',
     );
   }
 
@@ -376,6 +456,8 @@ export async function runSchedulerTickOnce(
     alumniAttendance: alumniAttendanceResult,
     invoiceOverdue: invoiceOverdueResult,
     cardExpiry: cardExpiryResult,
+    waitlistSessionExpiry: waitlistSessionExpiryResult,
+    waitlistSweep: waitlistSweepResult,
     idempotencyKeysSwept,
   };
 }

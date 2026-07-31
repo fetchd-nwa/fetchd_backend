@@ -270,9 +270,14 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
   // The owner elects to settle this OPEN, card-backed invoice IN PERSON (cash
   // or check at drop-off) rather than on the card. It charges nothing: it flips
   // `payment_expected` → 'in-person' and, in the same tx, schedules a
-  // `payment-due` reminder ~1h before the linked booking's drop-off (or ~1h
+  // `payment-due` reminder 24h before the linked booking's drop-off (or 24h
   // before the invoice's due time when no booking is linked). Bodyless 204 on
   // success (flag-flip convention, like POST /notifications/:id/read).
+  //
+  // Choosing in-person is never a one-way door: `POST /invoices/:id/pay` still
+  // accepts an in-person invoice (it gates on `status='open'` only), and the
+  // settle tears down this reminder — see `settleInvoiceCharge`. That is what
+  // backs the app's "pay by card now" option on an already-flagged invoice.
   //
   // Shape mirrors `/pay`: peek for an idempotent replay FIRST (this route flips
   // `payment_expected`, which the pre-validation reads — a replay would 409
@@ -331,11 +336,11 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           throw new ApiError('conflict', `invoice ${id} is no longer open + card-backed`);
         }
 
-        // Anchor the reminder ~1h before drop-off; past-due → now (R3) so the
-        // worker fires it on the next tick, same convention as booking reminders.
+        // Anchor the reminder PAYMENT_DUE_LEAD_MS before drop-off, clamped to
+        // now when that lands in the past (R3) so the worker fires it on the
+        // next tick, same convention as booking reminders.
         const anchor = await resolvePaymentDueAnchor(tx, invoiceRow);
-        const scheduledForMs = anchor.at.getTime() - PAYMENT_DUE_LEAD_MS;
-        const scheduledFor = scheduledForMs < now.getTime() ? now : new Date(scheduledForMs);
+        const scheduledFor = paymentDueReminderAt(anchor.at, now);
 
         await scheduledNotificationsRepository.enqueueIdempotent(tx, {
           ownerId: invoiceRow.ownerId,
@@ -362,8 +367,33 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
   });
 }
 
-/** Lead time for the pay-in-person reminder: ~1h before the drop-off anchor. */
-const PAYMENT_DUE_LEAD_MS = 60 * 60 * 1000;
+/**
+ * Lead time for the pay-in-person reminder: 24h before the drop-off anchor.
+ * (Was 1h through Phase 4c; Allison 2026-07-31 — an hour's notice isn't enough
+ * to get to an ATM, a day is.)
+ */
+const PAYMENT_DUE_LEAD_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * When to fire the "bring cash at drop-off" reminder: PAYMENT_DUE_LEAD_MS
+ * before the anchor, clamped into `[now, anchor]`.
+ *
+ * With a 24h lead the clamp is the COMMON case, not the edge — most invoices
+ * are created (and flagged in-person) less than a day before the drop-off they
+ * bill, so `anchor − 24h` is usually already past. Clamping to `now` makes the
+ * worker fire it on its next tick: late notice beats no notice, and a
+ * `scheduled_for` in the past would otherwise be indistinguishable from a
+ * backlog the worker is behind on.
+ *
+ * The clamp can only push the reminder PAST the anchor when the anchor itself
+ * is already behind us (an invoice flagged after its own drop-off / due date).
+ * No instant satisfies both bounds there, so we still fire now: the money is
+ * owed either way, and staying silent about it is the worse failure.
+ */
+function paymentDueReminderAt(anchorAt: Date, now: Date): Date {
+  const lead = new Date(anchorAt.getTime() - PAYMENT_DUE_LEAD_MS);
+  return lead > now ? lead : now;
+}
 
 /**
  * Resolve the payment-due reminder anchor for a cash/check invoice: the linked

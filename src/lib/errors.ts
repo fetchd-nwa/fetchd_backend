@@ -62,7 +62,9 @@ export type ApiErrorCode =
   | 'already_booked' // Day 19d: day-program booking blocked — dog already has a live booking for (category, day)
   | 'already_enrolled' // Day 19d: enrollment blocked — dog already enrolled in this cohort
   | 'already_requested' // Day 19d: request blocked — dog already has an open request of this category
-  | 'event_full'; // Day 19e: event RSVP blocked — live rsvp dogs + requested > events.capacity (owner self-serve soft cap)
+  | 'event_full' // Day 19e: event RSVP blocked — live rsvp dogs + requested > events.capacity (owner self-serve soft cap)
+  | 'already_waitlisted' // 2026-07-30: this dog already holds a live place in this queue
+  | 'waitlist_not_needed'; // 2026-07-30: seats are available — book it, don't queue for it
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   unauthenticated: 401,
@@ -93,6 +95,9 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   already_requested: 422,
   // Day 19e event RSVP soft cap — 422 (state-block: event is full).
   event_full: 422,
+  // Waitlist duplicate + not-needed guards — same 422 family (state-block).
+  already_waitlisted: 422,
+  waitlist_not_needed: 422,
 };
 
 /**

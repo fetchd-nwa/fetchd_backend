@@ -68,7 +68,7 @@ export type ScheduledNotificationType =
   | 'spay-neuter-reminder'
   // R3 2026-07-27: the cash/check invoice reminder (`payment-due:<invoiceId>`)
   // enqueued by `POST /invoices/:id/pay-in-person`. Push-capable (urgent-
-  // updates) so the owner is reminded to bring payment ~1h before drop-off.
+  // updates) so the owner is reminded to bring payment 24h before drop-off.
   | 'payment-due'
   // Allison 2026-07-29. Both are scheduled-scan arms (no single triggering
   // event) and both are push-capable under 'urgent-updates' — each one means
@@ -76,7 +76,14 @@ export type ScheduledNotificationType =
   // `invoice-overdue:<invoiceId>` fires once per invoice;
   // `card-expiring:<pmId>:warn|lapsed` fires at most twice per card.
   | 'invoice-overdue'
-  | 'card-expiring';
+  | 'card-expiring'
+  // Allison 2026-07-30: a waitlisted seat freed and the entry now HOLDS it
+  // pending an accept/decline. Push-capable (see `pushPreferences`) because the
+  // offer has a deadline and rolls to the next family when it lapses — feed-only
+  // would mean most offers expire unseen. Dedupe key is per-OFFER
+  // (`waitlist-spot-open:<entryId>:<offeredAt>`), not per-entry, so an entry
+  // re-offered after a lapse notifies again instead of being swallowed.
+  | 'waitlist-spot-open';
 
 export interface ScheduledNotificationRow {
   id: string;

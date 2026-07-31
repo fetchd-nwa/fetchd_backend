@@ -5,6 +5,7 @@ import type { NotificationDeepLinkKind } from "../../lib/notificationWire.js"
 export const announcementCategory = pgEnum("announcement_category", ['urgent', 'team', 'class', 'event', 'promo', 'report'])
 export const bookingAttendance = pgEnum("booking_attendance", ['pending', 'attended', 'no-show', 'excused'])
 export const bookingMode = pgEnum("booking_mode", ['school', 'daycare'])
+export const waitlistStatus = pgEnum("waitlist_status", ['waiting', 'offered', 'accepted', 'declined', 'expired', 'cancelled'])
 export const bookingStatus = pgEnum("booking_status", ['upcoming', 'past', 'cancelled'])
 export const chargePurpose = pgEnum("charge_purpose", ['package', 'payg', 'board-train', 'membership', 'group-class'])
 export const chargeStatus = pgEnum("charge_status", ['requires_payment', 'succeeded', 'failed', 'refunded'])
@@ -1597,3 +1598,84 @@ export const dogCreditBalance = pgView("dog_credit_balance", {	dogId: uuid("dog_
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	balance: bigint({ mode: "number" }),
 }).as(sql`SELECT cl.dog_id, cl.mode, cl.location, COALESCE(sum(cl.delta), 0::bigint) AS balance FROM credit_ledger cl LEFT JOIN credit_ledger lot ON lot.id = cl.lot_id WHERE CASE WHEN cl.lot_id IS NOT NULL THEN lot.expires_at IS NULL OR lot.expires_at > now() WHEN cl.delta > 0 THEN cl.expires_at IS NULL OR cl.expires_at > now() ELSE true END GROUP BY cl.dog_id, cl.mode, cl.location`);
+// Waitlist (Allison 2026-07-29/30). Hand-patched mirror — `db:introspect` is
+// broken, so this file is maintained by hand against schema.sql. See the DDL
+// there for the full rationale; the short version: a freed seat produces an
+// OFFER (accept/decline, money only on accept), not an auto-booking, and only
+// the three categories with a real capacity model are supported.
+export const waitlistEntries = pgTable("waitlist_entries", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	ownerId: uuid("owner_id").notNull(),
+	leadDogId: uuid("lead_dog_id").notNull(),
+	category: serviceCategory().notNull(),
+	status: waitlistStatus().default('waiting').notNull(),
+	sessionDate: date("session_date"),
+	location: text().$type<LocationKey>(),
+	mode: bookingMode(),
+	cohortId: uuid("cohort_id"),
+	offeredAt: timestamp("offered_at", { withTimezone: true, mode: 'string' }),
+	offerExpiresAt: timestamp("offer_expires_at", { withTimezone: true, mode: 'string' }),
+	resolvedAt: timestamp("resolved_at", { withTimezone: true, mode: 'string' }),
+	bookingId: uuid("booking_id"),
+	offeredByStaffId: uuid("offered_by_staff_id"),
+	gateBlockedAt: timestamp("gate_blocked_at", { withTimezone: true, mode: 'string' }),
+	gateBlockedReason: text("gate_blocked_reason"),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		dayQueueIdx: index("waitlist_day_queue_idx").using("btree", table.sessionDate.asc().nullsLast(), table.location.asc().nullsLast(), table.mode.asc().nullsLast(), table.status.asc().nullsLast(), table.createdAt.asc().nullsLast()).where(sql`(status = 'waiting'::waitlist_status)`),
+		cohortQueueIdx: index("waitlist_cohort_queue_idx").using("btree", table.cohortId.asc().nullsLast(), table.status.asc().nullsLast(), table.createdAt.asc().nullsLast()).where(sql`(status = 'waiting'::waitlist_status)`),
+		ownerIdx: index("waitlist_owner_idx").using("btree", table.ownerId.asc().nullsLast(), table.status.asc().nullsLast()),
+		offerExpiryIdx: index("waitlist_offer_expiry_idx").using("btree", table.offerExpiresAt.asc().nullsLast()).where(sql`(status = 'offered'::waitlist_status)`),
+		waitlistEntriesOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "waitlist_entries_owner_id_fkey"
+		}).onDelete("cascade"),
+		waitlistEntriesLeadDogIdFkey: foreignKey({
+			columns: [table.leadDogId],
+			foreignColumns: [dogs.id],
+			name: "waitlist_entries_lead_dog_id_fkey"
+		}).onDelete("cascade"),
+		waitlistEntriesLocationFkey: foreignKey({
+			columns: [table.location],
+			foreignColumns: [locations.slug],
+			name: "waitlist_entries_location_fkey"
+		}),
+		waitlistEntriesCohortIdFkey: foreignKey({
+			columns: [table.cohortId],
+			foreignColumns: [cohorts.id],
+			name: "waitlist_entries_cohort_id_fkey"
+		}).onDelete("cascade"),
+		waitlistEntriesBookingIdFkey: foreignKey({
+			columns: [table.bookingId],
+			foreignColumns: [bookings.id],
+			name: "waitlist_entries_booking_id_fkey"
+		}).onDelete("set null"),
+		waitlistEntriesOfferedByStaffIdFkey: foreignKey({
+			columns: [table.offeredByStaffId],
+			foreignColumns: [staff.id],
+			name: "waitlist_entries_offered_by_staff_id_fkey"
+		}),
+	}
+});
+
+export const waitlistEntryDogs = pgTable("waitlist_entry_dogs", {
+	waitlistEntryId: uuid("waitlist_entry_id").notNull(),
+	dogId: uuid("dog_id").notNull(),
+	isLead: boolean("is_lead").default(false).notNull(),
+}, (table) => {
+	return {
+		waitlistEntryDogsWaitlistEntryIdFkey: foreignKey({
+			columns: [table.waitlistEntryId],
+			foreignColumns: [waitlistEntries.id],
+			name: "waitlist_entry_dogs_waitlist_entry_id_fkey"
+		}).onDelete("cascade"),
+		waitlistEntryDogsDogIdFkey: foreignKey({
+			columns: [table.dogId],
+			foreignColumns: [dogs.id],
+			name: "waitlist_entry_dogs_dog_id_fkey"
+		}).onDelete("cascade"),
+		waitlistEntryDogsPkey: primaryKey({ columns: [table.waitlistEntryId, table.dogId], name: "waitlist_entry_dogs_pkey"}),
+	}
+});

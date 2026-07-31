@@ -12,6 +12,26 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.6.1] — 2026-07-31
+
+Doc-only (still regenerates both clients). The `payment-due` arm's comment said
+the cash/check reminder fires "~1h before the linked booking's drop-off". Allison
+raised the lead to **24h** on 2026-07-31 so it arrives the day before rather than
+the morning of; `PAYMENT_DUE_LEAD_MS` changed with it. No shape or enum member moved.
+
+## [1.6.0] — 2026-07-30
+
+Additive (waitlist, Allison 2026-07-30). One new deep-link kind; no field or
+enum member is removed or retyped.
+
+### Added
+
+- `NotificationDeepLinkKind` arm `'waitlist'` → `/waitlist/:waitlistEntryId`,
+  the destination for `waitlist-spot-open`. Deliberately NOT a booking link:
+  when a seat opens nothing is booked yet — the notification is an OFFER the
+  owner accepts or declines, and payment happens on accept. A booking deep link
+  would point at a row that does not exist.
+
 ## [1.5.0] — 2026-07-29
 
 Additive (Allison's notification sweep, 2026-07-29). Three new `NotificationType`
