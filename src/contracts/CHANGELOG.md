@@ -12,6 +12,60 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.7.0] — 2026-07-31
+
+Additive (Allison 2026-07-31: "fix the contract properly"). The pay endpoint
+enters the versioned contract and gains an optional request body. No field is
+removed or retyped, and a bodyless call behaves exactly as it did in 1.6.1.
+
+### Added
+
+- **`InvoicePayRequest`** — `POST /invoices/:id/pay` body, `{ payment_method_id?:
+  string }`. The card the owner picked at settle time. Before this the endpoint
+  took no body and always charged the invoice's BOUND card, so the mobile pay
+  sheet's card picker was decorative: an owner could select "Mastercard ••8203"
+  and be charged their Visa. The server now verifies the card is a live card of
+  the calling owner (404 otherwise, tenancy-miss-collapses-to-404 per §G) and
+  repoints `invoices.payment_method_id` at it inside the settle tx, so
+  `LedgerEntryWire.settled_card` cannot name a card that was never charged.
+- **`InvoicePayWire`** — the response, **relocated** here from
+  `src/routes/invoices.ts`. Shape unchanged. It had never been in the contract,
+  which meant the money endpoint had nothing for either client's
+  `check:contracts` to guard — the condition that let the picker drift.
+- **`ChargeStatus`** — `'requires_payment' | 'succeeded' | 'failed' | 'refunded'`,
+  moved from `chargesRepository` (which now re-exports it) because
+  `InvoicePayWire.charge_status` reports it. Pinned against the `charge_status`
+  pgEnum in `conformance.ts` like every other shared enum.
+
+### Note for client authors
+
+`payment_method_id` is optional on purpose. Canonical-JSON request hashing drops
+`undefined` keys, so an omitted card hashes byte-identically to the pre-1.7.0
+`{ id }` body and no in-flight `Idempotency-Key` breaks. Two calls naming
+DIFFERENT cards now hash differently — under the old `hashRequestBody({ id })`
+they collided, so the second call replayed the first's stored response and the
+owner was told a card had been charged that never was.
+
+## [1.6.1] — 2026-07-31
+
+Doc-only (still regenerates both clients). The `payment-due` arm's comment said
+the cash/check reminder fires "~1h before the linked booking's drop-off". Allison
+raised the lead to **24h** on 2026-07-31 so it arrives the day before rather than
+the morning of; `PAYMENT_DUE_LEAD_MS` changed with it. No shape or enum member moved.
+
+## [1.6.0] — 2026-07-30
+
+Additive (waitlist, Allison 2026-07-30). One new deep-link kind; no field or
+enum member is removed or retyped.
+
+### Added
+
+- `NotificationDeepLinkKind` arm `'waitlist'` → `/waitlist/:waitlistEntryId`,
+  the destination for `waitlist-spot-open`. Deliberately NOT a booking link:
+  when a seat opens nothing is booked yet — the notification is an OFFER the
+  owner accepts or declines, and payment happens on accept. A booking deep link
+  would point at a row that does not exist.
+
 ## [1.5.0] — 2026-07-29
 
 Additive (Allison's notification sweep, 2026-07-29). Three new `NotificationType`

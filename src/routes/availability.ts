@@ -23,6 +23,20 @@ import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.
  *
  * Range cap = `AVAILABILITY_MAX_DATES` (92 dates ≈ 3 months). Larger
  * windows fail with 400 `invalid_payload` to bound query + response size.
+ *
+ * **Known gap — this endpoint emits the day's CAP, not its free seats.**
+ * `school_openings` / `daycare_openings` are the configured openings for the
+ * date; nothing is subtracted for dogs already booked. The mobile app consumes
+ * them as remaining seats (`availabilityService.classifyStatus`: "green if
+ * every selected dog fits"), so a fully-booked day still renders open and the
+ * booking path is the first place the owner learns otherwise.
+ *
+ * The seat arithmetic that *is* authoritative lives in
+ * `dayCapacityRepository.assertCapacityWithinLock` (openings − booked), which
+ * every booking path goes through. Making this route emit that number instead
+ * changes the meaning of a §B wire field shared by three repos and its
+ * byte-match snapshots — contract-first work for the orchestrator, not a
+ * drive-by. Flagged 2026-07-31.
  */
 
 const MODES = pgEnumTuple(bookingMode);

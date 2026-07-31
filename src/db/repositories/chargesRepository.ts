@@ -1,4 +1,5 @@
 import { and, eq, sql } from 'drizzle-orm';
+import type { ChargeStatus } from '../../contracts/wire.js';
 import { charges } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
 
@@ -20,7 +21,11 @@ import type { Tx } from '../tx.js';
  */
 
 export type ChargePurpose = 'payg' | 'package' | 'board-train' | 'membership' | 'group-class';
-export type ChargeStatus = 'requires_payment' | 'succeeded' | 'failed' | 'refunded';
+// Re-exported, not redeclared: `ChargeStatus` moved into the wire contract in
+// 1.7.0 when `InvoicePayWire` did (it reports this value), and `conformance.ts`
+// pins it against the `charge_status` pgEnum. Two copies could drift apart while
+// both still compiled.
+export type { ChargeStatus } from '../../contracts/wire.js';
 
 export interface ChargeRow {
   id: string;

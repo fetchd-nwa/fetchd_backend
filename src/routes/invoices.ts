@@ -1,13 +1,18 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import { deepLinkToPath } from '../contracts/wire.js';
+import { deepLinkToPath, type InvoicePayWire } from '../contracts/wire.js';
 import { db } from '../db/client.js';
+import { bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { peekCompletedIdempotency } from '../db/idempotency.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
-import { chargesRepository, type ChargeStatus } from '../db/repositories/chargesRepository.js';
-import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
+import { chargesRepository } from '../db/repositories/chargesRepository.js';
+import {
+  invoicesRepository,
+  repointPaymentMethod,
+  type InvoiceRow,
+} from '../db/repositories/invoicesRepository.js';
 import { ledgerRepository } from '../db/repositories/ledgerRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
@@ -29,8 +34,10 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 /**
  * `POST /invoices/:id/pay` `[auth, $]` — pay-later settlement.
  *
- * Owner pays an open invoice using its bound `payment_method_id`. The
- * shape mirrors Day-14's `POST /credit-packages/:key/purchase`:
+ * Owner pays an open invoice with the card they chose at settle time
+ * (`payment_method_id` in the body, wire 1.7.0), falling back to the invoice's
+ * bound `payment_method_id` when the body omits one. The shape mirrors Day-14's
+ * `POST /credit-packages/:key/purchase`:
  *
  *   1. Pre-validate the invoice (owned, open, payment method live).
  *   2. Stripe `paymentIntents.create + confirm` pre-tx (idempotency-keyed).
@@ -55,25 +62,40 @@ export interface InvoicesRouteOptions extends AuthRouteOptions {
   stripe?: StripeClient;
 }
 
-export interface InvoicePayWire {
-  charge_id: string;
-  charge_status: ChargeStatus;
-  stripe_payment_intent_id: string;
-  client_secret: string | null;
-  invoice_status: 'open' | 'paid' | 'void';
-  /**
-   * True when this charge succeeded at Stripe but LOST the settle race against
-   * a concurrent worker auto-charge (or webhook) -- the invoice is already
-   * `paid` by that path, so this duplicate charge is being refunded post-commit
-   * (a 'pending' refund row was written in-tx; Stripe + webhook reconcile it).
-   * The owner's card nets exactly one charge. Honest signal so the client
-   * never renders "payment complete" for money that's on its way back. False
-   * on the clean win and on the 3DS / requires_action path.
-   */
-  charge_refunded: boolean;
-}
-
 const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
+
+/**
+ * `POST /invoices/:id/pay` body (wire 1.7.0). Every field optional and the whole
+ * body optional — a bodyless POST is the pre-1.7.0 call and still means "charge
+ * the invoice's bound card".
+ *
+ * `.strict()` so an unknown key is a 400 rather than silently ignored: the bug
+ * this endpoint is fixing was precisely a client sending a card the server threw
+ * away, and failing loudly is what stops the next version of that.
+ */
+const paySchema = z
+  .object({ payment_method_id: z.string().uuid('payment_method_id must be a UUID').optional() })
+  .strict();
+
+/**
+ * Parse the optional pay body. `undefined`/null/empty body → no card chosen.
+ *
+ * Returned as `{ payment_method_id?: string }` (key ABSENT rather than set to
+ * `undefined`) so the idempotency hash of a bodyless call is byte-identical to
+ * the pre-1.7.0 `hashRequestBody({ id })` — canonical JSON drops undefined
+ * values, so either spelling hashes the same, but keeping the key absent makes
+ * that property obvious instead of incidental.
+ */
+function parsePayBody(body: unknown): { payment_method_id?: string } {
+  if (body === undefined || body === null) return {};
+  const parsed = paySchema.safeParse(body);
+  if (!parsed.success) {
+    throw new ApiError('invalid_payload', `invalid body: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data.payment_method_id === undefined
+    ? {}
+    : { payment_method_id: parsed.data.payment_method_id };
+}
 
 export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
@@ -97,7 +119,13 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
       requireOwner(principal, 'pay an invoice');
       const { id } = parseIdParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
-      const requestHash = hashRequestBody({ id });
+      // Parse BEFORE the peek: the peek and `withMutation` must agree on the
+      // hash, and since 1.7.0 the chosen card is part of it. Two calls naming
+      // different cards now hash differently — under the old
+      // `hashRequestBody({ id })` they collided, so the second replayed the
+      // first's response and the owner was told a card was charged that wasn't.
+      const payBody = parsePayBody(request.body);
+      const requestHash = hashRequestBody({ id, ...payBody });
 
       // ── Idempotency replay short-circuit ──
       // The pre-validation below checks `invoice.status === 'open'`, but
@@ -130,9 +158,16 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
         throw new ApiError('conflict', `invoice ${id} is ${invoiceRow.status}, not open`);
       }
 
+      // The card the owner picked at settle time wins over the invoice's bound
+      // one (wire 1.7.0); omitting it keeps the bound card. `loadStripePaymentContext`
+      // IS the ownership check — it resolves through
+      // `paymentMethodsRepository.findLiveByIdForOwner` and throws 404 for a card
+      // that isn't a live card of THIS owner, so a chosen card needs no second,
+      // driftable check of its own.
+      const chargingPaymentMethodId = payBody.payment_method_id ?? invoiceRow.paymentMethodId;
       const stripeCtx = await loadStripePaymentContext({
         ownerId: principal.ownerId,
-        paymentMethodId: invoiceRow.paymentMethodId,
+        paymentMethodId: chargingPaymentMethodId,
       });
 
       // ── Stripe call (outside tx; idempotency-keyed) ──
@@ -148,6 +183,14 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
             purpose: invoiceRow.purpose,
           },
         },
+        // Deliberately NOT keyed by the chosen card. Since 1.7.0 the peek above
+        // already 422s a same-key-different-card retry, so the only way to reach
+        // Stripe twice under one key with two cards is a first attempt that
+        // called Stripe and then rolled back without persisting its idempotency
+        // row. Stripe rejects the reused key with changed params, and that loud
+        // error is the outcome we want: the alternative — folding the card into
+        // this key — would make the retry a SECOND capture on top of the first
+        // attempt's orphaned charge. Failing beats charging twice.
         `${idempotencyKey}:payment-intent`,
       );
       const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
@@ -244,6 +287,24 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
             // the response carries charge_refunded=true so the client never
             // claims a clean payment for money on its way back.
             pendingStripeRefund = settle.pendingStripeRefund;
+          } else if (chargingPaymentMethodId !== invoiceRow.paymentMethodId) {
+            // Clean win on a card the owner PICKED over the bound one: repoint
+            // the invoice at what actually paid it, in the same tx that settled
+            // it. `LedgerEntryWire.settled_card` is derived from
+            // `invoices.payment_method_id` (the `charges` row stores no card),
+            // so without this the receipt would name a card that was never
+            // charged. Same lever, same reason as the expired-card auto-charge
+            // fallback.
+            //
+            // Deliberately NOT on the two other branches: on 'refunded' another
+            // path settled this invoice and its bound card must keep naming
+            // whatever THAT charged; on the 3DS path nothing was captured and
+            // the invoice stays open, so repointing would hand the auto-charge
+            // worker a card the owner never successfully paid with.
+            await repointPaymentMethod(tx, {
+              id: invoiceRow.id,
+              paymentMethodId: chargingPaymentMethodId,
+            });
           }
 
           return {
@@ -270,9 +331,14 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
   // The owner elects to settle this OPEN, card-backed invoice IN PERSON (cash
   // or check at drop-off) rather than on the card. It charges nothing: it flips
   // `payment_expected` → 'in-person' and, in the same tx, schedules a
-  // `payment-due` reminder ~1h before the linked booking's drop-off (or ~1h
+  // `payment-due` reminder 24h before the linked booking's drop-off (or 24h
   // before the invoice's due time when no booking is linked). Bodyless 204 on
   // success (flag-flip convention, like POST /notifications/:id/read).
+  //
+  // Choosing in-person is never a one-way door: `POST /invoices/:id/pay` still
+  // accepts an in-person invoice (it gates on `status='open'` only), and the
+  // settle tears down this reminder — see `settleInvoiceCharge`. That is what
+  // backs the app's "pay by card now" option on an already-flagged invoice.
   //
   // Shape mirrors `/pay`: peek for an idempotent replay FIRST (this route flips
   // `payment_expected`, which the pre-validation reads — a replay would 409
@@ -331,11 +397,11 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           throw new ApiError('conflict', `invoice ${id} is no longer open + card-backed`);
         }
 
-        // Anchor the reminder ~1h before drop-off; past-due → now (R3) so the
-        // worker fires it on the next tick, same convention as booking reminders.
+        // Anchor the reminder PAYMENT_DUE_LEAD_MS before drop-off, clamped to
+        // now when that lands in the past (R3) so the worker fires it on the
+        // next tick, same convention as booking reminders.
         const anchor = await resolvePaymentDueAnchor(tx, invoiceRow);
-        const scheduledForMs = anchor.at.getTime() - PAYMENT_DUE_LEAD_MS;
-        const scheduledFor = scheduledForMs < now.getTime() ? now : new Date(scheduledForMs);
+        const scheduledFor = paymentDueReminderAt(anchor.at, now);
 
         await scheduledNotificationsRepository.enqueueIdempotent(tx, {
           ownerId: invoiceRow.ownerId,
@@ -346,7 +412,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           title: 'Payment due at drop-off',
           body: `Please bring ${formatDollars(invoiceRow.amountCents)} for your ${purposeLabel(
             invoiceRow.purpose,
-          )} when you drop off.`,
+          )} ${dropOffPhrase(scheduledFor, anchor.at)}.`,
           deepLinkPath: deepLinkToPath({ kind: 'invoice', id }),
           deepLinkKind: 'invoice',
           deepLinkId: id,
@@ -362,8 +428,66 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
   });
 }
 
-/** Lead time for the pay-in-person reminder: ~1h before the drop-off anchor. */
-const PAYMENT_DUE_LEAD_MS = 60 * 60 * 1000;
+/**
+ * Lead time for the pay-in-person reminder: 24h before the drop-off anchor.
+ * (Was 1h through Phase 4c; Allison 2026-07-31 — an hour's notice isn't enough
+ * to get to an ATM, a day is.)
+ */
+const PAYMENT_DUE_LEAD_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * When to fire the "bring cash at drop-off" reminder: PAYMENT_DUE_LEAD_MS
+ * before the anchor, clamped into `[now, anchor]`.
+ *
+ * With a 24h lead the clamp is the COMMON case, not the edge — most invoices
+ * are created (and flagged in-person) less than a day before the drop-off they
+ * bill, so `anchor − 24h` is usually already past. Clamping to `now` makes the
+ * worker fire it on its next tick: late notice beats no notice, and a
+ * `scheduled_for` in the past would otherwise be indistinguishable from a
+ * backlog the worker is behind on.
+ *
+ * The clamp can only push the reminder PAST the anchor when the anchor itself
+ * is already behind us (an invoice flagged after its own drop-off / due date).
+ * No instant satisfies both bounds there, so we still fire now: the money is
+ * owed either way, and staying silent about it is the worse failure.
+ */
+function paymentDueReminderAt(anchorAt: Date, now: Date): Date {
+  const lead = new Date(anchorAt.getTime() - PAYMENT_DUE_LEAD_MS);
+  return lead > now ? lead : now;
+}
+
+/**
+ * How the reminder should refer to the drop-off, derived from the gap between
+ * when it FIRES and the drop-off it is about — both bucketed to America/Chicago
+ * calendar days, the convention the capacity count and the vaccine gate already
+ * use for "which day is this on".
+ *
+ * Deliberately NOT a hardcoded "tomorrow" (Allison 2026-07-31 raised the lead to
+ * 24h so the push lands the day before). At a 24h lead the clamp in
+ * `paymentDueReminderAt` is the COMMON case, not the edge: most invoices are
+ * flagged in-person less than a day before the drop-off they bill, so the
+ * reminder fires immediately and the drop-off is TODAY. Wording it "tomorrow"
+ * unconditionally would be wrong for exactly those, and a reminder that names
+ * the wrong day is worse than one that names no day.
+ *
+ * The neutral fallback also covers the invoice flagged after its own drop-off,
+ * where no day-word is true.
+ */
+function dropOffPhrase(scheduledFor: Date, anchorAt: Date): string {
+  const fireDay = bucketToChicagoDate(scheduledFor);
+  const dropDay = bucketToChicagoDate(anchorAt);
+  if (dropDay === fireDay) return 'when you drop off today';
+  if (dropDay === chicagoDayAfter(fireDay)) return 'when you drop off tomorrow';
+  return 'when you drop off';
+}
+
+/** The calendar day after `day` (YYYY-MM-DD). Pure date arithmetic on the
+ *  already-bucketed Chicago day — anchored at UTC midnight so no DST shift can
+ *  move it, because the value is a calendar label, not an instant. */
+function chicagoDayAfter(day: string): string {
+  const [year, month, date] = day.split('-').map(Number);
+  return new Date(Date.UTC(year!, month! - 1, date! + 1)).toISOString().slice(0, 10);
+}
 
 /**
  * Resolve the payment-due reminder anchor for a cash/check invoice: the linked

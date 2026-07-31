@@ -317,6 +317,66 @@ match key for notification taps); `MembershipWire.payment_method?` `{ brand,
 last4 }` — the §J.1 pinned billing card, joined live-only, omitted when the
 bound card is no longer live.
 
+**Amendment 2026-07-31 (the owner picks the card at settle time; wire 1.6.1 →
+1.7.0).** Allison: _"fix the contract properly."_ Additive
+(`CHANGELOG.md` [1.7.0]); **no DDL**.
+
+The defect. `PayInvoiceModal` renders the owner's real cards and lets them
+select one, and the selection then stopped at the mobile repository boundary —
+`payInvoice` discarded it and POSTed a bodyless request, so the server charged
+`invoices.payment_method_id`. An owner tapped "Mastercard ••8203" and their Visa
+was charged. Live, on the invoices tab that had just become reachable when
+`isManuallyPayable` stopped excluding PAYG and in-person invoices.
+
+**The reason it could hide: `POST /invoices/:id/pay` was not in the contract at
+all.** `InvoicePayWire` was declared in `src/routes/invoices.ts`; there was no
+request type; `LedgerEntryWire` still lives in `src/lib/ledgerWire.ts`. A picker
+that sends nothing and a server that ignores what it doesn't receive agree
+perfectly as long as nothing writes the contract down, so `check:contracts` had
+nothing to compare. Fixing the instance without fixing that would keep the class.
+
+- **`InvoicePayRequest`** (new) — `{ payment_method_id?: string }`. Optional, and
+  a bodyless POST is still the pre-1.7.0 call. The server prefers it over the
+  bound card, verifies it via `loadStripePaymentContext` →
+  `paymentMethodsRepository.findLiveByIdForOwner` (**404** for another owner's or
+  a soft-expired card — tenancy-miss-collapses-to-404 per §G, no second
+  ownership check to drift), and **repoints `invoices.payment_method_id`** at it
+  inside the settle tx.
+- **The repoint is not bookkeeping.** `charges` carries no `payment_method_id`
+  (§B / ledger note), so `LedgerEntryWire.settled_card` is derived from
+  `invoices.payment_method_id`. Without it the receipt names a card that was
+  never charged. Same lever, same reason as the 2026-07-29 expired-card
+  auto-charge fallback. It fires **only** on a clean succeeded settle: not on the
+  lost-race branch (another path settled it; its bound card must keep naming
+  whatever THAT charged, and this charge is being refunded), and not on the 3DS
+  branch (nothing captured, invoice still open — repointing would silently
+  rewrite the auto-charge target from an abandoned 3DS prompt).
+- **Idempotency.** `requestHash` is now `hashRequestBody({ id, ...payBody })`,
+  parsed BEFORE the peek so peek and `withMutation` agree (§ R7 ordering
+  preserved). Canonical JSON drops `undefined` keys, so an omitted card hashes
+  **byte-identically** to the old `{ id }` and no in-flight `Idempotency-Key`
+  breaks. Two calls naming DIFFERENT cards now hash differently — under
+  `hashRequestBody({ id })` they collided and the second replayed the first's
+  stored 201, reporting a charge on a card Stripe was never asked about.
+- **`InvoicePayWire`** relocated into `wire.ts` unchanged, and **`ChargeStatus`**
+  moved there from `chargesRepository` (which re-exports it) because the response
+  reports it; pinned against the `charge_status` pgEnum in `conformance.ts`.
+- **Reminder copy** now names the day it will actually be
+  (`dropOffPhrase`): "…drop off tomorrow" when it fires the day before,
+  "…drop off today" when the 24h lead clamped to now — which is the COMMON case,
+  since most invoices are flagged in-person less than a day before the drop-off
+  they bill. A hardcoded "tomorrow" would be wrong for exactly those.
+
+Still outside the contract and flagged, not fixed: **`LedgerEntryWire`**
+(`src/lib/ledgerWire.ts`) — `GET /invoices` remains unguarded by
+`check:contracts`. Bringing it in is its own contract-first change.
+
+**Correction 2026-07-31 (drift in the 1.5.0 amendment below).** That entry names
+the third new `notification_type` arm `waitlist-accepted`. The arm that shipped —
+in `wire.ts`, the pgEnum, `pushPreferences` and the QA seed — is
+**`waitlist-spot-open`**. The name here was never the real one; read every
+`waitlist-accepted` below as `waitlist-spot-open`.
+
 **Amendment 2026-07-29 (Notification sweep — Apple-rule routing + 3 new types,
 wire 1.4.0 → 1.5.0).** Allison asked for the notification system to be judged
 against "what would Apple do." The modal-first rework scoped in the prior

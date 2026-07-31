@@ -75,7 +75,13 @@ interface WorkerLogger {
  *      Chicago). Flag + notify alumni dogs under 2 attended qualifying
  *      sessions in the just-closed month.
  *
- *   7. **`idempotency_keys` TTL sweep.** Prune rows older than the
+ *   7. **Overdue invoices.** Enqueue `invoice-overdue` for card-backed
+ *      invoices still open past their grace window.
+ *
+ *   8. **Expiring default cards.** Enqueue `card-expiring` before the
+ *      card that backs every auto-charge lapses, and once after.
+ *
+ *   9. **`idempotency_keys` TTL sweep.** Prune rows older than the
  *      retry-safety window (24h default) per schema.sql lines ~918-920.
  *      One Postgres DELETE; runs on the pool runner outside any tx.
  *

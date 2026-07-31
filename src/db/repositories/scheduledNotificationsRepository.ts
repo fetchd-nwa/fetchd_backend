@@ -68,7 +68,7 @@ export type ScheduledNotificationType =
   | 'spay-neuter-reminder'
   // R3 2026-07-27: the cash/check invoice reminder (`payment-due:<invoiceId>`)
   // enqueued by `POST /invoices/:id/pay-in-person`. Push-capable (urgent-
-  // updates) so the owner is reminded to bring payment ~1h before drop-off.
+  // updates) so the owner is reminded to bring payment 24h before drop-off.
   | 'payment-due'
   // Allison 2026-07-29. Both are scheduled-scan arms (no single triggering
   // event) and both are push-capable under 'urgent-updates' — each one means

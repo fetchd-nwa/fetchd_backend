@@ -489,7 +489,7 @@ export const bookingsRepository = {
 
   /**
    * The drop-off / scheduled anchor + lead dog for one booking. Backs the
-   * pay-in-person payment-due reminder (R3): it schedules ~1h before the
+   * pay-in-person payment-due reminder (R3): it schedules 24h before the
    * stay's drop-off (`dropoffAt`), falling back to `scheduledAt` for the
    * non-stay categories that carry no drop-off. Deliberately narrow — no
    * `live()` filter, no ownership scope (the caller already validated the

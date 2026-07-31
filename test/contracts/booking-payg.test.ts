@@ -12,7 +12,9 @@ import {
 } from '../../src/db/schema/schema.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
+import { pgTimestampToDate } from '../../src/lib/pgTimestamp.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
+import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import {
@@ -451,5 +453,97 @@ test(
     assert.equal(invs.length, 1, 'one combined invoice for the booking, not one per dog');
     assert.equal(invs[0]!.amountCents, DAY_CARE_RATE_CENTS * 2, 'per-day rate × 2 dogs');
     assert.equal((await bookingDebitsFor(bookingId)).length, 0, 'PAYG never debits credits');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Settling a PAYG invoice in person (R3; Allison 2026-07-31)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /invoices/:id/pay-in-person — a PAYG invoice flips to in-person and schedules payment-due at scheduled_at − 24h',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Allison 2026-07-31 made every OPEN invoice settleable, PAYG included —
+    // `isManuallyPayable` had excluded it, so this path was unreachable from
+    // the app and untested here. Two things only a PAYG booking can pin:
+    //
+    //   1. A day-program booking carries NO `dropoff_at`, so the reminder
+    //      anchor falls back to `scheduled_at` (`resolvePaymentDueAnchor`).
+    //      invoice-pay-in-person covers the fallback only via an invoice with
+    //      no booking at all, which never exercises the join.
+    //   2. The invoice under the flag is one the BOOKING route created, not one
+    //      the test hand-seeded — so the two writers agree on `payment_method_id`
+    //      and `booking_id` being set, which is what the flip's gate reads.
+    //
+    // Real-clock date: `pay-in-person` anchors against the real now (its route
+    // takes no `now` override), so a FIXTURE_NOW-relative date would already be
+    // past, clamp to now, and hide the 24h arithmetic this exists to pin.
+    const { app } = bookingApp();
+    const res = await postBooking({
+      app,
+      idempotencyKey: `pg-inperson-${randomUUID()}`,
+      payload: {
+        category: 'day-school',
+        lead_dog_id: FIXTURE_IDS.dog2Id,
+        dates: [realFutureWeekday(10)],
+        location: 'fayetteville',
+        payment: 'payg',
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const bookingId = (res.json() as Array<{ id: string }>)[0]!.id;
+    const invoiceId = await paygInvoiceIdFor(bookingId);
+
+    const [booking] = await db
+      .select({ scheduledAt: bookingsTable.scheduledAt, dropoffAt: bookingsTable.dropoffAt })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.id, bookingId));
+    assert.equal(booking?.dropoffAt, null, 'day programs carry no drop-off — anchor is scheduled_at');
+
+    const { app: invoiceApp, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerInvoicesRoute(invoiceApp, { authenticate, stripe: makeStripeStub() });
+    const flip = await invoiceApp.inject({
+      method: 'POST',
+      url: `/invoices/${invoiceId}/pay-in-person`,
+      headers: { 'idempotency-key': `pg-pip-${randomUUID()}` },
+      payload: {},
+    });
+    assert.equal(flip.statusCode, 204, flip.body);
+
+    const invoice = await invoicesRepository.findByIdForOwner(db, {
+      id: invoiceId,
+      ownerId: FIXTURE_IDS.ownerId,
+    });
+    assert.equal(invoice?.paymentExpected, 'in-person', 'PAYG invoice flagged pay-in-person');
+    assert.equal(invoice?.status, 'open', 'the flag charges nothing — the invoice stays open');
+
+    const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+      db,
+      `payment-due:${invoiceId}`,
+    );
+    assert.ok(scheduled !== undefined, 'payment-due reminder enqueued for the PAYG invoice');
+    assert.equal(scheduled?.type, 'payment-due');
+    assert.equal(scheduled?.dogId, FIXTURE_IDS.dog2Id, 'tagged the booking lead dog');
+    assert.match(scheduled!.body, /\$75/, 'body quotes the per-day rate actually billed');
+    assert.equal(
+      pgTimestampToDate(scheduled!.scheduledFor).getTime(),
+      new Date(booking!.scheduledAt).getTime() - ONE_DAY_MS,
+      'scheduled_for = scheduled_at − 24h (no drop-off to prefer)',
+    );
+
+    // Exactly one — the flip must not also leave the auto-charge dunning path
+    // enqueuing a second reminder for the same invoice.
+    const dueRows = await db
+      .select({ id: scheduledNotifications.id })
+      .from(scheduledNotifications)
+      .where(
+        and(
+          eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId),
+          eq(scheduledNotifications.type, 'payment-due'),
+        ),
+      );
+    assert.equal(dueRows.length, 1, 'one payment-due reminder for this invoice, not two');
   },
 );

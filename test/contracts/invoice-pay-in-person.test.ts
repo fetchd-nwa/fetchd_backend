@@ -22,13 +22,12 @@ import type { Principal } from '../../src/auth/principal.js';
 /**
  * R3 contract tests for `POST /invoices/:id/pay-in-person` — the cash/check
  * flag flip. The verb charges nothing: it flips `payment_expected` → 'in-person'
- * and enqueues a `payment-due` reminder anchored ~1h before the linked booking's
- * drop-off (or ~1h before the invoice's due time when unlinked; past-due → now).
+ * and enqueues a `payment-due` reminder anchored 24h before the linked booking's
+ * drop-off (or 24h before the invoice's due time when unlinked; past-due → now).
  */
 
 registerFixtureHooks();
 
-const ONE_HOUR_MS = 3_600_000;
 const ONE_DAY_MS = 86_400_000;
 const REAL_NOW_MS = Date.now();
 
@@ -105,7 +104,7 @@ async function payInPerson(opts: {
 }
 
 test(
-  'POST /invoices/:id/pay-in-person — booking anchor: flags in-person + enqueues payment-due at drop-off − 1h',
+  'POST /invoices/:id/pay-in-person — booking anchor: flags in-person + enqueues payment-due at drop-off − 24h',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -140,8 +139,8 @@ test(
     assert.match(scheduled!.body, /Board & Train/);
     assert.equal(
       pgTimestampToDate(scheduled!.scheduledFor).getTime(),
-      dropoffAt.getTime() - ONE_HOUR_MS,
-      'scheduled_for = drop-off − 1h',
+      dropoffAt.getTime() - ONE_DAY_MS,
+      'scheduled_for = drop-off − 24h',
     );
 
     await cleanup([bookingId]);
@@ -149,7 +148,7 @@ test(
 );
 
 test(
-  'POST /invoices/:id/pay-in-person — due-date anchor (no booking): scheduled_for = due_at − 1h, no dog tag',
+  'POST /invoices/:id/pay-in-person — due-date anchor (no booking): scheduled_for = due_at − 24h, no dog tag',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -168,8 +167,8 @@ test(
     assert.equal(scheduled?.dogId, null, 'no booking + no invoice dog → untagged');
     assert.equal(
       pgTimestampToDate(scheduled!.scheduledFor).getTime(),
-      dueAt.getTime() - ONE_HOUR_MS,
-      'scheduled_for = due_at − 1h',
+      dueAt.getTime() - ONE_DAY_MS,
+      'scheduled_for = due_at − 24h',
     );
 
     await cleanup();
@@ -181,7 +180,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
-    // due_at already in the past → anchor − 1h is past → clamp to now.
+    // due_at already in the past → anchor − 24h is past → clamp to now.
     const invoiceId = await seedOpenInvoice({ dueAt: '2026-06-15T00:00:00Z', bookingId: null });
 
     const { app } = buildApp();
@@ -301,5 +300,60 @@ test(
     assert.equal(inv?.status, 'open');
 
     await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Reminder copy names the right day (Allison 2026-07-31, 24h lead)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /invoices/:id/pay-in-person — reminder that fires the day before says "tomorrow"',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // Drop-off 10 days out, so the 24h lead lands in the future and the
+    // reminder genuinely arrives the day before.
+    const dropoffAt = new Date(REAL_NOW_MS + 10 * ONE_DAY_MS);
+    const bookingId = await seedBoardTrainBooking({ scheduledAt: dropoffAt, dropoffAt });
+    const invoiceId = await seedOpenInvoice({ bookingId });
+
+    const { app } = buildApp();
+    assert.equal((await payInPerson({ app, invoiceId })).statusCode, 204);
+
+    const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+      db,
+      `payment-due:${invoiceId}`,
+    );
+    assert.match(scheduled!.body, /drop off tomorrow/, 'names the day it will actually be');
+
+    await cleanup([bookingId]);
+  },
+);
+
+test(
+  'POST /invoices/:id/pay-in-person — a clamped reminder says "today", never "tomorrow"',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // Flagged in-person only a couple of hours before drop-off. `anchor − 24h`
+    // is already past, so the reminder clamps to now and fires TODAY — the
+    // common case at a 24h lead, and exactly where a hardcoded "tomorrow" would
+    // lie to the owner about which day to bring cash.
+    const dropoffAt = new Date(REAL_NOW_MS + 2 * 60 * 60 * 1000);
+    const bookingId = await seedBoardTrainBooking({ scheduledAt: dropoffAt, dropoffAt });
+    const invoiceId = await seedOpenInvoice({ bookingId });
+
+    const { app } = buildApp();
+    assert.equal((await payInPerson({ app, invoiceId })).statusCode, 204);
+
+    const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+      db,
+      `payment-due:${invoiceId}`,
+    );
+    assert.doesNotMatch(scheduled!.body, /tomorrow/, 'must not claim tomorrow for a same-day drop-off');
+    assert.match(scheduled!.body, /drop off today/);
+
+    await cleanup([bookingId]);
   },
 );

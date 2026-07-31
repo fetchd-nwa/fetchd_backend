@@ -45,6 +45,29 @@ Allison ruled on the open decisions. **Where a domain-section entry or roll-up i
 | 9 | Offerings / retail / packages | **Portal wins.** Offering config becomes backend-owned (`offering_config` + check-in questions), retail is in scope (`retail_items`), and the portal's package concept (all categories + visibility + derived `sold`) is the target. ⚠️ Consequence: the portal package-subscription model collides with locked §J.1 memberships (DRIFT-20) — reconciliation on the comeback list. The 3 OPEN matrix rows (`resTypes`/`updateResType`/`packages`) flip to C. |
 | 10 | Messaging | **Staff can create threads and send attachments.** Unblocks `POST /threads` (staff arm) + widening the message-attachment media purpose to staff. Storage choice for staff read-state, `pdf` kind, and channel prefs are build-time details (comeback list). |
 
+### Adjudication — 2026-07-31 (Allison): the owner picks the card at settle time
+
+**Reverses `BUSINESS-LOGIC/payments-invoices.md` R33** ("Paying an open invoice
+charges its BOUND card… the client cannot pick a different card on the wire").
+As of **wire 1.7.0**, `POST /invoices/:id/pay` accepts an optional
+`payment_method_id` and charges THAT card, then repoints
+`invoices.payment_method_id` at it inside the settle tx so
+`LedgerEntryWire.settled_card` names the card actually charged. Omitting the
+field keeps the old behaviour exactly.
+
+Allison's words: _"fix the contract properly."_ The trigger was a live defect,
+not a feature request — the mobile pay sheet already rendered a card picker
+whose selection was discarded client-side, so an owner could tap "Mastercard
+••8203" and have their Visa charged. R33 described the server correctly; the
+client had been promising something the contract didn't offer.
+
+Read R33 as: **paying an open invoice charges the card the owner chose, falling
+back to the bound card when none is named.** The ownership check is
+`findLiveByIdForOwner` (404 on another owner's or a soft-expired card); the
+rebind fires only on a clean succeeded settle, never on the lost-settle-race or
+3DS branches. Full rationale in `DATA-CONTRACT.md` (Amendment 2026-07-31) and
+`<umbrella>/designs/invoice-pay-card-selection.md`.
+
 ### Clarifications — 2026-07-27, rounds 2–3 (Allison)
 
 - **Board cancel (op `checkin.cancelSession`) is the real money cancel.** Refunds mirror the payment method: credit-paid → credit restored to the lot; card-charged single session → actual card refund. **No-shows also get credit/money back.** Owner late-cancel forfeit (§I window) remains the only keep-the-money case — its consistency with no-show generosity is on the comeback list.
