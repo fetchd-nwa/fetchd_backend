@@ -284,7 +284,7 @@ export function registerRequestConfirmPaymentRoute(
           await notificationsRepository.enqueue(tx, {
             ownerId: row.ownerId,
             type: 'booking-confirmed',
-            title: 'Board & Train confirmed',
+            title: 'Board & Train confirmed!',
             body: `Drop-off ${scheduledAtDate.toLocaleDateString('en-US', {
               timeZone: 'America/Chicago',
               month: 'short',

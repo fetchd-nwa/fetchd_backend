@@ -250,3 +250,20 @@ export function chicagoWallTimeToUtc(dateStr: string, hour: number, minute: numb
   // forward into the post-transition wall).
   return new Date(Math.max(guessUtcMs, lastGuessUtcMs));
 }
+
+/**
+ * A short, human date for owner-facing copy — "Aug 1" — in America/Chicago.
+ *
+ * One definition because two notifications now quote a date back to the owner
+ * (the cancelled-booking body and the payment-failed body), and copy that
+ * formats the same idea two ways reads as two different systems talking.
+ * Chicago rather than UTC for the same reason every other date in this codebase
+ * is: a late-evening event must not name tomorrow.
+ */
+export function chicagoShortDate(instant: Date): string {
+  return instant.toLocaleDateString('en-US', {
+    timeZone: 'America/Chicago',
+    month: 'short',
+    day: 'numeric',
+  });
+}

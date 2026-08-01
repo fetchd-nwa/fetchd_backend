@@ -254,7 +254,7 @@ export function registerStaffRequestsRoute(
             await notificationsRepository.enqueue(tx, {
               ownerId: row.ownerId,
               type: 'booking-confirmed',
-              title: 'Booking confirmed',
+              title: 'Booking confirmed!',
               body: notificationBodyFor(row.category, firstSession.scheduledAt),
               deepLinkPath: deepLinkToPath({ kind: 'booking', id: firstBooking.id }),
               deepLinkKind: 'booking',
@@ -323,7 +323,7 @@ export function registerStaffRequestsRoute(
             await notificationsRepository.enqueue(tx, {
               ownerId: row.ownerId,
               type: 'booking-confirmed',
-              title: 'Booking confirmed',
+              title: 'Booking confirmed!',
               body: notificationBodyFor(row.category, parsed.scheduledAt),
               deepLinkPath: deepLinkToPath({ kind: 'booking', id: inserted.id }),
               deepLinkKind: 'booking',

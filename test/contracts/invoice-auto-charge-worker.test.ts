@@ -376,7 +376,19 @@ test(
     assert.equal(scheduled?.trigger, 'payment-failed');
     assert.equal(scheduled?.status, 'pending', 'not yet delivered — awaits the scheduler tick');
     assert.equal(scheduled?.title, 'Payment failed');
-    assert.match(scheduled!.body, /\$120 for your group class enrollment.*update your card/i);
+    // Allison 2026-08-01 rewrote this copy. Each clause below is one thing she
+    // asked for, pinned separately so a future edit that drops one fails on the
+    // clause it dropped rather than on an opaque whole-string mismatch.
+    assert.match(scheduled!.body, /\$120/, 'names the amount');
+    assert.match(scheduled!.body, /group class enrollment/i, 'names what it was for');
+    assert.match(scheduled!.body, /\bon [A-Z][a-z]{2} \d{1,2}\b/, 'names the date it was tried');
+    assert.match(scheduled!.body, /didn't go through/i, 'says plainly that it failed');
+    assert.match(scheduled!.body, /different form of payment/i, 'offers a way out, not an order');
+    assert.match(scheduled!.body, /another card/i, 'names the card option');
+    assert.match(scheduled!.body, /in person with cash or check/i, 'names the in-person option');
+    // The old copy ordered the owner to "update your card" — one fix, and the
+    // wrong one for a healthy card that simply declined.
+    assert.doesNotMatch(scheduled!.body, /update your card/i);
     assert.equal(scheduled?.deepLinkPath, `/account/invoices?invoiceId=${invoiceId}`);
     assert.equal(scheduled?.deepLinkKind, 'invoice');
     assert.equal(scheduled?.deepLinkId, invoiceId);

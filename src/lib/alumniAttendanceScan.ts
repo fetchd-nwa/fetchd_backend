@@ -45,9 +45,13 @@ export interface AlumniAttendanceScanResult {
 
 /** Owner-facing copy: the flag means "check in with staff before booking". */
 function attendanceBody(dog: AlumniDogAttendance): string {
+  // Allison 2026-08-01: name the two things that actually clear the flag. The
+  // old copy ("reach out to the team") gave one vague action and never said
+  // what was at stake — an owner who books a day school fixes this without
+  // talking to anyone, and that is the cheaper path for both sides.
   return (
     `${dog.dogName} attended fewer than ${ALUMNI_MIN_MONTHLY_SESSIONS} sessions last month. ` +
-    `Reach out to the team for a quick check-in before your next visit.`
+    `Chat with staff or book a Day School to maintain alumni status.`
   );
 }
 

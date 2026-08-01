@@ -27,6 +27,7 @@ import { eq, inArray } from 'drizzle-orm';
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
 import { deepLinkToPath, type NotificationType } from '../src/contracts/wire.js';
+import { chicagoShortDate } from '../src/lib/chicagoDate.js';
 import { formatDollars } from '../src/lib/invoiceReceiptCopy.js';
 import {
   bookingDogs,
@@ -155,7 +156,7 @@ const QA_INVOICE_CENTS = 18_000;
 const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'booking-confirmed',
-    title: 'Booking confirmed',
+    title: 'Booking confirmed!',
     body: 'Waffles is booked for Day School. See you then.',
     deepLinkPath: deepLinkToPath({ kind: 'booking', id: BASE.bookingWafflesSchoolId }),
     deepLinkKind: 'booking',
@@ -223,7 +224,11 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'payment-failed',
     title: 'Payment failed',
-    body: `We couldn’t charge your card for ${formatDollars(QA_INVOICE_CENTS)}. Update it to keep booking.`,
+    body:
+      `We tried your ${formatDollars(QA_INVOICE_CENTS)} payment for Day School on ` +
+      `${chicagoShortDate(new Date(Date.now() - HOUR_MS * 3))} and it didn't go through. ` +
+      `Want to try a different form of payment? You can use another card, or pay ` +
+      `in person with cash or check.`,
     deepLinkPath: deepLinkToPath({ kind: 'invoice', id: BASE.invoiceOpenId }),
     deepLinkKind: 'invoice',
     deepLinkId: BASE.invoiceOpenId,
@@ -277,7 +282,7 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'alumni-attendance',
     title: 'Alumni check-in needed',
-    body: 'Lola hasn’t been in much lately — chat with staff before the next visit.',
+    body: 'Lola attended fewer than 2 sessions last month. Chat with staff or book a Day School to maintain alumni status.',
     deepLinkPath: deepLinkToPath({ kind: 'dog-profile', id: BASE.dogLolaId }),
     deepLinkKind: 'dog-profile',
     deepLinkId: BASE.dogLolaId,

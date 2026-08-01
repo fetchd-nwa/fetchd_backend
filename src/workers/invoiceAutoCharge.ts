@@ -5,6 +5,7 @@ import {
   repointPaymentMethod,
   type InvoiceRow,
 } from '../db/repositories/invoicesRepository.js';
+import { chicagoShortDate } from '../lib/chicagoDate.js';
 import { formatDollars, purposeLabel } from '../lib/invoiceReceiptCopy.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
@@ -414,9 +415,17 @@ async function recordFailed(
       dedupeKey: `payment-failed:${invoice.id}`,
       scheduledFor: now, // immediate — delivered on the next scheduler tick
       title: 'Payment failed',
-      body: `We couldn't process your payment of ${formatDollars(
-        invoice.amountCents,
-      )} for your ${purposeLabel(invoice.purpose)}. Please update your card.`,
+      // Allison 2026-08-01: name WHEN it was tried, then offer a way out rather
+      // than an instruction. "Please update your card" assumed the card was the
+      // problem and offered exactly one fix; an owner whose card is fine but
+      // declined has nothing to do with that sentence. Both real options are
+      // named because both work on the invoice this links to — the settle sheet
+      // takes another card OR flags it pay-in-person (cash/check at drop-off).
+      body:
+        `We tried your ${formatDollars(invoice.amountCents)} payment for ` +
+        `${purposeLabel(invoice.purpose)} on ${chicagoShortDate(now)} and it didn't go through. ` +
+        `Want to try a different form of payment? You can use another card, or pay ` +
+        `in person with cash or check.`,
       deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
       deepLinkKind: 'invoice',
       deepLinkId: invoice.id,
