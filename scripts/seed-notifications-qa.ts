@@ -27,6 +27,7 @@ import { eq, inArray } from 'drizzle-orm';
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
 import { deepLinkToPath, type NotificationType } from '../src/contracts/wire.js';
+import { formatDollars } from '../src/lib/invoiceReceiptCopy.js';
 import {
   bookingDogs,
   bookings,
@@ -102,9 +103,16 @@ const QA = {
   invoiceOverdueId: '12005000-0000-4000-8000-00000000c003',
 } as const;
 
-/** One notification id per type — `n0417000-…-<NN>`, numbered in feed order. */
+/**
+ * The uuid namespace every QA notification lives in. Cleanup deletes by this
+ * PREFIX rather than by the ids a given run computes, because the numbering
+ * below is positional — see `clearPriorQaRows`.
+ */
+const QA_NOTIFICATION_ID_PREFIX = '04170000-0000-4000-8000-';
+
+/** One notification id per type — `04170000-…-<NN>`, numbered in feed order. */
 function notificationId(index: number): string {
-  return `04170000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+  return `${QA_NOTIFICATION_ID_PREFIX}${String(index).padStart(12, '0')}`;
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -131,10 +139,19 @@ interface QaNotification {
 
 /**
  * The full roster, in the order they'll appear (newest first). Every arm of
- * `notification_type` appears EXACTLY once — that total-coverage property is
- * the point of the file, and the `assertEveryTypeCovered` check below fails the
- * run if a future arm is added to the enum and forgotten here.
+ * `notification_type` appears EXACTLY once, except those listed in
+ * `UNSEEDABLE_TYPES` below with a written reason — that near-total-coverage
+ * property is the point of the file, and `assertEveryTypeCovered` fails the run
+ * both when a new arm is forgotten here AND when an exemption goes stale.
  */
+/**
+ * The amount on every QA invoice, and therefore in every money notification's
+ * copy. One constant because the four bodies below and the four invoice rows
+ * they point at have to agree — an owner tapping "your $180 payment went
+ * through" must land on a $180 invoice.
+ */
+const QA_INVOICE_CENTS = 18_000;
+
 const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'booking-confirmed',
@@ -197,7 +214,7 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'payment-succeeded',
     title: 'Payment received',
-    body: 'Thanks! Your $180.00 payment went through.',
+    body: `Thanks! Your ${formatDollars(QA_INVOICE_CENTS)} payment went through.`,
     deepLinkPath: deepLinkToPath({ kind: 'invoice', id: QA.invoicePaidId }),
     deepLinkKind: 'invoice',
     deepLinkId: QA.invoicePaidId,
@@ -206,7 +223,7 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'payment-failed',
     title: 'Payment failed',
-    body: 'We couldn’t charge your card for $180.00. Update it to keep booking.',
+    body: `We couldn’t charge your card for ${formatDollars(QA_INVOICE_CENTS)}. Update it to keep booking.`,
     deepLinkPath: deepLinkToPath({ kind: 'invoice', id: BASE.invoiceOpenId }),
     deepLinkKind: 'invoice',
     deepLinkId: BASE.invoiceOpenId,
@@ -214,7 +231,7 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'payment-due',
     title: 'Payment due at drop-off',
-    body: 'Bring $180.00 (cash or check) when you drop off tomorrow.',
+    body: `Bring ${formatDollars(QA_INVOICE_CENTS)} (cash or check) when you drop off tomorrow.`,
     deepLinkPath: deepLinkToPath({ kind: 'invoice', id: QA.invoiceInPersonId }),
     deepLinkKind: 'invoice',
     deepLinkId: QA.invoiceInPersonId,
@@ -222,7 +239,7 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'invoice-overdue',
     title: 'Payment still outstanding',
-    body: 'Your $180.00 invoice hasn’t gone through yet. Check the card on file.',
+    body: `Your ${formatDollars(QA_INVOICE_CENTS)} invoice hasn’t gone through yet. Check the card on file.`,
     deepLinkPath: deepLinkToPath({ kind: 'invoice', id: QA.invoiceOverdueId }),
     deepLinkKind: 'invoice',
     deepLinkId: QA.invoiceOverdueId,
@@ -258,15 +275,6 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
     dogIds: [BASE.dogWafflesId],
   },
   {
-    type: 'waitlist-spot-open',
-    title: 'A spot opened up',
-    body: 'A Day Care spot opened up for Lola on Thursday. Accept within 24 hours to claim it.',
-    deepLinkPath: deepLinkToPath({ kind: 'booking', id: BASE.bookingBrodieBoardingId }),
-    deepLinkKind: 'booking',
-    deepLinkId: BASE.bookingBrodieBoardingId,
-    dogIds: [BASE.dogLolaId],
-  },
-  {
     type: 'alumni-attendance',
     title: 'Alumni check-in needed',
     body: 'Lola hasn’t been in much lately — chat with staff before the next visit.',
@@ -298,10 +306,86 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
 ];
 
 /**
- * Fails the run if the enum grows an arm this seed doesn't cover. Allison's
- * requirement is "every notification type exists in the notifications so I can
- * verify" — that only stays true if adding a type without a QA row is loud.
- * Reads the live pgEnum rather than a hand-copied list, so it can't drift.
+ * Enum arms that deliberately have NO QA row, each with the reason it can't
+ * have one. This is not a way to skip work — a fixture that cannot BUILD the
+ * state it claims must not fabricate one, which is the whole lesson of the four
+ * bugs Allison found by tapping (a "cancelled" booking that wasn't cancelled, a
+ * "tomorrow" reminder pointing two weeks back). A row that lies is worse than
+ * an absent row, because it reads as verified.
+ *
+ * Adding to this map is a deliberate act with a written reason. Everything not
+ * listed here still has to have a row, and the check below still fails loudly.
+ */
+const UNSEEDABLE_TYPES: Readonly<Record<string, string>> = {
+  // Parked 2026-07-31 with the rest of the waitlist. Nothing emits it (the
+  // producer went back to `waitlist-wip` with the feature), there are no
+  // `waitlist_entries` rows on this branch to point at, and the mobile
+  // `/waitlist/[id]` screen isn't built — a tap lands on `+not-found`. The row
+  // that used to sit here claimed "a Day Care spot opened up for Lola" and
+  // deep-linked to BRODIE'S BOARDING BOOKING: wrong dog, wrong category, and
+  // an offer pointing at a booking when the point of the type is that nothing
+  // is booked yet. Restore a real row when the waitlist ships.
+  'waitlist-spot-open': 'waitlist parked 2026-07-31 — no producer, no entry to link, no screen',
+};
+
+/**
+ * The `seed-dev` rows this seed BORROWS rather than builds — stable identities
+ * (the owner, her dogs, a thread, a card) that a notification points at.
+ *
+ * Checked before anything is written, because a dev DB that has drifted from
+ * `seed-dev` is indistinguishable from a correct one at query time: every row
+ * you ask about answers truthfully, it is the ABSENT rows that mislead. That is
+ * not hypothetical — on 2026-08-01 this DB held 2 of the 4 seeded dogs and no
+ * boarding bookings, and reading it produced two confident, wrong conclusions
+ * about fixtures that were actually fine. A stale environment has to announce
+ * itself; you cannot infer it from the answers it gives.
+ */
+const BORROWED_FROM_SEED_DEV: ReadonlyArray<{ what: string; table: string; id: string }> = [
+  { what: 'owner Allison', table: 'owners', id: BASE.ownerAllisonId },
+  { what: 'staff Shanthi', table: 'staff', id: BASE.staffShanthiId },
+  { what: 'dog Waffles', table: 'dogs', id: BASE.dogWafflesId },
+  { what: 'dog Lola', table: 'dogs', id: BASE.dogLolaId },
+  { what: "Waffles' day-school booking", table: 'bookings', id: BASE.bookingWafflesSchoolId },
+  { what: "Allison's thread", table: 'threads', id: BASE.threadAllisonId },
+  { what: "Allison's card", table: 'payment_methods', id: BASE.paymentMethodAllisonId },
+  { what: 'the open invoice', table: 'invoices', id: BASE.invoiceOpenId },
+  { what: 'the Yappy Hour announcement', table: 'announcements', id: BASE.annYappyHourId },
+];
+
+/**
+ * Refuse to seed against a dev DB that `seed-dev` hasn't populated (or has
+ * populated to a different shape). Seeding anyway produces a feed that LOOKS
+ * complete while pointing at subjects that aren't there — the exact failure this
+ * file exists to prevent, one level up.
+ */
+async function assertBaseSeedPresent(): Promise<void> {
+  const absent: string[] = [];
+  for (const subject of BORROWED_FROM_SEED_DEV) {
+    const rows = await db.execute(
+      `SELECT 1 FROM ${subject.table} WHERE id = '${subject.id}' LIMIT 1`,
+    );
+    if (rows.rows.length === 0) absent.push(`${subject.what} (${subject.table})`);
+  }
+  if (absent.length > 0) {
+    throw new Error(
+      `seed-notifications-qa: the dev DB is missing ${absent.length} row(s) this seed points at:\n` +
+        absent.map((a) => `  · ${a}`).join('\n') +
+        `\nThe dev DB has drifted from scripts/seed-dev.ts. Run \`npm run db:dev:seed\` first ` +
+        `(then this). Seeding on top of a stale DB yields a feed that looks right and isn't — ` +
+        `and any diagnosis read off that DB will be wrong in the same invisible way.`,
+    );
+  }
+}
+
+/**
+ * Fails the run if the enum grows an arm this seed neither covers nor
+ * explicitly parks. Allison's requirement is "every notification type exists in
+ * the notifications so I can verify" — that only stays true if adding a type
+ * without a QA row is loud. Reads the live pgEnum rather than a hand-copied
+ * list, so it can't drift.
+ *
+ * Also fails if `UNSEEDABLE_TYPES` names an arm that no longer exists, or one
+ * that now HAS a row — a stale exemption is how a gap quietly reopens.
  */
 async function assertEveryTypeCovered(): Promise<void> {
   const rows = await db.execute(
@@ -311,12 +395,27 @@ async function assertEveryTypeCovered(): Promise<void> {
   );
   const inDatabase = (rows.rows as { label: string }[]).map((r) => r.label);
   const covered = new Set<string>(QA_NOTIFICATIONS.map((n) => n.type));
-  const missing = inDatabase.filter((label) => !covered.has(label));
+  const parked = Object.keys(UNSEEDABLE_TYPES);
+
+  const missing = inDatabase.filter((label) => !covered.has(label) && !parked.includes(label));
   if (missing.length > 0) {
     throw new Error(
       `seed-notifications-qa is missing a row for: ${missing.join(', ')}. ` +
-        `Add one to QA_NOTIFICATIONS so every type stays verifiable in the feed.`,
+        `Add one to QA_NOTIFICATIONS so every type stays verifiable in the feed ` +
+        `(or, if it genuinely cannot be demonstrated yet, add it to UNSEEDABLE_TYPES with a reason).`,
     );
+  }
+
+  const staleExemptions = parked.filter((label) => !inDatabase.includes(label) || covered.has(label));
+  if (staleExemptions.length > 0) {
+    throw new Error(
+      `UNSEEDABLE_TYPES is stale for: ${staleExemptions.join(', ')} — ` +
+        `each is either gone from the enum or now has a QA row. Remove the exemption.`,
+    );
+  }
+
+  for (const [label, why] of Object.entries(UNSEEDABLE_TYPES)) {
+    console.log(`  · ${label}: no QA row on purpose — ${why}`);
   }
 }
 
@@ -373,7 +472,7 @@ async function seedNotificationSubjects(): Promise<void> {
   await db.insert(charges).values({
     id: QA.chargePaidId,
     ownerId: BASE.ownerAllisonId,
-    amountCents: 18000,
+    amountCents: QA_INVOICE_CENTS,
     status: 'succeeded',
     purpose: 'payg',
     createdAt: hoursAgo(7),
@@ -382,7 +481,7 @@ async function seedNotificationSubjects(): Promise<void> {
     {
       id: QA.invoicePaidId,
       ownerId: BASE.ownerAllisonId,
-      amountCents: 18000,
+      amountCents: QA_INVOICE_CENTS,
       status: 'paid',
       purpose: 'payg',
       paymentMethodId: BASE.paymentMethodAllisonId,
@@ -395,7 +494,7 @@ async function seedNotificationSubjects(): Promise<void> {
       // "Payment due at drop-off" — the cash/check path.
       id: QA.invoiceInPersonId,
       ownerId: BASE.ownerAllisonId,
-      amountCents: 18000,
+      amountCents: QA_INVOICE_CENTS,
       status: 'open',
       purpose: 'payg',
       paymentMethodId: BASE.paymentMethodAllisonId,
@@ -407,7 +506,7 @@ async function seedNotificationSubjects(): Promise<void> {
       // "Payment still outstanding" — open and past the 3-day grace window.
       id: QA.invoiceOverdueId,
       ownerId: BASE.ownerAllisonId,
-      amountCents: 18000,
+      amountCents: QA_INVOICE_CENTS,
       status: 'open',
       purpose: 'payg',
       paymentMethodId: BASE.paymentMethodAllisonId,
@@ -494,9 +593,21 @@ async function seedNotifications(): Promise<void> {
 
 /** Clear only the rows this script owns, so re-running is safe + idempotent. */
 async function clearPriorQaRows(): Promise<void> {
-  const ids = QA_NOTIFICATIONS.map((_, index) => notificationId(index + 1));
-  await db.delete(notificationDogs).where(inArray(notificationDogs.notificationId, ids));
-  await db.delete(notifications).where(inArray(notifications.id, ids));
+  // Delete the whole QA id NAMESPACE, not just the ids this run happens to
+  // produce. `notificationId` numbers rows by their position in the roster, so
+  // adding, removing or reordering a row shifts every id after it — and a
+  // cleanup scoped to the current list would leave the previous run's rows
+  // behind under the ids that shifted. That is not hypothetical: parking
+  // `waitlist-spot-open` shifted six ids and left an orphaned duplicate
+  // "Yappy Hour is back" in the feed, which is precisely the kind of thing the
+  // owner finds by tapping and the seed exists to prevent.
+  await db.execute(
+    `DELETE FROM notification_dogs
+      WHERE notification_id::text LIKE '${QA_NOTIFICATION_ID_PREFIX}%'`,
+  );
+  await db.execute(
+    `DELETE FROM notifications WHERE id::text LIKE '${QA_NOTIFICATION_ID_PREFIX}%'`,
+  );
   await db.delete(memberships).where(inArray(memberships.id, [QA.membershipEndedId]));
   await db.delete(reports).where(inArray(reports.id, [QA.reportWafflesId]));
   // Invoices before charges (paid_charge_id FK), bookingDogs before bookings.
@@ -514,6 +625,9 @@ async function clearPriorQaRows(): Promise<void> {
 
 async function main(): Promise<void> {
   assertLocalDb();
+  // Preconditions before any write: the base seed must be present (a stale DB
+  // cannot be detected from the answers it gives), and the enum must be covered.
+  await assertBaseSeedPresent();
   await assertEveryTypeCovered();
   await clearPriorQaRows();
   await seedNotificationSubjects();
@@ -521,7 +635,8 @@ async function main(): Promise<void> {
   await seedNotifications();
   console.log(
     `seed-notifications-qa: seeded ${QA_NOTIFICATIONS.length} notifications ` +
-      `(one per notification_type) for owner ${BASE.ownerAllisonId}.`,
+      `(one per notification_type, less ${Object.keys(UNSEEDABLE_TYPES).length} parked above) ` +
+      `for owner ${BASE.ownerAllisonId}.`,
   );
 }
 
