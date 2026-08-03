@@ -14,10 +14,13 @@
 #   1. It runs EVERY step even after one fails. `a && b && c` stops at the first
 #      failure, so you learn about lint and never learn about the suite — which
 #      is how a branch acquires two problems and a report mentioning one.
-#   2. It reads `# pass` / `# fail` / `# skipped` out of the suite, not just the
-#      exit code. A run that silently skipped every DB test exits 0. That has
-#      happened here (`SKIP_WHEN_NO_DB` misused as `{ skip: ... }` skips forever
-#      while reporting green).
+#   2. It reads the suite's own counts out of its summary block — tests, pass,
+#      fail, cancelled, skipped, todo — not just the exit code, and treats every
+#      test that did not PASS as a failure. A run that silently skipped every DB
+#      test exits 0. That has happened here (`SKIP_WHEN_NO_DB` misused as
+#      `{ skip: ... }` skips forever while reporting green). So does a throwing
+#      `{ todo: true }` test, which node:test scores `# pass 0 / # fail 0 /
+#      # todo 1` and exit 0.
 #   3. It prints one summary you can paste. If any step failed, the last line
 #      says FAILED and the exit code is non-zero — there is no arrangement of
 #      this output that lets a partial pass read as a pass.
@@ -45,13 +48,47 @@ test_code=${PIPESTATUS[0]}
 NAMES+=("test")
 CODES+=("$test_code")
 
-# The counts, not just the exit code. `-1` means the line was absent entirely,
-# which is itself a failure: a suite that printed no summary did not run.
-counts=$(grep -E '^# (tests|pass|fail|skipped)' "$LOGDIR/test.log" | tr '\n' ' ')
-fails=$(grep -E '^# fail' "$LOGDIR/test.log" | grep -oE '[0-9]+' | head -1)
-skips=$(grep -E '^# skipped' "$LOGDIR/test.log" | grep -oE '[0-9]+' | head -1)
-: "${fails:=-1}"
-: "${skips:=-1}"
+# ── Reading the suite, not the exit code ──────────────────────────────────────
+#
+# Two ways this used to lie, both found by adversarial review on 2026-08-03:
+#
+#   a. It grepped `# fail` and `# skipped` and nothing else. node:test reports a
+#      `{ todo: true }` test that THROWS as passing-with-directive:
+#        `# tests 1 / # pass 0 / # fail 0 / # skipped 0 / # todo 1`, exit 0.
+#      Nothing in that shape is a failure to a reader who only looks at two of
+#      the counters, so a broken test marked todo was gate green. Verified
+#      against real node:test v22 output, not assumed.
+#   b. It took `head -1` of a grep over the WHOLE log. The summary is the LAST
+#      thing the run prints; the first `^# fail` line anywhere in several
+#      thousand lines of output is not necessarily part of it. Whatever the
+#      backstop is for, it is not "whichever line got there first".
+#
+# So: parse the LAST COMPLETE summary block and decide from that alone. A block
+# is `# tests N` … `# duration_ms N`, and every counter must be inside it.
+# Anchoring each pattern with `$` matters too — node's TAP reporter escapes `#`
+# in test output as `# \# fail 0`, which must not be mistaken for a counter.
+#
+# The display line below is rendered from the same parse that makes the
+# decision. Printing one number and deciding on another is how you get a summary
+# that disagrees with its own verdict.
+read -r n_tests n_pass n_fail n_cancelled n_skipped n_todo <<EOF
+$(awk '
+  /^# tests [0-9]+$/      { t=$3; p=""; f=""; c=0; s=""; d=""; inblock=1; next }
+  !inblock                { next }
+  /^# pass [0-9]+$/       { p=$3; next }
+  /^# fail [0-9]+$/       { f=$3; next }
+  /^# cancelled [0-9]+$/  { c=$3; next }
+  /^# skipped [0-9]+$/    { s=$3; next }
+  /^# todo [0-9]+$/       { d=$3; next }
+  /^# duration_ms /       {
+    if (p != "" && f != "" && s != "" && d != "") {
+      T=t; P=p; F=f; C=c; S=s; D=d; found=1
+    }
+    inblock=0; next
+  }
+  END { if (found) print T, P, F, C, S, D }
+' "$LOGDIR/test.log")
+EOF
 
 printf '\n════════════════════ GATE SUMMARY ════════════════════\n'
 failed=0
@@ -63,17 +100,41 @@ for i in "${!NAMES[@]}"; do
     failed=1
   fi
 done
-printf '  suite counts: %s\n' "${counts:-<no summary line — the suite did not run>}"
+if [ -z "${n_tests:-}" ]; then
+  printf '  suite counts: <no node:test summary block — the suite did not run>\n'
+  printf '  ⚠ no complete summary block in the test log — nothing here proves a test ran\n'
+  failed=1
+else
+  printf '  suite counts: tests %s | pass %s | fail %s | cancelled %s | skipped %s | todo %s\n' \
+    "$n_tests" "$n_pass" "$n_fail" "$n_cancelled" "$n_skipped" "$n_todo"
 
-if [ "$fails" != "0" ]; then
-  printf '  ⚠ %s failing test(s)\n' "$fails"
-  failed=1
-fi
-if [ "$skips" != "0" ]; then
-  # Skips are not failures, but they are the shape of a green that proves
-  # nothing — surfaced so nobody has to remember to look.
-  printf '  ⚠ %s SKIPPED test(s) — a skipped suite is not a passing suite\n' "$skips"
-  failed=1
+  if [ "$n_fail" != "0" ]; then
+    printf '  ⚠ %s failing test(s)\n' "$n_fail"
+    failed=1
+  fi
+  # Everything below is a test that did not pass while the exit code said 0.
+  # Each one is a green that proves nothing, so each one is a failure here.
+  if [ "$n_skipped" != "0" ]; then
+    printf '  ⚠ %s SKIPPED test(s) — a skipped test is not a passing test\n' "$n_skipped"
+    failed=1
+  fi
+  if [ "$n_todo" != "0" ]; then
+    # A todo that throws is reported `not ok … # TODO` and counted here and
+    # NOWHERE else — not in fail, not in pass. Unread, it is invisible.
+    printf '  ⚠ %s TODO test(s) — a todo is not a passing test, and a todo that throws is counted here and nowhere else\n' "$n_todo"
+    failed=1
+  fi
+  if [ "$n_cancelled" != "0" ]; then
+    printf '  ⚠ %s CANCELLED test(s) — a cancelled test is not a passing test\n' "$n_cancelled"
+    failed=1
+  fi
+  if [ "$n_tests" -eq 0 ]; then
+    printf '  ⚠ the suite reported 0 tests — a suite that ran nothing cannot be green\n'
+    failed=1
+  elif [ "$n_pass" -eq 0 ]; then
+    printf '  ⚠ 0 of %s test(s) passed — an all-zero pass count is not a green suite\n' "$n_tests"
+    failed=1
+  fi
 fi
 
 if [ "$failed" -eq 0 ]; then
