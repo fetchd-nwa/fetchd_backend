@@ -62,7 +62,8 @@ export type ApiErrorCode =
   | 'already_booked' // Day 19d: day-program booking blocked — dog already has a live booking for (category, day)
   | 'already_enrolled' // Day 19d: enrollment blocked — dog already enrolled in this cohort
   | 'already_requested' // Day 19d: request blocked — dog already has an open request of this category
-  | 'event_full'; // Day 19e: event RSVP blocked — live rsvp dogs + requested > events.capacity (owner self-serve soft cap)
+  | 'event_full' // Day 19e: event RSVP blocked — live rsvp dogs + requested > events.capacity (owner self-serve soft cap)
+  | 'payment_failed'; // 1.8.0: a charge was ATTEMPTED and did not complete — nothing was created or settled
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   unauthenticated: 401,
@@ -93,6 +94,11 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   already_requested: 422,
   // Day 19e event RSVP soft cap — 422 (state-block: event is full).
   event_full: 422,
+  // 1.8.0 grant-site charge refusal — 402, and the one code here whose meaning
+  // is about MONEY rather than state: the card WAS charged, the charge did not
+  // complete, and nothing was created or settled behind it. Every other 4xx in
+  // this table means "we didn't try".
+  payment_failed: 402,
 };
 
 /**
@@ -118,4 +124,22 @@ export class ApiError extends Error {
     this.status = STATUS_BY_CODE[code];
     this.details = details;
   }
+}
+
+/**
+ * "Another request holds this Idempotency-Key and is still running"
+ * (`db/idempotency.ts` state 3). Read the `code`, never the message — the
+ * prose is a UI string and changing it must not change behavior.
+ *
+ * Exists for the two routes that capture money BEFORE their transaction opens
+ * (`routes/enrollments.ts`, `routes/requestConfirmPayment.ts`). Their catch
+ * blocks unwind the capture on any failure, and this is the ONE failure where
+ * unwinding is wrong: losing the claim race means the money the caller is
+ * holding is the OTHER request's — Stripe's own idempotency keyed off the same
+ * `Idempotency-Key` handed this request back the in-flight one's PaymentIntent.
+ * Refunding it would undo a charge that request is about to commit a booking
+ * against. One predicate, two call sites, so the exclusion is one decision.
+ */
+export function isIdempotencyInflight(err: unknown): boolean {
+  return err instanceof ApiError && err.code === 'idempotency_inflight';
 }

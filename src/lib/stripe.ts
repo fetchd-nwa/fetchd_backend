@@ -1,5 +1,7 @@
+import type { FastifyBaseLogger } from 'fastify';
 import Stripe from 'stripe';
 import { env } from '../env.js';
+import type { ChargeBlocker } from '../contracts/wire.js';
 import type { ChargeStatus } from '../db/repositories/chargesRepository.js';
 import { ApiError } from './errors.js';
 
@@ -107,6 +109,75 @@ export function stripeIntentStatusToChargeStatus(status: StripePaymentIntentStat
     case 'processing':
     case 'requires_capture':
       return 'requires_payment';
+  }
+}
+
+/**
+ * Every raw PaymentIntent status EXCEPT `succeeded` — the domain of
+ * {@link stripeIntentStatusToChargeBlocker}, since a confirm that reached
+ * `succeeded` has nothing blocking it. Derived from
+ * {@link StripePaymentIntentStatus} rather than re-listed, so a future Stripe
+ * status lands in the blocker switch as a TS error too.
+ */
+export type UnsettledPaymentIntentStatus = Exclude<StripePaymentIntentStatus, 'succeeded'>;
+
+/**
+ * Map a non-succeeded Stripe `payment_intent.status` to the DOMAIN reason the
+ * confirm stopped short — precisely the information
+ * {@link stripeIntentStatusToChargeStatus} above destroys, which is why this
+ * lives beside it. Five Stripe statuses collapse into `'requires_payment'`
+ * there, but "the card needs verification we cannot complete", "the card was
+ * declined" and "the money is still in flight, do NOT retry" are three
+ * different true sentences with three different next actions for the owner.
+ * The wire (1.8.0 `ChargeBlocker`) carries this BESIDE the collapsed status,
+ * never instead of it — `charge_status` is pinned to the `charge_status`
+ * pgEnum and widening it would be DDL.
+ *
+ * Two statuses are anomalous after a `confirm: true, off_session: true` create
+ * and so warn rather than map silently — reaching them means Stripe's
+ * lifecycle no longer matches the one modelled here:
+ *
+ *   - `requires_confirmation` — we confirmed; Stripe handing it back
+ *     unconfirmed shouldn't happen. Read as `authentication_required`, the
+ *     closest still-live state, so the copy asks for another card instead of
+ *     asserting a decline that didn't happen.
+ *   - `requires_capture` — nothing in this system authorizes without
+ *     capturing. Read as `processing` because the money may be authorized and
+ *     in flight; calling that "declined" would be flatly false.
+ *
+ * Exhaustive `switch` on the RAW status, same discipline as its neighbour: a
+ * future Stripe status surfaces as a TS error rather than a silent fallback.
+ */
+export function stripeIntentStatusToChargeBlocker(
+  status: UnsettledPaymentIntentStatus,
+  log: FastifyBaseLogger,
+): ChargeBlocker {
+  switch (status) {
+    case 'requires_action':
+      return 'authentication_required';
+    case 'requires_payment_method':
+      // Stripe resets a PI to this after an attempt that FAILED but returned a
+      // status rather than throwing a card error.
+      return 'declined';
+    case 'processing':
+      return 'processing';
+    case 'canceled':
+      // Defensive: `charge_status` is already 'failed' on this status and the
+      // client's pessimistic arm covers it. 'declined' is the honest domain
+      // reading of an intent that ended with no money moved.
+      return 'declined';
+    case 'requires_confirmation':
+      log.warn(
+        { stripeIntentStatus: status },
+        'off-session confirm returned requires_confirmation — anomalous after confirm:true; reporting authentication_required',
+      );
+      return 'authentication_required';
+    case 'requires_capture':
+      log.warn(
+        { stripeIntentStatus: status },
+        'off-session confirm returned requires_capture — anomalous (nothing here authorizes without capturing); reporting processing',
+      );
+      return 'processing';
   }
 }
 
@@ -239,12 +310,15 @@ export interface StripeClient {
   detachPaymentMethod(paymentMethodId: StripePaymentMethodId): Promise<void>;
 
   /**
-   * Cancel a PaymentIntent that didn't settle on an off-session auto-charge
-   * attempt (returned `requires_action` / `processing` / `requires_payment_
-   * method` rather than `succeeded`), so it can't later auto-succeed and
-   * double-charge against the next retry's fresh PI. Best-effort: the worker
-   * swallows failures — a PI Stripe refuses to cancel (already settling) is
-   * covered by the attempt-keyed Stripe idempotency on the next retry.
+   * Cancel a PaymentIntent that didn't settle on an off-session confirm
+   * (returned `requires_action` / `processing` / `requires_payment_method`
+   * rather than `succeeded`), so it can't later auto-succeed and double-charge
+   * against the next attempt's fresh PI. Every off-session confirm path owes
+   * this call while no client-side 3DS completion flow exists — the auto-charge
+   * worker, `POST /invoices/:id/pay`, `POST /credit-packages/:key/purchase`,
+   * `POST /memberships`, and the group-class enroll unwind. Best-effort: every
+   * caller swallows failures — a PI Stripe refuses to cancel (already settling)
+   * is covered by the key-scoped Stripe idempotency on the next attempt.
    */
   cancelPaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<void>;
 

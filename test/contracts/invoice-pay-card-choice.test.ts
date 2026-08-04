@@ -4,7 +4,14 @@ import { test } from 'node:test';
 import { eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
-import { charges, invoices, owners, paymentMethods, refunds } from '../../src/db/schema/schema.js';
+import {
+  charges,
+  idempotencyKeys,
+  invoices,
+  owners,
+  paymentMethods,
+  refunds,
+} from '../../src/db/schema/schema.js';
 import type { LedgerEntryWire } from '../../src/lib/ledgerWire.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { FIXTURE_IDS } from './_fixture.js';
@@ -15,6 +22,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
+import type { StripePaymentIntentStatus } from '../../src/lib/stripe.js';
 
 /**
  * Contract tests for `POST /invoices/:id/pay` honouring the card the owner
@@ -34,6 +42,9 @@ import { makeStripeStub } from './_stripeStub.js';
  *      collide. Under the old `hashRequestBody({ id })` they hashed the same, so
  *      the second replayed the first's stored 201 — the client was told a card
  *      had been charged that never was.
+ *
+ * Wire 1.7.1 adds a fourth, in the last section: a confirm that does NOT settle
+ * leaves no live PaymentIntent behind.
  */
 
 registerFixtureHooks();
@@ -142,8 +153,7 @@ async function pay(
   invoiceId: string,
   opts: { card?: string; key?: string; payload?: Record<string, unknown> } = {},
 ) {
-  const payload =
-    opts.payload ?? (opts.card === undefined ? {} : { payment_method_id: opts.card });
+  const payload = opts.payload ?? (opts.card === undefined ? {} : { payment_method_id: opts.card });
   return app.inject({
     method: 'POST',
     url: `/invoices/${invoiceId}/pay`,
@@ -157,6 +167,24 @@ function chargedStripeCards(stripe: ReturnType<typeof makeStripeStub>): string[]
   return stripe.calls
     .filter((c) => c.method === 'createAndConfirmPaymentIntent')
     .map((c) => c.args.paymentMethodId);
+}
+
+/** The invoice fields a pay attempt is allowed to move — read as one snapshot so
+ *  "untouched" is a single assertion rather than three that can drift apart. */
+async function invoiceRowOf(invoiceId: string) {
+  const [row] = await db
+    .select({
+      status: invoices.status,
+      paymentMethodId: invoices.paymentMethodId,
+      nextAttemptAt: invoices.nextAttemptAt,
+      autoChargeAttempts: invoices.autoChargeAttempts,
+      paidChargeId: invoices.paidChargeId,
+      paidAt: invoices.paidAt,
+    })
+    .from(invoices)
+    .where(eq(invoices.id, invoiceId));
+  assert.ok(row !== undefined, `invoice ${invoiceId} exists`);
+  return row;
 }
 
 async function boundCardOf(invoiceId: string): Promise<string | undefined> {
@@ -419,6 +447,225 @@ test(
       FIXTURE_IDS.paymentMethod1Id,
       'bound card unchanged on the 3DS path',
     );
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// The abandoned PaymentIntent is cancelled (wire 1.7.1)
+//
+// The hazard: an intent left live after a non-succeeded confirm can auto-succeed
+// later while the owner's next attempt captures on a fresh one — two succeeded
+// charges against one invoice, and `settleInvoiceCharge`'s duplicate refund only
+// fires inside a settle, so neither reverses. The auto-charge worker has always
+// cancelled for this reason; this route did not until 1.7.1.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** The PaymentIntent ids this stub was asked to cancel. */
+function cancelledIntents(stripe: ReturnType<typeof makeStripeStub>): string[] {
+  return stripe.calls
+    .filter((c) => c.method === 'cancelPaymentIntent')
+    .map((c) => c.args.paymentIntentId);
+}
+
+test(
+  'POST /invoices/:id/pay — a non-succeeded confirm cancels the PaymentIntent it just created',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    await seedCards();
+    const invoiceId = await seedOpenInvoice();
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentStatus('requires_action');
+
+    const res = await pay(app, invoiceId, { card: CARD2_ID });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as { stripe_payment_intent_id: string; invoice_status: string };
+    assert.equal(body.invoice_status, 'open');
+
+    assert.deepEqual(
+      cancelledIntents(stripe),
+      [body.stripe_payment_intent_id],
+      'the intent named in the response is the intent that was cancelled',
+    );
+    await cleanup();
+  },
+);
+
+test('POST /invoices/:id/pay — a succeeded confirm cancels nothing', SKIP_WHEN_NO_DB, async () => {
+  await cleanup();
+  await seedCards();
+  const invoiceId = await seedOpenInvoice();
+  const { app, stripe } = buildApp();
+
+  assert.equal((await pay(app, invoiceId, { card: CARD2_ID })).statusCode, 201);
+  assert.deepEqual(cancelledIntents(stripe), [], 'never cancel money that settled');
+  await cleanup();
+});
+
+test(
+  'POST /invoices/:id/pay — a cancel Stripe refuses does not fail the request',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    await seedCards();
+    const invoiceId = await seedOpenInvoice();
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentStatus('requires_action');
+    stripe.throwOnCancel();
+
+    // Best-effort is the whole point: an uncancellable intent (a `processing`
+    // one Stripe is already settling) must not turn a recorded attempt into a
+    // 500 the owner reads as "nothing happened".
+    const res = await pay(app, invoiceId, { card: CARD2_ID });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as { charge_id: string; charge_status: string };
+    assert.equal(body.charge_status, 'requires_payment');
+    assert.equal(cancelledIntents(stripe).length, 1, 'the cancel was attempted');
+
+    // The charge row is still written — it is the audit trail for an attempt
+    // that reached Stripe.
+    const [charge] = await db
+      .select({ status: charges.status })
+      .from(charges)
+      .where(eq(charges.id, body.charge_id));
+    assert.equal(charge?.status, 'requires_payment');
+    await cleanup();
+  },
+);
+
+test(
+  'POST /invoices/:id/pay — a cancelled-PI attempt leaves the invoice exactly as it found it',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    await seedCards();
+    const invoiceId = await seedOpenInvoice();
+    const { app, stripe } = buildApp();
+
+    const before = await invoiceRowOf(invoiceId);
+    stripe.setNextIntentStatus('requires_action');
+    assert.equal((await pay(app, invoiceId, { card: CARD2_ID })).statusCode, 201);
+
+    // The auto-charge worker's schedule and the owner's next manual attempt both
+    // have to proceed as if this attempt never happened — so status, bound card
+    // and the retry clock are all untouched on this arm.
+    assert.deepEqual(await invoiceRowOf(invoiceId), before);
+    assert.equal(before.status, 'open', 'precondition: it was open to begin with');
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// `charge_blocker` — WHY the confirm stopped (wire 1.8.0)
+//
+// `charge_status` cannot say: it is pinned to the `charge_status` pgEnum, and
+// five Stripe intent states collapse into `requires_payment` on the way in. The
+// client's copy depends on exactly what that collapse destroys — "needs
+// verification", "was declined" and "still processing" are three different true
+// sentences with three different next actions, and the mobile fallback shipped
+// against 1.7.1 had to GUESS between them.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Every non-succeeded raw Stripe status and the blocker the owner is told
+ * about. Pinned as a table so a re-derivation can't quietly re-lump
+ * `processing` under authentication-required — the copy for that one invites
+ * the retry that can double-charge, on the single status the cancel rule
+ * cannot kill.
+ */
+const BLOCKER_BY_RAW_STATUS: ReadonlyArray<readonly [StripePaymentIntentStatus, string]> = [
+  ['requires_action', 'authentication_required'],
+  ['requires_payment_method', 'declined'],
+  ['processing', 'processing'],
+  ['requires_confirmation', 'authentication_required'],
+  ['requires_capture', 'processing'],
+  ['canceled', 'declined'],
+];
+
+for (const [rawStatus, blocker] of BLOCKER_BY_RAW_STATUS) {
+  test(
+    `POST /invoices/:id/pay — ${rawStatus} reports charge_blocker '${blocker}'`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      await cleanup();
+      await seedCards();
+      const invoiceId = await seedOpenInvoice();
+      const { app, stripe } = buildApp();
+      stripe.setNextIntentStatus(rawStatus);
+
+      const res = await pay(app, invoiceId, { card: CARD2_ID });
+      assert.equal(res.statusCode, 201, res.body);
+      const body = res.json() as {
+        invoice_status: string;
+        charge_status: string;
+        charge_blocker?: string;
+      };
+      // The field rides BESIDE the collapsed status, never instead of it.
+      assert.equal(body.invoice_status, 'open');
+      assert.equal(body.charge_blocker, blocker);
+      await cleanup();
+    },
+  );
+}
+
+test(
+  'POST /invoices/:id/pay — a settled confirm omits charge_blocker entirely',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    await seedCards();
+    const invoiceId = await seedOpenInvoice();
+    const { app } = buildApp();
+
+    const res = await pay(app, invoiceId, { card: CARD2_ID });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as Record<string, unknown>;
+    assert.equal(body.invoice_status, 'paid');
+    // Omitted, not null: "present IFF non-succeeded" is what lets a client read
+    // the field's mere presence as "this did not settle".
+    assert.equal(
+      'charge_blocker' in body,
+      false,
+      'a settled arm must not carry a reason it stopped',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'POST /invoices/:id/pay — a pre-1.8.0 stored replay without the field still parses',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    await seedCards();
+    const invoiceId = await seedOpenInvoice();
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentStatus('requires_action');
+    const key = `pay-blocker-replay-${randomUUID()}`;
+
+    const first = await pay(app, invoiceId, { card: CARD2_ID, key });
+    assert.equal(first.statusCode, 201, first.body);
+
+    // Rewrite the stored response to the pre-1.8.0 shape, then replay: this is
+    // the real population of bodies a 1.8.0 client will meet — responses stored
+    // by the old server that nothing will ever re-derive the field for.
+    const [stored] = await db
+      .select({ body: idempotencyKeys.responseBody })
+      .from(idempotencyKeys)
+      .where(eq(idempotencyKeys.key, key));
+    const legacy = { ...(stored?.body as Record<string, unknown>) };
+    delete legacy.charge_blocker;
+    await db
+      .update(idempotencyKeys)
+      .set({ responseBody: legacy })
+      .where(eq(idempotencyKeys.key, key));
+
+    const replay = await pay(app, invoiceId, { card: CARD2_ID, key });
+    assert.equal(replay.statusCode, 201, replay.body);
+    const body = replay.json() as Record<string, unknown>;
+    assert.equal('charge_blocker' in body, false, 'the field is absent, and that is legal');
+    assert.equal(body.charge_status, 'requires_payment', 'the rest of the body still arrives');
     await cleanup();
   },
 );

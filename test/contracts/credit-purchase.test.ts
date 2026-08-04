@@ -16,6 +16,7 @@ import {
 } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
 import type { Principal } from '../../src/auth/principal.js';
+import type { StripePaymentIntentStatus } from '../../src/lib/stripe.js';
 
 /**
  * Day-14 contract tests for the credit-purchase write surface (HANDOFF §4.2):
@@ -126,7 +127,8 @@ test(
     };
     assert.equal(body.charge_status, 'requires_payment');
     assert.equal(body.credits_granted, 0);
-    assert.ok(body.client_secret !== null, '3DS path returns client_secret for FE to finish');
+    // Present, but naming a CANCELLED intent since 1.7.1 — support lookup only.
+    assert.ok(body.client_secret !== null, 'the unsettled path still names its intent');
     // Charges row landed; ledger row did NOT.
     const [charge] = await db
       .select({ status: charges.status })
@@ -139,6 +141,109 @@ test(
       .from(creditLedger)
       .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
     assert.equal(ledger.length, 0, 'no ledger row until Day-15 webhook confirms succeeded');
+    await cleanupChargesAndLedger();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// The abandoned PaymentIntent is cancelled (wire 1.7.1)
+//
+// Same class rule as the auto-charge worker and `POST /invoices/:id/pay`: no
+// client-side 3DS completion flow exists, so an intent left live after a
+// non-succeeded confirm is pure double-charge hazard — it can auto-succeed later
+// while the owner's next purchase captures on a fresh one.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** The PaymentIntent ids this stub was asked to cancel. */
+function cancelledIntents(stripe: ReturnType<typeof makeStripeStub>): string[] {
+  return stripe.calls
+    .filter((c) => c.method === 'cancelPaymentIntent')
+    .map((c) => c.args.paymentIntentId);
+}
+
+test(
+  'POST /credit-packages/:key/purchase — a non-succeeded confirm cancels the PaymentIntent it just created',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentStatus('requires_action');
+    const res = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': `cp-cancel-${randomUUID()}` },
+      payload: {
+        dog_id: FIXTURE_IDS.dog1Id,
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as { stripe_payment_intent_id: string; credits_granted: number };
+    assert.equal(body.credits_granted, 0);
+    assert.deepEqual(
+      cancelledIntents(stripe),
+      [body.stripe_payment_intent_id],
+      'the intent named in the response is the intent that was cancelled',
+    );
+    await cleanupChargesAndLedger();
+  },
+);
+
+test(
+  'POST /credit-packages/:key/purchase — a succeeded confirm cancels nothing',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': `cp-nocancel-${randomUUID()}` },
+      payload: {
+        dog_id: FIXTURE_IDS.dog1Id,
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    assert.deepEqual(cancelledIntents(stripe), [], 'never cancel money that settled');
+    await cleanupChargesAndLedger();
+  },
+);
+
+test(
+  'POST /credit-packages/:key/purchase — a cancel Stripe refuses does not fail the request',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentStatus('requires_action');
+    stripe.throwOnCancel();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': `cp-cancel-fail-${randomUUID()}` },
+      payload: {
+        dog_id: FIXTURE_IDS.dog1Id,
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
+      },
+    });
+    // Best-effort: an uncancellable intent must not turn a recorded attempt into
+    // a 500 the owner reads as "nothing happened".
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as { charge_id: string; charge_status: string };
+    assert.equal(body.charge_status, 'requires_payment');
+    assert.equal(cancelledIntents(stripe).length, 1, 'the cancel was attempted');
+
+    const [charge] = await db
+      .select({ status: charges.status })
+      .from(charges)
+      .where(eq(charges.id, body.charge_id));
+    assert.equal(charge?.status, 'requires_payment', 'the audit-trail charge row still landed');
+    const ledger = await db
+      .select()
+      .from(creditLedger)
+      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+    assert.equal(ledger.length, 0, 'nothing granted, so nothing to unwind');
     await cleanupChargesAndLedger();
   },
 );
@@ -482,6 +587,81 @@ test(
       .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
     assert.equal(ledger.length, 1);
     assert.equal(ledger[0]!.delta, 15);
+    await cleanupChargesAndLedger();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// `charge_blocker` — WHY the confirm stopped (wire 1.8.0)
+//
+// Same field, same union, same reason as `POST /invoices/:id/pay`: five Stripe
+// intent states collapse into `requires_payment` on the way into
+// `charge_status`, and the owner-facing sentence depends on exactly that
+// distinction. `CreditPurchaseWire` moved into the contract in the same bump —
+// it had been declared in the route, so no client's `check:contracts` could
+// guard it.
+// ──────────────────────────────────────────────────────────────────────────
+
+const BLOCKER_BY_RAW_STATUS: ReadonlyArray<readonly [StripePaymentIntentStatus, string]> = [
+  ['requires_action', 'authentication_required'],
+  ['requires_payment_method', 'declined'],
+  ['processing', 'processing'],
+  ['requires_confirmation', 'authentication_required'],
+  ['requires_capture', 'processing'],
+  ['canceled', 'declined'],
+];
+
+for (const [rawStatus, blocker] of BLOCKER_BY_RAW_STATUS) {
+  test(
+    `POST /credit-packages/:key/purchase — ${rawStatus} reports charge_blocker '${blocker}'`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const { app, stripe } = buildApp();
+      stripe.setNextIntentStatus(rawStatus);
+      const res = await app.inject({
+        method: 'POST',
+        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+        headers: { 'idempotency-key': `cp-blocker-${randomUUID()}` },
+        payload: {
+          dog_id: FIXTURE_IDS.dog1Id,
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          location: 'fayetteville',
+        },
+      });
+      assert.equal(res.statusCode, 201, res.body);
+      const body = res.json() as { credits_granted: number; charge_blocker?: string };
+      // Beside the collapsed status, and beside the un-granted credits.
+      assert.equal(body.credits_granted, 0);
+      assert.equal(body.charge_blocker, blocker);
+      await cleanupChargesAndLedger();
+    },
+  );
+}
+
+test(
+  'POST /credit-packages/:key/purchase — a settled purchase omits charge_blocker entirely',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      headers: { 'idempotency-key': `cp-noblocker-${randomUUID()}` },
+      payload: {
+        dog_id: FIXTURE_IDS.dog1Id,
+        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        location: 'fayetteville',
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json() as Record<string, unknown>;
+    assert.equal(body.charge_status, 'succeeded');
+    // Omitted, not null — presence alone means "this did not settle".
+    assert.equal(
+      'charge_blocker' in body,
+      false,
+      'a settled purchase must not carry a reason it stopped',
+    );
     await cleanupChargesAndLedger();
   },
 );

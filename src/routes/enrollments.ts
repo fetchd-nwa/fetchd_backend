@@ -28,7 +28,7 @@ import { computeCohortSessionDates } from '../lib/cohortSchedule.js';
 import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
-import { ApiError } from '../lib/errors.js';
+import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -415,7 +415,23 @@ export function registerEnrollmentsRoute(
         // Money was captured but the enrollment did not commit — refund/cancel
         // it all so nothing is stranded, then re-raise the original error so the
         // owner still gets the right 4xx (cohort_full, eligibility_missing, …).
-        await unwindCapturedIntents(stripe, paidIntents, idempotencyKey, request.log);
+        //
+        // ONE exception: we lost the idempotency claim race. `idempotency_inflight`
+        // means another request with this same Idempotency-Key is mid-flight, and
+        // `chargeEachDogNow` keyed Stripe off that same key
+        // (`<key>:dog:<dogId>`) — so Stripe handed us back THAT request's
+        // PaymentIntents, already captured, not ours. Unwinding here would refund
+        // money the in-flight request is about to write charge rows for and enroll
+        // against: the owner ends up charged, enrolled, AND refunded. We leave it
+        // alone and return our 409; if the in-flight request fails instead, its own
+        // catch unwinds its own intents, so nothing is stranded either way.
+        //
+        // Scope note: this closes that one interleaving, not the capture-before-tx
+        // class — see `unwindCapturedIntents`'s residual note about a same-key
+        // retry re-confirming an already-refunded intent.
+        if (!isIdempotencyInflight(err)) {
+          await unwindCapturedIntents(stripe, paidIntents, idempotencyKey, request.log);
+        }
         throw err;
       }
     },

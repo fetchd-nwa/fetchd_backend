@@ -14,12 +14,12 @@ import { boardTrainPriceCentsForLengthWeeks } from '../lib/boardTrainPricing.js'
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
-import { ApiError } from '../lib/errors.js';
+import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
   defaultStripeClient,
-  stripeIntentStatusToChargeStatus,
+  stripeIntentStatusToChargeBlocker,
   type StripeClient,
 } from '../lib/stripe.js';
 import { groupRequestDogs } from '../lib/requestWire.js';
@@ -47,6 +47,16 @@ import type { PendingRequestWire } from '../lib/requestWire.js';
  *   - `pickup_at` is the staffer-confirmed end-of-program datetime.
  *   - `pay_later: true` writes an open invoice instead of charging now;
  *     `due_at` (ISO) is required when pay_later is true.
+ *
+ * Pay-now is all-or-nothing. This is a GRANT-creating confirm site — the
+ * booking exists only because the money moved — so it follows the same class
+ * rule as `POST /memberships` and `POST /enrollments`: a confirm that returns
+ * anything but `succeeded` cancels its PaymentIntent and throws
+ * `payment_failed` (402) BEFORE the transaction opens, and a confirm that DID
+ * succeed but whose transaction then rolls back is refunded on the way out.
+ * Either way an owner never holds a multi-week board-and-train slot on money
+ * that isn't in the school's account, and never has money in the school's
+ * account with no booking behind it.
  *
  * Server authority for amount: `boardTrainPriceCentsForLengthWeeks(
  * request.length_weeks)`. The FE never passes the price — anti-scam
@@ -143,15 +153,11 @@ export function registerRequestConfirmPaymentRoute(
       });
 
       // Pay-now: call Stripe pre-tx. Pay-later: skip the Stripe call.
-      let intent:
-        | {
-            id: string;
-            status: ReturnType<typeof stripeIntentStatusToChargeStatus>;
-            stripePaymentIntentId: string;
-            clientSecret: string | null;
-            amountCents: number;
-          }
-        | undefined;
+      //
+      // Set ONLY by a confirm that reached 'succeeded' — the refusal below
+      // throws on every other status, so nothing downstream has to re-ask
+      // whether the money actually moved.
+      let capture: { paymentIntentId: string; amountCents: number } | undefined;
       if (!body.pay_later) {
         const stripeResult = await stripe.createAndConfirmPaymentIntent(
           {
@@ -168,145 +174,232 @@ export function registerRequestConfirmPaymentRoute(
           },
           `${idempotencyKey}:payment-intent`,
         );
-        intent = {
-          id: stripeResult.id,
-          status: stripeIntentStatusToChargeStatus(stripeResult.status),
-          stripePaymentIntentId: stripeResult.id,
-          clientSecret: stripeResult.clientSecret,
-          amountCents: stripeResult.amountCents,
-        };
-      }
 
-      // ── DB writes inside withMutation; state-machine guarded by lockById. ──
-      // cache-noop: pending_request / booking / invoice / charge reads
-      // aren't in the §3 cache map today. Day-19 staff-portal "requests
-      // queue" caching would add an explicit invalidation here.
-      const outcome = await withMutation<PendingRequestWire>(
-        {
-          principal,
-          idempotencyKey,
-          endpoint: 'POST /requests/:id/confirm-payment',
-          requestHash: hashRequestBody({ id, ...body }),
-        },
-        async (tx) => {
-          const row = await requestsRepository.lockById(tx, id);
-          if (row === undefined || row.expiredAt !== null) {
-            throw new ApiError('not_found', `pending request ${id} not found`);
-          }
-          if (row.ownerId !== principal.ownerId) {
-            throw new ApiError('not_found', `pending request ${id} not found`);
-          }
-          if (row.status !== 'approved-awaiting-payment') {
-            throw new ApiError(
-              'conflict',
-              `pending request ${id} is ${row.status}, not approved-awaiting-payment`,
+        if (stripeResult.status !== 'succeeded') {
+          // REFUSE — the grant-site class rule, whose two other instances are
+          // `memberships.ts` (cancel, then throw before `withMutation` opens)
+          // and `enrollments.ts` (throw + unwind). Creating the booking here on
+          // a charge that did not complete would schedule a multi-week stay and
+          // enqueue its reminders against money that never moved, with the
+          // charges row parked at `requires_payment` and no invoice behind it
+          // for anything to ever re-settle.
+          //
+          // Pre-tx on purpose: no Stripe call may run inside a transaction, and
+          // there is nothing to roll back because nothing has been written. No
+          // booking, no reminders, no charges row, no conversion, no push — and
+          // no idempotency record either, since the throw beats `withMutation`,
+          // so the request stays 'approved-awaiting-payment' and the owner can
+          // simply try again.
+          try {
+            await stripe.cancelPaymentIntent(stripeResult.id);
+          } catch (err) {
+            // Best-effort, exactly as at the other two confirm sites: an intent
+            // Stripe won't cancel (a `processing` one it is already settling)
+            // is covered by its changed-params rejection on the next same-key
+            // attempt. It must never turn a refusal into a 500.
+            request.log.warn(
+              { err, requestId: id, paymentIntentId: stripeResult.id },
+              'B&T confirm-payment: could not cancel unsettled PaymentIntent (best-effort)',
             );
           }
+          throw new ApiError(
+            'payment_failed',
+            'the card charge did not complete — your booking was not created; ' +
+              'the request is still approved, try a different card',
+            {
+              kind: 'payment_failed',
+              // Same `ChargeBlocker` vocabulary the 1.8.0 wire field carries on
+              // the two settle-site 201s, so a client renders the one specific
+              // sentence — needs verification / declined / still processing —
+              // from either channel.
+              charge_blocker: stripeIntentStatusToChargeBlocker(stripeResult.status, request.log),
+            },
+          );
+        }
 
-          // Resolve dogs + cancel-window deadline + build the booking row.
-          const dogRows = await requestsRepository.findDogsByRequestIds([id], tx);
-          const grouped = groupRequestDogs(dogRows).get(id);
-          if (grouped === undefined) {
-            throw new Error(`pending_request ${id}: no live pending_request_dogs rows`);
-          }
-          const hours = await cancelWindowSettingsRepository.resolveHoursFor('board-and-train', tx);
-          const scheduledAtDate = new Date(body.scheduled_at);
-          const dropoffAtDate = new Date(body.dropoff_at);
-          const pickupAtDate = new Date(body.pickup_at);
-          const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAtDate, hours);
+        capture = { paymentIntentId: stripeResult.id, amountCents: stripeResult.amountCents };
+      }
 
-          const inserted = await insertBookingWithGateMapping(tx, {
-            ownerId: row.ownerId,
-            leadDogId: grouped.lead,
-            category: 'board-and-train',
-            scheduledAt: scheduledAtDate,
-            location: body.location,
-            notes: body.notes ?? null,
-            cancelDeadlineAt,
-            additionalDogIds: grouped.additional,
-          });
+      try {
+        // ── DB writes inside withMutation; state-machine guarded by lockById. ──
+        // cache-noop: pending_request / booking / invoice / charge reads
+        // aren't in the §3 cache map today. Day-19 staff-portal "requests
+        // queue" caching would add an explicit invalidation here.
+        const outcome = await withMutation<PendingRequestWire>(
+          {
+            principal,
+            idempotencyKey,
+            endpoint: 'POST /requests/:id/confirm-payment',
+            requestHash: hashRequestBody({ id, ...body }),
+          },
+          async (tx) => {
+            const row = await requestsRepository.lockById(tx, id);
+            if (row === undefined || row.expiredAt !== null) {
+              throw new ApiError('not_found', `pending request ${id} not found`);
+            }
+            if (row.ownerId !== principal.ownerId) {
+              throw new ApiError('not_found', `pending request ${id} not found`);
+            }
+            if (row.status !== 'approved-awaiting-payment') {
+              throw new ApiError(
+                'conflict',
+                `pending request ${id} is ${row.status}, not approved-awaiting-payment`,
+              );
+            }
 
-          // Stamp dropoff_at + pickup_at — bookingsRepository.create
-          // doesn't accept these (schema CHECK gates them to stay
-          // categories; the repo's primitive stays narrow). Same
-          // pattern Day-12 uses for boarding.
-          await tx
-            .update(bookings)
-            .set({
-              dropoffAt: dropoffAtDate.toISOString(),
-              pickupAt: pickupAtDate.toISOString(),
-            })
-            .where(eq(bookings.id, inserted.id));
+            // Resolve dogs + cancel-window deadline + build the booking row.
+            const dogRows = await requestsRepository.findDogsByRequestIds([id], tx);
+            const grouped = groupRequestDogs(dogRows).get(id);
+            if (grouped === undefined) {
+              throw new Error(`pending_request ${id}: no live pending_request_dogs rows`);
+            }
+            const hours = await cancelWindowSettingsRepository.resolveHoursFor(
+              'board-and-train',
+              tx,
+            );
+            const scheduledAtDate = new Date(body.scheduled_at);
+            const dropoffAtDate = new Date(body.dropoff_at);
+            const pickupAtDate = new Date(body.pickup_at);
+            const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAtDate, hours);
 
-          // Day-16: enqueue reminder + boarding-profile-check. B&T
-          // explicitly carries dropoff_at distinct from scheduled_at
-          // (multi-week stay) — pass it so the 24h-pre-drop-off prompt
-          // anchors on the actual stay start.
-          await enqueueBookingReminders(tx, {
-            bookingId: inserted.id,
-            ownerId: row.ownerId,
-            leadDogId: grouped.lead,
-            category: 'board-and-train',
-            scheduledAt: scheduledAtDate,
-            dropoffAt: dropoffAtDate,
-          });
-
-          // Pay-now: INSERT the charges row mirroring Stripe status.
-          // Pay-later: INSERT an open invoice — the worker auto-charges
-          // at due_at; the charges row + invoice settlement land via
-          // either the worker or `POST /invoices/:id/pay`.
-          if (intent !== undefined) {
-            await chargesRepository.create(tx, {
+            const inserted = await insertBookingWithGateMapping(tx, {
               ownerId: row.ownerId,
-              amountCents: intent.amountCents,
-              status: intent.status,
-              purpose: 'board-train',
-              stripePaymentIntentId: intent.stripePaymentIntentId,
-              bookingId: inserted.id,
+              leadDogId: grouped.lead,
+              category: 'board-and-train',
+              scheduledAt: scheduledAtDate,
+              location: body.location,
+              notes: body.notes ?? null,
+              cancelDeadlineAt,
+              additionalDogIds: grouped.additional,
             });
-          } else if (body.pay_later && body.due_at) {
-            await invoicesRepository.createOpen(tx, {
+
+            // Stamp dropoff_at + pickup_at — bookingsRepository.create
+            // doesn't accept these (schema CHECK gates them to stay
+            // categories; the repo's primitive stays narrow). Same
+            // pattern Day-12 uses for boarding.
+            await tx
+              .update(bookings)
+              .set({
+                dropoffAt: dropoffAtDate.toISOString(),
+                pickupAt: pickupAtDate.toISOString(),
+              })
+              .where(eq(bookings.id, inserted.id));
+
+            // Day-16: enqueue reminder + boarding-profile-check. B&T
+            // explicitly carries dropoff_at distinct from scheduled_at
+            // (multi-week stay) — pass it so the 24h-pre-drop-off prompt
+            // anchors on the actual stay start.
+            await enqueueBookingReminders(tx, {
+              bookingId: inserted.id,
               ownerId: row.ownerId,
-              amountCents,
-              purpose: 'board-train',
-              paymentMethodId: body.payment_method_id,
-              dueAt: body.due_at,
-              bookingId: inserted.id,
-              requestId: id,
+              leadDogId: grouped.lead,
+              category: 'board-and-train',
+              scheduledAt: scheduledAtDate,
+              dropoffAt: dropoffAtDate,
             });
+
+            // Pay-now: INSERT the charges row for the money that moved. Its
+            // status is a literal, not a mapping, because `capture` exists only
+            // on the succeeded arm — a non-succeeded confirm never reaches here.
+            // Pay-later: INSERT an open invoice — the worker auto-charges
+            // at due_at; the charges row + invoice settlement land via
+            // either the worker or `POST /invoices/:id/pay`.
+            if (capture !== undefined) {
+              await chargesRepository.create(tx, {
+                ownerId: row.ownerId,
+                amountCents: capture.amountCents,
+                status: 'succeeded',
+                purpose: 'board-train',
+                stripePaymentIntentId: capture.paymentIntentId,
+                bookingId: inserted.id,
+              });
+            } else if (body.pay_later && body.due_at) {
+              await invoicesRepository.createOpen(tx, {
+                ownerId: row.ownerId,
+                amountCents,
+                purpose: 'board-train',
+                paymentMethodId: body.payment_method_id,
+                dueAt: body.due_at,
+                bookingId: inserted.id,
+                requestId: id,
+              });
+            }
+
+            await requestsRepository.markConverted(tx, id, {
+              approvedByStaffId: row.approvedByStaffId ?? '',
+              convertedBookingId: inserted.id,
+            });
+
+            await notificationsRepository.enqueue(tx, {
+              ownerId: row.ownerId,
+              type: 'booking-confirmed',
+              title: 'Board & Train confirmed!',
+              body: `Drop-off ${scheduledAtDate.toLocaleDateString('en-US', {
+                timeZone: 'America/Chicago',
+                month: 'short',
+                day: 'numeric',
+              })}`,
+              deepLinkPath: deepLinkToPath({ kind: 'booking', id: inserted.id }),
+              deepLinkKind: 'booking',
+              deepLinkId: inserted.id,
+              dogIds: [grouped.lead, ...grouped.additional],
+            });
+
+            const updated = await requestsRepository.findFullByIdInTx(tx, id);
+            if (updated === undefined) {
+              throw new Error(`confirm-payment ${id}: row vanished before re-fetch`);
+            }
+            const wire = await wireOneRequest(tx, updated);
+            return { status: 200, body: wire };
+          },
+        );
+
+        reply.code(outcome.status);
+        return outcome.body;
+      } catch (err) {
+        // Money captured, nothing committed. The transaction can still fail
+        // AFTER a succeeded confirm — a concurrent different-key confirm
+        // converts the request first and the state check at the top of the tx
+        // 409s — and without this the owner is charged for a booking that does
+        // not exist, with no charges row for anyone to find it by. Same guard,
+        // same shape, same reasoning as the group-class enroll unwind
+        // (`enrollments.ts` → `unwindCapturedIntents`): refund best-effort, log
+        // loudly if even that fails, and re-raise the ORIGINAL error so the
+        // owner still gets the right 4xx rather than a refund's failure.
+        //
+        // ONE exception, identical to the enroll site: we lost the idempotency
+        // claim race. `idempotency_inflight` means another request with this same
+        // Idempotency-Key is mid-flight, and the confirm above keyed Stripe off
+        // that same key (`<key>:payment-intent`) — so Stripe handed us back THAT
+        // request's PaymentIntent, already captured, not ours. Refunding it would
+        // undo the charge that request is about to write its charges row and
+        // booking against: the owner ends up charged, booked, AND refunded. We
+        // leave it alone and return our 409; if the in-flight request fails
+        // instead, its own catch refunds its own capture.
+        //
+        // Scope note: this closes that one interleaving, not the capture-before-tx
+        // class — a same-key retry after a transient failure can still re-confirm
+        // an already-refunded intent (`enrollments.ts` → `unwindCapturedIntents`
+        // carries the standing residual note; manual-capture is the real fix).
+        if (capture !== undefined && !isIdempotencyInflight(err)) {
+          try {
+            await stripe.createRefund(
+              {
+                paymentIntentId: capture.paymentIntentId,
+                amountCents: capture.amountCents,
+                reason: 'requested_by_customer',
+              },
+              `${idempotencyKey}:confirm-unwind`,
+            );
+          } catch (unwindErr) {
+            request.log.error(
+              { err: unwindErr, requestId: id, paymentIntentId: capture.paymentIntentId },
+              'B&T confirm-payment unwind FAILED — captured money needs manual reconciliation',
+            );
           }
-
-          await requestsRepository.markConverted(tx, id, {
-            approvedByStaffId: row.approvedByStaffId ?? '',
-            convertedBookingId: inserted.id,
-          });
-
-          await notificationsRepository.enqueue(tx, {
-            ownerId: row.ownerId,
-            type: 'booking-confirmed',
-            title: 'Board & Train confirmed!',
-            body: `Drop-off ${scheduledAtDate.toLocaleDateString('en-US', {
-              timeZone: 'America/Chicago',
-              month: 'short',
-              day: 'numeric',
-            })}`,
-            deepLinkPath: deepLinkToPath({ kind: 'booking', id: inserted.id }),
-            deepLinkKind: 'booking',
-            deepLinkId: inserted.id,
-            dogIds: [grouped.lead, ...grouped.additional],
-          });
-
-          const updated = await requestsRepository.findFullByIdInTx(tx, id);
-          if (updated === undefined) {
-            throw new Error(`confirm-payment ${id}: row vanished before re-fetch`);
-          }
-          const wire = await wireOneRequest(tx, updated);
-          return { status: 200, body: wire };
-        },
-      );
-
-      reply.code(outcome.status);
-      return outcome.body;
+        }
+        throw err;
+      }
     },
   );
 }

@@ -26,6 +26,7 @@ import { requireOwner } from '../lib/principalNarrows.js';
 import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import {
   defaultStripeClient,
+  stripeIntentStatusToChargeBlocker,
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
@@ -45,16 +46,17 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *      - INSERT `charges` row mirroring Stripe status.
  *      - On Stripe 'succeeded': `invoices.markPaid` flips the invoice
  *        to 'paid' + links the charge id.
- *      - 3DS / requires_action paths return `client_secret`; Day-15
- *        webhook's `payment_intent.succeeded` reconciles by flipping
- *        BOTH the charges row AND (TODO: invoice link — needs a
- *        webhook-driven invoice settlement path) once Stripe confirms.
+ *      - Non-succeeded (3DS / requires_action / declined): the intent is
+ *        CANCELLED pre-tx (wire 1.7.1) and the charge row is written at
+ *        its non-succeeded status; the invoice stays open for the next
+ *        attempt, which mints a fresh intent.
  *
  * The webhook does NOT currently re-settle the invoice for the async
- * path (only the charge flips). That's a known caveat for Day-15: 3DS
- * pay-later flows write `charges` at requires_payment but leave the
- * invoice 'open' until the next /pay attempt. The synchronous path
- * (test mode + stored non-3DS card) settles atomically.
+ * path (only the charge flips). That caveat survives the cancel rule
+ * only for the rare `processing` intent Stripe won't let us cancel: it
+ * can still flip to succeeded via webhook with the invoice left open.
+ * The synchronous path (test mode + stored non-3DS card) settles
+ * atomically.
  */
 
 export interface InvoicesRouteOptions extends AuthRouteOptions {
@@ -194,6 +196,39 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
         `${idempotencyKey}:payment-intent`,
       );
       const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
+      // Why it stopped, in domain vocabulary — derived from the RAW Stripe
+      // status, which is only in hand HERE: the line above collapses five of
+      // them into `requires_payment`, and the copy the owner reads depends on
+      // exactly that distinction (wire 1.8.0). Pre-tx so the anomalous-status
+      // warnings inside fire once per real confirm, not once per replay.
+      const chargeBlocker =
+        intent.status === 'succeeded'
+          ? undefined
+          : stripeIntentStatusToChargeBlocker(intent.status, request.log);
+
+      // Non-succeeded confirm: cancel the intent so it can't later auto-succeed
+      // and double-charge against the next attempt's fresh one — the same rule
+      // and the same reason as the auto-charge worker's cancel
+      // (`invoiceAutoCharge.ts`). It applies here too because no client-side 3DS
+      // completion flow exists anywhere in this system, so a live intent buys
+      // nothing to weigh against that hazard; wire 1.7.1 documents
+      // `client_secret` as naming a CANCELLED intent on this arm.
+      //
+      // PRE-TX deliberately: no Stripe call may run inside `withMutation`'s
+      // transaction. Best-effort — an intent Stripe refuses to cancel (a rare
+      // `processing`) is covered by Stripe's changed-params rejection on the
+      // next same-key attempt, and by the duplicate-settle refund on a
+      // fresh-key one.
+      if (chargeStatus !== 'succeeded') {
+        try {
+          await stripe.cancelPaymentIntent(intent.id);
+        } catch (err) {
+          request.log.warn(
+            { err, invoiceId: invoiceRow.id, paymentIntentId: intent.id },
+            'invoice pay: could not cancel unsettled PaymentIntent (best-effort)',
+          );
+        }
+      }
 
       // Closure-captured handle for the post-commit Stripe refund. Set inside
       // the withMutation body ONLY when this succeeded charge LOST the settle
@@ -240,10 +275,11 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           },
         },
         async (tx) => {
-          // 3DS / async path: Stripe didn't settle synchronously. INSERT the
-          // charge at its non-succeeded status and leave the invoice open; the
-          // webhook (or the owner's next /pay attempt) settles it. No race to
-          // resolve — nothing was actually captured yet.
+          // 3DS / async path: Stripe didn't settle synchronously, and the intent
+          // was cancelled above. INSERT the charge at its non-succeeded status
+          // as audit trail (R32 keeps it out of the owner ledger) and leave the
+          // invoice open for the owner's next /pay attempt. No race to resolve —
+          // nothing was actually captured.
           if (chargeStatus !== 'succeeded') {
             const charge = await chargesRepository.create(tx, {
               ownerId: principal.ownerId,
@@ -264,6 +300,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
                 client_secret: intent.clientSecret,
                 invoice_status: 'open',
                 charge_refunded: false,
+                charge_blocker: chargeBlocker,
               },
             };
           }

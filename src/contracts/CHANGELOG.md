@@ -12,6 +12,74 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.8.0] — 2026-08-03
+
+Additive (Allison 2026-08-03: **"we need this to be clear, not generic"**). She
+rejected merged copy for the failed-payment arm. The client could not be
+specific because the wire destroyed the distinction, so the wire now carries it.
+No field is removed or retyped and no DDL changes; a client that ignores the new
+field behaves exactly as it did at 1.7.1.
+
+### Added
+
+- **`ChargeBlocker`** — `'authentication_required' | 'declined' | 'processing'`.
+  Why a confirm stopped short of `succeeded`, at the domain level.
+  `ChargeStatus` cannot carry this: it is pinned to the `charge_status` pgEnum,
+  and `stripeIntentStatusToChargeStatus` (`src/lib/stripe.ts:104-110`) collapses
+  FIVE Stripe statuses — `requires_payment_method`, `requires_confirmation`,
+  `requires_action`, `processing`, `requires_capture` — into the single value
+  `requires_payment`. "Needs verification", "was declined" and "still
+  processing" are three different true sentences with three different next
+  actions for the owner, and the collapse destroyed exactly that. Widening
+  `ChargeStatus` would be a DDL change; this is deliberately not that.
+- **`InvoicePayWire.charge_blocker?`** — present iff the response reports a
+  non-succeeded confirm (`invoice_status: 'open'` + `charge_status:
+  'requires_payment'`). Absent on settled arms, and absent on stored idempotency
+  replays of pre-1.8.0 responses, so clients must keep deriving pessimistically
+  when it is missing.
+- **`CreditPurchaseWire`** — **moved in** from `routes/creditPackages.ts:64-70`,
+  shape unchanged, and gains the same `charge_blocker?`. A second money endpoint
+  was sitting outside the versioned contract with nothing for `check:contracts`
+  to guard — the same condition that let the invoice card picker drift into
+  charging a card the owner never tapped (see 1.7.0).
+
+### Not added, deliberately
+
+- No `charge_blocker` on `POST /requests/:id/confirm-payment`. Per the same
+  day's design addendum that route now REFUSES a non-succeeded board-and-train
+  confirm outright rather than returning a 201, so it has no non-succeeded
+  success body to carry the field; the reason rides the `payment_failed` error
+  envelope's `details.charge_blocker` using the same union, so clients keep one
+  taxonomy across both channels.
+- No new DB column. The blocker is transient advice about a synchronous
+  response, not accounting state: R32 keeps non-succeeded charges out of the
+  owner ledger, so no read path wants it later, and support lookups ride
+  `stripe_payment_intent_id` into the Stripe dashboard, which holds the full
+  truth.
+
+## [1.7.1] — 2026-08-03
+
+Doc-only. No shape change, no field added, removed, or retyped; no client is
+forced to move. Written before the behavior it describes was implemented, so
+that the contract leads the change rather than trailing it.
+
+### Changed
+
+- **`InvoicePayWire.client_secret`** — documented, for the first time, as **not
+  a completable intent**. The 2026-08-03 adversarial review found that
+  `POST /invoices/:id/pay` was the one settle path that did not cancel a
+  non-succeeded PaymentIntent — `invoiceAutoCharge.ts:268`,
+  `enrollments.ts:765` and `memberships.ts:259` all do, and the worker's comment
+  says why: so it "can't later auto-succeed and double-charge against the next
+  retry's fresh PI". `POST /credit-packages/:key/purchase` shares the gap.
+  The design (`<umbrella>/designs/invoice-pay-card-selection.md` § Gap 3) makes
+  the cancel a rule for the class, which means the returned `client_secret` on
+  the non-succeeded arm now names a *cancelled* intent. The field was previously
+  undocumented, which is the trap: a client author would reasonably assume a
+  client secret is there to be completed. It is returned for logging and support
+  lookup only. A future 3DS-completion design must revisit the rule and
+  re-document the field in the same change.
+
 ## [1.7.0] — 2026-07-31
 
 Additive (Allison 2026-07-31: "fix the contract properly"). The pay endpoint

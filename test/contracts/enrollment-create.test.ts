@@ -9,14 +9,18 @@ import {
   bookingDogs as bookingDogsTable,
   charges as chargesTable,
   cohorts as cohortsTable,
+  idempotencyKeys as idempotencyKeysTable,
   invoices as invoicesTable,
   paymentMethods,
   refunds as refundsTable,
   requiredVaccines,
 } from '../../src/db/schema/schema.js';
 import { and as andOp } from 'drizzle-orm';
+import { hashRequestBody } from '../../src/db/mutation.js';
+import { withActor } from '../../src/db/tx.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import type { GroupClassKey } from '../../src/db/repositories/groupClassesRepository.js';
+import type { StripeClient, StripePaymentIntentResult } from '../../src/lib/stripe.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
@@ -1075,5 +1079,238 @@ test(
       .from(chargesTable)
       .where(eq(chargesTable.cohortId, cohort.id));
     assert.equal(chargeRows.length, 0, 'no charge row for a non-succeeded intent');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Losing the idempotency claim race must NOT unwind the winner's money
+//
+// Two requests, ONE Idempotency-Key. The pay-now capture happens pre-tx under
+// `<key>:dog:<dogId>`, so Stripe's own idempotency hands the second request the
+// FIRST one's already-captured PaymentIntent. If the second then unwinds on its
+// way out, it refunds a charge the first is about to enroll against: the owner
+// is charged, enrolled, AND refunded.
+//
+// What the harness can and cannot drive, measured rather than assumed:
+//   - `withIdempotency`'s claim is `INSERT ... ON CONFLICT (key) DO NOTHING`
+//     inside the SAME transaction as the work. A second same-key request's
+//     INSERT therefore BLOCKS on the first's uncommitted row (verified against
+//     the test Postgres: the second statement waits indefinitely rather than
+//     returning zero rows) and resolves as a REPLAY once the first commits —
+//     the first test below asserts exactly that end state.
+//   - `idempotency_inflight` needs an observable claim row that is COMMITTED
+//     with `completed_at IS NULL`, which no single-transaction writer can leave
+//     behind. So the second test commits that row directly — the same
+//     "simulate another connection holding this key in-flight" device
+//     `test/idempotency.test.ts` uses — and then lets the holder finish for
+//     real through the route. The 409, the capture, the refund decision and the
+//     committed money are all the real code paths; only the in-flight WINDOW is
+//     placed by hand.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Enrollments app whose Stripe seam behaves like the real one on idempotency:
+ * the same `idempotency_key` returns the SAME PaymentIntent instead of minting
+ * a second one. Without this a stub makes two same-key requests look like two
+ * separate captures, which is precisely the confusion the bug lives in. Returns
+ * the memo so a test can assert "the intent the loser held IS the winner's".
+ */
+function enrollAppWithStripeIdempotency(): {
+  app: ReturnType<typeof makeContractApp>['app'];
+  stripe: ReturnType<typeof makeStripeStub>;
+  intentByKey: Map<string, StripePaymentIntentResult>;
+} {
+  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  const stripe = makeStripeStub();
+  const intentByKey = new Map<string, StripePaymentIntentResult>();
+  const stripeWithIdempotency: StripeClient = {
+    ...stripe,
+    async createAndConfirmPaymentIntent(args, idempotencyKey) {
+      const replayed = intentByKey.get(idempotencyKey);
+      if (replayed !== undefined) {
+        // Record the attempt so the test still sees both requests asking, then
+        // hand back the intent Stripe already created for this key.
+        stripe.calls.push({ method: 'createAndConfirmPaymentIntent', args, idempotencyKey });
+        return replayed;
+      }
+      const created = await stripe.createAndConfirmPaymentIntent(args, idempotencyKey);
+      intentByKey.set(idempotencyKey, created);
+      return created;
+    },
+  };
+  registerEnrollmentsRoute(app, {
+    authenticate,
+    stripe: stripeWithIdempotency,
+    now: FIXTURE_NOW,
+  });
+  return { app, stripe, intentByKey };
+}
+
+/** Commit a claim row for `key` with `completed_at IS NULL` — the state a
+ *  request that owns the key and is still executing would present if its claim
+ *  were visible to others. */
+async function seedInflightClaim(key: string, requestHash: string): Promise<void> {
+  await withActor(`owner:${FIXTURE_IDS.ownerId}`, async (tx) => {
+    await tx.insert(idempotencyKeysTable).values({
+      key,
+      ownerId: FIXTURE_IDS.ownerId,
+      endpoint: 'POST /enrollments',
+      requestHash,
+    });
+  });
+}
+
+test(
+  'POST /enrollments — two CONCURRENT pay-now requests with the SAME Idempotency-Key: one enrolls, the other replays it, and the shared PaymentIntent is never refunded',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollAppWithStripeIdempotency();
+    const key = `enr-samekey-race-${randomUUID()}`;
+    const payload = { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false };
+
+    const [a, b] = await Promise.all([
+      postEnrollment({ app, idempotencyKey: key, payload }),
+      postEnrollment({ app, idempotencyKey: key, payload }),
+    ]);
+
+    // Neither is an error: the loser's claim INSERT waits on the winner's
+    // uncommitted row and resolves as a replay of the stored 201.
+    assert.equal(a.statusCode, 201, a.body);
+    assert.equal(b.statusCode, 201, b.body);
+    assert.deepEqual(a.json(), b.json(), 'the loser replayed the winner’s response');
+
+    // Both asked Stripe under the same per-dog key, so there is ONE intent.
+    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    assert.equal(piCalls.length, 2, 'both requests reached the pre-tx capture');
+    assert.deepEqual(
+      [...new Set(piCalls.map((c) => c.idempotencyKey))],
+      [`${key}:dog:${FIXTURE_IDS.dog1Id}`],
+      'one Stripe idempotency key → one PaymentIntent',
+    );
+
+    // The money invariant: charged once, enrolled, nothing given back.
+    const chargeRows = await db
+      .select({ status: chargesTable.status })
+      .from(chargesTable)
+      .where(eq(chargesTable.cohortId, cohort.id));
+    assert.equal(chargeRows.length, 1, 'exactly one charges row');
+    assert.equal(chargeRows[0]!.status, 'succeeded');
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, cohort.weeks, 'the enrollment exists (one booking per week)');
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createRefund').length,
+      0,
+      'granted and NOT refunded',
+    );
+    assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 0);
+  },
+);
+
+test(
+  'POST /enrollments — pay-now request that LOSES the claim race → 409 idempotency_inflight, and the in-flight request’s captured PaymentIntent is left alone (granted, not refunded)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe, intentByKey } = enrollAppWithStripeIdempotency();
+    const key = `enr-inflight-${randomUUID()}`;
+    const payload = {
+      cohort_id: cohort.id,
+      dog_ids: [FIXTURE_IDS.dog1Id],
+      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      pay_later: false,
+    };
+    // The request that owns the key is mid-transaction: claimed, not completed.
+    await seedInflightClaim(key, hashRequestBody(payload));
+
+    // ── The loser arrives. It captures (Stripe returns the in-flight
+    //    request's intent for this key), then loses the claim. ──
+    const loser = await postEnrollment({ app, idempotencyKey: key, payload });
+    assert.equal(loser.statusCode, 409, loser.body);
+    assert.equal(
+      (loser.json() as { error: { code: string } }).error.code,
+      'idempotency_inflight',
+      'the loser must surface the 409, not a refund’s own failure',
+    );
+    const sharedIntentId = intentByKey.get(`${key}:dog:${FIXTURE_IDS.dog1Id}`)?.id;
+    assert.ok(sharedIntentId, 'the loser did capture — that is why the unwind was tempting');
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createRefund').length,
+      0,
+      'the loser must NOT refund a PaymentIntent it does not own',
+    );
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length,
+      0,
+      'and must not cancel it either',
+    );
+
+    // ── The in-flight request now finishes: its claim resolves and its
+    //    transaction commits the enrollment against that same intent. ──
+    await db.delete(idempotencyKeysTable).where(eq(idempotencyKeysTable.key, key));
+    const winner = await postEnrollment({ app, idempotencyKey: key, payload });
+    assert.equal(winner.statusCode, 201, winner.body);
+
+    const chargeRows = await db
+      .select({ status: chargesTable.status, intentId: chargesTable.stripePaymentIntentId })
+      .from(chargesTable)
+      .where(eq(chargesTable.cohortId, cohort.id));
+    assert.equal(chargeRows.length, 1, 'exactly one charges row');
+    assert.equal(chargeRows[0]!.status, 'succeeded');
+    assert.equal(
+      chargeRows[0]!.intentId,
+      sharedIntentId,
+      'the committed charge IS the intent the loser was holding — refunding it would have undone this money',
+    );
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, cohort.weeks, 'the enrollment exists (one booking per week)');
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createRefund').length,
+      0,
+      'no refund was ever issued: the owner is charged once, enrolled, and keeps neither half of a granted-and-refunded booking',
+    );
+  },
+);
+
+test(
+  'POST /enrollments — the inflight exclusion did not widen: a NON-inflight in-tx failure after capture (already_enrolled) still refunds',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+
+    // Enroll the dog pay-later first (no Stripe call), so the second enroll
+    // trips the in-tx duplicate guard AFTER its card is already captured.
+    const first = await postEnrollment({
+      app,
+      idempotencyKey: `enr-dup-seed-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: true },
+    });
+    assert.equal(first.statusCode, 201, first.body);
+
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-dup-paynow-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'already_enrolled');
+
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+      1,
+      'the card was captured pre-tx',
+    );
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createRefund').length,
+      1,
+      'every error that is NOT idempotency_inflight still unwinds',
+    );
   },
 );

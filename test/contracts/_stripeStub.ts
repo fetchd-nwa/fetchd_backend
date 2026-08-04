@@ -29,6 +29,7 @@ import type {
  *     returns that status (and clientSecret = `pi_test_*_secret_xyz`)
  *   - `throwOnDetach()` — next `detachPaymentMethod` rejects
  *   - `throwOnRefund()` — next `createRefund` rejects
+ *   - `throwOnCancel()` — next `cancelPaymentIntent` rejects
  *
  * All Stripe-facing calls are recorded as discriminated-union entries in
  * `calls`; tests can `.filter(c => c.method === 'createRefund')` to assert
@@ -94,6 +95,13 @@ export interface StripeStub extends StripeClient {
   throwOnDetach(): void;
   /** Make the next `createRefund` throw. */
   throwOnRefund(): void;
+  /**
+   * Make the next `cancelPaymentIntent` throw — the "Stripe won't let us cancel
+   * this one" case every caller of it swallows. The call is still recorded, so a
+   * test can assert both that the cancel was attempted and that the route
+   * carried on.
+   */
+  throwOnCancel(): void;
   /** Replace what `retrievePaymentMethod` returns next. */
   setPaymentMethodSnapshot(snapshot: Partial<StripePaymentMethodSnapshot>): void;
   /**
@@ -117,6 +125,7 @@ export function makeStripeStub(): StripeStub {
   let nextIntentStatus: StripePaymentIntentStatus = 'succeeded';
   let detachShouldThrow = false;
   let refundShouldThrow = false;
+  let cancelShouldThrow = false;
   let pmSnapshotOverride: Partial<StripePaymentMethodSnapshot> = {};
   let setupIntentOverride: Partial<StripeSetupIntentSnapshot> = {};
   // `undefined` = no event queued; `null` = next call throws (bad signature);
@@ -136,6 +145,9 @@ export function makeStripeStub(): StripeStub {
     },
     throwOnRefund() {
       refundShouldThrow = true;
+    },
+    throwOnCancel() {
+      cancelShouldThrow = true;
     },
     setPaymentMethodSnapshot(snapshot) {
       pmSnapshotOverride = snapshot;
@@ -201,6 +213,10 @@ export function makeStripeStub(): StripeStub {
         args: { paymentIntentId },
         idempotencyKey: null,
       });
+      if (cancelShouldThrow) {
+        cancelShouldThrow = false;
+        throw new Error('stub: cancel failed');
+      }
     },
 
     async createRefund(args, idempotencyKey): Promise<StripeRefundResult> {

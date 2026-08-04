@@ -1,8 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import type { CreditPurchaseWire } from '../contracts/wire.js';
 import { db } from '../db/client.js';
-import { chargesRepository, type ChargeStatus } from '../db/repositories/chargesRepository.js';
+import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
 import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
@@ -18,6 +19,7 @@ import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
   defaultStripeClient,
+  stripeIntentStatusToChargeBlocker,
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
@@ -35,9 +37,10 @@ type LocationKey = (typeof LOCATION_KEYS)[number];
  * confirmation path against Stripe test mode: the route creates +
  * confirms a PaymentIntent off the owner's stored payment_method, writes
  * the `charges` row mirroring Stripe's returned status, and (only on
- * `succeeded`) writes the matching `credit_ledger` purchase grant. 3DS
- * and async-settled paths return early with the client_secret and let
- * the Day-15 webhook reconcile the terminal status.
+ * `succeeded`) writes the matching `credit_ledger` purchase grant. A
+ * non-succeeded intent is CANCELLED pre-tx (wire 1.7.1) so it can't
+ * auto-succeed behind a later attempt; the returned client_secret names
+ * that cancelled intent and the owner buys again with a fresh one.
  *
  * Optional `quantity` (1–100, default 1) buys N units of the package in
  * one charge / one ledger lot — the app's "choose your own amount"
@@ -60,13 +63,10 @@ export interface CreditPackageWire {
   is_popular: boolean;
 }
 
-export interface CreditPurchaseWire {
-  charge_id: string;
-  charge_status: ChargeStatus;
-  stripe_payment_intent_id: string;
-  client_secret: string | null;
-  credits_granted: number;
-}
+// `CreditPurchaseWire` used to be declared right here — a money response
+// outside the versioned contract, which is why no client's `check:contracts`
+// could ever guard it. Since 1.8.0 it lives in `contracts/wire.ts` (shape
+// unchanged by the move) and this route imports it like every other wire type.
 
 export interface CreditPackagesRouteOptions extends AuthRouteOptions {
   /** Stripe seam (Day 14). Contract tests inject a stub. */
@@ -194,6 +194,39 @@ export function registerCreditPackagesRoute(
       );
 
       const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
+      // Why it stopped, in domain vocabulary — derived from the RAW Stripe
+      // status, which is only in hand HERE: the line above collapses five of
+      // them into `requires_payment`, and the copy the owner reads depends on
+      // exactly that distinction (wire 1.8.0). Pre-tx so the anomalous-status
+      // warnings inside fire once per real confirm, not once per replay.
+      const chargeBlocker =
+        intent.status === 'succeeded'
+          ? undefined
+          : stripeIntentStatusToChargeBlocker(intent.status, request.log);
+
+      // Non-succeeded confirm: cancel the intent so it can't later auto-succeed
+      // and double-charge against the next attempt's fresh one. Same rule as
+      // the auto-charge worker (`invoiceAutoCharge.ts`) and `POST
+      // /invoices/:id/pay` — it applies to every path that confirms
+      // off-session and sees a non-succeeded status, because no client-side 3DS
+      // completion flow exists anywhere in this system, so the returned
+      // `client_secret` names a cancelled intent and is for support lookup only.
+      //
+      // PRE-TX deliberately: no Stripe call may run inside `withMutation`'s
+      // transaction. Best-effort — a cancel Stripe refuses (a rare `processing`,
+      // or a replay re-cancelling an already-cancelled intent, since this route
+      // re-calls Stripe on the replay path) is logged and does not fail the
+      // purchase; nothing was granted either way.
+      if (chargeStatus !== 'succeeded') {
+        try {
+          await stripe.cancelPaymentIntent(intent.id);
+        } catch (err) {
+          request.log.warn(
+            { err, dogId: body.dog_id, paymentIntentId: intent.id },
+            'credit purchase: could not cancel unsettled PaymentIntent (best-effort)',
+          );
+        }
+      }
 
       // ── DB writes (inside withMutation; idempotency-keyed) ──
       const outcome = await withMutation<CreditPurchaseWire>(
@@ -256,6 +289,7 @@ export function registerCreditPackagesRoute(
               stripe_payment_intent_id: intent.id,
               client_secret: intent.clientSecret,
               credits_granted: chargeStatus === 'succeeded' ? grantCredits : 0,
+              charge_blocker: chargeBlocker,
             },
           };
         },

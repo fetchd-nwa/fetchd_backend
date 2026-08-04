@@ -371,6 +371,147 @@ Still outside the contract and flagged, not fixed: **`LedgerEntryWire`**
 (`src/lib/ledgerWire.ts`) — `GET /invoices` remains unguarded by
 `check:contracts`. Bringing it in is its own contract-first change.
 
+**Amendment 2026-08-03 (an abandoned PaymentIntent is always cancelled; wire
+1.7.0 → 1.7.1).** From the three-round adversarial review of the amendment
+above (finding 3, never refuted). Doc-only on the wire (`CHANGELOG.md`
+[1.7.1]) — no shape change, **no DDL** — but it changes the documented
+*semantics* of `InvoicePayWire.client_secret`.
+
+**The rule, for the class.** Any path that confirms an off-session
+PaymentIntent and observes a **non-succeeded** status must **best-effort
+cancel** it before returning, unless a client-side completion flow for that
+intent exists — and none does anywhere in this system. Left live, such an
+intent can auto-succeed later while the owner's next attempt captures on a
+fresh one: two succeeded charges against one invoice, and
+`settleInvoiceCharge`'s duplicate refund only fires inside a settle, so
+neither reverses. The auto-charge worker has always done this
+(`invoiceAutoCharge.ts`, R15); `POST /memberships` and the group-class enroll
+unwind do too. The two that did not now do: **`POST /invoices/:id/pay`** and
+**`POST /credit-packages/:key/purchase`**.
+
+- **Shape:** `try` / `cancel` / `catch` → `request.log.warn`, never throwing.
+  An intent Stripe refuses to cancel (a rare `processing`) is covered by
+  Stripe's changed-params rejection on the next same-key attempt.
+- **Placement is PRE-TX**, immediately after `chargeStatus` is computed —
+  §F forbids a Stripe call inside a DB transaction, and both routes' writes
+  happen inside `withMutation`.
+- **`client_secret` on the non-succeeded arm now names a CANCELLED intent.**
+  It is returned for logging and support lookup only; a client that feeds it to
+  a 3DS completion flow is building on a dead reference. Documented on the field
+  in `wire.ts`. When a 3DS-completion design lands it must revisit this rule for
+  on-session routes — completion needs a LIVE intent — and re-document the field
+  in the same change.
+- **Nothing else changes on that arm, deliberately.** The invoice stays `open`,
+  `payment_method_id` unmoved, `next_attempt_at` untouched, so the worker's
+  schedule and the owner's next manual attempt proceed as if the attempt never
+  happened. The inserted `charges` row parks at its non-succeeded status:
+  `payment_intent.canceled` is an unhandled webhook event, and R32 keeps
+  non-succeeded charges out of the owner ledger, so the row is audit trail, not
+  UI. For credit packages the same holds — `credits_granted: 0` on that arm,
+  nothing to unwind.
+- **The R36 caveat shrinks but does not vanish:** the webhook still doesn't
+  re-settle a 3DS pay-later invoice, and with the intent dead that now bites
+  only for the uncancellable `processing` case, which can flip to succeeded via
+  webhook with the invoice left open. Out of scope; on the record.
+
+**The gap this amendment flagged as unfixed —
+`POST /requests/:id/confirm-payment` — is closed by the 1.8.0 amendment
+below.** The design question it named ("the same rule, or different
+semantics?") was answered: neither. It is a *grant*-creating site, so it
+REFUSES rather than cancels-and-returns.
+
+**Amendment 2026-08-03 (`charge_blocker`, and the B&T pay-now refusal; wire
+1.7.1 → 1.8.0).** Additive on the wire, **no DDL**. Two independent pieces in
+one bump.
+
+**1. `ChargeBlocker` — WHY a confirm stopped, on the wire.** New union
+`'authentication_required' | 'declined' | 'processing'`, carried as
+`InvoicePayWire.charge_blocker?` and `CreditPurchaseWire.charge_blocker?`,
+emitted **iff** the response reports a non-succeeded confirm and omitted on
+every settled arm (omit-on-null). `ChargeStatus` cannot carry it: it is pinned
+to the `charge_status` pgEnum by `conformance.ts`, and
+`stripeIntentStatusToChargeStatus` collapses `requires_payment_method` /
+`requires_confirmation` / `requires_action` / `processing` /
+`requires_capture` into the single value `requires_payment` — which is exactly
+the distinction the owner-facing copy depends on. Widening the enum would be
+DDL; the blocker is a **sibling field, not a widening**.
+
+- **Derivation** is one pure helper beside the collapse it compensates for —
+  `stripeIntentStatusToChargeBlocker` (`src/lib/stripe.ts`), an exhaustive
+  switch on the RAW Stripe status so a future one is a `tsc` error rather than
+  a silent fallback: `requires_action` → `authentication_required`;
+  `requires_payment_method` → `declined`; `processing` → `processing`;
+  `canceled` → `declined`; and two anomalous-after-`confirm:true` statuses that
+  additionally `log.warn` — `requires_confirmation` →
+  `authentication_required`, `requires_capture` → `processing` (money possibly
+  authorized and in flight, so "declined" would be flatly false).
+- **Not persisted.** No new column: the blocker is transient advice about a
+  synchronous response, not accounting state. R32 keeps non-succeeded charges
+  out of every ledger read, so no read path wants it later, and support rides
+  `stripe_payment_intent_id` into the Stripe dashboard.
+- **Absent ≠ succeeded.** Stored idempotency replays of pre-1.8.0 responses
+  carry no field. Clients derive pessimistically when it is missing.
+- **`CreditPurchaseWire` relocated** from `routes/creditPackages.ts:64-70` into
+  `wire.ts`, shape otherwise byte-identical — a second money response that had
+  been sitting outside the versioned contract with nothing for any client's
+  `check:contracts` to guard. Same move `InvoicePayWire` made at 1.7.0, same
+  lesson, applied before it bit a third time.
+
+**2. `POST /requests/:id/confirm-payment` pay-now REFUSES on a non-succeeded
+confirm.** New `ApiErrorCode` **`payment_failed` → HTTP 402** (error envelope
+only — error codes do not ride `wire.ts` shapes, so no wire delta from this
+half), with `details: { kind: 'payment_failed', charge_blocker }` reusing the
+same union so a client renders one taxonomy from either channel.
+
+- **Why refuse rather than cancel-and-return.** The two site *classes* are
+  distinct. A **settle-an-existing-obligation** site (`/invoices/:id/pay`,
+  `/credit-packages/:key/purchase`) correctly 201s with the obligation still
+  open, because a standing invoice exists for the money to settle against
+  later. A **grant-creating** site has no such thing: `POST /memberships`
+  (R28) and `POST /enrollments` (R34) both refuse, and B&T — the highest-ticket
+  charge in the system — was the missing third instance, not a third pattern.
+  Before this it created the booking, stamped `dropoff_at`/`pickup_at`,
+  enqueued reminders, wrote the `charges` row at `requires_payment`, converted
+  the request and pushed "Board & Train confirmed!" — all on money that never
+  moved, with no invoice behind the charge for anything to re-settle.
+- **Placement is PRE-TX** (§F forbids Stripe calls inside a transaction, and
+  nothing has been written yet): best-effort `cancelPaymentIntent` per the
+  1.7.1 class rule above, then throw. No booking, no reminder rows, no charges
+  row, no conversion, no push — and no `idempotency_keys` row either, since the
+  throw beats `withMutation`, so the request stays
+  `approved-awaiting-payment` and a retry is clean.
+- **The other half of the same guard: a SUCCEEDED confirm whose transaction
+  then rolls back is refunded.** The capture happens pre-tx, so a concurrent
+  different-key confirm that converts the request first makes this one 409 at
+  the in-tx state check with money captured, no charges row and nothing to find
+  it by. The route now wraps `withMutation` in the enroll-unwind shape:
+  best-effort `createRefund` under `` `{key}:confirm-unwind` ``, logged loudly
+  on failure, **original** error rethrown.
+- **…except `idempotency_inflight`, at BOTH unwind sites (2026-08-03).** The
+  capture is keyed off the client's `Idempotency-Key`
+  (`` `{key}:payment-intent` `` here, `` `{key}:dog:{dogId}` `` at
+  `POST /enrollments`), so Stripe's own idempotency hands a request that LOSES
+  the claim race the in-flight request's already-captured PaymentIntent.
+  Unwinding there refunds money the winner is about to write its charges row
+  and grant against — charged, granted, **and** refunded. Both catch blocks now
+  skip the unwind for that one code (`isIdempotencyInflight`, `lib/errors.ts` —
+  read off `ApiError.code`, never the message, because `conflict` is a 409 too
+  and must still refund) and simply return the 409; if the winner fails
+  instead, its own catch unwinds its own capture. **Every other error still
+  unwinds**, unchanged. This closes one interleaving, **not** the
+  capture-before-tx class: the standing residual on
+  `unwindCapturedIntents` — a same-key retry after a transient failure
+  re-confirming an already-refunded intent — is untouched, and manual-capture
+  (authorize pre-tx, capture in `postCommit`, cancel on rollback) remains the
+  real fix.
+- **Reachability:** no client calls this route today
+  (`requests-approval.md:201`, drift #10 — the product flow dead-ends at
+  approval), so this hardens the route before its payment UI ships. Zero
+  regression surface now.
+- **Not done here:** `POST /enrollments` keeps its existing
+  `payment_required` code for the same meaning — cosmetic alignment to
+  `payment_failed`, named and deferred.
+
 **Correction 2026-07-31 (drift in the 1.5.0 amendment below).** That entry names
 the third new `notification_type` arm `waitlist-accepted`. The arm that shipped —
 in `wire.ts`, the pgEnum, `pushPreferences` and the QA seed — is
