@@ -1,11 +1,13 @@
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
 
 /**
- * Shared copy helpers for invoice-money notifications — the `payment-succeeded`
- * receipt (`settleInvoiceCharge`) and the `payment-due` cash/check reminder
- * (`POST /invoices/:id/pay-in-person`). Pure, dependency-free formatters kept
- * in one place so the two producers never drift on how a dollar amount or a
- * charge purpose reads to the owner.
+ * Shared copy helpers for money notifications — the `payment-succeeded` receipt
+ * (`settleInvoiceCharge`), the `payment-due` cash/check reminder (`POST
+ * /invoices/:id/pay-in-person`), the parked-invoice `payment-failed` push, and
+ * (wire 1.9.0) the credit-purchase late-settle pushes in
+ * `webhooks/stripeEventHandlers.ts`. Pure, dependency-free formatters kept in
+ * one place so no producer drifts on how a dollar amount or a charge purpose
+ * reads to the owner.
  */
 
 /**

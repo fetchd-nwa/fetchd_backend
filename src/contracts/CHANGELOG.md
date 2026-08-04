@@ -12,6 +12,44 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.9.0] — 2026-08-04
+
+Additive. New `InvoiceDeepLinkReason` (`'payment-failed' | 'payment-due'`);
+`deepLinkToPath`'s `invoice` arm accepts optional `params.reason` and emits it
+as a `&reason=` query param so a payment notification's tap can open the settle
+surface under the framing the push promised. Omitted = today's path; historical
+rows unaffected. An invalid reason throws at emit, matching the `report` arm's
+fail-loud rule — a broken deep link is not persisted.
+
+This exists because Allison's 2026-07-31 payment-failed and payment-due sheet
+copy shipped, passed its tests, and was **invisible to every owner**: no
+production host ever passed a reason, so the sheet always mounted under its
+neutral `'ledger'` default. The copy was right; nothing carried it.
+
+Server-side (no wire shape): Stripe card errors THROWN by an off-session
+confirm are now normalized at the Stripe seam into the same non-succeeded
+result the returning fork produces, so `charge_blocker` (201 channel) and
+`payment_failed` + `details.charge_blocker` (402 channel) now genuinely cover
+both Stripe behaviors — the residual named against `[1.8.0]` ("the thrown
+channel is unbuilt on the settle routes") closes. Non-card errors — connection,
+rate-limit, invalid-request — rethrow untouched, so a network failure to Stripe
+is never relabelled a decline.
+
+### Changed (doc-only)
+
+- **`InvoicePayWire.charge_blocker`** — presence gloss corrected. It claimed
+  presence IFF `charge_status: 'requires_payment'`, which is false: a `canceled`
+  raw status maps to `charge_status: 'failed'` and still carries a blocker.
+  Branch on the blocker's presence, never on a status pairing.
+  `CreditPurchaseWire.charge_blocker` cross-references it and inherits the fix.
+
+### Not in the wire delta, named
+
+The `payment_failed` error envelope and its `details.charge_blocker` stay
+outside `wire.ts` — error codes ride the envelope, per the 2026-08-03
+addendum's rule. The envelope being unversioned is a pre-existing known gap and
+is not widened here.
+
 ## [1.8.0] — 2026-08-03
 
 Additive (Allison 2026-08-03: **"we need this to be clear, not generic"**). She

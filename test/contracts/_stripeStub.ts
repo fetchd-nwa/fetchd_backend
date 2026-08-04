@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import Stripe from 'stripe';
 import { ApiError } from '../../src/lib/errors.js';
+import { normalizeThrownConfirmError } from '../../src/lib/stripe.js';
 import type {
   StripeClient,
   StripePaymentIntentResult,
@@ -27,6 +29,15 @@ import type {
  * Override knobs:
  *   - `setNextIntentStatus(status)` — next `createAndConfirmPaymentIntent`
  *     returns that status (and clientSecret = `pi_test_*_secret_xyz`)
+ *   - `setNextIntentThrowsCardError(status)` — next confirm simulates Stripe's
+ *     OTHER failure fork (a thrown card error carrying the failed intent). It
+ *     runs the simulated throw through the PRODUCTION normalizer, so a route
+ *     test driving this lever exercises the real 1.9.0 seam rather than a
+ *     lookalike — which is the whole point: the two forks must be
+ *     indistinguishable downstream.
+ *   - `setNextIntentThrowsTransport(err)` — next confirm throws a NON-card
+ *     Stripe error (connection/API/rate-limit). The seam rethrows those
+ *     untouched, so this is how a test pins "an outage is not a decline".
  *   - `throwOnDetach()` — next `detachPaymentMethod` rejects
  *   - `throwOnRefund()` — next `createRefund` rejects
  *   - `throwOnCancel()` — next `cancelPaymentIntent` rejects
@@ -91,6 +102,21 @@ export interface StripeStub extends StripeClient {
   readonly calls: StripeStubCall[];
   /** Force the next PaymentIntent confirm to return this status. */
   setNextIntentStatus(status: StripePaymentIntentStatus): void;
+  /**
+   * Force the next PaymentIntent confirm to take Stripe's THROWN fork: a
+   * `StripeCardError` carrying a failed PaymentIntent at `status`, run through
+   * the production normalizer. Per the `StripeClient` contract the call still
+   * RESOLVES — a card-level failure is a result, not an exception — so a route
+   * driving this lever must produce byte-identical behavior to the same status
+   * set via `setNextIntentStatus`. Any difference is the bug.
+   */
+  setNextIntentThrowsCardError(status: StripePaymentIntentStatus): void;
+  /**
+   * Force the next PaymentIntent confirm to throw a NON-card Stripe error.
+   * Defaults to a `StripeConnectionError` — "we could not reach Stripe", which
+   * must never render as a decline.
+   */
+  setNextIntentThrowsTransport(err?: Error): void;
   /** Make the next `detachPaymentMethod` throw. */
   throwOnDetach(): void;
   /** Make the next `createRefund` throw. */
@@ -123,6 +149,8 @@ export interface StripeStub extends StripeClient {
 export function makeStripeStub(): StripeStub {
   const calls: StripeStubCall[] = [];
   let nextIntentStatus: StripePaymentIntentStatus = 'succeeded';
+  let nextIntentThrowsCard = false;
+  let nextIntentTransportError: Error | undefined;
   let detachShouldThrow = false;
   let refundShouldThrow = false;
   let cancelShouldThrow = false;
@@ -139,6 +167,14 @@ export function makeStripeStub(): StripeStub {
     calls,
     setNextIntentStatus(status) {
       nextIntentStatus = status;
+    },
+    setNextIntentThrowsCardError(status) {
+      nextIntentStatus = status;
+      nextIntentThrowsCard = true;
+    },
+    setNextIntentThrowsTransport(err) {
+      nextIntentTransportError =
+        err ?? new Stripe.errors.StripeConnectionError({ message: 'stub: cannot reach Stripe' });
     },
     throwOnDetach() {
       detachShouldThrow = true;
@@ -185,12 +221,45 @@ export function makeStripeStub(): StripeStub {
     async createAndConfirmPaymentIntent(args, idempotencyKey): Promise<StripePaymentIntentResult> {
       const id = testIdPrefix('pi');
       const status = nextIntentStatus;
-      nextIntentStatus = 'succeeded'; // reset for the next call
+      const throwsCard = nextIntentThrowsCard;
+      const transportError = nextIntentTransportError;
+      // Reset every lever for the next call — a stale one bleeding into a
+      // route's SECOND confirm (multi-dog enroll, replay) would be a lie.
+      nextIntentStatus = 'succeeded';
+      nextIntentThrowsCard = false;
+      nextIntentTransportError = undefined;
       calls.push({ method: 'createAndConfirmPaymentIntent', args, idempotencyKey });
+
+      if (transportError !== undefined) {
+        // Non-card errors are rethrown by the seam untouched; the stub models
+        // that by simply throwing.
+        throw transportError;
+      }
+      const clientSecret = status === 'succeeded' ? null : `${id}_secret_${randomUUID().slice(0, 8)}`;
+      if (throwsCard) {
+        // Build the raw error the way Stripe does on a declined off-session
+        // confirm and hand it to the REAL normalizer — the stub must not carry
+        // its own copy of the mapping it exists to prove.
+        return normalizeThrownConfirmError(
+          new Stripe.errors.StripeCardError({
+            type: 'card_error',
+            code: 'card_declined',
+            decline_code: 'generic_decline',
+            message: 'Your card was declined.',
+            statusCode: 402,
+            payment_intent: {
+              id,
+              status,
+              client_secret: clientSecret,
+              amount: args.amountCents,
+            },
+          } as never),
+        );
+      }
       return {
         id,
         status,
-        clientSecret: status === 'succeeded' ? null : `${id}_secret_${randomUUID().slice(0, 8)}`,
+        clientSecret,
         amountCents: args.amountCents,
       };
     },

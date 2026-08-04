@@ -1,7 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import { deepLinkToPath, type InvoicePayWire } from '../contracts/wire.js';
+import {
+  deepLinkToPath,
+  type InvoiceDeepLinkReason,
+  type InvoicePayWire,
+} from '../contracts/wire.js';
 import { db } from '../db/client.js';
 import { bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { peekCompletedIdempotency } from '../db/idempotency.js';
@@ -450,7 +454,15 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           body: `Please bring ${formatDollars(invoiceRow.amountCents)} for your ${purposeLabel(
             invoiceRow.purpose,
           )} ${dropOffPhrase(scheduledFor, anchor.at)}.`,
-          deepLinkPath: deepLinkToPath({ kind: 'invoice', id }),
+          // Wire 1.9.0: carry the FRAMING the push promised through to the
+          // sheet the tap opens. `satisfies` rather than a bare string so a
+          // typo is a compile error here instead of an emit-time throw inside
+          // a worker tick.
+          deepLinkPath: deepLinkToPath({
+            kind: 'invoice',
+            id,
+            params: { reason: 'payment-due' satisfies InvoiceDeepLinkReason },
+          }),
           deepLinkKind: 'invoice',
           deepLinkId: id,
           ...(anchor.leadDogId !== null ? { dogId: anchor.leadDogId } : {}),

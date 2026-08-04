@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { deepLinkToPath, type NotificationDeepLink } from '../src/contracts/wire.js';
+import {
+  deepLinkToPath,
+  INVOICE_DEEP_LINK_REASONS,
+  type NotificationDeepLink,
+} from '../src/contracts/wire.js';
 
 /**
  * Unit coverage for `deepLinkToPath` — THE deep-link path grammar (contract
@@ -101,5 +105,65 @@ test('deepLinkToPath: report with empty-string dogId throws', () => {
   assert.throws(
     () => deepLinkToPath({ kind: 'report', id: 'rep-9', params: { dogId: '' } }),
     /report link requires params\.dogId/,
+  );
+});
+
+// ── invoice `params.reason` (wire 1.9.0) ─────────────────────────────────────
+//
+// The framing a payment notification carries to the settle sheet it opens.
+// Three properties matter and each is pinned separately:
+//   1. every member emits, so a producer can't ship a reason the client drops;
+//   2. an INVALID value throws at emit (the `report` arm's fail-loud rule) —
+//      persisting a path the parser will reject is worse than failing here;
+//   3. OMITTED is byte-identical to the pre-1.9.0 path, which is what makes
+//      every historical row and every non-payment producer untouched.
+
+test('deepLinkToPath: invoice with reason=payment-failed → &reason= appended', () => {
+  assert.equal(
+    deepLinkToPath({ kind: 'invoice', id: 'inv-1', params: { reason: 'payment-failed' } }),
+    '/account/invoices?invoiceId=inv-1&reason=payment-failed',
+  );
+});
+
+test('deepLinkToPath: invoice with reason=payment-due → &reason= appended', () => {
+  assert.equal(
+    deepLinkToPath({ kind: 'invoice', id: 'inv-1', params: { reason: 'payment-due' } }),
+    '/account/invoices?invoiceId=inv-1&reason=payment-due',
+  );
+});
+
+test('deepLinkToPath: every INVOICE_DEEP_LINK_REASONS member emits its own path', () => {
+  // Derived from the exported tuple rather than re-listed, so a member added to
+  // the contract without an emitted path fails HERE.
+  for (const reason of INVOICE_DEEP_LINK_REASONS) {
+    assert.equal(
+      deepLinkToPath({ kind: 'invoice', id: 'inv-1', params: { reason } }),
+      `/account/invoices?invoiceId=inv-1&reason=${reason}`,
+    );
+  }
+});
+
+test('deepLinkToPath: invoice with an INVALID reason throws at emit time', () => {
+  assert.throws(
+    () => deepLinkToPath({ kind: 'invoice', id: 'inv-1', params: { reason: 'ledger' } }),
+    /invoice link reason must be one of/,
+    "the client's local 'ledger' default is not a wire value",
+  );
+  assert.throws(
+    () => deepLinkToPath({ kind: 'invoice', id: 'inv-1', params: { reason: '' } }),
+    /invoice link reason must be one of/,
+  );
+});
+
+test('deepLinkToPath: invoice with params but no reason key is byte-identical to the legacy path', () => {
+  // A non-payment producer that passes OTHER params must not start emitting a
+  // query param — this is the backward-compat guarantee for historical rows.
+  assert.equal(
+    deepLinkToPath({ kind: 'invoice', id: 'inv-1', params: { dogId: 'dog-7' } }),
+    deepLinkToPath({ kind: 'invoice', id: 'inv-1' }),
+  );
+  assert.equal(
+    deepLinkToPath({ kind: 'invoice', id: 'inv-1' }),
+    '/account/invoices?invoiceId=inv-1',
   );
 });

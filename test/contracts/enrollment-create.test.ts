@@ -1063,7 +1063,16 @@ test(
       idempotencyKey: `enr-unsettled-${randomUUID()}`,
       payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
     });
-    assert.equal((res.json() as { error: { code: string } }).error.code, 'payment_required');
+    // Wire 1.9.0: `payment_failed` (402), NOT `payment_required` (422). Mobile's
+    // booking gate maps `payment_required` to the buy-credits "payment required"
+    // modal, so this decline used to tell the owner they needed to pay rather
+    // than that their card didn't go through — a live category error.
+    assert.equal(res.statusCode, 402, res.body);
+    const enrollErr = (
+      res.json() as { error: { code: string; details: { charge_blocker: string } } }
+    ).error;
+    assert.equal(enrollErr.code, 'payment_failed');
+    assert.equal(enrollErr.details.charge_blocker, 'authentication_required');
 
     // A non-succeeded intent never captured money → it's CANCELLED, not refunded,
     // and nothing is enrolled or recorded.
@@ -1079,6 +1088,72 @@ test(
       .from(chargesTable)
       .where(eq(chargesTable.cohortId, cohort.id));
     assert.equal(chargeRows.length, 0, 'no charge row for a non-succeeded intent');
+  },
+);
+
+test(
+  'POST /enrollments — a THROWN card decline refuses identically to a returned one (wire 1.9.0)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Stripe reports a declined stored card either by returning a non-succeeded
+    // intent or by throwing a card error. Before 1.9.0 the thrown fork blew past
+    // this refusal into `chargeEachDogNow`'s unwind + a 500; now both forks
+    // reach the same 402 with the same blocker, and no dog is enrolled either
+    // way.
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    stripe.setNextIntentThrowsCardError('requires_payment_method');
+
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-thrown-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+    });
+
+    assert.equal(res.statusCode, 402, res.body);
+    const body = res.json() as {
+      error: { code: string; details: { charge_blocker: string } };
+    };
+    assert.equal(body.error.code, 'payment_failed');
+    assert.equal(body.error.details.charge_blocker, 'declined');
+    assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 1);
+    assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 0);
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, 0, 'dog NOT enrolled on a thrown decline either');
+    const chargeRows = await db
+      .select({ id: chargesTable.id })
+      .from(chargesTable)
+      .where(eq(chargesTable.cohortId, cohort.id));
+    assert.equal(chargeRows.length, 0, 'no charge row for a non-succeeded intent');
+  },
+);
+
+test(
+  'POST /enrollments — a Stripe TRANSPORT error is not relabelled a decline',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    stripe.setNextIntentThrowsTransport();
+
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-transport-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+    });
+
+    // "We could not reach Stripe" is not "your card was declined": a 402 here
+    // would send the owner hunting for a different card during an outage.
+    assert.notEqual(res.statusCode, 402);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'internal');
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, 0);
   },
 );
 

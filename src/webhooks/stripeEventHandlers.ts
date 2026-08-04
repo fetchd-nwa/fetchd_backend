@@ -1,10 +1,14 @@
+import { deepLinkToPath } from '../contracts/wire.js';
 import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedger, type LocationKey } from '../db/schema/schema.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import { dogsRepository } from '../db/repositories/dogsRepository.js';
+import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
 import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
+import { formatDollars } from '../lib/invoiceReceiptCopy.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
@@ -158,6 +162,13 @@ async function handlePaymentIntentSucceeded(
         chargeId: charge.id,
         metadata: event.metadata,
       });
+      await enqueuePackageFlipPush(tx, {
+        settled: true,
+        ownerId: charge.ownerId,
+        chargeId: charge.id,
+        amountCents: event.amountCents,
+        metadata: event.metadata,
+      });
     }
 
     return { outcome: 'flipped-charge-succeeded', creditsDogId };
@@ -300,7 +311,96 @@ async function maybeReconstructOrphanedPackagePurchase(
     chargeId: charge.id,
     metadata: args.metadata,
   });
+  // Same promise as the flip arm below: the owner was told a `processing`
+  // purchase would be reported when it resolved. A reconstruct means the money
+  // moved and the sync 201 they hold may not even name this charge — so the
+  // push matters MORE here, not less.
+  await enqueuePackageFlipPush(tx, {
+    settled: true,
+    ownerId,
+    chargeId: charge.id,
+    amountCents: args.amountCents,
+    metadata: args.metadata,
+  });
   return { reconstructed: true, creditsDogId };
+}
+
+/**
+ * The late-settle owner push for a credit-package charge (wire 1.9.0, Allison
+ * approved 2026-08-04). The credit-purchase route commits its `charges` row
+ * BEFORE the 201, and `processing` is the one status the pre-tx cancel can't
+ * kill — so the owner's 201 says "your payment is still processing, don't buy
+ * again right now; if it goes through your credits will be added and we'll let
+ * you know", and THIS is the only place that promise can be kept. Without it
+ * that sentence points at nothing and the honest advice becomes "buy again",
+ * which is how an owner ends up charged twice and granted twice.
+ *
+ * Fires only on a FLIP (a charge that was still `requires_payment`) or a
+ * reconstruct — never on `charge-already-terminal`, where the sync response
+ * already told the owner the outcome. `enqueueIdempotent` on
+ * `package-flip[-failed]:<chargeId>` makes a replayed Stripe delivery a no-op
+ * on top of the receiver's own `stripe_events` dedupe.
+ *
+ * Silently skips when the PaymentIntent metadata isn't a package purchase
+ * (a membership month-1 PI carries the same package fields — §J.1 — and
+ * `parsePackagePurchaseMetadata` is the one guard that knows the difference):
+ * with no `dog_id` there is no credits surface to open, and a push that lands
+ * nowhere is worse than none.
+ *
+ * Inherits BUG-17 (`DISCREPANCIES.md`): stored notification preferences are the
+ * scheduler's to honor, and it does so for both these types via
+ * `pushPreferences.ts`. Nothing here widens that gap.
+ */
+async function enqueuePackageFlipPush(
+  tx: Tx,
+  args: {
+    /** true = the intent settled and credits landed; false = it failed. */
+    settled: boolean;
+    ownerId: string;
+    chargeId: string;
+    amountCents: number;
+    metadata: Record<string, string>;
+  },
+): Promise<void> {
+  const parsed = parsePackagePurchaseMetadata(args.metadata);
+  if (parsed === undefined) return;
+
+  const now = new Date();
+  if (!args.settled) {
+    await scheduledNotificationsRepository.enqueueIdempotent(tx, {
+      ownerId: args.ownerId,
+      type: 'payment-failed',
+      trigger: 'package-charge-failed',
+      dedupeKey: `package-flip-failed:${args.chargeId}`,
+      scheduledFor: now, // immediate — delivered on the next scheduler tick
+      title: 'Purchase failed',
+      body: "Your credit purchase didn't go through — you weren't charged. No credits were added.",
+      deepLinkPath: deepLinkToPath({ kind: 'credits', id: parsed.dogId }),
+      deepLinkKind: 'credits',
+      deepLinkId: parsed.dogId,
+      dogId: parsed.dogId,
+    });
+    return;
+  }
+
+  // Name the dog the credits actually landed on — the owner may have several,
+  // and "credits were added" without saying whose is the kind of vague that
+  // makes someone open the app to find out.
+  const dogName = (await dogsRepository.findNameInTx(tx, parsed.dogId)) ?? 'your dog';
+  const creditNoun = parsed.credits === 1 ? '1 credit was' : `${parsed.credits} credits were`;
+  await scheduledNotificationsRepository.enqueueIdempotent(tx, {
+    ownerId: args.ownerId,
+    type: 'payment-succeeded',
+    trigger: 'package-charge-settled',
+    dedupeKey: `package-flip:${args.chargeId}`,
+    scheduledFor: now,
+    title: 'Purchase complete',
+    body: `Your ${formatDollars(args.amountCents)} credit purchase went through — ${creditNoun} added for ${dogName}.`,
+    deepLinkPath: deepLinkToPath({ kind: 'credits', id: parsed.dogId }),
+    deepLinkKind: 'credits',
+    deepLinkId: parsed.dogId,
+    dogId: parsed.dogId,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -338,6 +438,19 @@ async function handlePaymentIntentFailed(
     }
 
     await chargesRepository.markStatus(tx, { id: charge.id, status: 'failed' });
+
+    if (charge.purpose === 'package') {
+      // The other half of the `processing` promise (wire 1.9.0): the purchase
+      // resolved, and it resolved badly. Saying so — including "you weren't
+      // charged" — is what makes it safe for the owner to buy again.
+      await enqueuePackageFlipPush(tx, {
+        settled: false,
+        ownerId: charge.ownerId,
+        chargeId: charge.id,
+        amountCents: event.amountCents,
+        metadata: event.metadata,
+      });
+    }
 
     // Reverse any provisional purchase ledger row. Defensive: Day-14's
     // sync path only writes the ledger on 'succeeded', so this is rare.

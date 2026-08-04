@@ -54,11 +54,18 @@ export type ScheduledNotificationType =
   | 'booking-reminder'
   | 'boarding-profile-check'
   | 'credits-expiring'
-  // `payment-failed` (a PARKED invoice — terminal auto-charge failure) routes
-  // through the scheduled queue so it gets the PUSH channel: it's action-
-  // required (the owner must fix their card). `payment-succeeded` (a receipt)
-  // stays feed-only — emitted directly by `settleInvoiceCharge`, never here.
+  // `payment-failed` routes through the scheduled queue so it gets the PUSH
+  // channel. Two producers: a PARKED invoice (terminal auto-charge failure —
+  // action-required, the owner must fix their card) and, since wire 1.9.0, a
+  // credit purchase whose `processing` intent later settled as FAILED at the
+  // webhook.
   | 'payment-failed'
+  // `payment-succeeded` is feed-only on the INVOICE receipt path (emitted
+  // directly by `settleInvoiceCharge`, never here). It joined this queue at
+  // wire 1.9.0 for exactly one producer: the credit-purchase webhook flip, where
+  // the 201 already told the owner "still processing — we'll let you know" and
+  // the push is that promise being kept. Same enum member, no DDL.
+  | 'payment-succeeded'
   // §J.3 monthly attendance scan: an alumni dog attended <2 qualifying
   // sessions in the just-closed Chicago month. Dedupe key doubles as the
   // once-per-month-per-dog guard (`alumni-attendance:<dogId>:<YYYY-MM>`).

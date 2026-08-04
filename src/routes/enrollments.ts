@@ -1,6 +1,7 @@
 import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import type { ChargeBlocker } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { lockCohort } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
@@ -34,6 +35,7 @@ import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
   defaultStripeClient,
+  stripeIntentStatusToChargeBlocker,
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
@@ -195,10 +197,30 @@ export function registerEnrollmentsRoute(
         // A pay-now intent that confirmed but did NOT reach 'succeeded'
         // (off-session 3DS / processing) must not enroll — unwind + fail rather
         // than write a non-succeeded charge row and enroll the dog anyway.
-        if (paidIntents.some((intent) => intent.status !== 'succeeded')) {
+        const unsettled = paidIntents.find((intent) => intent.status !== 'succeeded');
+        if (unsettled !== undefined) {
+          // Wire 1.9.0: `payment_failed` (402), NOT `payment_required` (422).
+          // The codes were conflated and the conflation was VISIBLE: mobile's
+          // booking gate maps `payment_required` to the buy-credits "payment
+          // required" modal, so an enrollment card decline told the owner they
+          // needed to pay rather than that their card was declined — a category
+          // error. `payment_required` keeps its original booking-gate meaning
+          // ("no card on file"); a charge that was attempted and did not
+          // complete now speaks the same taxonomy as the other two grant sites.
+          //
+          // The blocker names the FIRST unsettled dog's raw status. Multi-dog
+          // enrolls charge one intent per dog and unwind as a unit, so there is
+          // one outcome to report, not N.
           throw new ApiError(
-            'payment_required',
+            'payment_failed',
             'the card charge did not complete — no dogs were enrolled',
+            {
+              kind: 'payment_failed',
+              // `blocker` is set for every non-succeeded intent by construction;
+              // the fallback is the client's own pessimistic rule rather than a
+              // reason to omit the field.
+              charge_blocker: unsettled.blocker ?? 'declined',
+            },
           );
         }
 
@@ -688,6 +710,17 @@ interface PaidEnrollmentIntent {
   dogId: string;
   intentId: string;
   status: ChargeStatus;
+  /**
+   * WHY this confirm stopped short, in domain vocabulary (wire 1.9.0) —
+   * `undefined` on a succeeded intent. Derived where the RAW Stripe status is
+   * still in hand, because `stripeIntentStatusToChargeStatus` above destroys
+   * exactly that distinction: five raw statuses collapse into
+   * `requires_payment`, but "declined", "needs verification we can't complete"
+   * and "still in flight, do NOT retry" are three different sentences with
+   * three different next actions. Same derivation point and same reason as the
+   * two settle routes.
+   */
+  blocker: ChargeBlocker | undefined;
   amountCents: number;
 }
 
@@ -734,6 +767,10 @@ async function chargeEachDogNow(args: {
         dogId,
         intentId: intent.id,
         status: stripeIntentStatusToChargeStatus(intent.status),
+        blocker:
+          intent.status === 'succeeded'
+            ? undefined
+            : stripeIntentStatusToChargeBlocker(intent.status, args.log),
         amountCents: intent.amountCents,
       });
     }

@@ -439,6 +439,21 @@ async function findOwnerIdInTx(tx: Tx, dogId: string): Promise<string | undefine
 }
 
 /**
+ * Resolve a dog's display name inside a tx, cross-owner. `undefined` when the
+ * dog id doesn't exist at all.
+ *
+ * Deliberately NOT filtered to live rows, unlike its `findOwnerIdInTx`
+ * neighbour: the one caller is the Stripe webhook's late-settle push, which
+ * narrates money that ALREADY moved onto that dog's credit ledger. A dog
+ * soft-expired between the purchase and the webhook flip is still the dog the
+ * credits went to, and naming it is more honest than going anonymous.
+ */
+async function findNameInTx(tx: Tx, dogId: string): Promise<string | undefined> {
+  const [row] = await tx.select({ name: dogs.name }).from(dogs).where(eq(dogs.id, dogId)).limit(1);
+  return row?.name;
+}
+
+/**
  * One row of the cross-owner staff dog directory (`GET /staff/dogs`,
  * Day-19b). The data layer owns its own return-type vocabulary; the route
  * converts to the snake_case §B-style wire.
@@ -494,6 +509,7 @@ export const dogsRepository = {
   findEvaluationStatusInTx,
   findApprovalDivertFieldsInTx,
   findOwnerIdInTx,
+  findNameInTx,
   findAlumniFlagForStaff,
   lockForAlumniUpdate,
   findAllLiveForStaff,

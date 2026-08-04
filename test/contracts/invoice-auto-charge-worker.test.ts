@@ -389,7 +389,13 @@ test(
     // The old copy ordered the owner to "update your card" — one fix, and the
     // wrong one for a healthy card that simply declined.
     assert.doesNotMatch(scheduled!.body, /update your card/i);
-    assert.equal(scheduled?.deepLinkPath, `/account/invoices?invoiceId=${invoiceId}`);
+    // Wire 1.9.0: the tap must open the settle sheet under the SAME framing
+    // this push just used — a payment-failed push landing on a neutral ledger
+    // is the gap Allison's 2026-07-31 sheet copy was written for and never got.
+    assert.equal(
+      scheduled?.deepLinkPath,
+      `/account/invoices?invoiceId=${invoiceId}&reason=payment-failed`,
+    );
     assert.equal(scheduled?.deepLinkKind, 'invoice');
     assert.equal(scheduled?.deepLinkId, invoiceId);
 

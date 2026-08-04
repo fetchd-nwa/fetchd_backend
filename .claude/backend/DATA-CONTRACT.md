@@ -3191,3 +3191,75 @@ in — the earlier "lapse/revoke" sketch is superseded by the **flag** model.
   `alumni_attendance_flagged_at: string|null`. Mobile: alumni badge on the
   dog profile hero; amber flag warning on `CreditBalanceCard` (same pattern
   as the expiry warning row).
+
+## K. The payment-failure channel (wire 1.9.0, 2026-08-04)
+
+Amendment recording what changed when "a payment did not succeed" got ONE
+route from Stripe to the owner's eyes (`designs/payment-failure-channel.md`).
+No DDL, no migration; the pushes reuse existing `notification_type` members.
+
+- **The thrown fork is normalized at the Stripe seam, not per route.** Stripe
+  reports a failed off-session confirm two ways: by RETURNING a non-succeeded
+  PaymentIntent, or by THROWING a card error that carries it.
+  `createAndConfirmPaymentIntent` now catches the second and returns the same
+  `StripePaymentIntentResult` as the first (`lib/stripe.ts`
+  `normalizeThrownConfirmError`). **The `StripeClient` contract is therefore:
+  card-level failures RETURN a non-succeeded result; only transport,
+  configuration, and idempotency errors THROW** — and any stub implementing the
+  interface owes the same guarantee. All six confirm sites (both settle routes,
+  three grant routes, the auto-charge worker) travel one already-tested
+  non-succeeded arm regardless of fork, so the `charge_blocker` taxonomy really
+  does cover both channels rather than two mappings agreeing by luck.
+  - **Non-card errors rethrow untouched.** A connection / API / rate-limit /
+    auth / invalid-request failure means we do not know whether money moved;
+    relabelling one a decline would tell every owner at once that their card
+    failed during a Stripe outage, and "try a different card" is the wrong
+    recovery for it (the reused-key retry is).
+  - **A card error with no attached intent, or one whose attached intent
+    reached `succeeded`, throws loudly** (a plain `Error`, so it is an honest
+    500 rather than Stripe's own 402 under code `internal`). An error path may
+    never grant, settle, or convert.
+  - **New writes, named:** on the two settle routes a thrown decline used to
+    write nothing (the throw predated `withMutation`). It now writes the
+    non-succeeded `charges` audit row + the idempotency record, exactly as the
+    returning fork always has (R32 keeps such rows out of the owner ledger).
+    In the worker, a thrown decline now CANCELS the failed intent before
+    `recordFailed` — the catch never did, which was a dangling-PI residue.
+- **One error code across all three grant sites.** `POST /memberships` moved
+  from `invalid_payload` (422) and `POST /enrollments` from `payment_required`
+  (422) to **`payment_failed` (402) + `details.charge_blocker`**, matching
+  `POST /requests/:id/confirm-payment`. The enrollments change fixes a live
+  category error: mobile maps `payment_required` to the buy-credits gate modal,
+  so a card decline told the owner they needed to pay. `payment_required` keeps
+  its original booking-gate meaning ("no card on file").
+- **Notification deep links carry their framing.** `deepLinkToPath`'s `invoice`
+  arm accepts `params.reason` (`InvoiceDeepLinkReason`) and emits
+  `&reason=<reason>`; an invalid value throws at emit. Producers:
+  | producer | notification type | reason |
+  | --- | --- | --- |
+  | `workers/invoiceAutoCharge.ts` (parked auto-charge) | `payment-failed` | `payment-failed` |
+  | `routes/invoices.ts` (pay-in-person drop-off reminder) | `payment-due` | `payment-due` |
+  | `lib/enqueueInvoiceOverdueWarnings.ts` (overdue safety net) | `invoice-overdue` | `payment-due` |
+  | `lib/settleInvoiceCharge.ts` (receipt) | `payment-succeeded` | **none** — a receipt opens a PAID invoice; no settle framing applies |
+  Omitting the param emits the pre-1.9.0 path byte-for-byte, so historical rows
+  and every non-payment producer are untouched.
+- **The credit-purchase late-settle pushes.** The credit route commits its
+  `charges` row before the 201 and `processing` is the one status the pre-tx
+  cancel cannot kill, so the 201 tells the owner "still processing, don't buy
+  again — we'll let you know". `webhooks/stripeEventHandlers.ts` keeps that
+  promise: a `package` charge FLIPPING to succeeded (including via the orphan
+  reconstruct) enqueues a `payment-succeeded` push, and one flipping to failed
+  enqueues a `payment-failed` push, dedupe-keyed `package-flip:<chargeId>` /
+  `package-flip-failed:<chargeId>`. Never on `charge-already-terminal` (the
+  synchronous 201 already answered), never for a membership month-1 PI (§J.1 —
+  it carries the same package metadata fields), never for invoice charges (R36
+  is its own design). `payment-succeeded` joined `ScheduledNotificationType`
+  and `pushPreferences`' `urgent-updates` category for exactly this producer;
+  the invoice receipt stays feed-only.
+- **Deliberately NOT built:** server-side dedupe of two different-key package
+  purchases while one is `processing`. Two purchases are sometimes exactly what
+  the owner wants, and guessing intent on a money path is how refunds get
+  invented. The residual — an owner who ignores the no-retry copy, from a fresh
+  session, while a `processing` intent settles — nets two charges and two
+  grants, both visible on the ledger and both refundable through the Stripe
+  dashboard.

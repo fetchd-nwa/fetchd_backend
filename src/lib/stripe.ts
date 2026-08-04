@@ -288,6 +288,17 @@ export interface StripeClient {
    * HANDOFF Day-14). With a stored card + test mode, this returns
    * `status='succeeded'` immediately; in production a 3DS card returns
    * `'requires_action'` and the FE finishes via the returned client_secret.
+   *
+   * **The contract (wire 1.9.0): card-level failures RETURN a non-succeeded
+   * result; only transport, configuration, and idempotency errors THROW.**
+   * Stripe itself reports a failed off-session confirm two ways — by returning
+   * a non-succeeded PaymentIntent, or by throwing a card error that carries
+   * that same PaymentIntent — and every caller here has exactly one correct,
+   * tested non-succeeded arm. So the fork is erased at THIS seam
+   * ({@link normalizeThrownConfirmError}) rather than bet on, or re-handled at
+   * each of the six confirm sites. Implementations of this interface — the SDK
+   * one below AND the contract-test stub — owe that same guarantee, or a route
+   * test proves nothing about the fork it didn't simulate.
    */
   createAndConfirmPaymentIntent(
     args: {
@@ -360,13 +371,118 @@ export interface StripeClient {
 }
 
 /**
+ * Runtime membership test for {@link StripePaymentIntentStatus}, needed because
+ * the status on a THROWN card error's attached PaymentIntent arrives across a
+ * trust boundary (the SDK types it `any`) and must be validated, not asserted.
+ * The record is keyed BY the union, so a status added there without a key here
+ * is a compile error — the same "a future Stripe status can never slip through
+ * silently" discipline as the two exhaustive switches above.
+ */
+const PAYMENT_INTENT_STATUSES: Readonly<Record<StripePaymentIntentStatus, true>> = {
+  requires_payment_method: true,
+  requires_confirmation: true,
+  requires_action: true,
+  processing: true,
+  requires_capture: true,
+  canceled: true,
+  succeeded: true,
+};
+
+function isPaymentIntentStatus(value: unknown): value is StripePaymentIntentStatus {
+  return typeof value === 'string' && Object.hasOwn(PAYMENT_INTENT_STATUSES, value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * THE thrown-fork normalizer (wire 1.9.0) — the one place in this system that
+ * decides whether an error from an off-session confirm is a **payment outcome**
+ * or a **failure to find out**.
+ *
+ * Stripe reports a declined stored card either by returning a non-succeeded
+ * PaymentIntent or by throwing a card error; before 1.9.0 only the returning
+ * fork was built, so a thrown decline reached the global handler as a 500 and
+ * the owner read "We couldn't reach the server." on a card that was simply
+ * declined. This function converts the thrown fork into the exact
+ * {@link StripePaymentIntentResult} the returning fork produces, so every
+ * confirm site travels its already-tested non-succeeded arm either way — the
+ * charges audit row is written, the 1.7.1 cancel rule fires, and the
+ * `charge_blocker` taxonomy covers both channels because it is one code path,
+ * not two mappings that happen to agree.
+ *
+ * Either returns a normalized result or throws. The rows, and why each is what
+ * it is:
+ *
+ *   - **Not a `StripeCardError` → rethrow the original, untouched.** Connection,
+ *     API, rate-limit, authentication and invalid-request errors all mean *we do
+ *     not know whether money moved*. Relabelling one of those a decline would
+ *     tell every owner at once that their card failed during a Stripe outage,
+ *     and "try a different card" would be actively wrong advice — the reused-key
+ *     retry the `network` copy promises is the correct recovery. The
+ *     same-key-changed-params rejection (`StripeInvalidRequestError`) is the
+ *     loud failure the idempotency-key design WANTS (`invoices.ts` ~:188):
+ *     failing beats charging twice.
+ *   - **Card error whose attached intent reached `succeeded` → throw.** An error
+ *     path must never be allowed to grant, settle, or convert. This is an
+ *     anomaly to investigate, not a result to render.
+ *   - **Card error with no readable attached intent → throw.** Defensive (not
+ *     documented to happen on a confirm): with no intent state in hand, "we
+ *     don't know" is the only honest answer, and 500 → `network` says exactly
+ *     that.
+ *
+ * The two throwing anomalies are wrapped in a plain `Error` on purpose: the
+ * global handler maps a bare Stripe error to ITS `statusCode` (402/400) with
+ * code `internal`, and a 402 that isn't a `payment_failed` envelope is the most
+ * confusing shape we could hand a client. A plain Error is an honest 500, and
+ * `cause` keeps the original for the log.
+ *
+ * Discrimination is by Stripe's error CLASS, never by message text. The
+ * attached intent is read off `err.payment_intent` — pinned against
+ * `stripe@22.1.1`, where `StripeError`'s constructor copies it from the raw
+ * error body (`err.raw.payment_intent` is the same object); `test/stripeSeam.
+ * test.ts` fails if a future SDK moves it.
+ */
+export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentResult {
+  if (!(err instanceof Stripe.errors.StripeCardError)) throw err;
+
+  const attached: unknown = err.payment_intent;
+  const id: unknown = isRecord(attached) ? attached.id : undefined;
+  const status: unknown = isRecord(attached) ? attached.status : undefined;
+  const amount: unknown = isRecord(attached) ? attached.amount : undefined;
+  if (typeof id !== 'string' || id.length === 0 || !isPaymentIntentStatus(status)) {
+    throw new Error(
+      'Stripe card error carried no readable PaymentIntent — cannot report a payment outcome',
+      { cause: err },
+    );
+  }
+  if (status === 'succeeded') {
+    throw new Error(
+      `Stripe card error carried a SUCCEEDED PaymentIntent (${id}) — refusing to treat an error path as a settlement`,
+      { cause: err },
+    );
+  }
+  const clientSecret: unknown = isRecord(attached) ? attached.client_secret : undefined;
+  return {
+    id,
+    status,
+    clientSecret: typeof clientSecret === 'string' ? clientSecret : null,
+    // Amount is informational on this arm (nothing was captured), so a missing
+    // one degrades to 0 rather than costing the owner a real sentence.
+    amountCents: typeof amount === 'number' ? amount : 0,
+  };
+}
+
+/**
  * The default `StripeClient` implementation — direct SDK calls. Routes
  * substitute this for an in-memory stub via DI in contract tests. Errors
- * from Stripe are surfaced as-is (Stripe.errors.* subclasses); routes that
- * call this in a `withMutation` block let the error bubble to the error
- * mapper, which is rough today — Day-15 (webhooks) will likely formalize
- * the Stripe-error → API-error mapping. Pre-Day-15 callers either swallow
- * + log (post-commit detach/refund) or re-throw (sync purchase confirm).
+ * from Stripe are surfaced as-is (Stripe.errors.* subclasses) on every verb
+ * EXCEPT `createAndConfirmPaymentIntent`, where wire 1.9.0 normalizes a thrown
+ * CARD error into the non-succeeded result its callers already handle (see
+ * `normalizeThrownConfirmError`) — every other error class still bubbles to the
+ * error mapper untouched. Callers of the other verbs either swallow + log
+ * (post-commit detach/refund) or re-throw.
  */
 export const defaultStripeClient: StripeClient = {
   async createCustomer(args, idempotencyKey) {
@@ -415,18 +531,30 @@ export const defaultStripeClient: StripeClient = {
   },
 
   async createAndConfirmPaymentIntent(args, idempotencyKey) {
-    const intent = await stripeSingleton.paymentIntents.create(
-      {
-        amount: args.amountCents,
-        currency: args.currency,
-        customer: args.customerId,
-        payment_method: args.paymentMethodId,
-        confirm: true,
-        off_session: true,
-        metadata: args.metadata,
-      },
-      { idempotencyKey },
-    );
+    let intent: Stripe.PaymentIntent;
+    try {
+      intent = await stripeSingleton.paymentIntents.create(
+        {
+          amount: args.amountCents,
+          currency: args.currency,
+          customer: args.customerId,
+          payment_method: args.paymentMethodId,
+          confirm: true,
+          off_session: true,
+          metadata: args.metadata,
+        },
+        { idempotencyKey },
+      );
+    } catch (err) {
+      // THE seam (wire 1.9.0). A thrown card error is a payment OUTCOME, not a
+      // failure to find out, so it becomes the same non-succeeded result the
+      // returning fork produces and every confirm site travels one already-
+      // tested arm. Everything else rethrows untouched — see
+      // `normalizeThrownConfirmError` for why each row is what it is. Only the
+      // Stripe call is inside the `try`: our own mapping below must never be
+      // able to reach a catch whose job is interpreting Stripe.
+      return normalizeThrownConfirmError(err);
+    }
     return {
       id: intent.id,
       status: intent.status as StripePaymentIntentStatus,

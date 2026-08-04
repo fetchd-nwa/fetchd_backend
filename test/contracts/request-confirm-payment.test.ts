@@ -437,6 +437,71 @@ test(
 );
 
 test(
+  'POST /requests/:id/confirm-payment pay-now — a THROWN card decline refuses identically (wire 1.9.0)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Stripe reports a declined stored card two ways. Before 1.9.0 only the
+    // RETURNED fork reached this refusal; the THROWN one blew past it to the
+    // global handler as a 500, and the owner read "We couldn't reach the
+    // server." on a card that was simply declined. Both forks are now one code
+    // path, and this is the assertion that says so at this site.
+    await cleanup();
+    const requestId = await seedApprovedAwaitingPaymentBT();
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentThrowsCardError('requires_payment_method');
+    const before = await grantFootprint();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/requests/${requestId}/confirm-payment`,
+      headers: { 'idempotency-key': `cp-bt-thrown-${randomUUID()}` },
+      payload: CONFIRM_PAYLOAD,
+    });
+
+    assert.equal(res.statusCode, 402, res.body);
+    const body = res.json() as {
+      error: { code: string; details?: { charge_blocker: string } };
+    };
+    assert.equal(body.error.code, 'payment_failed');
+    assert.equal(body.error.details?.charge_blocker, 'declined');
+    assert.deepEqual(footprintSince(before, await grantFootprint()), NOTHING_CREATED);
+    assert.equal(await statusOf(requestId), 'approved-awaiting-payment');
+    assert.equal(cancelledIntents(stripe).length, 1, 'the failed intent is cancelled here too');
+
+    await cleanup();
+  },
+);
+
+test(
+  'POST /requests/:id/confirm-payment pay-now — a Stripe TRANSPORT error is not a decline',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The other side of the same seam. "We could not reach Stripe" must stay
+    // "we do not know whether money moved" — a 402 here would tell the owner to
+    // try a different card during an outage, which is wrong advice.
+    await cleanup();
+    const requestId = await seedApprovedAwaitingPaymentBT();
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentThrowsTransport();
+    const before = await grantFootprint();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/requests/${requestId}/confirm-payment`,
+      headers: { 'idempotency-key': `cp-bt-transport-${randomUUID()}` },
+      payload: CONFIRM_PAYLOAD,
+    });
+
+    assert.notEqual(res.statusCode, 402);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'internal');
+    assert.deepEqual(footprintSince(before, await grantFootprint()), NOTHING_CREATED);
+    assert.equal(await statusOf(requestId), 'approved-awaiting-payment');
+
+    await cleanup();
+  },
+);
+
+test(
   'POST /requests/:id/confirm-payment pay-now — a cancel Stripe refuses still refuses the booking',
   SKIP_WHEN_NO_DB,
   async () => {

@@ -225,7 +225,20 @@ test(
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
       },
     });
-    assert.equal(res.statusCode, 422, res.body);
+    // Wire 1.9.0: 402 `payment_failed`, not 422 `invalid_payload`. The old code
+    // was unrecognizable to any client as a money outcome, so a membership
+    // decline rendered mobile's generic "Couldn't complete the purchase"
+    // instead of the one true sentence. Same code + same `charge_blocker`
+    // vocabulary as the other two grant sites.
+    assert.equal(res.statusCode, 402, res.body);
+    const err = (res.json() as { error: { code: string; details: { charge_blocker: string } } })
+      .error;
+    assert.equal(err.code, 'payment_failed');
+    assert.equal(
+      err.details.charge_blocker,
+      'authentication_required',
+      'requires_action is "needs verification", never "declined"',
+    );
     assert.equal(
       stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length,
       1,

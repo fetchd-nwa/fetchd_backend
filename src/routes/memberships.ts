@@ -27,7 +27,11 @@ import { firstPeriod, membershipEndsAt } from '../lib/membershipBilling.js';
 import type { PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
-import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
+import {
+  defaultStripeClient,
+  stripeIntentStatusToChargeBlocker,
+  type StripeClient,
+} from '../lib/stripe.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
@@ -262,8 +266,19 @@ export function registerMembershipsRoute(
           // idempotency on the client's retry with the same key.
         }
         throw new ApiError(
-          'invalid_payload',
+          'payment_failed',
           'card could not be charged synchronously (declined or requires authentication) — memberships need a card that charges without extra steps; try a different card',
+          {
+            kind: 'payment_failed',
+            // Wire 1.9.0: one code and one vocabulary across all three grant
+            // sites (here, `enrollments.ts`, `requestConfirmPayment.ts`). This
+            // arm used to throw `invalid_payload` (422), which no client could
+            // recognize as a money outcome — a membership decline rendered
+            // mobile's generic "Couldn't complete the purchase" instead of the
+            // one true sentence. Derived from the RAW status, which is only in
+            // hand here.
+            charge_blocker: stripeIntentStatusToChargeBlocker(intent.status, request.log),
+          },
         );
       }
 

@@ -132,7 +132,12 @@ test(
     assert.ok(scheduled !== undefined, 'payment-due reminder enqueued');
     assert.equal(scheduled?.type, 'payment-due');
     assert.equal(scheduled?.title, 'Payment due at drop-off');
-    assert.equal(scheduled?.deepLinkPath, `/account/invoices?invoiceId=${invoiceId}`);
+    // Wire 1.9.0: a payment-DUE framing, so the sheet opens saying money is
+    // owed rather than reading as a neutral ledger visit.
+    assert.equal(
+      scheduled?.deepLinkPath,
+      `/account/invoices?invoiceId=${invoiceId}&reason=payment-due`,
+    );
     assert.equal(scheduled?.deepLinkKind, 'invoice');
     assert.equal(scheduled?.dogId, FIXTURE_IDS.dog1Id, 'tagged the booking lead dog');
     assert.match(scheduled!.body, /\$120/);

@@ -1,4 +1,4 @@
-import { deepLinkToPath } from '../contracts/wire.js';
+import { deepLinkToPath, type InvoiceDeepLinkReason } from '../contracts/wire.js';
 import {
   invoicesRepository,
   type OverdueInvoiceForWarning,
@@ -65,7 +65,15 @@ export async function enqueueInvoiceOverdueWarnings(
       scheduledFor: now,
       title: 'Payment still outstanding',
       body: overdueBody(invoice),
-      deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.invoiceId }),
+      // Wire 1.9.0: the overdue safety net is a payment-DUE framing — money is
+      // still owed and the sheet should open saying so. (Not `payment-failed`:
+      // this scan's own suppression predicate excludes invoices that already
+      // emitted a `payment-failed`, so the two never describe the same invoice.)
+      deepLinkPath: deepLinkToPath({
+        kind: 'invoice',
+        id: invoice.invoiceId,
+        params: { reason: 'payment-due' satisfies InvoiceDeepLinkReason },
+      }),
       deepLinkKind: 'invoice',
       deepLinkId: invoice.invoiceId,
       ...(invoice.dogId !== null ? { dogId: invoice.dogId } : {}),

@@ -1,4 +1,4 @@
-import { deepLinkToPath } from '../contracts/wire.js';
+import { deepLinkToPath, type InvoiceDeepLinkReason } from '../contracts/wire.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import {
   invoicesRepository,
@@ -230,10 +230,17 @@ async function processOne(
       attemptKey,
     );
   } catch (err) {
-    // Stripe-side rejection (card declined, etc) — terminal failed PI.
+    // TRANSPORT errors only, since wire 1.9.0: connection / API / rate-limit /
+    // auth / idempotency failures, where we do not know whether money moved.
+    // A declined card no longer arrives here — the Stripe seam normalizes a
+    // thrown card error into the same non-succeeded result the returning fork
+    // produces, so card failures take the arm below and get CANCELLED before
+    // `recordFailed` (this catch never cancelled, which is the dangling-PI
+    // residue the old comment here warned about). The attempt still counts and
+    // still parks on the same schedule either way.
     log.warn(
       { invoiceId: invoice.id, err: err instanceof Error ? err.message : String(err) },
-      'invoice auto-charge: Stripe call failed',
+      'invoice auto-charge: Stripe call failed (transport)',
     );
     const nextAttemptAt = scheduleNextAttempt(invoice.autoChargeAttempts, now);
     await recordFailed(invoice, nextAttemptAt, now);
@@ -426,7 +433,16 @@ async function recordFailed(
         `${purposeLabel(invoice.purpose)} on ${chicagoShortDate(now)} and it didn't go through. ` +
         `Want to try a different form of payment? You can use another card, or pay ` +
         `in person with cash or check.`,
-      deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
+      // Wire 1.9.0: the tap opens the settle sheet under the SAME framing this
+      // push just used. Allison's 2026-07-31 payment-failed sheet copy existed
+      // and no production host ever passed a reason, so it rendered only under
+      // test; the reason rides the path because that is the one channel both
+      // tap paths (OS push cold start, in-app list) share.
+      deepLinkPath: deepLinkToPath({
+        kind: 'invoice',
+        id: invoice.id,
+        params: { reason: 'payment-failed' satisfies InvoiceDeepLinkReason },
+      }),
       deepLinkKind: 'invoice',
       deepLinkId: invoice.id,
       dogId: invoice.dogId,

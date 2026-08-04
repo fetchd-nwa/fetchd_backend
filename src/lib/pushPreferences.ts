@@ -19,7 +19,9 @@ import type { NotificationType } from '../contracts/wire.js';
  * `NotificationCategoryPanel`: booking-confirmations, booking-reminders,
  * report-cards, session-photos, urgent-updates, announcements. Only two of them
  * gate a scheduled type the worker actually pushes today, so `PUSH_TYPE_CATEGORY`
- * below is total over exactly the seven push-capable scheduled types and no others.
+ * below is total over exactly the push-capable scheduled types and no others —
+ * `Record<PushCapableType, …>` is what enforces that, so adding an arm to the
+ * union without a category is a compile error rather than a silent ungated push.
  */
 type PushCategoryKey = 'booking-reminders' | 'urgent-updates';
 
@@ -33,6 +35,15 @@ type PushCapableType =
   | 'boarding-profile-check'
   | 'alumni-attendance'
   | 'payment-failed'
+  // Wire 1.9.0. Only the credit-purchase webhook flip enqueues this type (the
+  // invoice receipt is feed-only and never reaches the scheduler), and it is
+  // the promised follow-up to a `processing` purchase. It sits in the same
+  // category as its `payment-failed` twin ON PURPOSE: the two are one event
+  // with two outcomes, and an owner who muted one must not be told only the
+  // bad half. Without a mapping here it would push UNGATED — the map is total
+  // over the push-capable types by construction, so omitting an arm is a
+  // silent opt-out of the owner's own switch, not a neutral default.
+  | 'payment-succeeded'
   | 'payment-due'
   | 'credits-expiring'
   | 'spay-neuter-reminder'
@@ -44,6 +55,7 @@ const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'boarding-profile-check': 'booking-reminders',
   'alumni-attendance': 'booking-reminders',
   'payment-failed': 'urgent-updates',
+  'payment-succeeded': 'urgent-updates',
   // R3: the cash/check "bring payment at drop-off" reminder is action-required.
   'payment-due': 'urgent-updates',
   'credits-expiring': 'urgent-updates',
