@@ -15,7 +15,7 @@ import {
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
-import { FIXTURE_IDS, FIXTURE_NOW, topUpCredits } from './_fixture.js';
+import { FIXTURE_IDS, topUpCredits } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
@@ -89,7 +89,13 @@ function cancelApp(principal = FIXTURE_OWNER_PRINCIPAL): {
 } {
   const { app, authenticate } = makeContractApp(principal);
   const stripe = makeStripeStub();
-  registerBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe });
+  // Dates in this suite are anchored on the REAL clock (see `realFutureWeekday`
+  // and REAL_NOW_MS above) because the cancel route's forfeit math runs on
+  // Postgres `now()`. Injecting FIXTURE_NOW here put the CREATION route on a
+  // different clock from the dates it validates: the lookahead cap froze at
+  // FIXTURE_TODAY + 92 = 2026-08-19 while the dates kept moving, and the suite
+  // went red on 2026-08-20 by exactly one day. Same clock both sides.
+  registerBookingsRoute(app, { authenticate, now: () => new Date(REAL_NOW_MS), stripe });
   return { app, stripe };
 }
 
