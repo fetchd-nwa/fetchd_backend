@@ -27,7 +27,8 @@
     "db:test:nuke": "docker compose --profile test rm -sf db-test && docker volume rm -f fetchd-pg-test-data",
     "smoke:r2": "tsx scripts/smoke-r2.mjs",
     "db:dev:check": "tsx scripts/check-dev-db.ts",
-    "gate": "bash scripts/gate.sh"
+    "gate": "bash scripts/gate.sh",
+    "probe:stripe": "tsx scripts/probe-stripe-thrown-confirm.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1054.0",
