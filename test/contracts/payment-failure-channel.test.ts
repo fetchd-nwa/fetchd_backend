@@ -6,6 +6,7 @@ import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
+import { invoiceChargeAttemptsRepository } from '../../src/db/repositories/invoiceChargeAttemptsRepository.js';
 import { membershipsRepository } from '../../src/db/repositories/membershipsRepository.js';
 import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import {
@@ -23,7 +24,7 @@ import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
 import { runInvoiceAutoChargeOnce } from '../../src/workers/invoiceAutoCharge.js';
-import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -109,6 +110,7 @@ async function seedOpenInvoice(
 async function cleanup(): Promise<void> {
   await db.delete(creditLedger).where(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id));
   await db.delete(memberships).where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   // Break the scheduled -> feed FK link before dropping either side; the
@@ -641,7 +643,7 @@ test(
 );
 
 test(
-  'invoice auto-charge worker — a transport error still takes the catch (attempt counted, no cancel)',
+  'invoice auto-charge worker — a transport error takes the catch and counts NOTHING (2026-08-12)',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -657,16 +659,28 @@ test(
       limit: 1,
       now: new Date('2026-02-01T12:00:00Z'),
     });
-    assert.equal(tick.results[0]!.outcome, 'failed-retry-scheduled');
+    // This assertion INVERTED on 2026-08-12
+    // (`designs/auto-charge-unknown-outcome.md`). It used to read
+    // `'failed-retry-scheduled'` + `attempts === 1`, and it was pinning the
+    // defect: counting a transport failure as a dunning attempt incremented
+    // `auto_charge_attempts`, which was the Stripe idempotency key's suffix, so
+    // the next tick charged a NEW PaymentIntent for money that may already have
+    // moved. The catch is the arm that runs when nobody knows what happened,
+    // and the only safe thing it can do is record the doubt and stop.
+    assert.equal(tick.results[0]!.outcome, 'unknown-outcome-pending');
     const [inv] = await db
       .select({ status: invoices.status, attempts: invoices.autoChargeAttempts })
       .from(invoices)
       .where(eq(invoices.id, invoiceId));
-    assert.equal(inv?.attempts, 1);
+    assert.equal(inv?.attempts, 0, 'an unknown outcome is not a dunning failure');
     assert.equal(inv?.status, 'open');
     // The catch has no intent id to cancel — that is precisely why the card
     // fork must NOT arrive here any more.
     assert.equal(stripeFootprint(stripe).cancels, 0);
+    // The doubt is on the books, which is what makes the verify lane possible.
+    const attempts = await invoiceChargeAttemptsRepository.findAllForInvoice(db, invoiceId);
+    assert.equal(attempts.length, 1, 'the attempt row was written BEFORE the Stripe call');
+    assert.equal(attempts[0]?.outcome, 'pending');
 
     await cleanup();
   },

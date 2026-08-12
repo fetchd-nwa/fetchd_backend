@@ -18,7 +18,6 @@ import {
   type InvoiceRow,
 } from '../db/repositories/invoicesRepository.js';
 import { ledgerRepository } from '../db/repositories/ledgerRepository.js';
-import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
 import { toLedgerEntryWire, type LedgerEntryWire } from '../lib/ledgerWire.js';
@@ -27,7 +26,11 @@ import { formatDollars, purposeLabel } from '../lib/invoiceReceiptCopy.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
-import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
+import {
+  fireDuplicateRefundPostCommit,
+  settleInvoiceCharge,
+  type PendingDuplicateRefund,
+} from '../lib/settleInvoiceCharge.js';
 import {
   chargeBlockerForConfirm,
   defaultStripeClient,
@@ -268,22 +271,26 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
               ? [`credits:${invoiceRow.dogId}:*`]
               : [],
           // Post-commit Stripe refund for a lost-race duplicate charge. Fires
-          // once per non-replayed outcome; failure is logged + swallowed by the
-          // withMutation seam (the 'pending' refund row is the commitment, the
-          // webhook reconciles terminal status). Mirrors the cancel route.
+          // once per non-replayed outcome; the 'pending' refund row is the
+          // commitment and the webhook reconciles terminal status.
+          //
+          // **Through the shared helper since 2026-08-12 (round 3), and the
+          // idempotency KEY is why.** This used to build its own call keyed
+          // `${idempotencyKey}:dup-settle-refund` — the CLIENT's request key,
+          // which nothing durable can reconstruct afterwards. Every other
+          // caller of this same `settleInvoiceCharge` arm keys the refund by
+          // OUR refund-row uuid, and the new `duplicate-refund-retry` sweep
+          // relies on that: it re-fires unsent `duplicate-invoice-settle` rows
+          // under `duplicateRefundIdempotencyKey(refundId)`. A row written here
+          // but keyed on a request would have been retried under a key Stripe
+          // had never seen — which is how one duplicate charge becomes two
+          // refunds. One row, one key, one refund, whoever fires it.
           postCommit: async () => {
-            if (pendingStripeRefund === undefined) return;
-            const refund = await stripe.createRefund(
-              {
-                paymentIntentId: pendingStripeRefund.paymentIntentId,
-                amountCents: pendingStripeRefund.amountCents,
-                reason: 'requested_by_customer',
-              },
-              `${idempotencyKey}:dup-settle-refund`,
-            );
-            await refundsRepository.markStripeId({
-              id: pendingStripeRefund.refundId,
-              stripeRefundId: refund.id,
+            await fireDuplicateRefundPostCommit({
+              pending: pendingStripeRefund,
+              stripe,
+              log: request.log,
+              context: { invoiceId: invoiceRow.id, settlePath: 'invoice-pay-route' },
             });
           },
         },

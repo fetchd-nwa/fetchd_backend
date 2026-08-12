@@ -22,7 +22,7 @@ import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
 import { withActor } from '../../src/db/tx.js';
 import { registerMembershipsRoute, type MembershipWire } from '../../src/routes/memberships.js';
 import { registerStaffMembershipsRoute } from '../../src/routes/staffMemberships.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -106,6 +106,7 @@ async function cleanupMemberships(): Promise<void> {
       ),
     );
   await clearMembershipGrantLots();
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(isNotNull(invoices.membershipId));
   await db.delete(charges).where(eq(charges.purpose, 'membership'));
   await db.delete(memberships).where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));

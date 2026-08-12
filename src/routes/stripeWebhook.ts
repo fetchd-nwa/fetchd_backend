@@ -4,6 +4,7 @@ import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { invalidatePattern } from '../lib/cache.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { stripeEventsRepository } from '../db/repositories/stripeEventsRepository.js';
+import { fireDuplicateRefundPostCommit } from '../lib/settleInvoiceCharge.js';
 import { dispatchStripeEvent } from '../webhooks/stripeEventHandlers.js';
 
 export interface StripeWebhookOpts {
@@ -93,6 +94,19 @@ export function registerStripeWebhookRoute(
       try {
         const result = await dispatchStripeEvent(event, { stripe });
         await stripeEventsRepository.markProcessed(event.id);
+        // Post-commit Stripe refund when settling an orphaned invoice charge
+        // LOST the `markPaid` race — the owner had already paid that invoice, so
+        // this PaymentIntent double-bills and its 'pending' refund row is
+        // waiting. Fired here, never inside the handler's tx (R5), exactly as
+        // the auto-charge worker fires its own; a failure leaves the pending
+        // row for retry rather than a silent double charge. This is the second
+        // half of "two charges, one refund, no human".
+        await fireDuplicateRefundPostCommit({
+          pending: result.pendingStripeRefund,
+          stripe,
+          log: request.log,
+          context: { stripeEventId: event.id, stripeEventType: event.type },
+        });
         // Post-commit credit-balance cache wipe when the event moved a dog's
         // balance (async purchase grant / payment_failed reversal). Best-effort:
         // the DB is already committed + marked processed, so a Redis blip here

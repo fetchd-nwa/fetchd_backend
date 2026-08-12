@@ -14,7 +14,7 @@ import {
 import { membershipsRepository } from '../../src/db/repositories/membershipsRepository.js';
 import { withActor } from '../../src/db/tx.js';
 import { registerMembershipsRoute, type MembershipWire } from '../../src/routes/memberships.js';
-import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -91,6 +91,7 @@ async function cleanupUniqueness(): Promise<void> {
     .where(
       and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'membership-grant')),
     );
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(isNotNull(invoices.membershipId));
   const membershipCharges = await db
     .select({ id: charges.id })

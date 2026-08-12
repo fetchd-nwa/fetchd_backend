@@ -8,9 +8,13 @@ import type { InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { membershipsRepository } from '../db/repositories/membershipsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
-import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import {
+  refundsRepository,
+  ROW_KEYED_REFUND_REASON,
+} from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
+import type { StripeClient } from './stripe.js';
 import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
 import { nextMonthlyPeriodEnd } from './membershipBilling.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
@@ -164,7 +168,11 @@ export async function settleInvoiceCharge(
     chargeId: charge.id,
     bookingId: invoice.bookingId,
     amountCents: maxRefund,
-    reason: 'duplicate-invoice-settle',
+    // Load-bearing since 2026-08-12: this exact string is what the
+    // `duplicate-refund-retry` sweep claims on, because it means "this row's
+    // Stripe key is `duplicateRefundIdempotencyKey(row.id)`". Every caller of
+    // this arm fires it through `fireDuplicateRefundPostCommit`, so that holds.
+    reason: ROW_KEYED_REFUND_REASON,
   });
 
   return {
@@ -172,6 +180,78 @@ export async function settleInvoiceCharge(
     chargeId: charge.id,
     pendingStripeRefund: { refundId: refund.id, paymentIntentId, amountCents: maxRefund },
   };
+}
+
+/**
+ * The other half of the `'refunded'` outcome's contract, extracted 2026-08-12 so
+ * the two async settle paths cannot drift from the worker's.
+ *
+ * `settleInvoiceCharge` never calls Stripe (no Stripe inside a tx, R5): on a
+ * LOST settle race it writes the duplicate charge's refund row 'pending' and
+ * hands the caller this handle. Every caller then owes the same three steps
+ * post-commit — fire `createRefund` against the duplicate PI, persist the `re_*`
+ * id so the `charge.refund.updated` webhook matches deterministically, and on
+ * failure LOG and leave the 'pending' row for retry rather than swallow a
+ * paid-but-unrefunded double charge.
+ *
+ * Callers: the auto-charge worker, the verify lane, and (since the invoice
+ * orphan arm) the Stripe webhook receiver — the last of which reaches the
+ * lost-race branch most often, because it settles PIs for invoices the owner
+ * may have paid manually in the meantime. That is the "two charges, one refund,
+ * no human" arc, and it only works if every caller does this identically.
+ *
+ * `stripe` is narrowed to the one verb used so a caller can't accidentally be
+ * handed more Stripe surface than this needs.
+ */
+/**
+ * THE Stripe idempotency key for a lost-race duplicate refund. Keyed on OUR
+ * refund row's uuid, which is why the retry sweep exists at all: the key is
+ * reconstructible from durable state forever, so a retry of a `createRefund`
+ * whose response was lost REPLAYS the original refund instead of sending a
+ * second one. Both callers — the post-commit fire below and
+ * `workers/duplicateRefundRetry.ts` — must use this and nothing else; two
+ * spellings of one key would turn the retry into the double refund it exists
+ * to prevent.
+ */
+export function duplicateRefundIdempotencyKey(refundId: string): string {
+  return `dup-settle-refund:${refundId}`;
+}
+
+export async function fireDuplicateRefundPostCommit(args: {
+  pending: PendingDuplicateRefund | undefined;
+  stripe: Pick<StripeClient, 'createRefund'>;
+  log: { error(obj: Record<string, unknown>, msg?: string): void };
+  /** Context for the failure log line — whatever names the money for an operator. */
+  context: Record<string, unknown>;
+}): Promise<void> {
+  const { pending, stripe, log } = args;
+  if (pending === undefined) return; // defensive zero-refund case: nothing to send back
+  try {
+    const refund = await stripe.createRefund(
+      {
+        paymentIntentId: pending.paymentIntentId,
+        amountCents: pending.amountCents,
+        reason: 'requested_by_customer',
+      },
+      duplicateRefundIdempotencyKey(pending.refundId),
+    );
+    await refundsRepository.markStripeId({ id: pending.refundId, stripeRefundId: refund.id });
+  } catch (err) {
+    log.error(
+      {
+        ...args.context,
+        refundId: pending.refundId,
+        paymentIntentId: pending.paymentIntentId,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      // "Left for retry" is true as of 2026-08-12 and was not before: the
+      // scheduler's `duplicate-refund-retry` phase claims exactly these rows
+      // (pending, no `stripe_refund_id`) and re-fires under the SAME key. Until
+      // it existed, nothing anywhere retried them and this line was the entire
+      // response to an owner being double-charged.
+      'lost-race duplicate refund failed to fire; pending row left for the retry sweep',
+    );
+  }
 }
 
 /**

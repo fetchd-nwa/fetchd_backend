@@ -1,4 +1,4 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { ne } from 'drizzle-orm';
 import { db } from '../client.js';
 import { refunds } from '../schema/schema.js';
@@ -51,6 +51,16 @@ const REFUND_PROJECTION = {
   status: refunds.status,
   stripeRefundId: refunds.stripeRefundId,
 } as const;
+
+/**
+ * The `reason` written by `settleInvoiceCharge`'s lost-race arm — the ONLY
+ * pending-refund class whose Stripe idempotency key is reconstructible from the
+ * row alone (`duplicateRefundIdempotencyKey(refund.id)`), and therefore the only
+ * one the retry sweep may re-fire. Kept next to the query that depends on it so
+ * a future `createPending` caller reusing this string inherits the requirement
+ * rather than silently breaking it.
+ */
+export const ROW_KEYED_REFUND_REASON = 'duplicate-invoice-settle';
 
 export const refundsRepository = {
   /**
@@ -155,6 +165,108 @@ export const refundsRepository = {
       .where(and(eq(refunds.id, args.id), isNull(refunds.stripeRefundId)))
       .returning({ id: refunds.id });
     return updated.length;
+  },
+
+  /**
+   * The retry sweep's CLAIM (2026-08-12, round 3) — select + lease in one short
+   * tx, mirroring `invoiceChargeAttemptsRepository.claimUnresolvedForVerify`.
+   *
+   * The worklist: refunds still `pending` with NO `stripe_refund_id`, which is
+   * exactly "the money-back row was written but the Stripe call never landed".
+   * Until this existed, nothing retried them — no worker imported this
+   * repository, and `charge.refund.updated` cannot arrive for a refund that was
+   * never created at Stripe. Every `fireDuplicateRefundPostCommit` failure was
+   * therefore a permanent double charge whose only trace was one log line, and
+   * the webhook's invoice-orphan arm made lost-race refunds a COMMON path
+   * rather than a rare one.
+   *
+   * **Scoped to `reason = 'duplicate-invoice-settle'`, and that is a safety
+   * bound, not a convenience one.** A retry is only safe when it can reproduce
+   * the key the ORIGINAL call used; under a different key Stripe executes a
+   * SECOND refund instead of replaying the first. Only the lost-race arm of
+   * `settleInvoiceCharge` keys its refunds by OUR row uuid
+   * (`duplicateRefundIdempotencyKey`) — every one of its callers now does,
+   * including `POST /invoices/:id/pay`, which was fixed in the same round to
+   * stop keying on the client's request key. The other pending-refund writers
+   * (`reason='cancel'` from the cancel/withdraw paths, and
+   * `'duplicate-membership-subscribe'`) still key on `${idempotencyKey}:…`,
+   * which nothing durable can reconstruct — so this sweep must NOT touch them,
+   * and their failed refunds remain a named, un-swept gap.
+   *
+   * Two bounds, both on columns that already exist (no DDL):
+   *   - `staleBefore` (on `updated_at`) is the retry cadence AND the lease: the
+   *     claim's own UPDATE moves `updated_at` (explicitly, and the
+   *     `refunds_touch` trigger would anyway), hiding the row from the next
+   *     tick for a full interval. `markStripeId` moves it too, so a row that
+   *     succeeds simply leaves the worklist by no longer being unsent.
+   *   - `mintedAfter` (on `created_at`) is the ABANDON bound. A refund older
+   *     than that has outlived Stripe's ~24h idempotency-key lifetime, so a
+   *     retry under the same key could execute a SECOND refund rather than
+   *     replay the first — the mirror image of the auto-charge key window, and
+   *     the same answer: stop, and hand it to a human
+   *     (see `findAbandonedPending`).
+   */
+  async claimStalePendingForRetry(
+    tx: Tx,
+    args: { staleBefore: Date; mintedAfter: Date; limit?: number },
+  ): Promise<RefundRow[]> {
+    const due = await tx
+      .select({ id: refunds.id })
+      .from(refunds)
+      .where(
+        and(
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          eq(refunds.reason, ROW_KEYED_REFUND_REASON),
+          lte(refunds.updatedAt, args.staleBefore.toISOString()),
+          gt(refunds.createdAt, args.mintedAfter.toISOString()),
+        ),
+      )
+      .orderBy(asc(refunds.createdAt))
+      .limit(args.limit ?? 25)
+      .for('update', { skipLocked: true });
+    if (due.length === 0) return [];
+    return tx
+      .update(refunds)
+      .set({ updatedAt: sql`now()` })
+      .where(
+        inArray(
+          refunds.id,
+          due.map((r) => r.id),
+        ),
+      )
+      .returning(REFUND_PROJECTION);
+  },
+
+  /**
+   * Refunds nothing will ever send: still `pending`, still never sent, and
+   * minted before the retry window's floor. This is owed money that no
+   * automatic path will return, so the caller's job is to be LOUD about it —
+   * the one thing worse than a failed refund is a silently failed one. Capped,
+   * because the log line names them individually.
+   *
+   * Deliberately NOT scoped by `reason`, unlike the claim above. Retrying is an
+   * ACTION and must be keyed correctly; reporting is a READ, and a stuck
+   * `'cancel'` refund is exactly as much owed money as a stuck duplicate-settle
+   * one — more so, because no sweep will ever pick it up. Every row here needs
+   * the same thing: a human in the Stripe dashboard.
+   */
+  async findAbandonedPending(
+    runner: Runner,
+    args: { mintedBefore: Date; limit?: number },
+  ): Promise<RefundRow[]> {
+    return runner
+      .select(REFUND_PROJECTION)
+      .from(refunds)
+      .where(
+        and(
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          lte(refunds.createdAt, args.mintedBefore.toISOString()),
+        ),
+      )
+      .orderBy(asc(refunds.createdAt))
+      .limit(args.limit ?? 20);
   },
 
   /**

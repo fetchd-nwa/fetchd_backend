@@ -1176,6 +1176,86 @@ CREATE TABLE invoices (
 CREATE INDEX invoices_owner_idx  ON invoices (owner_id);
 CREATE INDEX invoices_open_idx   ON invoices (status) WHERE status = 'open';
 
+-- ----------------------------------------------------------------------------
+-- Invoice charge attempts (2026-08-12, `designs/auto-charge-unknown-outcome.md`).
+--
+-- The auto-charge worker used to keep TWO jobs in one integer: the dunning
+-- ladder (`invoices.auto_charge_attempts`) AND the Stripe idempotency key's
+-- identity (`auto-charge:{invoiceId}:{attempts}`). A transport failure — the
+-- one class where we do NOT know whether money moved — incremented that counter
+-- and thereby MINTED A NEW KEY, so the next tick asked Stripe for new money for
+-- a charge that may already have succeeded. Splitting the jobs is the fix:
+-- `auto_charge_attempts` keeps the ladder (known-failed attempts only) and the
+-- key identity moves HERE, where `attempt_no` advances only when the previous
+-- attempt is known-dead.
+--
+-- One row per attempt, written BEFORE the Stripe confirm so a worker that dies
+-- mid-flight leaves the doubt on the books instead of in a log:
+--   'pending'    -- we do not know (pre-call, crash, or transport-unknown)
+--   'processing' -- Stripe has it and the money is in flight
+--   'succeeded'  -- settled (charges/invoices rows carry the money truth)
+--   'no-charge'  -- known-dead: declined / auth-required / canceled
+-- The last two are terminal. `payment_method_id` + `stripe_payment_method_id` +
+-- `amount_cents` + `stripe_customer_id` are the params FROZEN at mint time: a
+-- re-issue under the same key must send byte-identical params or Stripe rejects
+-- it (`idempotency_error`) — which is the desired loud failure, not a reason to
+-- mint a fresh key. `stripe_customer_id` joined them 2026-08-12: it is part of
+-- the request Stripe hashes the key against, and re-reading it from
+-- `stripe_customers` at re-issue time meant a re-link between mint and verify
+-- silently drifted the fingerprint into the permanent-park arm.
+--
+-- `reconcile_reason` is the DURABLE half of a park. Every park arm looks
+-- identical in the invoice row (`next_attempt_at = NULL`), so the fact a human
+-- most needs — WHY automation stopped, and in particular whether our records
+-- disagree with Stripe's — used to live only in a log line.
+--
+-- NOT a wire surface (no `conformance.ts` pin, no client mirror) — worker
+-- telemetry + the operator's answer to "what happened to this money?".
+-- ----------------------------------------------------------------------------
+CREATE TYPE invoice_attempt_outcome AS ENUM
+  ('pending', 'processing', 'succeeded', 'no-charge');
+
+CREATE TABLE invoice_charge_attempts (
+  id                        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  invoice_id                uuid NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+  attempt_no                integer NOT NULL,
+  payment_method_id         uuid NOT NULL REFERENCES payment_methods(id) ON DELETE RESTRICT,
+  stripe_payment_method_id  text NOT NULL,
+  stripe_customer_id        text NOT NULL,  -- frozen with the other confirm params
+  amount_cents              integer NOT NULL CHECK (amount_cents >= 0),
+  idempotency_key           text NOT NULL UNIQUE,
+  stripe_payment_intent_id  text,          -- NULL until a response/webhook names it
+  outcome                   invoice_attempt_outcome NOT NULL DEFAULT 'pending',
+  verify_count              integer NOT NULL DEFAULT 0,
+  -- Why the verify lane handed this attempt to a human. NULL = never parked.
+  --   'key-window-expired'  -- past the key window with no PI id and no webhook
+  --   'in-flight-cap'       -- 'processing' longer than the cap allows
+  --   'idempotency-conflict'-- Stripe rejected our frozen params on our own key
+  --   'fresh-execution'     -- a re-issue EXECUTED instead of replaying: the
+  --                         -- key window assumption did not hold, so a second
+  --                         -- charge may exist for this debt
+  reconcile_reason          text CHECK (reconcile_reason IN
+                              ('key-window-expired', 'in-flight-cap',
+                               'idempotency-conflict', 'fresh-execution')),
+  created_at                timestamptz NOT NULL DEFAULT now(),
+  updated_at                timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (invoice_id, attempt_no)
+);
+-- THE interlock: at most one unresolved attempt per invoice, enforced by the
+-- database, not by worker discipline. The charge lane cannot mint attempt N+1
+-- while attempt N is in doubt even if its code path is wrong.
+CREATE UNIQUE INDEX invoice_charge_attempts_unresolved_uq
+  ON invoice_charge_attempts (invoice_id)
+  WHERE outcome IN ('pending', 'processing');
+-- The verify lane's worklist: oldest unresolved first.
+CREATE INDEX invoice_charge_attempts_unresolved_idx
+  ON invoice_charge_attempts (updated_at)
+  WHERE outcome IN ('pending', 'processing');
+-- The webhook's orphan match target (metadata carries the PI id, not our uuid).
+CREATE INDEX invoice_charge_attempts_pi_idx
+  ON invoice_charge_attempts (stripe_payment_intent_id)
+  WHERE stripe_payment_intent_id IS NOT NULL;
+
 -- The 3 Day School payment modes from the DS: PAYG (charges.purpose='payg'),
 -- packages (credit_packages + credit_ledger), memberships (below).
 --
@@ -1660,7 +1740,11 @@ BEGIN
     'owners','dogs','vets','reports','bookings','pending_requests','charges','refunds',
     -- Day-17 §A amendment 2026-05-27: worker queue carries updated_at so
     -- the dashboard can surface stalled 'processing' rows.
-    'media_derivative_jobs'
+    'media_derivative_jobs',
+    -- 2026-08-12: the verify lane claims unresolved attempts by `updated_at`,
+    -- so every outcome/verify_count write must move it or a resolved-then-
+    -- reopened row could sort ahead of a genuinely older one.
+    'invoice_charge_attempts'
   ]) LOOP
     EXECUTE format(
       'CREATE TRIGGER %I_touch BEFORE UPDATE ON %I
@@ -1670,7 +1754,8 @@ END $$;
 
 -- Attach audit_capture to every soft-expire entity + join table (AFTER
 -- UPDATE OR DELETE). Append-only/immutable-by-nature tables are intentionally
--- excluded (credit_ledger, charges, invoices, refunds, agreement_signatures,
+-- excluded (credit_ledger, charges, invoices, invoice_charge_attempts, refunds,
+-- agreement_signatures,
 -- scheduled_notifications, notifications, media_derivative_jobs, audit_log) as
 -- is idempotency_keys (transport dedupe, TTL-pruned). day_capacity is
 -- included — it carries expired_at. service_rates is included so closing an
@@ -2016,6 +2101,7 @@ COMMENT ON TABLE  stripe_customers               IS 'Maps an owner to their Stri
 COMMENT ON TABLE  payment_methods                IS 'Owner saved Stripe payment methods (token + displayable brand/last4); raw PAN never stored. Removal = expire (retained for charge history).';
 COMMENT ON TABLE  charges                        IS 'Stripe PaymentIntent records (package purchase, pay-as-you-go, board-and-train, membership, group-class). Retained financial record.';
 COMMENT ON TABLE  invoices                       IS 'Card-backed pay-later (anti-scam): every invoice has a required payment_method + due_at and is auto-charged by the worker — no open-ended unpaid balance. Distinct from charges; flips to paid when settled.';
+COMMENT ON TABLE  invoice_charge_attempts        IS 'One row per auto-charge attempt, written BEFORE the Stripe confirm. Owns the Stripe idempotency key identity (attempt_no advances only when the previous attempt is known-dead) and the frozen params a same-key re-issue must resend. A partial unique index allows at most one unresolved (pending/processing) attempt per invoice.';
 COMMENT ON TABLE  memberships                    IS 'Recurring Day School membership subscriptions (Stripe subscription-backed). Cancellation = status, never deleted.';
 COMMENT ON TABLE  refunds                        IS 'Refunds against a prior Stripe charge (partial allowed). Append-only retained financial record; money-back, distinct from a credit_ledger cancel-refund.';
 COMMENT ON TABLE  agreement_documents            IS 'Catalog of liability waivers / policy docs that gate bookings; applies_to empty = all categories. current_version drives the signature gate.';

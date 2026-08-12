@@ -6,7 +6,7 @@ import { invoicesRepository } from '../../src/db/repositories/invoicesRepository
 import { charges, invoices } from '../../src/db/schema/schema.js';
 import { registerStaffInvoicesRoute } from '../../src/routes/staffInvoices.js';
 import { MAX_AUTO_CHARGE_ATTEMPTS } from '../../src/workers/invoiceAutoCharge.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -38,6 +38,7 @@ function staffApp(principal: Principal = FIXTURE_STAFF_PRINCIPAL): {
 }
 
 async function cleanup(): Promise<void> {
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
 }

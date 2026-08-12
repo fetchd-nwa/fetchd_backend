@@ -14,7 +14,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import type { LedgerEntryWire } from '../../src/lib/ledgerWire.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -60,6 +60,7 @@ async function cleanup(bookingIds: string[] = []): Promise<void> {
     .delete(scheduledNotifications)
     .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   if (bookingIds.length > 0) {

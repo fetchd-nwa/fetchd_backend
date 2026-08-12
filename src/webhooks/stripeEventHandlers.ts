@@ -9,6 +9,10 @@ import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
 import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { formatDollars } from '../lib/invoiceReceiptCopy.js';
+import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
+import { invoiceChargeAttemptsRepository } from '../db/repositories/invoiceChargeAttemptsRepository.js';
+import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
+import { autoChargeParkNotification } from '../lib/autoChargeNotificationCopy.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
@@ -46,6 +50,12 @@ export interface WebhookHandlerResult {
     | 'flipped-charge-failed'
     | 'charge-already-terminal'
     | 'reconstructed-package-purchase'
+    // 2026-08-12: a succeeded auto-charge PaymentIntent whose invoice nothing
+    // here had recorded — the orphan class that used to be DROPPED.
+    | 'settled-orphaned-invoice-charge'
+    // The matching failure event for one of those: an attempt we had left in
+    // doubt, resolved the moment Stripe volunteered the answer.
+    | 'resolved-orphaned-invoice-attempt'
     | 'wrote-payment-method'
     | 'payment-method-already-present'
     | 'flipped-refund-succeeded'
@@ -54,6 +64,15 @@ export interface WebhookHandlerResult {
     | 'noop';
   /** Optional human-readable note for the log line. */
   note?: string;
+  /**
+   * Set when settling an orphaned invoice charge LOST the `markPaid` race — the
+   * owner had already paid this invoice another way, so this PI double-bills
+   * and its refund row was written 'pending' inside the handler's tx. The
+   * RECEIVER fires the Stripe refund post-commit (no Stripe call inside a tx,
+   * R5) exactly as the auto-charge worker does. Reported up rather than fired
+   * inline for the same reason `creditsDogId` is: handlers stay pure DB.
+   */
+  pendingStripeRefund?: PendingDuplicateRefund;
   /**
    * Set when this event moved a dog's credit balance (async purchase grant or
    * the payment_failed reversal). The receiver wipes the dog's
@@ -125,12 +144,29 @@ async function handlePaymentIntentSucceeded(
     const charge = await chargesRepository.findByStripePaymentIntentId(tx, event.paymentIntentId);
     if (charge === undefined) {
       // No charges row for a SUCCEEDED PaymentIntent — Stripe captured money
-      // but the synchronous purchase write never landed (DB failure after the
-      // Stripe call committed at Stripe's side). For a credit-package purchase
-      // the PI metadata carries everything to rebuild the record, so the
-      // webhook is the safety net: reconstruct the charge + grant idempotently.
-      // (Invoice auto-charge orphans self-heal via the worker's next tick, so
-      // only the client-driven package purchase needs this path.)
+      // but nothing here recorded it. Two producers, two safety nets:
+      //
+      //   1. An INVOICE auto-charge (or a manual `/invoices/:id/pay`) whose
+      //      outcome we never learned. Until 2026-08-12 this fell through to
+      //      the package parse, failed it (auto-charge PIs carry
+      //      invoice_id/owner_id/purpose, not package fields) and was DROPPED
+      //      as `orphan-event` — under a comment claiming these "self-heal via
+      //      the worker's next tick", which was false twice over: a parked
+      //      invoice has `next_attempt_at = NULL` so the lease can never see it
+      //      again, and the retry used a fresh idempotency key so it could
+      //      never re-adopt the orphaned PI. Money settled at Stripe with
+      //      nothing here knowing, and the owner got a push inviting them to
+      //      pay again. That is the drop this arm closes.
+      //   2. A credit-package purchase whose synchronous write failed after
+      //      Stripe captured — the PI metadata carries everything to rebuild
+      //      the record.
+      const invoiceOrphan = await maybeSettleOrphanedInvoiceCharge(tx, {
+        paymentIntentId: event.paymentIntentId,
+        amountCents: event.amountCents,
+        metadata: event.metadata,
+      });
+      if (invoiceOrphan !== undefined) return invoiceOrphan;
+
       const reconstructed = await maybeReconstructOrphanedPackagePurchase(tx, {
         paymentIntentId: event.paymentIntentId,
         amountCents: event.amountCents,
@@ -173,6 +209,136 @@ async function handlePaymentIntentSucceeded(
 
     return { outcome: 'flipped-charge-succeeded', creditsDogId };
   });
+}
+
+/**
+ * A non-empty string field off PaymentIntent metadata, which arrives across a
+ * trust boundary (anything can be in there, including nothing).
+ */
+function metadataString(metadata: Record<string, string>, key: string): string | undefined {
+  const value: unknown = metadata[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
+ * The `auto_charge_attempt` metadata field, as a non-negative integer. The
+ * worker stamps `invoice_charge_attempts.attempt_no` here; a pre-2026-08-12 PI
+ * stamped the dunning counter instead, which for the FIRST attempt of an
+ * invoice is the same number by the seeding rule and otherwise simply fails to
+ * match a row — a miss, never a wrong match, because the (invoice_id,
+ * attempt_no) pair is unique.
+ */
+function metadataAttemptNo(metadata: Record<string, string>): number | undefined {
+  const raw = metadataString(metadata, 'auto_charge_attempt');
+  if (raw === undefined) return undefined;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * Marry a succeeded PaymentIntent back to the INVOICE it was charging, when no
+ * `charges` row exists for it — the money-critical half of
+ * `designs/auto-charge-unknown-outcome.md` Decision 2.
+ *
+ * This is the ONLY resolver that works when the invoice can no longer be leased
+ * at all: parked (`next_attempt_at IS NULL`), voided by a group-class withdraw,
+ * or switched to pay-in-person. In every one of those the charge lane is blind
+ * to the invoice while a PaymentIntent may still settle.
+ *
+ * Returns `undefined` when the PI isn't an invoice charge (or fails the trust
+ * check) so the caller falls through to the package reconstruct; otherwise the
+ * finished handler result.
+ *
+ * The settle runs through `settleInvoiceCharge` — the same primitive both live
+ * settle paths use — which is what buys, for free, every consequence that
+ * matters here:
+ *   - invoice **open** → the atomic `markPaid` claim wins → paid + "Payment
+ *     received" receipt + the §J.1 membership month + payment-due teardown;
+ *   - invoice **paid** (the owner paid manually during the doubt window) →
+ *     lost-race arm → a 'pending' refund row in-tx, fired post-commit by the
+ *     receiver → the duplicate comes back automatically. Two charges, one
+ *     refund, no human;
+ *   - invoice **void** (withdrawn before the charge resolved) → same lost-race
+ *     arm → the money goes back, which is exactly what a void means.
+ *
+ * Idempotency: `charges.stripe_payment_intent_id` is UNIQUE, so a redelivery
+ * finds the charge row on the way in and takes the flip arm instead of ever
+ * reaching here; an insert that races another writer rolls this tx back, the
+ * receiver releases the claim, and Stripe's redelivery takes that same flip arm.
+ */
+async function maybeSettleOrphanedInvoiceCharge(
+  tx: Tx,
+  args: { paymentIntentId: string; amountCents: number; metadata: Record<string, string> },
+): Promise<WebhookHandlerResult | undefined> {
+  const invoiceId = metadataString(args.metadata, 'invoice_id');
+  const ownerId = metadataString(args.metadata, 'owner_id');
+  if (invoiceId === undefined || ownerId === undefined) return undefined;
+
+  const invoice = await invoicesRepository.findById(tx, invoiceId);
+  if (invoice === undefined) {
+    return {
+      outcome: 'orphan-event',
+      note: `PI ${args.paymentIntentId} names invoice ${invoiceId}, which does not exist`,
+    };
+  }
+  if (invoice.ownerId !== ownerId) {
+    // Trust boundary: metadata is attacker-shaped input in principle, and
+    // settling one owner's invoice from another owner's PI would be the worst
+    // possible outcome of believing it.
+    return {
+      outcome: 'orphan-event',
+      note: `PI ${args.paymentIntentId} owner_id metadata does not match invoice ${invoiceId}`,
+    };
+  }
+
+  const settled = await settleInvoiceCharge(tx, {
+    invoice,
+    paymentIntentId: args.paymentIntentId,
+    amountCents: args.amountCents,
+    purpose: invoice.purpose,
+    // The worker's convention: silent initiation, receipt on settle. This IS
+    // the settle, and it is the only moment the owner can be told — which is
+    // what makes the unconfirmed push's promise ("if it went through you'll
+    // get a receipt") mechanically true rather than aspirational.
+    notifyOwner: true,
+  });
+
+  // Close the attempt row this PI belongs to, when there is one. A pre-deploy
+  // orphan has none and the settle stands on its own.
+  const attemptNo = metadataAttemptNo(args.metadata);
+  if (attemptNo !== undefined) {
+    const attempt = await invoiceChargeAttemptsRepository.findByInvoiceAndAttemptNo(tx, {
+      invoiceId: invoice.id,
+      attemptNo,
+    });
+    if (attempt !== undefined) {
+      await invoiceChargeAttemptsRepository.resolve(tx, {
+        id: attempt.id,
+        outcome: 'succeeded',
+        stripePaymentIntentId: args.paymentIntentId,
+      });
+    }
+  }
+
+  if (settled.outcome === 'refunded') {
+    return {
+      outcome: 'settled-orphaned-invoice-charge',
+      note: `invoice ${invoice.id} was already settled by another path; duplicate charge ${settled.chargeId} refunding`,
+      ...(settled.pendingStripeRefund !== undefined
+        ? { pendingStripeRefund: settled.pendingStripeRefund }
+        : {}),
+    };
+  }
+  return {
+    outcome: 'settled-orphaned-invoice-charge',
+    note: `invoice ${invoice.id} settled from an orphaned PaymentIntent`,
+    // §J.1: a winning membership settle granted the month's lot inside this tx,
+    // so the dog's credit display cache is stale. The receiver wipes it
+    // post-commit through the existing `creditsDogId` channel.
+    ...(invoice.purpose === 'membership' && invoice.dogId !== null
+      ? { creditsDogId: invoice.dogId }
+      : {}),
+  };
 }
 
 interface PackagePurchaseMetadata {
@@ -418,6 +584,16 @@ async function handlePaymentIntentFailed(
   return withActor(WEBHOOK_ACTOR, async (tx) => {
     const charge = await chargesRepository.findByStripePaymentIntentId(tx, event.paymentIntentId);
     if (charge === undefined) {
+      // The symmetric half of the succeeded-orphan arm (2026-08-12): an
+      // auto-charge attempt we left in doubt, answered the moment Stripe
+      // volunteers it. Resolving it here rather than waiting for a verify pass
+      // is the difference between the owner learning today and learning in ten
+      // minutes — and, past the key window, between learning and not.
+      const resolved = await maybeResolveOrphanedInvoiceAttempt(tx, {
+        paymentIntentId: event.paymentIntentId,
+        metadata: event.metadata,
+      });
+      if (resolved !== undefined) return resolved;
       return {
         outcome: 'orphan-event',
         note: `no charges row for PI ${event.paymentIntentId}`,
@@ -489,6 +665,92 @@ async function handlePaymentIntentFailed(
 
     return { outcome: 'flipped-charge-failed', creditsDogId };
   });
+}
+
+/**
+ * Resolve an unresolved auto-charge attempt from a `payment_intent.
+ * payment_failed` event — the answer arriving from Stripe instead of from a
+ * verify pass.
+ *
+ * Marks the attempt `no-charge`, which frees the invoice for the next attempt
+ * (a fresh key is CORRECT once the previous one is known-dead — that is the
+ * whole distinction this design turns on). Deliberately does NOT touch the
+ * dunning ladder: the charge lane owns the ladder and will run it on the next
+ * lease, and double-counting from two places is how a park arrives early.
+ *
+ * The ONE case that needs a sentence here: an invoice already PARKED while its
+ * outcome was unknown. It will never be leased again, so if this handler stays
+ * silent the owner is left holding "we can't yet confirm whether it went
+ * through" forever. `resolve()` returning 1 means THIS event is the one that
+ * ended the doubt, which is exactly when the now-known answer is worth sending;
+ * the `payment-failed:<id>` dedupe key keeps it to one push per invoice, ever.
+ */
+async function maybeResolveOrphanedInvoiceAttempt(
+  tx: Tx,
+  args: { paymentIntentId: string; metadata: Record<string, string> },
+): Promise<WebhookHandlerResult | undefined> {
+  const invoiceId = metadataString(args.metadata, 'invoice_id');
+  const ownerId = metadataString(args.metadata, 'owner_id');
+  const attemptNo = metadataAttemptNo(args.metadata);
+  if (invoiceId === undefined || ownerId === undefined || attemptNo === undefined) return undefined;
+
+  const invoice = await invoicesRepository.findById(tx, invoiceId);
+  if (invoice === undefined || invoice.ownerId !== ownerId) return undefined;
+
+  const attempt = await invoiceChargeAttemptsRepository.findByInvoiceAndAttemptNo(tx, {
+    invoiceId,
+    attemptNo,
+  });
+  if (attempt === undefined) return undefined;
+
+  const resolved = await invoiceChargeAttemptsRepository.resolve(tx, {
+    id: attempt.id,
+    outcome: 'no-charge',
+    stripePaymentIntentId: args.paymentIntentId,
+  });
+  if (resolved === 0) {
+    return {
+      outcome: 'resolved-orphaned-invoice-attempt',
+      note: `attempt ${attempt.id} was already terminal; nothing to resolve`,
+    };
+  }
+
+  if (invoice.status === 'open' && invoice.nextAttemptAt === null) {
+    // Parked with the doubt unresolved. Nothing automatic will ever touch this
+    // invoice again, so this is the last chance to replace "we don't know" with
+    // the answer.
+    const copy = autoChargeParkNotification('failed-unknown-reason', {
+      invoiceId: invoice.id,
+      amountCents: invoice.amountCents,
+      purpose: invoice.purpose,
+      // When the charge was TRIED, not when its answer finally reached us. A
+      // late `payment_failed` can arrive hours after the attempt, and "we tried
+      // your payment on <the day the webhook landed>" is a date we made up.
+      at: new Date(attempt.createdAt),
+    });
+    await scheduledNotificationsRepository.enqueueIdempotent(tx, {
+      ownerId: invoice.ownerId,
+      type: 'payment-failed',
+      trigger: 'payment-failed',
+      dedupeKey: copy.dedupeKey,
+      scheduledFor: new Date(),
+      title: copy.title,
+      body: copy.body,
+      deepLinkPath: deepLinkToPath({
+        kind: 'invoice',
+        id: invoice.id,
+        params: { reason: copy.reason },
+      }),
+      deepLinkKind: 'invoice',
+      deepLinkId: invoice.id,
+      dogId: invoice.dogId,
+    });
+  }
+
+  return {
+    outcome: 'resolved-orphaned-invoice-attempt',
+    note: `attempt ${attempt.id} for invoice ${invoice.id} resolved no-charge from Stripe`,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────

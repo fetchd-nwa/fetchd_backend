@@ -8,7 +8,7 @@ import { scheduledNotificationsRepository } from '../../src/db/repositories/sche
 import { bookings, invoices, scheduledNotifications } from '../../src/db/schema/schema.js';
 import { pgTimestampToDate } from '../../src/lib/pgTimestamp.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -44,6 +44,7 @@ async function cleanup(bookingIds: string[] = []): Promise<void> {
   await db
     .delete(scheduledNotifications)
     .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   if (bookingIds.length > 0) {
     await db.delete(bookings).where(inArray(bookings.id, bookingIds));

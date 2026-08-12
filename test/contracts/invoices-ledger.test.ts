@@ -4,7 +4,7 @@ import { eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { charges, creditLedger, invoices } from '../../src/db/schema/schema.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -122,6 +122,7 @@ async function seedLedger(): Promise<void> {
 }
 
 async function cleanupLedger(): Promise<void> {
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(creditLedger).where(inArray(creditLedger.chargeId, [LEDGER.chargePackageId]));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));

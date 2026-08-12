@@ -21,7 +21,13 @@ import { CURRICULUM_PROGRAMS } from '../../src/lib/alumni.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerDogsRoute } from '../../src/routes/dogs.js';
 import { registerStaffRequestsRoute } from '../../src/routes/staffRequests.js';
-import { futureWeekday, FIXTURE_IDS, FIXTURE_NOW, topUpCredits } from './_fixture.js';
+import {
+  clearInvoiceChargeAttempts,
+  futureWeekday,
+  FIXTURE_IDS,
+  FIXTURE_NOW,
+  topUpCredits,
+} from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -68,6 +74,7 @@ after(async () => {
     await db
       .delete(scheduledNotifications)
       .where(inArray(scheduledNotifications.bookingId, bookingIds));
+    await clearInvoiceChargeAttempts();
     await db.delete(invoices).where(inArray(invoices.bookingId, bookingIds));
     await db.delete(creditLedger).where(inArray(creditLedger.bookingId, bookingIds));
   }

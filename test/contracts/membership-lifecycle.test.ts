@@ -13,7 +13,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
 import { registerMembershipsRoute } from '../../src/routes/memberships.js';
-import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -55,6 +55,7 @@ async function cleanupLifecycle(): Promise<void> {
     .where(
       and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'membership-grant')),
     );
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(isNotNull(invoices.membershipId));
   await db.delete(charges).where(eq(charges.purpose, 'membership'));
   await db.delete(memberships).where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));

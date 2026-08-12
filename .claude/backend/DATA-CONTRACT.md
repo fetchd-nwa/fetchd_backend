@@ -3351,3 +3351,248 @@ the backend was emitting the wrong one.
   Residual: an idempotency replay recorded before this fix still returns its
   stored body with the old wrong `declined` — it decays with the replay window
   and is not worth migrating stored response bodies for.
+
+## K.2 The unknown outcome — the key, the attempt ledger, and saying "we don't know" (wire 1.10.0, 2026-08-12)
+
+Amendment to §K/§K.1, from `designs/auto-charge-unknown-outcome.md`. **Wire
+delta: one additive enum arm** (`InvoiceDeepLinkReason` gains
+`'payment-unconfirmed'`, 1.9.0 → 1.10.0). **DDL: one new enum + one new table.**
+Everything else is server-side.
+
+- **The defect.** The auto-charge worker's Stripe idempotency key was
+  `auto-charge:{invoiceId}:{invoices.auto_charge_attempts}`, and its transport
+  catch — the arm that exists *precisely because we do not know whether money
+  moved* — called `recordFailedAttempt`, which incremented that counter, which
+  **minted a new key**. The next tick therefore created a brand-new
+  PaymentIntent for a charge that may already have succeeded. When it had,
+  the resulting `payment_intent.succeeded` found no `charges` row, failed the
+  package-metadata parse and was dropped as `orphan-event` — under a comment
+  claiming invoice orphans "self-heal via the worker's next tick", which was
+  false twice over (a parked invoice has `next_attempt_at = NULL` so the lease
+  can never see it again, and a fresh key can never re-adopt the orphaned PI).
+  Meanwhile the park push told the owner it "didn't go through" and offered
+  another payment method: an invitation to pay twice for money that had moved.
+- **The counter's two jobs are split.** `invoices.auto_charge_attempts` is now
+  the dunning ladder ONLY — it advances on a KNOWN-failed attempt (declined,
+  authentication-required, a successfully cancelled intent) and on the
+  no-card / no-Stripe-customer parks. The Stripe key identity moved to
+  `invoice_charge_attempts.attempt_no`, which advances only when the previous
+  attempt is known-dead. **Key format is unchanged**
+  (`auto-charge:{invoiceId}:{attemptNo}`), and the seeding rule keeps deploy
+  continuity: an invoice with no attempt rows takes
+  `attempt_no = auto_charge_attempts`, byte-identical to the key the old code
+  would have minted next — so no in-flight old key is collided with or reused.
+  Existing rows need no migration: the old counter counted a superset, which
+  only ever parks EARLIER.
+- **`metadata.auto_charge_attempt` now stamps `attempt_no`.** It used to stamp
+  the mutable counter, and metadata is part of Stripe's idempotent request
+  hash — so even a CORRECT same-key retry would have been rejected live. The
+  key reuse this design rests on could not have worked while that line read the
+  ladder count.
+- **Params are frozen per attempt.** `payment_method_id` +
+  `stripe_payment_method_id` + `amount_cents` are recorded at mint time and a
+  re-issue sends exactly those. The 2026-07-29 expired-card fallback runs only
+  at mint, never on a re-issue: a card swap mid-doubt cannot change the params
+  under a live key. If a key is nonetheless replayed with different params
+  Stripe rejects it (`idempotency_error`) and **that is the desired behavior** —
+  failing beats charging twice. The worker treats an actual occurrence as an
+  invariant violation: park for human reconciliation, error-log, never a fresh
+  key.
+- **`invoice_charge_attempts` (new table).** One row per attempt, written
+  BEFORE the Stripe confirm, so a process that dies mid-flight leaves an honest
+  `pending` row rather than nothing. Outcomes: `pending` (we do not know),
+  `processing` (in flight), `succeeded`, `no-charge` (known-dead). **A partial
+  unique index on `(invoice_id) WHERE outcome IN ('pending','processing')` is
+  the interlock** — at most one unresolved attempt per invoice, enforced by the
+  database rather than by worker discipline. Not a wire surface: no
+  `conformance.ts` pin, no client mirror, nothing new on `GET /invoices` (R32
+  untouched).
+- **The charge lane refuses.** A leased invoice carrying an unresolved attempt
+  is not charged; the lease lapses and the verify lane owns it. Bounded churn:
+  at most one skipped lease window per verify interval.
+- **The verify lane** (`src/workers/invoiceAttemptVerify.ts`, a new scheduler
+  phase that runs BEFORE the charge phase). PI id known → `retrievePaymentIntent`
+  (a GET; new `StripeClient` verb, `blocker` stamped from
+  `last_payment_error.code` through the same observed-code map, so
+  `chargeBlockerForConfirm` reads it unchanged). PI id unknown and inside
+  `IDEMPOTENCY_KEY_SAFE_WINDOW_HOURS` (20h) → re-issue the identical confirm
+  under the recorded key. Past the window → park the invoice for human
+  reconciliation and tell the owner we don't know. **Both loops terminate:** the
+  ladder at `MAX_AUTO_CHARGE_ATTEMPTS`; this lane because the claim bumps
+  `verify_count` on every pass and refuses to claim at
+  `MAX_ATTEMPT_VERIFY_PASSES`, with the behavioral caps (24h in-flight, the key
+  window) exiting far earlier.
+- **The webhook reconciles invoice orphans.** `payment_intent.succeeded` with
+  `metadata.invoice_id` (validated against `invoices.owner_id`) settles through
+  `settleInvoiceCharge` — so an open invoice flips to paid with a receipt, and
+  an already-paid or voided one takes the lost-race arm and the duplicate is
+  refunded automatically (the receiver fires the Stripe refund post-commit).
+  `payment_intent.payment_failed` resolves the matching attempt `no-charge`,
+  and — only when the invoice is already parked, so nothing else will ever
+  speak — delivers the now-known failure copy. Pre-deploy orphans are matchable
+  too: `invoice_id`/`owner_id` have been stamped since Day 15.
+- **The push taxonomy** lives in `src/lib/autoChargeNotificationCopy.ts` and
+  nowhere else; Allison approved the eight **bodies** ("if its too wordy we can
+  change later on"), which is why every string is in one file. **The two new
+  titles — "Payment still processing" and "We're checking your payment" — are
+  builder-invented and still pending her veto**; every other arm reuses the
+  already-shipped "Payment failed" title. (The approval is recorded here as
+  2026-08-12 and in the mobile repo as 2026-08-11; that disagreement is
+  unreconciled and one of the two is wrong.)
+  Arms: settled receipt (unchanged, in `settleInvoiceCharge`), declined,
+  needs-verification, failed-reason-unknown (the shipped 2026-08-01 sentence,
+  kept verbatim for exactly this arm), no-card-on-file, stripe-customer-missing,
+  in-flight, unconfirmed. The last two carry `reason=payment-unconfirmed`, use
+  the dedupe key `payment-unconfirmed:<invoiceId>`, and **never invite a
+  retry**. The two zero-Stripe-call arms say "nothing has been charged" instead
+  of the old "We tried your $X payment", which was simply false on those paths.
+  This closes §K.1's "deliberately NOT done" item — the worker's push copy is
+  now blocker-aware.
+- **`findOverdueForWarning` suppression widened** to both dedupe prefixes. An
+  `invoice-overdue` nag says "check the card on file"; landing that on top of
+  "we can't confirm whether your payment went through — don't pay it again" is
+  how the unknown becomes a double charge.
+- **Deliberately NOT done:** blocking `POST /invoices/:id/pay` during a doubt
+  window (the lost-race refund already makes the manual path net-once; blocking
+  would strand owners and contradict the not-getting-charged half); manual
+  capture; the server-truth in-flight Pay-disable (its own parked design — this
+  table is its ready data source); a staff verb to resolve a parked/unknown
+  invoice (portal round, Adjudication 8); honoring notification prefs (BUG-17,
+  inherited not widened).
+- **What no gate can prove, and this one especially:** Stripe's real
+  idempotency semantics — the ~24h key window, replay-returns-the-original-
+  snapshot, replay across the create-vs-throw fork — are **stub-modelled and
+  Stripe-documented, UNVERIFIED live**. `IDEMPOTENCY_KEY_SAFE_WINDOW_HOURS = 20`
+  is a margin under an assumption, not a measurement.
+
+### K.2.1 Amendments from the adversarial round (2026-08-12)
+
+Both reviews found the same sentence of Allison's violated in both directions —
+"i dont want money charged on accident or things not getting charged" — so these
+are corrections to §K.2 above, not additions to it.
+
+- **A re-issue is a CHARGE, and now owes a charge's guards.** `verifyByReissue`
+  re-checks `status = 'open'` AND `payment_expected = 'card'` against the row the
+  pass already read. It used to re-issue blind, so an owner who paid in person
+  during the doubt window (that route's guard does not consider attempt rows), or
+  an invoice voided on a withdrawal, could be freshly charged by the lane whose
+  entire purpose is not charging twice — and on a still-open invoice the settle
+  WINS `markPaid`, so no refund arm fires. The attempt stays `pending` for the
+  webhook; the past-window arm parks it if no answer ever comes.
+- **A re-issue that EXECUTED is no longer settled.** The seam now carries the
+  intent's `created` and Stripe's `Idempotency-Replayed` header
+  (`StripePaymentIntentResult.createdAt` / `.replayed`), and the lane parks
+  rather than settles when it cannot see a replay (`reissueLooksReplayed`,
+  outcome `parked-fresh-execution`, `reconcile_reason = 'fresh-execution'`).
+  **This is a deliberate behavior change from Decision 3**, which blessed a fresh
+  execution as "simply the attempt happening": that reading is right only if the
+  20h window assumption holds, and nothing measured it. The benign case now costs
+  one "we're checking your payment" push and a ~10-minute delay — the next pass
+  RETRIEVES the recorded id and settles, so the money still lands with its
+  receipt.
+- **Stripe's two `idempotency_error`s are told apart** (`stripeIdempotencyErrorKind`).
+  HTTP 409 ("another request is currently using this Idempotency Key") is a
+  concurrency signal — pg_cron fires `/workers/tick` every minute with no overlap
+  guard — and is treated as still-unknown. Only the 400 params-mismatch is the
+  invariant violation that parks.
+- **The dunning ladder is advanced only by the winner of `resolve()`.** Its row
+  count used to be discarded, so a webhook resolving an attempt mid-retrieve made
+  one decline consume two of the four rungs, skipping the +24h/+72h retries that
+  actually recover a temporarily-declined card (outcome `lost-resolve-race`).
+- **The verify lane's known-dead arm now cancels the intent (R15)** before
+  freeing the invoice for a fresh key — `requires_action` /
+  `requires_confirmation` reach it, and both leave a live confirmable intent at
+  Stripe — **and never un-parks.** On an already-parked invoice it keeps the
+  park, leaves the ladder alone, and enqueues the now-known failure copy, exactly
+  as the webhook resolver already did.
+- **Every park push is dated by what it is ABOUT**, not by when it fires:
+  `enqueueAutoChargeParkPush` takes `at` explicitly — the attempt row's
+  `created_at` on the verify lane and the late webhook, the invoice's `due_at` on
+  the zero-Stripe-call arms, `now` only in the charge lane. It was hardcoded to
+  `now`, so the 24h in-flight arm was always at least a day late and the no-card
+  arm named today instead of the due date.
+- **The push follows the park.** `parkForReconciliation`'s row count is honored,
+  so an owner who paid during the doubt window is not told "we can't confirm your
+  payment — please don't pay it again" while holding a receipt.
+- **Two new columns on `invoice_charge_attempts`.** `stripe_customer_id` joins
+  the frozen params (it is part of Stripe's request hash; re-reading it meant a
+  support re-link between mint and verify silently drifted the fingerprint into
+  the permanent park). `reconcile_reason` records WHY a human was fetched —
+  `key-window-expired` / `in-flight-cap` / `idempotency-conflict` /
+  `fresh-execution` — because every park looks identical in the invoice row and
+  "Stripe's records disagree with ours" must not live only in a log line.
+- **The charge phase has the log-and-swallow boundary its siblings have.** It was
+  the only phase without one, and the likeliest thing to throw out of it was the
+  interlock (`invoice_charge_attempts_unresolved_uq`) doing its job — which cost
+  the rest of the batch and every later phase, once a minute. `mint`'s unique
+  violation is now read for what it means: `skipped-unresolved-attempt`.
+- **The stub can now tell a replay from a fresh execution** (`replayed` on the
+  confirm fork) and carries `last_payment_error.code` on `retrievePaymentIntent`
+  through the production normalizer. Before this, no test could have caught
+  either the window assumption failing or a decline/auth-failure being
+  mis-copied on the retrieve path.
+
+### K.2.2 Amendments from the second adversarial round (2026-08-12, round 3)
+
+Round 2 fixed "money charged on accident" hard enough to break the other half of
+the same sentence. These are corrections to §K.2.1 above.
+
+- **The fresh-execution park is narrowed to a capture.** `verifyByReissue` parks
+  only when the un-replayed re-issue came back `succeeded` — the one case where
+  THIS call moved money and a duplicate can exist. A fresh execution that ended
+  terminally dead captured nothing, so it is resolved as attempt N's own known
+  outcome and takes the ordinary dunning ladder, with
+  `reconcile_reason = 'fresh-execution'` still stamped as the trail. As written
+  in round 2 the park applied to EVERY execution — and `replayed` is `false` for
+  every fresh execution, on the transport case the design itself calls the
+  overwhelming one — so one blip plus one temporary decline left the invoice
+  open, parked, at rung zero, with the `payment-unconfirmed:<id>` row
+  suppressing the overdue net: never charged again, by any path.
+- **"Does this invoice still want a card charge?" is asked before the key-window
+  park, not after.** `parkForReconciliation` filters on `status='open'`, which a
+  cash/check invoice still is, so an owner who was asked to bring cash was being
+  told "we can't confirm your payment, please don't pay it again" and the
+  invoice was leaving the dunning schedule for a staff worklist. The
+  not-chargeable arm still stamps `reconcile_reason = 'key-window-expired'` when
+  the attempt is past the window: the park and the push are withheld, the record
+  is not.
+- **The charge lane's failure arms re-read the invoice too** — as the count on
+  `recordFailedAttempt`, now filtered on `status='open'`, whose row count gates
+  the park push (`recordKnownFailure` returns it; outcome
+  `skipped-already-settled`). Round 2 gave the VERIFY lane this guard and left
+  the lane that actually charges cards without it, so an owner who paid manually
+  during the Stripe round-trip still got "your card was declined — want to try a
+  different form of payment?".
+- **R15 is applied in the same order in both lanes:** cancel the dead intent,
+  THEN `resolve` — because resolving is what opens the interlock and lets a
+  fresh key exist. The verify lane had it backwards.
+- **A throwing attempt is isolated to itself** (per-attempt try/catch, outcome
+  `errored`). `claimUnresolvedForVerify` bumps `verify_count` for the whole
+  batch before any row is worked and orders `updated_at ASC`, so one
+  deterministic thrower burned a pass off every row behind it, every tick. The
+  known thrower — the `charges` unique violation between the "already on the
+  books?" read and the settle INSERT — is now handled as the flip arm it is:
+  the money IS recorded, by the other path, so the attempt is closed `succeeded`.
+- **Pending refunds are actually retried.** `settleInvoiceCharge`'s lost-race
+  arm writes a `'pending'` refund row and every caller's failure branch said it
+  was "left for retry" — and nothing retried it. No worker imported
+  `refundsRepository`, and `charge.refund.updated` cannot arrive for a refund
+  never created at Stripe, so one failed `createRefund` was a permanent double
+  charge. New scheduler phase `duplicate-refund-retry`
+  (`src/workers/duplicateRefundRetry.ts`, before the charge phase) claims
+  `pending` refunds with no `stripe_refund_id` after a 5-minute grace and
+  re-fires under **the same idempotency key** — `duplicateRefundIdempotencyKey`,
+  keyed on our own refund-row uuid, now the single source for both callers. Past
+  `DUPLICATE_REFUND_ABANDON_AFTER_HOURS` (24h, Stripe's documented key lifetime)
+  it stops retrying — a key Stripe may have forgotten could send a SECOND refund
+  — and reports the abandoned rows individually at ERROR on every tick. No DDL:
+  `status`, `stripe_refund_id`, `created_at`, `updated_at` carry it.
+- **Timestamps read from `mode:'string'` columns go through
+  `pgTimestampToDate`**, not `new Date(...)`, in both worker lanes. No live
+  defect on Node 22 (verified by execution, not by reading) — the bare parse is
+  the implementation-defined fallback rather than the spec'd ISO path, and the
+  helper's own doc comment claimed V8 rejected these strings, which is false.
+  Corrected there too.
+- **Still true, and still not provable here:** the ~24h Stripe key window (now
+  load-bearing in two places — the re-issue and the refund retry) is
+  documented and stub-modelled, **never measured live**.

@@ -11,6 +11,7 @@ export const chargeStatus = pgEnum("charge_status", ['requires_payment', 'succee
 export const evaluationStatus = pgEnum("evaluation_status", ['not-evaluated', 'pending', 'passed', 'failed'])
 export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'manners-2', 'public-pups'])
 export const invoiceStatus = pgEnum("invoice_status", ['open', 'paid', 'void'])
+export const invoiceAttemptOutcome = pgEnum("invoice_attempt_outcome", ['pending', 'processing', 'succeeded', 'no-charge'])
 export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment', 'membership-grant'])
 // Locations are a table since the Δ 2026-06-08 (was the `location_key`/`app_location`
 // enums). `slug` is the natural key + the wire value; `LOCATION_SLUGS` is the TS
@@ -958,6 +959,48 @@ export const invoices = pgTable("invoices", {
 		invoicesSourceExternalRefKey: unique("invoices_source_external_ref_key").on(table.externalRef, table.source),
 		invoicesAmountCentsCheck: check("invoices_amount_cents_check", sql`amount_cents >= 0`),
 		invoicesCheck: check("invoices_check", sql`(status <> 'paid'::invoice_status) OR (paid_at IS NOT NULL)`),
+	}
+});
+
+// 2026-08-12 (`designs/auto-charge-unknown-outcome.md`): one row per auto-charge
+// attempt, written BEFORE the Stripe confirm. Owns the idempotency key identity
+// (`attempt_no`) + the frozen params a same-key re-issue must resend. The
+// partial unique index on (invoice_id) WHERE outcome IN ('pending','processing')
+// is the DB-level interlock — at most one unresolved attempt per invoice.
+export const invoiceChargeAttempts = pgTable("invoice_charge_attempts", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	invoiceId: uuid("invoice_id").notNull(),
+	attemptNo: integer("attempt_no").notNull(),
+	paymentMethodId: uuid("payment_method_id").notNull(),
+	stripePaymentMethodId: text("stripe_payment_method_id").notNull(),
+	stripeCustomerId: text("stripe_customer_id").notNull(),
+	amountCents: integer("amount_cents").notNull(),
+	idempotencyKey: text("idempotency_key").notNull(),
+	stripePaymentIntentId: text("stripe_payment_intent_id"),
+	outcome: invoiceAttemptOutcome().default('pending').notNull(),
+	verifyCount: integer("verify_count").default(0).notNull(),
+	reconcileReason: text("reconcile_reason"),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		unresolvedUq: uniqueIndex("invoice_charge_attempts_unresolved_uq").using("btree", table.invoiceId.asc().nullsLast().op("uuid_ops")).where(sql`(outcome = ANY (ARRAY['pending'::invoice_attempt_outcome, 'processing'::invoice_attempt_outcome]))`),
+		unresolvedIdx: index("invoice_charge_attempts_unresolved_idx").using("btree", table.updatedAt.asc().nullsLast().op("timestamptz_ops")).where(sql`(outcome = ANY (ARRAY['pending'::invoice_attempt_outcome, 'processing'::invoice_attempt_outcome]))`),
+		piIdx: index("invoice_charge_attempts_pi_idx").using("btree", table.stripePaymentIntentId.asc().nullsLast().op("text_ops")).where(sql`(stripe_payment_intent_id IS NOT NULL)`),
+		invoiceChargeAttemptsInvoiceIdFkey: foreignKey({
+			columns: [table.invoiceId],
+			foreignColumns: [invoices.id],
+			name: "invoice_charge_attempts_invoice_id_fkey"
+		}).onDelete("restrict"),
+		invoiceChargeAttemptsPaymentMethodIdFkey: foreignKey({
+			columns: [table.paymentMethodId],
+			foreignColumns: [paymentMethods.id],
+			name: "invoice_charge_attempts_payment_method_id_fkey"
+		}).onDelete("restrict"),
+		invoiceChargeAttemptsIdempotencyKeyKey: unique("invoice_charge_attempts_idempotency_key_key").on(table.idempotencyKey),
+		invoiceChargeAttemptsInvoiceAttemptNoKey: unique("invoice_charge_attempts_invoice_id_attempt_no_key").on(table.invoiceId, table.attemptNo),
+		invoiceChargeAttemptsAmountCentsCheck: check("invoice_charge_attempts_amount_cents_check", sql`amount_cents >= 0`),
+		invoiceChargeAttemptsReconcileReasonCheck: check("invoice_charge_attempts_reconcile_reason_check", sql`reconcile_reason = ANY (ARRAY['key-window-expired'::text, 'in-flight-cap'::text, 'idempotency-conflict'::text, 'fresh-execution'::text])`),
 	}
 });
 

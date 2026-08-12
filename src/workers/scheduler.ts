@@ -35,6 +35,14 @@ import {
 import type { R2Client } from '../lib/r2.js';
 import type { StripeClient } from '../lib/stripe.js';
 import { runInvoiceAutoChargeOnce, type InvoiceAutoChargeTickResult } from './invoiceAutoCharge.js';
+import {
+  runInvoiceAttemptVerifyOnce,
+  type InvoiceAttemptVerifyTickResult,
+} from './invoiceAttemptVerify.js';
+import {
+  runDuplicateRefundRetryOnce,
+  type DuplicateRefundRetryTickResult,
+} from './duplicateRefundRetry.js';
 import { runMediaDerivativesOnce, type MediaDerivativesTickResult } from './mediaDerivatives.js';
 
 interface WorkerLogger {
@@ -61,7 +69,22 @@ interface WorkerLogger {
  *      (advance period + card-backed invoice) or hard-stop at term end.
  *      Before the charge pass so a rolled invoice charges this tick.
  *
- *   3. **Invoice auto-charge.** Compose Day-15's
+ *   3a. **Invoice attempt verify** (2026-08-12,
+ *      `designs/auto-charge-unknown-outcome.md`). Resolve every auto-charge
+ *      attempt whose outcome is still unknown — retrieve the PaymentIntent
+ *      when its id is known, re-issue the identical request under the SAME
+ *      idempotency key when it isn't, park for a human past the window.
+ *      Deliberately BEFORE the charge pass: the charge lane refuses to charge
+ *      an invoice with an unresolved attempt, so resolving doubt first is what
+ *      keeps that refusal from also meaning "and therefore never charged".
+ *
+ *   3a-bis. **Duplicate-refund retry** (2026-08-12). Re-fire lost-race refund
+ *      rows still `pending` with no `stripe_refund_id`, under the SAME
+ *      idempotency key the first attempt used. Before the charge pass for the
+ *      same reason the verify lane is: money we already owe back outranks
+ *      money we are about to ask for.
+ *
+ *   3b. **Invoice auto-charge.** Compose Day-15's
  *      `runInvoiceAutoChargeOnce` so one cron firing handles BOTH
  *      outbound notifications AND invoice dunning — fewer moving parts
  *      operationally.
@@ -136,6 +159,8 @@ export interface SchedulerTickResult {
   membershipRoll: MembershipRollResult;
   invoiceOverdue: EnqueueInvoiceOverdueWarningsResult;
   cardExpiry: EnqueueCardExpiryWarningsResult;
+  invoiceAttemptVerify: InvoiceAttemptVerifyTickResult;
+  duplicateRefundRetry: DuplicateRefundRetryTickResult;
   invoiceAutoCharge: InvoiceAutoChargeTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
   creditExpiryWarnings: EnqueueCreditExpiryWarningsResult;
@@ -197,12 +222,80 @@ export async function runSchedulerTickOnce(
     );
   }
 
-  const invoiceResult = await runInvoiceAutoChargeOnce({
-    ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
-    limit: opts.invoiceLimit,
-    now,
-    log,
-  });
+  // Phase 3a — resolve unknown auto-charge outcomes BEFORE charging anything.
+  // Its own log-and-swallow boundary: a Stripe outage in the verify lane must
+  // not stop the dunning ladder for every other invoice (the charge lane
+  // refuses only the invoices that actually carry an unresolved attempt).
+  let invoiceAttemptVerifyResult: InvoiceAttemptVerifyTickResult = { scanned: 0, results: [] };
+  try {
+    invoiceAttemptVerifyResult = await runInvoiceAttemptVerifyOnce({
+      ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
+      now,
+      log,
+    });
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'invoice-attempt-verify',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'invoice-attempt-verify phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 3a-bis — send back the money we already know we owe, BEFORE charging
+  // anyone anything new. These are `refunds` rows written 'pending' by a lost
+  // settle race whose post-commit Stripe call failed; nothing retried them
+  // until this phase existed, so each one was a permanent double charge. Own
+  // log-and-swallow boundary like every sibling.
+  let duplicateRefundRetryResult: DuplicateRefundRetryTickResult = {
+    scanned: 0,
+    sent: 0,
+    abandoned: 0,
+    results: [],
+  };
+  try {
+    duplicateRefundRetryResult = await runDuplicateRefundRetryOnce({
+      ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
+      now,
+      log,
+    });
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'duplicate-refund-retry',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'duplicate-refund-retry phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 3b — the charge lane. Its own log-and-swallow boundary, like every
+  // sibling phase: it was the ONLY phase without one, and the thing most likely
+  // to throw out of it is the DB interlock (`invoice_charge_attempts_unresolved_uq`)
+  // doing its job. That would have cost the remaining leased invoices AND every
+  // later phase — media derivatives, credit expiry, the idempotency sweep —
+  // once a minute for as long as the condition held.
+  let invoiceResult: InvoiceAutoChargeTickResult = { scanned: 0, results: [] };
+  try {
+    invoiceResult = await runInvoiceAutoChargeOnce({
+      ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
+      limit: opts.invoiceLimit,
+      now,
+      log,
+    });
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'invoice-auto-charge',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'invoice-auto-charge phase threw at the worker boundary; will retry next tick',
+    );
+  }
 
   // Phase 4 — media derivatives (Day 17). Each job runs claim → sharp →
   // settle independently; failures stay parked on the job row and don't
@@ -376,6 +469,8 @@ export async function runSchedulerTickOnce(
   return {
     scheduledNotifications: notificationsResult,
     membershipRoll: membershipRollResult,
+    invoiceAttemptVerify: invoiceAttemptVerifyResult,
+    duplicateRefundRetry: duplicateRefundRetryResult,
     invoiceAutoCharge: invoiceResult,
     mediaDerivatives: mediaDerivativesResult,
     creditExpiryWarnings: creditExpiryWarningsResult,

@@ -1,4 +1,3 @@
-import type { FastifyBaseLogger } from 'fastify';
 import Stripe from 'stripe';
 import { env } from '../env.js';
 import type { ChargeBlocker } from '../contracts/wire.js';
@@ -31,6 +30,19 @@ import { ApiError } from './errors.js';
  */
 
 const stripeSingleton = new Stripe(env.STRIPE_SECRET_KEY);
+
+/**
+ * The logger {@link chargeBlockerForConfirm} needs — the two levels it actually
+ * calls, structurally. Widened from `FastifyBaseLogger` on 2026-08-12 so the
+ * auto-charge worker and the verify lane (which carry their own three-method
+ * `WorkerLogger`, not a Fastify request logger) can reach the ONE blocker
+ * derivation instead of growing a second one. `FastifyBaseLogger` satisfies
+ * this structurally, so every existing route call site is unchanged.
+ */
+export interface ChargeBlockerLogger {
+  warn(obj: Record<string, unknown>, msg?: string): void;
+  error(obj: Record<string, unknown>, msg?: string): void;
+}
 
 export type StripeCustomerId = string;
 export type StripePaymentMethodId = string;
@@ -103,6 +115,27 @@ export interface StripePaymentIntentResult {
    * never persisted, never on the wire.
    */
   unknownStatus?: string;
+  /**
+   * The PaymentIntent's `created` instant (2026-08-12), carried through the
+   * seam because it is one of only two signals that can tell a REPLAY from a
+   * FRESH EXECUTION — and the whole double-charge defence of the verify lane's
+   * re-issue arm rests on that distinction. An intent created back when the
+   * attempt row was minted is the ORIGINAL being replayed; one created now was
+   * executed now, which means Stripe no longer holds the key
+   * (`invoiceAttemptVerify.reissueLooksReplayed`).
+   *
+   * `undefined` only when the source object carried no readable `created` (the
+   * thrown fork's attached intent may not).
+   */
+  createdAt?: Date;
+  /**
+   * `true` when Stripe answered this confirm from its idempotency record
+   * (`Idempotency-Replayed: true`), `false` when it executed the request, and
+   * `undefined` when the header could not be read at all — the three states are
+   * NOT interchangeable. Only the confirm verb stamps it: a retrieve is a GET
+   * with no idempotency key, so "replayed" has no meaning there.
+   */
+  replayed?: boolean;
 }
 
 /**
@@ -192,7 +225,7 @@ export type UnsettledPaymentIntentStatus = Exclude<StripePaymentIntentStatus, 's
  */
 function stripeIntentStatusToChargeBlocker(
   status: UnsettledPaymentIntentStatus,
-  log: FastifyBaseLogger,
+  log: ChargeBlockerLogger,
 ): ChargeBlocker {
   switch (status) {
     case 'requires_action':
@@ -263,7 +296,7 @@ export function chargeBlockerForConfirm(
   // make impossible. Requiring the full result means the argument can only
   // have come from the seam.
   intent: StripePaymentIntentResult,
-  log: FastifyBaseLogger,
+  log: ChargeBlockerLogger,
 ): ChargeBlocker | undefined {
   // Reported here rather than at the seam, which has no logger. Loud on
   // purpose: a status we don't model on a money path means the taxonomy has
@@ -465,6 +498,20 @@ export interface StripeClient {
   cancelPaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<void>;
 
   /**
+   * Read a PaymentIntent's CURRENT state — the verify lane's way of resolving
+   * doubt by asking rather than by charging again
+   * (`designs/auto-charge-unknown-outcome.md`, Decision 3). A GET in Stripe's
+   * API: no idempotency key, no money moved by calling it.
+   *
+   * Returns the same {@link StripePaymentIntentResult} the confirm verbs
+   * produce, with `blocker`/`failureCode` stamped from `last_payment_error.code`
+   * through the same observed-code map — so `chargeBlockerForConfirm` reads a
+   * retrieved intent exactly as it reads a confirmed one, and its "the argument
+   * can only have come from the seam" invariant still holds.
+   */
+  retrievePaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<StripePaymentIntentResult>;
+
+  /**
    * Refund a portion (or all) of a prior PaymentIntent. Used by POST
    * /bookings/:id/cancel money-back branch post-commit (Day-13 stubbed
    * this; Day-14 wires it). Stripe is asynchronous for refunds — the
@@ -642,12 +689,16 @@ const THROWN_CARD_CODE_TO_BLOCKER: Readonly<Record<string, ChargeBlocker>> = {
  * function has no logger — {@link chargeBlockerForConfirm} does, and reports it.
  */
 export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePaymentIntentResult {
+  // `created` rides along on both forks (2026-08-12) — see
+  // {@link StripePaymentIntentResult.createdAt}. Unix SECONDS at Stripe.
+  const created = intentCreatedAt(intent.created);
   if (isPaymentIntentStatus(intent.status)) {
     return {
       id: intent.id,
       status: intent.status,
       clientSecret: intent.client_secret,
       amountCents: intent.amount,
+      ...(created !== undefined ? { createdAt: created } : {}),
     };
   }
   return {
@@ -656,7 +707,103 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
     clientSecret: intent.client_secret,
     amountCents: intent.amount,
     unknownStatus: String(intent.status),
+    ...(created !== undefined ? { createdAt: created } : {}),
   };
+}
+
+/** Stripe's `created` (unix SECONDS) → a Date, or undefined if unreadable. */
+function intentCreatedAt(created: unknown): Date | undefined {
+  if (typeof created !== 'number' || !Number.isFinite(created)) return undefined;
+  return new Date(created * 1000);
+}
+
+/**
+ * Did Stripe REPLAY this response from its idempotency record, or execute the
+ * request? Read off the `Idempotency-Replayed` response header, which Stripe
+ * documents on exactly that condition.
+ *
+ * Returns `undefined` when we could not tell (no `lastResponse` — the object
+ * did not come from a live SDK call), which callers must NOT read as `false`:
+ * "Stripe executed this fresh" and "we don't know how this got here" have
+ * different money consequences.
+ */
+function replayedFromResponse(intent: Stripe.PaymentIntent): boolean | undefined {
+  const headers = (intent as Partial<Stripe.Response<Stripe.PaymentIntent>>).lastResponse?.headers;
+  if (headers === undefined) return undefined;
+  const raw = headers['idempotency-replayed'] ?? headers['Idempotency-Replayed'];
+  return typeof raw === 'string' && raw.toLowerCase() === 'true';
+}
+
+/**
+ * The RETRIEVE fork's normalizer (2026-08-12) — a GET on a PaymentIntent whose
+ * outcome the worker never learned. Structurally the returning fork plus one
+ * thing: a retrieved intent that has already failed carries
+ * `last_payment_error.code`, the same field the thrown fork reads and the only
+ * one that distinguishes a decline from an authentication failure (both rest at
+ * `requires_payment_method`). Mapped through the SAME observed-code table, so
+ * the verify lane's park copy is derived by the identical rule as the charge
+ * lane's — one derivation, not two that happen to agree.
+ */
+export function normalizeRetrievedIntent(intent: Stripe.PaymentIntent): StripePaymentIntentResult {
+  const base = normalizeReturnedConfirm(intent);
+  const rawCode: unknown = intent.last_payment_error?.code;
+  const code = typeof rawCode === 'string' && rawCode.length > 0 ? rawCode : undefined;
+  // `Object.hasOwn` before the lookup — same trust-boundary discipline as the
+  // thrown fork: a bare index also finds INHERITED keys.
+  const blocker =
+    code !== undefined && Object.hasOwn(THROWN_CARD_CODE_TO_BLOCKER, code)
+      ? THROWN_CARD_CODE_TO_BLOCKER[code]
+      : undefined;
+  return {
+    ...base,
+    ...(blocker !== undefined ? { blocker } : {}),
+    ...(code !== undefined ? { failureCode: code } : {}),
+  };
+}
+
+/**
+ * WHICH idempotency error is this? Stripe spends one error type
+ * (`idempotency_error`) on two conditions that could not be further apart on a
+ * money path, and reading them as one is how a transient blip parked a healthy
+ * invoice forever (2026-08-12 adversarial review):
+ *
+ *   - **`params-mismatch` (HTTP 400)** — the key was first used with DIFFERENT
+ *     parameters. On the auto-charge path that can only mean our records and
+ *     Stripe's disagree about what attempt N was. The one response that must
+ *     never follow is a fresh key, which is how a double charge gets
+ *     manufactured out of a bookkeeping disagreement, so the verify lane parks
+ *     it for a human and charges nothing (`designs/auto-charge-unknown-
+ *     outcome.md`, Decision 1).
+ *   - **`concurrent-request` (HTTP 409)** — "another request is currently using
+ *     this Idempotency Key". This says NOTHING about our bookkeeping: it is two
+ *     of our own workers (or two overlapping `POST /workers/tick` runs, which
+ *     pg_cron fires every minute with no overlap guard) racing on the same
+ *     attempt. The outcome is still UNKNOWN, exactly as it was a moment ago, so
+ *     the honest response is to leave the attempt pending and ask again — never
+ *     to park an invoice whose bookkeeping is fine.
+ *
+ * Returns `undefined` for anything that is not an idempotency error. An
+ * idempotency error with an unreadable status code reads as `params-mismatch`:
+ * of the two, that is the arm that touches no money.
+ *
+ * Neither condition has been observed live by this project — UNVERIFIED,
+ * stub-modelled, documented.
+ */
+export type StripeIdempotencyErrorKind = 'params-mismatch' | 'concurrent-request';
+
+export function stripeIdempotencyErrorKind(err: unknown): StripeIdempotencyErrorKind | undefined {
+  // Three checks, not one: `StripeIdempotencyError` is the class stripe-node
+  // generates for a raw `type: 'idempotency_error'`; `rawType` is that same raw
+  // type on a base error; and the `code` check catches the condition arriving
+  // as a plain invalid-request error (the shape `stripe.ts`'s own doc at the
+  // thrown-fork normalizer describes).
+  if (!(err instanceof Stripe.errors.StripeError)) return undefined;
+  const isIdempotency =
+    err instanceof Stripe.errors.StripeIdempotencyError ||
+    err.rawType === 'idempotency_error' ||
+    err.code === 'idempotency_error';
+  if (!isIdempotency) return undefined;
+  return err.statusCode === 409 ? 'concurrent-request' : 'params-mismatch';
 }
 
 export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentResult {
@@ -679,6 +826,9 @@ export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentRe
     );
   }
   const clientSecret: unknown = isRecord(attached) ? attached.client_secret : undefined;
+  // Same `created` the returning fork carries, when the attached intent has one
+  // — the verify lane's replay-vs-fresh-execution test must work on both forks.
+  const createdAt = intentCreatedAt(isRecord(attached) ? attached.created : undefined);
   // The field the pre-2026-08-11 seam dropped, and the whole reason an owner
   // whose card needed verification was told it had been declined. `err.code` is
   // the ONLY field on this error that names WHICH failure happened — the
@@ -709,6 +859,7 @@ export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentRe
     // key, and "absent both ways" is one less shape for a consumer to model.
     ...(blocker !== undefined ? { blocker } : {}),
     ...(code !== undefined ? { failureCode: code } : {}),
+    ...(createdAt !== undefined ? { createdAt } : {}),
   };
 }
 
@@ -808,7 +959,16 @@ export const defaultStripeClient: StripeClient = {
     // — a wrongly-cautious owner is told to wait; a wrongly-confident one pays
     // twice. Same reasoning as the `processing` carve-out in
     // `chargeBlockerForConfirm`.
-    return normalizeReturnedConfirm(intent);
+    //
+    // `replayed` is stamped HERE rather than in the normalizer because it is a
+    // property of the RESPONSE, not of the PaymentIntent — and only the confirm
+    // verb sends an idempotency key at all. Omitted (not `false`) when the
+    // header could not be read: see the field's doc.
+    const replayed = replayedFromResponse(intent);
+    return {
+      ...normalizeReturnedConfirm(intent),
+      ...(replayed !== undefined ? { replayed } : {}),
+    };
   },
 
   async detachPaymentMethod(paymentMethodId) {
@@ -817,6 +977,11 @@ export const defaultStripeClient: StripeClient = {
 
   async cancelPaymentIntent(paymentIntentId) {
     await stripeSingleton.paymentIntents.cancel(paymentIntentId);
+  },
+
+  async retrievePaymentIntent(paymentIntentId) {
+    const intent = await stripeSingleton.paymentIntents.retrieve(paymentIntentId);
+    return normalizeRetrievedIntent(intent);
   },
 
   async createRefund(args, idempotencyKey) {

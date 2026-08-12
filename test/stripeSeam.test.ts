@@ -7,6 +7,7 @@ import {
   defaultStripeClient,
   normalizeReturnedConfirm,
   normalizeThrownConfirmError,
+  stripeIdempotencyErrorKind,
   type StripePaymentIntentResult,
   type StripePaymentIntentStatus,
 } from '../src/lib/stripe.js';
@@ -631,4 +632,95 @@ test('normalizeThrownConfirmError: a card error with NO code carries neither new
   assert.deepEqual(result, returnedForkResult('requires_payment_method'));
   assert.equal(chargeBlockerForConfirm(result, log), 'declined');
   assert.deepEqual(warns, [], 'no code is not the same event as an unrecognized code');
+});
+
+// ── The two signals that tell a REPLAY from a FRESH EXECUTION (2026-08-12) ──
+//
+// The verify lane's re-issue is safe only while Stripe still holds the key, and
+// this project has never measured how long that is. These are the fields that
+// let the lane NOTICE the assumption failing instead of settling on faith —
+// they are money-path evidence, so the seam that carries them is pinned here.
+
+test('normalizeReturnedConfirm: `created` rides through as createdAt', () => {
+  const result = normalizeReturnedConfirm({
+    id: 'pi_created_1',
+    status: 'succeeded',
+    client_secret: null,
+    amount: 12_500,
+    created: 1_772_452_800, // 2026-03-02T12:00:00Z
+  } as unknown as Stripe.PaymentIntent);
+
+  assert.deepEqual(result.createdAt, new Date('2026-03-02T12:00:00Z'));
+  assert.equal(result.replayed, undefined, 'a bare intent object says nothing about replay');
+});
+
+test('normalizeReturnedConfirm: an unreadable `created` is omitted, never guessed', () => {
+  const result = normalizeReturnedConfirm({
+    id: 'pi_created_2',
+    status: 'processing',
+    client_secret: 'pi_created_2_secret',
+    amount: 100,
+  } as unknown as Stripe.PaymentIntent);
+
+  assert.equal(result.createdAt, undefined, 'absent beats invented on a money path');
+});
+
+test('normalizeThrownConfirmError: the attached intent’s `created` rides through too', () => {
+  // HAND-BUILT: the thrown fork must carry the same evidence as the returning
+  // one, or a replayed DECLINE (which arrives thrown) would be unexaminable.
+  const result = normalizeThrownConfirmError(
+    cardErrorWithIntent({ ...attachedIntent('requires_payment_method'), created: 1_772_452_800 }),
+  );
+  assert.deepEqual(result.createdAt, new Date('2026-03-02T12:00:00Z'));
+});
+
+// ── Stripe spends ONE error type on two conditions (2026-08-12) ──────────────
+
+test('stripeIdempotencyErrorKind: a 409 is a concurrency signal, not a bookkeeping one', () => {
+  const err = new Stripe.errors.StripeIdempotencyError({
+    type: 'idempotency_error',
+    code: 'idempotency_error',
+    statusCode: 409,
+    message: 'There is currently another in-progress request using this Idempotency Key.',
+  } as never);
+  assert.equal(
+    stripeIdempotencyErrorKind(err),
+    'concurrent-request',
+    'two of our own ticks overlapping must never park a healthy invoice forever',
+  );
+});
+
+test('stripeIdempotencyErrorKind: a 400 is the invariant violation that parks', () => {
+  const err = new Stripe.errors.StripeIdempotencyError({
+    type: 'idempotency_error',
+    code: 'idempotency_error',
+    statusCode: 400,
+    message:
+      'Keys for idempotent requests can only be used with the same parameters they were first used with.',
+  } as never);
+  assert.equal(stripeIdempotencyErrorKind(err), 'params-mismatch');
+});
+
+test('stripeIdempotencyErrorKind: an idempotency error with no status code parks (safe default)', () => {
+  const err = new Stripe.errors.StripeIdempotencyError({
+    type: 'idempotency_error',
+    code: 'idempotency_error',
+    message: 'idempotency error with no status',
+  } as never);
+  assert.equal(
+    stripeIdempotencyErrorKind(err),
+    'params-mismatch',
+    'of the two arms, the one that touches no money is the right guess',
+  );
+});
+
+test('stripeIdempotencyErrorKind: everything else is not an idempotency error at all', () => {
+  assert.equal(
+    stripeIdempotencyErrorKind(
+      new Stripe.errors.StripeConnectionError({ message: 'cannot reach Stripe' } as never),
+    ),
+    undefined,
+  );
+  assert.equal(stripeIdempotencyErrorKind(new Error('plain')), undefined);
+  assert.equal(stripeIdempotencyErrorKind(undefined), undefined);
 });

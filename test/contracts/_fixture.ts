@@ -22,6 +22,7 @@ import {
   eventSeries,
   events,
   groupClasses,
+  invoiceChargeAttempts,
   messages,
   deviceTokens,
   notificationDogs,
@@ -1654,6 +1655,24 @@ export async function topUpCredits(
  * — both isolation (the file alone) AND multi-file (the full suite),
  * because race-on-shared-DB is the test container's failure mode.
  */
+/**
+ * Drop every `invoice_charge_attempts` row (2026-08-12).
+ *
+ * The auto-charge attempt ledger FK-restricts `invoices` — deliberately, since
+ * an invoice is a retained financial record and its attempt history is the
+ * operator's answer to "what happened to this money?". That means EVERY test
+ * teardown that hard-deletes invoices must clear attempts first, or the delete
+ * FK-blocks and takes the whole file's `after` hook down with it.
+ *
+ * Unscoped on purpose: the test container is exclusively ours, the suite runs
+ * `--test-concurrency=1`, and these rows are worker telemetry, not fixture
+ * identity. Scoping each caller's subquery would buy nothing and would be one
+ * more thing to get wrong in fifteen files.
+ */
+export async function clearInvoiceChargeAttempts(): Promise<void> {
+  await db.delete(invoiceChargeAttempts);
+}
+
 export async function teardownFixture(): Promise<void> {
   // Day-16: scheduled_notifications must drop BEFORE notifications —
   // the FK `emitted_notification_id → notifications.id` has no ON DELETE
@@ -1743,6 +1762,7 @@ export async function teardownFixture(): Promise<void> {
   // clean across runs. Independent of the FK chain — no foreign keys
   // reference stripe_events.
   await db.delete(stripeEvents).where(like(stripeEvents.eventId, 'evt_test_%'));
+  await clearInvoiceChargeAttempts();
   // Day-15: invoices restricts on owner_id + payment_method_id; drop
   // before payment_methods + owners. invoices.paid_charge_id is FK to
   // charges (no on-delete), so drop invoices BEFORE charges as well —

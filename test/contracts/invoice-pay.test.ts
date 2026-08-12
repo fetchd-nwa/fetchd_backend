@@ -8,7 +8,7 @@ import { charges, invoices, refunds } from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
 import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -46,6 +46,7 @@ async function seedOpenInvoice(amountCents = 200_000): Promise<string> {
 
 async function cleanupInvoicesAndCharges(): Promise<void> {
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
 }

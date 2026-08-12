@@ -17,7 +17,7 @@ import {
   scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import { registerRequestConfirmPaymentRoute } from '../../src/routes/requestConfirmPayment.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -84,6 +84,7 @@ async function cleanup(): Promise<void> {
   // Order: notifications + invoices + charges + booking_dogs (cascade)
   // + bookings + pending_request_dogs (cascade) + pending_requests.
   await db.delete(notifications).where(eq(notifications.ownerId, FIXTURE_IDS.ownerId));
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   // Drop any test-created pending requests (not the two fixture rows

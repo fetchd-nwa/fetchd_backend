@@ -19,7 +19,7 @@ import {
   scheduleNextAttempt,
 } from '../../src/workers/invoiceAutoCharge.js';
 import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
 import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
 import { makeExpoPushStub } from './_expoPushStub.js';
@@ -70,6 +70,7 @@ async function clearDeviceTokens(): Promise<void> {
 }
 
 async function cleanup(): Promise<void> {
+  await clearInvoiceChargeAttempts();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   // A parked invoice now enqueues a payment-failed `scheduled_notifications`
@@ -376,13 +377,17 @@ test(
     assert.equal(scheduled?.trigger, 'payment-failed');
     assert.equal(scheduled?.status, 'pending', 'not yet delivered — awaits the scheduler tick');
     assert.equal(scheduled?.title, 'Payment failed');
-    // Allison 2026-08-01 rewrote this copy. Each clause below is one thing she
-    // asked for, pinned separately so a future edit that drops one fails on the
-    // clause it dropped rather than on an opaque whole-string mismatch.
+    // Allison 2026-08-01 rewrote this copy; 2026-08-12 split it into a taxonomy
+    // (`lib/autoChargeNotificationCopy.ts`). `requires_payment_method` derives
+    // the `declined` blocker, so this is the DECLINED arm — it names the actual
+    // reason rather than the generic "it didn't go through". Each clause below
+    // is one thing Allison asked for, pinned separately so a future edit that
+    // drops one fails on the clause it dropped rather than on an opaque
+    // whole-string mismatch.
     assert.match(scheduled!.body, /\$120/, 'names the amount');
     assert.match(scheduled!.body, /group class enrollment/i, 'names what it was for');
     assert.match(scheduled!.body, /\bon [A-Z][a-z]{2} \d{1,2}\b/, 'names the date it was tried');
-    assert.match(scheduled!.body, /didn't go through/i, 'says plainly that it failed');
+    assert.match(scheduled!.body, /your card was declined/i, 'names the actual reason');
     assert.match(scheduled!.body, /different form of payment/i, 'offers a way out, not an order');
     assert.match(scheduled!.body, /another card/i, 'names the card option');
     assert.match(scheduled!.body, /in person with cash or check/i, 'names the in-person option');

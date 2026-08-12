@@ -93,6 +93,27 @@ export const invoicesRepository = {
   },
 
   /**
+   * Look up one invoice by id ALONE — no owner filter, because the two callers
+   * are system actors that have no principal to scope by: the Stripe webhook's
+   * invoice-orphan reconciliation (which validates the PI's `owner_id` metadata
+   * against `invoices.owner_id` itself, as a trust-boundary check the 404
+   * collapse cannot do for it) and the attempt-verify lane (which starts from an
+   * `invoice_charge_attempts` row, not from a request).
+   *
+   * Never reachable from an owner-facing route — those use
+   * {@link findByIdForOwner}, whose owner filter is the id-enumeration
+   * 404-collapse.
+   */
+  async findById(runner: Runner, id: string): Promise<InvoiceRow | undefined> {
+    const [row] = await runner
+      .select(INVOICE_PROJECTION)
+      .from(invoices)
+      .where(eq(invoices.id, id))
+      .limit(1);
+    return row;
+  },
+
+  /**
    * INSERT an open invoice. Used by `POST /requests/:id/confirm-payment`
    * pay-later branch (B&T) and (Day-19 portal extension) future ad-hoc
    * invoice flows. `next_attempt_at` defaults to `due_at` so the worker
@@ -347,9 +368,35 @@ export const invoicesRepository = {
 
   /**
    * Worker dunning: increment attempts + reschedule the next attempt.
-   * Called inside the worker's per-invoice tx after a Stripe failure.
-   * `nextAttemptAt = null` parks the invoice (e.g. exhausted retries
+   * Called inside the worker's per-invoice tx after a KNOWN-FAILED charge
+   * attempt. `nextAttemptAt = null` parks the invoice (e.g. exhausted retries
    * → staff notification + manual resolution).
+   *
+   * **Narrowed 2026-08-12** (`designs/auto-charge-unknown-outcome.md`,
+   * Decision 1). `auto_charge_attempts` now counts ONE thing: how many times
+   * the card actually said no (declined / authentication-required / a cancelled
+   * intent), plus the no-card / no-Stripe-customer parks. It no longer counts
+   * "we never found out" — an unknown outcome leaves the ladder alone and goes
+   * to the verify lane, because incrementing here used to ROTATE THE STRIPE
+   * IDEMPOTENCY KEY (which embedded this counter) and so turned "we don't know
+   * whether money moved" into "ask Stripe for new money". The key's identity
+   * now lives on `invoice_charge_attempts.attempt_no`, which advances only when
+   * the previous attempt is known-dead.
+   *
+   * Existing rows need no migration: the old semantics counted a superset of
+   * the new ones, which can only park an invoice EARLIER, never later — the
+   * safe direction.
+   *
+   * **Filtered on `status='open'`, and the row count is the caller's permission
+   * slip** (round 3, 2026-08-12) — mirroring `parkForReconciliation` and the
+   * verify lane's re-read. The charge lane holds no lock across the Stripe
+   * round-trip (R5 forbids it), so an owner can pay the invoice manually
+   * between the confirm leaving and its answer arriving. Unfiltered, a decline
+   * that raced a real payment still advanced the dunning ladder on a PAID
+   * invoice and — at the last rung — pushed "we tried your payment and your
+   * card was declined. Want to try a different form of payment?" at someone
+   * holding a receipt. Zero rows means the invoice stopped being open; the
+   * caller must then say nothing.
    */
   async recordFailedAttempt(
     tx: Tx,
@@ -361,7 +408,29 @@ export const invoicesRepository = {
         autoChargeAttempts: sql`auto_charge_attempts + 1`,
         nextAttemptAt: args.nextAttemptAt,
       })
-      .where(eq(invoices.id, args.id))
+      .where(and(eq(invoices.id, args.id), eq(invoices.status, 'open')))
+      .returning({ id: invoices.id });
+    return updated.length;
+  },
+
+  /**
+   * Park an OPEN invoice for HUMAN reconciliation without touching the dunning
+   * ladder (2026-08-12). The verify lane's terminal arm: an attempt whose
+   * outcome is past the point where anything automatic can learn it — the
+   * idempotency-key window has closed with no PI id and no webhook, or an
+   * intent has sat `processing` past the cap. Nothing failed, so nothing may be
+   * counted as a failure; but nothing may keep charging either, so
+   * `next_attempt_at` goes NULL and the invoice surfaces on the existing staff
+   * worklist (`findParked`).
+   *
+   * Filtered on `status='open'` so it can never re-park a paid/void invoice.
+   * Returns the affected row count.
+   */
+  async parkForReconciliation(tx: Tx, args: { id: string }): Promise<number> {
+    const updated = await tx
+      .update(invoices)
+      .set({ nextAttemptAt: null })
+      .where(and(eq(invoices.id, args.id), eq(invoices.status, 'open')))
       .returning({ id: invoices.id });
     return updated.length;
   },
@@ -448,11 +517,21 @@ export const invoicesRepository = {
    *    at drop-off would be false by construction. Bring in-person into scope
    *    when the staff mark-paid verb ships.
    *  - `due_at < cutoff` — cutoff is `now - INVOICE_OVERDUE_GRACE_DAYS`.
-   *  - no `payment-failed:<id>` already queued — a terminally parked invoice
-   *    ALREADY produced an action-required notification naming this exact
-   *    invoice. Firing a second one is nagging, not a safety net. What survives
-   *    this filter is the real gap: an invoice past due that nothing else has
-   *    told the owner about (still mid-retry, or missed by the charge worker).
+   *  - no `payment-failed:<id>` **or `payment-unconfirmed:<id>`** already
+   *    queued — a terminally parked invoice ALREADY produced an
+   *    action-required notification naming this exact invoice. Firing a second
+   *    one is nagging, not a safety net. What survives this filter is the real
+   *    gap: an invoice past due that nothing else has told the owner about
+   *    (still mid-retry, or missed by the charge worker).
+   *
+   *    The `payment-unconfirmed` half is 2026-08-12
+   *    (`designs/auto-charge-unknown-outcome.md`) and it is a MONEY rule, not
+   *    tidiness: that push exists to say "we can't yet confirm whether your
+   *    payment went through — please don't pay it again". An `invoice-overdue`
+   *    nag landing on top of it says the opposite ("check the card on file so
+   *    it doesn't hold up your next booking"), and an owner who acts on the
+   *    later message pays money that may already have moved. Suppression here
+   *    is what keeps the unknown from being nagged into a double charge.
    *
    * Ordered `due_at` ASC — longest overdue first, so a capped tick warns the
    * worst cases. Tx runner (the scan enqueues in the same transaction).
@@ -469,7 +548,10 @@ export const invoicesRepository = {
         AND i.due_at < ${args.cutoff.toISOString()}
         AND NOT EXISTS (
           SELECT 1 FROM scheduled_notifications sn
-          WHERE sn.dedupe_key = 'payment-failed:' || i.id::text
+          WHERE sn.dedupe_key IN (
+            'payment-failed:' || i.id::text,
+            'payment-unconfirmed:' || i.id::text
+          )
         )
       ORDER BY i.due_at ASC
     `);
