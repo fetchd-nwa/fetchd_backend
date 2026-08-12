@@ -12,6 +12,31 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.10.0] — 2026-08-12
+
+Additive. `InvoiceDeepLinkReason` gains `'payment-unconfirmed'` (and the
+`INVOICE_DEEP_LINK_REASONS` tuple with it). No field, endpoint, or shape
+changes; an older client that does not know the arm falls back to its neutral
+`'ledger'` framing rather than crashing — verified against mobile's parser
+before the bump.
+
+This exists because the auto-charge worker can finish an attempt **without
+knowing whether Stripe took the money** — a transport failure after the request
+left the process. Both existing arms assert an outcome: `payment-failed` says
+it did not go through, `payment-due` says it has not been tried. The worker was
+using `payment-failed` for the unknown case, so an owner whose money may
+already have moved read "it didn't go through — try another card," and the
+client's key changes with the card, which mints a second PaymentIntent. Two
+charges, no refund, no reconciliation.
+
+The arm carries "we don't know yet, don't pay again" from the push through to
+the settle sheet, which is the only channel both tap paths (OS push cold start
+and the in-app list) share. See `designs/auto-charge-unknown-outcome.md`.
+
+NOTE ON NUMBERING: `STATUS.md` previously reserved "1.10.0" for the manual-capture
+round. That work has not landed and now takes **1.11.0**; this bump got there
+first because a live double-charge outranks a planned refactor.
+
 ## [1.9.0] — 2026-08-04
 
 Additive. New `InvoiceDeepLinkReason` (`'payment-failed' | 'payment-due'`);
