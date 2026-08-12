@@ -40,16 +40,22 @@ export interface CancelBookingResult {
  * line ~1491). Both the owner self-cancel (`POST /bookings/:id/cancel`)
  * and the Day-19 staff-portal cancel (`POST /staff/bookings/:id/cancel`)
  * run this identical body — same forfeit rule (`now > cancel_deadline_at`,
- * resolved in SQL), same credit-back / money-back / forfeit branching,
- * same booking-cancelled notification to the booking's owner. The schema
- * pins the cancel as owner-OR-staff authorized with no separate staff
- * refund policy, so there is exactly one transaction.
+ * resolved in SQL against the caller's `now`), same credit-back /
+ * money-back / forfeit branching, same booking-cancelled notification to
+ * the booking's owner. The schema pins the cancel as owner-OR-staff
+ * authorized with no separate staff refund policy, so there is exactly
+ * one transaction.
  *
  * The only caller difference is ownership scope:
  *   - owner route passes `requireOwnerId = principal.ownerId` → a
  *     cross-owner id collapses to 404 (no enumeration).
  *   - staff route passes `requireOwnerId = null` → cross-owner by design
  *     (`requireStaff` already gated the route).
+ *
+ * `now` is required and threads through BOTH time-sensitive decisions in
+ * this transaction — the forfeit check and the credit-lot re-mint. One
+ * instant per cancel: a cancel that is in-window for the refund must not
+ * be able to be out-of-window for the lot expiry it writes.
  *
  * The Stripe refund API call is NOT made here; the money-back branch
  * returns a `pendingStripeRefund` handle the route fires after commit.
@@ -63,9 +69,11 @@ export async function cancelBookingInTx(
     cancelledBy: 'owner' | 'staff';
     /** Optional staff-supplied reason line; owner self-cancels omit it. */
     cancelReason?: string;
+    /** The cancel instant — the route's `nowFactory()`, never a fresh wall clock. */
+    now: Date;
   },
 ): Promise<CancelBookingResult> {
-  const { id, requireOwnerId, cancelledBy, cancelReason } = args;
+  const { id, requireOwnerId, cancelledBy, cancelReason, now } = args;
 
   // 1. Row-lock; serialize concurrent cancels. 404 collapses not-found,
   //    expired, and (owner route only) not-yours into one response.
@@ -88,9 +96,10 @@ export async function cancelBookingInTx(
   }
 
   // 2. Soft-cancel. `cancelForfeited` is computed in SQL against the
-  //    stamped `cancel_deadline_at`; the resolved value lands on commit.
+  //    stamped `cancel_deadline_at` and the caller's `now`; the resolved
+  //    value lands on commit.
   //    `cancelledBy` + `cancelReason` (R5) record WHO/WHY for the banner.
-  await bookingsRepository.markCancelled(tx, { id, cancelledBy, cancelReason });
+  await bookingsRepository.markCancelled(tx, { id, cancelledBy, cancelReason, now });
 
   // 3. Re-read so the refund branch reads the resolved `cancelForfeited`
   //    (not the pre-update snapshot).
@@ -114,8 +123,9 @@ export async function cancelBookingInTx(
       // CREDIT-BACK: one +1 refund row per original debit, routed back to the
       // lot it drew from (or a fresh lot if that lot has since expired).
       // §J.3: an alumni dog's fresh re-mint never expires — one status read
-      // per distinct dog, memoized across this booking's debits.
-      const now = new Date();
+      // per distinct dog, memoized across this booking's debits. `now` is the
+      // caller's cancel instant (destructured above), so the lot the refund
+      // lands in is dated by the same clock the forfeit check used.
       const alumniByDogId = new Map<string, boolean>();
       for (const debit of debits) {
         let dogIsAlumni = alumniByDogId.get(debit.dogId);

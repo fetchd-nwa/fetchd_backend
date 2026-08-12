@@ -62,6 +62,14 @@ const cancelBodySchema = z
 export interface StaffBookingsRouteOptions extends AuthRouteOptions {
   /** Stripe seam for the cancel money-back postCommit (mirrors bookings). */
   stripe?: StripeClient;
+  /**
+   * Injectable clock (mirrors `BookingsRouteOptions.now`). The staff cancel
+   * runs the same `cancelBookingInTx` the owner cancel does, and that
+   * transaction's forfeit check now reads the caller's instant rather than
+   * Postgres `now()` — so this route has to own one. Production passes the
+   * real clock; contract tests freeze it.
+   */
+  now?: () => Date;
 }
 
 export function registerStaffBookingsRoute(
@@ -70,6 +78,7 @@ export function registerStaffBookingsRoute(
 ): void {
   const authHook = resolveAuthHook(opts);
   const stripe = opts.stripe ?? defaultStripeClient;
+  const nowFactory = opts.now ?? ((): Date => new Date());
 
   // --- GET /staff/bookings ------------------------------------------------
   //
@@ -205,6 +214,7 @@ export function registerStaffBookingsRoute(
             requireOwnerId: null,
             cancelledBy: 'staff',
             ...(reason !== undefined ? { cancelReason: reason } : {}),
+            now: nowFactory(),
           });
           pendingStripeRefund = result.pendingStripeRefund;
           creditRefundedDogIds = result.creditRefundedDogIds;

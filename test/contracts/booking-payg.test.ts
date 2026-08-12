@@ -42,23 +42,23 @@ import {
 registerFixtureHooks();
 
 const FIXTURE_TODAY_MS = FIXTURE_TODAY.getTime();
-const REAL_NOW_MS = Date.now();
 const ONE_DAY_MS = 86_400_000;
 const ONE_HOUR_MS = 3_600_000;
 const DAY_SCHOOL_FAY_RATE_CENTS = 7500;
 const DAY_CARE_RATE_CENTS = 4500;
 
-/** YYYY-MM-DD for the `nth` weekday after FIXTURE_TODAY (validation clock).
- * Weekday-only so day_capacity defaults to 3/3 (weekends seed 0/0 = closed). */
+/**
+ * YYYY-MM-DD for the `nth` weekday after FIXTURE_TODAY. Weekday-only so
+ * day_capacity defaults to 3/3 (weekends seed 0/0 = closed).
+ *
+ * Δ 2026-08-12: this file used to carry a second, REAL-clock helper for the
+ * cancel + pay-in-person cases, because those routes read a clock no test could
+ * inject (Postgres `now()` for the forfeit check; a bare `new Date()` in
+ * `pay-in-person`). Both are injectable now, so there is one anchor and no way
+ * for the two sides to drift apart as the real calendar advances.
+ */
 function futureWeekday(nth: number): string {
   return nthWeekday(FIXTURE_TODAY_MS, nth);
-}
-
-/** Same, anchored on REAL now — the cancel route's forfeit math uses Postgres
- * `now()`, so a booking that must be inside its window when cancelled needs a
- * real-clock-relative date (see booking-cancel.test.ts for the full rationale). */
-function realFutureWeekday(nth: number): string {
-  return nthWeekday(REAL_NOW_MS, nth);
 }
 
 function nthWeekday(anchorMs: number, nth: number): string {
@@ -328,7 +328,7 @@ test(
       payload: {
         category: 'day-school',
         lead_dog_id: FIXTURE_IDS.dog1Id,
-        dates: [realFutureWeekday(3)],
+        dates: [futureWeekday(50)],
         location: 'fayetteville',
         payment: 'payg',
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
@@ -363,7 +363,7 @@ test(
       payload: {
         category: 'day-school',
         lead_dog_id: FIXTURE_IDS.dog1Id,
-        dates: [realFutureWeekday(4)],
+        dates: [futureWeekday(51)],
         location: 'fayetteville',
         payment: 'payg',
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
@@ -375,7 +375,7 @@ test(
     // Force the cancel window closed (deadline 6h in the past).
     await db
       .update(bookingsTable)
-      .set({ cancelDeadlineAt: new Date(REAL_NOW_MS - 6 * ONE_HOUR_MS).toISOString() })
+      .set({ cancelDeadlineAt: new Date(FIXTURE_TODAY_MS - 6 * ONE_HOUR_MS).toISOString() })
       .where(eq(bookingsTable.id, bookingId));
 
     const cancel = await postCancel({
@@ -476,9 +476,10 @@ test(
     //      the test hand-seeded — so the two writers agree on `payment_method_id`
     //      and `booking_id` being set, which is what the flip's gate reads.
     //
-    // Real-clock date: `pay-in-person` anchors against the real now (its route
-    // takes no `now` override), so a FIXTURE_NOW-relative date would already be
-    // past, clamp to now, and hide the 24h arithmetic this exists to pin.
+    // Both routes run on FIXTURE_NOW (Δ 2026-08-12 — `pay-in-person` takes a
+    // `now` override now). The date has to sit more than 24h past that instant
+    // or the reminder clamps to now and the 24h arithmetic this exists to pin
+    // disappears; `futureWeekday(52)` is ~73 days out, inside the 92-day cap.
     const { app } = bookingApp();
     const res = await postBooking({
       app,
@@ -486,7 +487,7 @@ test(
       payload: {
         category: 'day-school',
         lead_dog_id: FIXTURE_IDS.dog2Id,
-        dates: [realFutureWeekday(10)],
+        dates: [futureWeekday(52)],
         location: 'fayetteville',
         payment: 'payg',
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
@@ -503,7 +504,11 @@ test(
     assert.equal(booking?.dropoffAt, null, 'day programs carry no drop-off — anchor is scheduled_at');
 
     const { app: invoiceApp, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-    registerInvoicesRoute(invoiceApp, { authenticate, stripe: makeStripeStub() });
+    registerInvoicesRoute(invoiceApp, {
+      authenticate,
+      now: FIXTURE_NOW,
+      stripe: makeStripeStub(),
+    });
     const flip = await invoiceApp.inject({
       method: 'POST',
       url: `/invoices/${invoiceId}/pay-in-person`,

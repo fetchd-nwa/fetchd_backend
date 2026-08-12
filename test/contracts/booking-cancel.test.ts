@@ -15,7 +15,7 @@ import {
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
-import { FIXTURE_IDS, topUpCredits } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
@@ -36,8 +36,8 @@ import {
  *   - Money-back path manually seeds a `charges` row alongside a hand-
  *     inserted booking (no API path writes `charges` until Day 14).
  *   - Forfeit path hand-inserts a booking with a `cancel_deadline_at`
- *     already in the past; the markCancelled SQL `now() > deadline`
- *     resolves forfeited=true on commit.
+ *     already in the past; the markCancelled SQL `<injected now> >
+ *     deadline` resolves forfeited=true on commit.
  *   - Free-service (eval-style) path hand-inserts a booking with NO
  *     ledger rows and NO charge — the route's "neither credit-paid
  *     nor money-paid" branch.
@@ -50,28 +50,35 @@ registerFixtureHooks();
 
 const ONE_DAY_MS = 86_400_000;
 const ONE_HOUR_MS = 3_600_000;
-/** Real-time anchor — see `realFutureWeekday` for the reason. Cancel
- * route reads Postgres `now()` for the forfeit calculation, so seeded
- * scheduledAt + cancel_deadline_at need to be relative to real clock,
- * not FIXTURE_TODAY. */
-const REAL_NOW_MS = Date.now();
+/**
+ * The ONE anchor for this file (Δ 2026-08-12). Every date here — booked,
+ * hand-seeded, scheduled, deadlined — is relative to FIXTURE_TODAY, and every
+ * route under test is registered with `now: FIXTURE_NOW`. The suite does not
+ * read the real calendar anywhere.
+ *
+ * History, because this is the third time this file broke on a date: the cancel
+ * route's `cancel_forfeited` used to be resolved by Postgres `now()`, a clock no
+ * test could reach. So the suite anchored on the REAL clock to satisfy it — and
+ * then the CREATION route, on FIXTURE_NOW, validated real-clock dates against a
+ * frozen 92-day lookahead cap and the file went red on 2026-08-20 by one day
+ * (fixed in 1bb207f by moving both sides to the real clock, which re-armed it:
+ * on the real clock the fixture's last-attended dates aged past 3 months and
+ * every credit-back seed started diverting to a 202). The fix is the seam, not
+ * the anchor: `cancelBookingInTx` now takes the caller's `now`, so BOTH sides
+ * can be frozen and there is no second clock left to disagree with.
+ */
+const FIXTURE_NOW_MS = FIXTURE_TODAY.getTime();
 
 /**
- * Day-13 cancel tests anchor dates on REAL `now()`, not `FIXTURE_TODAY`.
- * The cancel route's `cancel_forfeited` computation uses Postgres `now()`
- * (real clock), so a booking dated relative to FIXTURE_TODAY (2026-05-19)
- * but cancelled at real-today lands forfeited unexpectedly. Real-time-
- * anchored dates pass BOTH validation (the booking-creation route's
- * "scheduledAt >= FIXTURE_NOW" check is satisfied since real now is
- * after FIXTURE_TODAY) AND the cancel-time forfeit math. Earned
- * 2026-05-26.
+ * YYYY-MM-DD for the `nth` weekday strictly after FIXTURE_TODAY. Weekday-only
+ * because `day_capacity` seeds weekends at 0/0 (closed) — a Saturday date is a
+ * capacity rejection, not a cancel test.
  */
-function realFutureWeekday(nth: number): string {
-  const realTodayMs = Date.now();
+function futureWeekday(nth: number): string {
   let count = 0;
   let offset = 1;
   for (;;) {
-    const d = new Date(realTodayMs + offset * ONE_DAY_MS);
+    const d = new Date(FIXTURE_NOW_MS + offset * ONE_DAY_MS);
     const dow = d.getUTCDay();
     if (dow !== 0 && dow !== 6) {
       if (count === nth) {
@@ -89,20 +96,15 @@ function cancelApp(principal = FIXTURE_OWNER_PRINCIPAL): {
 } {
   const { app, authenticate } = makeContractApp(principal);
   const stripe = makeStripeStub();
-  // Dates in this suite are anchored on the REAL clock (see `realFutureWeekday`
-  // and REAL_NOW_MS above) because the cancel route's forfeit math runs on
-  // Postgres `now()`. Injecting FIXTURE_NOW here put the CREATION route on a
-  // different clock from the dates it validates: the lookahead cap froze at
-  // FIXTURE_TODAY + 92 = 2026-08-19 while the dates kept moving, and the suite
-  // went red on 2026-08-20 by exactly one day. Same clock both sides.
-  registerBookingsRoute(app, { authenticate, now: () => new Date(REAL_NOW_MS), stripe });
+  // One clock for creation AND cancellation (see FIXTURE_NOW_MS above).
+  registerBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe });
   return { app, stripe };
 }
 
 /** Staff-principal app for the cross-owner `POST /staff/bookings/:id/cancel`. */
 function staffCancelApp(): { app: ReturnType<typeof makeContractApp>['app'] } {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
-  registerStaffBookingsRoute(app, { authenticate, stripe: makeStripeStub() });
+  registerStaffBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe: makeStripeStub() });
   return { app };
 }
 
@@ -212,8 +214,8 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     // scheduledAt 30h ahead, deadline 6h ago → outside the 48h window.
-    const scheduledAt = new Date(REAL_NOW_MS + 30 * ONE_HOUR_MS);
-    const cancelDeadlineAt = new Date(REAL_NOW_MS - 6 * ONE_HOUR_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 30 * ONE_HOUR_MS);
+    const cancelDeadlineAt = new Date(FIXTURE_NOW_MS - 6 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
       scheduledAt,
@@ -265,7 +267,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = cancelApp();
-    const bookingId = await createCreditPaidBooking({ app, date: realFutureWeekday(5) });
+    const bookingId = await createCreditPaidBooking({ app, date: futureWeekday(5) });
 
     const res = await postCancel({
       app,
@@ -299,7 +301,7 @@ test(
     const { app } = cancelApp();
     const bookingId = await createCreditPaidBooking({
       app,
-      date: realFutureWeekday(6),
+      date: futureWeekday(6),
       additionalDogIds: [FIXTURE_IDS.dog2Id],
     });
 
@@ -330,7 +332,7 @@ test(
   'POST /bookings/:id/cancel — money-back creates pending refunds row equal to charge amount',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
@@ -373,7 +375,7 @@ test(
   'POST /bookings/:id/cancel — money-back honors cumulative-refund cap (charge − prior succeeded)',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
@@ -414,7 +416,7 @@ test(
   'POST /bookings/:id/cancel — money-back fires post-commit Stripe refund (Day-14 seam)',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
@@ -444,7 +446,7 @@ test(
   'POST /bookings/:id/cancel — money-back: Stripe refund failure is swallowed (DB refund row persists)',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
@@ -476,7 +478,7 @@ test(
   'POST /bookings/:id/cancel — replay does NOT re-fire Stripe refund',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
@@ -510,7 +512,7 @@ test(
   'POST /bookings/:id/cancel — free service within window → status flip only, no ledger, no refund',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'evaluation',
@@ -560,7 +562,7 @@ test('POST /bookings/:id/cancel — unknown booking id → 404', SKIP_WHEN_NO_DB
 });
 
 test('POST /bookings/:id/cancel — already-cancelled → 409', SKIP_WHEN_NO_DB, async () => {
-  const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+  const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
   const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
   const bookingId = await seedRawBooking({
     category: 'private-lesson',
@@ -595,8 +597,8 @@ test('POST /bookings/:id/cancel — group-class booking → 422', SKIP_WHEN_NO_D
     leadDogId: FIXTURE_IDS.dog1Id,
     category: 'group-class',
     status: 'upcoming',
-    scheduledAt: new Date(REAL_NOW_MS + 7 * ONE_DAY_MS).toISOString(),
-    cancelDeadlineAt: new Date(REAL_NOW_MS + 5 * ONE_DAY_MS).toISOString(),
+    scheduledAt: new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS).toISOString(),
+    cancelDeadlineAt: new Date(FIXTURE_NOW_MS + 5 * ONE_DAY_MS).toISOString(),
     cohortId: FIXTURE_IDS.cohortPuppyId,
     location: 'fayetteville',
   });
@@ -614,7 +616,7 @@ test('POST /bookings/:id/cancel — group-class booking → 422', SKIP_WHEN_NO_D
 });
 
 test('POST /bookings/:id/cancel — staff principal → 403', SKIP_WHEN_NO_DB, async () => {
-  const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+  const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
   const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
   const bookingId = await seedRawBooking({
     category: 'private-lesson',
@@ -632,7 +634,7 @@ test('POST /bookings/:id/cancel — staff principal → 403', SKIP_WHEN_NO_DB, a
 });
 
 test('POST /bookings/:id/cancel — missing Idempotency-Key → 400', SKIP_WHEN_NO_DB, async () => {
-  const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+  const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
   const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
   const bookingId = await seedRawBooking({
     category: 'private-lesson',
@@ -650,7 +652,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = cancelApp();
-    const bookingId = await createCreditPaidBooking({ app, date: realFutureWeekday(7) });
+    const bookingId = await createCreditPaidBooking({ app, date: futureWeekday(7) });
     const key = `cn-replay-${randomUUID()}`;
 
     const r1 = await postCancel({ app, bookingId, idempotencyKey: key });
@@ -673,7 +675,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = cancelApp();
-    const bookingId = await createCreditPaidBooking({ app, date: realFutureWeekday(8) });
+    const bookingId = await createCreditPaidBooking({ app, date: futureWeekday(8) });
 
     const res = await postCancel({
       app,
@@ -704,7 +706,7 @@ test(
     // POST /bookings enqueues a pending `booking-reminder:<bookingId>` schedule
     // row via the shared booking-creation core — the natural fixture for the
     // cancel-on-cancel path, so no hand-seeding of scheduled_notifications.
-    const bookingId = await createCreditPaidBooking({ app, date: realFutureWeekday(11) });
+    const bookingId = await createCreditPaidBooking({ app, date: futureWeekday(11) });
 
     const reminderKey = `booking-reminder:${bookingId}`;
     const [before] = await db
@@ -733,7 +735,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = cancelApp();
-    const date = realFutureWeekday(9);
+    const date = futureWeekday(9);
     // Drive day_capacity to a 1-seat ceiling at this date so the cancel
     // → re-book sequence is observable. The default rule is 3/3; the
     // override below shrinks it to 1/1 just for this calendar day.
@@ -795,7 +797,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = cancelApp();
-    const bookingId = await createCreditPaidBooking({ app, date: realFutureWeekday(10) });
+    const bookingId = await createCreditPaidBooking({ app, date: futureWeekday(10) });
 
     // Pre-warm a fake range cache so we can prove invalidation happens.
     const sentinelKey = `avail:fayetteville:2026-12-01:2026-12-31`;
@@ -820,7 +822,7 @@ test(
   'POST /bookings/:id/cancel — owner self-cancel stamps cancelled_by=owner (no reason) + wire emits it',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
@@ -849,7 +851,7 @@ test(
   'POST /staff/bookings/:id/cancel — staff cancel with reason stamps cancelled_by=staff + cancel_reason + wire emits both',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',
@@ -883,7 +885,7 @@ test(
   'POST /staff/bookings/:id/cancel — staff cancel WITHOUT a reason stamps cancelled_by=staff, omits cancel_reason',
   SKIP_WHEN_NO_DB,
   async () => {
-    const scheduledAt = new Date(REAL_NOW_MS + 7 * ONE_DAY_MS);
+    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
       category: 'private-lesson',

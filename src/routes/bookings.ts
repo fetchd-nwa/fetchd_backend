@@ -630,6 +630,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             requireOwnerId: principal.ownerId,
             // Owner self-cancel → "You cancelled this on …" (R5). No reason line.
             cancelledBy: 'owner',
+            now: nowFactory(),
           });
           pendingStripeRefund = result.pendingStripeRefund;
           creditRefundedDogIds = result.creditRefundedDogIds;

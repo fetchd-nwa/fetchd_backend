@@ -66,6 +66,14 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 export interface InvoicesRouteOptions extends AuthRouteOptions {
   /** Stripe seam (Day 14). Contract tests inject a stub. */
   stripe?: StripeClient;
+  /**
+   * Injectable clock (mirrors `BookingsRouteOptions.now`). `pay-in-person`
+   * anchors its payment-due reminder relative to "now"; a test that books
+   * on a frozen clock has to be able to flag that invoice on the SAME
+   * clock, or the reminder's 24h lead clamps against the real calendar and
+   * the arithmetic under test disappears. Production passes the real clock.
+   */
+  now?: () => Date;
 }
 
 const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
@@ -106,6 +114,7 @@ function parsePayBody(body: unknown): { payment_method_id?: string } {
 export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
   const stripe = opts.stripe ?? defaultStripeClient;
+  const nowFactory = opts.now ?? ((): Date => new Date());
 
   // `GET /invoices` `[auth]` — the owner's billing ledger (charges + open
   // invoices), newest first. Owner-scoped; a staff principal gets an empty
@@ -392,7 +401,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
     const { id } = parseIdParam(request.params);
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
     const requestHash = hashRequestBody({ id });
-    const now = new Date();
+    const now = nowFactory();
 
     const replay = await peekCompletedIdempotency<null>(
       idempotencyKey,

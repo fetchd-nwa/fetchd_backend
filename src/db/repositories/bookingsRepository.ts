@@ -512,20 +512,28 @@ export const bookingsRepository = {
   },
 
   /**
-   * Soft-cancel one booking. Sets `status='cancelled'`, `cancelledAt =
-   * now()`, `cancelForfeited` per the per-row deadline check, and — R5
-   * (Allison sim-QA 2026-07-27) — `cancelledBy` ('owner' | 'staff') plus
-   * the optional `cancelReason` staff supplies. These drive the owner
-   * app's cancelled-booking banner ("You cancelled this…" vs "The school
-   * cancelled this…" + the reason line). (The older `cancellation_reason`
-   * column stays unused — the new `cancel_reason` supersedes it.)
+   * Soft-cancel one booking. Sets `status='cancelled'`, `cancelledAt` to
+   * the caller's `now`, `cancelForfeited` per the per-row deadline check,
+   * and — R5 (Allison sim-QA 2026-07-27) — `cancelledBy` ('owner' |
+   * 'staff') plus the optional `cancelReason` staff supplies. These drive
+   * the owner app's cancelled-booking banner ("You cancelled this…" vs
+   * "The school cancelled this…" + the reason line). (The older
+   * `cancellation_reason` column stays unused — `cancel_reason` supersedes it.)
    *
    * `cancelForfeited` is computed in SQL against `cancel_deadline_at`
-   * (`now() > cancel_deadline_at`). Doing the check in SQL means a
-   * deadline of NULL — possible on legacy-import rows pre-Day-10 —
-   * coerces to `cancel_forfeited = false` (NULL > anything is NULL,
-   * COALESCEd to false). Defensible behavior: a missing deadline can't
-   * be enforced, so treat the cancel as in-window.
+   * (`now > cancel_deadline_at`) — but `now` is the caller's instant,
+   * bound as a parameter, NOT Postgres `now()`. The comparison still
+   * happens in SQL so a deadline of NULL — possible on legacy-import
+   * rows pre-Day-10 — coerces to `cancel_forfeited = false` (NULL >
+   * anything is NULL, COALESCEd to false). Defensible behavior: a
+   * missing deadline can't be enforced, so treat the cancel as in-window.
+   *
+   * `now` is required, not defaulted (Δ 2026-08-12). The route already
+   * owns an injectable clock (`registerXxxRoute(app, { now })`); reading
+   * a SECOND clock here — Postgres's — put the cancel on a different
+   * time axis from the creation it reverses, which is what froze the
+   * Day-13 contract tests to the real calendar. One `now` per request,
+   * chosen by the caller, visible at the call site.
    *
    * No `expired_at` write — DATA-CONTRACT §A2 "never DELETE" applies:
    * cancellation is a status flip, not a row-expire. Audit row captures
@@ -533,14 +541,21 @@ export const bookingsRepository = {
    */
   async markCancelled(
     tx: Tx,
-    args: { id: string; cancelledBy: 'owner' | 'staff'; cancelReason?: string | null },
+    args: {
+      id: string;
+      cancelledBy: 'owner' | 'staff';
+      cancelReason?: string | null;
+      /** The cancel instant — the route's clock, never Postgres's. */
+      now: Date;
+    },
   ): Promise<void> {
+    const nowIso = args.now.toISOString();
     await tx
       .update(bookings)
       .set({
         status: 'cancelled',
-        cancelledAt: sql`now()`,
-        cancelForfeited: sql`COALESCE(now() > ${bookings.cancelDeadlineAt}, false)`,
+        cancelledAt: nowIso,
+        cancelForfeited: sql`COALESCE(${nowIso}::timestamptz > ${bookings.cancelDeadlineAt}, false)`,
         cancelledBy: args.cancelledBy,
         cancelReason: args.cancelReason ?? null,
       })
