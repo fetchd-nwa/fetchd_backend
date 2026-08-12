@@ -108,11 +108,40 @@ export interface ContractApp {
   authenticate: preHandlerHookHandler;
 }
 
-export function makeContractApp(principal: Principal): ContractApp {
+/**
+ * Collect every log line a route emits, so a test can assert on logging that is
+ * itself the product behavior — an operator-facing alarm no HTTP response
+ * carries. `lines` are the parsed pino records (`level` 60 = fatal, 50 = error,
+ * 40 = warn).
+ */
+export interface LogCapture {
+  lines: Array<Record<string, unknown>>;
+  stream: { write(msg: string): void };
+}
+
+export function makeLogCapture(): LogCapture {
+  const lines: Array<Record<string, unknown>> = [];
+  return {
+    lines,
+    stream: {
+      write(msg: string): void {
+        // pino writes one NDJSON record per call; a non-JSON line would be a
+        // transport misconfiguration and should fail the test loudly.
+        lines.push(JSON.parse(msg) as Record<string, unknown>);
+      },
+    },
+  };
+}
+
+export function makeContractApp(principal: Principal, capture?: LogCapture): ContractApp {
   // Logger on so unhandled errors surface on stderr — the default `Fastify()`
   // silently swallows them and the test only sees a 500. Disable noisy
-  // request-log lines; we want errors only.
-  const app = Fastify({ logger: { level: 'error' } });
+  // request-log lines; we want errors only. A `capture` swaps the destination
+  // and drops the level floor so a test can assert on the records themselves.
+  const app =
+    capture === undefined
+      ? Fastify({ logger: { level: 'error' } })
+      : Fastify({ logger: { level: 'trace', stream: capture.stream } });
   registerAuth(app);
   const authenticate: preHandlerHookHandler = async (request) => {
     request.principal = principal;

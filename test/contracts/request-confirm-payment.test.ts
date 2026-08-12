@@ -473,6 +473,47 @@ test(
 );
 
 test(
+  'POST /requests/:id/confirm-payment pay-now — a RECORDED 3DS failure says authentication_required',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Driven by the error live Stripe ACTUALLY threw off-session for a 3DS card
+    // (`test/fixtures/stripe-thrown-confirm.json`). Its attached intent rests at
+    // `requires_payment_method`, identical to a plain decline, so deriving the
+    // blocker from the status alone told a B&T owner whose card merely needed
+    // verification to go find a different card. The recorded decline runs
+    // alongside so the fix cannot invert the bug it fixes.
+    for (const [scenario, expected] of [
+      ['authentication-required', 'authentication_required'],
+      ['saved-card-declined', 'declined'],
+    ] as const) {
+      await cleanup();
+      const requestId = await seedApprovedAwaitingPaymentBT();
+      const { app, stripe } = buildApp();
+      stripe.setNextIntentThrowsRecorded(scenario);
+      const before = await grantFootprint();
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/requests/${requestId}/confirm-payment`,
+        headers: { 'idempotency-key': `cp-bt-rec-${scenario}-${randomUUID()}` },
+        payload: CONFIRM_PAYLOAD,
+      });
+
+      assert.equal(res.statusCode, 402, `${scenario}: ${res.body}`);
+      const body = res.json() as { error: { code: string; details?: { charge_blocker: string } } };
+      assert.equal(body.error.code, 'payment_failed');
+      assert.equal(body.error.details?.charge_blocker, expected);
+      // Nothing created, request still recoverable, intent dead — unchanged by
+      // which sentence the owner reads.
+      assert.deepEqual(footprintSince(before, await grantFootprint()), NOTHING_CREATED);
+      assert.equal(await statusOf(requestId), 'approved-awaiting-payment');
+      assert.equal(cancelledIntents(stripe).length, 1, `${scenario}: the failed intent is cancelled`);
+    }
+    await cleanup();
+  },
+);
+
+test(
   'POST /requests/:id/confirm-payment pay-now — a Stripe TRANSPORT error is not a decline',
   SKIP_WHEN_NO_DB,
   async () => {

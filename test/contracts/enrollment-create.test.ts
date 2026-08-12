@@ -1132,6 +1132,147 @@ test(
 );
 
 test(
+  'POST /enrollments — a RECORDED 3DS failure refuses with authentication_required, not declined',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Driven by the error live Stripe ACTUALLY threw for a 3DS card off-session
+    // (`test/fixtures/stripe-thrown-confirm.json`), not a hand-built one. Its
+    // attached intent rests at `requires_payment_method` — the same status a
+    // plain decline rests at — so before 2026-08-11 this route told an owner
+    // whose card needed verification to try a different card. The recorded
+    // decline is asserted alongside it so the fix cannot invert the bug.
+    for (const [scenario, expected] of [
+      ['authentication-required', 'authentication_required'],
+      ['saved-card-declined', 'declined'],
+    ] as const) {
+      const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+      const { app, stripe } = enrollApp();
+      stripe.setNextIntentThrowsRecorded(scenario);
+
+      const res = await postEnrollment({
+        app,
+        idempotencyKey: `enr-rec-${scenario}-${randomUUID()}`,
+        payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+      });
+
+      assert.equal(res.statusCode, 402, `${scenario}: ${res.body}`);
+      const body = res.json() as { error: { code: string; details: { charge_blocker: string } } };
+      assert.equal(body.error.code, 'payment_failed');
+      assert.equal(body.error.details.charge_blocker, expected);
+      // The unwind is unchanged by which sentence the owner reads.
+      assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 1);
+      assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 0);
+      const bookingRows = await db
+        .select({ id: bookingsTable.id })
+        .from(bookingsTable)
+        .where(eq(bookingsTable.cohortId, cohort.id));
+      assert.equal(bookingRows.length, 0, `${scenario}: no dog enrolled`);
+      const chargeRows = await db
+        .select({ id: chargesTable.id })
+        .from(chargesTable)
+        .where(eq(chargesTable.cohortId, cohort.id));
+      assert.equal(chargeRows.length, 0, `${scenario}: no charge row`);
+    }
+  },
+);
+
+test(
+  'POST /enrollments — one dog declined + one dog PROCESSING reports processing, not declined',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The double-charge path. A multi-dog enroll charges one intent per dog and
+    // can report only ONE blocker; picking it by position (first sorted dog id)
+    // rather than by hazard is how the `processing` shield gets thrown away.
+    //
+    // Concretely: dog1 declines, dog2 comes back `processing`. Report
+    // `declined` and mobile renders "try a different card" → the owner picks a
+    // different card → the card is part of mobile's idempotency-key signature →
+    // a FRESH key → dog2 is charged again, while the first `processing` intent
+    // (the one kind our unwind cannot cancel) settles anyway. Two charges.
+    //
+    // dog1Id sorts before dog2Id, so the queue below puts the decline FIRST —
+    // exactly the order in which first-match aggregation reports the wrong one.
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    stripe.queueIntentOutcomes([
+      { kind: 'recorded', scenario: 'saved-card-declined' },
+      { kind: 'status', status: 'processing' },
+    ]);
+
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-mixed-${randomUUID()}`,
+      payload: {
+        cohort_id: cohort.id,
+        dog_ids: [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id],
+        pay_later: false,
+      },
+    });
+
+    assert.equal(res.statusCode, 402, res.body);
+    const body = res.json() as { error: { code: string; details: { charge_blocker: string } } };
+    assert.equal(body.error.code, 'payment_failed');
+    assert.equal(
+      body.error.details.charge_blocker,
+      'processing',
+      'the in-flight dog outranks the declined one — "try a different card" here is a double charge',
+    );
+
+    // Both dogs were charged, both intents unwound, nothing enrolled.
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+      2,
+      'one intent per dog',
+    );
+    assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 2);
+    assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 0);
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, 0, 'no dog enrolled');
+    const chargeRows = await db
+      .select({ id: chargesTable.id })
+      .from(chargesTable)
+      .where(eq(chargesTable.cohortId, cohort.id));
+    assert.equal(chargeRows.length, 0, 'no charge row');
+  },
+);
+
+test(
+  'POST /enrollments — a mixed decline set with NO processing dog still reports the first dog',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The tie half of the hazard rule: `declined` and `authentication_required`
+    // rank equal (both send the owner to the card picker), so the earliest dog
+    // in the stable sorted order keeps the slot and the response is unchanged
+    // from what it always was. Pins that the ranking did not quietly become a
+    // preference between the two copy arms.
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    stripe.queueIntentOutcomes([
+      { kind: 'recorded', scenario: 'authentication-required' },
+      { kind: 'recorded', scenario: 'saved-card-declined' },
+    ]);
+
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-mixed-tie-${randomUUID()}`,
+      payload: {
+        cohort_id: cohort.id,
+        dog_ids: [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id],
+        pay_later: false,
+      },
+    });
+
+    assert.equal(res.statusCode, 402, res.body);
+    const body = res.json() as { error: { details: { charge_blocker: string } } };
+    assert.equal(body.error.details.charge_blocker, 'authentication_required', 'first dog wins ties');
+    assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 2);
+  },
+);
+
+test(
   'POST /enrollments — a Stripe TRANSPORT error is not relabelled a decline',
   SKIP_WHEN_NO_DB,
   async () => {

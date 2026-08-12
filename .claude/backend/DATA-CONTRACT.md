@@ -3263,3 +3263,91 @@ No DDL, no migration; the pushes reuse existing `notification_type` members.
   session, while a `processing` intent settles — nets two charges and two
   grants, both visible on the ledger and both refundable through the Stripe
   dashboard.
+
+## K.1 The charge blocker was lost at the seam (2026-08-11)
+
+Amendment to §K, from `designs/charge-blocker-lost-at-the-seam.md`. **No wire
+delta, no version bump, no DDL, no client work** — `wire.ts` stays at 1.9.0.
+The union member the backend should have been emitting has existed since 1.8.0;
+the backend was emitting the wrong one.
+
+- **What the probe found.** `npm run probe:stripe` (live Stripe, test mode,
+  the production call shape) showed that an off-session 3DS card
+  (`4000002500003155`) does not RETURN `requires_action` as §K's design assumed.
+  It **throws** `StripeCardError` with `code=authentication_required`, and the
+  PaymentIntent attached to that error has already been reset to
+  **`requires_payment_method`** — the same status a plain decline
+  (`4000000000000341`, `code=card_declined`) rests at. `requires_payment_method`
+  is Stripe's post-failure resting state, not a diagnosis.
+- **The defect.** §K's seam converts the thrown fork into the returning fork's
+  result and, in doing so, dropped `err.code` — the only field that
+  distinguishes the two failures. `charge_blocker` was then derived from status
+  alone, so **every owner whose card needed authentication was told it was
+  declined and to try a different card**, on all five confirm sites that emit a
+  blocker. (Six sites call `createAndConfirmPaymentIntent`; the sixth,
+  `src/workers/invoiceAutoCharge.ts`, emits no blocker at all — see below.) The
+  `authentication_required` arm — the reason 1.8.0 was bumped — was unreachable
+  from real Stripe. (The 2026-08-04 device QA that "passed" that arm ran in mock
+  mode, where the client fabricates the outcome; it is reclassified as
+  mock-only.)
+- **The fix, in one sentence:** `StripePaymentIntentResult` gained
+  `blocker?` / `failureCode?`, populated by the seam from the thrown error's
+  code; **the five blocker-emitting confirm sites** now derive through one
+  exported helper, `chargeBlockerForConfirm`, and
+  `stripeIntentStatusToChargeBlocker` is module-private. Un-exporting alone
+  would NOT stop the drift — it blocks the import, not the derivation — so the
+  helper takes the whole `StripePaymentIntentResult` rather than a `Pick` of
+  optional members, which makes a hand-built `{ status }` a compile error
+  (`TS2345`, verified). **The sixth site, `src/workers/invoiceAutoCharge.ts`,
+  is deliberately NOT fixed**: it derives no blocker and its `payment-failed`
+  push copy stays blocker-agnostic. That is the one off-session channel where
+  an authentication failure still produces generic copy — parked pending
+  Allison's words for the differentiated push, not resolved.
+- **The precedence rule.** When code and status disagree, **the code wins** —
+  it is attempt-scoped, which is the question `charge_blocker` asks, while the
+  status is intent-scoped and reads identically for two different events.
+  Choosing between `declined` and `authentication_required` selects COPY only:
+  `charge_status`, the charges row, the 1.7.1 cancel rule, refunds,
+  idempotency and every obligation outcome still derive from status alone, and
+  **no DB value changes under this fix**.
+- **The one carve-out: `processing`.** A status that maps to `'processing'`
+  (status `processing`, or the anomalous `requires_capture`) is **never**
+  overridden by a code; the contradiction is logged instead. `processing` copy
+  says "don't retry"; `declined` copy says "try a different card", and that
+  against in-flight money is the reachable double charge. A card error carrying
+  a `processing` intent is self-contradictory evidence, and on a money path the
+  money-safe reading wins.
+- **Only OBSERVED codes are mapped** — `authentication_required` and
+  `card_declined`. Everything else falls back to the status derivation and
+  emits `log.warn`. `insufficient_funds` is not a top-level code (it arrives as
+  `card_declined` + `decline_code`); `expired_card` / `processing_error` /
+  `incorrect_cvc` are documented but unobserved here and would degrade to
+  `declined` anyway, which is the right owner ACTION. Speculative rows in a
+  money-path map are the failure mode this amendment exists to undo; the warn
+  line is how the map grows from evidence.
+- **The fork-equivalence invariant is amended, not abandoned.** §K's
+  "byte-identical behavior on both forks" is now false by design — the thrown
+  fork carries strictly more information. The forks agree on everything that
+  moves or records money, and on the blocker whenever the code maps to what the
+  status implies; the thrown fork may be MORE specific and may never contradict
+  the `processing` reading. Recorded at the three doc sites in `lib/stripe.ts`
+  and on the test stub's lever.
+- **Test provenance, which is the real change.** The seam tests used to
+  CONSTRUCT the Stripe error they then asserted against, so they could only
+  prove we read fields we invented — which is how this defect survived a green
+  suite and a device-QA pass. The chain is now: live Stripe →
+  `npm run probe:stripe -- --record` → `test/fixtures/stripe-thrown-confirm.json`
+  (committed, `client_secret` scrubbed) → `rebuildRecordedCardError` → the
+  suite. Every probe run re-compares live Stripe to the recording and exits
+  non-zero on drift. **Honest reach:** nothing in `npm run gate` calls Stripe,
+  so the suite proves conformance to the RECORDING; only a human running the
+  probe re-verifies the recording, and only for test mode. Live-mode 3DS
+  behavior is UNVERIFIED and assumed symmetric.
+- **Deliberately NOT done:** differentiating the auto-charge worker's
+  `payment-failed` push copy by blocker (the worker derives no blocker; that
+  copy is Allison's to write); persisting `failureCode` or `decline_code`
+  (DDL); reading `decline_code` at all (below the `ChargeBlocker` vocabulary);
+  client-side 3DS completion (the blocker still describes a cancelled intent).
+  Residual: an idempotency replay recorded before this fix still returns its
+  stored body with the old wrong `declined` — it decays with the replay window
+  and is not worth migrating stored response bodies for.

@@ -28,8 +28,8 @@ import type { PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
+  chargeBlockerForConfirm,
   defaultStripeClient,
-  stripeIntentStatusToChargeBlocker,
   type StripeClient,
 } from '../lib/stripe.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
@@ -265,6 +265,18 @@ export function registerMembershipsRoute(
           // best-effort — an uncancellable PI is caught by Stripe-side
           // idempotency on the client's retry with the same key.
         }
+        const blocker = chargeBlockerForConfirm(intent, request.log);
+        if (blocker === undefined) {
+          // Unreachable: the guard above establishes a non-succeeded status,
+          // and `succeeded` is the ONLY input for which the helper returns
+          // undefined. TypeScript narrows `intent.status` but not `intent`, so
+          // the impossible arm is asserted rather than defaulted — a
+          // `?? 'declined'` here would silently re-bury the thrown error's
+          // code, which is precisely the defect being fixed.
+          throw new Error(
+            `unreachable: non-succeeded PaymentIntent ${intent.id} (${intent.status}) derived no charge blocker`,
+          );
+        }
         throw new ApiError(
           'payment_failed',
           'card could not be charged synchronously (declined or requires authentication) — memberships need a card that charges without extra steps; try a different card',
@@ -275,9 +287,8 @@ export function registerMembershipsRoute(
             // arm used to throw `invalid_payload` (422), which no client could
             // recognize as a money outcome — a membership decline rendered
             // mobile's generic "Couldn't complete the purchase" instead of the
-            // one true sentence. Derived from the RAW status, which is only in
-            // hand here.
-            charge_blocker: stripeIntentStatusToChargeBlocker(intent.status, request.log),
+            // one true sentence.
+            charge_blocker: blocker,
           },
         );
       }

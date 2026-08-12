@@ -18,8 +18,8 @@ import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
+  chargeBlockerForConfirm,
   defaultStripeClient,
-  stripeIntentStatusToChargeBlocker,
   type StripeClient,
 } from '../lib/stripe.js';
 import { groupRequestDogs } from '../lib/requestWire.js';
@@ -202,6 +202,18 @@ export function registerRequestConfirmPaymentRoute(
               'B&T confirm-payment: could not cancel unsettled PaymentIntent (best-effort)',
             );
           }
+          const blocker = chargeBlockerForConfirm(stripeResult, request.log);
+          if (blocker === undefined) {
+            // Unreachable: the guard above establishes a non-succeeded status,
+            // and `succeeded` is the ONLY input for which the helper returns
+            // undefined. TypeScript narrows `stripeResult.status` but not
+            // `stripeResult`, so the impossible arm is asserted rather than
+            // defaulted — a `?? 'declined'` here would silently re-bury the
+            // thrown error's code, which is precisely the defect being fixed.
+            throw new Error(
+              `unreachable: non-succeeded PaymentIntent ${stripeResult.id} (${stripeResult.status}) derived no charge blocker`,
+            );
+          }
           throw new ApiError(
             'payment_failed',
             'the card charge did not complete — your booking was not created; ' +
@@ -212,7 +224,7 @@ export function registerRequestConfirmPaymentRoute(
               // the two settle-site 201s, so a client renders the one specific
               // sentence — needs verification / declined / still processing —
               // from either channel.
-              charge_blocker: stripeIntentStatusToChargeBlocker(stripeResult.status, request.log),
+              charge_blocker: blocker,
             },
           );
         }

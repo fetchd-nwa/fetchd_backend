@@ -242,7 +242,12 @@ test(
       await cleanup();
       const { app, stripe } = creditsApp();
       if (fork === 'returned') stripe.setNextIntentStatus('requires_action');
-      else stripe.setNextIntentThrowsCardError('requires_action');
+      // The code is passed explicitly since 2026-08-11. Equivalence between the
+      // forks is now conditional: they agree on the blocker WHEN the thrown
+      // code says what the status implies. Leaving the default `card_declined`
+      // here would pair a `requires_action` status with a decline code and
+      // assert they must agree — demanding the fix be undone.
+      else stripe.setNextIntentThrowsCardError('requires_action', 'authentication_required');
 
       const res = await app.inject({
         method: 'POST',
@@ -386,6 +391,186 @@ test(
     // to hit the catch and leave the failed PI live. It is cancelled now.
     assert.equal(returned!.footprint.cancels, 1, 'the failed intent is cancelled on both forks');
 
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// 1b. RECORDED Stripe — the arm wire 1.8.0 exists for, reached at last
+//
+// Everything above drives the stub with HAND-BUILT card errors. These drive it
+// with the error live Stripe actually threw (`test/fixtures/stripe-thrown-
+// confirm.json`, recorded by `npm run probe:stripe -- --record`).
+//
+// Why that distinction earned its own section: off-session, Stripe reports a
+// 3DS failure as `code=authentication_required` on an intent that has ALREADY
+// been reset to `requires_payment_method`. Deriving the blocker from that
+// status alone yields `declined`, so every owner whose card needed
+// verification was told to go find a different card — on all five routes, for
+// as long as the field has existed. No hand-built error contained that shape,
+// because nobody imagined it; the recording contains it because Stripe sent it.
+//
+// Each site gets the recorded PAIR — authentication-required AND declined —
+// because pinning only the new arm would leave the inverse un-pinned, and
+// relabelling genuine declines as "needs verification" would be worse than the
+// bug being fixed.
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /invoices/:id/pay — a RECORDED 3DS failure says authentication_required, and a RECORDED decline still says declined',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    for (const [scenario, expected] of [
+      ['authentication-required', 'authentication_required'],
+      ['saved-card-declined', 'declined'],
+    ] as const) {
+      await cleanup();
+      const invoiceId = await seedOpenInvoice();
+      const { app, stripe } = invoicesApp();
+      stripe.setNextIntentThrowsRecorded(scenario);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/invoices/${invoiceId}/pay`,
+        headers: { 'idempotency-key': `pfc-inv-rec-${scenario}-${randomUUID()}` },
+        payload: {},
+      });
+
+      assert.equal(res.statusCode, 201, `${scenario}: ${res.body}`);
+      const body = res.json() as Record<string, unknown>;
+      assert.equal(body.charge_blocker, expected, `${scenario}: the owner's sentence`);
+      // Everything that MOVES or RECORDS money is unchanged by which sentence
+      // the owner reads — the amended fork invariant, asserted rather than
+      // assumed.
+      assert.equal(body.charge_status, 'requires_payment');
+      assert.equal(body.invoice_status, 'open');
+      const [inv] = await db
+        .select({ status: invoices.status })
+        .from(invoices)
+        .where(eq(invoices.id, invoiceId));
+      assert.equal(inv?.status, 'open', 'the obligation stays open on both codes');
+      assert.equal(stripeFootprint(stripe).cancels, 1, 'the 1.7.1 cancel rule still fires');
+      assert.deepEqual(await chargeRowsForOwner(), [
+        { status: 'requires_payment', purpose: 'board-train' },
+      ]);
+    }
+    await cleanup();
+  },
+);
+
+test(
+  'POST /credit-packages/:key/purchase — a RECORDED 3DS failure says authentication_required, grants nothing',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    for (const [scenario, expected] of [
+      ['authentication-required', 'authentication_required'],
+      ['saved-card-declined', 'declined'],
+    ] as const) {
+      await cleanup();
+      const { app, stripe } = creditsApp();
+      stripe.setNextIntentThrowsRecorded(scenario);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+        headers: { 'idempotency-key': `pfc-cp-rec-${scenario}-${randomUUID()}` },
+        payload: {
+          dog_id: FIXTURE_IDS.dog1Id,
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          location: 'fayetteville',
+        },
+      });
+
+      assert.equal(res.statusCode, 201, `${scenario}: ${res.body}`);
+      const body = res.json() as Record<string, unknown>;
+      assert.equal(body.charge_blocker, expected);
+      assert.equal(body.charge_status, 'requires_payment');
+      assert.equal(body.credits_granted, 0, 'no grant on either code');
+      const ledger = await db
+        .select({ id: creditLedger.id })
+        .from(creditLedger)
+        .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+      assert.equal(ledger.length, 0, 'run what would go red: nothing was granted');
+      assert.equal(stripeFootprint(stripe).cancels, 1);
+    }
+    await cleanup();
+  },
+);
+
+test(
+  'POST /memberships — a RECORDED 3DS failure 402s with authentication_required and creates nothing',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    for (const [scenario, expected] of [
+      ['authentication-required', 'authentication_required'],
+      ['saved-card-declined', 'declined'],
+    ] as const) {
+      await cleanup();
+      const { app, stripe } = membershipsApp();
+      stripe.setNextIntentThrowsRecorded(scenario);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/memberships',
+        headers: { 'idempotency-key': `pfc-mem-rec-${scenario}-${randomUUID()}` },
+        payload: {
+          dog_id: FIXTURE_IDS.dog1Id,
+          package_key: FIXTURE_IDS.creditPackageSchool5Key,
+          location: 'fayetteville',
+          term_months: 6,
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        },
+      });
+
+      assert.equal(res.statusCode, 402, `${scenario}: ${res.body}`);
+      const body = res.json() as { error: { code: string; details: { charge_blocker: string } } };
+      assert.equal(body.error.code, 'payment_failed');
+      assert.equal(body.error.details.charge_blocker, expected);
+      assert.equal(stripeFootprint(stripe).cancels, 1, 'the PI is cancelled before the refusal');
+      // Run what would go red if the refusal leaked past the guard.
+      const rows = await db
+        .select({ id: memberships.id })
+        .from(memberships)
+        .where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
+      assert.equal(rows.length, 0, 'no half-created membership');
+      assert.equal((await chargeRowsForOwner()).length, 0, 'the refusal beats withMutation');
+    }
+    await cleanup();
+  },
+);
+
+test(
+  'invoice auto-charge worker — a RECORDED 3DS failure takes the same arm as a decline',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The worker derives no blocker (its `payment-failed` push copy is
+    // deliberately blocker-agnostic), so this is a PIN, not a new behavior: the
+    // fix must not have disturbed the arm the worker travels. Cancel still
+    // fires, the attempt still counts, the schedule is unchanged.
+    for (const scenario of ['authentication-required', 'saved-card-declined'] as const) {
+      await cleanup();
+      const invoiceId = await seedOpenInvoice({
+        dueAt: '2026-01-01T00:00:00Z',
+        nextAttemptAt: '2026-01-01T00:00:00Z',
+      });
+      const stripe = makeStripeStub();
+      stripe.setNextIntentThrowsRecorded(scenario);
+
+      const tick = await runInvoiceAutoChargeOnce({
+        stripe,
+        limit: 1,
+        now: new Date('2026-02-01T12:00:00Z'),
+      });
+      const [inv] = await db
+        .select({ status: invoices.status, attempts: invoices.autoChargeAttempts })
+        .from(invoices)
+        .where(eq(invoices.id, invoiceId));
+
+      assert.equal(tick.results[0]!.outcome, 'failed-retry-scheduled', scenario);
+      assert.equal(inv?.attempts, 1, `${scenario}: the attempt still counts toward the park cap`);
+      assert.equal(inv?.status, 'open');
+      assert.equal(stripeFootprint(stripe).cancels, 1, `${scenario}: the failed intent is cancelled`);
+    }
     await cleanup();
   },
 );

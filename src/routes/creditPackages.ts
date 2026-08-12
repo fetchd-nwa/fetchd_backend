@@ -18,8 +18,8 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
+  chargeBlockerForConfirm,
   defaultStripeClient,
-  stripeIntentStatusToChargeBlocker,
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
@@ -194,15 +194,15 @@ export function registerCreditPackagesRoute(
       );
 
       const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
-      // Why it stopped, in domain vocabulary — derived from the RAW Stripe
-      // status, which is only in hand HERE: the line above collapses five of
-      // them into `requires_payment`, and the copy the owner reads depends on
-      // exactly that distinction (wire 1.8.0). Pre-tx so the anomalous-status
-      // warnings inside fire once per real confirm, not once per replay.
-      const chargeBlocker =
-        intent.status === 'succeeded'
-          ? undefined
-          : stripeIntentStatusToChargeBlocker(intent.status, request.log);
+      // Why it stopped, in domain vocabulary — the distinction the line above
+      // destroys by collapsing five Stripe statuses into `requires_payment`,
+      // and the one the copy the owner reads depends on (wire 1.8.0). Derived
+      // in ONE place for all six confirm sites: a thrown card error's `code`
+      // outranks the intent's resting status (which reads the same for a
+      // decline and an authentication failure), except where the status says
+      // money may be in motion. Pre-tx so the warnings inside fire once per
+      // real confirm, not once per replay.
+      const chargeBlocker = chargeBlockerForConfirm(intent, request.log);
 
       // Non-succeeded confirm: cancel the intent so it can't later auto-succeed
       // and double-charge against the next attempt's fresh one. Same rule as

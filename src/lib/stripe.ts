@@ -77,6 +77,32 @@ export interface StripePaymentIntentResult {
   status: StripePaymentIntentStatus;
   clientSecret: string | null;
   amountCents: number;
+  /**
+   * Domain blocker derived from the THROWN card error's `err.code`, mapped at
+   * the seam ({@link THROWN_CARD_CODE_TO_BLOCKER}). Absent on the returning
+   * fork — which has no code to read — and absent for codes the map doesn't
+   * cover. Strictly MORE specific than {@link status}: the probe of 2026-08-11
+   * showed a decline and an authentication failure resting at the identical
+   * status (`requires_payment_method`), with only the code telling them apart.
+   * Never wire-emitted raw; {@link chargeBlockerForConfirm} is the one reader.
+   */
+  blocker?: ChargeBlocker;
+  /**
+   * The raw `err.code` string off a thrown card error — informational only,
+   * for the unmapped-code log line and support forensics. Never persisted,
+   * never on the wire (raw Stripe vocabulary would couple two clients to it).
+   */
+  failureCode?: string;
+  /**
+   * Set ONLY when Stripe returned a `payment_intent.status` this codebase does
+   * not know. {@link status} is then read as `processing` — the money-safe
+   * reading, since an unrecognized status does not tell us the money stopped,
+   * and `processing` is the one blocker that refuses a retry. This field
+   * carries the raw value so {@link chargeBlockerForConfirm}, which has a
+   * logger, can say what arrived and what it was read as. Informational only:
+   * never persisted, never on the wire.
+   */
+  unknownStatus?: string;
 }
 
 /**
@@ -147,8 +173,24 @@ export type UnsettledPaymentIntentStatus = Exclude<StripePaymentIntentStatus, 's
  *
  * Exhaustive `switch` on the RAW status, same discipline as its neighbour: a
  * future Stripe status surfaces as a TS error rather than a silent fallback.
+ *
+ * **MODULE-PRIVATE since 2026-08-11, deliberately.** A status alone cannot say
+ * why a confirm stopped — Stripe parks a PaymentIntent at
+ * `requires_payment_method` after ANY terminally failed attempt, so a decline
+ * and an authentication failure read identically here (probe, 2026-08-11:
+ * cards `4000000000000341` and `4000002500003155` both rested there). Deriving
+ * the owner-facing blocker from this function alone is exactly the defect
+ * `designs/charge-blocker-lost-at-the-seam.md` fixes, so the export was
+ * removed and every call site goes through {@link chargeBlockerForConfirm}.
+ *
+ * Un-exporting alone does NOT prevent the drift — it blocks the import, not
+ * the derivation, and a caller could still hand `chargeBlockerForConfirm` a
+ * hand-built `{ status }`. That is why its parameter is the WHOLE
+ * {@link StripePaymentIntentResult} rather than a `Pick`: the only way to
+ * obtain one is from the seam, which always stamps the code when there was
+ * one. The compiler carries the invariant instead of a comment asking for it.
  */
-export function stripeIntentStatusToChargeBlocker(
+function stripeIntentStatusToChargeBlocker(
   status: UnsettledPaymentIntentStatus,
   log: FastifyBaseLogger,
 ): ChargeBlocker {
@@ -179,6 +221,85 @@ export function stripeIntentStatusToChargeBlocker(
       );
       return 'processing';
   }
+}
+
+/**
+ * THE one derivation point for `charge_blocker` — every confirm site in this
+ * system calls this and nothing else (`designs/charge-blocker-lost-at-the-seam.md`).
+ *
+ * Two sources of truth arrive here and they can disagree:
+ *
+ *   - `intent.blocker` — mapped at the seam from the THROWN card error's
+ *     `err.code`. Attempt-scoped: it names what happened on THIS confirm.
+ *   - `intent.status` — where the PaymentIntent now rests. Intent-scoped, and
+ *     NOT a diagnosis: Stripe parks a PI at `requires_payment_method` after any
+ *     terminally failed attempt, so it reads the same for a decline and for an
+ *     authentication failure.
+ *
+ * **The precedence rule: the code wins — except when the status says money may
+ * be in motion.** `charge_blocker` answers an attempt-scoped question
+ * (`wire.ts` `ChargeBlocker`), the code is the only field that answers it, and
+ * choosing between `declined` and `authentication_required` selects COPY, not
+ * behavior — `charge_status`, the charges row, the 1.7.1 cancel rule, refunds
+ * and idempotency all still derive from `status` alone.
+ *
+ * **The `processing` carve-out** is the exception, and the only arm where the
+ * wrong pick costs real money: `processing` copy says "don't retry", and
+ * telling an owner "try a different card" while a charge is in flight is the
+ * reachable double charge. A thrown card error carrying a `processing` intent
+ * is self-contradictory evidence (a card error means the attempt failed;
+ * `processing` means it may not have) — unobserved, and when evidence
+ * contradicts itself on a money path we take the money-safe reading. So a
+ * status mapping to `processing` is never overridden by a code; the
+ * contradiction is logged instead.
+ *
+ * Returns `undefined` for exactly one input — a confirm that reached
+ * `succeeded`, which has nothing blocking it.
+ */
+export function chargeBlockerForConfirm(
+  // The whole result, deliberately — NOT a `Pick`. With a Pick of optional
+  // members, `chargeBlockerForConfirm({ status: 'requires_payment_method' })`
+  // type-checks, which is the status-only derivation this design exists to
+  // make impossible. Requiring the full result means the argument can only
+  // have come from the seam.
+  intent: StripePaymentIntentResult,
+  log: FastifyBaseLogger,
+): ChargeBlocker | undefined {
+  // Reported here rather than at the seam, which has no logger. Loud on
+  // purpose: a status we don't model on a money path means the taxonomy has
+  // drifted from Stripe's lifecycle, and every reading below it is a guess.
+  if (intent.unknownStatus !== undefined) {
+    log.error(
+      { stripeIntentStatus: intent.unknownStatus, paymentIntentId: intent.id },
+      'off-session confirm returned an UNKNOWN PaymentIntent status — read as processing (money may be in flight, retry refused); the status union needs updating',
+    );
+  }
+  if (intent.status === 'succeeded') return undefined;
+  const fromStatus = stripeIntentStatusToChargeBlocker(intent.status, log);
+
+  if (fromStatus === 'processing') {
+    if (intent.blocker !== undefined && intent.blocker !== 'processing') {
+      log.warn(
+        { stripeIntentStatus: intent.status, code: intent.failureCode },
+        'thrown card error code contradicts an in-flight status — status wins (money-safety carve-out)',
+      );
+    }
+    return fromStatus;
+  }
+
+  if (intent.blocker !== undefined) return intent.blocker;
+
+  if (intent.failureCode !== undefined) {
+    // The map is grown from THIS log line plus probe runs, never from Stripe's
+    // documentation alone — a speculative row in a money-path map is how a
+    // wrong observation gets invented, which is the class of defect this
+    // derivation exists to undo.
+    log.warn(
+      { code: intent.failureCode, stripeIntentStatus: intent.status },
+      'thrown card error carried an unmapped code — blocker derived from status',
+    );
+  }
+  return fromStatus;
 }
 
 export type StripeRefundStatus =
@@ -299,6 +420,16 @@ export interface StripeClient {
    * each of the six confirm sites. Implementations of this interface — the SDK
    * one below AND the contract-test stub — owe that same guarantee, or a route
    * test proves nothing about the fork it didn't simulate.
+   *
+   * **Erasing the fork is not the same as erasing its evidence (2026-08-11).**
+   * The thrown fork carries strictly MORE information than the returning one —
+   * `err.code` names the failure where the attached status cannot — so the
+   * result it produces may carry `blocker` / `failureCode`, and an
+   * implementation that drops them re-creates the defect this seam was
+   * repaired for. What implementations owe each other is the amended
+   * invariant on {@link normalizeThrownConfirmError}: identical money
+   * behavior, a blocker that may be more specific, and never a contradiction
+   * of the `processing` reading.
    */
   createAndConfirmPaymentIntent(
     args: {
@@ -397,6 +528,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Thrown-card-error `err.code` → domain blocker. **Only rows OBSERVED against
+ * live Stripe are here** (`npm run probe:stripe`, test mode, 2026-08-11,
+ * recorded in `test/fixtures/stripe-thrown-confirm.json`):
+ *
+ *   | `err.code`                 | blocker                   | card              |
+ *   | -------------------------- | ------------------------- | ----------------- |
+ *   | `authentication_required`  | `authentication_required` | 4000002500003155  |
+ *   | `card_declined`            | `declined`                | 4000000000000341  |
+ *
+ * Everything else falls through to status-derived and logs a warning
+ * ({@link chargeBlockerForConfirm}) — deliberately, not as an oversight:
+ *
+ *   - `insufficient_funds` is not a top-level code at all. Stripe reports it as
+ *     `code='card_declined'` + `decline_code='insufficient_funds'`, so the
+ *     `card_declined` row already covers it; `decline_code` granularity is
+ *     below the `ChargeBlocker` vocabulary and stays unread.
+ *   - `expired_card`, `processing_error`, `incorrect_cvc`, … all degrade to
+ *     `declined` via `requires_payment_method`, which is the right owner
+ *     ACTION ("try a different card") even where the tone is imperfect. Mapping
+ *     them now would encode an unobserved assumption into a money path — the
+ *     exact failure mode this table exists to undo. The warn line is how their
+ *     real frequency and shape become known before anything maps them.
+ */
+const THROWN_CARD_CODE_TO_BLOCKER: Readonly<Record<string, ChargeBlocker>> = {
+  authentication_required: 'authentication_required',
+  card_declined: 'declined',
+};
+
+/**
  * THE thrown-fork normalizer (wire 1.9.0) — the one place in this system that
  * decides whether an error from an off-session confirm is a **payment outcome**
  * or a **failure to find out**.
@@ -411,6 +571,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * charges audit row is written, the 1.7.1 cancel rule fires, and the
  * `charge_blocker` taxonomy covers both channels because it is one code path,
  * not two mappings that happen to agree.
+ *
+ * **Amended 2026-08-11 — the two forks are no longer byte-identical, and that
+ * is the fix, not a regression.** The 1.9.0 version of this doc claimed they
+ * were; erasing the fork also erased `err.code`, the only field naming WHICH
+ * failure happened. An off-session 3DS failure throws
+ * `code=authentication_required` while its attached intent already rests at
+ * `requires_payment_method` (probe, 2026-08-11), so the status-only derivation
+ * above it rendered "declined — try a different card" for a card that would
+ * work with verification. The result now carries `blocker` + `failureCode`, on
+ * the thrown fork only. The amended equivalence invariant:
+ *
+ *   > The two forks agree on everything that MOVES or RECORDS money —
+ *   > obligation semantics (201-open vs 402-refuse), `charge_status`, the
+ *   > charges row, the 1.7.1 cancel rule, idempotency — and on the blocker
+ *   > whenever the thrown code maps to the same value the status implies. The
+ *   > thrown fork may make the blocker MORE SPECIFIC than the status can; it
+ *   > may never contradict the `processing` reading
+ *   > ({@link chargeBlockerForConfirm}).
  *
  * Either returns a normalized result or throws. The rows, and why each is what
  * it is:
@@ -444,6 +622,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * error body (`err.raw.payment_intent` is the same object); `test/stripeSeam.
  * test.ts` fails if a future SDK moves it.
  */
+/**
+ * The RETURNING fork's normalizer — the sibling of
+ * {@link normalizeThrownConfirmError}, and exported for the same reason: a
+ * money-path trust boundary that only a real test can hold honest.
+ *
+ * This fork used to assert rather than verify (`intent.status as
+ * StripePaymentIntentStatus`), so a status Stripe adds later fell off the end
+ * of both exhaustive switches and produced `undefined` at RUNTIME — the
+ * wire-required `charge_status` omitted, and `charges.status` silently taking
+ * its DDL default. A mis-typed money row that nothing would have flagged.
+ * Stripe has added statuses before (`requires_capture`; `requires_source` →
+ * `requires_payment_method`).
+ *
+ * An unrecognized status is read as `processing`, never `declined`: we do not
+ * know the money stopped, and `processing` is the one blocker that refuses a
+ * retry. Wrongly cautious costs an owner a wait; wrongly confident costs them
+ * a second charge. The raw value rides along in `unknownStatus` because this
+ * function has no logger — {@link chargeBlockerForConfirm} does, and reports it.
+ */
+export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePaymentIntentResult {
+  if (isPaymentIntentStatus(intent.status)) {
+    return {
+      id: intent.id,
+      status: intent.status,
+      clientSecret: intent.client_secret,
+      amountCents: intent.amount,
+    };
+  }
+  return {
+    id: intent.id,
+    status: 'processing',
+    clientSecret: intent.client_secret,
+    amountCents: intent.amount,
+    unknownStatus: String(intent.status),
+  };
+}
+
 export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentResult {
   if (!(err instanceof Stripe.errors.StripeCardError)) throw err;
 
@@ -464,6 +679,25 @@ export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentRe
     );
   }
   const clientSecret: unknown = isRecord(attached) ? attached.client_secret : undefined;
+  // The field the pre-2026-08-11 seam dropped, and the whole reason an owner
+  // whose card needed verification was told it had been declined. `err.code` is
+  // the ONLY field on this error that names WHICH failure happened — the
+  // attached intent's status is the same `requires_payment_method` either way.
+  // Carried as a pre-mapped `blocker` (so nothing downstream re-derives a
+  // second mapping that can drift) plus the raw string for the log line.
+  //
+  // `Object.hasOwn` before the lookup, same discipline as `isPaymentIntentStatus`
+  // above and for the same reason: `err.code` crosses a trust boundary, and a
+  // bare index into an object literal also finds INHERITED keys —
+  // `THROWN_CARD_CODE_TO_BLOCKER['toString']` is a function at runtime while
+  // TypeScript types it `ChargeBlocker | undefined`. Unreachable in practice
+  // (Stripe would have to send `code: 'constructor'`), and one line to make
+  // impossible rather than merely unlikely on a money path.
+  const code = typeof err.code === 'string' && err.code.length > 0 ? err.code : undefined;
+  const blocker =
+    code !== undefined && Object.hasOwn(THROWN_CARD_CODE_TO_BLOCKER, code)
+      ? THROWN_CARD_CODE_TO_BLOCKER[code]
+      : undefined;
   return {
     id,
     status,
@@ -471,6 +705,10 @@ export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentRe
     // Amount is informational on this arm (nothing was captured), so a missing
     // one degrades to 0 rather than costing the owner a real sentence.
     amountCents: typeof amount === 'number' ? amount : 0,
+    // Omitted rather than set to `undefined` — the returning fork emits neither
+    // key, and "absent both ways" is one less shape for a consumer to model.
+    ...(blocker !== undefined ? { blocker } : {}),
+    ...(code !== undefined ? { failureCode: code } : {}),
   };
 }
 
@@ -555,12 +793,22 @@ export const defaultStripeClient: StripeClient = {
       // able to reach a catch whose job is interpreting Stripe.
       return normalizeThrownConfirmError(err);
     }
-    return {
-      id: intent.id,
-      status: intent.status as StripePaymentIntentStatus,
-      clientSecret: intent.client_secret,
-      amountCents: intent.amount,
-    };
+    // The returning fork is a trust boundary too, and it used to be the only
+    // one that wasn't checked: `as StripePaymentIntentStatus` asserted rather
+    // than verified, so a status Stripe adds later would fall off the end of
+    // both exhaustive switches and yield `undefined` at RUNTIME — omitting the
+    // wire-required `charge_status` and letting `charges.status` fall to its
+    // DDL default, a silently mis-typed money row. Stripe has added statuses
+    // before (`requires_capture`; `requires_source` → `requires_payment_method`).
+    //
+    // An unrecognized status is read as `processing`, not `declined`: we do not
+    // know that the money stopped, and the whole taxonomy exists because
+    // "may be in flight" and "try another card" have opposite next actions.
+    // `processing` is the arm that refuses a retry, so it is the safe default
+    // — a wrongly-cautious owner is told to wait; a wrongly-confident one pays
+    // twice. Same reasoning as the `processing` carve-out in
+    // `chargeBlockerForConfirm`.
+    return normalizeReturnedConfirm(intent);
   },
 
   async detachPaymentMethod(paymentMethodId) {

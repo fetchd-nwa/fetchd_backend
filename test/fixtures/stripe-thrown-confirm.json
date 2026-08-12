@@ -1,0 +1,321 @@
+{
+  "recordedAt": "2026-08-11T23:06:58.822Z",
+  "stripeSdkVersion": "22.1.1",
+  "note": "Machine-recorded by `npm run probe:stripe -- --record` from LIVE Stripe test mode. Never hand-edit: the point of this file is that no human chose its contents. client_secret is scrubbed at every depth. Re-record with the same command.",
+  "scenarios": {
+    "saved-card-declined": {
+      "paymentMethodToken": "pm_card_chargeCustomerFail",
+      "card": "visa ••0341 (US)",
+      "derivedBlocker": "declined",
+      "error": {
+        "type": "card_error",
+        "sdkErrorClass": "StripeCardError",
+        "code": "card_declined",
+        "decline_code": "generic_decline",
+        "message": "Your card was declined.",
+        "statusCode": 402,
+        "payment_intent": {
+          "id": "pi_3U3Ol0LE5OGXyaT11DxYoR88",
+          "object": "payment_intent",
+          "allowed_payment_method_types": null,
+          "amount": 4500,
+          "amount_capturable": 0,
+          "amount_details": {
+            "tip": {}
+          },
+          "amount_received": 0,
+          "application": null,
+          "application_fee_amount": null,
+          "automatic_payment_methods": {
+            "allow_redirects": "always",
+            "enabled": true
+          },
+          "canceled_at": null,
+          "cancellation_reason": null,
+          "capture_method": "automatic_async",
+          "client_secret": "<scrubbed by probe --record>",
+          "confirmation_method": "automatic",
+          "created": 1786489615,
+          "currency": "usd",
+          "customer": "cus_V3VmWtNdhPhzrc",
+          "customer_account": null,
+          "description": null,
+          "excluded_payment_method_types": null,
+          "last_payment_error": {
+            "advice_code": "try_again_later",
+            "charge": "ch_3U3Ol0LE5OGXyaT11L0VmsCc",
+            "code": "card_declined",
+            "decline_code": "generic_decline",
+            "doc_url": "https://stripe.com/docs/error-codes/card-declined",
+            "message": "Your card was declined.",
+            "network_decline_code": "01",
+            "payment_method": {
+              "id": "pm_1U3Ol0LE5OGXyaT1iBfc9wft",
+              "object": "payment_method",
+              "allow_redisplay": "unspecified",
+              "billing_details": {
+                "address": {
+                  "city": null,
+                  "country": null,
+                  "line1": null,
+                  "line2": null,
+                  "postal_code": null,
+                  "state": null
+                },
+                "email": null,
+                "name": null,
+                "phone": null,
+                "tax_id": null
+              },
+              "card": {
+                "brand": "visa",
+                "checks": {
+                  "address_line1_check": null,
+                  "address_postal_code_check": null,
+                  "cvc_check": "pass"
+                },
+                "country": "US",
+                "display_brand": "visa",
+                "exp_month": 8,
+                "exp_year": 2027,
+                "fingerprint": "uXs7jVlFE3ED3P8i",
+                "funding": "credit",
+                "generated_from": null,
+                "last4": "0341",
+                "networks": {
+                  "available": [
+                    "visa"
+                  ],
+                  "preferred": null
+                },
+                "regulated_status": "unregulated",
+                "three_d_secure_usage": {
+                  "supported": true
+                },
+                "wallet": null
+              },
+              "created": 1786489614,
+              "customer": null,
+              "customer_account": null,
+              "livemode": false,
+              "metadata": {},
+              "shared_payment_granted_token": null,
+              "type": "card"
+            },
+            "type": "card_error"
+          },
+          "latest_charge": "ch_3U3Ol0LE5OGXyaT11L0VmsCc",
+          "livemode": false,
+          "managed_payments": {
+            "enabled": false
+          },
+          "metadata": {
+            "purpose": "probe-stripe-thrown-confirm"
+          },
+          "next_action": null,
+          "on_behalf_of": null,
+          "payment_method": null,
+          "payment_method_configuration_details": {
+            "id": "pmc_1TYuQOLE5OGXyaT1BtDHL9ei",
+            "parent": null
+          },
+          "payment_method_options": {
+            "affirm": {},
+            "amazon_pay": {
+              "express_checkout_element_session_id": null
+            },
+            "card": {
+              "installments": null,
+              "mandate_options": null,
+              "network": null,
+              "request_three_d_secure": "automatic"
+            },
+            "cashapp": {},
+            "klarna": {
+              "preferred_locale": null
+            },
+            "link": {
+              "persistent_token": null
+            }
+          },
+          "payment_method_types": [
+            "card",
+            "klarna",
+            "link",
+            "affirm",
+            "cashapp",
+            "amazon_pay"
+          ],
+          "processing": null,
+          "receipt_email": null,
+          "review": null,
+          "setup_future_usage": null,
+          "shared_payment_granted_token": null,
+          "shipping": null,
+          "source": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "requires_payment_method",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      }
+    },
+    "authentication-required": {
+      "paymentMethodToken": "pm_card_authenticationRequired",
+      "card": "visa ••3184 (DE)",
+      "derivedBlocker": "authentication_required",
+      "error": {
+        "type": "card_error",
+        "sdkErrorClass": "StripeCardError",
+        "code": "authentication_required",
+        "decline_code": "authentication_required",
+        "message": "Your card was declined. This transaction requires authentication.",
+        "statusCode": 402,
+        "payment_intent": {
+          "id": "pi_3U3Ol2LE5OGXyaT11DgTD1lw",
+          "object": "payment_intent",
+          "allowed_payment_method_types": null,
+          "amount": 4500,
+          "amount_capturable": 0,
+          "amount_details": {
+            "tip": {}
+          },
+          "amount_received": 0,
+          "application": null,
+          "application_fee_amount": null,
+          "automatic_payment_methods": {
+            "allow_redirects": "always",
+            "enabled": true
+          },
+          "canceled_at": null,
+          "cancellation_reason": null,
+          "capture_method": "automatic_async",
+          "client_secret": "<scrubbed by probe --record>",
+          "confirmation_method": "automatic",
+          "created": 1786489616,
+          "currency": "usd",
+          "customer": "cus_V3VmWtNdhPhzrc",
+          "customer_account": null,
+          "description": null,
+          "excluded_payment_method_types": null,
+          "last_payment_error": {
+            "charge": "ch_3U3Ol2LE5OGXyaT11llr3XI6",
+            "code": "authentication_required",
+            "decline_code": "authentication_required",
+            "doc_url": "https://stripe.com/docs/error-codes/authentication-required",
+            "message": "Your card was declined. This transaction requires authentication.",
+            "payment_method": {
+              "id": "pm_1U3Ol2LE5OGXyaT1flvzJEwd",
+              "object": "payment_method",
+              "allow_redisplay": "unspecified",
+              "billing_details": {
+                "address": {
+                  "city": null,
+                  "country": null,
+                  "line1": null,
+                  "line2": null,
+                  "postal_code": null,
+                  "state": null
+                },
+                "email": null,
+                "name": null,
+                "phone": null,
+                "tax_id": null
+              },
+              "card": {
+                "brand": "visa",
+                "checks": {
+                  "address_line1_check": null,
+                  "address_postal_code_check": null,
+                  "cvc_check": "pass"
+                },
+                "country": "DE",
+                "display_brand": "visa",
+                "exp_month": 8,
+                "exp_year": 2027,
+                "fingerprint": "KImclgGXD40Y1dCm",
+                "funding": "credit",
+                "generated_from": null,
+                "last4": "3184",
+                "networks": {
+                  "available": [
+                    "visa"
+                  ],
+                  "preferred": null
+                },
+                "regulated_status": "unregulated",
+                "three_d_secure_usage": {
+                  "supported": true
+                },
+                "wallet": null
+              },
+              "created": 1786489616,
+              "customer": null,
+              "customer_account": null,
+              "livemode": false,
+              "metadata": {},
+              "shared_payment_granted_token": null,
+              "type": "card"
+            },
+            "type": "card_error"
+          },
+          "latest_charge": "ch_3U3Ol2LE5OGXyaT11llr3XI6",
+          "livemode": false,
+          "managed_payments": {
+            "enabled": false
+          },
+          "metadata": {
+            "purpose": "probe-stripe-thrown-confirm"
+          },
+          "next_action": null,
+          "on_behalf_of": null,
+          "payment_method": null,
+          "payment_method_configuration_details": {
+            "id": "pmc_1TYuQOLE5OGXyaT1BtDHL9ei",
+            "parent": null
+          },
+          "payment_method_options": {
+            "affirm": {},
+            "amazon_pay": {
+              "express_checkout_element_session_id": null
+            },
+            "card": {
+              "installments": null,
+              "mandate_options": null,
+              "network": null,
+              "request_three_d_secure": "automatic"
+            },
+            "cashapp": {},
+            "klarna": {
+              "preferred_locale": null
+            },
+            "link": {
+              "persistent_token": null
+            }
+          },
+          "payment_method_types": [
+            "card",
+            "klarna",
+            "link",
+            "affirm",
+            "cashapp",
+            "amazon_pay"
+          ],
+          "processing": null,
+          "receipt_email": null,
+          "review": null,
+          "setup_future_usage": null,
+          "shared_payment_granted_token": null,
+          "shipping": null,
+          "source": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "requires_payment_method",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      }
+    }
+  }
+}

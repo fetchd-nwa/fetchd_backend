@@ -34,8 +34,8 @@ import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
+  chargeBlockerForConfirm,
   defaultStripeClient,
-  stripeIntentStatusToChargeBlocker,
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
@@ -197,7 +197,7 @@ export function registerEnrollmentsRoute(
         // A pay-now intent that confirmed but did NOT reach 'succeeded'
         // (off-session 3DS / processing) must not enroll — unwind + fail rather
         // than write a non-succeeded charge row and enroll the dog anyway.
-        const unsettled = paidIntents.find((intent) => intent.status !== 'succeeded');
+        const unsettled = mostHazardousUnsettledIntent(paidIntents);
         if (unsettled !== undefined) {
           // Wire 1.9.0: `payment_failed` (402), NOT `payment_required` (422).
           // The codes were conflated and the conflation was VISIBLE: mobile's
@@ -208,18 +208,30 @@ export function registerEnrollmentsRoute(
           // ("no card on file"); a charge that was attempted and did not
           // complete now speaks the same taxonomy as the other two grant sites.
           //
-          // The blocker names the FIRST unsettled dog's raw status. Multi-dog
-          // enrolls charge one intent per dog and unwind as a unit, so there is
-          // one outcome to report, not N.
+          // Multi-dog enrolls charge one intent per dog and unwind as a unit, so
+          // there is one outcome to report, not N — and WHICH one is reported is
+          // chosen by hazard, never by position (`mostHazardousUnsettledIntent`).
+          // The blocker names that dog's confirm outcome: since 2026-08-11 the
+          // thrown card error's code where there is one, the intent's resting
+          // status otherwise.
+          if (unsettled.blocker === undefined) {
+            // Unreachable: `mostHazardousUnsettledIntent` only returns intents
+            // whose `status !== 'succeeded'`, and `succeeded` is the ONLY input
+            // for which `chargeBlockerForConfirm` returns undefined. Asserted
+            // rather than defaulted, matching `memberships.ts` and
+            // `requestConfirmPayment.ts` — a `?? 'declined'` here would silently
+            // re-bury the thrown error's code (and on THIS site could bury a
+            // `processing`), which is precisely the defect being fixed.
+            throw new Error(
+              `unreachable: non-succeeded PaymentIntent ${unsettled.intentId} (dog ${unsettled.dogId}) derived no charge blocker`,
+            );
+          }
           throw new ApiError(
             'payment_failed',
             'the card charge did not complete — no dogs were enrolled',
             {
               kind: 'payment_failed',
-              // `blocker` is set for every non-succeeded intent by construction;
-              // the fallback is the client's own pessimistic rule rather than a
-              // reason to omit the field.
-              charge_blocker: unsettled.blocker ?? 'declined',
+              charge_blocker: unsettled.blocker,
             },
           );
         }
@@ -718,10 +730,72 @@ interface PaidEnrollmentIntent {
    * `requires_payment`, but "declined", "needs verification we can't complete"
    * and "still in flight, do NOT retry" are three different sentences with
    * three different next actions. Same derivation point and same reason as the
-   * two settle routes.
+   * two settle routes — `chargeBlockerForConfirm`, which since 2026-08-11
+   * prefers the THROWN error's code over the intent's resting status (the two
+   * are indistinguishable by status alone), with the `processing` carve-out.
    */
   blocker: ChargeBlocker | undefined;
   amountCents: number;
+}
+
+/**
+ * How much it COSTS to report the wrong blocker, per arm. Higher wins when a
+ * multi-dog enroll produces more than one unsettled outcome and the response
+ * can carry only one.
+ *
+ * This ordering is the whole point of {@link mostHazardousUnsettledIntent} and
+ * is not cosmetic. `processing` means "money may be in flight, do NOT retry";
+ * `declined` and `authentication_required` both render copy that sends the
+ * owner to the card picker. Report `declined` for a set that contains a
+ * `processing` dog and the owner picks another card, which changes mobile's
+ * idempotency-key signature, which produces a FRESH key — while the
+ * `processing` intent, the one kind our unwind cannot cancel, settles anyway.
+ * That is a double charge, and it is reachable from one declined dog plus one
+ * in-flight dog in the same request.
+ *
+ * `declined` and `authentication_required` tie deliberately: both ask for
+ * another card, so between them the cost of the wrong pick is tone, and the tie
+ * is broken by dog order (stable, sorted ids) rather than by a preference we
+ * have no evidence for.
+ */
+const ENROLL_BLOCKER_HAZARD_RANK: Readonly<Record<ChargeBlocker, number>> = {
+  processing: 2,
+  declined: 1,
+  authentication_required: 1,
+};
+
+/**
+ * The ONE unsettled intent whose blocker a multi-dog enroll reports — the most
+ * hazardous one ({@link ENROLL_BLOCKER_HAZARD_RANK}), not the first one.
+ * `undefined` when every dog settled.
+ *
+ * Ties keep the earliest dog in the (sorted, stable) charge order, so a set with
+ * no `processing` dog reports exactly what it always did.
+ */
+function mostHazardousUnsettledIntent(
+  intents: readonly PaidEnrollmentIntent[],
+): PaidEnrollmentIntent | undefined {
+  let chosen: PaidEnrollmentIntent | undefined;
+  let chosenRank = -1;
+  for (const intent of intents) {
+    if (intent.status === 'succeeded') continue;
+    // An unsettled intent with no blocker is unreachable today —
+    // `chargeBlockerForConfirm` returns `undefined` only for `succeeded`, which
+    // the guard above already skipped, and an unknown Stripe status is read as
+    // `processing` at the seam rather than left blank. It ranks HIGHEST anyway:
+    // if it ever becomes reachable it means we could not say why a charge
+    // stopped, and "don't know" must not lose to "declined" and invite a retry.
+    const rank =
+      intent.blocker === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : ENROLL_BLOCKER_HAZARD_RANK[intent.blocker];
+    // Strictly greater: the first intent at a given rank keeps the slot.
+    if (rank > chosenRank) {
+      chosen = intent;
+      chosenRank = rank;
+    }
+  }
+  return chosen;
 }
 
 /**
@@ -763,16 +837,26 @@ async function chargeEachDogNow(args: {
         },
         `${args.idempotencyKey}:dog:${dogId}`,
       );
-      intents.push({
+      // The unwind in the catch below can only refund or cancel intents that
+      // are ALREADY in this list, so a just-captured PI's identity is pushed
+      // before anything is derived from it: a throw between the capture and the
+      // push strands real money with no charge row and no refund. Nothing below
+      // can throw today (both derivations are total over
+      // `StripePaymentIntentStatus`) — the ordering, rather than that analysis,
+      // is what keeps the money reachable.
+      const captured: PaidEnrollmentIntent = {
         dogId,
         intentId: intent.id,
+        // The one derivation the unwind itself reads (refund a succeeded
+        // intent, cancel anything else) — a pure exhaustive switch, no logger.
         status: stripeIntentStatusToChargeStatus(intent.status),
-        blocker:
-          intent.status === 'succeeded'
-            ? undefined
-            : stripeIntentStatusToChargeBlocker(intent.status, args.log),
+        // Filled in immediately below: reporting-only, and the only step here
+        // that touches a logger.
+        blocker: undefined,
         amountCents: intent.amountCents,
-      });
+      };
+      intents.push(captured);
+      captured.blocker = chargeBlockerForConfirm(intent, args.log);
     }
   } catch (err) {
     // A later dog's card threw mid-loop — unwind the EARLIER dogs' captured
@@ -818,10 +902,28 @@ async function unwindCapturedIntents(
         await stripe.cancelPaymentIntent(intent.intentId);
       }
     } catch (unwindErr) {
-      log.error(
-        { err: unwindErr, paymentIntentId: intent.intentId, dogId: intent.dogId },
-        'group-class enroll unwind FAILED — captured money needs manual reconciliation',
-      );
+      if (intent.blocker === 'processing') {
+        // The one unwind failure that can leave money captured with nothing to
+        // show for it: a `processing` intent is precisely the kind a cancel
+        // cannot stop, so a FAILED cancel here means the charge may still
+        // settle while the enrollment it paid for is not being written. Own
+        // level and own string so it is greppable on its own rather than buried
+        // in the general unwind-failure volume.
+        log.fatal(
+          {
+            err: unwindErr,
+            paymentIntentId: intent.intentId,
+            dogId: intent.dogId,
+            chargeBlocker: intent.blocker,
+          },
+          'STRANDED MONEY: could not cancel an IN-FLIGHT group-class PaymentIntent — it may capture with no enrollment and no charge row; refund manually',
+        );
+      } else {
+        log.error(
+          { err: unwindErr, paymentIntentId: intent.intentId, dogId: intent.dogId },
+          'group-class enroll unwind FAILED — captured money needs manual reconciliation',
+        );
+      }
     }
   }
 }

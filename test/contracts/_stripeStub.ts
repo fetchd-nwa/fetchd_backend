@@ -2,6 +2,10 @@ import { randomUUID } from 'node:crypto';
 import Stripe from 'stripe';
 import { ApiError } from '../../src/lib/errors.js';
 import { normalizeThrownConfirmError } from '../../src/lib/stripe.js';
+import {
+  rebuildRecordedCardError,
+  type RecordedScenarioKey,
+} from '../fixtures/recordedStripeErrors.js';
 import type {
   StripeClient,
   StripePaymentIntentResult,
@@ -29,12 +33,20 @@ import type {
  * Override knobs:
  *   - `setNextIntentStatus(status)` — next `createAndConfirmPaymentIntent`
  *     returns that status (and clientSecret = `pi_test_*_secret_xyz`)
- *   - `setNextIntentThrowsCardError(status)` — next confirm simulates Stripe's
- *     OTHER failure fork (a thrown card error carrying the failed intent). It
- *     runs the simulated throw through the PRODUCTION normalizer, so a route
- *     test driving this lever exercises the real 1.9.0 seam rather than a
- *     lookalike — which is the whole point: the two forks must be
- *     indistinguishable downstream.
+ *   - `setNextIntentThrowsCardError(status, code?)` — next confirm simulates
+ *     Stripe's OTHER failure fork (a thrown card error carrying the failed
+ *     intent), HAND-BUILT. It runs the simulated throw through the PRODUCTION
+ *     normalizer, so a route test driving this lever exercises the real seam
+ *     rather than a lookalike. Use it for status/code combinations Stripe has
+ *     never been observed to send (a `processing` intent under a card error);
+ *     for the shapes Stripe DOES send, prefer the recorded lever below.
+ *   - `setNextIntentThrowsRecorded(scenario)` — next confirm throws the error
+ *     Stripe ACTUALLY threw, rebuilt from `test/fixtures/stripe-thrown-confirm.json`
+ *     (recorded live by `npm run probe:stripe -- --record`). This is the lever
+ *     that would have caught the 2026-08-11 defect: hand-built errors could
+ *     only ever contain shapes someone imagined, and nobody imagined
+ *     `code=authentication_required` on an intent resting at
+ *     `requires_payment_method`.
  *   - `setNextIntentThrowsTransport(err)` — next confirm throws a NON-card
  *     Stripe error (connection/API/rate-limit). The seam rethrows those
  *     untouched, so this is how a test pins "an outage is not a decline".
@@ -97,20 +109,65 @@ export type StripeStubCall =
       idempotencyKey: null;
     };
 
+/**
+ * One confirm's outcome, for {@link StripeStub.queueIntentOutcomes} — the
+ * multi-dog case the single-shot levers cannot express, since each of those
+ * resets itself after one call.
+ */
+export type QueuedIntentOutcome =
+  | { kind: 'status'; status: StripePaymentIntentStatus }
+  | { kind: 'cardError'; status: StripePaymentIntentStatus; code?: string }
+  | { kind: 'recorded'; scenario: RecordedScenarioKey };
+
 export interface StripeStub extends StripeClient {
   /** Every Stripe call this stub received, in order. */
   readonly calls: StripeStubCall[];
+  /**
+   * Queue an outcome per confirm, in call order — the only way to give the N
+   * confirms of a multi-dog enroll DIFFERENT outcomes. A queued outcome wins
+   * over the single-shot levers for that call; once the queue drains, the
+   * single-shot levers (and the `succeeded` default) apply again.
+   *
+   * Exists because "one dog declined, one dog still processing" is a real
+   * multi-dog shape and the response can carry only one blocker — see
+   * `mostHazardousUnsettledIntent` in `src/routes/enrollments.ts`.
+   */
+  queueIntentOutcomes(outcomes: readonly QueuedIntentOutcome[]): void;
   /** Force the next PaymentIntent confirm to return this status. */
   setNextIntentStatus(status: StripePaymentIntentStatus): void;
   /**
    * Force the next PaymentIntent confirm to take Stripe's THROWN fork: a
-   * `StripeCardError` carrying a failed PaymentIntent at `status`, run through
-   * the production normalizer. Per the `StripeClient` contract the call still
-   * RESOLVES — a card-level failure is a result, not an exception — so a route
-   * driving this lever must produce byte-identical behavior to the same status
-   * set via `setNextIntentStatus`. Any difference is the bug.
+   * HAND-BUILT `StripeCardError` carrying a failed PaymentIntent at `status`
+   * with the given `code`, run through the production normalizer. Per the
+   * `StripeClient` contract the call still RESOLVES — a card-level failure is a
+   * result, not an exception.
+   *
+   * **The equivalence doctrine, amended 2026-08-11.** This used to say a route
+   * driving this lever "must produce byte-identical behavior to the same status
+   * set via `setNextIntentStatus`", and that instruction was wrong: it demanded
+   * the forks agree on a field the thrown fork knows more about. Stripe's
+   * thrown error carries `err.code`, which names WHICH failure happened; the
+   * attached intent's status reads `requires_payment_method` for a decline and
+   * for an authentication failure alike. The amended invariant:
+   *
+   *   > The forks agree on everything that MOVES or RECORDS money — the status
+   *   > body, the charges row, the cancel rule, the obligation outcome — and on
+   *   > the blocker WHENEVER `code` maps to what `status` implies. The thrown
+   *   > fork may make `charge_blocker` more specific; it may never contradict a
+   *   > `processing` status.
+   *
+   * So a test comparing the two forks must pass a `code` consistent with
+   * `status`, or expect (and assert) the more specific blocker.
    */
-  setNextIntentThrowsCardError(status: StripePaymentIntentStatus): void;
+  setNextIntentThrowsCardError(status: StripePaymentIntentStatus, code?: string): void;
+  /**
+   * Force the next PaymentIntent confirm to throw the error live Stripe
+   * ACTUALLY threw for this scenario, rebuilt from the committed recording and
+   * run through the production normalizer. The recorded intent's `id`,
+   * `amount` and `client_secret` are adjusted to this call; its `status`,
+   * `code` and `decline_code` — the evidence — are replayed verbatim.
+   */
+  setNextIntentThrowsRecorded(scenario: RecordedScenarioKey): void;
   /**
    * Force the next PaymentIntent confirm to throw a NON-card Stripe error.
    * Defaults to a `StripeConnectionError` — "we could not reach Stripe", which
@@ -150,7 +207,10 @@ export function makeStripeStub(): StripeStub {
   const calls: StripeStubCall[] = [];
   let nextIntentStatus: StripePaymentIntentStatus = 'succeeded';
   let nextIntentThrowsCard = false;
+  let nextIntentThrowsCardCode = 'card_declined';
+  let nextIntentThrowsRecorded: RecordedScenarioKey | undefined;
   let nextIntentTransportError: Error | undefined;
+  const outcomeQueue: QueuedIntentOutcome[] = [];
   let detachShouldThrow = false;
   let refundShouldThrow = false;
   let cancelShouldThrow = false;
@@ -168,9 +228,16 @@ export function makeStripeStub(): StripeStub {
     setNextIntentStatus(status) {
       nextIntentStatus = status;
     },
-    setNextIntentThrowsCardError(status) {
+    setNextIntentThrowsCardError(status, code = 'card_declined') {
       nextIntentStatus = status;
+      nextIntentThrowsCardCode = code;
       nextIntentThrowsCard = true;
+    },
+    setNextIntentThrowsRecorded(scenario) {
+      nextIntentThrowsRecorded = scenario;
+    },
+    queueIntentOutcomes(outcomes) {
+      outcomeQueue.push(...outcomes);
     },
     setNextIntentThrowsTransport(err) {
       nextIntentTransportError =
@@ -220,13 +287,35 @@ export function makeStripeStub(): StripeStub {
 
     async createAndConfirmPaymentIntent(args, idempotencyKey): Promise<StripePaymentIntentResult> {
       const id = testIdPrefix('pi');
+      // A queued outcome (multi-dog enroll) overrides the single-shot levers
+      // for THIS call by setting them, so everything below stays one code path.
+      const queuedOutcome = outcomeQueue.shift();
+      if (queuedOutcome !== undefined) {
+        switch (queuedOutcome.kind) {
+          case 'status':
+            nextIntentStatus = queuedOutcome.status;
+            break;
+          case 'cardError':
+            nextIntentStatus = queuedOutcome.status;
+            nextIntentThrowsCardCode = queuedOutcome.code ?? 'card_declined';
+            nextIntentThrowsCard = true;
+            break;
+          case 'recorded':
+            nextIntentThrowsRecorded = queuedOutcome.scenario;
+            break;
+        }
+      }
       const status = nextIntentStatus;
       const throwsCard = nextIntentThrowsCard;
+      const throwsCardCode = nextIntentThrowsCardCode;
+      const throwsRecorded = nextIntentThrowsRecorded;
       const transportError = nextIntentTransportError;
       // Reset every lever for the next call — a stale one bleeding into a
       // route's SECOND confirm (multi-dog enroll, replay) would be a lie.
       nextIntentStatus = 'succeeded';
       nextIntentThrowsCard = false;
+      nextIntentThrowsCardCode = 'card_declined';
+      nextIntentThrowsRecorded = undefined;
       nextIntentTransportError = undefined;
       calls.push({ method: 'createAndConfirmPaymentIntent', args, idempotencyKey });
 
@@ -236,6 +325,18 @@ export function makeStripeStub(): StripeStub {
         throw transportError;
       }
       const clientSecret = status === 'succeeded' ? null : `${id}_secret_${randomUUID().slice(0, 8)}`;
+      if (throwsRecorded !== undefined) {
+        // The error Stripe REALLY threw, replayed through the REAL normalizer.
+        // Only the call-scoped identifiers are re-pointed; the recorded status
+        // and code are the evidence and are never edited here.
+        return normalizeThrownConfirmError(
+          rebuildRecordedCardError(throwsRecorded, {
+            id,
+            amount: args.amountCents,
+            client_secret: `${id}_secret_${randomUUID().slice(0, 8)}`,
+          }),
+        );
+      }
       if (throwsCard) {
         // Build the raw error the way Stripe does on a declined off-session
         // confirm and hand it to the REAL normalizer — the stub must not carry
@@ -243,7 +344,7 @@ export function makeStripeStub(): StripeStub {
         return normalizeThrownConfirmError(
           new Stripe.errors.StripeCardError({
             type: 'card_error',
-            code: 'card_declined',
+            code: throwsCardCode,
             decline_code: 'generic_decline',
             message: 'Your card was declined.',
             statusCode: 402,
