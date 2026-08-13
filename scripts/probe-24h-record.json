@@ -1,0 +1,23 @@
+{
+  "plantedAt": "2026-08-13T14:59:43.926Z",
+  "idempotencyKey": "probe-24h-window:2026-08-13",
+  "params": {
+    "amount": 4500,
+    "currency": "usd",
+    "customer": "cus_V48NG4ND0B4Snx",
+    "payment_method": "pm_card_visa",
+    "confirm": true,
+    "off_session": true,
+    "metadata": {
+      "purpose": "probe-24h-window"
+    }
+  },
+  "firstIntentId": "pi_3U406dLE5OGXyaT110Jqi6VO",
+  "customerId": "cus_V48NG4ND0B4Snx",
+  "q1SameIdOnImmediateRetry": true,
+  "q2ReplayHeader": [
+    "idempotency-key",
+    "probe-24h-window:2026-08-13"
+  ],
+  "stage2": "after 24h: re-run the identical create with the same key+params; same id = key survived, new id = expired"
+}
