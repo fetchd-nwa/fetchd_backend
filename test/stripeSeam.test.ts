@@ -7,6 +7,7 @@ import {
   defaultStripeClient,
   normalizeReturnedConfirm,
   normalizeThrownConfirmError,
+  replayedFromResponse,
   stripeIdempotencyErrorKind,
   type StripePaymentIntentResult,
   type StripePaymentIntentStatus,
@@ -723,4 +724,85 @@ test('stripeIdempotencyErrorKind: everything else is not an idempotency error at
   );
   assert.equal(stripeIdempotencyErrorKind(new Error('plain')), undefined);
   assert.equal(stripeIdempotencyErrorKind(undefined), undefined);
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// The replay header — pinned to what Stripe SENDS, not to what it documents.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * A PaymentIntent as the SDK hands it back from a live call: the resource with
+ * `lastResponse` attached. `headers` is the only part these tests care about.
+ */
+function withResponseHeaders(headers: Record<string, string>): Stripe.PaymentIntent {
+  return {
+    id: 'pi_test_replay',
+    status: 'succeeded',
+    amount: 4500,
+    client_secret: 'cs_test',
+    lastResponse: { headers, requestId: 'req_test', statusCode: 200 },
+  } as unknown as Stripe.PaymentIntent;
+}
+
+/**
+ * MEASURED, 2026-08-13 (live test-mode probe: a same-key `paymentIntents.create`
+ * replayed, every response header dumped). Stripe sends `idempotent-replayed`
+ * — idempot**ent** — and the seam read only `idempotency-replayed` /
+ * `Idempotency-Replayed`, the DOCUMENTED spellings. So the strongest of the two
+ * replay signals returned `false` on every real replay, and
+ * `reissueLooksReplayed` silently degraded to its `created`-timestamp heuristic.
+ * Nothing went red because the heuristic answers the common case correctly —
+ * the same class of failure as a test that asserts we can read a field we
+ * invented ourselves.
+ */
+test('replayedFromResponse: reads the header name live Stripe actually sends', () => {
+  assert.equal(
+    replayedFromResponse(
+      withResponseHeaders({
+        'idempotent-replayed': 'true',
+        'original-request': 'req_original',
+        'request-id': 'req_second',
+      }),
+    ),
+    true,
+    'the measured header is the one that has to work',
+  );
+});
+
+test('replayedFromResponse: the two DOCUMENTED spellings still work', () => {
+  assert.equal(replayedFromResponse(withResponseHeaders({ 'idempotency-replayed': 'true' })), true);
+  assert.equal(replayedFromResponse(withResponseHeaders({ 'Idempotency-Replayed': 'true' })), true);
+  // Stripe has renamed response headers across versions before; carrying all
+  // three costs one `??` and buys the signal surviving the next rename.
+});
+
+test('replayedFromResponse: a response with no replay header is a real `false`', () => {
+  assert.equal(
+    replayedFromResponse(withResponseHeaders({ 'request-id': 'req_fresh' })),
+    false,
+    'the header is sent on replays and omitted otherwise — its absence is an answer',
+  );
+  assert.equal(
+    replayedFromResponse(withResponseHeaders({ 'idempotent-replayed': 'false' })),
+    false,
+  );
+});
+
+test('replayedFromResponse: no attached response is `undefined`, never `false`', () => {
+  assert.equal(
+    replayedFromResponse({ id: 'pi_x', status: 'succeeded' } as unknown as Stripe.PaymentIntent),
+    undefined,
+    '"Stripe executed this fresh" and "we cannot tell" have different money consequences',
+  );
+});
+
+test('replayedFromResponse: `original-request` alone does NOT mean replayed', () => {
+  assert.equal(
+    replayedFromResponse(
+      withResponseHeaders({ 'original-request': 'req_original', 'request-id': 'req_second' }),
+    ),
+    false,
+    'nobody has measured a FRESH response’s headers; if Stripe sets this there too, ' +
+      'trusting it would settle a genuine second charge as if it were the first',
+  );
 });

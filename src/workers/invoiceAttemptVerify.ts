@@ -519,8 +519,13 @@ async function verifyByReissue(
  *
  * Two independent signals, checked in order of authority:
  *
- *   1. **The `Idempotency-Replayed` header**, which Stripe sets on exactly this
- *      condition. When the seam could read it, it is the answer.
+ *   1. **The replay response header**, which Stripe sets on exactly this
+ *      condition. When the seam could read it, it is the answer. Live Stripe
+ *      sends it as `idempotent-replayed`, not the documented
+ *      `Idempotency-Replayed` (measured 2026-08-13, round 4) — until then the
+ *      seam read only the documented spellings, so signal 1 never fired and
+ *      this function was in truth a one-signal heuristic. It answered the
+ *      common case correctly, which is why nothing went red.
  *   2. **The intent's own `created`.** The attempt row is written immediately
  *      before the original confirm, so a replayed intent was created back then;
  *      one created a verify interval later was executed by THIS call. The
@@ -698,14 +703,39 @@ async function applyVerifiedIntent(
     // webhook's resolver has always got this right and this arm did not. Keep
     // the park, keep the ladder, and say the now-known answer once (the
     // `payment-failed:<id>` dedupe key is the "ever" in one push per invoice).
-    const enqueued = await withActor(WORKER_ACTOR, (tx) =>
-      enqueueAutoChargeParkPush(tx, {
-        invoice: fresh,
-        arm: parkArmForBlocker(blocker),
-        now,
-        at: attemptedAt,
-      }),
-    );
+    //
+    // **Gated on the WRITE, not on the re-read above** (round 4, 2026-08-13).
+    // The `fresh.status !== 'open'` check is a read, and the manual-pay window
+    // does not close while we hold it: an owner can settle this invoice in the
+    // gap between that SELECT and this push, and then be told "your card was
+    // declined — want to try a different form of payment?" while holding a
+    // receipt. Every sibling arm gates its push on a row count from a write
+    // filtered `status='open'` (`recordFailedAttempt` in `recordKnownFailure`
+    // below, `parkForReconciliation` in `parkForHuman`); this one was the miss.
+    // Re-parking an already-parked invoice is a no-op write —
+    // `next_attempt_at` is already NULL — so it changes nothing and buys the
+    // one thing a read cannot: the answer to "is this invoice still open?"
+    // decided in the same statement that authorises the push.
+    const { stillOpen, enqueued } = await withActor(WORKER_ACTOR, async (tx) => {
+      const rows = await invoicesRepository.parkForReconciliation(tx, { id: fresh.id });
+      if (rows === 0) return { stillOpen: false, enqueued: false };
+      return {
+        stillOpen: true,
+        enqueued: await enqueueAutoChargeParkPush(tx, {
+          invoice: fresh,
+          arm: parkArmForBlocker(blocker),
+          now,
+          at: attemptedAt,
+        }),
+      };
+    });
+    if (!stillOpen) {
+      log.info(
+        { attemptId: attempt.id, invoiceId: invoice.id, paymentIntentId: intent.id, blocker },
+        'invoice attempt verify: the invoice was settled or voided between the re-read and the push; the now-known failure was withheld from an owner who already paid',
+      );
+      return { attemptId: attempt.id, invoiceId: invoice.id, outcome: 'no-charge' };
+    }
     log.info(
       { attemptId: attempt.id, invoiceId: invoice.id, paymentIntentId: intent.id, blocker, enqueued },
       'invoice attempt verify: attempt resolved as known-dead on an already-parked invoice; park kept, owner told the answer',

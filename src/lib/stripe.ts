@@ -130,10 +130,12 @@ export interface StripePaymentIntentResult {
   createdAt?: Date;
   /**
    * `true` when Stripe answered this confirm from its idempotency record
-   * (`Idempotency-Replayed: true`), `false` when it executed the request, and
-   * `undefined` when the header could not be read at all — the three states are
-   * NOT interchangeable. Only the confirm verb stamps it: a retrieve is a GET
-   * with no idempotency key, so "replayed" has no meaning there.
+   * (`idempotent-replayed: true` — the MEASURED header name, not the documented
+   * `Idempotency-Replayed`; see {@link REPLAYED_HEADER_NAMES}), `false` when it
+   * executed the request, and `undefined` when no response was attached to read
+   * at all — the three states are NOT interchangeable. Only the confirm verb
+   * stamps it: a retrieve is a GET with no idempotency key, so "replayed" has
+   * no meaning there.
    */
   replayed?: boolean;
 }
@@ -718,20 +720,58 @@ function intentCreatedAt(created: unknown): Date | undefined {
 }
 
 /**
+ * The response-header spellings that mean "this was replayed from the
+ * idempotency record". Ordered by what Stripe was OBSERVED to send.
+ *
+ * **`idempotent-replayed` is the measured one** (live test-mode probe,
+ * 2026-08-13: a same-key `paymentIntents.create` replay was dumped header by
+ * header). Note the stem — idempot**ent**, not idempot**ency**. Until that probe
+ * this function read only the two `idempotency-` spellings, so it returned
+ * `false` on every genuine replay and the whole detector silently fell through
+ * to `reissueLooksReplayed`'s `created`-timestamp heuristic — which answers
+ * correctly in the common case, which is exactly why nothing went red.
+ *
+ * The two `idempotency-` spellings stay: they are what Stripe's own docs say,
+ * Stripe has renamed response headers across API versions before, and an extra
+ * miss in a `??` chain costs nothing while a missing one costs the signal.
+ *
+ * **Deliberately NOT read: `original-request`.** The same probe showed it
+ * present on the replay, naming the original request id — but nobody has
+ * measured a FRESH response's headers, and Stripe sets `request-id` on every
+ * response. If `original-request` also appears on non-replayed responses, using
+ * its presence as a replay signal would report every re-issue as a replay, and
+ * a re-issue wrongly believed to be a replay is a SECOND charge settled as if
+ * it were the first. Measure the fresh case before trusting it.
+ */
+const REPLAYED_HEADER_NAMES = [
+  'idempotent-replayed',
+  'idempotency-replayed',
+  'Idempotency-Replayed',
+] as const;
+
+/**
  * Did Stripe REPLAY this response from its idempotency record, or execute the
- * request? Read off the `Idempotency-Replayed` response header, which Stripe
- * documents on exactly that condition.
+ * request? Read off the response header — see {@link REPLAYED_HEADER_NAMES} for
+ * which one, and for why the documented name was not the one that arrives.
  *
  * Returns `undefined` when we could not tell (no `lastResponse` — the object
  * did not come from a live SDK call), which callers must NOT read as `false`:
  * "Stripe executed this fresh" and "we don't know how this got here" have
- * different money consequences.
+ * different money consequences. A `lastResponse` that carries NONE of the names
+ * is a genuine `false`: the header is sent on replays and omitted otherwise.
+ *
+ * Exported for the seam unit test, which pins the MEASURED header name — the
+ * defect this replaced survived precisely because nothing asserted against what
+ * Stripe actually sends.
  */
-function replayedFromResponse(intent: Stripe.PaymentIntent): boolean | undefined {
+export function replayedFromResponse(intent: Stripe.PaymentIntent): boolean | undefined {
   const headers = (intent as Partial<Stripe.Response<Stripe.PaymentIntent>>).lastResponse?.headers;
   if (headers === undefined) return undefined;
-  const raw = headers['idempotency-replayed'] ?? headers['Idempotency-Replayed'];
-  return typeof raw === 'string' && raw.toLowerCase() === 'true';
+  for (const name of REPLAYED_HEADER_NAMES) {
+    const raw = headers[name];
+    if (typeof raw === 'string') return raw.toLowerCase() === 'true';
+  }
+  return false;
 }
 
 /**

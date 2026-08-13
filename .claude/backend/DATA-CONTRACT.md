@@ -3435,10 +3435,20 @@ Everything else is server-side.
   nowhere else; Allison approved the eight **bodies** ("if its too wordy we can
   change later on"), which is why every string is in one file. **The two new
   titles — "Payment still processing" and "We're checking your payment" — are
-  builder-invented and still pending her veto**; every other arm reuses the
-  already-shipped "Payment failed" title. (The approval is recorded here as
-  2026-08-12 and in the mobile repo as 2026-08-11; that disagreement is
-  unreconciled and one of the two is wrong.)
+  builder-invented and still pending her veto**, unchanged by round 4. Arms 2-4
+  and 6 reuse the already-shipped "Payment failed" title. Arm 5
+  (no-card-on-file) carries **"Payment due"** with `reason=payment-due` since
+  round 4 (2026-08-13) — not builder-invented and not awaiting a veto: it is the
+  product's existing approved pair for that state, the one the payment-due
+  reminder and the overdue nag already use, whose settle sheet is headed
+  "Payment due / How would you like to pay?". It replaced a "Payment failed"
+  title and a `payment-failed` deep link sitting over a body that says nothing
+  was attempted; a push is read title-first, and the tap has to land on a
+  surface that agrees with it. Its dedupe key stays `payment-failed:<invoiceId>`
+  — the "one terminal park push per invoice, ever" floor, and the key
+  `findOverdueForWarning` reads. (The approval is recorded here as 2026-08-12
+  and in the mobile repo as 2026-08-11; that disagreement is unreconciled and
+  one of the two is wrong.)
   Arms: settled receipt (unchanged, in `settleInvoiceCharge`), declined,
   needs-verification, failed-reason-unknown (the shipped 2026-08-01 sentence,
   kept verbatim for exactly this arm), no-card-on-file, stripe-customer-missing,
@@ -3585,8 +3595,9 @@ the same sentence. These are corrections to §K.2.1 above.
   keyed on our own refund-row uuid, now the single source for both callers. Past
   `DUPLICATE_REFUND_ABANDON_AFTER_HOURS` (24h, Stripe's documented key lifetime)
   it stops retrying — a key Stripe may have forgotten could send a SECOND refund
-  — and reports the abandoned rows individually at ERROR on every tick. No DDL:
-  `status`, `stripe_refund_id`, `created_at`, `updated_at` carry it.
+  — and reports the abandoned rows for a human. No DDL: `status`,
+  `stripe_refund_id`, `created_at`, `updated_at` carry it. (The abandon report's
+  shape and the sweep's third bound are corrected in §K.2.3.)
 - **Timestamps read from `mode:'string'` columns go through
   `pgTimestampToDate`**, not `new Date(...)`, in both worker lanes. No live
   defect on Node 22 (verified by execution, not by reading) — the bare parse is
@@ -3596,3 +3607,73 @@ the same sentence. These are corrections to §K.2.1 above.
 - **Still true, and still not provable here:** the ~24h Stripe key window (now
   load-bearing in two places — the re-issue and the refund retry) is
   documented and stub-modelled, **never measured live**.
+
+### K.2.3 Amendments from the final adversarial round (2026-08-13, round 4)
+
+Round 3 built the refund sweep and shipped it without a deploy boundary. These
+are corrections to §K.2.2 above.
+
+- **The refund sweep has a deploy floor, and `reason` alone never was one.**
+  `REFUND_SWEEP_FLOOR` (`refundsRepository.ts`) is a `created_at` bound applied
+  inside `claimStalePendingForRetry`, so no caller can widen it. Without it the
+  sweep would have re-fired **pre-deploy** rows: `settleInvoiceCharge`'s
+  lost-race arm has stamped `reason='duplicate-invoice-settle'` since 2026-06-21
+  (`cade494`) and BOTH the worker and `POST /invoices/:id/pay` call it, but
+  until this branch the route fired its refund under
+  `` `${idempotencyKey}:dup-settle-refund` `` — the CLIENT's request key. Nothing
+  in the row distinguishes them, so re-firing one under
+  `dup-settle-refund:<refundId>` is not a replay: Stripe has never seen that key
+  and executes a SECOND full refund, unattended. Round 3's own doc comment on
+  the claim asserted the opposite ("every one of its callers now does") and is
+  corrected in place. **Operational requirement: the constant must be >= the
+  deploy instant.** It is set to 2026-08-13; if this branch lands later,
+  advance it first — a floor earlier than deploy re-opens exactly this.
+- **The abandon report is classified, floor-aware, and loud once.**
+  `findAbandonedPending` LEFT JOINs `charges` and returns an
+  `AbandonedRefundClass` per row — `never-sent` (no `stripe_payment_intent_id`
+  behind it: pre-Stripe-wire seed money from `cancelBookingService`, nothing in
+  any dashboard to refund), `client-keyed` (a non-row-keyed reason, OR a
+  `duplicate-invoice-settle` row minted below the floor: unreconstructible key,
+  so CHECK Stripe before issuing anything), `row-keyed` (post-floor, the sweep's
+  own, aged past the key window). One ERROR per class, each an instruction its
+  reader can actually follow; round 3 sent one sentence — "refund by hand in the
+  Stripe dashboard" — which was false for the first class and dangerous for the
+  second. Each row is named at ERROR the first time a process sees it and
+  counted at INFO after (`ALARMED_REFUND_IDS`), the verify lane's
+  loud-once/quiet-after posture: at a one-minute tick an unresolved row emitted
+  ~1,440 identical ERRORs a day, so the next real incident arrived pre-buried.
+  The report is deliberately NOT floored — hiding what the claim refuses is how
+  a double-charged owner ends up with no surface at all — and per-class counts
+  ride on the tick result (`abandonedByClass`) so the split is assertable
+  without scraping log text. An acknowledgement table is portal work and is
+  still not built: a restart re-announces every outstanding row once, which is
+  the right failure mode.
+- **The verify lane's keep-the-park push is gated on the WRITE.** The arm that
+  delivers a now-known failure to an already-parked invoice was guarded by the
+  `status='open'` re-read alone. Every sibling gates on a row count from a write
+  filtered `status='open'` (`recordFailedAttempt`, `parkForReconciliation`);
+  this one was the miss, and an owner who paid manually in the gap between the
+  read and the push got "your card was declined — want to try a different form
+  of payment?" while holding a receipt. It now re-parks through
+  `parkForReconciliation` — a no-op write on an already-parked invoice — purely
+  to decide, in the same statement that authorises the push, whether the invoice
+  is still open.
+- **The last `new Date(pgString)`** (`stripeEventHandlers.ts`, the late
+  `payment_failed` park copy) routes through `pgTimestampToDate`. No behavioral
+  difference on Node 22, which is why nothing caught it; the point is that the
+  sweep is now complete.
+- **The replay detector was reading a header Stripe does not send — MEASURED.**
+  A live test-mode probe (2026-08-13) replayed a same-key
+  `paymentIntents.create` and dumped every response header: Stripe sends
+  **`idempotent-replayed: true`** (idempot**ent**, not idempot**ency**), which
+  is not either of the two documented spellings `replayedFromResponse` was
+  reading. So `StripePaymentIntentResult.replayed` was `false` on every genuine
+  replay and `reissueLooksReplayed` was in truth a ONE-signal function, resting
+  entirely on the `created`-timestamp heuristic — which answers the common case
+  correctly, which is why the suite stayed green. All three spellings are now
+  read and the measured one is pinned by a seam unit test.
+  **`original-request` is deliberately NOT read** as a corroborating signal: the
+  probe measured only the replay case, Stripe stamps `request-id` on every
+  response, and if `original-request` also appears on fresh ones then trusting
+  it would make every re-issue look replayed — settling a genuine second charge
+  as though it were the first. Measure a FRESH response before adding it.

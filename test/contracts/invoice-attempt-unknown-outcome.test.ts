@@ -9,6 +9,10 @@ import { invoicesRepository } from '../../src/db/repositories/invoicesRepository
 import { invoiceChargeAttemptsRepository } from '../../src/db/repositories/invoiceChargeAttemptsRepository.js';
 import { stripeCustomersRepository } from '../../src/db/repositories/stripeCustomersRepository.js';
 import {
+  REFUND_SWEEP_FLOOR,
+  refundsRepository,
+} from '../../src/db/repositories/refundsRepository.js';
+import {
   fireDuplicateRefundPostCommit,
   settleInvoiceCharge,
 } from '../../src/lib/settleInvoiceCharge.js';
@@ -829,6 +833,17 @@ test(
       assert.match(push!.body, /add a card in the app/i);
       // The sentence this arm used to send was flatly false.
       assert.doesNotMatch(push!.body, /we tried your/i, 'never claim we tried when we did not');
+      // And so were the two lines wrapped around it (round 4). A push is read
+      // title-first, and the tap has to land on a surface that matches: nothing
+      // failed here, nothing was even attempted. `payment-due` is the product's
+      // existing approved pair for this state — the settle sheet it opens is
+      // headed "Payment due / How would you like to pay?".
+      assert.equal(push!.title, 'Payment due', 'the title cannot contradict the body');
+      assert.equal(
+        push!.deepLinkPath,
+        `/account/invoices?invoiceId=${invoiceId}&reason=payment-due`,
+        'and the sheet it opens must not frame an untried payment as a failure',
+      );
     } finally {
       await cleanup();
       await db
@@ -1224,6 +1239,93 @@ test(
     assert.ok(
       await pushBody(`payment-unconfirmed:${invoiceId}`),
       'and the earlier "still processing" push stands — two truths, two dedupe keys',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'the keep-the-park answer is withheld from an owner who paid in the GAP — the push follows the write, not the read',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedDueInvoice({ amountCents: 4500, purpose: 'group-class' });
+    const stripe = makeStripeStub();
+    stripe.setNextIntentStatus('processing');
+    stripe.throwOnCancel();
+    const now = new Date();
+    await runInvoiceAutoChargeOnce({ stripe, limit: 5, now });
+    await backdateAttempt(invoiceId);
+
+    // Pass 1: in flight past the cap → parked, owner told "still processing".
+    const first = await runInvoiceAttemptVerifyOnce({
+      stripe,
+      now: new Date(now.getTime() + 20 * MINUTE),
+    });
+    assert.equal(first.results[0]?.outcome, 'parked-in-flight');
+
+    // The bank declines it later, so the verify lane now has a real answer to
+    // deliver — the keep-the-park arm.
+    const attempt = await readAttempt(invoiceId);
+    stripe.setIntentState(attempt!.stripePaymentIntentId!, 'requires_payment_method', {
+      failureCode: 'card_declined',
+    });
+
+    // Meanwhile the owner, told nothing was confirmed, pays the invoice
+    // themselves. The settle lands in the gap between the lane's re-read and
+    // its push — the exact window R5 opens by forbidding a lock across the
+    // Stripe round-trip. Staged where it actually happens: the read returns the
+    // row it truly saw, and the invoice is paid by the time the push runs.
+    const [manualCharge] = await db
+      .insert(charges)
+      .values({
+        ownerId: FIXTURE_IDS.ownerId,
+        amountCents: 4500,
+        status: 'succeeded',
+        purpose: 'group-class',
+        stripePaymentIntentId: `pi_test_manual_${randomUUID().slice(0, 8)}`,
+      })
+      .returning({ id: charges.id });
+    const findById = invoicesRepository.findById;
+    let reads = 0;
+    invoicesRepository.findById = async (runner, id) => {
+      const row = await findById(runner, id);
+      if (id === invoiceId) {
+        reads += 1;
+        // The second read of this invoice in a pass is the verify lane's
+        // re-read at the top of the known-dead arm.
+        if (reads === 2) {
+          await withActor('system:stripe-webhook', (tx) =>
+            invoicesRepository.markPaid(tx, { id: invoiceId, paidChargeId: manualCharge!.id }),
+          );
+        }
+      }
+      return row;
+    };
+    try {
+      const second = await runInvoiceAttemptVerifyOnce({
+        stripe,
+        now: new Date(now.getTime() + 40 * MINUTE),
+      });
+      assert.equal(second.results[0]?.outcome, 'no-charge');
+    } finally {
+      invoicesRepository.findById = findById;
+    }
+
+    assert.equal(
+      (await readInvoice(invoiceId))?.status,
+      'paid',
+      'the manual payment stands — the lane must not undo it',
+    );
+    assert.equal(
+      await pushBody(`payment-failed:${invoiceId}`),
+      undefined,
+      'nobody holding a receipt is told their card was declined and asked to try another',
+    );
+    assert.equal(
+      (await readAttempt(invoiceId))?.outcome,
+      'no-charge',
+      'the attempt is still resolved — withholding the push is not withholding the truth',
     );
     await cleanup();
   },
@@ -1838,12 +1940,23 @@ test(
     await cleanup();
     const invoiceId = await seedDueInvoice({ amountCents: 12_000, purpose: 'group-class' });
     const { refundId, failedKey } = await stageFailedDuplicateRefund(invoiceId, 12_000);
+    // Pin the row and the sweep to one post-floor instant. Staged rows carry a
+    // wall-clock created_at, and REFUND_SWEEP_FLOOR is midnight AFTER the
+    // deploy day — so on the deploy day itself a wall-clock row sits below the
+    // floor and is correctly unclaimable (see the deploy-day pin). Left
+    // unpinned, this test would fail before the floor date and pass after it:
+    // the fixture-clock bomb class, third sighting. One clock, both sides.
+    const rowMintedAt = new Date(FLOOR_MS + 25 * HOUR);
+    await db
+      .update(refunds)
+      .set({ createdAt: rowMintedAt.toISOString(), updatedAt: rowMintedAt.toISOString() })
+      .where(eq(refunds.id, refundId));
 
     // Before this sweep existed nothing retried these rows — no worker imported
     // `refundsRepository`, and `charge.refund.updated` cannot arrive for a
     // refund that was never created. The owner stayed double-charged forever.
     const sweeper = makeStripeStub();
-    const now = new Date(Date.now() + 10 * MINUTE);
+    const now = new Date(rowMintedAt.getTime() + 10 * MINUTE);
     const tick = await runDuplicateRefundRetryOnce({ stripe: sweeper, now });
     assert.equal(tick.scanned, 1);
     assert.equal(tick.sent, 1);
@@ -1917,6 +2030,290 @@ test(
   },
 );
 
+// ──────────────────────────────────────────────────────────────────────────
+// The DEPLOY boundary — round 4. `reason` alone cannot say who keyed a row.
+// ──────────────────────────────────────────────────────────────────────────
+
+const FLOOR_MS = REFUND_SWEEP_FLOOR.getTime();
+
+/**
+ * A 'pending', never-sent refund with the three facts the abandon report
+ * classifies on: whether a PaymentIntent exists behind it, what `reason` it
+ * carries, and which side of {@link REFUND_SWEEP_FLOOR} it was minted on.
+ */
+async function seedPendingRefund(args: {
+  reason: string | null;
+  withPaymentIntent: boolean;
+  createdAt: number;
+  amountCents?: number;
+}): Promise<string> {
+  const amountCents = args.amountCents ?? 5_000;
+  const [charge] = await db
+    .insert(charges)
+    .values({
+      ownerId: FIXTURE_IDS.ownerId,
+      amountCents,
+      status: 'succeeded',
+      purpose: 'group-class',
+      stripePaymentIntentId: args.withPaymentIntent
+        ? `pi_test_${randomUUID().slice(0, 8)}`
+        : null,
+    })
+    .returning({ id: charges.id });
+  const [row] = await db
+    .insert(refunds)
+    .values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId: charge!.id,
+      bookingId: null,
+      amountCents,
+      reason: args.reason,
+    })
+    .returning({ id: refunds.id });
+  await db
+    .update(refunds)
+    .set({ createdAt: new Date(args.createdAt).toISOString() })
+    .where(eq(refunds.id, row!.id));
+  return row!.id;
+}
+
+function collectLogs() {
+  const errors: { obj: Record<string, unknown>; msg?: string }[] = [];
+  const infos: { obj: Record<string, unknown>; msg?: string }[] = [];
+  return {
+    errors,
+    infos,
+    log: {
+      info: (obj: Record<string, unknown>, msg?: string) => infos.push({ obj, msg }),
+      warn: () => undefined,
+      error: (obj: Record<string, unknown>, msg?: string) => errors.push({ obj, msg }),
+    },
+    error: (refundClass: string) => errors.find((e) => e.obj.refundClass === refundClass),
+  };
+}
+
+/**
+ * An instant that is BOTH past the 24h abandon window for a floor-era row and
+ * comfortably ahead of the real clock, so the `updated_at` staleness bound is
+ * always satisfied and `created_at` is the only thing deciding anything. Fixed
+ * at `FLOOR + 48h` while that is still in the future, and tracking the wall
+ * clock afterwards — a test whose meaning expires on a calendar date is a test
+ * that starts passing for the wrong reason on that date.
+ */
+function reportNow(): Date {
+  return new Date(Math.max(FLOOR_MS + 48 * HOUR, Date.now() + HOUR));
+}
+
+test(
+  'a refund minted before the deploy floor is never CLAIMED — its key may have been the client’s — however wide the caller’s window is',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // 12 hours BEFORE the floor. `settleInvoiceCharge`'s lost-race arm has
+    // stamped `reason='duplicate-invoice-settle'` since 2026-06-21, and BOTH
+    // the worker and `POST /invoices/:id/pay` call it — but until this branch
+    // the route fired the Stripe refund under `${idempotencyKey}:dup-settle-
+    // refund`, the CLIENT's request key. Nothing in the row says which one
+    // wrote it, so re-firing under `dup-settle-refund:<id>` is not a replay: it
+    // is a SECOND full refund on a key Stripe has never seen.
+    const preFloor = await seedPendingRefund({
+      reason: 'duplicate-invoice-settle',
+      withPaymentIntent: true,
+      createdAt: FLOOR_MS - 12 * HOUR,
+    });
+    // The control, and the reason this pin cannot pass by accident: an
+    // otherwise IDENTICAL row on the other side of the floor, claimed under
+    // the very same call.
+    const postFloor = await seedPendingRefund({
+      reason: 'duplicate-invoice-settle',
+      withPaymentIntent: true,
+      createdAt: FLOOR_MS + 1 * HOUR,
+    });
+
+    // Asserted against the repository rather than the worker on purpose: the
+    // worker derives `mintedAfter` from a 24h window on `now`, so a
+    // worker-level pin could only isolate the FLOOR from that window while the
+    // wall clock stayed within a day of it. Here the caller's window is opened
+    // wide enough to admit both rows, which leaves the floor as the only thing
+    // that can exclude either — for good, not until tomorrow.
+    const claimed = await withActor('system:stripe-webhook', (tx) =>
+      refundsRepository.claimStalePendingForRetry(tx, {
+        staleBefore: new Date(Date.now() + HOUR),
+        mintedAfter: new Date(FLOOR_MS - 24 * HOUR),
+      }),
+    );
+    assert.deepEqual(
+      claimed.map((r) => r.id),
+      [postFloor],
+      'the floor is applied in the query, not left to a caller who could widen it',
+    );
+    assert.equal(
+      claimed.some((r) => r.id === preFloor),
+      false,
+      'a pre-floor row is not this sweep’s to re-key',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'a refund the sweep refuses is not DROPPED — the abandon report names it, and truthfully',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedDueInvoice({ amountCents: 12_000, purpose: 'group-class' });
+    const { refundId } = await stageFailedDuplicateRefund(invoiceId, 12_000);
+    await db
+      .update(refunds)
+      .set({ createdAt: new Date(FLOOR_MS - 12 * HOUR).toISOString() })
+      .where(eq(refunds.id, refundId));
+
+    // Refusing to retry is only safe because the row reaches a human instead,
+    // described as what it actually is.
+    const sweeper = makeStripeStub();
+    const logs = collectLogs();
+    const later = await runDuplicateRefundRetryOnce({
+      stripe: sweeper,
+      now: reportNow(),
+      log: logs.log,
+    });
+    assert.equal(later.scanned, 0);
+    const [untouched] = await db.select().from(refunds).where(eq(refunds.id, refundId));
+    assert.equal(untouched?.stripeRefundId, null, 'untouched');
+    assert.equal(untouched?.status, 'pending');
+    assert.equal(later.abandoned, 1);
+    assert.equal(later.abandonedByClass['client-keyed'], 1, 'reported as what it is');
+    assert.equal(later.abandonedByClass['row-keyed'], 0, 'and NOT as a row the sweep owns');
+    const alarm = logs.error('client-keyed');
+    assert.ok(alarm, 'the row a human must resolve is named at ERROR');
+    assert.match(JSON.stringify(alarm.obj.refunds), new RegExp(refundId));
+    assert.match(
+      alarm.msg ?? '',
+      /CHECK it for an existing refund first/i,
+      'the instruction has to be safe: the first refund may already exist under a key we cannot see',
+    );
+    assert.equal(
+      sweeper.calls.filter((c) => c.method === 'createRefund').length,
+      0,
+      'and reporting it never sends it',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'the abandon report splits by what a human can actually DO, and never tells one to refund a charge that never reached Stripe',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // Pre-Stripe-wire seed money: `cancelBookingService` writes the 'pending'
+    // row to capture the intent even when the charge has no PaymentIntent.
+    // There is nothing in any dashboard to refund.
+    const neverSent = await seedPendingRefund({
+      reason: 'cancel',
+      withPaymentIntent: false,
+      createdAt: FLOOR_MS - 60 * 24 * HOUR,
+    });
+    // A cancel/withdraw refund: real money, real PI, and a key derived from the
+    // client's request that nothing durable can reproduce.
+    const clientKeyed = await seedPendingRefund({
+      reason: 'cancel',
+      withPaymentIntent: true,
+      createdAt: FLOOR_MS - 12 * HOUR,
+    });
+    // Post-floor, row-keyed: the sweep's own, aged out of the key window.
+    const rowKeyed = await seedPendingRefund({
+      reason: 'duplicate-invoice-settle',
+      withPaymentIntent: true,
+      createdAt: FLOOR_MS + 2 * HOUR,
+    });
+
+    const logs = collectLogs();
+    const sweeper = makeStripeStub();
+    const tick = await runDuplicateRefundRetryOnce({
+      stripe: sweeper,
+      now: reportNow(),
+      log: logs.log,
+    });
+    assert.equal(tick.abandoned, 3);
+    assert.deepEqual(tick.abandonedByClass, {
+      'row-keyed': 1,
+      'client-keyed': 1,
+      'never-sent': 1,
+    });
+    assert.equal(sweeper.calls.filter((c) => c.method === 'createRefund').length, 0);
+
+    // One alarm per class, each carrying only its own rows.
+    const never = logs.error('never-sent');
+    assert.ok(never);
+    assert.match(JSON.stringify(never.obj.refunds), new RegExp(neverSent));
+    assert.doesNotMatch(JSON.stringify(never.obj.refunds), new RegExp(clientKeyed));
+    assert.doesNotMatch(
+      never.msg ?? '',
+      /refund by hand/i,
+      'an instruction a human cannot follow is worse than no instruction',
+    );
+    assert.match(never.msg ?? '', /no Stripe charge behind them/i);
+
+    const client = logs.error('client-keyed');
+    assert.ok(client);
+    assert.match(JSON.stringify(client.obj.refunds), new RegExp(clientKeyed));
+    assert.match(client.msg ?? '', /no sweep will ever retry/i);
+    assert.match(client.msg ?? '', /CHECK it for an existing refund first/i);
+
+    const owned = logs.error('row-keyed');
+    assert.ok(owned);
+    assert.match(JSON.stringify(owned.obj.refunds), new RegExp(rowKeyed));
+    assert.match(owned.msg ?? '', /idempotency-key window/i);
+    assert.match(
+      JSON.stringify(owned.obj.refunds),
+      new RegExp(`dup-settle-refund:${rowKeyed}`),
+      'the key a human can search Stripe for is in the line that asks them to',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'a standing abandon condition is shouted once per process and counted after — a report nobody can read is a silent one',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const refundId = await seedPendingRefund({
+      reason: 'cancel',
+      withPaymentIntent: true,
+      createdAt: FLOOR_MS - 12 * HOUR,
+    });
+
+    const logs = collectLogs();
+    const sweeper = makeStripeStub();
+    const first = await runDuplicateRefundRetryOnce({
+      stripe: sweeper,
+      now: reportNow(),
+      log: logs.log,
+    });
+    assert.equal(first.abandoned, 1);
+    assert.equal(logs.errors.length, 1, 'the first sighting is the incident');
+    assert.match(JSON.stringify(logs.errors[0]?.obj.refunds), new RegExp(refundId));
+
+    // The tick runs every minute. Unchanged, this row would emit ~1,440
+    // identical ERRORs a day, so the next REAL incident arrives pre-buried.
+    const second = await runDuplicateRefundRetryOnce({
+      stripe: sweeper,
+      now: new Date(reportNow().getTime() + HOUR),
+      log: logs.log,
+    });
+    assert.equal(second.abandoned, 1, 'the condition is still true');
+    assert.equal(second.abandonedByClass['client-keyed'], 1);
+    assert.equal(logs.errors.length, 1, 'and it is not shouted twice');
+    const counted = logs.infos.find(
+      (i) => i.obj.refundClass === 'client-keyed' && i.obj.abandonedCount === 1,
+    );
+    assert.ok(counted, 'demoted, not dropped — the count stays visible every tick');
+    await cleanup();
+  },
+);
+
 test(
   'the sweep refuses refunds whose original key it cannot reproduce',
   SKIP_WHEN_NO_DB,
@@ -1972,12 +2369,19 @@ test(
     await cleanup();
     const invoiceId = await seedDueInvoice({ amountCents: 12_000, purpose: 'group-class' });
     const { refundId } = await stageFailedDuplicateRefund(invoiceId, 12_000);
+    // Same post-floor pinning as the same-key retry test, same reason: a
+    // wall-clock row on the deploy day is below the floor by design.
+    const rowMintedAt = new Date(FLOOR_MS + 25 * HOUR);
+    await db
+      .update(refunds)
+      .set({ createdAt: rowMintedAt.toISOString(), updatedAt: rowMintedAt.toISOString() })
+      .where(eq(refunds.id, refundId));
 
     const sweeper = makeStripeStub();
     const result = await runSchedulerTickOnce({
       expoPush: makeExpoPushStub(),
       stripe: sweeper,
-      now: new Date(Date.now() + 10 * MINUTE),
+      now: new Date(rowMintedAt.getTime() + 10 * MINUTE),
     });
     assert.equal(
       result.duplicateRefundRetry.sent,
@@ -2191,6 +2595,92 @@ test(
       new RegExp(`on ${ATTEMPT_TRIED_ON} and`),
       'dated when the charge was TRIED — a late webhook must not name its own arrival date',
     );
+    await cleanup();
+  },
+);
+
+test(
+  'a refund minted ON the deploy day itself is below the floor — the floor is the midnight AFTER deploy, not the midnight before',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // The first version of REFUND_SWEEP_FLOOR was midnight of the deploy DATE
+    // (2026-08-13T00:00:00Z) — which sits BEFORE any possible deploy instant on
+    // that day, so rows the OLD route minted between 00:00Z and cutover were
+    // above the floor and claimable: the exact unattended second refund F1
+    // exists to prevent, reopened by an off-by-a-day (2026-08-13 verify panel).
+    // This pins a mid-deploy-day row as unclaimable. The instant is absolute on
+    // purpose: if the constant is ever legitimately advanced, this row only
+    // gets FURTHER below the floor — the pin cannot rot into a false red.
+    const deployDayRow = await seedPendingRefund({
+      reason: 'duplicate-invoice-settle',
+      withPaymentIntent: true,
+      createdAt: Date.parse('2026-08-13T09:00:00.000Z'),
+    });
+    const claimed = await withActor('system:stripe-webhook', (tx) =>
+      refundsRepository.claimStalePendingForRetry(tx, {
+        staleBefore: new Date(Date.now() + HOUR),
+        mintedAfter: new Date(Date.parse('2026-08-12T00:00:00.000Z')),
+      }),
+    );
+    assert.equal(
+      claimed.some((r) => r.id === deployDayRow),
+      false,
+      'a deploy-day row may carry the client key the old route used — never re-keyed',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'a page saturated by old never-sent rows cannot bury a newer row-keyed double charge — the counts are true and the buried class is named',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // The report page is capped at 20 OLDEST-FIRST, and never-sent seed rows
+    // are by construction the oldest with no resolution path — so before this
+    // fix, 20 of them held the page forever and a NEWER row-keyed abandoned
+    // double charge (the exact row this worker exists to surface) was never
+    // returned, never counted, never named; every count saturated at the cap
+    // with nothing marking truncation (2026-08-13 verify panel).
+    for (let i = 0; i < 20; i += 1) {
+      await seedPendingRefund({
+        reason: 'cancel',
+        withPaymentIntent: false,
+        createdAt: FLOOR_MS - (90 - i) * 24 * HOUR,
+      });
+    }
+    const buriedRowKeyed = await seedPendingRefund({
+      reason: 'duplicate-invoice-settle',
+      withPaymentIntent: true,
+      createdAt: FLOOR_MS + 1 * HOUR,
+    });
+    const sweeper = makeStripeStub();
+    const logs = collectLogs();
+    const tick = await runDuplicateRefundRetryOnce({
+      stripe: sweeper,
+      now: reportNow(),
+      log: logs.log,
+    });
+    assert.equal(tick.abandonedByClass['row-keyed'], 1, 'the true count, not the page count');
+    assert.equal(tick.abandonedByClass['never-sent'], 20);
+    assert.equal(tick.abandoned, 21, 'the total is the truth, not the page length');
+    assert.equal(tick.abandonedTruncated, true, 'truncation is marked, never silent');
+    const buried = logs.error('row-keyed');
+    assert.ok(buried, 'the buried class is named at ERROR even with zero page presence');
+    assert.match(
+      buried.msg ?? '',
+      /saturated by older rows/i,
+      'and the alarm says WHY the row detail is absent, with the query to run',
+    );
+    assert.equal(
+      sweeper.calls.filter((c) => c.method === 'createRefund').length,
+      0,
+      'reporting the buried row never sends anything',
+    );
+    // Not asserted: buriedRowKeyed's id in the alarm — by construction the page
+    // cannot carry it, which is the point. It exists so the seed is honest.
+    void buriedRowKeyed;
     await cleanup();
   },
 );

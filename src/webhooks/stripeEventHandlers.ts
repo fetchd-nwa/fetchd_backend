@@ -14,6 +14,7 @@ import { invoiceChargeAttemptsRepository } from '../db/repositories/invoiceCharg
 import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import { autoChargeParkNotification } from '../lib/autoChargeNotificationCopy.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
+import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
 import { withActor, type Tx } from '../db/tx.js';
@@ -726,7 +727,12 @@ async function maybeResolveOrphanedInvoiceAttempt(
       // When the charge was TRIED, not when its answer finally reached us. A
       // late `payment_failed` can arrive hours after the attempt, and "we tried
       // your payment on <the day the webhook landed>" is a date we made up.
-      at: new Date(attempt.createdAt),
+      // Through the helper, like every other timestamptz read: Drizzle hands
+      // back PG's space-separated `+00` form, and a bare `new Date` on it is
+      // the engine's implementation-defined fallback rather than the ISO path
+      // (`lib/pgTimestamp.ts`). This was the one site the 2026-08-12 sweep
+      // missed.
+      at: pgTimestampToDate(attempt.createdAt),
     });
     await scheduledNotificationsRepository.enqueueIdempotent(tx, {
       ownerId: invoice.ownerId,

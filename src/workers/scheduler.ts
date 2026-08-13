@@ -253,6 +253,8 @@ export async function runSchedulerTickOnce(
     scanned: 0,
     sent: 0,
     abandoned: 0,
+    abandonedTruncated: false,
+    abandonedByClass: { 'row-keyed': 0, 'client-keyed': 0, 'never-sent': 0 },
     results: [],
   };
   try {

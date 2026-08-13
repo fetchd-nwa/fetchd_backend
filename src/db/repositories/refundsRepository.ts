@@ -1,7 +1,8 @@
 import { and, asc, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { ne } from 'drizzle-orm';
 import { db } from '../client.js';
-import { refunds } from '../schema/schema.js';
+import { pgTimestampToDate } from '../../lib/pgTimestamp.js';
+import { charges, refunds } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
 
 /** Polymorphic runner — pool for pre/post-tx ops, Tx for in-mutation work. */
@@ -61,6 +62,89 @@ const REFUND_PROJECTION = {
  * rather than silently breaking it.
  */
 export const ROW_KEYED_REFUND_REASON = 'duplicate-invoice-settle';
+
+/**
+ * THE DEPLOY BOUNDARY of the retry sweep, and the reason it is a date rather
+ * than a `reason` value (2026-08-13, round 4).
+ *
+ * `reason = 'duplicate-invoice-settle'` has been written since 2026-06-21
+ * (`cade494`), by `settleInvoiceCharge`'s lost-race arm — which BOTH the worker
+ * and `POST /invoices/:id/pay` call. The worker's post-commit fire was always
+ * keyed on our refund-row uuid. The route's was NOT: until this branch it built
+ * its own key, `` `${idempotencyKey}:dup-settle-refund` ``, from the CLIENT's
+ * request key. So the reason string alone cannot tell a row-keyed refund from a
+ * client-keyed one — and re-firing a client-keyed row under
+ * `dup-settle-refund:<refundId>` sends a key Stripe has never seen, which is
+ * not a replay, it is a SECOND full refund of somebody's money. Nothing in the
+ * row can distinguish them; only when it was written can.
+ *
+ * So the sweep claims nothing minted at or before this instant. Rows below the
+ * floor are not lost — {@link findAbandonedPending} still reports them, under
+ * the `client-keyed` class, because their key is unreconstructible and a human
+ * with the Stripe dashboard is the only safe resolver.
+ *
+ * **This value must be > the instant the last OLD-code process stops, and the
+ * only date a human can promise that of in advance is midnight UTC of the day
+ * AFTER deploy.** The first version of this constant was midnight of the
+ * deploy DATE — which sits BEFORE the deploy instant, so rows the old route
+ * minted between 00:00Z and cutover were above the floor and claimable: the
+ * exact double refund this exists to prevent, re-opened by an off-by-a-day
+ * (caught by the 2026-08-13 verify panel, not by any test — a calendar value
+ * cannot be pinned by a suite that runs on arbitrary days).
+ *
+ * If this branch does not deploy on 2026-08-13, ADVANCE this to midnight UTC
+ * of the day AFTER the actual deploy day. Too-late costs only automation —
+ * those rows surface on the abandon report as `client-keyed` and a human
+ * resolves them — which is the safe direction of the two. Too-early is the
+ * double refund.
+ */
+export const REFUND_SWEEP_FLOOR = new Date('2026-08-14T00:00:00.000Z');
+
+/**
+ * What an abandoned-pending refund IS, from the row's own durable facts — the
+ * discriminator {@link findAbandonedPending} returns so the caller's alarm can
+ * say something TRUE about each one instead of one sentence that is false for
+ * two thirds of them.
+ *
+ *   - `never-sent` — the charge behind it carries no `stripe_payment_intent_id`
+ *     at all (pre-Stripe-wire seed money; `cancelBookingService` writes the
+ *     'pending' row anyway to capture the intent). There is nothing at Stripe
+ *     to refund, so "refund it by hand in the dashboard" is not an instruction
+ *     a human can follow. Checked FIRST: how a row would have been keyed does
+ *     not matter when no charge was ever sent.
+ *   - `client-keyed` — either the reason is not {@link ROW_KEYED_REFUND_REASON}
+ *     (`'cancel'`, `'duplicate-membership-subscribe'`), or it is but the row
+ *     predates {@link REFUND_SWEEP_FLOOR}. Both mean the same operationally:
+ *     the original Stripe idempotency key was the client's request key, no
+ *     automatic path can reproduce it, and a human must CHECK Stripe for an
+ *     existing refund before issuing one.
+ *   - `row-keyed` — post-floor, `duplicate-invoice-settle`: the sweep owns
+ *     these, tried, and has now aged past the key window. Its key is
+ *     `dup-settle-refund:<refund id>`, which a human can search for.
+ */
+export type AbandonedRefundClass = 'never-sent' | 'client-keyed' | 'row-keyed';
+
+export interface AbandonedRefundRow extends RefundRow {
+  refundClass: AbandonedRefundClass;
+  /** The PI the refund reverses — `null` is what makes a row `never-sent`. */
+  stripePaymentIntentId: string | null;
+}
+
+/**
+ * The three-way discriminator behind {@link AbandonedRefundClass}. Order is the
+ * whole point: "there is no Stripe charge here" outranks "we could not have
+ * reproduced its key", because a human told to find a refund that never had a
+ * charge will not find one.
+ */
+function classifyAbandoned(args: {
+  reason: string | null;
+  createdAt: string;
+  piId: string | null;
+}): AbandonedRefundClass {
+  if (args.piId === null) return 'never-sent';
+  if (args.reason !== ROW_KEYED_REFUND_REASON) return 'client-keyed';
+  return pgTimestampToDate(args.createdAt) > REFUND_SWEEP_FLOOR ? 'row-keyed' : 'client-keyed';
+}
 
 export const refundsRepository = {
   /**
@@ -180,20 +264,34 @@ export const refundsRepository = {
    * the webhook's invoice-orphan arm made lost-race refunds a COMMON path
    * rather than a rare one.
    *
-   * **Scoped to `reason = 'duplicate-invoice-settle'`, and that is a safety
-   * bound, not a convenience one.** A retry is only safe when it can reproduce
-   * the key the ORIGINAL call used; under a different key Stripe executes a
-   * SECOND refund instead of replaying the first. Only the lost-race arm of
-   * `settleInvoiceCharge` keys its refunds by OUR row uuid
-   * (`duplicateRefundIdempotencyKey`) — every one of its callers now does,
-   * including `POST /invoices/:id/pay`, which was fixed in the same round to
-   * stop keying on the client's request key. The other pending-refund writers
-   * (`reason='cancel'` from the cancel/withdraw paths, and
-   * `'duplicate-membership-subscribe'`) still key on `${idempotencyKey}:…`,
-   * which nothing durable can reconstruct — so this sweep must NOT touch them,
-   * and their failed refunds remain a named, un-swept gap.
+   * **Scoped to `reason = 'duplicate-invoice-settle'` AND to rows minted after
+   * {@link REFUND_SWEEP_FLOOR}, and both are safety bounds, not convenience
+   * ones.** A retry is only safe when it can reproduce the key the ORIGINAL
+   * call used; under a different key Stripe executes a SECOND refund instead of
+   * replaying the first.
    *
-   * Two bounds, both on columns that already exist (no DDL):
+   * The reason string is necessary and NOT sufficient, which an earlier version
+   * of this comment got wrong (round 4, 2026-08-13). It claimed every caller of
+   * `settleInvoiceCharge`'s lost-race arm keys by our row uuid "now, including
+   * `POST /invoices/:id/pay`, which was fixed in the same round" — true of rows
+   * this branch's code writes, and false of every row already in the table.
+   * That arm has stamped this exact reason since 2026-06-21, and the route
+   * fired those refunds under `` `${idempotencyKey}:dup-settle-refund` ``, the
+   * client's request key. A sweep with no lower bound would re-fire them under
+   * `dup-settle-refund:<refundId>` — a key Stripe has never seen — and refund
+   * the owner a second time, unattended. Hence the floor; see its own doc for
+   * why the boundary has to be a date.
+   *
+   * The other pending-refund writers (`reason='cancel'` from the
+   * cancel/withdraw paths, and `'duplicate-membership-subscribe'`) key on
+   * `${idempotencyKey}:…` to this day, which nothing durable can reconstruct —
+   * so this sweep must NOT touch them either, and their failed refunds remain a
+   * named, un-swept gap.
+   *
+   * Nothing excluded here is dropped: every unsent 'pending' refund the sweep
+   * refuses still reaches a human through {@link findAbandonedPending}.
+   *
+   * Three bounds, all on columns that already exist (no DDL):
    *   - `staleBefore` (on `updated_at`) is the retry cadence AND the lease: the
    *     claim's own UPDATE moves `updated_at` (explicitly, and the
    *     `refunds_touch` trigger would anyway), hiding the row from the next
@@ -205,11 +303,16 @@ export const refundsRepository = {
    *     replay the first — the mirror image of the auto-charge key window, and
    *     the same answer: stop, and hand it to a human
    *     (see `findAbandonedPending`).
+   *   - {@link REFUND_SWEEP_FLOOR} (on `created_at`) is the DEPLOY bound, and
+   *     it is applied HERE rather than by the caller so no caller can widen it.
+   *     The effective floor is whichever of the two is later.
    */
   async claimStalePendingForRetry(
     tx: Tx,
     args: { staleBefore: Date; mintedAfter: Date; limit?: number },
   ): Promise<RefundRow[]> {
+    const mintedAfter =
+      args.mintedAfter > REFUND_SWEEP_FLOOR ? args.mintedAfter : REFUND_SWEEP_FLOOR;
     const due = await tx
       .select({ id: refunds.id })
       .from(refunds)
@@ -219,7 +322,7 @@ export const refundsRepository = {
           isNull(refunds.stripeRefundId),
           eq(refunds.reason, ROW_KEYED_REFUND_REASON),
           lte(refunds.updatedAt, args.staleBefore.toISOString()),
-          gt(refunds.createdAt, args.mintedAfter.toISOString()),
+          gt(refunds.createdAt, mintedAfter.toISOString()),
         ),
       )
       .orderBy(asc(refunds.createdAt))
@@ -248,25 +351,84 @@ export const refundsRepository = {
    * Deliberately NOT scoped by `reason`, unlike the claim above. Retrying is an
    * ACTION and must be keyed correctly; reporting is a READ, and a stuck
    * `'cancel'` refund is exactly as much owed money as a stuck duplicate-settle
-   * one — more so, because no sweep will ever pick it up. Every row here needs
-   * the same thing: a human in the Stripe dashboard.
+   * one — more so, because no sweep will ever pick it up.
+   *
+   * **And deliberately not floored at {@link REFUND_SWEEP_FLOOR} either**
+   * (round 4, 2026-08-13). The floor is what makes those rows UN-RETRYABLE; a
+   * report that also hid them would leave a double-charged owner with no
+   * surface at all, and the claim's own contract is that what it refuses lands
+   * here instead. What the floor does here is CLASSIFY: a pre-floor
+   * `duplicate-invoice-settle` row is reported as `client-keyed`, because that
+   * is the honest thing to tell whoever has to resolve it.
+   *
+   * Every row carries {@link AbandonedRefundClass} and the charge's PI id, for
+   * one reason: the caller's alarm used to end "refund by hand in the Stripe
+   * dashboard", which is an instruction a human CANNOT follow for a pre-Stripe
+   * seed row and a dangerous one for a client-keyed row (issue a second refund
+   * for one that may already exist). One sentence per class, each true — the
+   * LEFT JOIN is what makes `never-sent` knowable at all.
    */
   async findAbandonedPending(
     runner: Runner,
     args: { mintedBefore: Date; limit?: number },
-  ): Promise<RefundRow[]> {
-    return runner
-      .select(REFUND_PROJECTION)
+  ): Promise<{ rows: AbandonedRefundRow[]; totalByClass: Record<AbandonedRefundClass, number> }> {
+    // The page is capped and OLDEST-FIRST, and never-sent seed rows are by
+    // construction the oldest rows with no resolution path in this change — so
+    // with enough of them standing, the page is permanently theirs, and a NEWER
+    // row-keyed abandoned double charge would never appear in it. The 2026-08-13
+    // verify panel proved that made the alarm's own guarantee ("the condition is
+    // never invisible") false: the caps saturated with nothing marking
+    // truncation. So the TRUE counts come from a companion unbounded query over
+    // only the classification inputs — same WHERE, same classifier, so the two
+    // cannot disagree about what a row is — and the caller alarms on counts, not
+    // on page presence.
+    const abandonedWhere = and(
+      eq(refunds.status, 'pending'),
+      isNull(refunds.stripeRefundId),
+      lte(refunds.createdAt, args.mintedBefore.toISOString()),
+    );
+    const classInputs = await runner
+      .select({
+        reason: refunds.reason,
+        createdAt: refunds.createdAt,
+        stripePaymentIntentId: charges.stripePaymentIntentId,
+      })
       .from(refunds)
-      .where(
-        and(
-          eq(refunds.status, 'pending'),
-          isNull(refunds.stripeRefundId),
-          lte(refunds.createdAt, args.mintedBefore.toISOString()),
-        ),
-      )
+      .leftJoin(charges, eq(refunds.chargeId, charges.id))
+      .where(abandonedWhere);
+    const totalByClass: Record<AbandonedRefundClass, number> = {
+      'row-keyed': 0,
+      'client-keyed': 0,
+      'never-sent': 0,
+    };
+    for (const input of classInputs) {
+      totalByClass[
+        classifyAbandoned({
+          reason: input.reason,
+          createdAt: input.createdAt,
+          piId: input.stripePaymentIntentId,
+        })
+      ] += 1;
+    }
+    const rows = await runner
+      .select({
+        ...REFUND_PROJECTION,
+        reason: refunds.reason,
+        createdAt: refunds.createdAt,
+        stripePaymentIntentId: charges.stripePaymentIntentId,
+      })
+      .from(refunds)
+      .leftJoin(charges, eq(refunds.chargeId, charges.id))
+      .where(abandonedWhere)
       .orderBy(asc(refunds.createdAt))
       .limit(args.limit ?? 20);
+    return {
+      rows: rows.map(({ reason, createdAt, ...row }) => ({
+        ...row,
+        refundClass: classifyAbandoned({ reason, createdAt, piId: row.stripePaymentIntentId }),
+      })),
+      totalByClass,
+    };
   },
 
   /**

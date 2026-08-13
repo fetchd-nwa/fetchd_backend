@@ -13,10 +13,15 @@ import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
  * never shown): she approved the eight **bodies**, with the note *"if its too
  * wordy we can change later on"*. The two NEW titles — `'Payment still
  * processing'` (in-flight) and `"We're checking your payment"` (unconfirmed) —
- * are builder-invented and still pending her veto; every other arm reuses the
- * already-shipped `'Payment failed'` title. The approval is dated 2026-08-12
- * here and 2026-08-11 in the mobile repo's mirror of the same event; that
- * disagreement is unreconciled and one of the two is wrong.
+ * are builder-invented and **still pending her veto**; that is unchanged by
+ * round 4. Arms 2-4 and 6 reuse the already-shipped `'Payment failed'` title,
+ * which she has approved and explicitly kept for arm 6. Arm 5
+ * (`no-card-on-file`) now carries `'Payment due'` — also not builder-invented
+ * and not awaiting a veto: it is the product's existing approved pair for that
+ * state, reused verbatim from the payment-due reminder (2026-08-13, her
+ * delegated judgment; the reasoning is in the round-4 record). The approval is
+ * dated 2026-08-12 here and 2026-08-11 in the mobile repo's mirror of the same
+ * event; that disagreement is unreconciled and one of the two is wrong.
  *
  * **Nothing here may be inlined at a call site.** Shortening this copy later
  * has to be a one-file edit, which is only true while this file is the only
@@ -40,7 +45,12 @@ import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
  *   - **Never claim we tried when we didn't.** `no-card-on-file` and
  *     `stripe-customer-missing` make ZERO Stripe calls, so they say "nothing
  *     has been charged" rather than the old "We tried your $X payment…", which
- *     was simply false on those two paths.
+ *     was simply false on those two paths. `no-card-on-file` carries that
+ *     through to its title and its deep-link reason (`payment-due`); the two
+ *     of them used to say "failed" over a body saying nothing was attempted,
+ *     and a push is read title-first. `stripe-customer-missing` keeps
+ *     `'Payment failed'` on purpose — for the owner it IS a failed payment,
+ *     and its body takes the blame in the next clause.
  */
 
 /**
@@ -165,9 +175,25 @@ export function autoChargeParkNotification(
           `or pay in person with cash or check.`,
       };
     case 'no-card-on-file':
+      // NOT 'Payment failed', and NOT `reason: 'payment-failed'` (round 4,
+      // 2026-08-13). Nothing failed on this arm: zero Stripe calls were made,
+      // there is no card to decline, and the body says so in its own second
+      // clause. A title and a deep-link reason that both say "failed" made the
+      // push contradict itself and opened the settle sheet under a failure
+      // framing for an owner whose only task is to add a card or pay in
+      // person. `payment-due` is the product's already-approved vocabulary for
+      // exactly this state — the same pair `invoice-overdue` and the
+      // payment-due reminder use, whose sheet heading is "Payment due / How
+      // would you like to pay?". No new words, and coherent end to end.
+      //
+      // The dedupe key stays `payment-failed:<id>` deliberately: it is the
+      // "one terminal park push per invoice, ever" floor shared with arms 2-6
+      // and the key `findOverdueForWarning` reads to suppress the overdue nag.
+      // Changing it would let an invoice send two terminal pushes.
       return {
-        ...failed,
-        title: 'Payment failed',
+        dedupeKey: failed.dedupeKey,
+        reason: 'payment-due',
+        title: 'Payment due',
         body:
           `Your ${amount} payment for ${what} was due ${when}, but there's no card on ` +
           `file we can charge — nothing has been charged. You can add a card in the app, ` +
