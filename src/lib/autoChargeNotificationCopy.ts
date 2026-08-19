@@ -13,8 +13,9 @@ import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
  * never shown): she approved the eight **bodies**, with the note *"if its too
  * wordy we can change later on"*. The two NEW titles — `'Payment still
  * processing'` (in-flight) and `"We're checking your payment"` (unconfirmed) —
- * are builder-invented and **still pending her veto**; that is unchanged by
- * round 4. Arms 2-4 and 6 reuse the already-shipped `'Payment failed'` title,
+ * were builder-invented and shipped flagged; **Allison approved both
+ * 2026-08-19**, closing that veto. Arms 2-4 and 6 reuse the already-shipped
+ * `'Payment failed'` title,
  * which she has approved and explicitly kept for arm 6. Arm 5
  * (`no-card-on-file`) now carries `'Payment due'` — also not builder-invented
  * and not awaiting a veto: it is the product's existing approved pair for that
