@@ -42,6 +42,16 @@ import {
   threads,
   vets,
 } from '../../src/db/schema/schema.js';
+import { env } from '../../src/env.js';
+import { assertTestDatabaseUrl } from './_dbGuard.js';
+
+// Before anything else in this module can run: teardown hard-DELETEs whatever
+// DATABASE_URL reaches, and the only database allowed to absorb that is the
+// isolated db-test container on :5433. On 2026-08-13 a bare `tsx --test` run
+// (no CLI env, so `.env.local` won) aimed teardown at the dev DB and mangled
+// the seed. `npm test` / `npm run gate` set the :5433 URL on the CLI.
+assertTestDatabaseUrl(env.DATABASE_URL);
+
 /**
  * Fixed UUIDs let the contract snapshots be real JSON files checked into git —
  * no normalization gymnastics, the regression net catches a field rename the
