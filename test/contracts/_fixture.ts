@@ -42,7 +42,6 @@ import {
   threads,
   vets,
 } from '../../src/db/schema/schema.js';
-
 /**
  * Fixed UUIDs let the contract snapshots be real JSON files checked into git —
  * no normalization gymnastics, the regression net catches a field rename the
@@ -247,6 +246,22 @@ export const FIXTURE_TODAY = new Date('2026-05-19T17:00:00Z');
 export const FIXTURE_NOW = (): Date => FIXTURE_TODAY;
 
 /**
+ * Wall-clock-safe vaccine expiries. The DDL trigger `assert_vaccines_current`
+ * (schema.sql) compares `dog_vaccines.expires_at` to REAL `now()` — the
+ * injected FIXTURE_TODAY clock cannot reach a trigger — so these dates must
+ * stay far ahead of the actual calendar or every gated booking insert in
+ * `seedFixture` dies at the hook (2026-08-19: Bordetella at '2026-08-15' took
+ * 830 of 1087 tests down as one root cause). `fixture-rot.test.ts` trips 180
+ * days before they rot again. The snapshots pin these exact strings — bump
+ * `snapshots/dogs.json` + `snapshots/dog-by-id.json` in the same edit.
+ * Bordetella stays earlier than Rabies so the emitted order is preserved.
+ */
+export const FIXTURE_VACCINE_EXPIRIES = {
+  rabies: '2031-05-19',
+  bordetella: '2030-08-15',
+} as const;
+
+/**
  * Re-seed the fixture. Idempotent across runs: hard-deletes any prior rows
  * first (test scaffolding may use raw DELETE — the never-DELETE invariant is
  * the API's contract with the FE, not a constraint on test seam code).
@@ -383,14 +398,14 @@ export async function seedFixture(): Promise<void> {
       dogId: FIXTURE_IDS.dog1Id,
       name: 'Rabies',
       requirementKey: FIXTURE_IDS.requiredVaccineRabiesKey,
-      expiresAt: '2027-05-19',
+      expiresAt: FIXTURE_VACCINE_EXPIRIES.rabies,
     },
     {
       id: FIXTURE_IDS.vaccine2Id,
       dogId: FIXTURE_IDS.dog1Id,
       name: 'Bordetella',
       requirementKey: FIXTURE_IDS.requiredVaccineBordetellaKey,
-      expiresAt: '2026-08-15',
+      expiresAt: FIXTURE_VACCINE_EXPIRIES.bordetella,
     },
     // Lola gets the same gating vaccines so she can be lead on day-care /
     // day-school / boarding bookings (vaccine gate checks the lead dog).
@@ -399,14 +414,14 @@ export async function seedFixture(): Promise<void> {
       dogId: FIXTURE_IDS.dog2Id,
       name: 'Rabies',
       requirementKey: FIXTURE_IDS.requiredVaccineRabiesKey,
-      expiresAt: '2027-05-19',
+      expiresAt: FIXTURE_VACCINE_EXPIRIES.rabies,
     },
     {
       id: FIXTURE_IDS.vaccine4Id,
       dogId: FIXTURE_IDS.dog2Id,
       name: 'Bordetella',
       requirementKey: FIXTURE_IDS.requiredVaccineBordetellaKey,
-      expiresAt: '2026-08-15',
+      expiresAt: FIXTURE_VACCINE_EXPIRIES.bordetella,
     },
   ]);
 

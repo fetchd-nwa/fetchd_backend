@@ -8,13 +8,13 @@
     {
       "id": "44444444-4444-4444-8444-444444444442",
       "name": "Bordetella",
-      "expires_at": "2026-08-15",
+      "expires_at": "2030-08-15",
       "requirement_key": "test-bordetella"
     },
     {
       "id": "44444444-4444-4444-8444-444444444441",
       "name": "Rabies",
-      "expires_at": "2027-05-19",
+      "expires_at": "2031-05-19",
       "requirement_key": "test-rabies"
     }
   ],

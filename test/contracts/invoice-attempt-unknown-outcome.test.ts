@@ -1940,23 +1940,29 @@ test(
     await cleanup();
     const invoiceId = await seedDueInvoice({ amountCents: 12_000, purpose: 'group-class' });
     const { refundId, failedKey } = await stageFailedDuplicateRefund(invoiceId, 12_000);
-    // Pin the row and the sweep to one post-floor instant. Staged rows carry a
-    // wall-clock created_at, and REFUND_SWEEP_FLOOR is midnight AFTER the
-    // deploy day — so on the deploy day itself a wall-clock row sits below the
-    // floor and is correctly unclaimable (see the deploy-day pin). Left
-    // unpinned, this test would fail before the floor date and pass after it:
-    // the fixture-clock bomb class, third sighting. One clock, both sides.
-    const rowMintedAt = new Date(FLOOR_MS + 25 * HOUR);
+    // Anchor the row to the WALL clock. The old floor-relative pin
+    // (FLOOR_MS + 25h, updated_at pinned to match) rotted on 2026-08-15: the
+    // `refunds_touch` trigger unconditionally overwrites updated_at with real
+    // now() on ANY update, so the updated_at half of that pin never landed,
+    // and the test passed only while wall-now was still below the pinned
+    // staleBefore horizon — the fixture-clock bomb class again, caught
+    // 2026-08-19, six days after it was written. Wall anchoring: created_at
+    // ten real minutes ago (above the floor while the floor is in the past),
+    // and the sweep runs ten minutes AHEAD of the wall so the trigger-stamped
+    // updated_at clears the 5-minute staleness grace. This honestly reds if
+    // the floor is ever advanced past today for a future deploy — the sweep
+    // is inert then by design, and the stored-key build retires the floor.
+    const rowMintedAt = new Date(Date.now() - 10 * MINUTE);
     await db
       .update(refunds)
-      .set({ createdAt: rowMintedAt.toISOString(), updatedAt: rowMintedAt.toISOString() })
+      .set({ createdAt: rowMintedAt.toISOString() })
       .where(eq(refunds.id, refundId));
 
     // Before this sweep existed nothing retried these rows — no worker imported
     // `refundsRepository`, and `charge.refund.updated` cannot arrive for a
     // refund that was never created. The owner stayed double-charged forever.
     const sweeper = makeStripeStub();
-    const now = new Date(rowMintedAt.getTime() + 10 * MINUTE);
+    const now = new Date(Date.now() + 10 * MINUTE);
     const tick = await runDuplicateRefundRetryOnce({ stripe: sweeper, now });
     assert.equal(tick.scanned, 1);
     assert.equal(tick.sent, 1);
@@ -2369,19 +2375,20 @@ test(
     await cleanup();
     const invoiceId = await seedDueInvoice({ amountCents: 12_000, purpose: 'group-class' });
     const { refundId } = await stageFailedDuplicateRefund(invoiceId, 12_000);
-    // Same post-floor pinning as the same-key retry test, same reason: a
-    // wall-clock row on the deploy day is below the floor by design.
-    const rowMintedAt = new Date(FLOOR_MS + 25 * HOUR);
+    // Same wall-clock anchoring as the same-key retry test, same reason: the
+    // touch trigger voids any updated_at pin, so the only honest clock is the
+    // real one (created_at ten minutes back, sweep ten minutes ahead).
+    const rowMintedAt = new Date(Date.now() - 10 * MINUTE);
     await db
       .update(refunds)
-      .set({ createdAt: rowMintedAt.toISOString(), updatedAt: rowMintedAt.toISOString() })
+      .set({ createdAt: rowMintedAt.toISOString() })
       .where(eq(refunds.id, refundId));
 
     const sweeper = makeStripeStub();
     const result = await runSchedulerTickOnce({
       expoPush: makeExpoPushStub(),
       stripe: sweeper,
-      now: new Date(rowMintedAt.getTime() + 10 * MINUTE),
+      now: new Date(Date.now() + 10 * MINUTE),
     });
     assert.equal(
       result.duplicateRefundRetry.sent,
