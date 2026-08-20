@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { deepLinkToPath } from '../contracts/wire.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
@@ -14,23 +15,24 @@ import {
 } from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
-import type { StripeClient } from './stripe.js';
 import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
 import { nextMonthlyPeriodEnd } from './membershipBilling.js';
+import type { PendingStripeRefund } from './pendingRefund.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
 
 /**
- * The post-Stripe handle the caller fires after commit (mirrors
- * `cancelBookingService.PendingStripeRefund`): on a lost settle race the
- * duplicate charge's refund row is written 'pending' inside the tx, and the
+ * The post-Stripe handle the caller fires after commit: on a lost settle race
+ * the duplicate charge's refund row is written 'pending' inside the tx, and the
  * caller fires the actual Stripe `createRefund` against `paymentIntentId`
  * post-commit, then persists the `re_*` id via `refundsRepository.markStripeId`.
+ *
+ * An alias, not a second type, since 2026-08-19: this and
+ * `cancelBookingService`'s handle were structurally identical declarations in
+ * two files, and the stored idempotency key is exactly the kind of field that
+ * gets added to one of those and forgotten on the other. One shape, one fire
+ * helper ({@link firePendingRefundPostCommit}), five sites.
  */
-export interface PendingDuplicateRefund {
-  refundId: string;
-  paymentIntentId: string;
-  amountCents: number;
-}
+export type PendingDuplicateRefund = PendingStripeRefund;
 
 /**
  * Discriminated result so each caller can shape its own honest response:
@@ -163,95 +165,59 @@ export async function settleInvoiceCharge(
     return { outcome: 'refunded', chargeId: charge.id, pendingStripeRefund: undefined };
   }
 
+  // The row's uuid is minted APP-SIDE here, not by the DB default, because this
+  // lane's Stripe key is derived from it — the key has to exist before the
+  // INSERT that stores it, and only the caller can break that circle. Storing
+  // it converges this lane on the same one honest claim predicate as every
+  // other writer instead of leaving `reason` to carry the meaning (design §2.1).
+  const refundId = randomUUID();
   const refund = await refundsRepository.createPending(tx, {
+    id: refundId,
     ownerId: invoice.ownerId,
     chargeId: charge.id,
     bookingId: invoice.bookingId,
     amountCents: maxRefund,
     // Load-bearing since 2026-08-12: this exact string is what the
-    // `duplicate-refund-retry` sweep claims on, because it means "this row's
-    // Stripe key is `duplicateRefundIdempotencyKey(row.id)`". Every caller of
-    // this arm fires it through `fireDuplicateRefundPostCommit`, so that holds.
+    // `duplicate-refund-retry` sweep's LEGACY lane claims on, because it means
+    // "this row's Stripe key is `duplicateRefundIdempotencyKey(row.id)`". Rows
+    // minted from here on also carry that key in the column above, so the
+    // legacy lane matters only for rows already on disk.
     reason: ROW_KEYED_REFUND_REASON,
+    stripeIdempotencyKey: duplicateRefundIdempotencyKey(refundId),
   });
 
   return {
     outcome: 'refunded',
     chargeId: charge.id,
-    pendingStripeRefund: { refundId: refund.id, paymentIntentId, amountCents: maxRefund },
+    pendingStripeRefund: {
+      refundId: refund.id,
+      paymentIntentId,
+      amountCents: maxRefund,
+      stripeIdempotencyKey: duplicateRefundIdempotencyKey(refund.id),
+    },
   };
 }
 
 /**
- * The other half of the `'refunded'` outcome's contract, extracted 2026-08-12 so
- * the two async settle paths cannot drift from the worker's.
- *
- * `settleInvoiceCharge` never calls Stripe (no Stripe inside a tx, R5): on a
- * LOST settle race it writes the duplicate charge's refund row 'pending' and
- * hands the caller this handle. Every caller then owes the same three steps
- * post-commit — fire `createRefund` against the duplicate PI, persist the `re_*`
- * id so the `charge.refund.updated` webhook matches deterministically, and on
- * failure LOG and leave the 'pending' row for retry rather than swallow a
- * paid-but-unrefunded double charge.
- *
- * Callers: the auto-charge worker, the verify lane, and (since the invoice
- * orphan arm) the Stripe webhook receiver — the last of which reaches the
- * lost-race branch most often, because it settles PIs for invoices the owner
- * may have paid manually in the meantime. That is the "two charges, one refund,
- * no human" arc, and it only works if every caller does this identically.
- *
- * `stripe` is narrowed to the one verb used so a caller can't accidentally be
- * handed more Stripe surface than this needs.
- */
-/**
  * THE Stripe idempotency key for a lost-race duplicate refund. Keyed on OUR
- * refund row's uuid, which is why the retry sweep exists at all: the key is
- * reconstructible from durable state forever, so a retry of a `createRefund`
- * whose response was lost REPLAYS the original refund instead of sending a
- * second one. Both callers — the post-commit fire below and
- * `workers/duplicateRefundRetry.ts` — must use this and nothing else; two
- * spellings of one key would turn the retry into the double refund it exists
- * to prevent.
+ * refund row's uuid, which is why the retry sweep could exist for this lane at
+ * all before there was a column to store keys in: the key is reconstructible
+ * from durable state forever, so a retry of a `createRefund` whose response was
+ * lost REPLAYS the original refund instead of sending a second one.
+ *
+ * Since 2026-08-19 the mint above also WRITES this string onto the row, so
+ * there is one spelling and one source: this function. It keeps its
+ * single-source role for both the legacy rows already on disk (which the
+ * sweep's fallback reconstructs) and the alarm line that prints the key a human
+ * should search Stripe for.
+ *
+ * The post-commit fire itself moved to `lib/pendingRefund.ts`
+ * ({@link firePendingRefundPostCommit}) — all five money-back writers now share
+ * one helper and one params constructor, because a same-key retry only replays
+ * when the parameters match byte-for-byte.
  */
 export function duplicateRefundIdempotencyKey(refundId: string): string {
   return `dup-settle-refund:${refundId}`;
-}
-
-export async function fireDuplicateRefundPostCommit(args: {
-  pending: PendingDuplicateRefund | undefined;
-  stripe: Pick<StripeClient, 'createRefund'>;
-  log: { error(obj: Record<string, unknown>, msg?: string): void };
-  /** Context for the failure log line — whatever names the money for an operator. */
-  context: Record<string, unknown>;
-}): Promise<void> {
-  const { pending, stripe, log } = args;
-  if (pending === undefined) return; // defensive zero-refund case: nothing to send back
-  try {
-    const refund = await stripe.createRefund(
-      {
-        paymentIntentId: pending.paymentIntentId,
-        amountCents: pending.amountCents,
-        reason: 'requested_by_customer',
-      },
-      duplicateRefundIdempotencyKey(pending.refundId),
-    );
-    await refundsRepository.markStripeId({ id: pending.refundId, stripeRefundId: refund.id });
-  } catch (err) {
-    log.error(
-      {
-        ...args.context,
-        refundId: pending.refundId,
-        paymentIntentId: pending.paymentIntentId,
-        err: err instanceof Error ? err.message : String(err),
-      },
-      // "Left for retry" is true as of 2026-08-12 and was not before: the
-      // scheduler's `duplicate-refund-retry` phase claims exactly these rows
-      // (pending, no `stripe_refund_id`) and re-fires under the SAME key. Until
-      // it existed, nothing anywhere retried them and this line was the entire
-      // response to an owner being double-charged.
-      'lost-race duplicate refund failed to fire; pending row left for the retry sweep',
-    );
-  }
 }
 
 /**

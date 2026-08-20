@@ -213,8 +213,58 @@ export interface StripeStub extends StripeClient {
   ): void;
   /** Make the next `detachPaymentMethod` throw. */
   throwOnDetach(): void;
-  /** Make the next `createRefund` throw. */
+  /**
+   * Make the next `createRefund` throw BEFORE anything is recorded — the
+   * request never reached Stripe. A same-key retry afterwards therefore
+   * EXECUTES (correctly: it is the one and only refund).
+   */
   throwOnRefund(): void;
+  /**
+   * The dangerous half of a failed refund, and the one the stub could not
+   * express until 2026-08-19: the `createRefund` REACHED Stripe (the refund
+   * exists, the idempotency key is now live, the money is on its way back) and
+   * only the RESPONSE was lost. The caller sees a thrown transport error, our
+   * row stays `'pending'` with no `re_*`, and the retry sweep will try again —
+   * which is safe if and only if it sends the SAME key, because a same-key call
+   * REPLAYS this refund instead of executing a second one.
+   *
+   * This is THE case the stored-key design exists for. Before this knob,
+   * `createRefund` minted a fresh `re_*` on every call regardless of key, so a
+   * sweep that re-executed instead of replaying — an unattended double refund —
+   * passed the suite exactly as a correct one did.
+   */
+  refundLandsThenThrows(err?: Error): void;
+  /**
+   * Make the next `createRefund` fail the way Stripe fails a key that is
+   * ALREADY IN FLIGHT: HTTP 409 `idempotency_key_in_use`. This is design §3
+   * arm 3 — the sweep firing while the original post-commit call is still
+   * running, because a slow Stripe round-trip outlasted the 5-minute grace.
+   *
+   * Nothing is recorded and no money moves: Stripe is the arbiter, our side
+   * needs no interlock, and the correct response is to leave the row pending
+   * and let the next tick resolve it. The design promised this arm would be
+   * "unit-covered, stated not skipped" and it was neither until 2026-08-20.
+   */
+  refundConcurrentKeyInUse(): void;
+  /**
+   * Declare how many cents a PaymentIntent can still have refunded against it,
+   * so the arms where a refund must be REFUSED are assertable: the charge was
+   * already refunded out of band (design §3 arm 7), or an expired-key retry
+   * executed fresh against a charge that already came back (arm 5). Past the
+   * declared balance the stub throws a `charge_already_refunded`-coded error
+   * and moves no money.
+   *
+   * Only needed for PaymentIntents the stub did not mint itself — for its own
+   * `pi_test_*` intents the confirmed amount IS the balance.
+   */
+  setRefundableBalance(paymentIntentId: string, amountCents: number): void;
+  /**
+   * Every refund Stripe actually EXECUTED, in order. A replay is not an
+   * execution and does not appear twice — which is what makes "exactly one
+   * refund exists for this money" an assertion rather than a hope. Compare with
+   * `calls`, which counts attempts including replays.
+   */
+  executedRefunds(): readonly StripeRefundResult[];
   /**
    * Make the next `cancelPaymentIntent` throw — the "Stripe won't let us cancel
    * this one" case every caller of it swallows. The call is still recorded, so a
@@ -261,6 +311,19 @@ function paramsFingerprint(args: Parameters<StripeClient['createAndConfirmPaymen
   ]);
 }
 
+/**
+ * The fingerprint Stripe hashes a refund idempotency key against. Every field
+ * the production `refundCreateParams` sends, in the order it sends them —
+ * because a same-key call whose params differ in ANY of them is an
+ * `idempotency_error`, and the sweep re-building these params differently from
+ * the post-commit fire is exactly the regression the byte-equality pin watches.
+ */
+function refundParamsFingerprint(
+  args: Parameters<StripeClient['createRefund']>[0],
+): string {
+  return JSON.stringify([args.paymentIntentId, args.amountCents, args.reason ?? null]);
+}
+
 /** One live PaymentIntent, as Stripe would hold it. */
 interface StubIntentState {
   status: StripePaymentIntentStatus;
@@ -293,8 +356,23 @@ export function makeStripeStub(): StripeStub {
   // Live PaymentIntent state, so `retrievePaymentIntent` answers what Stripe
   // would and `cancelPaymentIntent` actually changes something.
   const intents = new Map<string, StubIntentState>();
+  // Stripe's idempotency layer for REFUNDS, modelled exactly as the confirm
+  // verb's above. The confirm verb got its replay store on 2026-08-12;
+  // `createRefund` did not, so until 2026-08-19 a broken sweep that
+  // re-EXECUTED a refund instead of replaying it passed the suite identically
+  // to a correct one — a counterfeit for the one mechanism that keeps a retry
+  // from becoming a second refund of somebody's money.
+  const refundReplays = new Map<string, { fingerprint: string; result: StripeRefundResult }>();
+  /** Refunds Stripe EXECUTED. A replay adds nothing here; that is the point. */
+  const executedRefundLog: StripeRefundResult[] = [];
+  /** Cumulative executed refund cents per PaymentIntent. */
+  const refundedByPi = new Map<string, number>();
+  /** Declared refundable balance per PI (see `setRefundableBalance`). */
+  const declaredRefundable = new Map<string, number>();
   let detachShouldThrow = false;
   let refundShouldThrow = false;
+  let refundLandsThenThrowsErr: Error | undefined;
+  let refundKeyInUse = false;
   let cancelShouldThrow = false;
   let pmSnapshotOverride: Partial<StripePaymentMethodSnapshot> = {};
   let setupIntentOverride: Partial<StripeSetupIntentSnapshot> = {};
@@ -355,6 +433,22 @@ export function makeStripeStub(): StripeStub {
     },
     throwOnRefund() {
       refundShouldThrow = true;
+    },
+    refundLandsThenThrows(err) {
+      refundLandsThenThrowsErr =
+        err ??
+        new Stripe.errors.StripeConnectionError({
+          message: 'stub: refund reached Stripe, response lost',
+        });
+    },
+    refundConcurrentKeyInUse() {
+      refundKeyInUse = true;
+    },
+    setRefundableBalance(paymentIntentId, amountCents) {
+      declaredRefundable.set(paymentIntentId, amountCents);
+    },
+    executedRefunds() {
+      return executedRefundLog;
     },
     throwOnCancel() {
       cancelShouldThrow = true;
@@ -618,12 +712,92 @@ export function makeStripeStub(): StripeStub {
 
     async createRefund(args, idempotencyKey): Promise<StripeRefundResult> {
       calls.push({ method: 'createRefund', args, idempotencyKey });
+
+      // ── Stripe's idempotency layer, BEFORE anything else ──────────────────
+      // Checked before the levers, deliberately: a replay is not a new
+      // execution, so it must not consume a single-shot failure knob either.
+      const recorded = refundReplays.get(idempotencyKey);
+      if (recorded !== undefined) {
+        if (recorded.fingerprint !== refundParamsFingerprint(args)) {
+          // Same key, drifted params. Stripe 400s and NO money moves — loud and
+          // safe, but the refund also never lands, which is why both the
+          // post-commit fire and the sweep build these params in one place.
+          throw new Stripe.errors.StripeIdempotencyError({
+            type: 'idempotency_error',
+            code: 'idempotency_error',
+            message:
+              'Keys for idempotent requests can only be used with the same parameters they were first used with.',
+            statusCode: 400,
+          } as never);
+        }
+        // The ORIGINAL refund object — same `re_*`. Exactly one refund exists
+        // for this money no matter how many times the sweep re-fires.
+        return recorded.result;
+      }
+
       if (refundShouldThrow) {
+        // Never reached Stripe: nothing recorded, no key burned, no money.
         refundShouldThrow = false;
         throw new Error('stub: refund failed');
       }
-      const id = testIdPrefix('re');
-      return { id, status: 'pending', amountCents: args.amountCents };
+
+      if (refundKeyInUse) {
+        // The key is live on a request Stripe is still working. Nothing is
+        // recorded here BECAUSE nothing is decided yet — the in-flight call
+        // owns the outcome, and this attempt simply loses the race.
+        refundKeyInUse = false;
+        throw new Stripe.errors.StripeIdempotencyError({
+          type: 'idempotency_error',
+          code: 'idempotency_key_in_use',
+          message:
+            'There is currently another in-progress request using this Idempotent Key.',
+          statusCode: 409,
+        } as never);
+      }
+
+      // ── The cumulative refundable cap ─────────────────────────────────────
+      // Stripe will not return more than a charge holds. For intents this stub
+      // minted, the confirmed amount IS the balance; otherwise a test declares
+      // it. Unknown means unmodelled, and an unmodelled cap is stated here
+      // rather than silently enforced as "infinite is fine".
+      const cap =
+        declaredRefundable.get(args.paymentIntentId) ??
+        intents.get(args.paymentIntentId)?.amountCents;
+      const already = refundedByPi.get(args.paymentIntentId) ?? 0;
+      if (cap !== undefined && already + args.amountCents > cap) {
+        throw new Stripe.errors.StripeInvalidRequestError({
+          type: 'invalid_request_error',
+          code: already >= cap ? 'charge_already_refunded' : 'amount_too_large',
+          message:
+            already >= cap
+              ? 'Charge has already been refunded.'
+              : `Refund amount ($${args.amountCents / 100}) is greater than the remaining unrefunded amount.`,
+          statusCode: 400,
+        } as never);
+      }
+
+      const executed: StripeRefundResult = {
+        id: testIdPrefix('re'),
+        status: 'pending',
+        amountCents: args.amountCents,
+      };
+      refundReplays.set(idempotencyKey, {
+        fingerprint: refundParamsFingerprint(args),
+        result: executed,
+      });
+      executedRefundLog.push(executed);
+      refundedByPi.set(args.paymentIntentId, already + args.amountCents);
+
+      if (refundLandsThenThrowsErr !== undefined) {
+        // Recorded FIRST, then thrown: the request reached Stripe and only the
+        // response was lost. Everything above is now true at Stripe and false
+        // in our database — which is precisely the state the retry sweep, and
+        // the same-key rule it rests on, exist to resolve.
+        const err = refundLandsThenThrowsErr;
+        refundLandsThenThrowsErr = undefined;
+        throw err;
+      }
+      return executed;
     },
 
     async retrievePaymentMethod(paymentMethodId): Promise<StripePaymentMethodSnapshot> {

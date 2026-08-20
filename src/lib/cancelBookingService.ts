@@ -11,13 +11,14 @@ import type { Tx } from '../db/tx.js';
 import type { ServiceCategory } from './bookingBucket.js';
 import type { BookingWire } from './bookingWire.js';
 import { ApiError } from './errors.js';
+import {
+  logUnroutableRefundMint,
+  type PendingStripeRefund,
+  type UnroutableRefundMint,
+} from './pendingRefund.js';
 import { wireManyBookings } from './wireManyBookings.js';
 
-export interface PendingStripeRefund {
-  refundId: string;
-  paymentIntentId: string;
-  amountCents: number;
-}
+export type { PendingStripeRefund };
 
 export interface CancelBookingResult {
   wire: BookingWire;
@@ -27,6 +28,18 @@ export interface CancelBookingResult {
    * seam). Undefined for forfeit / credit-back / free-service paths.
    */
   pendingStripeRefund?: PendingStripeRefund;
+  /**
+   * Set INSTEAD of `pendingStripeRefund` when the money-back branch found a
+   * charge with no `stripe_payment_intent_id` — pre-Stripe-wire money the
+   * school owes back through a channel no code here can reach (design §4). The
+   * row is written TERMINAL at `'unroutable'`.
+   *
+   * Returned for the CALLER'S information only. The announcement is NOT the
+   * caller's job: it is emitted in-transaction at the mint below, and this
+   * field must never become the thing an alarm depends on again — see the
+   * comment there.
+   */
+  unroutableRefund?: UnroutableRefundMint;
   /**
    * Distinct dog ids that received a credit-back on this cancel. The route
    * wipes each dog's `credits:{dogId}:*` display cache post-commit. Empty on
@@ -71,9 +84,27 @@ export async function cancelBookingInTx(
     cancelReason?: string;
     /** The cancel instant — the route's `nowFactory()`, never a fresh wall clock. */
     now: Date;
+    /**
+     * The EXACT Stripe idempotency key the route's post-commit `createRefund`
+     * will send (`` `${request Idempotency-Key}:refund` ``), stored on the
+     * refunds row in THIS transaction (design §2.1).
+     *
+     * Required, and required of both routes: the key lives only in the request
+     * closure, so if the row does not carry it, a `createRefund` that fails
+     * post-commit can never be retried by anything and the owner's money simply
+     * does not come back. Passing it down is what makes the sweep possible.
+     */
+    stripeIdempotencyKey: string;
+    /**
+     * Where the `'unroutable'` mint announces itself. Required, because that
+     * announcement is the ONLY surface a terminal unroutable refund ever gets
+     * (see the mint below) and a default no-op logger would make losing it a
+     * silent, one-argument mistake.
+     */
+    log: { error(obj: Record<string, unknown>, msg?: string): void };
   },
 ): Promise<CancelBookingResult> {
-  const { id, requireOwnerId, cancelledBy, cancelReason, now } = args;
+  const { id, requireOwnerId, cancelledBy, cancelReason, now, stripeIdempotencyKey, log } = args;
 
   // 1. Row-lock; serialize concurrent cancels. 404 collapses not-found,
   //    expired, and (owner route only) not-yours into one response.
@@ -116,6 +147,7 @@ export async function cancelBookingInTx(
 
   // 4. Refund branching — within the cancel window only.
   let pendingStripeRefund: PendingStripeRefund | undefined;
+  let unroutableRefund: UnroutableRefundMint | undefined;
   const creditRefundedDogIds = new Set<string>();
   if (!updated.cancelForfeited) {
     const debits = await creditLedgerRepository.findDebitsForBooking(tx, id);
@@ -154,22 +186,68 @@ export async function cancelBookingInTx(
         const alreadyRefunded = await refundsRepository.sumNonFailedForCharge(tx, charge.id);
         const maxRefund = charge.amountCents - alreadyRefunded;
         if (maxRefund > 0) {
-          const refund = await refundsRepository.createPending(tx, {
-            ownerId: row.ownerId,
-            chargeId: charge.id,
-            bookingId: id,
-            amountCents: maxRefund,
-            reason: 'cancel',
-          });
           if (charge.stripePaymentIntentId !== null) {
+            const refund = await refundsRepository.createPending(tx, {
+              ownerId: row.ownerId,
+              chargeId: charge.id,
+              bookingId: id,
+              amountCents: maxRefund,
+              reason: 'cancel',
+              // Stored in the SAME tx as the row, so the retry sweep can send
+              // exactly what the post-commit fire sends — a replay, never a
+              // second refund.
+              stripeIdempotencyKey,
+            });
             pendingStripeRefund = {
               refundId: refund.id,
               paymentIntentId: charge.stripePaymentIntentId,
               amountCents: maxRefund,
+              stripeIdempotencyKey,
             };
+          } else {
+            // Charges with NULL stripe_payment_intent_id are pre-Stripe-wire
+            // seeds. The refunds row still records the obligation, but there is
+            // no PaymentIntent to reverse and there never will be, so it is
+            // written TERMINAL rather than 'pending' (design §4): a 'pending'
+            // row here meant a worklist entry no sweep could send and no
+            // webhook could close, re-shouted on every process restart forever.
+            const refund = await refundsRepository.createUnroutable(tx, {
+              ownerId: row.ownerId,
+              chargeId: charge.id,
+              bookingId: id,
+              amountCents: maxRefund,
+              reason: 'cancel',
+            });
+            unroutableRefund = {
+              refundId: refund.id,
+              ownerId: row.ownerId,
+              chargeId: charge.id,
+              amountCents: maxRefund,
+            };
+            // ANNOUNCED HERE, IN-TRANSACTION, and never from the route's
+            // post-commit seam (adversary panel, 2026-08-20 — proven on :5433).
+            //
+            // An `'unroutable'` row is TERMINAL at birth, so it appears in no
+            // worklist by design: `markUnroutable` requires `status='pending'`
+            // and `findAbandonedPending` excludes it. This log line is its
+            // ONLY surface, ever. Announcing it post-commit lost it outright on
+            // the crash-then-replay arc — a request whose response the client
+            // never saw commits the row, then the client retries the same
+            // Idempotency-Key, `withMutation` replays the stored response and
+            // SKIPS `postCommit` entirely (`db/mutation.ts` — the whole
+            // post-commit block is gated on `!outcome.replayed`), which also
+            // swallows anything thrown. Result: money owed, recorded, and
+            // announced nowhere. Permanently.
+            //
+            // The cost of moving it here is a false alarm if this transaction
+            // later rolls back — an ERROR about a row that does not exist. That
+            // failure is loud and recoverable by looking; the one it replaces
+            // is silent and permanent. Wrong direction traded for right one.
+            logUnroutableRefundMint(log, unroutableRefund, {
+              bookingId: id,
+              cancelledBy,
+            });
           }
-          // Charges with NULL stripe_payment_intent_id are pre-Stripe-wire
-          // seeds; the refunds row at 'pending' captures the intent.
         }
       } else {
         // PAYG within-window: void the pending auto-charge so the worker
@@ -220,13 +298,29 @@ export async function cancelBookingInTx(
   if (wire === undefined) {
     throw new Error(`cancelBooking ${id}: wire assembly returned no row`);
   }
-  return { wire, pendingStripeRefund, creditRefundedDogIds: [...creditRefundedDogIds] };
+  return {
+    wire,
+    pendingStripeRefund,
+    unroutableRefund,
+    creditRefundedDogIds: [...creditRefundedDogIds],
+  };
 }
 
 /**
  * Notification body for the booking-cancelled push. Brief, category-
  * aware, mentions the forfeit state when applicable so the owner doesn't
  * have to open the booking detail to learn the refund didn't land.
+ *
+ * "Refund is on the way" also covers the `'unroutable'` branch, where it is
+ * true because a human will send the money by hand rather than because a worker
+ * will. Flagged to Allison with exactly that caveat and **ruled KEEP on
+ * 2026-08-20 — explicitly including refunds a human sends by hand** (the money
+ * IS coming; the owner does not need to know which channel carries it). Do not
+ * "fix" this to a hedged variant without a new ruling.
+ *
+ * Provenance, because an earlier version of this comment cited the wrong date:
+ * 2026-08-19's only ruling was the two flagged push titles. This copy ruling is
+ * 2026-08-20.
  */
 function cancellationBody(
   category: ServiceCategory,

@@ -7,8 +7,13 @@ import {
   type RefundRow,
 } from '../db/repositories/refundsRepository.js';
 import { withActor } from '../db/tx.js';
+import { refundCreateParams } from '../lib/pendingRefund.js';
 import { duplicateRefundIdempotencyKey } from '../lib/settleInvoiceCharge.js';
-import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
+import {
+  defaultStripeClient,
+  stripeIdempotencyErrorKind,
+  type StripeClient,
+} from '../lib/stripe.js';
 import type { WorkerLogger } from './invoiceAutoCharge.js';
 
 /**
@@ -90,8 +95,7 @@ export interface DuplicateRefundRetryOpts {
 
 export interface DuplicateRefundRetryResult {
   refundId: string;
-  outcome:
-    /** Stripe accepted it (or replayed the original) and the `re_*` id is on
+  outcome: /** Stripe accepted it (or replayed the original) and the `re_*` id is on
      *  the row — the webhook can now match it deterministically. */
     | 'sent'
     /** The retry failed again. The row stays claimable next interval. */
@@ -136,7 +140,34 @@ export async function runDuplicateRefundRetryOnce(
   const log = opts.log ?? NOOP_LOG;
   const now = opts.now ?? new Date();
   const staleBefore = new Date(now.getTime() - DUPLICATE_REFUND_RETRY_GRACE_MINUTES * 60 * 1000);
-  const windowFloor = new Date(now.getTime() - DUPLICATE_REFUND_ABANDON_AFTER_HOURS * 60 * 60 * 1000);
+  const windowFloor = new Date(
+    now.getTime() - DUPLICATE_REFUND_ABANDON_AFTER_HOURS * 60 * 60 * 1000,
+  );
+
+  // Retire the rows that were never routable BEFORE anything else looks at the
+  // table (design §4). These are pre-Stripe-wire seed-money refunds: the charge
+  // behind them carries no PaymentIntent, so no sweep can send them and no
+  // webhook can close them, and until now they sat 'pending' forever —
+  // saturating an oldest-first report page and re-shouting on every restart.
+  // The flip is TERMINAL and it is the memory: a restarted process does not
+  // re-announce a row that is already 'unroutable'.
+  // Own log-and-continue boundary, like every sibling phase. Unguarded, this
+  // was the tick's FIRST statement, so one persistent throw here — a lock
+  // timeout, a deadlock against a concurrent writer — took down the retry claim
+  // AND both halves of the abandon report with it, via the scheduler's
+  // per-phase catch. A cosmetic retirement pass must never be able to silence
+  // the money-returning one.
+  try {
+    const flippedUnroutable = await withActor(WORKER_ACTOR, (tx) =>
+      refundsRepository.markUnroutable(tx),
+    );
+    reportUnroutable(flippedUnroutable, log);
+  } catch (err) {
+    log.error(
+      { workerTick: 'duplicate-refund-retry', phase: 'mark-unroutable', err: errMsg(err) },
+      'duplicate refund retry: retiring unroutable refunds threw; the retry and abandon passes below still run',
+    );
+  }
 
   const claimed = await withActor(WORKER_ACTOR, (tx) =>
     refundsRepository.claimStalePendingForRetry(tx, {
@@ -165,8 +196,7 @@ export async function runDuplicateRefundRetryOnce(
   const { rows: abandoned, totalByClass } = await refundsRepository.findAbandonedPending(db, {
     mintedBefore: windowFloor,
   });
-  const abandonedTotal =
-    totalByClass['row-keyed'] + totalByClass['client-keyed'] + totalByClass['never-sent'];
+  const abandonedTotal = ABANDONED_CLASSES.reduce((sum, c) => sum + totalByClass[c], 0);
   reportAbandoned(abandoned, totalByClass, log);
 
   const sent = results.filter((r) => r.outcome === 'sent').length;
@@ -210,29 +240,71 @@ async function retryOne(
     return { refundId: refund.id, outcome: 'skipped-unreadable' };
   }
 
+  // THE SAME KEY the post-commit fire used. A retry is never a new refund.
+  // Stored on the row since 2026-08-19 — which is the only way this can be true
+  // for the cancel / withdraw / membership writers, whose keys were the
+  // client's request key. The fallback covers rows minted by round-4-era code:
+  // `duplicate-invoice-settle` above `REFUND_SWEEP_FLOOR`, whose key IS
+  // derivable from the row. The claim admits nothing else, so a row that
+  // reaches here with a NULL key is provably a legacy row-keyed one.
+  const idempotencyKey = refund.stripeIdempotencyKey ?? duplicateRefundIdempotencyKey(refund.id);
+
   let stripeRefundId: string;
   try {
     const created = await stripe.createRefund(
-      {
+      // Built by the SAME constructor the post-commit fire uses. Same key with
+      // drifted params is Stripe's `idempotency_error` — no money moves, but
+      // the refund never lands either, so the two call sites cannot be allowed
+      // to build this object independently.
+      refundCreateParams({
         paymentIntentId: charge.stripePaymentIntentId,
         amountCents: refund.amountCents,
-        reason: 'requested_by_customer',
-      },
-      // THE SAME KEY the post-commit fire used. A retry is never a new refund.
-      duplicateRefundIdempotencyKey(refund.id),
+      }),
+      idempotencyKey,
     );
     stripeRefundId = created.id;
   } catch (err) {
-    log.error(
-      {
-        refundId: refund.id,
-        chargeId: refund.chargeId,
-        paymentIntentId: charge.stripePaymentIntentId,
-        amountCents: refund.amountCents,
-        err: errMsg(err),
-      },
-      'duplicate refund retry: re-fire failed; the row stays pending and is retried next interval',
-    );
+    // Not every failure here means the same thing, and the verify lane already
+    // proved the distinction is worth drawing (`stripeIdempotencyErrorKind`).
+    // The outcome is `still-failing` in every arm — the row stays claimable and
+    // no money moved — but the SENTENCE differs, because one of these is a code
+    // defect that will never fix itself and the others resolve on their own.
+    const idempotencyKind = stripeIdempotencyErrorKind(err);
+    const context = {
+      refundId: refund.id,
+      chargeId: refund.chargeId,
+      paymentIntentId: charge.stripePaymentIntentId,
+      amountCents: refund.amountCents,
+      stripeIdempotencyKey: idempotencyKey,
+      err: errMsg(err),
+    };
+    if (idempotencyKind === 'params-mismatch') {
+      // Design §3 arm 4. Stripe holds this key against DIFFERENT parameters
+      // than we just sent, which cannot happen from bad luck: the fire and this
+      // retry build their params through one constructor, so this is a code
+      // defect or a row rewritten underneath us. No money moved — Stripe
+      // refuses the call outright — but retrying will fail identically every
+      // interval until the abandon bound, so say so on the first sighting
+      // instead of emitting the transient sentence 288 times.
+      log.error(
+        { ...context, idempotencyKind },
+        'duplicate refund retry: Stripe rejected the retry because this key was first used with DIFFERENT parameters — no money moved, and no retry can fix it; the refund params drifted from what the original call sent, which is a code defect to fix, not a transient to wait out',
+      );
+    } else if (idempotencyKind === 'concurrent-request') {
+      // Design §3 arm 3, now covered. The original post-commit call is STILL
+      // RUNNING and owns this key; our claim's 5-minute grace simply lost to a
+      // slow round-trip. Stripe is the arbiter and no interlock is needed on
+      // our side — this is the system working, so it is not an ERROR.
+      log.warn(
+        { ...context, idempotencyKind },
+        'duplicate refund retry: the original refund call is still in flight under this key (Stripe 409) — no second refund was created, and the next tick resolves it',
+      );
+    } else {
+      log.error(
+        context,
+        'duplicate refund retry: re-fire failed; the row stays pending and is retried next interval',
+      );
+    }
     return { refundId: refund.id, outcome: 'still-failing' };
   }
 
@@ -274,6 +346,30 @@ async function retryOne(
 const ALARMED_REFUND_IDS = new Set<string>();
 
 /**
+ * Per class, the largest abandoned count this PROCESS has already announced.
+ *
+ * The companion to {@link ALARMED_REFUND_IDS} for the rows that never reach the
+ * capped report page. Loud-once has to key on something, and a boolean "have I
+ * mentioned this class" — what this replaced — is only correct while the class's
+ * population is static. It is not: `stripe-failed` rows are terminal and
+ * accumulate forever, and pending rows past the page cap arrive whenever money
+ * fails to return. Keying on the COUNT means new owed money is always an ERROR
+ * exactly once, and unchanged owed money stays an INFO.
+ *
+ * The mark is the last count this process ANNOUNCED for the class — not a
+ * true high-water (final panel pass, 2026-08-20): the row-naming path
+ * re-bases it to the current total, which can LOWER it after a shrink, so a
+ * later regrowth re-alarms sooner than a never-decreasing mark would. The
+ * one silence this leaves — the accepted residue — is a fully page-buried
+ * class whose count shrinks (a human resolves rows) and regrows to at or
+ * below the last announced level: genuinely NEW never-named rows arrive as
+ * INFO only in that window. Resetting the mark on every decrease would
+ * re-shout rows already announced, which is the flood this map exists to
+ * prevent. Do not "fix" the re-basing to Math.max — it is the safer side.
+ */
+const ALARMED_BURIED_HIGH_WATER = new Map<AbandonedRefundClass, number>();
+
+/**
  * One sentence per class, each of which is an instruction its class's reader
  * can actually follow. The single sentence this replaced ended "refund by hand
  * in the Stripe dashboard" for every row — impossible for `never-sent` (there
@@ -287,13 +383,81 @@ const ABANDONED_CLASS_MESSAGE: Record<AbandonedRefundClass, string> = {
     'duplicate refund retry: refunds no sweep will ever retry are still unsent — their original Stripe key was the CLIENT request key and nothing durable can reproduce it; an owner is owed this money, so refund by hand against the listed PaymentIntent, but CHECK it for an existing refund first (a lost response rather than a lost request means the money already went back)',
   'never-sent':
     'duplicate refund retry: refund rows with no Stripe charge behind them are still pending — the charge carries no PaymentIntent (pre-Stripe-wire seed money), so there is nothing to refund in the dashboard and no automatic path applies; these record an intent to return money that never moved through Stripe and must be resolved out of band',
+  'stripe-failed':
+    'duplicate refund retry: Stripe reported these refunds FAILED after creating them — the money did NOT return to the owner and nothing retries them (the refund identity is spent); CHECK the listed PaymentIntent for an existing manual refund first (this alarm repeats per process restart, so a colleague may already have re-sent it), then issue a FRESH refund from the Stripe dashboard — safe because a failed refund drops out of the cumulative refundable cap and Stripe refuses over-refunding',
+};
+
+/**
+ * Report order, and the order the totals are summed in. `never-sent` stays in
+ * the list even though {@link refundsRepository.markUnroutable} should empty it
+ * on the same tick: the flip is batched, so a large legacy backlog can leave
+ * rows behind for a tick or two, and a class that silently vanished from the
+ * sum would understate owed money at exactly the moment there is most of it.
+ *
+ * What buries the page is NOT a frozen set (corrected 2026-08-20). An earlier
+ * version of this file said the only saturating class was `client-keyed`, which
+ * is finite and cannot grow after deploy. `stripe-failed` broke that: those rows
+ * are terminal, unbounded by age, and therefore always the oldest rows in the
+ * result. {@link refundsRepository.findAbandonedPending} now orders the page by
+ * ACTIONABILITY first — pending rows take the slots, failed rows fill the
+ * remainder and can never evict one — and {@link ALARMED_BURIED_HIGH_WATER}
+ * re-alarms when a class's buried count grows past the level this process
+ * last announced. Saturation therefore cannot hide GROWTH in owed money; the
+ * shrink-then-regrow window below the announced level is the one accepted
+ * silence, documented at the map itself.
+ */
+/**
+ * The query that LISTS a buried class, per class — because the saturation alarm
+ * has no row detail to give and the query is the whole instruction.
+ *
+ * It is a map rather than one literal because the classes do not live in the
+ * same rows (adversary panel, 2026-08-20): the three unsent classes are
+ * `status='pending' AND stripe_refund_id IS NULL`, while `stripe-failed` rows
+ * are `status='failed'` and carry a NON-NULL `stripe_refund_id` by
+ * construction. The single pending-shaped literal this replaced returned ZERO
+ * rows when the buried class was `stripe-failed` — an alarm naming a class and
+ * then handing over a query that cannot find it.
+ */
+const ABANDONED_CLASS_QUERY: Record<AbandonedRefundClass, string> = {
+  'row-keyed':
+    "SELECT * FROM refunds WHERE status='pending' AND stripe_refund_id IS NULL ORDER BY created_at DESC",
+  'client-keyed':
+    "SELECT * FROM refunds WHERE status='pending' AND stripe_refund_id IS NULL AND stripe_idempotency_key IS NULL ORDER BY created_at DESC",
+  'never-sent':
+    "SELECT * FROM refunds WHERE status='pending' AND stripe_refund_id IS NULL ORDER BY created_at DESC",
+  'stripe-failed': "SELECT * FROM refunds WHERE status='failed' ORDER BY created_at DESC",
 };
 
 const ABANDONED_CLASSES: readonly AbandonedRefundClass[] = [
   'row-keyed',
   'client-keyed',
   'never-sent',
+  'stripe-failed',
 ];
+
+/**
+ * The ONE durable announcement for a refund that was owed with no route to send
+ * it (design §4). Unlike {@link reportAbandoned}, this needs no per-process
+ * memory: it fires on the tick that FLIPS the row, and a flipped row can never
+ * be flipped again — the status transition is the "have I said this already".
+ */
+function reportUnroutable(flipped: AbandonedRefundRow[], log: WorkerLogger): void {
+  if (flipped.length === 0) return;
+  log.error(
+    {
+      workerTick: 'duplicate-refund-retry',
+      refundClass: 'unroutable' as const,
+      flippedCount: flipped.length,
+      refunds: flipped.map((r) => ({
+        refundId: r.id,
+        ownerId: r.ownerId,
+        chargeId: r.chargeId,
+        amountCents: r.amountCents,
+      })),
+    },
+    'duplicate refund retry: refunds with no Stripe route are now TERMINAL at "unroutable" — the charge behind each carries no PaymentIntent (pre-Stripe-wire money), so nothing here can ever send them; this is the one and only time each will be announced, and the money must be returned out of band',
+  );
+}
 
 /**
  * Report the abandon worklist: split by class so each alarm is true, and once
@@ -308,42 +472,53 @@ function reportAbandoned(
     const inClass = rows.filter((r) => r.refundClass === refundClass);
     const total = totalByClass[refundClass];
     if (total === 0) continue;
-    if (inClass.length === 0) {
-      // Nonzero TOTAL with zero page presence: the oldest-first page is
-      // saturated by older rows of other classes (in practice: never-sent seed
-      // rows, which have no resolution path in this change). Without this arm,
-      // exactly the row this worker exists to surface — a newer row-keyed
-      // double charge — was never returned, never named, never counted (2026-08-13
-      // verify panel). No row detail is available here by construction, so the
-      // instruction is the query, and loud-once keys on a class sentinel.
-      const sentinel = `buried:${refundClass}`;
-      if (ALARMED_REFUND_IDS.has(sentinel)) {
-        log.info(
-          { workerTick: 'duplicate-refund-retry', refundClass, abandonedCount: total },
-          'duplicate refund retry: abandoned refunds of this class remain outside the report page, already announced by this process',
-        );
-      } else {
-        ALARMED_REFUND_IDS.add(sentinel);
-        log.error(
-          { workerTick: 'duplicate-refund-retry', refundClass, abandonedCount: total },
-          `duplicate refund retry: ${total} abandoned ${refundClass} refund(s) exist but the report page is saturated by older rows — list them with: SELECT * FROM refunds WHERE status='pending' AND stripe_refund_id IS NULL ORDER BY created_at DESC`,
-        );
-      }
-      continue;
-    }
     const unreported = inClass.filter((r) => !ALARMED_REFUND_IDS.has(r.id));
     if (unreported.length === 0) {
+      // Nothing NEW to name by row. Two very different situations reach here and
+      // the difference is money (adversary round 3, 2026-08-20):
+      //
+      //   · the count is unchanged — a standing condition, correctly demoted to
+      //     INFO so it cannot bury the next incident; or
+      //   · the count GREW — new abandoned money arrived, but every row the page
+      //     can show is one this process already named, so per-row loud-once has
+      //     nothing left to say and the growth would pass in silence.
+      //
+      // The second case was real and provable: a saturating class made the page
+      // permanently unavailable to newer rows, and the old boolean
+      // `buried:<class>` sentinel fired ONCE PER PROCESS PER CLASS, so tick after
+      // tick of genuinely new abandoned refunds produced zero ERRORs and only a
+      // climbing INFO number nobody is watching. A high-water mark per class
+      // fixes that without reopening the flood it replaced: one ERROR per
+      // INCREASE, not one per tick.
+      const seen = ALARMED_BURIED_HIGH_WATER.get(refundClass) ?? 0;
+      if (total > seen) {
+        ALARMED_BURIED_HIGH_WATER.set(refundClass, total);
+        log.error(
+          {
+            workerTick: 'duplicate-refund-retry',
+            refundClass,
+            abandonedCount: total,
+            previouslyAnnounced: seen,
+            newlyAbandonedCount: total - seen,
+          },
+          `duplicate refund retry: ${total - seen} MORE abandoned ${refundClass} refund(s) since this process last said so (${total} total) — the report page cannot show them, so list them with: ${ABANDONED_CLASS_QUERY[refundClass]}`,
+        );
+        continue;
+      }
       log.info(
         {
           workerTick: 'duplicate-refund-retry',
           refundClass,
           abandonedCount: total,
         },
-        'duplicate refund retry: still-abandoned refunds, every one already reported by this process',
+        'duplicate refund retry: still-abandoned refunds at or below the count this process last alarmed — on-page rows were named individually; buried rows are carried by count',
       );
       continue;
     }
     for (const row of unreported) ALARMED_REFUND_IDS.add(row.id);
+    // Naming rows by id also settles the count question for this class, so a
+    // later pure-growth alarm measures from here rather than re-reporting these.
+    ALARMED_BURIED_HIGH_WATER.set(refundClass, total);
     log.error(
       {
         workerTick: 'duplicate-refund-retry',
@@ -356,16 +531,22 @@ function reportAbandoned(
           chargeId: r.chargeId,
           amountCents: r.amountCents,
           paymentIntentId: r.stripePaymentIntentId,
+          // The key the human is being told to search for. Stored on the row
+          // for everything minted since 2026-08-19; derived for the legacy
+          // `duplicate-invoice-settle` rows, which is the only other way a row
+          // reaches this class.
           ...(refundClass === 'row-keyed'
-            ? { idempotencyKey: duplicateRefundIdempotencyKey(r.id) }
+            ? { idempotencyKey: r.stripeIdempotencyKey ?? duplicateRefundIdempotencyKey(r.id) }
             : {}),
+          // A failed refund's identity IS the thing to look up: the dashboard
+          // shows why it failed next to the charge it belongs to.
+          ...(refundClass === 'stripe-failed' ? { stripeRefundId: r.stripeRefundId } : {}),
         })),
       },
       ABANDONED_CLASS_MESSAGE[refundClass],
     );
   }
 }
-
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);

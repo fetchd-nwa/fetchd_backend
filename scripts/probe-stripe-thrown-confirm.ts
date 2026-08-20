@@ -71,6 +71,7 @@
  * "everything is fine".
  */
 
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -138,6 +139,153 @@ const SCENARIOS: Scenario[] = [
     expectation: 'RETURN succeeded',
   },
 ];
+
+// ── The refund questions (P1–P3) ──────────────────────────────────────────
+//
+// Added 2026-08-19 for `designs/client-keyed-refund-recovery.md` §8. That
+// design's safety case rests on three sentences that currently end in an
+// assumption, and this converts each into a measurement. **Nothing in the
+// design waits on the answers** — every bound is safe under any of them; the
+// point is to stop calling "documented" the same thing as "known".
+//
+//   P1  Does a same-key `refunds.create` REPLAY — the same `re_*` object back —
+//       the way a same-key `paymentIntents.create` was measured to on
+//       2026-08-13? Confirmation, not load-bearing: refunds ride the same
+//       idempotency layer. If it does NOT, the retry sweep's entire premise is
+//       wrong and the sweep must be switched off, so this is the one question
+//       here that could change the build.
+//
+//   P2  What does Stripe ACTUALLY return for a refund against a fully-refunded
+//       charge? The design names `charge_already_refunded` as the unrelied-on
+//       backstop behind arms 5 and 7, from the SDK's error union rather than
+//       from observation. The stub models that code; this is what makes the
+//       model honest or corrects it.
+//
+//   P3  Does `charge.refund.updated` fire at all for a refund that is already
+//       `succeeded` when created? R18 assumes the webhook completes the row. If
+//       it does not fire, the sweep's `markStripeId` is the ONLY closer — which
+//       this design makes true anyway, so a "no" costs nothing and a "yes"
+//       confirms a redundancy we believe we have.
+//
+// Test mode only, one session, and it moves a few real test-mode dollars in a
+// circle: charge $45 on 4242, refund it, try to refund it again.
+async function probeRefunds(stripe: Stripe, customerId: string): Promise<void> {
+  console.log('── refund questions (P1–P3) ──');
+  let intent: Stripe.PaymentIntent;
+  try {
+    intent = await stripe.paymentIntents.create({
+      amount: PROBE_AMOUNT_CENTS,
+      currency: 'usd',
+      customer: customerId,
+      payment_method: 'pm_card_visa',
+      confirm: true,
+      off_session: true,
+      metadata: { purpose: 'probe-stripe-refund-questions' },
+    });
+  } catch (err) {
+    console.log(
+      `   SKIPPED: could not create the charge to refund — ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+  if (intent.status !== 'succeeded') {
+    console.log(`   SKIPPED: control charge rested at ${intent.status}, nothing to refund.`);
+    return;
+  }
+  console.log(`   charged ${intent.id} (${PROBE_AMOUNT_CENTS} cents)`);
+
+  // The production call shape, verbatim (`lib/pendingRefund.refundCreateParams`
+  // + `lib/stripe.createRefund`). A probe that sent a different shape would
+  // measure a different question.
+  const refundKey = `probe-refund:${randomUUID()}`;
+  const refundParams: Stripe.RefundCreateParams = {
+    payment_intent: intent.id,
+    amount: PROBE_AMOUNT_CENTS,
+    reason: 'requested_by_customer',
+  };
+
+  let firstRefund: Stripe.Refund;
+  try {
+    firstRefund = await stripe.refunds.create(refundParams, { idempotencyKey: refundKey });
+  } catch (err) {
+    console.log(
+      `   P1: *** the FIRST refund failed *** — ${err instanceof Error ? err.message : String(err)}`,
+    );
+    console.log('   Nothing below can be measured. The refund path itself is in question.');
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`   P1: first  → id=${firstRefund.id} status=${firstRefund.status}`);
+
+  // P1 — the same key, the same params, immediately.
+  try {
+    const replay = await stripe.refunds.create(refundParams, { idempotencyKey: refundKey });
+    const same = replay.id === firstRefund.id;
+    console.log(`   P1: replay → id=${replay.id} status=${replay.status}`);
+    console.log(
+      `   P1 VERDICT: ${
+        same
+          ? 'REPLAYED — same re_* id, exactly one refund exists.'
+          : `*** DIFFERENT id (${replay.id}) — this is a SECOND refund ***`
+      }`,
+    );
+    if (!same) process.exitCode = 1;
+  } catch (err) {
+    const cls = err instanceof Error ? err.constructor.name : typeof err;
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`   P1: replay → THREW ${cls}: ${msg}`);
+    console.log(
+      '   P1 VERDICT: *** a same-key refund did NOT replay *** — the retry sweep’s premise is',
+    );
+    console.log('   wrong and `duplicate-refund-retry` must be disabled until this is understood.');
+    process.exitCode = 1;
+  }
+
+  // P2 — a DIFFERENT key against a charge with no refundable balance left. The
+  // different key is the whole point: under the same key we would only measure
+  // the replay again.
+  try {
+    const over = await stripe.refunds.create(refundParams, {
+      idempotencyKey: `probe-refund-over:${randomUUID()}`,
+    });
+    console.log(`   P2: over-refund → SUCCEEDED, id=${over.id} *** MONEY MOVED TWICE ***`);
+    console.log(
+      '   P2 VERDICT: there is NO balance-cap backstop. The 24h abandon bound is the only',
+    );
+    console.log('   guard, exactly as the design says it must be — but now that is measured.');
+    process.exitCode = 1;
+  } catch (err) {
+    const cls = err instanceof Error ? err.constructor.name : typeof err;
+    const code = isRecord(err) && typeof err.code === 'string' ? err.code : '(no code)';
+    const type = isRecord(err) && typeof err.type === 'string' ? err.type : '(no type)';
+    console.log(`   P2: over-refund → THREW ${cls} type=${type} code=${code}`);
+    console.log(
+      `   P2 VERDICT: refused. ${
+        code === 'charge_already_refunded'
+          ? 'The code is what the stub models.'
+          : `The stub models 'charge_already_refunded'; live says '${code}' — UPDATE THE STUB.`
+      }`,
+    );
+  }
+
+  // P3 — did an event actually get emitted for a refund that may have been
+  // `succeeded` at creation? Read from the event log rather than a webhook
+  // endpoint, so this needs no tunnel and no receiver.
+  await new Promise((resolve) => setTimeout(resolve, 5_000));
+  const events = await stripe.events.list({ type: 'charge.refund.updated', limit: 25 });
+  const mine = events.data.filter((e) => JSON.stringify(e.data.object).includes(firstRefund.id));
+  console.log(
+    `   P3: charge.refund.updated events naming ${firstRefund.id} within ~5s: ${mine.length}`,
+  );
+  console.log(
+    `   P3 VERDICT: ${
+      mine.length > 0
+        ? 'the webhook DOES fire — R18’s row-completion backstop is real.'
+        : `none yet (creation status was '${firstRefund.status}'). Either it fires later or not at all; either way the sweep’s markStripeId is the closer this design already relies on. NOT a failure.`
+    }`,
+  );
+  console.log('');
+}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
@@ -328,6 +476,10 @@ async function main(): Promise<void> {
   console.log(`  stripe sdk: ${Stripe.PACKAGE_VERSION}`);
   console.log(`  question:   does a thrown card error carry err.payment_intent AND err.code?`);
   console.log(
+    '  also (2026-08-19, P1-P3): does a same-key refunds.create REPLAY, what does an\n' +
+      '              over-refund actually return, and does charge.refund.updated fire?',
+  );
+  console.log(
     `  fixture:    ${committed === undefined ? 'ABSENT' : `recorded ${committed.recordedAt}`}` +
       `${recording ? '  (--record: this run will REWRITE it)' : ''}`,
   );
@@ -437,6 +589,7 @@ async function main(): Promise<void> {
       }
       console.log('');
     }
+    await probeRefunds(stripe, customer.id);
   } finally {
     await stripe.customers.del(customer.id);
     console.log(`  cleaned up customer ${customer.id} (detaches its payment methods)\n`);

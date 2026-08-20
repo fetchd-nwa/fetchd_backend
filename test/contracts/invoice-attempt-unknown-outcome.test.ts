@@ -12,10 +12,8 @@ import {
   REFUND_SWEEP_FLOOR,
   refundsRepository,
 } from '../../src/db/repositories/refundsRepository.js';
-import {
-  fireDuplicateRefundPostCommit,
-  settleInvoiceCharge,
-} from '../../src/lib/settleInvoiceCharge.js';
+import { firePendingRefundPostCommit } from '../../src/lib/pendingRefund.js';
+import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
 import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import {
   charges,
@@ -1894,7 +1892,7 @@ test(
  * settled by one path, a SECOND succeeded charge for the same debt, a 'pending'
  * `refunds` row for it, and a `createRefund` that threw — so nothing at Stripe
  * knows the money should come back. This is the production path verbatim
- * (`settleInvoiceCharge` + `fireDuplicateRefundPostCommit`), not a lookalike.
+ * (`settleInvoiceCharge` + `firePendingRefundPostCommit`), not a lookalike.
  */
 async function stageFailedDuplicateRefund(
   invoiceId: string,
@@ -1919,7 +1917,7 @@ async function stageFailedDuplicateRefund(
   assert.ok(pending);
 
   stripe.throwOnRefund();
-  await fireDuplicateRefundPostCommit({
+  await firePendingRefundPostCommit({
     pending,
     stripe,
     log: { error: () => undefined },
@@ -2171,7 +2169,16 @@ test(
     const { refundId } = await stageFailedDuplicateRefund(invoiceId, 12_000);
     await db
       .update(refunds)
-      .set({ createdAt: new Date(FLOOR_MS - 12 * HOUR).toISOString() })
+      .set({
+        createdAt: new Date(FLOOR_MS - 12 * HOUR).toISOString(),
+        // What a row written by PRE-2026-08-19 code looks like on disk: minted
+        // below the floor and carrying no stored key. Cleared explicitly
+        // because `settleInvoiceCharge` now stores one, and a row that carries
+        // its key is `row-keyed` no matter when it was minted — correctly so.
+        // This test is about the rows that predate the column, which are the
+        // only rows the client-keyed instruction can ever describe again.
+        stripeIdempotencyKey: null,
+      })
       .where(eq(refunds.id, refundId));
 
     // Refusing to retry is only safe because the row reaches a human instead,
@@ -2241,25 +2248,32 @@ test(
       now: reportNow(),
       log: logs.log,
     });
-    assert.equal(tick.abandoned, 3);
+    // Two, not three: the never-sent row is retired by the same tick's
+    // `markUnroutable` pass (design §4) and leaves the report for good rather
+    // than being carried forever with an instruction nobody can follow.
+    assert.equal(tick.abandoned, 2);
     assert.deepEqual(tick.abandonedByClass, {
       'row-keyed': 1,
       'client-keyed': 1,
-      'never-sent': 1,
+      'never-sent': 0,
+      'stripe-failed': 0,
     });
     assert.equal(sweeper.calls.filter((c) => c.method === 'createRefund').length, 0);
 
-    // One alarm per class, each carrying only its own rows.
-    const never = logs.error('never-sent');
-    assert.ok(never);
-    assert.match(JSON.stringify(never.obj.refunds), new RegExp(neverSent));
-    assert.doesNotMatch(JSON.stringify(never.obj.refunds), new RegExp(clientKeyed));
+    // It is not DROPPED, though — it is announced once, as the terminal thing
+    // it now is, and the announcement still refuses to say "refund by hand".
+    const unroutable = logs.error('unroutable');
+    assert.ok(unroutable, 'the row a human owes money on is named at ERROR exactly once');
+    assert.match(JSON.stringify(unroutable.obj.refunds), new RegExp(neverSent));
+    assert.doesNotMatch(JSON.stringify(unroutable.obj.refunds), new RegExp(clientKeyed));
     assert.doesNotMatch(
-      never.msg ?? '',
+      unroutable.msg ?? '',
       /refund by hand/i,
       'an instruction a human cannot follow is worse than no instruction',
     );
-    assert.match(never.msg ?? '', /no Stripe charge behind them/i);
+    assert.match(unroutable.msg ?? '', /no PaymentIntent/i);
+    const [flipped] = await db.select().from(refunds).where(eq(refunds.id, neverSent));
+    assert.equal(flipped?.status, 'unroutable', 'and the flip is the durable memory');
 
     const client = logs.error('client-keyed');
     assert.ok(client);
@@ -2644,24 +2658,40 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
-    // The report page is capped at 20 OLDEST-FIRST, and never-sent seed rows
-    // are by construction the oldest with no resolution path — so before this
-    // fix, 20 of them held the page forever and a NEWER row-keyed abandoned
-    // double charge (the exact row this worker exists to surface) was never
-    // returned, never counted, never named; every count saturated at the cap
-    // with nothing marking truncation (2026-08-13 verify panel).
+    // The report page is capped at 20 OLDEST-FIRST, so a standing backlog of
+    // old unresolvable rows held the page forever and a NEWER row-keyed
+    // abandoned double charge (the exact row this worker exists to surface) was
+    // never returned, never counted, never named; every count saturated at the
+    // cap with nothing marking truncation (2026-08-13 verify panel).
+    //
+    // The saturating class is `client-keyed` rather than `never-sent` since
+    // 2026-08-19: never-sent rows are flipped terminal by the same tick's
+    // `markUnroutable` pass and can no longer bury anything. Client-keyed rows
+    // still can — that set is frozen and finite, but "finite" is not "small",
+    // and a pre-deploy backlog is exactly when a new double charge must not be
+    // invisible.
     for (let i = 0; i < 20; i += 1) {
       await seedPendingRefund({
         reason: 'cancel',
-        withPaymentIntent: false,
+        withPaymentIntent: true,
         createdAt: FLOOR_MS - (90 - i) * 24 * HOUR,
       });
     }
-    const buriedRowKeyed = await seedPendingRefund({
-      reason: 'duplicate-invoice-settle',
-      withPaymentIntent: true,
-      createdAt: FLOOR_MS + 1 * HOUR,
-    });
+    // FIVE buried row-keyed rows, not one (2026-08-20). The buried-class alarm
+    // is now keyed on a per-class HIGH-WATER MARK rather than a once-per-process
+    // boolean, so that new abandoned money always re-alarms — and earlier tests
+    // in this same file have already named row-keyed rows in this process,
+    // raising that mark. A single row here would sit under it and correctly stay
+    // an INFO. Planting a count no earlier test reaches keeps this test about
+    // SATURATION, which is what it exists to prove.
+    let buriedRowKeyed = '';
+    for (let i = 0; i < 5; i += 1) {
+      buriedRowKeyed = await seedPendingRefund({
+        reason: 'duplicate-invoice-settle',
+        withPaymentIntent: true,
+        createdAt: FLOOR_MS + (1 + i) * HOUR,
+      });
+    }
     const sweeper = makeStripeStub();
     const logs = collectLogs();
     const tick = await runDuplicateRefundRetryOnce({
@@ -2669,15 +2699,16 @@ test(
       now: reportNow(),
       log: logs.log,
     });
-    assert.equal(tick.abandonedByClass['row-keyed'], 1, 'the true count, not the page count');
-    assert.equal(tick.abandonedByClass['never-sent'], 20);
-    assert.equal(tick.abandoned, 21, 'the total is the truth, not the page length');
+    assert.equal(tick.abandonedByClass['row-keyed'], 5, 'the true count, not the page count');
+    assert.equal(tick.abandonedByClass['client-keyed'], 20);
+    assert.equal(tick.abandonedByClass['never-sent'], 0, 'that class is retired by the flip');
+    assert.equal(tick.abandoned, 25, 'the total is the truth, not the page length');
     assert.equal(tick.abandonedTruncated, true, 'truncation is marked, never silent');
     const buried = logs.error('row-keyed');
     assert.ok(buried, 'the buried class is named at ERROR even with zero page presence');
     assert.match(
       buried.msg ?? '',
-      /saturated by older rows/i,
+      /the report page cannot show them/i,
       'and the alarm says WHY the row detail is absent, with the query to run',
     );
     assert.equal(

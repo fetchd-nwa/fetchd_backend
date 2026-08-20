@@ -4,11 +4,14 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
-import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { type BookingWire } from '../lib/bookingWire.js';
 import type { AttendanceWire } from '../contracts/wire.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { ApiError } from '../lib/errors.js';
+import {
+  firePendingRefundPostCommit,
+  type PendingStripeRefund,
+} from '../lib/pendingRefund.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
@@ -164,10 +167,10 @@ export function registerStaffBookingsRoute(
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const reason = parseCancelReason(request.body);
 
-      let pendingStripeRefund:
-        | { refundId: string; paymentIntentId: string; amountCents: number }
-        | undefined;
+      let pendingStripeRefund: PendingStripeRefund | undefined;
       let creditRefundedDogIds: string[] = [];
+      // Computed ONCE, here, so the row stores the same string the fire sends.
+      const refundIdempotencyKey = `${idempotencyKey}:refund`;
 
       const outcome = await withMutation<BookingWire>(
         {
@@ -191,18 +194,11 @@ export function registerStaffBookingsRoute(
             return patterns;
           },
           postCommit: async () => {
-            if (pendingStripeRefund === undefined) return;
-            const result = await stripe.createRefund(
-              {
-                paymentIntentId: pendingStripeRefund.paymentIntentId,
-                amountCents: pendingStripeRefund.amountCents,
-                reason: 'requested_by_customer',
-              },
-              `${idempotencyKey}:refund`,
-            );
-            await refundsRepository.markStripeId({
-              id: pendingStripeRefund.refundId,
-              stripeRefundId: result.id,
+            await firePendingRefundPostCommit({
+              pending: pendingStripeRefund,
+              stripe,
+              log: request.log,
+              context: { bookingId: id, cancelPath: 'staff-cancel' },
             });
           },
         },
@@ -215,6 +211,9 @@ export function registerStaffBookingsRoute(
             cancelledBy: 'staff',
             ...(reason !== undefined ? { cancelReason: reason } : {}),
             now: nowFactory(),
+            stripeIdempotencyKey: refundIdempotencyKey,
+            // The unroutable mint announces itself in-tx through this logger.
+            log: request.log,
           });
           pendingStripeRefund = result.pendingStripeRefund;
           creditRefundedDogIds = result.creditRefundedDogIds;

@@ -164,7 +164,16 @@ CREATE TYPE group_class_key    AS ENUM ('puppy', 'manners-1', 'manners-2', 'publ
 CREATE TYPE charge_purpose     AS ENUM ('package','payg','board-train','membership','group-class');
 CREATE TYPE charge_status      AS ENUM ('requires_payment','succeeded','failed','refunded');
 CREATE TYPE ledger_reason      AS ENUM ('purchase','booking-debit','cancel-refund','adjustment','membership-grant');
-CREATE TYPE refund_status      AS ENUM ('pending','succeeded','failed');
+-- 2026-08-19 (`designs/client-keyed-refund-recovery.md` §4): 'unroutable' is a
+-- TERMINAL fourth state, not a variant of 'pending'. It means "money is owed
+-- back and no automatic path can ever send it" — the charge behind the refund
+-- carries no stripe_payment_intent_id (pre-Stripe-wire seed money), so there is
+-- nothing at Stripe to reverse and a human must resolve it out of band. Keeping
+-- those rows at 'pending' made every worklist and every abandon report carry
+-- them forever with an instruction nobody could follow. `ADD VALUE` is
+-- effectively irreversible (Postgres cannot drop an enum value without a type
+-- rebuild) — accepted, because the arm names a real, permanent business state.
+CREATE TYPE refund_status      AS ENUM ('pending','succeeded','failed','unroutable');
 CREATE TYPE rate_unit          AS ENUM ('per-day','per-night','per-session','per-week','flat');
 CREATE TYPE media_kind         AS ENUM ('image', 'video');
 CREATE TYPE media_purpose      AS ENUM ('dog-profile','owner-avatar','report-photo','report-video','message-attachment');
@@ -1328,6 +1337,18 @@ CREATE TABLE refunds (
   charge_id        uuid NOT NULL REFERENCES charges(id) ON DELETE RESTRICT,
   booking_id       uuid REFERENCES bookings(id),          -- cancellation-driven refund
   stripe_refund_id text UNIQUE,
+  -- The EXACT Stripe idempotency key the post-commit createRefund will use /
+  -- used, written in the same tx as the row (2026-08-19,
+  -- `designs/client-keyed-refund-recovery.md` §1.2). NULL means the row
+  -- predates this column OR is 'unroutable' (no Stripe call will ever be
+  -- made): either way, no automatic retry may touch it. The retry sweep's
+  -- claim reads this instead of reconstructing keys it cannot know — three of
+  -- the four pending-refund writers key on the CLIENT's request
+  -- Idempotency-Key, which exists only in that request's closure, so before
+  -- this column their failed refunds could never be retried by anything.
+  -- `stripe_idempotency_key IS NULL` IS the deploy boundary, true row by row,
+  -- which is why this design needs no date constant of its own.
+  stripe_idempotency_key text,
   amount_cents     integer NOT NULL CHECK (amount_cents > 0),
   reason           text,
   status           refund_status NOT NULL DEFAULT 'pending',

@@ -24,7 +24,7 @@ export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avata
 export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'alumni-attendance', 'membership-ended', 'spay-neuter-reminder', 'payment-due', 'invoice-overdue', 'card-expiring', 'waitlist-spot-open'])
 export const rateUnit = pgEnum("rate_unit", ['per-day', 'per-night', 'per-session', 'per-week', 'flat'])
 export const recordSource = pgEnum("record_source", ['app', 'gingr', 'seed'])
-export const refundStatus = pgEnum("refund_status", ['pending', 'succeeded', 'failed'])
+export const refundStatus = pgEnum("refund_status", ['pending', 'succeeded', 'failed', 'unroutable'])
 export const reportProgram = pgEnum("report_program", ['foundation', 'advanced', 'loose-leash', 'house-manners', 'cgc', 'private-lesson', 'boarding-session', 'group-class-session', 'board-train-session'])
 export const requestStatus = pgEnum("request_status", ['submitted', 'approved', 'approved-awaiting-payment', 'converted', 'cancelled'])
 export const scheduledStatus = pgEnum("scheduled_status", ['pending', 'sent', 'cancelled'])
@@ -1063,6 +1063,7 @@ export const refunds = pgTable("refunds", {
 	chargeId: uuid("charge_id").notNull(),
 	bookingId: uuid("booking_id"),
 	stripeRefundId: text("stripe_refund_id"),
+	stripeIdempotencyKey: text("stripe_idempotency_key"),
 	amountCents: integer("amount_cents").notNull(),
 	reason: text(),
 	status: refundStatus().default('pending').notNull(),

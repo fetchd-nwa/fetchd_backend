@@ -26,8 +26,8 @@ import { formatDollars, purposeLabel } from '../lib/invoiceReceiptCopy.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
+import { firePendingRefundPostCommit } from '../lib/pendingRefund.js';
 import {
-  fireDuplicateRefundPostCommit,
   settleInvoiceCharge,
   type PendingDuplicateRefund,
 } from '../lib/settleInvoiceCharge.js';
@@ -286,7 +286,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
           // had never seen — which is how one duplicate charge becomes two
           // refunds. One row, one key, one refund, whoever fires it.
           postCommit: async () => {
-            await fireDuplicateRefundPostCommit({
+            await firePendingRefundPostCommit({
               pending: pendingStripeRefund,
               stripe,
               log: request.log,

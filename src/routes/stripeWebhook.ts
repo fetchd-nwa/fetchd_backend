@@ -4,7 +4,7 @@ import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { invalidatePattern } from '../lib/cache.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { stripeEventsRepository } from '../db/repositories/stripeEventsRepository.js';
-import { fireDuplicateRefundPostCommit } from '../lib/settleInvoiceCharge.js';
+import { firePendingRefundPostCommit } from '../lib/pendingRefund.js';
 import { dispatchStripeEvent } from '../webhooks/stripeEventHandlers.js';
 
 export interface StripeWebhookOpts {
@@ -101,7 +101,7 @@ export function registerStripeWebhookRoute(
         // the auto-charge worker fires its own; a failure leaves the pending
         // row for retry rather than a silent double charge. This is the second
         // half of "two charges, one refund, no human".
-        await fireDuplicateRefundPostCommit({
+        await firePendingRefundPostCommit({
           pending: result.pendingStripeRefund,
           stripe,
           log: request.log,

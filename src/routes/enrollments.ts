@@ -31,6 +31,10 @@ import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowS
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
+import {
+  firePendingRefundPostCommit,
+  type PendingStripeRefund,
+} from '../lib/pendingRefund.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
@@ -509,9 +513,9 @@ export function registerEnrollmentsRoute(
 
       // Closure handle for the post-commit Stripe refund (money-back branch);
       // undefined for the void / free paths (postCommit no-ops).
-      let pendingStripeRefund:
-        | { refundId: string; paymentIntentId: string; amountCents: number }
-        | undefined;
+      let pendingStripeRefund: PendingStripeRefund | undefined;
+      // Computed ONCE, here, so the row stores the same string the fire sends.
+      const refundIdempotencyKey = `${idempotencyKey}:refund`;
 
       const outcome = await withMutation<{ withdrawn: true; refunded_cents: number }>(
         {
@@ -521,18 +525,11 @@ export function registerEnrollmentsRoute(
           requestHash: hashRequestBody({ cohortId, dogId }),
           keysToInvalidate: () => [],
           postCommit: async () => {
-            if (pendingStripeRefund === undefined) return;
-            const result = await stripe.createRefund(
-              {
-                paymentIntentId: pendingStripeRefund.paymentIntentId,
-                amountCents: pendingStripeRefund.amountCents,
-                reason: 'requested_by_customer',
-              },
-              `${idempotencyKey}:refund`,
-            );
-            await refundsRepository.markStripeId({
-              id: pendingStripeRefund.refundId,
-              stripeRefundId: result.id,
+            await firePendingRefundPostCommit({
+              pending: pendingStripeRefund,
+              stripe,
+              log: request.log,
+              context: { cohortId, dogId, refundPath: 'cohort-withdraw' },
             });
           },
         },
@@ -617,11 +614,16 @@ export function registerEnrollmentsRoute(
                   bookingId: null,
                   amountCents: maxRefund,
                   reason: 'cancel',
+                  // Stored in the SAME tx as the row: without it a failed
+                  // post-commit `createRefund` was unretryable by anything,
+                  // because this key lives only in this request's closure.
+                  stripeIdempotencyKey: refundIdempotencyKey,
                 });
                 pendingStripeRefund = {
                   refundId: refund.id,
                   paymentIntentId: charge.stripePaymentIntentId,
                   amountCents: maxRefund,
+                  stripeIdempotencyKey: refundIdempotencyKey,
                 };
                 refundedCents = maxRefund;
               }

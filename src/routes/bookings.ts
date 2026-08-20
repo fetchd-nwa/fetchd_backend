@@ -6,7 +6,6 @@ import { withDivertRequestLocks, withDogModeLocks } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import { db } from '../db/client.js';
@@ -31,6 +30,10 @@ import {
 } from '../lib/bookingSchedule.js';
 import type { BookingWire } from '../lib/bookingWire.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
+import {
+  firePendingRefundPostCommit,
+  type PendingStripeRefund,
+} from '../lib/pendingRefund.js';
 import {
   createDayProgramBookings,
   resolvePaygPlan,
@@ -561,9 +564,9 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       // Set inside the money-back branch below; read by the postCommit
       // callback below. Stays undefined for forfeit / credit-back /
       // free-service / no-prior-refunds paths (postCommit no-ops).
-      let pendingStripeRefund:
-        | { refundId: string; paymentIntentId: string; amountCents: number }
-        | undefined;
+      let pendingStripeRefund: PendingStripeRefund | undefined;
+      // Computed ONCE, here, so the row stores the same string the fire sends.
+      const refundIdempotencyKey = `${idempotencyKey}:refund`;
       // Dogs credited back on this cancel (empty on every non-credit-back
       // path); post-commit we wipe each dog's `credits:{dogId}:*` display cache.
       let creditRefundedDogIds: string[] = [];
@@ -605,18 +608,11 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           // back to the webhook's race-recovery path
           // (`findUnmatchedPendingForCharge`) — same swallow/log policy.
           postCommit: async () => {
-            if (pendingStripeRefund === undefined) return;
-            const result = await stripe.createRefund(
-              {
-                paymentIntentId: pendingStripeRefund.paymentIntentId,
-                amountCents: pendingStripeRefund.amountCents,
-                reason: 'requested_by_customer',
-              },
-              `${idempotencyKey}:refund`,
-            );
-            await refundsRepository.markStripeId({
-              id: pendingStripeRefund.refundId,
-              stripeRefundId: result.id,
+            await firePendingRefundPostCommit({
+              pending: pendingStripeRefund,
+              stripe,
+              log: request.log,
+              context: { bookingId: id, cancelPath: 'owner-cancel' },
             });
           },
         },
@@ -631,6 +627,9 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             // Owner self-cancel → "You cancelled this on …" (R5). No reason line.
             cancelledBy: 'owner',
             now: nowFactory(),
+            stripeIdempotencyKey: refundIdempotencyKey,
+            // The unroutable mint announces itself in-tx through this logger.
+            log: request.log,
           });
           pendingStripeRefund = result.pendingStripeRefund;
           creditRefundedDogIds = result.creditRefundedDogIds;

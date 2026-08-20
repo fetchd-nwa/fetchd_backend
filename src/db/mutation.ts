@@ -10,10 +10,52 @@ import { withActor, type Tx } from './tx.js';
 
 /**
  * Length-bounded so a hostile client can't fill the `idempotency_keys` table
- * with arbitrarily large keys. Stripe's limit is 255; Standard Webhooks
- * recommends UUIDs (36). 255 is generous and matches existing convention.
+ * with arbitrarily large keys. Standard Webhooks recommends UUIDs (36).
+ *
+ * **The bound is DERIVED, not chosen (2026-08-20).** Routes do not send the
+ * client's key to Stripe; they send SUFFIXED keys built from it
+ * (`` `${idempotencyKey}:refund` ``, `` `${idempotencyKey}:payment-intent` ``,
+ * `` `${idempotencyKey}:enroll-unwind:${dogId}` ``, …). Stripe's own limit is
+ * 255, so accepting a 255-char client key mints derived keys of up to 306
+ * characters — keys Stripe rejects outright.
+ *
+ * That was survivable while a rejected key only failed one call. It stopped
+ * being survivable when `refunds.stripe_idempotency_key` began STORING the
+ * derived key: an over-length key is unsendable, and the retry sweep would
+ * re-send that same unsendable key every interval for 24 hours before
+ * abandoning the refund to a human — a guaranteed-to-fail loop bounded only by
+ * the abandon window (adversary panel, 2026-08-20).
+ *
+ * So the cap is 255 minus the longest suffix any route actually appends, and it
+ * is COMPUTED from that list rather than written as a number, so adding a
+ * longer suffix tightens the bound instead of silently overflowing it. Keep
+ * {@link STRIPE_DERIVED_KEY_SUFFIXES} honest and this stays correct by itself.
  */
-export const IDEMPOTENCY_KEY_MAX_LEN = 255;
+export const STRIPE_IDEMPOTENCY_KEY_MAX_LEN = 255;
+
+/**
+ * Every suffix a route appends to the client's `Idempotency-Key` before handing
+ * the result to Stripe. Two carry an interpolated uuid, counted as 36.
+ * Grep-verifiable — the key variable is NOT always named `idempotencyKey`
+ * (enrollments threads it as `args.idempotencyKey`), so grep for the suffix
+ * construction, not one spelling: `grep -rn 'dempotencyKey}:' src/`. The
+ * round-2 adversary caught `:dog:` missing from this list precisely because
+ * the old hint grepped the one spelling (2026-08-20).
+ */
+export const STRIPE_DERIVED_KEY_SUFFIXES = [
+  ':refund', // bookings, staffBookings, enrollments cancel/withdraw money-back
+  ':dup-subscribe-refund', // memberships subscribe lost-race
+  ':payment-intent', // memberships, invoices, requestConfirmPayment, creditPackages
+  ':customer', // paymentMethods
+  ':setup-intent', // paymentMethods
+  ':confirm-unwind', // requestConfirmPayment
+  `:enroll-unwind:${'x'.repeat(36)}`, // enrollments — suffix + a uuid dog id
+  `:dog:${'x'.repeat(36)}`, // enrollments — per-dog pay-now charge loop
+] as const;
+
+const LONGEST_DERIVED_SUFFIX = Math.max(...STRIPE_DERIVED_KEY_SUFFIXES.map((x) => x.length));
+
+export const IDEMPOTENCY_KEY_MAX_LEN = STRIPE_IDEMPOTENCY_KEY_MAX_LEN - LONGEST_DERIVED_SUFFIX;
 
 /**
  * Parse the `Idempotency-Key` header from a Fastify request's `headers` slot.
@@ -31,7 +73,9 @@ export function requireIdempotencyKey(raw: string | string[] | undefined): strin
   if (key.length > IDEMPOTENCY_KEY_MAX_LEN) {
     throw new ApiError(
       'bad_request',
-      `Idempotency-Key exceeds ${IDEMPOTENCY_KEY_MAX_LEN} characters`,
+      `Idempotency-Key exceeds ${IDEMPOTENCY_KEY_MAX_LEN} characters ` +
+        `(Stripe caps derived keys at ${STRIPE_IDEMPOTENCY_KEY_MAX_LEN} and this API appends up to ` +
+        `${LONGEST_DERIVED_SUFFIX} characters to yours)`,
     );
   }
   return key;

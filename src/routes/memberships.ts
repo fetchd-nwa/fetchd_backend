@@ -25,6 +25,7 @@ import { ApiError } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { firstPeriod, membershipEndsAt } from '../lib/membershipBilling.js';
 import type { PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
+import { firePendingRefundPostCommit } from '../lib/pendingRefund.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import {
@@ -297,6 +298,8 @@ export function registerMembershipsRoute(
       // on the uniqueness lost-race branch below (mirrors the invoice-pay
       // route's duplicate-settle refund seam).
       let pendingStripeRefund: PendingDuplicateRefund | undefined;
+      // Computed ONCE, here, so the row stores the same string the fire sends.
+      const refundIdempotencyKey = `${idempotencyKey}:dup-subscribe-refund`;
 
       // ── DB writes (inside withMutation; idempotency-keyed) ──
       const outcome = await withMutation<MembershipCreateWire>(
@@ -310,18 +313,11 @@ export function registerMembershipsRoute(
           patternsToInvalidate: (body) =>
             body.credits_granted > 0 ? [`credits:${body.membership.dog_id}:*`] : [],
           postCommit: async () => {
-            if (pendingStripeRefund === undefined) return;
-            const refund = await stripe.createRefund(
-              {
-                paymentIntentId: pendingStripeRefund.paymentIntentId,
-                amountCents: pendingStripeRefund.amountCents,
-                reason: 'requested_by_customer',
-              },
-              `${idempotencyKey}:dup-subscribe-refund`,
-            );
-            await refundsRepository.markStripeId({
-              id: pendingStripeRefund.refundId,
-              stripeRefundId: refund.id,
+            await firePendingRefundPostCommit({
+              pending: pendingStripeRefund,
+              stripe,
+              log: request.log,
+              context: { dogId: body.dog_id, refundPath: 'membership-subscribe-lost-race' },
             });
           },
         },
@@ -352,11 +348,16 @@ export function registerMembershipsRoute(
                 bookingId: null,
                 amountCents: intent.amountCents,
                 reason: 'duplicate-membership-subscribe',
+                // Stored in the SAME tx as the row: without it a failed
+                // post-commit `createRefund` was unretryable by anything,
+                // because this key lives only in this request's closure.
+                stripeIdempotencyKey: refundIdempotencyKey,
               });
               pendingStripeRefund = {
                 refundId: refund.id,
                 paymentIntentId: intent.id,
                 amountCents: intent.amountCents,
+                stripeIdempotencyKey: refundIdempotencyKey,
               };
               return {
                 status: 201,

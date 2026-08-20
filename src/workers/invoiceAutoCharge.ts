@@ -15,7 +15,8 @@ import {
   type AutoChargeParkArm,
 } from '../lib/autoChargeNotificationCopy.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
-import { fireDuplicateRefundPostCommit, settleInvoiceCharge } from '../lib/settleInvoiceCharge.js';
+import { firePendingRefundPostCommit } from '../lib/pendingRefund.js';
+import { settleInvoiceCharge } from '../lib/settleInvoiceCharge.js';
 import {
   chargeBlockerForConfirm,
   defaultStripeClient,
@@ -611,7 +612,7 @@ export async function settleAttempt(args: {
   });
 
   if (result.outcome === 'refunded') {
-    await fireDuplicateRefundPostCommit({
+    await firePendingRefundPostCommit({
       pending: result.pendingStripeRefund,
       stripe,
       log,

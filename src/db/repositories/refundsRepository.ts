@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import { ne } from 'drizzle-orm';
 import { db } from '../client.js';
 import { pgTimestampToDate } from '../../lib/pgTimestamp.js';
@@ -8,7 +8,14 @@ import type { Tx } from '../tx.js';
 /** Polymorphic runner — pool for pre/post-tx ops, Tx for in-mutation work. */
 type Runner = Tx | typeof db;
 
-export type RefundStatus = 'pending' | 'succeeded' | 'failed';
+/**
+ * `schema.sql` `refund_status`. `'unroutable'` (2026-08-19, design §4) is
+ * TERMINAL and reachable only two ways: minted there by
+ * `cancelBookingService`'s no-PaymentIntent branch, or flipped there from
+ * `'pending'` by {@link refundsRepository.markUnroutable}. Nothing ever leaves
+ * it automatically — the money returns when a human returns it.
+ */
+export type RefundStatus = 'pending' | 'succeeded' | 'failed' | 'unroutable';
 
 /**
  * Data-access seam for `refunds` (schema.sql ~line 778). Append-only
@@ -41,6 +48,13 @@ export interface RefundRow {
   amountCents: number;
   status: RefundStatus;
   stripeRefundId: string | null;
+  /**
+   * The EXACT Stripe idempotency key this row's `createRefund` uses, stored at
+   * mint (design §1). NULL means the row predates the column or is
+   * `'unroutable'` — in both cases no automatic retry may touch it, which is
+   * why the sweep's claim reads this instead of a calendar constant.
+   */
+  stripeIdempotencyKey: string | null;
 }
 
 const REFUND_PROJECTION = {
@@ -51,6 +65,7 @@ const REFUND_PROJECTION = {
   amountCents: refunds.amountCents,
   status: refunds.status,
   stripeRefundId: refunds.stripeRefundId,
+  stripeIdempotencyKey: refunds.stripeIdempotencyKey,
 } as const;
 
 /**
@@ -101,28 +116,43 @@ export const ROW_KEYED_REFUND_REASON = 'duplicate-invoice-settle';
 export const REFUND_SWEEP_FLOOR = new Date('2026-08-14T00:00:00.000Z');
 
 /**
- * What an abandoned-pending refund IS, from the row's own durable facts — the
+ * What an unreturned refund IS, from the row's own durable facts — the
  * discriminator {@link findAbandonedPending} returns so the caller's alarm can
  * say something TRUE about each one instead of one sentence that is false for
  * two thirds of them.
  *
+ *   - `stripe-failed` — `status='failed'`: the refund WAS created at Stripe and
+ *     Stripe then failed it (a closed card account, R18/R19). The money did not
+ *     return, no retry can help (the identity is spent), and until 2026-08-19
+ *     this class had no recurring surface at all — the webhook flipped the row
+ *     and moved on. Checked FIRST: a terminal Stripe outcome outranks every
+ *     question about keys. A fresh dashboard refund is safe here because the
+ *     failed row drops out of the cumulative cap (`sumNonFailedForCharge`).
  *   - `never-sent` — the charge behind it carries no `stripe_payment_intent_id`
- *     at all (pre-Stripe-wire seed money; `cancelBookingService` writes the
- *     'pending' row anyway to capture the intent). There is nothing at Stripe
- *     to refund, so "refund it by hand in the dashboard" is not an instruction
- *     a human can follow. Checked FIRST: how a row would have been keyed does
- *     not matter when no charge was ever sent.
- *   - `client-keyed` — either the reason is not {@link ROW_KEYED_REFUND_REASON}
- *     (`'cancel'`, `'duplicate-membership-subscribe'`), or it is but the row
- *     predates {@link REFUND_SWEEP_FLOOR}. Both mean the same operationally:
- *     the original Stripe idempotency key was the client's request key, no
- *     automatic path can reproduce it, and a human must CHECK Stripe for an
- *     existing refund before issuing one.
- *   - `row-keyed` — post-floor, `duplicate-invoice-settle`: the sweep owns
- *     these, tried, and has now aged past the key window. Its key is
- *     `dup-settle-refund:<refund id>`, which a human can search for.
+ *     at all (pre-Stripe-wire seed money). There is nothing at Stripe to refund,
+ *     so "refund it by hand in the dashboard" is not an instruction a human can
+ *     follow. **This class should now always be empty**: such rows are minted
+ *     `'unroutable'` and legacy ones are flipped by {@link markUnroutable} at
+ *     the top of each sweep. It survives as the honest answer for a row the
+ *     flip has not reached yet (the flip is batched), not as a standing class.
+ *   - `client-keyed` — no stored key AND not legacy-reconstructible: the reason
+ *     is not {@link ROW_KEYED_REFUND_REASON} (`'cancel'`,
+ *     `'duplicate-membership-subscribe'`), or it is but the row predates
+ *     {@link REFUND_SWEEP_FLOOR}. Operationally identical: the original Stripe
+ *     idempotency key was the client's request key, no automatic path can
+ *     reproduce it, and a human must CHECK Stripe for an existing refund before
+ *     issuing one. **Frozen and finite** — since 2026-08-19 every writer stores
+ *     its key, so nothing new can join this class.
+ *   - `row-keyed` — the key is KNOWN: stored on the row, or (pre-2026-08-19,
+ *     post-floor `duplicate-invoice-settle`) reconstructible as
+ *     `dup-settle-refund:<refund id>`. The sweep owns these, tried, and has now
+ *     aged past the key window; a human can search that exact key in Stripe.
  */
-export type AbandonedRefundClass = 'never-sent' | 'client-keyed' | 'row-keyed';
+export type AbandonedRefundClass =
+  | 'never-sent'
+  | 'client-keyed'
+  | 'row-keyed'
+  | 'stripe-failed';
 
 export interface AbandonedRefundRow extends RefundRow {
   refundClass: AbandonedRefundClass;
@@ -131,17 +161,23 @@ export interface AbandonedRefundRow extends RefundRow {
 }
 
 /**
- * The three-way discriminator behind {@link AbandonedRefundClass}. Order is the
- * whole point: "there is no Stripe charge here" outranks "we could not have
- * reproduced its key", because a human told to find a refund that never had a
- * charge will not find one.
+ * The discriminator behind {@link AbandonedRefundClass}. Order is the whole
+ * point: a terminal Stripe outcome outranks everything, then "there is no
+ * Stripe charge here" outranks "we could not have reproduced its key" — because
+ * a human told to find a refund that never had a charge will not find one.
  */
 function classifyAbandoned(args: {
+  status: RefundStatus;
   reason: string | null;
   createdAt: string;
   piId: string | null;
+  stripeIdempotencyKey: string | null;
 }): AbandonedRefundClass {
+  if (args.status === 'failed') return 'stripe-failed';
   if (args.piId === null) return 'never-sent';
+  // The stored key is the whole design: a row that carries one is retryable and
+  // searchable regardless of which writer minted it or when.
+  if (args.stripeIdempotencyKey !== null) return 'row-keyed';
   if (args.reason !== ROW_KEYED_REFUND_REASON) return 'client-keyed';
   return pgTimestampToDate(args.createdAt) > REFUND_SWEEP_FLOOR ? 'row-keyed' : 'client-keyed';
 }
@@ -155,6 +191,11 @@ export const refundsRepository = {
    * the purpose of capacity (we don't double-refund). If the Stripe
    * call fails the webhook flips status to 'failed' and the amount
    * drops out of the sum on retry.
+   *
+   * `'unroutable'` counts too, and that is the correct reading of `ne('failed')`
+   * rather than an accident of it (design §4): the obligation to return that
+   * money is recorded, a human will honor it, and nothing may mint a second
+   * refund row against the same charge in the meantime.
    *
    * Returns 0 if no prior refunds exist (the common case — first
    * cancel of a money-paid booking).
@@ -206,6 +247,63 @@ export const refundsRepository = {
       bookingId: string | null;
       amountCents: number;
       reason?: string | null;
+      /**
+       * The EXACT Stripe idempotency key the post-commit fire will use.
+       * **REQUIRED, and required on purpose** (design §2.1): a default would let
+       * a future writer forget to decide, and a forgotten decision here is a
+       * refund nothing can ever retry. `null` is a statement — "this row will
+       * never be fired automatically" — not an omission.
+       */
+      stripeIdempotencyKey: string | null;
+      /**
+       * Supply the row's uuid app-side when the KEY IS DERIVED FROM IT
+       * (`settleInvoiceCharge`'s `dup-settle-refund:<id>`): the key must be
+       * computed before the INSERT that stores it, and only the caller can
+       * break that circle. Everyone else lets the DB default it.
+       */
+      id?: string;
+    },
+  ): Promise<RefundRow> {
+    const [row] = await tx
+      .insert(refunds)
+      .values({
+        ...(args.id !== undefined ? { id: args.id } : {}),
+        ownerId: args.ownerId,
+        chargeId: args.chargeId,
+        bookingId: args.bookingId,
+        amountCents: args.amountCents,
+        reason: args.reason ?? null,
+        stripeIdempotencyKey: args.stripeIdempotencyKey,
+      })
+      .returning(REFUND_PROJECTION);
+    if (!row) {
+      throw new Error('refundsRepository.createPending: refunds INSERT returned no row');
+    }
+    return row;
+  },
+
+  /**
+   * INSERT one refund row TERMINAL at `status='unroutable'` (design §4) — the
+   * money-back branch of a charge that carries no `stripe_payment_intent_id`.
+   *
+   * Deliberately a separate verb rather than a `status` argument on
+   * {@link createPending}: a function named `createPending` that can mint a
+   * non-pending row is a lie a future reader has to catch, and these two mints
+   * differ in every downstream consequence. `stripe_idempotency_key` is NULL by
+   * construction — there is no Stripe call to key.
+   *
+   * The row is still WRITTEN, not skipped: it records that the school owes this
+   * money, and `sumNonFailedForCharge` counts it toward the cumulative cap so
+   * nothing can double-mint against the same charge.
+   */
+  async createUnroutable(
+    tx: Tx,
+    args: {
+      ownerId: string;
+      chargeId: string;
+      bookingId: string | null;
+      amountCents: number;
+      reason?: string | null;
     },
   ): Promise<RefundRow> {
     const [row] = await tx
@@ -216,10 +314,12 @@ export const refundsRepository = {
         bookingId: args.bookingId,
         amountCents: args.amountCents,
         reason: args.reason ?? null,
+        status: 'unroutable',
+        stripeIdempotencyKey: null,
       })
       .returning(REFUND_PROJECTION);
     if (!row) {
-      throw new Error('refundsRepository.createPending: refunds INSERT returned no row');
+      throw new Error('refundsRepository.createUnroutable: refunds INSERT returned no row');
     }
     return row;
   },
@@ -259,16 +359,34 @@ export const refundsRepository = {
    * exactly "the money-back row was written but the Stripe call never landed".
    * Until this existed, nothing retried them — no worker imported this
    * repository, and `charge.refund.updated` cannot arrive for a refund that was
-   * never created at Stripe. Every `fireDuplicateRefundPostCommit` failure was
+   * never created at Stripe. Every `firePendingRefundPostCommit` failure was
    * therefore a permanent double charge whose only trace was one log line, and
    * the webhook's invoice-orphan arm made lost-race refunds a COMMON path
    * rather than a rare one.
    *
-   * **Scoped to `reason = 'duplicate-invoice-settle'` AND to rows minted after
-   * {@link REFUND_SWEEP_FLOOR}, and both are safety bounds, not convenience
-   * ones.** A retry is only safe when it can reproduce the key the ORIGINAL
-   * call used; under a different key Stripe executes a SECOND refund instead of
-   * replaying the first.
+   * **A retry is only safe when it can reproduce the key the ORIGINAL call
+   * used**; under a different key Stripe executes a SECOND refund instead of
+   * replaying the first. That is the one rule, and there are now two ways a row
+   * can satisfy it (design §2.3):
+   *
+   *   1. **The stored-key lane** (`stripe_idempotency_key IS NOT NULL`) — since
+   *      2026-08-19 every writer records its exact key in the minting tx, so
+   *      the row itself says what to send. This is the lane that finally covers
+   *      the cancel / withdraw / membership-lost-race writers, whose keys were
+   *      derived from the CLIENT's request `Idempotency-Key` and existed only
+   *      inside that request's closure. Note what it does NOT need: a date
+   *      constant. `stripe_idempotency_key IS NULL` IS the deploy boundary,
+   *      true row by row, immune to a deploy that slips a day and safe under a
+   *      mixed-version fleet — an old-code instance mints a NULL-key row, which
+   *      simply stays out of this lane.
+   *   2. **The legacy lane** (`reason = 'duplicate-invoice-settle'` AND
+   *      `created_at > REFUND_SWEEP_FLOOR`) — round 4's bound, kept VERBATIM,
+   *      for rows already on disk that round-4-era code minted without a stored
+   *      key. The 24h abandon bound retires it naturally within a day of
+   *      deploy; it stays because it is provably safe and deleting it is a
+   *      later cleanup, not a correctness need. Its floor must NOT be relaxed
+   *      or advanced by this design: below it, `reason` alone cannot tell a
+   *      row-keyed refund from a client-keyed one.
    *
    * The reason string is necessary and NOT sufficient, which an earlier version
    * of this comment got wrong (round 4, 2026-08-13). It claimed every caller of
@@ -283,10 +401,11 @@ export const refundsRepository = {
    * why the boundary has to be a date.
    *
    * The other pending-refund writers (`reason='cancel'` from the
-   * cancel/withdraw paths, and `'duplicate-membership-subscribe'`) key on
-   * `${idempotencyKey}:…` to this day, which nothing durable can reconstruct —
-   * so this sweep must NOT touch them either, and their failed refunds remain a
-   * named, un-swept gap.
+   * cancel/withdraw paths, and `'duplicate-membership-subscribe'`) keyed on
+   * `${idempotencyKey}:…` until 2026-08-19 — nothing durable can reconstruct
+   * that, so their PRE-EXISTING rows still fall outside both lanes and remain a
+   * named, un-swept, and now finite gap. Their new rows carry a stored key and
+   * are retried by lane 1.
    *
    * Nothing excluded here is dropped: every unsent 'pending' refund the sweep
    * refuses still reaches a human through {@link findAbandonedPending}.
@@ -303,16 +422,17 @@ export const refundsRepository = {
    *     replay the first — the mirror image of the auto-charge key window, and
    *     the same answer: stop, and hand it to a human
    *     (see `findAbandonedPending`).
-   *   - {@link REFUND_SWEEP_FLOOR} (on `created_at`) is the DEPLOY bound, and
-   *     it is applied HERE rather than by the caller so no caller can widen it.
-   *     The effective floor is whichever of the two is later.
+   *   - {@link REFUND_SWEEP_FLOOR} (on `created_at`) is the DEPLOY bound of the
+   *     LEGACY lane, and it is applied HERE rather than by the caller so no
+   *     caller can widen it. It deliberately does NOT gate the stored-key lane:
+   *     that lane's boundary is the column itself, per row, so a floor sitting
+   *     in the future for an unshipped deploy must not also switch off the
+   *     retry for rows that carry their own key.
    */
   async claimStalePendingForRetry(
     tx: Tx,
     args: { staleBefore: Date; mintedAfter: Date; limit?: number },
   ): Promise<RefundRow[]> {
-    const mintedAfter =
-      args.mintedAfter > REFUND_SWEEP_FLOOR ? args.mintedAfter : REFUND_SWEEP_FLOOR;
     const due = await tx
       .select({ id: refunds.id })
       .from(refunds)
@@ -320,9 +440,17 @@ export const refundsRepository = {
         and(
           eq(refunds.status, 'pending'),
           isNull(refunds.stripeRefundId),
-          eq(refunds.reason, ROW_KEYED_REFUND_REASON),
           lte(refunds.updatedAt, args.staleBefore.toISOString()),
-          gt(refunds.createdAt, mintedAfter.toISOString()),
+          gt(refunds.createdAt, args.mintedAfter.toISOString()),
+          or(
+            // Lane 1 — the row carries the exact key its first attempt used.
+            isNotNull(refunds.stripeIdempotencyKey),
+            // Lane 2 — round 4's legacy lane, VERBATIM. Do not widen.
+            and(
+              eq(refunds.reason, ROW_KEYED_REFUND_REASON),
+              gt(refunds.createdAt, REFUND_SWEEP_FLOOR.toISOString()),
+            ),
+          ),
         ),
       )
       .orderBy(asc(refunds.createdAt))
@@ -367,6 +495,22 @@ export const refundsRepository = {
    * seed row and a dangerous one for a client-keyed row (issue a second refund
    * for one that may already exist). One sentence per class, each true — the
    * LEFT JOIN is what makes `never-sent` knowable at all.
+   *
+   * **Widened 2026-08-19 (design §5) to `status IN ('pending','failed')`, with a
+   * predicate per status.** `'failed'` rows are the last class of owed-back
+   * money with no recurring surface anywhere: the refund WAS created at Stripe,
+   * the webhook flipped it `'failed'` (the card account closed, R18/R19), the
+   * money did not return, and the row then left every worklist forever. They
+   * carry a `stripe_refund_id` by construction, so the `IS NULL` predicate that
+   * defines an unsent pending row cannot apply to them — hence per-status arms
+   * rather than one WHERE. They are also NOT age-bounded: nothing about a
+   * terminal Stripe failure changes in 24 hours, so delaying the alarm by the
+   * key window would only delay a human.
+   *
+   * `'unroutable'` rows are excluded by construction — they are terminal, they
+   * have already been shouted about once (at mint, or at the flip in
+   * {@link markUnroutable}), and re-listing them every tick forever is exactly
+   * the noise this report was rebuilt to stop making.
    */
   async findAbandonedPending(
     runner: Runner,
@@ -382,15 +526,22 @@ export const refundsRepository = {
     // only the classification inputs — same WHERE, same classifier, so the two
     // cannot disagree about what a row is — and the caller alarms on counts, not
     // on page presence.
-    const abandonedWhere = and(
-      eq(refunds.status, 'pending'),
-      isNull(refunds.stripeRefundId),
-      lte(refunds.createdAt, args.mintedBefore.toISOString()),
+    const abandonedWhere = or(
+      // Unsent and past the key window: nothing automatic will send it now.
+      and(
+        eq(refunds.status, 'pending'),
+        isNull(refunds.stripeRefundId),
+        lte(refunds.createdAt, args.mintedBefore.toISOString()),
+      ),
+      // Sent, then failed AT Stripe. Terminal, unbounded by age (see the doc).
+      eq(refunds.status, 'failed'),
     );
     const classInputs = await runner
       .select({
+        status: refunds.status,
         reason: refunds.reason,
         createdAt: refunds.createdAt,
+        stripeIdempotencyKey: refunds.stripeIdempotencyKey,
         stripePaymentIntentId: charges.stripePaymentIntentId,
       })
       .from(refunds)
@@ -400,13 +551,16 @@ export const refundsRepository = {
       'row-keyed': 0,
       'client-keyed': 0,
       'never-sent': 0,
+      'stripe-failed': 0,
     };
     for (const input of classInputs) {
       totalByClass[
         classifyAbandoned({
+          status: input.status,
           reason: input.reason,
           createdAt: input.createdAt,
           piId: input.stripePaymentIntentId,
+          stripeIdempotencyKey: input.stripeIdempotencyKey,
         })
       ] += 1;
     }
@@ -420,15 +574,112 @@ export const refundsRepository = {
       .from(refunds)
       .leftJoin(charges, eq(refunds.chargeId, charges.id))
       .where(abandonedWhere)
-      .orderBy(asc(refunds.createdAt))
+      // PAGE PRIORITY, not pure age (adversary round 3, 2026-08-20 — proven on
+      // :5433). `'failed'` rows are TERMINAL and unbounded by age, so they only
+      // ever accumulate and they are always the oldest thing in this result.
+      // Ordering the page by `created_at` alone therefore handed all 20 slots
+      // to them permanently, and a brand-new abandoned PENDING refund — the
+      // actionable kind, the whole reason this report exists — could never
+      // appear on it again.
+      //
+      // So actionable pending rows take the slots first, oldest-first among
+      // themselves; failed rows fill only what is left. A `'failed'` row can
+      // never evict a `'pending'` one. The unbounded per-class COUNTS are
+      // untouched by this and remain the source of truth for "how much".
+      .orderBy(
+        sql`CASE WHEN ${refunds.status} = 'pending' THEN 0 ELSE 1 END`,
+        asc(refunds.createdAt),
+      )
       .limit(args.limit ?? 20);
     return {
       rows: rows.map(({ reason, createdAt, ...row }) => ({
         ...row,
-        refundClass: classifyAbandoned({ reason, createdAt, piId: row.stripePaymentIntentId }),
+        refundClass: classifyAbandoned({
+          status: row.status,
+          reason,
+          createdAt,
+          piId: row.stripePaymentIntentId,
+          stripeIdempotencyKey: row.stripeIdempotencyKey,
+        }),
       })),
       totalByClass,
     };
+  },
+
+  /**
+   * Flip every `pending`, never-sent refund whose charge carries NO
+   * PaymentIntent to the terminal `'unroutable'` status (design §4), returning
+   * what it flipped so the caller can shout about each one ONCE.
+   *
+   * These are the pre-Stripe-wire seed-money rows. There is nothing at Stripe to
+   * reverse, so no sweep can ever send them and no webhook can ever close them —
+   * yet they sat `'pending'` forever, saturating an oldest-first report page and
+   * re-shouting on every process restart. **The flip IS the memory**: unlike a
+   * per-process `Set`, a restart does not re-announce a row that is already
+   * terminal, and no manual backfill or runbook step is needed.
+   *
+   * Information-preserving and reversible by the same predicate — the amount,
+   * owner, charge and reason are untouched, and `sumNonFailedForCharge` keeps
+   * counting the row toward the cumulative cap, so nothing can double-mint
+   * against the obligation this records.
+   *
+   * Batched (default 100) because the caller names each flipped row in a log
+   * line; a backlog drains over consecutive ticks and whatever is left stays
+   * honestly classified as `never-sent` in the meantime.
+   */
+  async markUnroutable(
+    runner: Runner,
+    args: { limit?: number } = {},
+  ): Promise<AbandonedRefundRow[]> {
+    const due = await runner
+      .select({ id: refunds.id })
+      .from(refunds)
+      .innerJoin(charges, eq(refunds.chargeId, charges.id))
+      .where(
+        and(
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          isNull(charges.stripePaymentIntentId),
+          // A STORED KEY IS PROOF A STRIPE CALL WAS AIMED at this row, and such
+          // a row belongs to the sweep's lane 1 (adversary panel, 2026-08-20).
+          // Flipping it terminal would delete it from that lane forever and
+          // silently strand a refund the sweep was about to send. The two
+          // conditions can co-occur: a charge row whose PaymentIntent is NULL
+          // while a writer still recorded a key is corrupt state, and the safe
+          // reading of corrupt state is "leave it for the lane that can act".
+          isNull(refunds.stripeIdempotencyKey),
+        ),
+      )
+      .orderBy(asc(refunds.createdAt))
+      .limit(args.limit ?? 100);
+    if (due.length === 0) return [];
+    const flipped = await runner
+      .update(refunds)
+      .set({ status: 'unroutable', updatedAt: sql`now()` })
+      .where(
+        and(
+          inArray(
+            refunds.id,
+            due.map((r) => r.id),
+          ),
+          // Re-assert the claim shape at write time: between the read above and
+          // this UPDATE a webhook could have moved the row, and a flip that
+          // overwrote a real terminal status would be data loss. The stored-key
+          // condition is re-asserted for the same reason — a concurrent writer
+          // that stamped a key between the SELECT and here has claimed this row
+          // for lane 1, and this flip must lose that race, not win it.
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          isNull(refunds.stripeIdempotencyKey),
+        ),
+      )
+      .returning(REFUND_PROJECTION);
+    return flipped.map((row) => ({
+      ...row,
+      // Known by the predicate that selected it — the charge has no PI.
+      stripePaymentIntentId: null,
+      refundClass: 'never-sent' as const,
+    }));
   },
 
   /**

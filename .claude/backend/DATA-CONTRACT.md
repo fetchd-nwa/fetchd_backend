@@ -3677,3 +3677,153 @@ are corrections to §K.2.2 above.
   response, and if `original-request` also appears on fresh ones then trusting
   it would make every re-issue look replayed — settling a genuine second charge
   as though it were the first. Measure a FRESH response before adding it.
+
+### K.2.4 The refund key is stored, not reconstructed (2026-08-19)
+
+From `designs/client-keyed-refund-recovery.md`. **No wire delta** — `wire.ts`
+carries no refund shapes at all, so nothing here is client-visible and no
+version moved. These are additions to §K.2.3, and one correction to what round 4
+believed it had closed.
+
+- **THE GAP round 4 named but did not close.** The retry sweep could only ever
+  re-fire rows whose Stripe idempotency key was *reconstructible from the row*
+  — `reason='duplicate-invoice-settle'`, key `dup-settle-refund:<refundId>`.
+  Three other writers mint `'pending'` refund rows and key their post-commit
+  `createRefund` on the **client's request `Idempotency-Key`**, a string that
+  exists only inside that request's closure: booking cancel (owner
+  `routes/bookings.ts`, staff `routes/staffBookings.ts`), group-class withdraw
+  (`routes/enrollments.ts`), and the membership subscribe lost-race
+  (`routes/memberships.ts`). When one of their post-commit calls failed — a rate
+  limit, a 500, a dropped connection — **nothing anywhere retried it and the
+  money never went back.** Round 4's classified report *named* those rows
+  (`client-keyed`); naming is not returning.
+- **The fix is a stored key, not a re-key.** `refunds.stripe_idempotency_key`
+  (nullable text) records, in the same transaction that mints the row, the exact
+  key the fire will send. `refundsRepository.createPending` takes it as a
+  **required** argument — `null` is a statement, never a default — and the
+  sweep's claim reads it. `settleInvoiceCharge` stores its row-derived key too
+  (generating the row uuid app-side so the key exists before the INSERT), so all
+  four writers converge on one predicate.
+- **Why storage beats re-keying the three writers onto row-derived keys.**
+  Re-keying reproduces F1's exact hazard: rows already on disk under client keys
+  are indistinguishable from new ones by `reason` alone, so it would need its
+  own `REFUND_SWEEP_FLOOR`-style date constant with the same advance-it-or-else
+  footgun. A stored key needs no constant and no operator memory:
+  **`stripe_idempotency_key IS NULL` IS the deploy boundary**, true row by row,
+  immune to a deploy that slips a day and safe under a mixed-version fleet (an
+  old-code instance mints a NULL-key row, which simply stays out of the lane).
+- **The claim gained one lane and lost nothing.** `claimStalePendingForRetry`
+  keeps every round-4 bound and ORs in `stripe_idempotency_key IS NOT NULL`
+  alongside round 4's legacy lane (`reason='duplicate-invoice-settle' AND
+  created_at > REFUND_SWEEP_FLOOR`), kept verbatim. **`REFUND_SWEEP_FLOOR` now
+  gates only the legacy lane** — deliberately, so a floor sitting in the future
+  for an unshipped deploy cannot also switch off the retry for rows that carry
+  their own key. `retryOne` fires under
+  `row.stripeIdempotencyKey ?? duplicateRefundIdempotencyKey(row.id)`, and both
+  the fire and the retry build their Stripe params through ONE constructor
+  (`lib/pendingRefund.refundCreateParams`) because a same-key replay requires
+  byte-equal params — same key with drifted params is a 400 `idempotency_error`
+  and the refund never lands.
+- **One fire helper for all five sites.** `fireDuplicateRefundPostCommit` is
+  replaced by `lib/pendingRefund.firePendingRefundPostCommit`, and the four
+  route sites that hand-rolled `stripe.createRefund` inside
+  `withMutation.postCommit` now call it. Their failures were previously an
+  unstructured `withMutation` stderr line that did not name the refund; they are
+  now a structured ERROR carrying refund id, PI, amount and the stored key.
+  `PendingStripeRefund` and `PendingDuplicateRefund` collapse into one type.
+- **`refund_status` gains a fourth arm: `'unroutable'`, terminal.** A cancel
+  against a charge with **no `stripe_payment_intent_id`** (pre-Stripe-wire seed
+  money) writes the row at `'unroutable'` with a NULL key instead of `'pending'`
+  — there is nothing at Stripe to reverse and there never will be — and
+  **announces itself at ERROR inside that same transaction**, never from the
+  route's post-commit seam. `withMutation` skips `postCommit` outright on an
+  idempotent replay, so the crash-then-replay arc lost the ONLY surface a
+  terminal row ever gets: money owed, recorded, announced nowhere, permanently
+  (adversary panel, 2026-08-20, proven with a planted row on :5433). The cost is
+  a false alarm if the transaction rolls back — loud and recoverable, against
+  silent and permanent. The owner-facing cancel copy, "Refund is on the way",
+  **stands as-is over these hand-sent refunds by Allison's 2026-08-20 ruling.**
+  Legacy `'pending'` rows of that shape are flipped once by
+  `refundsRepository.markUnroutable` — which requires `stripe_idempotency_key IS
+  NULL` in both its SELECT and its re-asserted UPDATE predicate, because a
+  stored key is proof a Stripe call was aimed and flipping such a row would
+  delete it from the retry lane forever — called at the top of every sweep tick;
+  **the flip is the durable memory**, so unlike round 4's per-process
+  `ALARMED_REFUND_IDS` a restart does not re-shout them and the report stops
+  carrying them forever. No manual backfill, no runbook line. `ADD VALUE` is
+  effectively irreversible in Postgres — accepted, because the arm names a real
+  permanent business state. `sumNonFailedForCharge` counts `'unroutable'`
+  toward the cumulative cap, which is correct: the obligation is recorded and
+  nothing may double-mint against it. The webhook cannot reach these rows
+  (no `stripe_refund_id` to match, and `findUnmatchedPendingForCharge` filters
+  `status='pending'`).
+- **The report gained a fourth class, `stripe-failed`.** `findAbandonedPending`
+  widens to `status IN ('pending','failed')` with a predicate per status. A
+  `'failed'` row is a refund Stripe CREATED and then failed (closed card
+  account, R18/R19): the money did not return, no retry can help because the
+  identity is spent, and until now the webhook flipped the row and it left every
+  worklist forever. Deliberately **not** age-bounded — nothing about a terminal
+  Stripe failure changes in 24 hours. The instruction is "issue a FRESH refund
+  from the dashboard", which is safe precisely because a failed row drops out of
+  `sumNonFailedForCharge`. **Allison ruled 2026-08-20: INCLUDE AS-BUILT** — the
+  unbounded, all-history count is accepted, and the future portal staff
+  reconciliation surface (F2) is this class's exit state. It remains technically
+  severable; nothing else depends on it. (An earlier draft of this section dated
+  both this and the copy ruling 2026-08-19; that date's only ruling was the two
+  flagged push titles.)
+- **The accepted `Idempotency-Key` header shrank from 255 to 204 characters —
+  the only client-visible behavior change in this design (2026-08-20).** The
+  bound is computed: Stripe's own 255-char key limit minus the longest suffix
+  any route appends before handing a derived key to Stripe (currently
+  `:enroll-unwind:<uuid>` at 51 — the list is `STRIPE_DERIVED_KEY_SUFFIXES`,
+  `src/db/mutation.ts`). A 255-char client key used to mint derived keys
+  Stripe rejects outright; once `refunds.stripe_idempotency_key` stores such
+  a key, the sweep would re-send an unsendable key for the full 24h window.
+  Over-length keys now 400 at the door with the arithmetic in the message.
+  Both clients mint 36-char uuids, so real traffic has ~5.6× headroom.
+- **The `never-sent` class survives in the code but should always read 0.** The
+  flip empties it at the top of the same tick; it remains as the honest answer
+  for a row a batched flip has not reached yet, not as a standing class. The
+  round-4 saturation pin moved with it: a report page can still be buried, but
+  by `client-keyed` rows rather than never-sent ones.
+- **The named page is ordered by ACTIONABILITY, and buried classes re-alarm on
+  growth (corrected 2026-08-20, adversary round 3).** The sentence above used to
+  end "…a frozen, finite set", arguing saturation was harmless because the only
+  class that could bury the page could not grow. **This diff made that false and
+  the panel proved it on :5433**: `stripe-failed` rows are terminal and
+  unbounded by age, so they are always the oldest rows in the result and 20+ of
+  them owned the `created_at`-ordered page permanently. Compounding it, the
+  buried-class alarm keyed on a once-per-process-per-class boolean, so ticks
+  carrying genuinely new abandoned money emitted **zero** ERRORs and only a
+  climbing INFO. Two fixes, per Allison's 2026-08-20 ruling (her include-as-built
+  ruling on the class itself stands — unbounded count, no age bound):
+  `findAbandonedPending` orders the page `status='pending'` first and
+  `created_at` second, so actionable rows take the 20 slots and a failed row can
+  never evict a pending one; and the boolean sentinel becomes a per-class
+  **last-announced-count mark**, so growth past the level this process last
+  announced is a fresh ERROR while an unchanged count stays INFO. One accepted
+  silence remains (final panel pass, 2026-08-20): a fully page-buried class
+  whose count shrinks and regrows to at or below the last announced level
+  stays INFO in that window — resetting the mark on decrease would re-shout
+  already-announced rows. The naming path re-bases the mark downward, which
+  narrows this window rather than widening it. The unbounded per-class counts
+  that feed `abandonedByClass` are untouched by either change.
+- **The stub stopped counterfeiting refunds.** `_stripeStub.createRefund` minted
+  a fresh `re_*` on **every** call regardless of key, so a sweep that
+  re-EXECUTED instead of replaying passed the suite identically to a correct one
+  — the confirm verb got its replay store on 2026-08-12 and this verb did not.
+  It now models Stripe's idempotency layer (same key + same params → the same
+  `re_*`; same key + drifted params → `idempotency_error`), a
+  `refundLandsThenThrows()` knob for the lost-response case, a per-PI cumulative
+  refundable cap that throws `charge_already_refunded`, and `executedRefunds()`
+  so "exactly one refund exists for this money" is assertable rather than
+  hopeful. Each was proven red before it was trusted.
+- **What is measured and what is not.** Same-key `paymentIntents.create` replay
+  was measured live 2026-08-13; same-key **refunds.create** replay is NOT, and
+  neither is the `charge_already_refunded` code nor whether
+  `charge.refund.updated` fires for an instantly-succeeded refund. All three are
+  now questions P1–P3 in `npm run probe:stripe`, which **a human runs** —
+  nothing in `npm run gate` calls Stripe. Every bound in this change is safe
+  under any answer; P1 is the only one that could change the build (a refund
+  that does not replay would mean disabling the sweep). The ~24h key lifetime
+  itself remains documented, never measured.
