@@ -12,6 +12,33 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.11.0] — 2026-08-20
+
+Additive. Per-dog partial success on POST /enrollments (Allison 2026-08-12:
+"it should report per dog … not transactional where we fail the entire
+thing"; designs/partial-success-enrollment.md).
+
+- New request field `allow_partial?: boolean` (default false — old bodies
+  hash and behave identically). With it, the route enrolls every dog that
+  passes its checks and reports every dog that doesn't, per dog, with the
+  exact reason.
+- New: `EnrollmentResultWire`, `EnrollmentDogResultWire`,
+  `EnrollmentDogFailureReason`, `EnrollmentVaccineGapWire`. 201 = >=1
+  enrolled; 200 = 0 enrolled. Without the field: 201 BookingWire[] unchanged.
+- Old clients cannot render a partial outcome, so they are never handed one —
+  the field is the degrade boundary, not the version.
+
+Server-side (no wire shape): POST /enrollments pay-now converts to manual
+capture (authorize -> enroll -> capture), the enrollments slice of
+designs/money-safety-rollback-and-replay.md. A failed or abandoned enrollment
+now releases holds instead of refunding captures. Partial success removes the
+reason the hazard-ranked single blocker existed: every dog reports its own.
+
+NOTE ON NUMBERING: [1.10.0] reserved 1.11.0 for the manual-capture round.
+This bump delivers that round's enrollments slice (wire-invisible) together
+with the envelope; the remaining slice (memberships wire move, B&T
+conversion) takes the next minor at its own landing.
+
 ## [1.10.0] — 2026-08-12
 
 Additive. `InvoiceDeepLinkReason` gains `'payment-unconfirmed'` (and the
