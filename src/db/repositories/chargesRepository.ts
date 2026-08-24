@@ -396,11 +396,11 @@ export const chargesRepository = {
   },
 
   /**
-   * The capture-pending authorization for one (cohort, dog) — a group-class
-   * charge still at `'requires_payment'` with a PaymentIntent attached
-   * (ADDENDUM 3 §A3.2 step 3, the withdraw arm's advisory money-state read).
+   * The unsettled group-class charge rows for one (cohort, dog) — still at
+   * `'requires_payment'` with a PaymentIntent attached (ADDENDUM 3 §A3.2
+   * step 3, the withdraw arm's advisory money-state read).
    *
-   * Under manual capture this row is a LIVE HOLD on the owner's card, not a
+   * Under manual capture such a row is a LIVE HOLD on the owner's card, not a
    * dead attempt: the enroll transaction writes it at the honest status for an
    * authorization and the post-commit capture flips it. A withdraw that ignores
    * it releases nothing and stops nothing, which is exactly the round-3
@@ -409,40 +409,48 @@ export const chargesRepository = {
    * authoritative rows plus that answer.
    *
    * **A STAMPED row of ANOTHER enrollment is refused outright** (ADDENDUM 3
-   * §A3.17). A withdraw settles the hold it picks here AT STRIPE and reports on
-   * it, so picking the previous enrollment's hold means cancelling money this
+   * §A3.17). A withdraw settles the rows it picks here AT STRIPE and reports on
+   * them, so picking a previous enrollment's hold means cancelling money this
    * withdraw was never about while the live one goes unmentioned. Identity
-   * answers that where ordering cannot.
+   * answers that where ordering cannot. Legacy (NULL-anchor) rows join the same
+   * rule (§A3.18 D5) — OP-4 executed the cost of exempting them: a withdraw
+   * reported a two-day-old foreign $50 hold as THIS class's `released_cents`
+   * and cancelled it at Stripe.
    *
-   * **NEWEST first among what remains, and the choice is still load-bearing.**
-   * This query cannot tell an enrollment hold from the invoice lane's
-   * bookkeeping row (same purpose, same cohort/dog stamps —
-   * `pendingGroupClassCaptureWhere` above says why), and a (cohort, dog) can
-   * carry both. That bounded-failure window NARROWS to within-enrollment rows
-   * and is otherwise unchanged, restated rather than re-proven: the newest row
-   * is the live attempt in every ordinary sequence; when it is not, the pre-tx
-   * retrieve reads `canceled` for a dead bookkeeping row and the withdraw
-   * truthfully reports `released`, while the live hold it did not pick is
-   * released by the reconciler's not-owed arm within a tick (§A3.3) — the
-   * defence-in-depth that arm exists for.
+   * **Two readers, and the difference is a real invariant, not a taste.**
    *
-   * **Legacy (NULL-anchor) rows join the same rule (§A3.18 D5).** §A3.17 left
-   * them on plain newest-first, reasoning that excluding one would leave a real
-   * hold unsettled. OP-4 executed the cost of that: a withdraw reported a
-   * two-day-old foreign $50 hold — a different amount than the class costs — as
-   * THIS class's `released_cents`, and cancelled it at Stripe on a withdraw it
-   * had nothing to do with. The honest answer is `'none'` (this withdraw has no
-   * live money of its own), and the foreign hold is still released within a
-   * tick by the reconciler's row-scoped arm, whose enrollment is not live
-   * either: money netted exactly as before, statement true now.
+   *   - {@link findAllPendingCaptureForCohortDog} returns EVERY member row.
+   *     The invoice lane needs it: the pay route has no guard against
+   *     re-attempting while a prior PI is still `processing`, and each
+   *     non-succeeded attempt mints a fresh row — so a (cohort, dog) carrying
+   *     several is ordinary use. Resolving all of them is what CLOSES the
+   *     ordering window described below, rather than merely bounding it
+   *     (§A2.1, 2026-08-24).
+   *   - {@link findPendingCaptureForCohortDog} returns the NEWEST one only,
+   *     and is now the PAY-NOW call site's read exclusively. Its license is
+   *     §A3.14's echo chain: at most one live hold per dog exists on that
+   *     lane (a refused dog mints no charge row at all, §A3.13), so "newest"
+   *     and "all" coincide there and the single-row read is exact.
+   *
+   * **The superseded justification, named so it cannot be cited again.** This
+   * block used to argue that sampling the newest row left only a
+   * "bounded-failure window", because a dead bookkeeping row would retrieve
+   * `canceled` and "the withdraw truthfully reports `released`" while the
+   * reconciler released the real hold within a tick. That reasoning was
+   * REFUTED EXECUTABLY on the invoice lane (§A2.1): with attempt #1
+   * `processing` and attempt #2 declined, the newest row is the DEAD one, and
+   * the withdraw answered `'voided'` — "you were never charged" — over money
+   * still in motion. A sentence about the owner's money is not a bounded
+   * failure. The invoice lane therefore resolves every row; the argument above
+   * survives only where §A3.14 makes the multi-row case impossible.
    *
    * No lease and no `FOR UPDATE`: one request settling its own owner's
    * withdraw, not a worklist.
    */
-  async findPendingCaptureForCohortDog(
+  async findAllPendingCaptureForCohortDog(
     tx: Tx,
     args: { cohortId: string; dogId: string; enrollment: EnrollmentIdentity | undefined },
-  ): Promise<{ id: string; amountCents: number; stripePaymentIntentId: string } | undefined> {
+  ): Promise<{ id: string; amountCents: number; stripePaymentIntentId: string }[]> {
     const candidates = await tx
       .select({
         id: charges.id,
@@ -462,16 +470,28 @@ export const chargesRepository = {
         ),
       )
       .orderBy(desc(charges.createdAt));
-    const row = candidates.find((candidate) =>
-      chargeBelongsToEnrollment(candidate, args.enrollment),
-    );
-    if (row === undefined) return undefined;
-    return {
-      id: row.id,
-      amountCents: row.amountCents,
-      // Narrowed by the IS NOT NULL predicate above.
-      stripePaymentIntentId: row.stripePaymentIntentId as string,
-    };
+    return candidates
+      .filter((candidate) => chargeBelongsToEnrollment(candidate, args.enrollment))
+      .map((row) => ({
+        id: row.id,
+        amountCents: row.amountCents,
+        // Narrowed by the IS NOT NULL predicate above.
+        stripePaymentIntentId: row.stripePaymentIntentId as string,
+      }));
+  },
+
+  /**
+   * The NEWEST unsettled group-class charge row for one (cohort, dog) — the
+   * pay-now withdraw lane's read. See
+   * {@link findAllPendingCaptureForCohortDog} for the shared predicate, the
+   * §A3.17 membership rule, and why exactly one lane may sample.
+   */
+  async findPendingCaptureForCohortDog(
+    tx: Tx,
+    args: { cohortId: string; dogId: string; enrollment: EnrollmentIdentity | undefined },
+  ): Promise<{ id: string; amountCents: number; stripePaymentIntentId: string } | undefined> {
+    const [newest] = await this.findAllPendingCaptureForCohortDog(tx, args);
+    return newest;
   },
 
   /**

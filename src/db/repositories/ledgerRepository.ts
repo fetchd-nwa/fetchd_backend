@@ -1,6 +1,14 @@
 import { and, eq, inArray, ne } from 'drizzle-orm';
 import { db } from '../client.js';
-import { bookings, charges, creditLedger, invoices, paymentMethods } from '../schema/schema.js';
+import {
+  bookings,
+  charges,
+  cohorts,
+  creditLedger,
+  groupClasses,
+  invoices,
+  paymentMethods,
+} from '../schema/schema.js';
 import type { ChargePurpose, ChargeStatus } from './chargesRepository.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { Tx } from '../tx.js';
@@ -57,6 +65,18 @@ export interface LedgerEntryRow {
    * own `created_at`. NULL for open and refunded entries.
    */
   settledAt: string | null;
+  /**
+   * Group-class entries only: the class this money was for, via the row's own
+   * `cohort_id` → `cohorts.class_key` → `group_classes.name` (Q16, 2026-08-24,
+   * `designs/enrollment-followup-copy-flow.md` §3.3). NULL for every other
+   * kind, and for a legacy group-class row carrying no cohort — which is what
+   * keeps those rendering the generic label they render today.
+   *
+   * The backend supplies the FACT; the client composes the line
+   * ("Manners 1 — Waffles"). No display string is minted here — none ever has
+   * been on this surface.
+   */
+  groupClassName: string | null;
 }
 
 // A charge is a ledger line only when it represents a completed money event.
@@ -120,6 +140,10 @@ export const ledgerRepository = {
         date: charges.createdAt,
         bookingCategory: bookings.category,
         bookingLeadDog: bookings.leadDogId,
+        // The group-class row's OWN per-dog column, and the class its cohort
+        // belongs to (Q16). Both NULL on every other purpose.
+        chargeDogId: charges.dogId,
+        groupClassName: groupClasses.name,
         packDogId: creditLedger.dogId,
         packMode: creditLedger.mode,
         settledInvoiceId: invoices.id,
@@ -141,10 +165,19 @@ export const ledgerRepository = {
       // below, which the comment above already describes as existing for
       // "a group-class charge spanning multiple bookings", stays the one that
       // answers for them.
+      //
+      // **What Q16 added, and why it is not that join returning.** A
+      // group-class row's DOG rides its own `charges.dog_id` (Δ 2026-06-09:
+      // "group-class enrollment is paid per-(cohort, dog)"), and its CLASS
+      // rides its own `charges.cohort_id`. Both are facts about the money row
+      // itself, so neither needs — or is allowed to borrow from — one
+      // arbitrary week's booking.
       .leftJoin(
         bookings,
         and(eq(bookings.id, charges.bookingId), ne(charges.purpose, 'group-class')),
       )
+      .leftJoin(cohorts, eq(cohorts.id, charges.cohortId))
+      .leftJoin(groupClasses, eq(groupClasses.key, cohorts.classKey))
       .leftJoin(creditLedger, eq(creditLedger.chargeId, charges.id))
       .leftJoin(invoices, eq(invoices.paidChargeId, charges.id))
       .leftJoin(paymentMethods, eq(paymentMethods.id, invoices.paymentMethodId))
@@ -153,6 +186,7 @@ export const ledgerRepository = {
     const chargeEntries: LedgerEntryRow[] = chargeRows.map((row) => {
       const kind = kindForPurpose(row.purpose);
       const isPackage = kind === 'credit-pack';
+      const isGroupClass = row.purpose === 'group-class';
       const status: LedgerStatus = row.status === 'refunded' ? 'refunded' : 'paid';
       const isPaid = status === 'paid';
       return {
@@ -161,9 +195,13 @@ export const ledgerRepository = {
         status,
         amountCents: row.amountCents,
         date: row.date,
-        dogId: isPackage ? row.packDogId : row.bookingLeadDog,
+        // Three sources, one per money shape: the credit grant funds a package,
+        // the money row itself names the dog for a group class (Q16), and every
+        // other kind reads the booking it is linked to.
+        dogId: isPackage ? row.packDogId : isGroupClass ? row.chargeDogId : row.bookingLeadDog,
         category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
         mode: isPackage ? row.packMode : null,
+        groupClassName: isGroupClass ? row.groupClassName : null,
         settledInvoiceId: row.settledInvoiceId,
         paymentExpected: null,
         // Every settled charge today is a Stripe card charge; refunds carry no
@@ -188,6 +226,9 @@ export const ledgerRepository = {
         date: invoices.issuedAt,
         bookingCategory: bookings.category,
         bookingLeadDog: bookings.leadDogId,
+        // The invoice twin of the charge branch's Q16 columns.
+        invoiceDogId: invoices.dogId,
+        groupClassName: groupClasses.name,
         paymentExpected: invoices.paymentExpected,
       })
       .from(invoices)
@@ -200,24 +241,33 @@ export const ledgerRepository = {
       // start emitting a `dog_id` this surface has never carried for
       // group-class money. Excluded, so the output stays byte-identical and the
       // purpose-derived `category` fallback keeps answering for them.
+      //
+      // Q16 reads the dog and the class off the INVOICE's own `dog_id` /
+      // `cohort_id` — the pay-later twins of the charge columns, same
+      // Δ 2026-06-09 per-(cohort, dog) model — so the anchor stays out of the
+      // display path here too.
       .leftJoin(
         bookings,
         and(eq(bookings.id, invoices.bookingId), ne(invoices.purpose, 'group-class')),
       )
+      .leftJoin(cohorts, eq(cohorts.id, invoices.cohortId))
+      .leftJoin(groupClasses, eq(groupClasses.key, cohorts.classKey))
       .where(and(eq(invoices.ownerId, ownerId), eq(invoices.status, 'open')));
 
     const invoiceEntries: LedgerEntryRow[] = invoiceRows.map((row) => {
       const kind = kindForPurpose(row.purpose);
       const isPackage = kind === 'credit-pack';
+      const isGroupClass = row.purpose === 'group-class';
       return {
         id: row.id,
         kind,
         status: 'open',
         amountCents: row.amountCents,
         date: row.date,
-        dogId: isPackage ? null : row.bookingLeadDog,
+        dogId: isPackage ? null : isGroupClass ? row.invoiceDogId : row.bookingLeadDog,
         category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
         mode: null,
+        groupClassName: isGroupClass ? row.groupClassName : null,
         settledInvoiceId: null,
         paymentExpected: row.paymentExpected,
         settledMethod: null,

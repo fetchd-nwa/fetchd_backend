@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and as andOp, eq, ne } from 'drizzle-orm';
+import { and as andOp, desc as descOp, eq, ne } from 'drizzle-orm';
 import Stripe from 'stripe';
 import { db } from '../../src/db/client.js';
 import {
   bookings as bookingsTable,
   charges as chargesTable,
   cohorts as cohortsTable,
+  idempotencyKeys,
   invoices as invoicesTable,
   refunds as refundsTable,
 } from '../../src/db/schema/schema.js';
 import type { EnrollmentWithdrawResultWire } from '../../src/contracts/wire.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
+import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import type { StripeClient, StripePaymentIntentResult } from '../../src/lib/stripe.js';
 import { runCaptureReconcilerOnce } from '../../src/workers/captureReconciler.js';
 import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRetry.js';
@@ -85,6 +87,16 @@ function trackedApp(capture?: LogCapture): {
   intentIdByKey: Map<string, string>;
   executedIntentIds: Set<string>;
   wrap(overrides: Partial<StripeClient>): void;
+  /**
+   * Mount the invoice routes on the SAME app and the SAME stub.
+   *
+   * Only §A3.19-B needs them, and it needs the REAL producer: the pay route's
+   * async arm (`invoices.ts:304-316`) is the one path in this system that
+   * leaves an invoice-lane group-class charge resting at `'requires_payment'`
+   * with a live PaymentIntent behind an invoice that is still open. Staging
+   * that row by hand would be a test asserting against a state I invented.
+   */
+  mountInvoicesRoute(): void;
 } {
   const stripe = makeStripeStub();
   const intentIdByKey = new Map<string, string>();
@@ -120,6 +132,9 @@ function trackedApp(capture?: LogCapture): {
     executedIntentIds,
     wrap(next) {
       Object.assign(overrides, next);
+    },
+    mountInvoicesRoute() {
+      registerInvoicesRoute(app, { authenticate, stripe: tracking, now: FIXTURE_NOW });
     },
   };
 }
@@ -255,6 +270,15 @@ async function cleanup(cohortId: string): Promise<void> {
   for (const row of rows) {
     await db.delete(refundsTable).where(eq(refundsTable.chargeId, row.id));
   }
+  // Release the settle back-reference FIRST. A test that let an invoice reach
+  // `paid` leaves `invoices.paid_charge_id` pointing at a row this function is
+  // about to delete, and that FK has no ON DELETE — so without this the
+  // teardown raises 23503 and REPLACES the real assertion failure with a
+  // plumbing one. (Cost us a masked red once; both attack lanes hit it too.)
+  await db
+    .update(invoicesTable)
+    .set({ paidChargeId: null })
+    .where(eq(invoicesTable.cohortId, cohortId));
   await db.delete(chargesTable).where(eq(chargesTable.cohortId, cohortId));
   await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohortId));
 }
@@ -920,6 +944,861 @@ test(
         invs.map((i) => i.status),
         ['void'],
       );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// A1 (2026-08-24) — Q18-B, amended: the void arm discriminates AT STRIPE.
+//
+// The two rows the invoice lane can leave behind are byte-identical in the
+// database — `requires_payment` + a PI, minted by one arm
+// (`invoices.ts:304-316`) after one best-effort cancel (`:239-248`). A DECLINE's
+// cancel lands (dead money, "never charged" is TRUE); a `processing` one's is
+// refused (live money, "never charged" would be a LIE). Only Stripe knows
+// which, so only Stripe may decide the sentence — and the DB read gates the
+// call, so a withdraw with no pay attempt still touches Stripe zero times.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Pay-later enroll — the open invoice, and no charge row at all yet.
+ */
+async function enrollPayLater(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  cohortId: string;
+}): Promise<string> {
+  const enrolled = await enroll({
+    app: opts.app,
+    cohortId: opts.cohortId,
+    dogIds: [FIXTURE_IDS.dog1Id],
+    key: `a1e-${randomUUID()}`,
+    payLater: true,
+  });
+  assert.equal(enrolled.statusCode, 201, enrolled.body);
+  const [invoice] = await db
+    .select({ id: invoicesTable.id })
+    .from(invoicesTable)
+    .where(eq(invoicesTable.cohortId, opts.cohortId));
+  assert.ok(invoice, 'the pay-later enrollment minted its open invoice');
+  return invoice.id;
+}
+
+/**
+ * ONE in-app pay attempt that does not settle, leaving a `requires_payment`
+ * charge row carrying a PaymentIntent.
+ *
+ * This route is the ONLY producer of such a row (§A1.3 — the auto-charge
+ * worker's in-flight arm resolves an ATTEMPT row and mints no charge), and it
+ * has **no guard against re-attempting while a prior PI is still processing**,
+ * which is why calling this twice is ordinary use rather than a contrivance
+ * (§A2.1).
+ *
+ * `intentStatus` picks which of the two byte-identical rows this is. Nothing
+ * is levered: the stub REFUSES to cancel a `processing` intent exactly as
+ * Stripe does, so a processing attempt's row is live because of what it is,
+ * not because a test told the cancel to fail.
+ */
+async function payAttempt(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  stripe: Stub;
+  cohortId: string;
+  invoiceId: string;
+  intentStatus: 'requires_payment_method' | 'processing';
+}): Promise<{ chargeId: string; paymentIntentId: string }> {
+  opts.stripe.setNextIntentStatus(opts.intentStatus);
+  const paid = await opts.app.inject({
+    method: 'POST',
+    url: `/invoices/${opts.invoiceId}/pay`,
+    headers: { 'idempotency-key': `a1p-${randomUUID()}` },
+    payload: {},
+  });
+  assert.equal(paid.statusCode, 201, paid.body);
+  const body = paid.json() as { charge_id: string; stripe_payment_intent_id: string };
+  const [stillOpen] = await db
+    .select({ status: invoicesTable.status })
+    .from(invoicesTable)
+    .where(eq(invoicesTable.id, opts.invoiceId));
+  assert.equal(stillOpen?.status, 'open', 'nothing settled, so the debt stands');
+  return { chargeId: body.charge_id, paymentIntentId: body.stripe_payment_intent_id };
+}
+
+/** Pay-later enroll + exactly one unsettled pay attempt. */
+async function payLaterWithOneAttempt(opts: {
+  app: ReturnType<typeof makeContractApp>['app'];
+  stripe: Stub;
+  cohortId: string;
+  intentStatus: 'requires_payment_method' | 'processing';
+}): Promise<{ invoiceId: string; chargeId: string; paymentIntentId: string }> {
+  const invoiceId = await enrollPayLater({ app: opts.app, cohortId: opts.cohortId });
+  const attempt = await payAttempt({ ...opts, invoiceId });
+  const row = await chargeRow(opts.cohortId);
+  assert.equal(row.status, 'requires_payment', 'the invoice-lane charge row rests unsettled');
+  assert.ok(row.paymentIntentId);
+  return { invoiceId, ...attempt };
+}
+
+async function invoiceStatus(invoiceId: string): Promise<string | undefined> {
+  const [row] = await db
+    .select({ status: invoicesTable.status })
+    .from(invoicesTable)
+    .where(eq(invoicesTable.id, invoiceId));
+  return row?.status;
+}
+
+/** Every charge row for a cohort, newest first — the order the settle walks. */
+async function chargeRowsNewestFirst(cohortId: string): Promise<
+  { id: string; status: string; amountCents: number; paymentIntentId: string | null }[]
+> {
+  return db
+    .select({
+      id: chargesTable.id,
+      status: chargesTable.status,
+      amountCents: chargesTable.amountCents,
+      paymentIntentId: chargesTable.stripePaymentIntentId,
+    })
+    .from(chargesTable)
+    .where(eq(chargesTable.cohortId, cohortId))
+    .orderBy(descOp(chargesTable.createdAt));
+}
+
+test(
+  'A1/1 a DECLINED pay attempt (intent dead) withdraws as voided — "never charged" is the truth here',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED against the first Q18-B build, which answered `'release_pending'`
+    // with `released_cents: 12000` — inventing a hold over money that was
+    // never held, on what is the MORE COMMON path. The probe that found it is
+    // this test (`probe-declined-attempt.log`, promoted per §A1.5/1).
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const staged = await payLaterWithOneAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        intentStatus: 'requires_payment_method',
+      });
+      assert.equal(
+        (await stripe.retrievePaymentIntent(staged.paymentIntentId)).status,
+        'canceled',
+        'the route cancelled the declined intent: this money is DEAD, not in flight',
+      );
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a1w1-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+
+      // THE PIN.
+      assert.equal(body.money_outcome, 'voided');
+      assert.equal(body.refunded_cents, 0);
+      assert.equal(
+        body.released_cents,
+        undefined,
+        'NOT `released`: a declined automatic-capture intent held nothing, and naming a released hold would invent one',
+      );
+
+      assert.equal(await invoiceStatus(staged.invoiceId), 'void');
+      assert.equal(
+        (await chargeRow(cohort.id)).status,
+        'failed',
+        'canceled → failed, the established mapping — and it retires the reconciler rescan for this row',
+      );
+      assert.equal(countCalls(stripe, 'createRefund'), 0, 'nothing moved, so nothing returns');
+      assert.equal(await liveBookingCount(cohort.id), 0);
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A1/2 a PROCESSING pay attempt (intent live) still withdraws as release_pending — the original Q18-B case',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Preserved through the amendment: this is now the ONLY state that says
+    // `release_pending`. `'voided'` here would be the falsehood Q18-B exists
+    // to remove — the PI may still settle, and the reconciler would then
+    // refund a charge the owner was told never happened.
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const staged = await payLaterWithOneAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        intentStatus: 'processing',
+      });
+      assert.equal(
+        (await stripe.retrievePaymentIntent(staged.paymentIntentId)).status,
+        'processing',
+        'the money really is still in motion at Stripe',
+      );
+
+      const cancelsBefore = countCalls(stripe, 'cancelPaymentIntent');
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a1w2-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+      assert.equal(body.money_outcome, 'release_pending');
+      // AMENDED by A2.3: `released_cents` is defined as AUTHORIZED-HOLD cents
+      // (`wire.ts:875-877`), and an automatic-capture invoice-lane intent
+      // authorized nothing — emitting the class price here invented a hold,
+      // the exact thing A1/1 refuses one case earlier. Omitted, not zeroed.
+      assert.equal(
+        'released_cents' in body,
+        false,
+        'no hold ever existed on this lane, so no hold figure is emitted',
+      );
+      assert.equal(body.refunded_cents, 0, 'nothing was captured, so nothing is refunded yet');
+
+      assert.equal(await invoiceStatus(staged.invoiceId), 'void', 'the debt is still cancelled');
+      assert.equal(
+        (await chargeRow(cohort.id)).status,
+        'requires_payment',
+        'the row stays claimable ON PURPOSE — the reconciler is the executor of this promise',
+      );
+      assert.equal(
+        countCalls(stripe, 'cancelPaymentIntent'),
+        cancelsBefore,
+        'Stripe refuses to cancel a processing intent, so we do not ask',
+      );
+      assert.equal((await refundRows(cohort.id)).length, 0, 'and nothing was minted');
+      assert.equal(await liveBookingCount(cohort.id), 0, 'the dog is withdrawn either way');
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A1/3 the capture WON the race behind an open invoice: the withdraw refunds in full and says so',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED first. The bank cleared the in-flight payment between the pay
+    // attempt and the withdraw. The invoice is still open (no webhook has
+    // landed), so the void arm owns this — and answering `'voided'` here would
+    // tell an owner whose card WAS charged that they never were.
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute } = trackedApp();
+    mountInvoicesRoute();
+    const withdrawKey = `a1w3-${randomUUID()}`;
+    try {
+      const staged = await payLaterWithOneAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        intentStatus: 'processing',
+      });
+      stripe.setIntentState(staged.paymentIntentId, 'succeeded');
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: withdrawKey,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+      assert.equal(body.money_outcome, 'refunded');
+      assert.equal(body.refunded_cents, PUPPY_PRICE_PER_DOG_CENTS, 'the full remainder, R9-capped');
+      assert.equal(body.released_cents, undefined, 'nothing was released — it was captured');
+
+      assert.equal(await invoiceStatus(staged.invoiceId), 'void');
+      assert.equal(
+        (await chargeRow(cohort.id)).status,
+        'succeeded',
+        'the ledger is honest first: the money DID move',
+      );
+      const refunds = await refundRows(cohort.id);
+      assert.equal(refunds.length, 1);
+      assert.equal(refunds[0]!.amountCents, PUPPY_PRICE_PER_DOG_CENTS);
+      // AMENDED by A2.1/5: the invoice lane can now mint for SEVERAL rows in
+      // one request, so its key is per-charge — unique across rows, still
+      // deterministic per request. The pay-now lane keeps the landed
+      // `${K}:refund` spelling (at most one mint there, §A3.14).
+      const invoiceLaneKey = `${withdrawKey}:refund:${staged.chargeId}`;
+      assert.equal(refunds[0]!.stripeIdempotencyKey, invoiceLaneKey);
+      assert.deepEqual(refundKeys(stripe), [invoiceLaneKey], 'fired once, under the stored key');
+      assert.equal(stripe.executedRefunds().length, 1, 'exactly one refund EXISTS for this money');
+      assert.equal(await liveBookingCount(cohort.id), 0);
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A1/4 THE COST CLAIM: a pay-later withdraw with NO attempt touches Stripe zero times',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // This is the assertion the whole amendment is gated on. A1.1 extends the
+    // pre-tx settle into the invoice lane, and the rejection it overturns
+    // ("Stripe traffic on every open-invoice withdraw") was wrong ONLY because
+    // the DB read gates the call. If that gate ever regresses, every pay-later
+    // withdraw — the bulk of them — starts paying a Stripe round-trip and
+    // inherits a Stripe outage as a failure mode. Green before and after the
+    // amendment, by design; it is a preservation pin, not a red-first one.
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const enrolled = await enroll({
+        app,
+        cohortId: cohort.id,
+        dogIds: [FIXTURE_IDS.dog1Id],
+        key: `a1e4-${randomUUID()}`,
+        payLater: true,
+      });
+      assert.equal(enrolled.statusCode, 201, enrolled.body);
+      assert.equal(stripe.calls.length, 0, 'a pay-later ENROLL never touches Stripe either');
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a1w4-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+      assert.equal(body.money_outcome, 'voided', 'never attempted ⇒ never charged');
+      assert.equal(body.refunded_cents, 0);
+      assert.equal(body.released_cents, undefined);
+      assert.equal(
+        stripe.calls.length,
+        0,
+        'ZERO Stripe calls: the no-pending-row DB read is what gates the settle, and it must keep gating it',
+      );
+      const [inv] = await db
+        .select({ status: invoicesTable.status })
+        .from(invoicesTable)
+        .where(eq(invoicesTable.cohortId, cohort.id));
+      assert.equal(inv?.status, 'void');
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A1/5 Stripe unreadable ⇒ the withdraw ABORTS and NOTHING changed',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED first: before A1 the invoice lane never consulted Stripe, so a dead
+    // retrieve could not stop anything and the withdraw answered 200.
+    //
+    // §A3.2's "no uncertains" applied to ourselves: a withdraw either
+    // completes with a definite money statement or does not complete. The
+    // named cost (A1.6) is that a Stripe outage now blocks the pay-ATTEMPTED
+    // subset of pay-later withdraws — the same posture every pay-now withdraw
+    // already has. What must NOT happen is a half-withdraw, or an idempotency
+    // record that would replay this failure forever.
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute, wrap } = trackedApp();
+    mountInvoicesRoute();
+    const withdrawKey = `a1w5-${randomUUID()}`;
+    try {
+      const staged = await payLaterWithOneAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        intentStatus: 'processing',
+      });
+      const bookingsBefore = await liveBookingCount(cohort.id);
+      assert.ok(bookingsBefore > 0);
+
+      wrap({
+        retrievePaymentIntent: () => {
+          throw new Error('stripe is unreachable');
+        },
+      });
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: withdrawKey,
+      });
+      assert.notEqual(out.statusCode, 200, `the withdraw must not answer OK: ${out.body}`);
+
+      // Nothing moved: the dog is still enrolled, the debt still stands, the
+      // charge row is untouched.
+      assert.equal(await liveBookingCount(cohort.id), bookingsBefore, 'the dog is STILL enrolled');
+      assert.equal(await invoiceStatus(staged.invoiceId), 'open', 'the invoice was never voided');
+      assert.equal((await chargeRow(cohort.id)).status, 'requires_payment');
+      assert.equal((await refundRows(cohort.id)).length, 0);
+
+      // And the failure did not fossilize: a retry must be able to re-enter,
+      // not replay a 500 forever.
+      const stored = await db
+        .select({ key: idempotencyKeys.key })
+        .from(idempotencyKeys)
+        .where(eq(idempotencyKeys.key, withdrawKey));
+      assert.equal(stored.length, 0, 'no idempotency record persisted for an aborted withdraw');
+
+      // The owner's retry heals it, exactly as §A3.2 promises.
+      wrap({ retrievePaymentIntent: undefined });
+      const retry = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a1w5r-${randomUUID()}`,
+      });
+      assert.equal(retry.statusCode, 200, retry.body);
+      assert.equal(
+        (retry.json() as EnrollmentWithdrawResultWire).money_outcome,
+        'release_pending',
+        'and the retry gives the definite answer the first attempt could not',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// A2 (2026-08-24, fix round 2) — resolve EVERY pending row; per-lane truth on
+// every arm.
+//
+// A1 sampled ONE pending row, newest first. The pay route has no guard against
+// re-attempting while a prior PI is processing, so N-row states are ordinary
+// use — and the newest row is not reliably the live one. Sampling the dead
+// newest row and answering "you were never charged" over an older live PI is
+// the same falsehood A1 was written to remove, one layer down (§A2.1).
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'A2/1 THE HIGH: dead NEWEST attempt + live OLDER attempt ⇒ release_pending, never "never charged"',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED against the A1 build, which sampled only the newest row: it settled
+    // the dead decline, answered `'voided'`, and never looked at the older
+    // processing PI — money genuinely in motion. Promoted from the Fable
+    // lane's PROBE A (`attack-fable-mini/probe-a1-attack.test.ts`).
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const invoiceId = await enrollPayLater({ app, cohortId: cohort.id });
+      // Attempt 1: the bank sits on it. LIVE.
+      const live = await payAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        invoiceId,
+        intentStatus: 'processing',
+      });
+      // Attempt 2: the owner retries and is declined; the route's cancel
+      // lands. DEAD, and NEWER.
+      const dead = await payAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        invoiceId,
+        intentStatus: 'requires_payment_method',
+      });
+      assert.equal(
+        (await stripe.retrievePaymentIntent(dead.paymentIntentId)).status,
+        'canceled',
+        'the NEWEST attempt is dead',
+      );
+      assert.equal(
+        (await stripe.retrievePaymentIntent(live.paymentIntentId)).status,
+        'processing',
+        'the OLDER attempt is live — money genuinely in motion at Stripe',
+      );
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a2w1-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+
+      // THE PIN.
+      assert.equal(body.money_outcome, 'release_pending');
+      assert.equal('released_cents' in body, false, 'A2.3: no hold existed on this lane');
+      assert.equal(body.refunded_cents, 0);
+
+      // Per-row actions, not one sampled row: the dead one is retired, the
+      // live one is left for the reconciler that will finish it.
+      const rows = await chargeRowsNewestFirst(cohort.id);
+      assert.equal(rows.length, 2);
+      assert.equal(rows.find((r) => r.id === dead.chargeId)?.status, 'failed');
+      assert.equal(
+        rows.find((r) => r.id === live.chargeId)?.status,
+        'requires_payment',
+        'the live row stays claimable ON PURPOSE',
+      );
+      assert.equal(await invoiceStatus(invoiceId), 'void');
+      assert.equal(await liveBookingCount(cohort.id), 0);
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A2/2 a CAPTURE among the attempts outranks everything: refunded, with the sum actually minted',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED first. Precedence is refunded > release_pending > released (A2.1/4):
+    // moved money outranks every other sentence, and `refunded_cents` is the
+    // sum this request actually put on its way back.
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute } = trackedApp();
+    mountInvoicesRoute();
+    const withdrawKey = `a2w2-${randomUUID()}`;
+    try {
+      const invoiceId = await enrollPayLater({ app, cohortId: cohort.id });
+      const captured = await payAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        invoiceId,
+        intentStatus: 'processing',
+      });
+      const live = await payAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        invoiceId,
+        intentStatus: 'processing',
+      });
+      // The FIRST attempt's bank clears it — the money moved. The second is
+      // still in flight.
+      stripe.setIntentState(captured.paymentIntentId, 'succeeded');
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: withdrawKey,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+      assert.equal(body.money_outcome, 'refunded', 'a capture outranks the settling sibling');
+      assert.equal(
+        body.refunded_cents,
+        PUPPY_PRICE_PER_DOG_CENTS,
+        'Σ minted this request — one captured row, refunded in full',
+      );
+      assert.equal('released_cents' in body, false);
+
+      const rows = await chargeRowsNewestFirst(cohort.id);
+      assert.equal(rows.find((r) => r.id === captured.chargeId)?.status, 'succeeded');
+      assert.equal(
+        rows.find((r) => r.id === live.chargeId)?.status,
+        'requires_payment',
+        'the still-settling sibling is left to the reconciler (disclosed mixed-state silence, A2.1)',
+      );
+      const refunds = await refundRows(cohort.id);
+      assert.equal(refunds.length, 1);
+      assert.equal(refunds[0]!.chargeId, captured.chargeId, 'minted against the row that moved');
+      assert.equal(
+        refunds[0]!.stripeIdempotencyKey,
+        `${withdrawKey}:refund:${captured.chargeId}`,
+        'per-charge key: unique across rows, deterministic per request (A2.1/5)',
+      );
+      assert.equal(await invoiceStatus(invoiceId), 'void');
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A2/3 THE COST BOUND: N pending rows cost exactly N retrieves, and no attempt costs zero',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // A1 claimed "one retrieve"; that was only true of single-row states. The
+    // honest bound is ≤1 retrieve + ≤1 cancel PER PENDING ROW (§A2.1 cost
+    // restatement), and the no-attempt path — the bulk of pay-later withdraws
+    // — must still touch Stripe zero times. Both halves pinned here because
+    // the second is what licenses the whole amendment.
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const invoiceId = await enrollPayLater({ app, cohortId: cohort.id });
+      await payAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        invoiceId,
+        intentStatus: 'processing',
+      });
+      await payAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        invoiceId,
+        intentStatus: 'processing',
+      });
+      assert.equal((await chargeRowsNewestFirst(cohort.id)).length, 2);
+
+      const retrievesBefore = countCalls(stripe, 'retrievePaymentIntent');
+      const cancelsBefore = countCalls(stripe, 'cancelPaymentIntent');
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a2w3-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      assert.equal(
+        countCalls(stripe, 'retrievePaymentIntent') - retrievesBefore,
+        2,
+        'exactly one retrieve per pending row — no re-walking, no N²',
+      );
+      assert.equal(
+        countCalls(stripe, 'cancelPaymentIntent') - cancelsBefore,
+        0,
+        'cancels only on CANCELLABLE rows; both of these are processing, which Stripe refuses',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+
+    // The other half: a withdraw with no pay attempt at all.
+    const quiet = await makeCohort();
+    const { app: app2, stripe: stripe2, mountInvoicesRoute: mount2 } = trackedApp();
+    mount2();
+    try {
+      await enrollPayLater({ app: app2, cohortId: quiet.id });
+      const out = await withdraw({
+        app: app2,
+        cohortId: quiet.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a2w3b-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      assert.equal((out.json() as EnrollmentWithdrawResultWire).money_outcome, 'voided');
+      assert.equal(stripe2.calls.length, 0, 'ZERO Stripe calls — the DB read still gates everything');
+    } finally {
+      await cleanup(quiet.id);
+    }
+  },
+);
+
+test(
+  'A2/4 fall-through, invoice lane, invoice VOID ⇒ voided — never "the hold has been released"',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED first. Promoted from the Fable lane's PROBE B. When the invoice stops
+    // being open between the pre-tx read and the in-tx `markVoid`, A1 routed an
+    // invoice-lane verdict into the pay-now fall-through, which renders
+    // `'released'` — "the $X hold on your card has been released" — for an
+    // automatic-capture intent that never held anything. The void arm refuses
+    // that exact word for that exact row; the fall-through did not (§A2.2).
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute, wrap } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const staged = await payLaterWithOneAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        intentStatus: 'requires_payment_method',
+      });
+      // The pre-tx retrieve is the seam that runs in exactly that window.
+      wrap({
+        retrievePaymentIntent: async (id) => {
+          await db
+            .update(invoicesTable)
+            .set({ status: 'void' })
+            .where(eq(invoicesTable.id, staged.invoiceId));
+          return stripe.retrievePaymentIntent(id);
+        },
+      });
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a2w4-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+      assert.equal(body.money_outcome, 'voided', 'cancelled, never charged — and no hold invented');
+      assert.equal('released_cents' in body, false);
+      assert.equal(body.refunded_cents, 0);
+      assert.equal(
+        (await chargeRow(cohort.id)).status,
+        'failed',
+        'the dead row is still retired on this arm',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A2/5 fall-through, invoice lane, invoice SETTLED by a covered charge ⇒ none',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED first. The Opus lane's CASE E: the invoice is settled in the pre-tx
+    // window by a charge whose refunds already cover it, so §A3.15's skip rule
+    // passes over it and the fall-through reaches the verdict arms — where A1
+    // answered `'released'` + 12000c for a declined automatic-capture row.
+    //
+    // `'none'` — "There's no charge on file to return." — is the truthful
+    // answer in these covered-settler leftovers: the ordinary covered settler
+    // is intercepted before this point by `findUnsettledSucceededCharge`,
+    // which answers `'refunded'` with real money (§A2.2).
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute, wrap } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const staged = await payLaterWithOneAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        intentStatus: 'requires_payment_method',
+      });
+      let fired = false;
+      wrap({
+        retrievePaymentIntent: async (id) => {
+          if (!fired) {
+            fired = true;
+            // A real settle lands: a NEW charge pays the invoice, and that
+            // charge is already fully refunded out of band.
+            const settler = randomUUID();
+            await db.insert(chargesTable).values({
+              id: settler,
+              ownerId: FIXTURE_IDS.ownerId,
+              stripePaymentIntentId: `pi_settler_${randomUUID().slice(0, 8)}`,
+              amountCents: PUPPY_PRICE_PER_DOG_CENTS,
+              status: 'succeeded',
+              purpose: 'group-class',
+              cohortId: cohort.id,
+              dogId: FIXTURE_IDS.dog1Id,
+            });
+            await db.insert(refundsTable).values({
+              id: randomUUID(),
+              ownerId: FIXTURE_IDS.ownerId,
+              chargeId: settler,
+              bookingId: null,
+              amountCents: PUPPY_PRICE_PER_DOG_CENTS,
+              reason: 'cancel',
+              stripeIdempotencyKey: null,
+            });
+            await db
+              .update(invoicesTable)
+              .set({
+                status: 'paid',
+                paidChargeId: settler,
+                paidAt: '2026-06-01T00:00:00.000Z',
+              })
+              .where(eq(invoicesTable.id, staged.invoiceId));
+          }
+          return stripe.retrievePaymentIntent(id);
+        },
+      });
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a2w5-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+      assert.equal(body.money_outcome, 'none', 'nothing of this enrollment’s is left to return');
+      assert.equal('released_cents' in body, false, 'and above all: no invented hold');
+      assert.equal(body.refunded_cents, 0);
+      assert.equal(
+        (await chargeRowsNewestFirst(cohort.id)).find((r) => r.id === staged.chargeId)?.status,
+        'failed',
+        'the dead row is retired on this arm too',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'A2/6 a pay attempt landing AFTER the pre-tx pass raises the floor to release_pending',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED first (§A2.6a). The pre-tx settle resolves what it can SEE; a tap
+    // landing between that pass and the in-tx void leaves a live PI the
+    // request never examined, and `'voided'` over it is the same falsehood
+    // again. Ruled fix: after the void and the per-row actions, re-read the
+    // pending set IN-TX (DB only — R5 intact), subtract the ids this request
+    // already settled, and let a non-empty remainder raise the sentence floor.
+    //
+    // The seam is the pre-tx retrieve: it runs after the pending set was read
+    // and before the transaction opens.
+    const cohort = await makeCohort();
+    const { app, stripe, mountInvoicesRoute, wrap } = trackedApp();
+    mountInvoicesRoute();
+    try {
+      const staged = await payLaterWithOneAttempt({
+        app,
+        stripe,
+        cohortId: cohort.id,
+        intentStatus: 'requires_payment_method',
+      });
+      const [anchored] = await db
+        .select({ bookingId: invoicesTable.bookingId })
+        .from(invoicesTable)
+        .where(eq(invoicesTable.id, staged.invoiceId));
+      assert.ok(anchored?.bookingId, 'the invoice carries its enrollment anchor (§A3.18 D1)');
+
+      let fired = false;
+      wrap({
+        retrievePaymentIntent: async (id) => {
+          if (!fired) {
+            fired = true;
+            // A second tap lands, minting a live row this request's pre-tx
+            // pass has already walked past.
+            await db.insert(chargesTable).values({
+              id: randomUUID(),
+              ownerId: FIXTURE_IDS.ownerId,
+              stripePaymentIntentId: `pi_late_${randomUUID().slice(0, 8)}`,
+              amountCents: PUPPY_PRICE_PER_DOG_CENTS,
+              status: 'requires_payment',
+              purpose: 'group-class',
+              bookingId: anchored.bookingId,
+              cohortId: cohort.id,
+              dogId: FIXTURE_IDS.dog1Id,
+            });
+          }
+          return stripe.retrievePaymentIntent(id);
+        },
+      });
+
+      const out = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key: `a2w6-${randomUUID()}`,
+      });
+      assert.equal(out.statusCode, 200, out.body);
+      const body = out.json() as EnrollmentWithdrawResultWire;
+      assert.equal(
+        body.money_outcome,
+        'release_pending',
+        'a pending row visible at COMMIT time must never be spoken over as "never charged"',
+      );
+      assert.equal('released_cents' in body, false);
+      assert.equal(await invoiceStatus(staged.invoiceId), 'void');
     } finally {
       await cleanup(cohort.id);
     }

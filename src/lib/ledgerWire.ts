@@ -9,7 +9,9 @@ import type { ServiceCategory } from './bookingBucket.js';
  * (not null) when absent: membership rows carry no dog; only sessions/payg
  * carry a category; only credit-packs carry a mode. A paid entry that settled
  * an invoice also carries settle detail (method/card/time — see
- * ledgerRepository); direct package/membership charges carry none.
+ * ledgerRepository); direct package/membership charges carry none. Since
+ * 2026-08-24 (Q16) a group-class entry also carries its own `dog_id` and its
+ * `group_class_name` — the two facts the client's line is composed from.
  */
 export interface LedgerEntryWire {
   id: string;
@@ -49,6 +51,20 @@ export interface LedgerEntryWire {
    * Omitted on open/refunded entries.
    */
   settled_at?: string;
+  /**
+   * Group-class entries only: the class name off the row's own cohort
+   * ("Manners 1"). Added 2026-08-24 (Q16,
+   * `designs/enrollment-followup-copy-flow.md` §3.3) together with `dog_id`
+   * finally being emitted for these rows — the two facts the client composes
+   * "Manners 1 — Waffles · $120" from. Omitted for every other kind, and for a
+   * legacy group-class row carrying no cohort, which therefore keeps rendering
+   * the generic label a pre-Q16 client renders.
+   *
+   * Deliberately a FACT, not a display string: every ledger line in this
+   * system is composed client-side, and keeping it that way is what lets the
+   * copy change without a backend deploy.
+   */
+  group_class_name?: string;
 }
 
 export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
@@ -67,5 +83,6 @@ export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
   if (row.settledMethod !== null) wire.settled_method = row.settledMethod;
   if (row.settledCard !== null) wire.settled_card = row.settledCard;
   if (row.settledAt !== null) wire.settled_at = pgTimestampToIso(row.settledAt);
+  if (row.groupClassName !== null) wire.group_class_name = row.groupClassName;
   return wire;
 }

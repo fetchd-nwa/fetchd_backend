@@ -396,9 +396,13 @@ export function registerEnrollmentsRoute(
         nowFactory,
       });
 
-      // Closure handle for the post-commit Stripe refund (money-back branch);
-      // undefined for the void / release / free paths (postCommit no-ops).
-      let pendingStripeRefund: PendingStripeRefund | undefined;
+      // Closure handles for the post-commit Stripe refunds (money-back
+      // branches); EMPTY for the void / release / free paths (postCommit
+      // no-ops). A LIST since §A2.1: the invoice lane settles every unsettled
+      // pay attempt, and two taps that both captured are two charges owed two
+      // refunds. Each carries its own stored key, so the fan-out below is a
+      // loop over commitments, not a fan-out of one.
+      const pendingStripeRefunds: PendingStripeRefund[] = [];
       // Computed ONCE, here, so the row stores the same string the fire sends.
       const refundIdempotencyKey = `${idempotencyKey}:refund`;
 
@@ -410,12 +414,19 @@ export function registerEnrollmentsRoute(
           requestHash,
           keysToInvalidate: () => [],
           postCommit: async () => {
-            await firePendingRefundPostCommit({
-              pending: pendingStripeRefund,
-              stripe,
-              log: request.log,
-              context: { cohortId, dogId, refundPath: 'cohort-withdraw' },
-            });
+            // Sequential, and every one is attempted: each refund row is an
+            // independent R35 commitment with its own stored key, so one
+            // failing fire must not swallow its siblings. The helper already
+            // logs-and-swallows per refund, and the duplicate-refund sweep
+            // re-fires anything whose response was lost.
+            for (const pending of pendingStripeRefunds) {
+              await firePendingRefundPostCommit({
+                pending,
+                stripe,
+                log: request.log,
+                context: { cohortId, dogId, refundPath: 'cohort-withdraw' },
+              });
+            }
           },
         },
         async (tx) => {
@@ -470,8 +481,12 @@ export function registerEnrollmentsRoute(
 
           // 6. Settle the money — §A3.2's table, exhaustive over the states a
           //    group-class charge row can be in, in priority order. AT MOST ONE
-          //    arm fires, which is why the two `${K}:refund` mint sites below
-          //    can never collide inside one request.
+          //    arm fires per request. There are THREE mint sites below in two
+          //    key spellings — the multi-row settle arm's per-charge
+          //    `${K}:refund:${chargeId}` and the two single-charge arms' bare
+          //    `${K}:refund` — and they cannot collide: one arm per request,
+          //    and a bare key can never equal a per-charge key (charge ids are
+          //    UUID suffixes).
           //
           //    The authoritative rows are re-read HERE; the pre-tx verdict is
           //    Stripe's post-race truth and is not re-derivable from the DB, so
@@ -481,7 +496,7 @@ export function registerEnrollmentsRoute(
           let releasedCents: number | undefined;
           let owedCents: number | undefined;
 
-          /** The refund mint, identical for both arms that reach it (R35
+          /** The refund mint, identical for every arm that reaches it (R35
            *  pending-row-as-commitment, the client-keyed recovery machinery).
            *  Returns the cents ACTUALLY put on their way back — 0 when there
            *  was nothing left to return, which is what the callers read the
@@ -492,9 +507,15 @@ export function registerEnrollmentsRoute(
            *  this leg and the scheduler's `settlePostWithdrawRefund` were
            *  measured overlapping, both reading `sumNonFailed = 0` for one
            *  charge and both committing a full refund under different Stripe
-           *  keys — which Stripe would have executed twice. The key stays the
-           *  CLIENT's `${K}:refund` here, so the factory ignores the row id. */
-          const mintRefund = async (charge: { id: string }): Promise<number> => {
+           *  keys — which Stripe would have executed twice.
+           *
+           *  **The key is the caller's** (§A2.1/5). The pay-now lane passes the
+           *  landed `${K}:refund`; the invoice lane passes
+           *  `${K}:refund:${charge.id}`, because it can mint for SEVERAL rows in
+           *  one request (two taps can both capture) and one key across two
+           *  refunds is how one debt becomes one refund. Both spellings are
+           *  deterministic per request, which is what makes a retry replay. */
+          const mintRefund = async (charge: { id: string }, stripeKey: string): Promise<number> => {
             const minted = await refundsRepository.mintCappedPendingRefund(tx, {
               chargeId: charge.id,
               ownerId: principal.ownerId,
@@ -503,16 +524,115 @@ export function registerEnrollmentsRoute(
               // Stored in the SAME tx as the row: without it a failed
               // post-commit `createRefund` was unretryable by anything,
               // because this key lives only in this request's closure.
-              stripeIdempotencyKey: () => refundIdempotencyKey,
+              stripeIdempotencyKey: () => stripeKey,
             });
             if (minted.kind !== 'minted') return 0;
-            pendingStripeRefund = {
+            pendingStripeRefunds.push({
               refundId: minted.refundId,
               paymentIntentId: minted.paymentIntentId,
               amountCents: minted.amountCents,
               stripeIdempotencyKey: minted.stripeIdempotencyKey,
-            };
+            });
             return minted.amountCents;
+          };
+
+          /**
+           * Apply §A2.1's PER-ROW actions for everything the pre-tx phase
+           * settled, and hand back the facts each arm composes its sentence
+           * from. Actions are per row; the SENTENCE is by precedence, and the
+           * precedence lives at the call sites because the two arms disagree
+           * about what "all dead" means.
+           *
+           * Every `released` row flips `'failed'` — the established
+           * `canceled → failed` mapping, asserted through the mapper so the
+           * compiler checks the citation. That flip is also what ends the
+           * reconciler's claim on the row (its worklist predicate is
+           * `status='requires_payment'`). Every `refunded` row flips
+           * `'succeeded'` FIRST — ledger honesty is independent of the
+           * envelope (§A3.15 finding 2): the money moved, so the row says so
+           * even when the cap leaves nothing to return — and then mints its
+           * capped refund. Every `release_pending` row is left at
+           * `'requires_payment'` DELIBERATELY, because the reconciler is the
+           * executor of the promise that word makes (§A3.3).
+           */
+          const applySettledRows = async (
+            settlement: WithdrawPreTxSettlement,
+          ): Promise<{
+            mintedCents: number;
+            anyRefunded: boolean;
+            livePending: { amountCents: number } | undefined;
+            settledIds: string[];
+          }> => {
+            let mintedCents = 0;
+            let anyRefunded = false;
+            let livePending: { amountCents: number } | undefined;
+            for (const row of settlement.rows) {
+              switch (row.verdict) {
+                case 'released':
+                  await chargesRepository.markStatus(tx, {
+                    id: row.charge.id,
+                    status: stripeIntentStatusToChargeStatus('canceled'),
+                  });
+                  break;
+                case 'refunded':
+                  await chargesRepository.markStatus(tx, {
+                    id: row.charge.id,
+                    status: 'succeeded',
+                  });
+                  anyRefunded = true;
+                  mintedCents += await mintRefund(
+                    row.charge,
+                    settlement.lane === 'invoice'
+                      ? `${refundIdempotencyKey}:${row.charge.id}`
+                      : refundIdempotencyKey,
+                  );
+                  break;
+                case 'release_pending':
+                  livePending ??= { amountCents: row.charge.amountCents };
+                  break;
+              }
+            }
+            return {
+              mintedCents,
+              anyRefunded,
+              livePending,
+              settledIds: settlement.rows.map((row) => row.charge.id),
+            };
+          };
+
+          /**
+           * §A2.6a — the pre-tx/in-tx race, closed as far as R5 permits.
+           *
+           * The pre-tx phase resolves what it can SEE. A pay attempt landing
+           * between that read and this transaction leaves a live PI this
+           * request never examined, and `'voided'` spoken over it is the same
+           * falsehood one window later. So after the void and the per-row
+           * actions, re-read the pending set IN-TX — DB only, no Stripe call,
+           * R5 intact — and subtract the ids we settled. (`released` and
+           * `refunded` rows have already dropped out via their own flips; the
+           * subtraction is what keeps a `release_pending` survivor from being
+           * double-counted as a newcomer.)
+           *
+           * A non-empty remainder raises the sentence FLOOR to
+           * `'release_pending'`: no in-tx Stripe verdict is possible, and
+           * "automatic release-or-full-refund committed" is the definite-outcome
+           * truth for a row the reconciler now owns. It never overrides
+           * `'refunded'` — moved money outranks everything (§A2.1/4).
+           *
+           * **What this does NOT close, stated rather than implied:** a row
+           * committed AFTER our transaction. That remainder is seconds-wide,
+           * money-safe (a settle against a voided invoice lands in the
+           * dead-money machinery), sentence-only, and provably unreachable by
+           * any R5-conformant design. Disclosed and queued beside the
+           * webhook-flip door.
+           */
+          const pendingSurvivesCommit = async (settledIds: string[]): Promise<boolean> => {
+            const remaining = await chargesRepository.findAllPendingCaptureForCohortDog(tx, {
+              cohortId,
+              dogId,
+              enrollment: enrollmentIdentityOf(enrolledBookings),
+            });
+            return remaining.some((row) => !settledIds.includes(row.id));
           };
 
           const openInvoice = await invoicesRepository.findOpenForCohortDog(tx, {
@@ -528,7 +648,53 @@ export function registerEnrollmentsRoute(
               ? await invoicesRepository.markVoid(tx, { id: openInvoice.id })
               : 0;
           if (voidedCount > 0) {
-            moneyOutcome = 'voided';
+            // The debt is cancelled. WHAT TO SAY ABOUT IT depends on what the
+            // owner's pay attempts — if any — left resting at Stripe, and those
+            // verdicts were decided pre-tx (§A1.1, corrected by §A2.1).
+            //
+            // `markVoid` above ran FIRST and unchanged, so R10 (void, never
+            // refund, for an unpaid invoice) and R11 (the void/refund race) are
+            // exactly as they were; only the report and the row actions are new.
+            const settled =
+              preTx === undefined ? undefined : await applySettledRows(preTx);
+            const lateRow = await pendingSurvivesCommit(settled?.settledIds ?? []);
+
+            if (settled?.anyRefunded === true) {
+              // A capture outranks every other sentence: money moved, and the
+              // owner needs to hear that before anything else (§A2.1/4). The
+              // figure is Σ minted THIS REQUEST — the wire's own semantics for
+              // the field, "cents on their way back".
+              refundedCents = settled.mintedCents;
+              moneyOutcome = refundedCents > 0 ? 'refunded' : 'none';
+            } else if (settled?.livePending !== undefined || lateRow) {
+              // At least one payment is genuinely still settling — either one
+              // Stripe told us about, or one that appeared after the pre-tx
+              // pass (§A2.6a). `'voided'` over it would be the falsehood this
+              // machinery exists to remove: the money may still land, and the
+              // owner told "never charged" would watch a charge appear and
+              // reverse.
+              moneyOutcome = 'release_pending';
+              // `released_cents` is AUTHORIZED-HOLD cents (`wire.ts:875-877`).
+              // An automatic-capture invoice-lane intent authorized NOTHING, so
+              // naming a figure here would invent a hold — the same refusal the
+              // dead-row arm below makes (§A2.3). The pay-now lane really did
+              // hold the money and keeps saying so.
+              releasedCents =
+                preTx?.lane === 'auth-hold' ? settled?.livePending?.amountCents : undefined;
+            } else {
+              // Every row this request resolved is dead, and none appeared
+              // behind it. Nothing was ever captured and nothing can be, so the
+              // voided invoice IS the complete story — for every row this
+              // request resolved, which is what §A2.6a's re-check above makes
+              // an honest claim at commit time rather than a hopeful one.
+              //
+              // **Deliberately NOT `'released'`** on the invoice lane: that
+              // word renders "the $X hold has been released", and an
+              // automatic-capture pay attempt never held anything. `'voided'` —
+              // "you were never charged" — is the truth here, and the dead rows
+              // were already flipped `'failed'` by the per-row actions.
+              moneyOutcome = 'voided';
+            }
           } else {
             // A succeeded charge whose non-failed refunds already COVER it is
             // ALREADY SETTLED and is not this withdraw's business — skip it and
@@ -543,13 +709,23 @@ export function registerEnrollmentsRoute(
             // money — re-answering `'refund_manual'` for a refund already being
             // arranged by hand, re-firing its ERROR page, and leaving this
             // withdraw's live hold both unmentioned and uncancelled.
+            //
+            // On THIS arm the pre-tx settled rows are deliberately NOT applied:
+            // a sibling that captured at Stripe stays un-flipped, which is
+            // exactly the shape the reconciler's post-withdraw arm scans for —
+            // its money completes on the next tick (executed 2026-08-24:
+            // 24000c captured, 24000c returned).
             const charge = await chargesRepository.findUnsettledSucceededCharge(tx, {
               cohortId,
               dogId,
               enrollment: enrollmentIdentityOf(enrolledBookings),
             });
             if (charge !== undefined && charge.stripePaymentIntentId !== null) {
-              refundedCents = await mintRefund({ id: charge.id });
+              // The landed `${K}:refund` spelling, deliberately. §A2.1/5's
+              // per-charge key belongs to the multi-row settle arm; this arm
+              // mints for exactly one already-succeeded charge and its key is
+              // pinned by tests on both lanes.
+              refundedCents = await mintRefund({ id: charge.id }, refundIdempotencyKey);
               // Asserted iff THIS request minted. The skip above makes the
               // zero branch unreachable here; the guard stays because the
               // invariant is the wire's, not this arm's.
@@ -580,48 +756,54 @@ export function registerEnrollmentsRoute(
                 'group-class withdraw: this enrollment was PAID on a charge with no PaymentIntent, so there is no automatic route to return it — a human must refund this money out of band',
               );
             } else if (preTx !== undefined) {
-              switch (preTx.verdict) {
-                case 'released':
-                  // The hold is dead at Stripe. Flipping the row is what ends
-                  // the reconciler's claim on it (its worklist predicate is
-                  // `status='requires_payment'`), and `'failed'` is the
-                  // ESTABLISHED mapping for a canceled intent — asserted here
-                  // through the mapper itself so the compiler checks the
-                  // citation. No DDL, and every reader of `'failed'` already
-                  // means "no money moved on this charge", which is exactly
-                  // true of a released authorization.
-                  await chargesRepository.markStatus(tx, {
-                    id: preTx.charge.id,
-                    status: stripeIntentStatusToChargeStatus('canceled'),
-                  });
-                  moneyOutcome = 'released';
-                  releasedCents = preTx.charge.amountCents;
-                  break;
-                case 'refunded': {
-                  // A capture won the race. The row says so — honestly, the
-                  // money DID move — and the refund is minted exactly as the
-                  // succeeded arm above mints it: same key spelling, same cap,
-                  // same recovery machinery.
-                  //
-                  // **The flip happens whatever the mint decides.** Ledger
-                  // honesty is independent of the envelope (§A3.15 finding 2):
-                  // the money moved, so the row says `'succeeded'` even when
-                  // there is nothing left to return.
-                  await chargesRepository.markStatus(tx, {
-                    id: preTx.charge.id,
-                    status: 'succeeded',
-                  });
-                  refundedCents = await mintRefund(preTx.charge);
-                  moneyOutcome = refundedCents > 0 ? 'refunded' : 'none';
-                  break;
-                }
-                case 'release_pending':
-                  // Left at `'requires_payment'` DELIBERATELY: the reconciler
-                  // must keep claiming this row, because it is the executor
-                  // that finishes what this response promises (§A3.3).
-                  moneyOutcome = 'release_pending';
-                  releasedCents = preTx.charge.amountCents;
-                  break;
+              // **The fall-through speaks the LANE's sentences, not the pay-now
+              // lane's** (§A2.2). A1 routed invoice-lane verdicts here, where
+              // `'released'` renders "the $X hold on your card has been
+              // released" — for an automatic-capture intent that never held
+              // anything. The void arm refuses that exact word for that exact
+              // row; this arm was still saying it one branch over.
+              const settled = await applySettledRows(preTx);
+              if (settled.anyRefunded) {
+                // Unchanged machinery either way: a capture won, the row says
+                // so, and the capped refund is on its way.
+                refundedCents = settled.mintedCents;
+                moneyOutcome = refundedCents > 0 ? 'refunded' : 'none';
+              } else if (settled.livePending !== undefined) {
+                moneyOutcome = 'release_pending';
+                // Hold cents only where a hold existed (§A2.3).
+                releasedCents =
+                  preTx.lane === 'auth-hold' ? settled.livePending.amountCents : undefined;
+              } else if (preTx.lane === 'auth-hold') {
+                // A manual-capture authorization really was holding this
+                // owner's money and is now dead at Stripe. `'released'` is a
+                // fact about it, and the figure is the amount that was
+                // authorized. Byte-identical to the landed behaviour.
+                moneyOutcome = 'released';
+                releasedCents = preTx.rows[0]?.charge.amountCents;
+              } else {
+                // Invoice lane, every row dead, and no open invoice was found
+                // to void — so the debt went somewhere between the pre-tx read
+                // and here. WHERE decides the sentence, and only the invoice
+                // itself knows: re-read it regardless of status.
+                //
+                //   `'void'`  ⇒ cancelled by an ops void or a prior crashed
+                //               withdraw. Never charged: `'voided'` is true.
+                //   anything ⇒ `'none'` — "There's no charge on file to
+                //   else       return." The ordinary covered settler never
+                //              reaches here: `findUnsettledSucceededCharge`
+                //              above intercepts it and answers `'refunded'`
+                //              with real money. What reaches here is the
+                //              leftovers — a settler whose refunds already
+                //              cover it — where "nothing left to return" is
+                //              exactly right.
+                //
+                // Either way the dead rows were already retired by the per-row
+                // actions, and neither answer invents a hold.
+                const invoice = await invoicesRepository.findLatestForCohortDog(tx, {
+                  cohortId,
+                  dogId,
+                });
+                moneyOutcome = invoice?.status === 'void' ? 'voided' : 'none';
               }
             }
           }
@@ -693,11 +875,32 @@ function requireAnchor(
  *  make the peek miss forever and re-enter the settle phase on every retry. */
 const WITHDRAW_ENDPOINT = 'POST /enrollments/:cohortId/withdraw';
 
-/** The capture-pending charge row this withdraw settled at Stripe, plus what
- *  Stripe's answer means for the owner's money (§A3.2 step 4). */
-interface WithdrawPreTxSettlement {
+/** One charge row this withdraw settled at Stripe, plus what Stripe's answer
+ *  means for the owner's money (§A3.2 step 4). */
+interface WithdrawSettledRow {
   charge: { id: string; amountCents: number; stripePaymentIntentId: string };
   verdict: WithdrawSettleVerdict;
+}
+
+/**
+ * Everything the pre-tx phase resolved, and — load-bearing since §A2.2 —
+ * WHICH LANE it came from.
+ *
+ * The lane is not bookkeeping: it decides which sentences are true. An
+ * `'auth-hold'` row is a manual-capture authorization that really held the
+ * owner's money, so "the $X hold has been released" is a fact about it. An
+ * `'invoice'` row is an automatic-capture pay attempt that authorized NOTHING,
+ * so the same words would invent a hold — the exact refusal the void arm makes
+ * and the fall-through used to violate one branch over.
+ *
+ * `rows` is newest-first. The pay-now lane always carries exactly one (§A3.14:
+ * at most one live hold per dog); the invoice lane carries every unsettled pay
+ * attempt, because the pay route lets an owner tap again while a prior PI is
+ * still processing (§A2.1).
+ */
+interface WithdrawPreTxSettlement {
+  lane: 'auth-hold' | 'invoice';
+  rows: WithdrawSettledRow[];
 }
 
 /**
@@ -758,42 +961,98 @@ async function settleWithdrawMoneyBeforeTx(args: {
     }
 
     // The money-state read, in the priority order the in-tx table uses. Only
-    // the LAST class — a live authorization — needs anything from Stripe.
-    const openInvoice = await invoicesRepository.findOpenForCohortDog(tx, {
-      cohortId: args.cohortId,
-      dogId: args.dogId,
-    });
-    if (openInvoice !== undefined) return undefined;
-    // The SKIP rule, on the advisory side too (§A3.15 finding 2): an
-    // already-covered succeeded charge is not a reason to stop looking. Reading
-    // it as one is what let a live hold go unexamined — and no Stripe call
-    // would have been made for it, so the response could only ever have been
-    // about the old money.
+    // a charge row resting `'requires_payment'` with a PI needs anything from
+    // Stripe — and that read is what GATES the call, in both branches below.
     //
     // Same enrollment identity as the in-tx table (§A3.17), derived from the
     // same pre-cancel live set, so the advisory verdict and the authoritative
     // one cannot diverge on WHICH enrollment they are settling.
     const enrollment = enrollmentIdentityOf(enrolledBookings);
+
+    const openInvoice = await invoicesRepository.findOpenForCohortDog(tx, {
+      cohortId: args.cohortId,
+      dogId: args.dogId,
+    });
+    if (openInvoice !== undefined) {
+      // **The invoice lane consults Stripe, and about EVERY unsettled attempt**
+      // (§A1.1, corrected by §A2.1 — 2026-08-24,
+      // `designs/enrollment-followup-copy-flow.md`).
+      //
+      // Two rows this lane can leave are INDISTINGUISHABLE in the database.
+      // One arm mints both (`invoices.ts:304-316`) after one best-effort
+      // cancel (`:239-248`): a DECLINE's cancel lands, leaving dead money for
+      // which "never charged" is true; a `processing` one's is refused,
+      // leaving live money for which it is a lie. The difference exists only
+      // at Stripe, so only Stripe can decide the sentence.
+      //
+      // And it must be asked about ALL of them, not the newest. The pay route
+      // has no guard against re-attempting while a prior PI is processing, so
+      // {processing, then declined} is ordinary use — and there the newest row
+      // is the DEAD one. Sampling it answered `'voided'` over money still in
+      // motion, which is the very falsehood this machinery exists to remove
+      // (§A2.1, executed).
+      //
+      // The DB read still GATES the Stripe traffic, which is the whole cost
+      // argument: a pay-later withdraw with no attempt row — the bulk of them
+      // — returns an empty list here and touches Stripe zero times. The bound
+      // is ≤1 retrieve + ≤1 cancel PER PENDING ROW, and the pay-ATTEMPTED
+      // subset inherits §A3.2's abort-on-unreadable posture with it (A1.6).
+      return {
+        lane: 'invoice' as const,
+        pending: await chargesRepository.findAllPendingCaptureForCohortDog(tx, {
+          cohortId: args.cohortId,
+          dogId: args.dogId,
+          enrollment,
+        }),
+      };
+    }
+    // The SKIP rule, on the advisory side too (§A3.15 finding 2): an
+    // already-covered succeeded charge is not a reason to stop looking. Reading
+    // it as one is what let a live hold go unexamined — and no Stripe call
+    // would have been made for it, so the response could only ever have been
+    // about the old money.
     const succeeded = await chargesRepository.findUnsettledSucceededCharge(tx, {
       cohortId: args.cohortId,
       dogId: args.dogId,
       enrollment,
     });
     if (succeeded !== undefined) return undefined;
-    return chargesRepository.findPendingCaptureForCohortDog(tx, {
+    // The pay-now lane keeps the SINGLE-row read, licensed by §A3.14's echo
+    // chain: at most one live hold per dog exists here (a refused dog mints no
+    // charge row at all, §A3.13), so "newest" and "all" coincide and sampling
+    // is exact. Multi-row is an invoice-lane fact.
+    const hold = await chargesRepository.findPendingCaptureForCohortDog(tx, {
       cohortId: args.cohortId,
       dogId: args.dogId,
       enrollment,
     });
+    return hold === undefined
+      ? undefined
+      : { lane: 'auth-hold' as const, pending: [hold] };
   });
 
-  if (capturePending === undefined) return undefined;
+  if (capturePending === undefined || capturePending.pending.length === 0) return undefined;
 
-  const verdict = await settleCapturePendingHold({
-    stripe: args.stripe,
-    paymentIntentId: capturePending.stripePaymentIntentId,
-  });
-  return { charge: capturePending, verdict };
+  // Newest→oldest, one settle per row. `settleCapturePendingHold` spends at
+  // most one retrieve and one cancel each, and THROWS on anything it cannot
+  // read — which aborts the whole withdraw here, before the transaction opens,
+  // with zero DB changes (§A3.2's no-uncertains rule applied to ourselves).
+  //
+  // Cancels that already landed when a later row aborts are reconciler-safe:
+  // that is the established "cancel landed, response lost" residual
+  // (`withdrawSettlement.ts:74-83`) — the reconciler pages or answers
+  // `canceled`, and the owner's retry re-reads `canceled` and completes.
+  const rows: WithdrawSettledRow[] = [];
+  for (const charge of capturePending.pending) {
+    rows.push({
+      charge,
+      verdict: await settleCapturePendingHold({
+        stripe: args.stripe,
+        paymentIntentId: charge.stripePaymentIntentId,
+      }),
+    });
+  }
+  return { lane: capturePending.lane, rows };
 }
 
 /**

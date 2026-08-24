@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNotNull, isNull, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { invoices } from '../schema/schema.js';
 import type { ChargePurpose } from './chargesRepository.js';
@@ -247,6 +247,36 @@ export const invoicesRepository = {
           eq(invoices.status, 'open'),
         ),
       )
+      .limit(1);
+    return row;
+  },
+
+  /**
+   * The most recent group-class invoice for one (cohort, dog), WHATEVER its
+   * status — the withdraw fall-through's "what actually became of this debt?"
+   * re-read (§A2.2, 2026-08-24).
+   *
+   * Deliberately status-blind, unlike {@link findOpenForCohortDog}. It is
+   * asked only on the arm where every pending charge row resolved DEAD and the
+   * open-invoice read has already come back empty in-tx: the answer decides
+   * between "cancelled, never charged" (`void` — an ops void, or a prior
+   * crashed withdraw) and "nothing of this enrollment's is left to return"
+   * (anything else). Reading only `open` rows there would return nothing and
+   * force the arm to guess.
+   *
+   * Newest-first because a withdraw-then-re-enroll mints a second invoice for
+   * the same pair; the enrollment's own is the latest one, and the arm that
+   * consults this has already established the earlier ones are not live.
+   */
+  async findLatestForCohortDog(
+    tx: Tx,
+    args: { cohortId: string; dogId: string },
+  ): Promise<InvoiceRow | undefined> {
+    const [row] = await tx
+      .select(INVOICE_PROJECTION)
+      .from(invoices)
+      .where(and(eq(invoices.cohortId, args.cohortId), eq(invoices.dogId, args.dogId)))
+      .orderBy(desc(invoices.issuedAt))
       .limit(1);
     return row;
   },

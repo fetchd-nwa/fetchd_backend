@@ -31,6 +31,15 @@ const LEDGER = {
   invoiceSettledId: 'aaaa2222-0000-4000-8000-000000000002',
 } as const;
 
+// Q16 (2026-08-24, `designs/enrollment-followup-copy-flow.md` §3.3) — the rows
+// that carry a cohort. Kept apart from LEDGER so the legacy deepEqual above
+// keeps seeing exactly the ledger it was written against.
+const Q16 = {
+  chargeGroupNamedId: 'aaaa1111-0000-4000-8000-000000000006',
+  chargeGroupLegacyId: 'aaaa1111-0000-4000-8000-000000000007',
+  invoiceGroupOpenId: 'aaaa2222-0000-4000-8000-000000000003',
+} as const;
+
 function buildApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL) {
   const { app, authenticate } = makeContractApp(principal);
   registerInvoicesRoute(app, { authenticate });
@@ -237,6 +246,125 @@ test(
     const seededOrder = rows.filter((r) => r.id.startsWith('aaaa')).map((r) => r.date);
     const sorted = [...seededOrder].sort((a, b) => b.localeCompare(a));
     assert.deepEqual(seededOrder, sorted);
+
+    await cleanupLedger();
+  },
+);
+
+/**
+ * Q16's three group-class money rows, all under the fixture owner:
+ *   - a settled charge and an open invoice, each carrying its OWN
+ *     `(cohort_id, dog_id)` — the shape every group-class row minted since
+ *     Δ 2026-06-09 has ("group-class enrollment is paid per-(cohort, dog)");
+ *   - one legacy row carrying neither, which must keep rendering today's bytes.
+ *
+ * **`booking_id` points at a FOREIGN booking on purpose** — `booking2Id` is
+ * dog2's day-care booking, and neither money row is dog2's or day-care. It is
+ * not a realistic anchor; it is the one fixture that makes the §A3.17/§A3.18
+ * exclusion falsifiable. If the ledger ever starts joining `bookings` for
+ * group-class rows again, this test fails twice over: `dog_id` becomes dog2's
+ * and `category` becomes 'day-care'.
+ */
+async function seedGroupClassLedger(): Promise<void> {
+  await db.insert(charges).values([
+    {
+      id: Q16.chargeGroupNamedId,
+      ownerId: FIXTURE_IDS.ownerId,
+      amountCents: 20_000,
+      status: 'succeeded',
+      purpose: 'group-class',
+      bookingId: FIXTURE_IDS.booking2Id,
+      cohortId: FIXTURE_IDS.cohortMannersId,
+      dogId: FIXTURE_IDS.dog1Id,
+      createdAt: '2026-04-24T15:00:00.000Z',
+    },
+    {
+      // Pre-Δ 2026-06-09 money: no cohort, no dog. The degrade case.
+      id: Q16.chargeGroupLegacyId,
+      ownerId: FIXTURE_IDS.ownerId,
+      amountCents: 15_000,
+      status: 'succeeded',
+      purpose: 'group-class',
+      createdAt: '2026-04-23T15:00:00.000Z',
+    },
+  ]);
+  await db.insert(invoices).values([
+    {
+      id: Q16.invoiceGroupOpenId,
+      ownerId: FIXTURE_IDS.ownerId,
+      amountCents: 12_000,
+      status: 'open',
+      purpose: 'group-class',
+      paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+      bookingId: FIXTURE_IDS.booking2Id,
+      cohortId: FIXTURE_IDS.cohortPuppyId,
+      dogId: FIXTURE_IDS.dog1Id,
+      issuedAt: '2026-04-25T15:00:00.000Z',
+      dueAt: '2026-05-09T15:00:00.000Z',
+    },
+  ]);
+}
+
+test(
+  'GET /invoices — a group-class row carries its own dog and its class name (Q16)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED before `ledgerRepository` learned the cohort join: group-class rows
+    // emitted neither `dog_id` nor `group_class_name`, so the client could only
+    // render the generic "Group Class session" with no dog chip — the line
+    // Allison's 2026-08-24 ruling replaces with "Manners 1 — Waffles".
+    await cleanupLedger();
+    await seedGroupClassLedger();
+    const res = await buildApp().inject({ method: 'GET', url: '/invoices' });
+    assert.equal(res.statusCode, 200, res.body);
+    const entries = byId(res.json() as LedgerEntryWire[]);
+
+    // The settled charge: dog from `charges.dog_id`, name from the cohort's
+    // class. Cohort `manners-2` → 'Group Manners 2 (fixture)'.
+    assert.deepEqual(entries.get(Q16.chargeGroupNamedId), {
+      id: Q16.chargeGroupNamedId,
+      kind: 'session',
+      status: 'paid',
+      amount_cents: 20_000,
+      date: '2026-04-24T15:00:00.000Z',
+      dog_id: FIXTURE_IDS.dog1Id,
+      category: 'group-class',
+      group_class_name: 'Group Manners 2 (fixture)',
+      settled_method: 'card',
+      settled_at: '2026-04-24T15:00:00.000Z',
+    });
+
+    // The open invoice, the same two facts off its own columns. A DIFFERENT
+    // cohort, so a name resolved from anywhere but this row cannot pass both.
+    assert.deepEqual(entries.get(Q16.invoiceGroupOpenId), {
+      id: Q16.invoiceGroupOpenId,
+      kind: 'session',
+      status: 'open',
+      amount_cents: 12_000,
+      date: '2026-04-25T15:00:00.000Z',
+      dog_id: FIXTURE_IDS.dog1Id,
+      category: 'group-class',
+      payment_expected: 'card',
+      group_class_name: 'Puppy Class (fixture)',
+    });
+
+    // Legacy row: no cohort ⇒ neither fact, and the bytes are today's.
+    assert.deepEqual(entries.get(Q16.chargeGroupLegacyId), {
+      id: Q16.chargeGroupLegacyId,
+      kind: 'session',
+      status: 'paid',
+      amount_cents: 15_000,
+      date: '2026-04-23T15:00:00.000Z',
+      category: 'group-class',
+      settled_method: 'card',
+      settled_at: '2026-04-23T15:00:00.000Z',
+    });
+
+    // Belt-and-braces over the deepEqual exactness, because these two absences
+    // are the old-client degrade contract.
+    const legacy = entries.get(Q16.chargeGroupLegacyId)!;
+    assert.equal('dog_id' in legacy, false);
+    assert.equal('group_class_name' in legacy, false);
 
     await cleanupLedger();
   },
