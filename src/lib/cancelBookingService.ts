@@ -183,26 +183,31 @@ export async function cancelBookingInTx(
         // MONEY-BACK: refunds row at 'pending'; cumulative-refund rule
         // (refunds ≤ charge) enforced API-side. Stripe call fires
         // post-commit via the returned handle.
-        const alreadyRefunded = await refundsRepository.sumNonFailedForCharge(tx, charge.id);
-        const maxRefund = charge.amountCents - alreadyRefunded;
-        if (maxRefund > 0) {
-          if (charge.stripePaymentIntentId !== null) {
-            const refund = await refundsRepository.createPending(tx, {
-              ownerId: row.ownerId,
-              chargeId: charge.id,
-              bookingId: id,
-              amountCents: maxRefund,
-              reason: 'cancel',
-              // Stored in the SAME tx as the row, so the retry sweep can send
-              // exactly what the post-commit fire sends — a replay, never a
-              // second refund.
-              stripeIdempotencyKey,
-            });
+        // Capped under the charge row's LOCK, through the one shared helper
+        // (§A3.18 D2) — R9's cap is a read-modify-write, and an unlocked one
+        // was measured double-refunding a charge across two overlapping
+        // transactions. The helper REFUSES a charge with no PaymentIntent
+        // rather than minting a 'pending' row nothing could ever send, and
+        // hands back the cap so the unroutable branch below can record the
+        // obligation under that same lock.
+        const minted = await refundsRepository.mintCappedPendingRefund(tx, {
+          chargeId: charge.id,
+          ownerId: row.ownerId,
+          bookingId: id,
+          reason: 'cancel',
+          // Stored in the SAME tx as the row, so the retry sweep can send
+          // exactly what the post-commit fire sends — a replay, never a
+          // second refund. The client's key, so the row id is ignored.
+          stripeIdempotencyKey: () => stripeIdempotencyKey,
+        });
+        if (minted.kind !== 'nothing-to-refund') {
+          const maxRefund = minted.amountCents;
+          if (minted.kind === 'minted') {
             pendingStripeRefund = {
-              refundId: refund.id,
-              paymentIntentId: charge.stripePaymentIntentId,
-              amountCents: maxRefund,
-              stripeIdempotencyKey,
+              refundId: minted.refundId,
+              paymentIntentId: minted.paymentIntentId,
+              amountCents: minted.amountCents,
+              stripeIdempotencyKey: minted.stripeIdempotencyKey,
             };
           } else {
             // Charges with NULL stripe_payment_intent_id are pre-Stripe-wire

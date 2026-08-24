@@ -600,6 +600,8 @@ export async function settleAttempt(args: {
       purpose: invoice.purpose,
       notifyOwner: true,
       now,
+      // The §A3.19 F2 anchor fallback's tripwire needs somewhere to go.
+      log,
     });
     if (args.attemptId !== undefined) {
       await invoiceChargeAttemptsRepository.resolve(tx, {

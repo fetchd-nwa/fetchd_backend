@@ -92,7 +92,7 @@ export function registerStripeWebhookRoute(
       }
 
       try {
-        const result = await dispatchStripeEvent(event, { stripe });
+        const result = await dispatchStripeEvent(event, { stripe, log: request.log });
         await stripeEventsRepository.markProcessed(event.id);
         // Post-commit Stripe refund when settling an orphaned invoice charge
         // LOST the `markPaid` race — the owner had already paid that invoice, so

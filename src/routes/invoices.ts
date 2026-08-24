@@ -28,6 +28,7 @@ import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { firePendingRefundPostCommit } from '../lib/pendingRefund.js';
 import {
+  resolveInvoiceAnchorBookingId,
   settleInvoiceCharge,
   type PendingDuplicateRefund,
 } from '../lib/settleInvoiceCharge.js';
@@ -307,7 +308,9 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
               status: chargeStatus,
               purpose: invoiceRow.purpose,
               stripePaymentIntentId: intent.id,
-              bookingId: invoiceRow.bookingId,
+              // The invoice's own enrollment anchor (§A3.18 D1), with the
+              // §A3.19 F2 fallback behind it for invoices carrying none.
+              bookingId: await resolveInvoiceAnchorBookingId(tx, invoiceRow, request.log),
               cohortId: invoiceRow.cohortId,
               dogId: invoiceRow.dogId,
             });
@@ -336,6 +339,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
             amountCents: intent.amountCents,
             purpose: invoiceRow.purpose,
             notifyOwner: false,
+            log: request.log,
           });
 
           if (settle.outcome === 'refunded') {

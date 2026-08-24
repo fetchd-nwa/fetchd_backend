@@ -318,14 +318,31 @@ export const bookingsRepository = {
    * `weeks` weekly rows for the (cohort, dog); the withdraw verb cancels all of
    * them. The earliest `scheduled_at` doubles as the cohort's first-session
    * instant for the "class hasn't started" guard. Empty = not enrolled.
+   *
+   * **This set IS the enrollment's identity** (ADDENDUM 3 §A3.17): its ids are
+   * the anchors a group-class charge may be stamped with, and `min(created_at)`
+   * over it is the enrollment's BIRTH — the only input the legacy (NULL-anchor)
+   * membership rule has. `lib/enrollmentIdentity.ts` is what turns these rows
+   * into the identity every money read takes.
+   *
+   * **The birth is projected in MICROSECONDS (§A3.18 D3), not as a timestamp
+   * string.** `Date` truncates Postgres's microseconds to milliseconds, and
+   * that truncation made JS and SQL disagree about whether a sub-millisecond
+   * legacy charge predated its enrollment — which released a live hold for an
+   * enrolled dog. `::text` because node-postgres hands `int8` back as a string
+   * rather than risking a lossy parse; `enrollmentIdentity` normalizes it once.
    */
   async findLiveBookingsForCohortDog(
     tx: Tx,
     cohortId: string,
     dogId: string,
-  ): Promise<{ id: string; scheduledAt: string }[]> {
+  ): Promise<{ id: string; scheduledAt: string; createdAtUs: string }[]> {
     return tx
-      .select({ id: bookings.id, scheduledAt: bookings.scheduledAt })
+      .select({
+        id: bookings.id,
+        scheduledAt: bookings.scheduledAt,
+        createdAtUs: sql<string>`((EXTRACT(EPOCH FROM ${bookings.createdAt})::numeric * 1000000)::bigint)::text`,
+      })
       .from(bookings)
       .where(
         and(
@@ -336,6 +353,51 @@ export const bookingsRepository = {
         ),
       )
       .orderBy(asc(bookings.scheduledAt));
+  },
+
+  /**
+   * **The same-transaction identity witness** (ADDENDUM 3 §A3.19 F2): the
+   * earliest-scheduled booking of this (cohort, dog) whose `created_at` EQUALS
+   * the invoice's `issued_at`, over rows of ANY status.
+   *
+   * A group-class invoice and its enrollment's `weeks` booking rows are written
+   * by ONE transaction, and Postgres `now()` is transaction-start-stable — so
+   * `bookings.created_at = invoices.issued_at` is not a heuristic, it is proof
+   * that these rows were minted together. (`issued_at` IS the invoice's
+   * transaction stamp; `invoices` has no `created_at` column.)
+   *
+   * It exists for invoices carrying a NULL anchor, which §A3.18 believed could
+   * no longer arise and which two doors kept producing: rows minted BEFORE the
+   * anchor stamp existed (draining on `due_at` horizons measured in weeks), and
+   * rows silently orphaned by `invoices.booking_id`'s `ON DELETE SET NULL` when
+   * an ops script hard-deletes an anchor. One mechanism covers both: a legacy
+   * invoice resolves its own — possibly CANCELLED — rows exactly, and an
+   * orphaned one resolves the surviving siblings of the same enroll tx.
+   *
+   * ANY status, deliberately: the whole point is to name a DEAD enrollment's
+   * first session, so that a late settle files its money where it belongs
+   * instead of being claimed by whatever enrollment is live now.
+   *
+   * The comparison is done in SQL against the invoice row itself, so no
+   * timestamp ever round-trips through a JS `Date` — the §A3.18 D3 rule.
+   */
+  async findAnchorByInvoiceIssuedAt(
+    tx: Tx,
+    args: { invoiceId: string; cohortId: string; dogId: string },
+  ): Promise<string | undefined> {
+    const [row] = await tx
+      .select({ id: bookings.id })
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.cohortId, args.cohortId),
+          eq(bookings.leadDogId, args.dogId),
+          sql`${bookings.createdAt} = (SELECT i.issued_at FROM invoices i WHERE i.id = ${args.invoiceId})`,
+        ),
+      )
+      .orderBy(asc(bookings.scheduledAt))
+      .limit(1);
+    return row?.id;
   },
 
   /**

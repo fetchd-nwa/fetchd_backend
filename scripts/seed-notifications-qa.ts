@@ -22,7 +22,7 @@
  * the real producers use — so a QA row can never point somewhere a real
  * notification couldn't. If a kind's path changes, this seed changes with it.
  */
-import { eq, inArray } from 'drizzle-orm';
+import { eq, inArray, or } from 'drizzle-orm';
 
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
@@ -619,7 +619,20 @@ async function clearPriorQaRows(): Promise<void> {
   await db
     .delete(invoices)
     .where(inArray(invoices.id, [QA.invoicePaidId, QA.invoiceInPersonId, QA.invoiceOverdueId]));
-  await db.delete(charges).where(inArray(charges.id, [QA.chargePaidId]));
+  // Charges BY LINKAGE, not by the id list (Δ 2026-08-22, ADDENDUM 3 §A3.18 D7).
+  // `charges.booking_id` has no ON DELETE, and since §A3.17 a group-class charge
+  // is ANCHORED to a booking row — so deleting only `QA.chargePaidId` and then
+  // dropping these bookings raises 23503 the moment any anchored charge points
+  // at one. Sweeping every charge that references a booking about to go keeps
+  // this script re-runnable whatever else has attached itself to the QA rows.
+  await db
+    .delete(charges)
+    .where(
+      or(
+        inArray(charges.id, [QA.chargePaidId]),
+        inArray(charges.bookingId, [QA.bookingCancelledId, QA.bookingTomorrowId]),
+      ),
+    );
   await db
     .delete(bookingDogs)
     .where(inArray(bookingDogs.bookingId, [QA.bookingCancelledId, QA.bookingTomorrowId]));

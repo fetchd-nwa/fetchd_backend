@@ -12,6 +12,56 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.12.0] — 2026-08-21
+
+Additive. The withdraw response states what happened to the owner's money
+(Allison 2026-08-21: "as a user it should be very clear what is happening
+with my money. no uncertains"; designs/partial-success-enrollment.md
+ADDENDUM 3).
+
+- New: `EnrollmentWithdrawResultWire`, `WithdrawMoneyOutcome`. POST
+  /enrollments/:cohortId/withdraw now types its response in the contract
+  (previously an inline route shape — a DRIFT-26-class gap, partially
+  closed). `refunded_cents` semantics unchanged; `money_outcome` names the
+  settlement; `released_cents` carries the freed hold's amount.
+- Old clients read the old fields unchanged; mobile ≤1.11.0 discards the
+  body entirely, so the degrade is a non-event.
+- Request body (documented here; request bodies remain outside wire.ts —
+  the §1.2 known gap, unchanged): `POST /enrollments` gains optional
+  `retry_of?: string` — the Idempotency-Key under which this dog's latest
+  EXECUTED payment attempt ran; clients echo the `verify_key` from the
+  dog's most recent result row and omit the field when absent (ADDENDUM 3
+  §A3.13 as repaired by §A3.14). The authorize step re-issues the confirm
+  under that derived key first, adopting a settled hold / reporting a
+  still-verifying one / minting fresh only on a terminal prior attempt —
+  at most one live hold per dog by construction (invariant proved in
+  §A3.14). Omitting the field hashes identically to today's body (the
+  1.11.0 `allow_partial` precedent).
+- New: `EnrollmentDogResultWire.verify_key` — present iff
+  `charge_unverified` (the only refusal leaving a live intent); the key
+  naming the live attempt, for the echo rule above.
+- New: `WithdrawMoneyOutcome` gains `'refund_manual'` +
+  `EnrollmentWithdrawResultWire.owed_cents` (present iff `'refund_manual'`)
+  — a refund owed on a charge with no payment-intent wiring (pre-Stripe
+  seed rows) is stated truthfully as arranged-by-hand instead of the false
+  "no charge on file"; `owed_cents` is the R9 remainder, computed for the
+  sentence, never minted here (ADDENDUM 3 §A3.15). `refunded_cents`'s
+  `> 0`-iff-`'refunded'` invariant is untouched.
+
+Server-side (no wire shape): the withdraw arm settles EVERY charge-row
+state under manual capture — cancel a live hold (released), refund a
+capture that won the race (refunded), commit to automatic
+release-or-refund for an in-flight payment (release_pending) — and the
+capture reconciler asks the live-bookings question before capturing,
+releasing instead of capturing when nothing is owed. Closes the round-3
+blocker (withdraw-then-capture of a cancelled enrollment).
+
+NOTE ON NUMBERING: [1.11.0]'s note reserving "the next minor" for the
+remaining money-safety slice (memberships wire move, B&T conversion) now
+points past this bump — that slice takes the next minor at its own
+landing, unchanged in substance. This bump got there first because a
+proven capture-of-cancelled-money outranks a planned refactor.
+
 ## [1.11.0] — 2026-08-20
 
 Additive. Per-dog partial success on POST /enrollments (Allison 2026-08-12:

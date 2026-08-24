@@ -4,6 +4,7 @@ import { env } from '../env.js';
 import { ApiError } from '../lib/errors.js';
 import { defaultExpoPushClient, type ExpoPushClient } from '../lib/expoPush.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import type { WorkerLogger } from '../workers/invoiceAutoCharge.js';
 import { runSchedulerTickOnce, type SchedulerTickResult } from '../workers/scheduler.js';
 
 /**
@@ -36,8 +37,20 @@ export interface WorkersTickOpts {
    * Override the worker entrypoint. Contract tests inject a fake to assert
    * the route plumbs args/auth correctly without hitting the DB worker
    * surface (which has its own dedicated test file).
+   *
+   * `log` is part of this shape because the tick's ALARMS are carried by it and
+   * nothing else — LOST HOLD, ABANDONED ENROLLMENT HOLDS, the two refund lines.
+   * Omitting the field here is what made `scheduler.ts` resolve
+   * `opts.log ?? NOOP_LOG` in production and discard every one of them while
+   * money moved unattended (2026-08-24). It is REQUIRED, not optional, so that
+   * deleting the call-site wire-up is a compile error rather than a silent
+   * repeat of that regression.
    */
-  runTick?: (opts: { expoPush?: ExpoPushClient; r2?: R2Client }) => Promise<SchedulerTickResult>;
+  runTick?: (opts: {
+    expoPush?: ExpoPushClient;
+    r2?: R2Client;
+    log: WorkerLogger;
+  }) => Promise<SchedulerTickResult>;
 }
 
 function firstHeader(value: string | string[] | undefined): string | undefined {
@@ -56,7 +69,8 @@ function constantTimeEqual(a: string, b: string): boolean {
 export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTickOpts = {}): void {
   const runTick =
     opts.runTick ??
-    ((tickOpts: { expoPush?: ExpoPushClient; r2?: R2Client }) => runSchedulerTickOnce(tickOpts));
+    ((tickOpts: { expoPush?: ExpoPushClient; r2?: R2Client; log: WorkerLogger }) =>
+      runSchedulerTickOnce(tickOpts));
 
   app.post('/workers/tick', async (request, reply) => {
     const auth = firstHeader(request.headers['authorization']);
@@ -71,6 +85,10 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
     const result = await runTick({
       expoPush: opts.expoPush ?? defaultExpoPushClient,
       r2: opts.r2 ?? defaultR2Client,
+      // The request logger IS the tick's alarm channel: `request.log` already
+      // structurally satisfies `WorkerLogger`, and it is the same destination
+      // the "scheduler tick complete" line below lands in.
+      log: request.log,
     });
     request.log.info(
       {

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import { ne } from 'drizzle-orm';
 import { db } from '../client.js';
@@ -7,6 +8,21 @@ import type { Tx } from '../tx.js';
 
 /** Polymorphic runner — pool for pre/post-tx ops, Tx for in-mutation work. */
 type Runner = Tx | typeof db;
+
+/**
+ * What {@link refundsRepository.mintCappedPendingRefund} decided, under the
+ * charge row's lock (§A3.18 D2).
+ */
+export type CappedRefundMint =
+  | { kind: 'nothing-to-refund' }
+  | { kind: 'no-payment-intent'; amountCents: number }
+  | {
+      kind: 'minted';
+      refundId: string;
+      amountCents: number;
+      stripeIdempotencyKey: string;
+      paymentIntentId: string;
+    };
 
 /**
  * `schema.sql` `refund_status`. `'unroutable'` (2026-08-19, design §4) is
@@ -280,6 +296,130 @@ export const refundsRepository = {
       throw new Error('refundsRepository.createPending: refunds INSERT returned no row');
     }
     return row;
+  },
+
+  /**
+   * **THE capped refund mint** — lock the charge, compute R9's cap under that
+   * lock, and INSERT the pending row, all in ONE transaction (ADDENDUM 3
+   * §A3.18 D2, 2026-08-22).
+   *
+   * **Why the lock exists.** R9's cap is a read-modify-write: read
+   * `sumNonFailed`, subtract, insert. OP-9 executed the consequence with two
+   * genuinely overlapping transactions — the API withdraw's refund leg and the
+   * scheduler's `settlePostWithdrawRefund` — both reading `sumNonFailed = 0`
+   * for the same 12000c charge and both committing a full 12000c pending
+   * refund, under DISTINCT `withdraw-refund:<uuid>` keys. Two different keys
+   * means Stripe replays neither: it executes both, and 24000c leaves the
+   * account for a 12000c charge. Pending rows already counted against the cap,
+   * so every SEQUENTIAL second minter computed 0 — the hole was only ever the
+   * overlap, and §A3.17 widened `settlePostWithdrawRefund`'s firing enough to
+   * make it reachable.
+   *
+   * `SELECT … FOR UPDATE` on the charge row makes the second minter BLOCK until
+   * the first commits, then re-read the sum INCLUDING the winner's pending row
+   * and compute 0. **R5 is preserved**: the lock lives only inside the
+   * pending-mint transaction and no Stripe call happens under it — the caller
+   * still fires post-commit, exactly as R35 requires. Hold time is one sum
+   * query.
+   *
+   * **The deadlock invariant, stated correctly (§A3.19 R1).** An earlier
+   * version of this comment claimed "every leg takes the charge FIRST", and
+   * that is literally false: three of the four call sites already hold a
+   * cohort, booking or invoice lock by the time they get here, so the charge is
+   * the LAST contended lock, not the first. What actually makes this safe is
+   * narrower and must be preserved by name: **this helper never waits on an
+   * existing `refunds` row.** It reads `refunds` with a plain aggregate and
+   * INSERTs a fresh one, so it can never block behind a writer holding a
+   * refunds row while that writer waits for the charge. That is the only reason
+   * `stripeEventHandlers.ts`'s refunds-then-charges write order — the reverse
+   * of this one — cannot deadlock against it. **A future
+   * `SELECT … FROM refunds … FOR UPDATE` here, or a unique index on `refunds`
+   * that makes an INSERT wait on a concurrent one, creates a live deadlock
+   * pair.** That is a constraint on future work, not an observation.
+   *
+   * **What the lock does NOT serialize (§A3.19 R4):** the cap is serialized
+   * against other MINTERS only. The webhook's `pending → failed` flip does not
+   * take this lock, so a mint can read a sum that still counts a refund Stripe
+   * has just failed. The stale direction is UNDER-refund — we return less than
+   * we could — which is the safe one: the reopened remainder surfaces on the
+   * `stripe-failed` abandon report for a human, and no money leaves twice.
+   *
+   * **It is one helper, and that is the point.** Six legs mint capped refunds
+   * (the withdraw's succeeded and refunded-verdict arms,
+   * `settlePostWithdrawRefund`, the invoice settle's lost-race/void arm,
+   * `cancelBookingService`'s money-back branch, and the reconciler's
+   * surplus arm). Open-coding lock-sum-cap-mint six times is how the seventh
+   * one forgets the lock.
+   *
+   * Three answers, because the callers genuinely differ:
+   *   - `'minted'` — a pending row exists and the caller must fire it.
+   *   - `'nothing-to-refund'` — the cap is 0; someone already spoke for this
+   *     money. Never an error: it is R9 working.
+   *   - `'no-payment-intent'` — pre-Stripe-wire seed money. The obligation is
+   *     real but there is nothing at Stripe to reverse, so this mints NOTHING
+   *     and hands back the cap; the one caller that can reach it
+   *     (`cancelBookingService`) writes an `'unroutable'` row instead, still
+   *     under this lock. A `'pending'` row here would be a worklist entry no
+   *     sweep could send and no webhook could close.
+   */
+  async mintCappedPendingRefund(
+    tx: Tx,
+    args: {
+      chargeId: string;
+      ownerId: string;
+      bookingId: string | null;
+      reason?: string | null;
+      /**
+       * THE Stripe key, built from the refund row's uuid. A factory rather than
+       * a string because most legs derive the key FROM the row id (the key must
+       * exist before the INSERT that stores it), while the withdraw legs use the
+       * client's request key and ignore the argument.
+       */
+      stripeIdempotencyKey: (refundId: string) => string;
+    },
+  ): Promise<CappedRefundMint> {
+    // The lock. FIRST, before `refunds` is read or written, so the legs cannot
+    // deadlock against each other.
+    const [charge] = await tx
+      .select({
+        amountCents: charges.amountCents,
+        stripePaymentIntentId: charges.stripePaymentIntentId,
+      })
+      .from(charges)
+      .where(eq(charges.id, args.chargeId))
+      .for('update');
+    if (charge === undefined) {
+      throw new Error(`mintCappedPendingRefund: charge ${args.chargeId} not found`);
+    }
+
+    const alreadyRefunded = await this.sumNonFailedForCharge(tx, args.chargeId);
+    const amountCents = charge.amountCents - alreadyRefunded;
+    if (amountCents <= 0) return { kind: 'nothing-to-refund' };
+    if (charge.stripePaymentIntentId === null) {
+      return { kind: 'no-payment-intent', amountCents };
+    }
+
+    // The uuid is minted app-side because the Stripe key derives from it: the
+    // key has to exist before the INSERT that stores it, and only the caller of
+    // `createPending` can break that circle.
+    const refundId = randomUUID();
+    const stripeIdempotencyKey = args.stripeIdempotencyKey(refundId);
+    const refund = await this.createPending(tx, {
+      id: refundId,
+      ownerId: args.ownerId,
+      chargeId: args.chargeId,
+      bookingId: args.bookingId,
+      amountCents,
+      reason: args.reason ?? null,
+      stripeIdempotencyKey,
+    });
+    return {
+      kind: 'minted',
+      refundId: refund.id,
+      amountCents,
+      stripeIdempotencyKey,
+      paymentIntentId: charge.stripePaymentIntentId,
+    };
   },
 
   /**

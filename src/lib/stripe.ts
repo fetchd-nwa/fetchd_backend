@@ -24,9 +24,10 @@ import { ApiError } from './errors.js';
  *     Stripe Elements; we only see the resulting `payment_method` token +
  *     the displayable bits (brand/last4/exp).
  *
- * The interface is narrow — only the 5 verbs Day-14 actually calls. Adding a
- * method here when Day-15 wires webhooks is the rule-of-two trigger; new
- * verbs land alongside their first caller.
+ * The interface stays narrow: a verb lands here alongside its first caller,
+ * never ahead of one. `capturePaymentIntent` is the newest (2026-08-20,
+ * enrollments manual capture) and the first verb whose *precondition* — the
+ * intent's retrieved status — lives in the caller rather than in the seam.
  */
 
 const stripeSingleton = new Stripe(env.STRIPE_SECRET_KEY);
@@ -129,6 +130,21 @@ export interface StripePaymentIntentResult {
    */
   createdAt?: Date;
   /**
+   * The intent's `metadata`, as Stripe holds it (2026-08-21, ADDENDUM 3
+   * §A3.13). Carried because ONE caller needs to prove an intent is the
+   * principal's own before adopting it: the `retry_of` re-verify arm re-issues
+   * a confirm under ANOTHER REQUEST'S derived key, and while a forged
+   * `retry_of` is already refused by Stripe (same key + this principal's
+   * customer/payment-method ids ⇒ `idempotency_error`), the belt-and-braces
+   * assertion is `metadata.owner_id` — stamped at create by
+   * `enrollmentPartial.authorizeDogsForEnrollment`.
+   *
+   * `undefined` when the source object carried no readable metadata object
+   * (the thrown fork's attached intent may not). An ABSENT owner_id is not
+   * proof of ownership and callers must not read it as one.
+   */
+  metadata?: Record<string, string>;
+  /**
    * `true` when Stripe answered this confirm from its idempotency record
    * (`idempotent-replayed: true` — the MEASURED header name, not the documented
    * `Idempotency-Replayed`; see {@link REPLAYED_HEADER_NAMES}), `false` when it
@@ -202,9 +218,17 @@ export type UnsettledPaymentIntentStatus = Exclude<StripePaymentIntentStatus, 's
  *     unconfirmed shouldn't happen. Read as `authentication_required`, the
  *     closest still-live state, so the copy asks for another card instead of
  *     asserting a decline that didn't happen.
- *   - `requires_capture` — nothing in this system authorizes without
- *     capturing. Read as `processing` because the money may be authorized and
- *     in flight; calling that "declined" would be flatly false.
+ *   - `requires_capture` — anomalous **for the callers that reach this
+ *     function**. Since 2026-08-20 one site DOES authorize without capturing
+ *     (`POST /enrollments` pay-now, `captureMethod: 'manual'`), and there
+ *     `requires_capture` is the HEALTHY resting status — the authorization
+ *     succeeded and nothing has moved. That site therefore never asks this
+ *     function about it: `enrollmentPartial.ts` treats `requires_capture` as
+ *     the success arm and only derives a blocker for the other statuses. Every
+ *     other confirm site still sends `capture_method: automatic`, so seeing
+ *     this status there means Stripe's lifecycle no longer matches ours. Read
+ *     as `processing` because the money may be authorized and in flight;
+ *     calling that "declined" would be flatly false.
  *
  * Exhaustive `switch` on the RAW status, same discipline as its neighbour: a
  * future Stripe status surfaces as a TS error rather than a silent fallback.
@@ -252,7 +276,7 @@ function stripeIntentStatusToChargeBlocker(
     case 'requires_capture':
       log.warn(
         { stripeIntentStatus: status },
-        'off-session confirm returned requires_capture — anomalous (nothing here authorizes without capturing); reporting processing',
+        'off-session confirm returned requires_capture on an AUTOMATIC-capture site — anomalous (only the manual-capture enrollment authorize expects this status, and it never asks for a blocker); reporting processing',
       );
       return 'processing';
   }
@@ -473,7 +497,57 @@ export interface StripeClient {
       amountCents: number;
       currency: string;
       metadata: Record<string, string>;
+      /**
+       * Stripe's `capture_method` (2026-08-20). **Omitted by default, and that
+       * omission is load-bearing** — it is part of the request body Stripe
+       * hashes the idempotency key against, so sending `'automatic'`
+       * explicitly on the sites that always relied on the default would
+       * invalidate every key currently in flight for them. Absent here means
+       * absent on the wire to Stripe, which is byte-identical to every call
+       * this system has ever made.
+       *
+       * `'manual'` AUTHORIZES: the funds are held on the card and **nothing
+       * moves** until {@link StripeClient.capturePaymentIntent}. The resting
+       * status is `requires_capture`, not `succeeded`; a card auth expires on
+       * its own (~7 days, card-network dependent — documented, not probed on
+       * this account) if never captured, which is why every failure path on a
+       * manual-capture site releases a hold instead of refunding a payment.
+       *
+       * One site sends it today: `POST /enrollments` pay-now
+       * (`enrollmentPartial.ts`), the enrollments slice of
+       * `designs/money-safety-rollback-and-replay.md`.
+       */
+      captureMethod?: 'automatic' | 'manual';
     },
+    idempotencyKey: string,
+  ): Promise<StripePaymentIntentResult>;
+
+  /**
+   * Capture a PaymentIntent that is resting at `requires_capture` — the second
+   * half of an authorize → capture pair, and the ONLY verb in this system that
+   * moves money which was merely held (2026-08-20).
+   *
+   * **The caller owes one precondition, and it is asserted, not assumed:
+   * capture only an intent whose RETRIEVED status is `requires_capture`.**
+   * Capturing is irreversible without a refund, and the two states that most
+   * look like "ready to capture" from a stale snapshot — an intent someone
+   * already captured, and one someone already cancelled — have opposite
+   * correct responses. `enrollmentPartial.ts` holds that rule; this verb
+   * mechanically does what it is told.
+   *
+   * `idempotencyKey` is required for the same reason the confirm verb's is: a
+   * retried capture must replay rather than double-move money. Stripe also
+   * refuses a capture of an already-captured intent outright, so the two
+   * defences stack.
+   *
+   * Returns the post-capture {@link StripePaymentIntentResult} — `succeeded`
+   * on the ordinary path. Errors are NOT normalized into a result here (unlike
+   * the confirm verb): there is no card-decline fork for a capture, so anything
+   * thrown is a genuine failure to find out, and the caller's honest answer is
+   * `payment_state: 'pending'` plus the reconciler, never a decline.
+   */
+  capturePaymentIntent(
+    paymentIntentId: StripePaymentIntentId,
     idempotencyKey: string,
   ): Promise<StripePaymentIntentResult>;
 
@@ -493,9 +567,18 @@ export interface StripeClient {
    * against the next attempt's fresh PI. Every off-session confirm path owes
    * this call while no client-side 3DS completion flow exists — the auto-charge
    * worker, `POST /invoices/:id/pay`, `POST /credit-packages/:key/purchase`,
-   * `POST /memberships`, and the group-class enroll unwind. Best-effort: every
+   * `POST /memberships`, and `POST /enrollments`. Best-effort: every
    * caller swallows failures — a PI Stripe refuses to cancel (already settling)
    * is covered by the key-scoped Stripe idempotency on the next attempt.
+   *
+   * **Second job since 2026-08-20: releasing an AUTHORIZATION.** On the
+   * manual-capture enrollment path this is what a failure path calls instead of
+   * `createRefund`, and the difference is the whole point — a released hold is
+   * money that never left the owner's account, while a refund is money taken
+   * and given back days later. Cancelling a `requires_capture` intent is
+   * cheap, total, and available; that is why the enrollment failure paths call
+   * this and never `createRefund` (money-safety §1.2 ownership invariant:
+   * `refunds` rows stay exclusive to the withdraw arm).
    */
   cancelPaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<void>;
 
@@ -694,6 +777,7 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
   // `created` rides along on both forks (2026-08-12) — see
   // {@link StripePaymentIntentResult.createdAt}. Unix SECONDS at Stripe.
   const created = intentCreatedAt(intent.created);
+  const metadata = intentMetadata(intent.metadata);
   if (isPaymentIntentStatus(intent.status)) {
     return {
       id: intent.id,
@@ -701,6 +785,7 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
       clientSecret: intent.client_secret,
       amountCents: intent.amount,
       ...(created !== undefined ? { createdAt: created } : {}),
+      ...(metadata !== undefined ? { metadata } : {}),
     };
   }
   return {
@@ -710,7 +795,23 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
     amountCents: intent.amount,
     unknownStatus: String(intent.status),
     ...(created !== undefined ? { createdAt: created } : {}),
+    ...(metadata !== undefined ? { metadata } : {}),
   };
+}
+
+/**
+ * Stripe's `metadata` as a plain string map, or `undefined` when there is
+ * nothing readable there. Non-string values are DROPPED rather than coerced:
+ * the one reader asserts an owner id against a principal, and a coerced value
+ * that happens to stringify equal is not evidence of anything.
+ */
+function intentMetadata(raw: unknown): Record<string, string> | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === 'string') out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Stripe's `created` (unix SECONDS) → a Date, or undefined if unreadable. */
@@ -971,6 +1072,10 @@ export const defaultStripeClient: StripeClient = {
           confirm: true,
           off_session: true,
           metadata: args.metadata,
+          // Spread-omitted when the caller didn't ask, so the request body is
+          // byte-identical to every pre-2026-08-20 call and no in-flight
+          // idempotency key changes its fingerprint. See the arg's doc.
+          ...(args.captureMethod !== undefined ? { capture_method: args.captureMethod } : {}),
         },
         { idempotencyKey },
       );
@@ -1022,6 +1127,26 @@ export const defaultStripeClient: StripeClient = {
   async retrievePaymentIntent(paymentIntentId) {
     const intent = await stripeSingleton.paymentIntents.retrieve(paymentIntentId);
     return normalizeRetrievedIntent(intent);
+  },
+
+  async capturePaymentIntent(paymentIntentId, idempotencyKey) {
+    const intent = await stripeSingleton.paymentIntents.capture(
+      paymentIntentId,
+      {},
+      { idempotencyKey },
+    );
+    // Same normalizer as the returning confirm fork — a capture answers with a
+    // PaymentIntent and nothing else, and reading its status through one shared
+    // exhaustive switch is the whole reason a future Stripe status surfaces as
+    // a TS error instead of `undefined` on a money row. `replayed` is stamped
+    // for the same reason it is on the confirm verb: this call carries an
+    // idempotency key, so "Stripe captured just now" and "Stripe replayed the
+    // capture it already did" are distinguishable and must not be conflated.
+    const replayed = replayedFromResponse(intent);
+    return {
+      ...normalizeReturnedConfirm(intent),
+      ...(replayed !== undefined ? { replayed } : {}),
+    };
   },
 
   async createRefund(args, idempotencyKey) {

@@ -1,4 +1,5 @@
 import { ApiError } from './errors.js';
+import type { ChargeBlocker, EnrollmentDogResultWire } from '../contracts/wire.js';
 import type { BookingMode } from './bookingMode.js';
 import type { GroupClassKey } from '../db/repositories/groupClassesRepository.js';
 import type { LocationKey } from '../db/schema/schema.js';
@@ -298,6 +299,183 @@ export function alreadyRequestedError(details: AlreadyRequestedDetails): ApiErro
       : `${details.dog_ids.length} dogs already have an open request of this type.`,
     { kind: 'already_requested', category: details.category, dog_ids: [...details.dog_ids] },
   );
+}
+
+// ---- Per-dog enrollment results (wire 1.11.0) ----------------------------
+//
+// The partial-success counterpart of the constructors above. Same discipline,
+// different shape: a multi-dog enrollment that sends `allow_partial: true`
+// REPORTS each dog rather than throwing on the first failure (Allison,
+// 2026-08-12: "it shoudl report per dog … not transactional where we fail the
+// entire ting"), so these build `EnrollmentDogResultWire` values instead of
+// `ApiError`s. Both vocabularies stay live: the `allow_partial`-absent path
+// still throws the whole-request errors above, unchanged.
+//
+// They live here, beside the errors they mirror, so the day a reason is added
+// to one vocabulary the other is one screen away — the two drifting apart is
+// how a dog ends up with a failure the client has no copy for.
+//
+// `wire.ts` stays dependency-free: this file imports FROM it, never the
+// reverse.
+
+/**
+ * Anti-enumeration, preserved per-dog: `not_found` answers identically for "not
+ * your dog" and "no such dog", exactly as the whole-request 404 does. A
+ * per-dog envelope would otherwise be a free oracle for probing dog ids across
+ * owners — the granularity Allison asked for must not become that.
+ */
+export function dogNotFoundResult(dogId: string): EnrollmentDogResultWire {
+  return { dog_id: dogId, enrolled: false, reason: 'not_found' };
+}
+
+/**
+ * The duplicate guard's per-dog voice. A calm fact, not an error: this is the
+ * result of the self-healing resubmit (fix one dog, send the whole roster
+ * again under a fresh key), and it is the reason that resubmit cannot double
+ * charge or double enroll.
+ */
+export function dogAlreadyEnrolledResult(dogId: string): EnrollmentDogResultWire {
+  return { dog_id: dogId, enrolled: false, reason: 'already_enrolled' };
+}
+
+/** R7: this dog completed none of the class's OR-prereqs. */
+export function dogEligibilityMissingResult(
+  dogId: string,
+  missingAlternatives: readonly string[],
+): EnrollmentDogResultWire {
+  return {
+    dog_id: dogId,
+    enrolled: false,
+    reason: 'eligibility_missing',
+    missing_prereq_alternatives: [...missingAlternatives],
+  };
+}
+
+/**
+ * This dog's COMPLETE vaccine gap list — the same "one full picture per gate"
+ * rule the whole-request `vaccineMissingError` follows, scoped to one dog.
+ * Takes the {@link VaccineGap} shape the gate produces and drops `dog_id`,
+ * which the parent row already carries.
+ */
+export function dogVaccineMissingResult(
+  dogId: string,
+  gaps: readonly VaccineGap[],
+): EnrollmentDogResultWire {
+  if (gaps.length === 0) {
+    // Same defensive posture as `vaccineMissingError`: an empty list would
+    // report a gate failure with nothing the owner could act on.
+    throw new Error('dogVaccineMissingResult: gaps array must be non-empty');
+  }
+  return {
+    dog_id: dogId,
+    enrolled: false,
+    reason: 'vaccine_missing',
+    missing_vaccines: gaps.map((g) => ({ requirement_key: g.requirement_key, label: g.label })),
+  };
+}
+
+/**
+ * More healthy dogs than seats. `seats_remaining` is the count at decision
+ * time and the server assigns NOBODY — it refuses to choose which dog misses
+ * class (design §3.6). Every passing dog gets this same result so the owner
+ * sees the real choice rather than a silent alphabetical pick.
+ */
+export function dogSeatShortfallResult(
+  dogId: string,
+  seatsRemaining: number,
+): EnrollmentDogResultWire {
+  return {
+    dog_id: dogId,
+    enrolled: false,
+    reason: 'seat_shortfall',
+    seats_remaining: seatsRemaining,
+  };
+}
+
+/**
+ * The authorization was refused. `charge_blocker` is the 1.8.0 taxonomy and
+ * carries only the two arms that send the owner to a card:
+ * `declined` / `authentication_required`. **Never `processing`** — an in-flight
+ * authorization is {@link dogChargeUnverifiedResult}, because "your card was
+ * declined, try another" while money may be moving is the reachable double
+ * charge this whole taxonomy exists to prevent.
+ *
+ * **`blocker` is optional, and omitting it is a real answer** (ADDENDUM 1 R5,
+ * 2026-08-20). Two arms reach `charge_failed` with no cause to name: a hold
+ * someone ELSE released (retrieved `canceled` — the card was never asked) and
+ * an adopted `succeeded` intent whose money is already recorded against an
+ * earlier request. Reporting `declined` for either tells an owner their card
+ * failed when it never did, sends them to change a working card, and is the
+ * same category error wire 1.9.0 was cut to fix. The wire types
+ * `charge_blocker` optional precisely so "we are not going to guess" is
+ * expressible.
+ */
+export function dogChargeFailedResult(
+  dogId: string,
+  blocker?: Exclude<ChargeBlocker, 'processing'>,
+): EnrollmentDogResultWire {
+  return {
+    dog_id: dogId,
+    enrolled: false,
+    reason: 'charge_failed',
+    ...(blocker !== undefined ? { charge_blocker: blocker } : {}),
+  };
+}
+
+/**
+ * The authorization is still verifying. Under manual capture this sentence is
+ * simply true and it is the one the automatic-capture protocol could not say:
+ * an authorization holds NO captured money and cannot capture itself, so
+ * nothing will be charged, the hold expires on its own, and the owner may
+ * retry shortly. No cancel is attempted on it — a `processing` intent is
+ * precisely the one Stripe will not let us cancel.
+ *
+ * **`verifyKey` is REQUIRED, and that is the point (ADDENDUM 3 §A3.14).** This
+ * is the one refusal that leaves a LIVE, non-terminal intent for this dog, and
+ * `verify_key` is the client key under which that intent EXECUTED — this
+ * request's own key when the mint happened now, or the carried `retry_of` when
+ * a re-verify found it still `processing`. An auto-retry client echoes it back
+ * as `retry_of`, which is what keeps at most one live hold per dog across a
+ * retry chain.
+ *
+ * The parameter is required rather than optional because the fact is only
+ * knowable server-side and the client cannot infer it: a FRESH mint whose own
+ * intent goes `processing` is reported `charge_unverified` byte-identically to
+ * a no-mint still-processing re-verify, and carrying the wrong key forward
+ * re-verifies a DEAD intent and mints beside a live one — the double-hold the
+ * retry rule exists to prevent. A caller that had to remember to pass it would
+ * eventually not.
+ */
+export function dogChargeUnverifiedResult(
+  dogId: string,
+  verifyKey: string,
+): EnrollmentDogResultWire {
+  return {
+    dog_id: dogId,
+    enrolled: false,
+    reason: 'charge_unverified',
+    verify_key: verifyKey,
+  };
+}
+
+/**
+ * The dog is in. `payment_state` is money truth, not celebration: `'paid'`
+ * only once the capture returned, `'pending'` while a capture is still being
+ * completed by the reconciler, `'pay-later'` for an open invoice. A `'pending'`
+ * dog is excluded from `total_captured_cents` — the sheet must never announce
+ * money that has not moved.
+ */
+export function dogEnrolledResult(
+  dogId: string,
+  paymentState: 'paid' | 'pay-later' | 'pending',
+  amountCents: number,
+): EnrollmentDogResultWire {
+  return {
+    dog_id: dogId,
+    enrolled: true,
+    payment_state: paymentState,
+    amount_cents: amountCents,
+  };
 }
 
 /**

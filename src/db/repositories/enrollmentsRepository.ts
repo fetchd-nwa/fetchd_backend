@@ -9,11 +9,22 @@ import { db } from '../client.js';
  * state and the first-session instant (drives the "can still withdraw" guard,
  * which the withdraw verb re-checks authoritatively under the cohort lock).
  *
- * Payment state is derived per (cohort, dog): a succeeded `charges` row →
- * `paid` (pay-now, or a pay-later that already auto-charged); else an open
- * `invoices` row → `pay-later` (card-backed, auto-charges at due_at); else
- * `pending` (an async/3DS charge not yet settled — rare). The enrollment
- * itself is the live, non-cancelled group-class bookings.
+ * Payment state is derived per ENROLLMENT: a succeeded `charges` row
+ * **belonging to this enrollment** → `paid` (pay-now, or a pay-later that
+ * already auto-charged); else an open `invoices` row → `pay-later`
+ * (card-backed, auto-charges at due_at); else `pending` (an async/3DS charge
+ * not yet settled — rare). The enrollment itself is the live, non-cancelled
+ * group-class bookings.
+ *
+ * **"Belonging to this enrollment" is the correction of 2026-08-22**
+ * (ADDENDUM 3 §A3.17). It used to mean ANY succeeded charge for the (cohort,
+ * dog) — not even remainder-checked — and a (cohort, dog) is not an
+ * enrollment: withdraw + re-enroll mints a second one under the same key, so a
+ * re-enrolled dog resting on an uncaptured hold showed `paid` off the previous
+ * enrollment's money. The enum values and the wire shape are unchanged; what
+ * changed is that the documented meaning became true. (Remainder-awareness —
+ * `paid` for a live enrollment refunded out of band — stays OUT of scope:
+ * portal surface, Adjudication 8.)
  */
 
 export type EnrollmentPaymentStatus = 'paid' | 'pay-later' | 'pending';
@@ -69,6 +80,33 @@ export const enrollmentsRepository = {
             SELECT 1 FROM charges ch
             WHERE ch.cohort_id = b.cohort_id AND ch.dog_id = b.lead_dog_id
               AND ch.status = 'succeeded'
+              -- The enrollment-membership rule (ADDENDUM 3 §A3.17), in SQL:
+              -- the charge's ANCHOR is one of THIS enrollment's live rows, or
+              -- (legacy, NULL anchor) it was minted at or after this
+              -- enrollment's birth. Without it, a re-enrolled dog whose money
+              -- is an uncaptured hold read 'paid' off the PREVIOUS
+              -- enrollment's charge — and mobile branches its withdraw
+              -- confirm-dialog money sentence on this field.
+              AND (
+                EXISTS (
+                  SELECT 1 FROM bookings anchor
+                  WHERE anchor.id = ch.booking_id
+                    AND anchor.cohort_id = b.cohort_id
+                    AND anchor.lead_dog_id = b.lead_dog_id
+                    AND anchor.status <> 'cancelled'
+                    AND anchor.expired_at IS NULL
+                )
+                OR (
+                  ch.booking_id IS NULL
+                  AND ch.created_at >= (
+                    SELECT min(born.created_at) FROM bookings born
+                    WHERE born.cohort_id = b.cohort_id
+                      AND born.lead_dog_id = b.lead_dog_id
+                      AND born.status <> 'cancelled'
+                      AND born.expired_at IS NULL
+                  )
+                )
+              )
           ) THEN 'paid'
           WHEN EXISTS (
             SELECT 1 FROM invoices iv

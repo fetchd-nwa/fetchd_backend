@@ -462,8 +462,13 @@ test(
       sweeper.calls.find((c) => c.method === 'createRefund')?.idempotencyKey,
       `${requestKey}:refund`,
     );
-    await db.delete(bookingsTable).where(eq(bookingsTable.cohortId, cohortId));
+    // `cleanup()` FIRST: since §A3.17 a group-class charge carries its
+    // enrollment's anchor in `charges.booking_id`, and that FK has no
+    // `ON DELETE`, so dropping the bookings while their charge is still on
+    // disk raises 23503. Same order the fixture teardown already uses
+    // (`_fixture.ts` — charges, then bookings).
     await cleanup();
+    await db.delete(bookingsTable).where(eq(bookingsTable.cohortId, cohortId));
   },
 );
 

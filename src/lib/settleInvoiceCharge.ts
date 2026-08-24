@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
 import { deepLinkToPath } from '../contracts/wire.js';
+import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
@@ -71,6 +71,17 @@ export interface SettleInvoiceChargeArgs {
    * (see `grantMembershipMonth`). Defaults to wall clock; workers/tests pass
    * their pinned `now`. */
   now?: Date;
+  /**
+   * Where the NULL-anchor fallback's WARN goes (§A3.19 F2). Optional because
+   * not every caller has a logger in scope, but a caller that omits it makes
+   * the tripwire silent — plumb it.
+   */
+  log?: AnchorResolutionLog;
+}
+
+/** The one thing the anchor fallback needs from a logger. */
+export interface AnchorResolutionLog {
+  warn(obj: Record<string, unknown>, msg: string): void;
 }
 
 /**
@@ -113,89 +124,210 @@ export async function settleInvoiceCharge(
     status: 'succeeded',
     purpose,
     stripePaymentIntentId: paymentIntentId,
-    bookingId: invoice.bookingId,
+    // The invoice's OWN enrollment anchor (§A3.18 D1), with the §A3.19 F2
+    // fallback behind it for invoices that carry none.
+    bookingId: await resolveInvoiceAnchorBookingId(tx, invoice, args.log),
     // Carry the enrollment identity so a later group-class withdraw can find +
     // refund this dog's payment (mirrors both prior settle paths).
     cohortId: invoice.cohortId,
     dogId: invoice.dogId,
   });
 
-  const flipped = await invoicesRepository.markPaid(tx, {
-    id: invoice.id,
-    paidChargeId: charge.id,
+  const claimed = await claimInvoiceWithCharge(tx, {
+    invoice,
+    chargeId: charge.id,
+    amountCents,
+    purpose,
+    notifyOwner,
+    now,
   });
-
-  if (flipped > 0) {
-    // The invoice is settled — any pending pay-in-person reminder ("bring $… at
-    // drop-off") is now stale money-already-collected noise. Tear it down in the
-    // settle tx (D4's in-tx reminder-teardown precedent). A no-op for a plain
-    // card invoice (no `payment-due:` row was ever enqueued).
-    await scheduledNotificationsRepository.cancelPendingByDedupePrefix(
-      tx,
-      `payment-due:${invoice.id}`,
-    );
-    if (invoice.purpose === 'membership' && invoice.membershipId !== null) {
-      await grantMembershipMonth(tx, { invoice, chargeId: charge.id, now });
-    }
-    if (notifyOwner) {
-      await notificationsRepository.enqueue(tx, {
-        ownerId: invoice.ownerId,
-        type: 'payment-succeeded',
-        title: 'Payment received',
-        body: `We charged your card ${formatDollars(amountCents)} for your ${purposeLabel(
-          purpose,
-        )}.`,
-        deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
-        deepLinkKind: 'invoice',
-        deepLinkId: invoice.id,
-        dogIds: invoice.dogId ? [invoice.dogId] : [],
-      });
-    }
-    return { outcome: 'settled', chargeId: charge.id };
-  }
+  if (claimed) return { outcome: 'settled', chargeId: charge.id };
 
   // Lost the race: the invoice was already settled by the other path. This
-  // charge double-bills the same money -> refund it. Idempotency-guarded
-  // (`sumNonFailedForCharge`) exactly as cancelBookingService's money-back
-  // branch: a re-run that finds the full amount already pending-refunded
-  // computes `maxRefund <= 0` and creates no second refund row.
-  const alreadyRefunded = await refundsRepository.sumNonFailedForCharge(tx, charge.id);
-  const maxRefund = amountCents - alreadyRefunded;
-  if (maxRefund <= 0) {
-    return { outcome: 'refunded', chargeId: charge.id, pendingStripeRefund: undefined };
-  }
-
-  // The row's uuid is minted APP-SIDE here, not by the DB default, because this
-  // lane's Stripe key is derived from it — the key has to exist before the
-  // INSERT that stores it, and only the caller can break that circle. Storing
-  // it converges this lane on the same one honest claim predicate as every
-  // other writer instead of leaving `reason` to carry the meaning (design §2.1).
-  const refundId = randomUUID();
-  const refund = await refundsRepository.createPending(tx, {
-    id: refundId,
-    ownerId: invoice.ownerId,
+  // charge double-bills the same money -> refund it.
+  //
+  // **This arm also serves the VOIDED invoice** — a withdraw voids the invoice
+  // while its PaymentIntent is still settling, and the webhook lands minutes
+  // later (`stripeEventHandlers.ts` — "invoice void (withdrawn before the
+  // charge resolved) → same lost-race arm"). `markPaid` filters
+  // `status = 'open'`, so a void invoice yields `flipped = 0` and arrives here.
+  // The money MOVED, so the ledger row is written and this returns it. That is
+  // the whole return path for §A3.18 D1's dead money, and it already existed.
+  //
+  // Capped and idempotency-guarded through the one shared helper (§A3.18 D2):
+  // it locks the charge row, sums the non-failed refunds and mints at most the
+  // remainder, so a re-run that finds the full amount already pending-refunded
+  // creates no second row — exactly as cancelBookingService's money-back branch
+  // does, through the same function. The charge was INSERTed by this same
+  // transaction, so the lock is already ours and costs nothing here; the
+  // uniformity is the point, because open-coding lock-sum-cap-mint at each of
+  // six legs is how the seventh forgets the lock.
+  //
+  // The row's uuid is minted app-side inside the helper, because this lane's
+  // Stripe key is derived from it — the key has to exist before the INSERT that
+  // stores it. Storing it converges this lane on the same one honest claim
+  // predicate as every other writer instead of leaving `reason` to carry the
+  // meaning (design §2.1).
+  const minted = await refundsRepository.mintCappedPendingRefund(tx, {
     chargeId: charge.id,
+    ownerId: invoice.ownerId,
     bookingId: invoice.bookingId,
-    amountCents: maxRefund,
     // Load-bearing since 2026-08-12: this exact string is what the
     // `duplicate-refund-retry` sweep's LEGACY lane claims on, because it means
     // "this row's Stripe key is `duplicateRefundIdempotencyKey(row.id)`". Rows
     // minted from here on also carry that key in the column above, so the
     // legacy lane matters only for rows already on disk.
     reason: ROW_KEYED_REFUND_REASON,
-    stripeIdempotencyKey: duplicateRefundIdempotencyKey(refundId),
+    stripeIdempotencyKey: duplicateRefundIdempotencyKey,
   });
+  if (minted.kind !== 'minted') {
+    return { outcome: 'refunded', chargeId: charge.id, pendingStripeRefund: undefined };
+  }
 
   return {
     outcome: 'refunded',
     chargeId: charge.id,
     pendingStripeRefund: {
-      refundId: refund.id,
+      refundId: minted.refundId,
       paymentIntentId,
-      amountCents: maxRefund,
-      stripeIdempotencyKey: duplicateRefundIdempotencyKey(refund.id),
+      amountCents: minted.amountCents,
+      stripeIdempotencyKey: minted.stripeIdempotencyKey,
     },
   };
+}
+
+/**
+ * What `charges.booking_id` must be for a charge settling this invoice.
+ *
+ * Normally: the invoice's own stamp, copied. A group-class invoice is minted
+ * inside the enroll tx that created its bookings (§A3.18 D1), so it names the
+ * enrollment this money was actually for — even when that enrollment was
+ * withdrawn minutes ago and this settle is the late webhook landing.
+ *
+ * **When the invoice carries NO anchor, resolve it by same-transaction
+ * equality** (§A3.19 F2). §A3.18 claimed no post-deploy path could mint a NULL
+ * anchor; two doors kept producing them, both executed:
+ *
+ *   · a group-class invoice minted BEFORE the stamp existed — a population
+ *     that drains on `due_at` horizons measured in WEEKS, not a deploy-second;
+ *   · `invoices.booking_id` is `ON DELETE SET NULL`, so an ops script that
+ *     hard-deletes an anchor row silently orphans the invoice. (§A3.18's ops
+ *     warning covered only the charges-side FK, which THROWS — the loud
+ *     direction; this side is silent, and silence is what re-opens a money
+ *     defect.)
+ *
+ * Copying NULL is NOT neutral: the charge is minted NOW, so the legacy time
+ * rule (`created_at >= bornAt`) hands it to whatever enrollment is live at
+ * settle time — precisely the adjudicated-BLOCKER shape. The witness
+ * (`bookings.created_at = invoices.issued_at`) is exact, so it names the right
+ * enrollment's rows whatever their status.
+ *
+ * **This readmits §A3.18.9.2 deliberately, and only here.** That rejection's
+ * reasoning was "reconstruction where a stamp EXISTS"; for these rows no stamp
+ * exists, and the same honest-inference rationale that licenses the legacy time
+ * rule licenses this narrower, EXACT inference. For stamped rows the rejection
+ * stands untouched — this function returns the stamp without looking.
+ *
+ * Every firing WARNs: expected while the legacy population drains, notable
+ * afterwards. A miss mints NULL and WARNs louder, with the legacy time rule
+ * still behind it as the net.
+ */
+export async function resolveInvoiceAnchorBookingId(
+  tx: Tx,
+  invoice: Pick<InvoiceRow, 'id' | 'purpose' | 'bookingId' | 'cohortId' | 'dogId'>,
+  log?: AnchorResolutionLog,
+): Promise<string | null> {
+  if (invoice.purpose !== 'group-class' || invoice.cohortId === null || invoice.dogId === null) {
+    return invoice.bookingId;
+  }
+  if (invoice.bookingId !== null) return invoice.bookingId;
+
+  const resolved = await bookingsRepository.findAnchorByInvoiceIssuedAt(tx, {
+    invoiceId: invoice.id,
+    cohortId: invoice.cohortId,
+    dogId: invoice.dogId,
+  });
+  if (resolved === undefined) {
+    log?.warn(
+      { invoiceId: invoice.id, cohortId: invoice.cohortId, dogId: invoice.dogId },
+      'group-class invoice has NO enrollment anchor and none could be proven: no booking row shares its transaction instant, so this charge is minted UNANCHORED and the legacy time rule will attribute it by timestamp — check whether this money belongs to the enrollment that is live now',
+    );
+    return null;
+  }
+  log?.warn(
+    {
+      invoiceId: invoice.id,
+      cohortId: invoice.cohortId,
+      dogId: invoice.dogId,
+      resolvedBookingId: resolved,
+    },
+    'group-class invoice carried no enrollment anchor; resolved it from the booking rows written in the same transaction (expected while pre-stamp invoices drain, worth investigating afterwards)',
+  );
+  return resolved;
+}
+
+/**
+ * **The settle-half**: claim the invoice for a charge that already exists, and
+ * do everything winning that claim implies.
+ *
+ * Factored out for §A3.19 F1, which gave the capture reconciler a reason to
+ * settle an invoice: a `requires_payment` group-class charge whose intent
+ * succeeded, covering a LIVE enrollment whose money is an OPEN invoice, is not
+ * surplus — it is that invoice's own payment, arrived late. Two callers now
+ * share ONE implementation of "the invoice is settled", so the receipt, the
+ * reminder teardown and the membership grant cannot be present on one path and
+ * forgotten on the other.
+ *
+ * The `markPaid` claim is the atomic arbiter, unchanged: it filters
+ * `status = 'open'`, so the UPDATE row count IS the claim (R11's guard), and a
+ * caller that loses it must decide what its charge is instead.
+ *
+ * Returns `true` iff THIS call won.
+ */
+export async function claimInvoiceWithCharge(
+  tx: Tx,
+  args: {
+    invoice: InvoiceRow;
+    chargeId: string;
+    amountCents: number;
+    purpose: ChargePurpose;
+    notifyOwner: boolean;
+    now?: Date;
+  },
+): Promise<boolean> {
+  const { invoice, chargeId, amountCents, purpose, notifyOwner } = args;
+  const flipped = await invoicesRepository.markPaid(tx, {
+    id: invoice.id,
+    paidChargeId: chargeId,
+  });
+  if (flipped === 0) return false;
+
+  // The invoice is settled — any pending pay-in-person reminder ("bring $… at
+  // drop-off") is now stale money-already-collected noise. Tear it down in the
+  // settle tx (D4's in-tx reminder-teardown precedent). A no-op for a plain
+  // card invoice (no `payment-due:` row was ever enqueued).
+  await scheduledNotificationsRepository.cancelPendingByDedupePrefix(
+    tx,
+    `payment-due:${invoice.id}`,
+  );
+  if (invoice.purpose === 'membership' && invoice.membershipId !== null) {
+    await grantMembershipMonth(tx, { invoice, chargeId, now: args.now ?? new Date() });
+  }
+  if (notifyOwner) {
+    await notificationsRepository.enqueue(tx, {
+      ownerId: invoice.ownerId,
+      type: 'payment-succeeded',
+      title: 'Payment received',
+      body: `We charged your card ${formatDollars(amountCents)} for your ${purposeLabel(
+        purpose,
+      )}.`,
+      deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
+      deepLinkKind: 'invoice',
+      deepLinkId: invoice.id,
+      dogIds: invoice.dogId ? [invoice.dogId] : [],
+    });
+  }
+  return true;
 }
 
 /**

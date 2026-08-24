@@ -373,11 +373,20 @@ export function registerRequestConfirmPaymentRoute(
         // AFTER a succeeded confirm — a concurrent different-key confirm
         // converts the request first and the state check at the top of the tx
         // 409s — and without this the owner is charged for a booking that does
-        // not exist, with no charges row for anyone to find it by. Same guard,
-        // same shape, same reasoning as the group-class enroll unwind
-        // (`enrollments.ts` → `unwindCapturedIntents`): refund best-effort, log
-        // loudly if even that fails, and re-raise the ORIGINAL error so the
-        // owner still gets the right 4xx rather than a refund's failure.
+        // not exist, with no charges row for anyone to find it by. Refund
+        // best-effort, log loudly if even that fails, and re-raise the ORIGINAL
+        // error so the owner still gets the right 4xx rather than a refund's
+        // failure.
+        //
+        // **This site no longer has a sibling to mirror (2026-08-20).** It used
+        // to name `enrollments.ts` → `unwindCapturedIntents` as its precedent;
+        // that function is DELETED. `POST /enrollments` pay-now converted to
+        // manual capture (wire 1.11.0), so its failure paths release a HOLD
+        // (`cancelPaymentIntent`) and never refund a capture at all — the whole
+        // class of unwind this mirrored stopped existing there. Until this route
+        // converts too, the refund below is still the only correct move here:
+        // money really was captured before the tx, so there really is something
+        // to give back.
         //
         // ONE exception, identical to the enroll site: we lost the idempotency
         // claim race. `idempotency_inflight` means another request with this same
@@ -391,8 +400,11 @@ export function registerRequestConfirmPaymentRoute(
         //
         // Scope note: this closes that one interleaving, not the capture-before-tx
         // class — a same-key retry after a transient failure can still re-confirm
-        // an already-refunded intent (`enrollments.ts` → `unwindCapturedIntents`
-        // carries the standing residual note; manual-capture is the real fix).
+        // an already-refunded intent. Manual capture is the real fix, and
+        // `POST /enrollments` is the site that took it (2026-08-20): under
+        // authorize → commit → capture there is no captured money to unwind, so
+        // that residual cannot arise there at all. `lib/enrollmentPartial.ts` is
+        // the shape to copy when this route converts — not the refund below.
         if (capture !== undefined && !isIdempotencyInflight(err)) {
           try {
             await stripe.createRefund(

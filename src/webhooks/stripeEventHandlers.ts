@@ -11,7 +11,11 @@ import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.
 import { formatDollars } from '../lib/invoiceReceiptCopy.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { invoiceChargeAttemptsRepository } from '../db/repositories/invoiceChargeAttemptsRepository.js';
-import { settleInvoiceCharge, type PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
+import {
+  settleInvoiceCharge,
+  type AnchorResolutionLog,
+  type PendingDuplicateRefund,
+} from '../lib/settleInvoiceCharge.js';
 import { autoChargeParkNotification } from '../lib/autoChargeNotificationCopy.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
@@ -43,6 +47,14 @@ export const WEBHOOK_ACTOR = 'system:stripe-webhook';
 
 export interface WebhookHandlerOpts {
   stripe: StripeClient;
+  /**
+   * Where the §A3.19 F2 anchor-fallback WARN goes. Optional so existing callers
+   * compile, but THIS lane is the one that matters most for it: the late
+   * settle of a voided invoice is a webhook, and the pre-stamp invoice
+   * population it fires for drains over weeks. A caller that omits it makes
+   * the tripwire silent.
+   */
+  log?: AnchorResolutionLog;
 }
 
 export interface WebhookHandlerResult {
@@ -113,7 +125,7 @@ export async function dispatchStripeEvent(
 ): Promise<WebhookHandlerResult> {
   switch (event.type) {
     case 'payment_intent.succeeded':
-      return handlePaymentIntentSucceeded(event);
+      return handlePaymentIntentSucceeded(event, opts);
     case 'payment_intent.payment_failed':
       return handlePaymentIntentFailed(event);
     case 'setup_intent.succeeded':
@@ -140,6 +152,7 @@ export async function dispatchStripeEvent(
 
 async function handlePaymentIntentSucceeded(
   event: StripeWebhookEvent & { type: 'payment_intent.succeeded' },
+  opts: WebhookHandlerOpts,
 ): Promise<WebhookHandlerResult> {
   return withActor(WEBHOOK_ACTOR, async (tx) => {
     const charge = await chargesRepository.findByStripePaymentIntentId(tx, event.paymentIntentId);
@@ -165,6 +178,7 @@ async function handlePaymentIntentSucceeded(
         paymentIntentId: event.paymentIntentId,
         amountCents: event.amountCents,
         metadata: event.metadata,
+        ...(opts.log !== undefined ? { log: opts.log } : {}),
       });
       if (invoiceOrphan !== undefined) return invoiceOrphan;
 
@@ -269,7 +283,12 @@ function metadataAttemptNo(metadata: Record<string, string>): number | undefined
  */
 async function maybeSettleOrphanedInvoiceCharge(
   tx: Tx,
-  args: { paymentIntentId: string; amountCents: number; metadata: Record<string, string> },
+  args: {
+    paymentIntentId: string;
+    amountCents: number;
+    metadata: Record<string, string>;
+    log?: AnchorResolutionLog;
+  },
 ): Promise<WebhookHandlerResult | undefined> {
   const invoiceId = metadataString(args.metadata, 'invoice_id');
   const ownerId = metadataString(args.metadata, 'owner_id');
@@ -302,6 +321,7 @@ async function maybeSettleOrphanedInvoiceCharge(
     // what makes the unconfirmed push's promise ("if it went through you'll
     // get a receipt") mechanically true rather than aspirational.
     notifyOwner: true,
+    ...(args.log !== undefined ? { log: args.log } : {}),
   });
 
   // Close the attempt row this PI belongs to, when there is one. A pre-deploy

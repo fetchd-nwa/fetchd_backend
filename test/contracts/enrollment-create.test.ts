@@ -1000,16 +1000,20 @@ test(
 );
 
 // ──────────────────────────────────────────────────────────────────────────
-// Money is never stranded (Δ 2026-07-18) — pay-now captures the card BEFORE
-// the enroll tx, so any post-charge failure must unwind the captured money.
+// Money is never stranded (Δ 2026-07-18; converted to manual capture
+// 2026-08-20). Pay-now now AUTHORIZES each dog's card before the enroll tx and
+// captures after it commits, so a post-authorize failure releases HOLDS —
+// there is nothing captured to refund. These tests changed their verb, not
+// their subject: the money must still end up untouched, and the assertions
+// below are what proves it.
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /enrollments — pay-now into a FULL cohort → 422 cohort_full AND every captured card is refunded (no stranded money, no bookings, no charge rows)',
+  'POST /enrollments — pay-now into a FULL cohort → 422 cohort_full AND every hold is RELEASED (never captured, so never refunded)',
   SKIP_WHEN_NO_DB,
   async () => {
     // capacity 1, two dogs → filled(0)+requested(2) > 1 → cohort_full IN the tx,
-    // AFTER both cards already charged pre-tx. Both must be refunded.
+    // AFTER both cards are already authorized. Both holds must be released.
     const cohort = await makeCohort({ classKey: 'puppy', capacity: 1, filled: 0, weeks: 4 });
     const { app, stripe } = enrollApp();
     const res = await postEnrollment({
@@ -1024,16 +1028,29 @@ test(
     assert.equal(res.statusCode, 422);
     assert.equal((res.json() as { error: { code: string } }).error.code, 'cohort_full');
 
-    // Both cards were charged pre-tx, then BOTH refunded when the tx rolled back.
+    // Both cards were AUTHORIZED pre-tx, then both holds released when the tx
+    // rolled back. The refund count is the load-bearing zero: under manual
+    // capture nothing was ever taken, so a refund here would mean this route
+    // had captured money it had no enrollment for (Δ 2026-08-20).
     assert.equal(
       stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
       2,
-      'both dogs charged pre-tx',
+      'both dogs authorized pre-tx',
+    );
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length,
+      2,
+      'both holds released — money is not stranded',
     );
     assert.equal(
       stripe.calls.filter((c) => c.method === 'createRefund').length,
-      2,
-      'both captured charges refunded — money is not stranded',
+      0,
+      'nothing was captured, so nothing is refunded — refunds belong to the withdraw arm alone',
+    );
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'capturePaymentIntent').length,
+      0,
+      'a request that never committed must never capture',
     );
 
     // The tx rolled back cleanly: no bookings, no charge rows.
@@ -1218,14 +1235,30 @@ test(
       'the in-flight dog outranks the declined one — "try a different card" here is a double charge',
     );
 
-    // Both dogs were charged, both intents unwound, nothing enrolled.
+    // Both dogs were authorized; nothing enrolled; nothing captured.
     assert.equal(
       stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
       2,
       'one intent per dog',
     );
-    assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 2);
+    // Δ 2026-08-20: ONE cancel, not two. The declined dog's intent is released
+    // as before; the `processing` one is deliberately left alone. Under
+    // automatic capture that cancel was mandatory and impossible at the same
+    // time — a `processing` intent is precisely the kind Stripe refuses to
+    // cancel, which is why the old unwind's failure arm was a
+    // `log.fatal('STRANDED MONEY')`. Under manual capture the same intent
+    // holds no captured money and cannot capture itself: it resolves to
+    // `requires_capture` and expires. Not calling a verb that was guaranteed
+    // to fail is the fix, not a regression.
+    const cancelled = stripe.calls.filter((c) => c.method === 'cancelPaymentIntent');
+    assert.equal(cancelled.length, 1, 'the declined dog’s intent is released');
+    const processingIntentId = stripe.calls
+      .filter((c) => c.method === 'createAndConfirmPaymentIntent')
+      .map((c) => c.idempotencyKey)
+      .find((k) => k.endsWith(`:dog:${FIXTURE_IDS.dog2Id}`));
+    assert.ok(processingIntentId, 'dog2 was authorized under its own per-dog key');
     assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 0);
+    assert.equal(stripe.calls.filter((c) => c.method === 'capturePaymentIntent').length, 0);
     const bookingRows = await db
       .select({ id: bookingsTable.id })
       .from(bookingsTable)
@@ -1495,7 +1528,7 @@ test(
 );
 
 test(
-  'POST /enrollments — the inflight exclusion did not widen: a NON-inflight in-tx failure after capture (already_enrolled) still refunds',
+  'POST /enrollments — the inflight exclusion did not widen: a NON-inflight in-tx failure (already_enrolled) still releases the hold',
   SKIP_WHEN_NO_DB,
   async () => {
     const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
@@ -1521,12 +1554,126 @@ test(
     assert.equal(
       stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
       1,
-      'the card was captured pre-tx',
+      'the card was authorized pre-tx',
+    );
+    assert.equal(
+      stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length,
+      1,
+      'every error that is NOT idempotency_inflight still releases what it holds',
     );
     assert.equal(
       stripe.calls.filter((c) => c.method === 'createRefund').length,
-      1,
-      'every error that is NOT idempotency_inflight still unwinds',
+      0,
+      'Δ 2026-08-20 — the unwind is a RELEASE now; a refund here would mean money had been captured for an enrollment that never committed',
+    );
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// R5 on the OLD response shape (round-2 panel, 2026-08-20)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'POST /enrollments — a blockerless refusal reports payment_failed with NO charge_blocker, and still refuses the whole request',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // RED against the round-1-fixed build: `details.charge_blocker` came back
+    // `'declined'`. ADDENDUM 1 R5 ("never invent a blocker") was applied to
+    // the `allow_partial` envelope only; this path kept a
+    // `failure.charge_blocker ?? 'declined'` default at the one-slot report,
+    // so a hold someone ELSE released — the card was never asked, nobody
+    // declined anything — told the owner their card was declined and sent
+    // them to the card picker. `charge_blocker` is optional on this shape
+    // (`wire.ts:723`), and absent is the honest answer.
+    //
+    // The default was load-bearing for CONTROL FLOW, not just for copy: with
+    // it removed naively the report is `undefined`, the 402 is skipped, and
+    // the dog walks into the enroll transaction with no hold and hits
+    // `unreachable: dog ... reached the enroll tx with no authorization`. So
+    // the second half of this test is the throw, not the copy.
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    const key = `enr-blockerless-${randomUUID()}`;
+    // The canonical producer of a retrieved `canceled`: a same-key sibling's
+    // failure path, or Stripe's own expiry of the hold.
+    stripe.setIntentOutcomeForKey(`${key}:dog:${FIXTURE_IDS.dog1Id}`, {
+      kind: 'status',
+      status: 'canceled',
+    });
+
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: key,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: false },
+    });
+
+    assert.equal(res.statusCode, 402, res.body);
+    const body = res.json() as {
+      error: { code: string; details: Record<string, unknown> };
+    };
+    assert.equal(body.error.code, 'payment_failed');
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(body.error.details, 'charge_blocker'),
+      false,
+      'the field is OMITTED, not null and not defaulted — we do not know why the charge did not complete and we do not guess',
+    );
+    assert.equal(body.error.details.kind, 'payment_failed', 'the rest of the detail is unchanged');
+
+    // Control flow: the request was REFUSED, which is the half the `?? declined`
+    // default was silently carrying.
+    const bookingRows = await db
+      .select({ id: bookingsTable.id })
+      .from(bookingsTable)
+      .where(eq(bookingsTable.cohortId, cohort.id));
+    assert.equal(bookingRows.length, 0, 'no dog enrolled');
+    const chargeRows = await db
+      .select({ id: chargesTable.id })
+      .from(chargesTable)
+      .where(eq(chargesTable.cohortId, cohort.id));
+    assert.equal(chargeRows.length, 0, 'and no charge row was written');
+    const [cohortRow] = await db
+      .select({ filled: cohortsTable.filled })
+      .from(cohortsTable)
+      .where(eq(cohortsTable.id, cohort.id));
+    assert.equal(cohortRow?.filled, 0, 'and no seat was taken');
+  },
+);
+
+test(
+  'POST /enrollments — a NAMED blocker still wins the one slot over a blockerless dog',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The other half of dropping the default: a blockerless failure must
+    // contribute a FAILURE without contributing a CAUSE. If it ranked as a
+    // cause, the set below would report nothing at all and the owner would be
+    // told a card declined with no reason, having actually had one declined.
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app, stripe } = enrollApp();
+    const key = `enr-blockerless-mixed-${randomUUID()}`;
+    // dog1 sorts first (the stable order walks sorted ids), so the blockerless
+    // dog is seen BEFORE the declined one — the tie-break cannot hide the bug.
+    const [firstDog, secondDog] = [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id].sort();
+    stripe.setIntentOutcomeForKey(`${key}:dog:${firstDog}`, {
+      kind: 'status',
+      status: 'canceled',
+    });
+    stripe.setIntentOutcomeForKey(`${key}:dog:${secondDog}`, {
+      kind: 'recorded',
+      scenario: 'saved-card-declined',
+    });
+
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: key,
+      payload: { cohort_id: cohort.id, dog_ids: [firstDog, secondDog], pay_later: false },
+    });
+
+    assert.equal(res.statusCode, 402, res.body);
+    const body = res.json() as { error: { details: { charge_blocker?: string } } };
+    assert.equal(
+      body.error.details.charge_blocker,
+      'declined',
+      'the dog that really was declined names the blocker; the blockerless one contributes a failure and no cause',
     );
   },
 );

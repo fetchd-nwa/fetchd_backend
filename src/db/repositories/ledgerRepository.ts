@@ -1,4 +1,4 @@
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, ne } from 'drizzle-orm';
 import { db } from '../client.js';
 import { bookings, charges, creditLedger, invoices, paymentMethods } from '../schema/schema.js';
 import type { ChargePurpose, ChargeStatus } from './chargesRepository.js';
@@ -128,7 +128,23 @@ export const ledgerRepository = {
         cardLast4: paymentMethods.last4,
       })
       .from(charges)
-      .leftJoin(bookings, eq(bookings.id, charges.bookingId))
+      // **Booking-lane rows only, and the exclusion is deliberate** (ADDENDUM 3
+      // §A3.17, 2026-08-22). A group-class charge now carries an ANCHOR in
+      // `booking_id` — the enrollment's first session — so that the money reads
+      // can tell one enrollment's charge from a previous one's. That column is
+      // NOT a booking-lane link for these rows: an enrollment is `weeks` rows
+      // and the anchor is one arbitrary member of them, so joining it here
+      // would attach a ledger line to a single week and start emitting a
+      // `dog_id` this surface has never carried for group-class money. Keeping
+      // them unjoined preserves today's output byte for byte — §A3.17 rules the
+      // old-client blast ZERO — and the purpose-derived `category` fallback
+      // below, which the comment above already describes as existing for
+      // "a group-class charge spanning multiple bookings", stays the one that
+      // answers for them.
+      .leftJoin(
+        bookings,
+        and(eq(bookings.id, charges.bookingId), ne(charges.purpose, 'group-class')),
+      )
       .leftJoin(creditLedger, eq(creditLedger.chargeId, charges.id))
       .leftJoin(invoices, eq(invoices.paidChargeId, charges.id))
       .leftJoin(paymentMethods, eq(paymentMethods.id, invoices.paymentMethodId))
@@ -175,7 +191,19 @@ export const ledgerRepository = {
         paymentExpected: invoices.paymentExpected,
       })
       .from(invoices)
-      .leftJoin(bookings, eq(bookings.id, invoices.bookingId))
+      // The MIRROR of the charge branch's exclusion above (§A3.18 D1.3). Since
+      // §A3.18 a group-class invoice carries its enrollment's ANCHOR in
+      // `booking_id` so a late settle can file its charge under the enrollment
+      // it was actually for. That column is not a booking-lane link for these
+      // rows — an enrollment is `weeks` rows and the anchor is one member —
+      // so joining it here would attach a ledger line to a single week and
+      // start emitting a `dog_id` this surface has never carried for
+      // group-class money. Excluded, so the output stays byte-identical and the
+      // purpose-derived `category` fallback keeps answering for them.
+      .leftJoin(
+        bookings,
+        and(eq(bookings.id, invoices.bookingId), ne(invoices.purpose, 'group-class')),
+      )
       .where(and(eq(invoices.ownerId, ownerId), eq(invoices.status, 'open')));
 
     const invoiceEntries: LedgerEntryRow[] = invoiceRows.map((row) => {

@@ -53,6 +53,13 @@ import type {
  *   - `throwOnDetach()` — next `detachPaymentMethod` rejects
  *   - `throwOnRefund()` — next `createRefund` rejects
  *   - `throwOnCancel()` — next `cancelPaymentIntent` rejects
+ *   - `captureBeforeCancel()` — next `cancelPaymentIntent` finds the intent
+ *     already captured (the cancel-vs-capture race, ADDENDUM 3 §A3.9)
+ *
+ * `cancelPaymentIntent` models Stripe's REFUSALS since 2026-08-21: it moves a
+ * cancellable intent to `canceled` and THROWS on `succeeded` / `processing` /
+ * already-`canceled`. Two callers now read a cancel's throw as evidence about
+ * who won a race, so a cancel that never refuses would prove nothing.
  *
  * All Stripe-facing calls are recorded as discriminated-union entries in
  * `calls`; tests can `.filter(c => c.method === 'createRefund')` to assert
@@ -99,6 +106,11 @@ export type StripeStubCall =
       idempotencyKey: null;
     }
   | {
+      method: 'capturePaymentIntent';
+      args: { paymentIntentId: string };
+      idempotencyKey: string;
+    }
+  | {
       method: 'createRefund';
       args: Parameters<StripeClient['createRefund']>[0];
       idempotencyKey: string;
@@ -138,6 +150,23 @@ export interface StripeStub extends StripeClient {
    * `mostHazardousUnsettledIntent` in `src/routes/enrollments.ts`.
    */
   queueIntentOutcomes(outcomes: readonly QueuedIntentOutcome[]): void;
+  /**
+   * Bind an outcome to one Stripe idempotency KEY rather than to a position in
+   * the call order (2026-08-20, partial-success enrollment).
+   *
+   * {@link queueIntentOutcomes} answers "the second confirm declines", which
+   * was expressible only while the route authorized every dog it was handed, in
+   * one fixed order. The advisory pre-flight breaks that: a dog that fails a
+   * check never reaches Stripe, so the dog a queued outcome lands on depends on
+   * how many earlier dogs were skipped — a test could assert "dog 2 declined"
+   * and be pinning dog 3. Keying on `<K>:dog:<dogId>` NAMES the dog.
+   *
+   * Not single-shot, unlike every lever above it: a key identifies one logical
+   * confirm, so there is nothing to bleed into a later call. A second confirm
+   * under the same key is a REPLAY and is answered by the replay store above
+   * this lever, exactly as at Stripe.
+   */
+  setIntentOutcomeForKey(idempotencyKey: string, outcome: QueuedIntentOutcome): void;
   /** Force the next PaymentIntent confirm to return this status. */
   setNextIntentStatus(status: StripePaymentIntentStatus): void;
   /**
@@ -272,6 +301,38 @@ export interface StripeStub extends StripeClient {
    * carried on.
    */
   throwOnCancel(): void;
+  /**
+   * The cancel-vs-capture RACE, expressible (ADDENDUM 3 §A3.9): the next
+   * `cancelPaymentIntent` finds the intent already CAPTURED — a capture landed
+   * between the caller's retrieve and its cancel. The stub captures the intent
+   * first, then refuses the cancel exactly as Stripe refuses a cancel of a
+   * succeeded intent.
+   *
+   * This is the one interleaving that cannot be staged with `setIntentState`
+   * alone: the caller's own retrieve must see a live hold, and only the cancel
+   * may discover otherwise. Without it, "a capture won the race, so the
+   * withdraw refunds instead of releasing" is a sentence in a design and
+   * nothing in a test.
+   *
+   * Single-shot, like every other lever here.
+   */
+  captureBeforeCancel(): void;
+  /**
+   * Make the next `capturePaymentIntent` throw BEFORE anything is recorded —
+   * the request never reached Stripe, so the hold is untouched and a same-key
+   * retry EXECUTES (correctly: it is still the one and only capture).
+   *
+   * This is the lever behind the design's honest tail: a failed capture leaves
+   * the dog ENROLLED with `payment_state: 'pending'` and a `'requires_payment'`
+   * charge row for the reconciler to finish — never a decline, and never a
+   * green check on money that has not moved.
+   *
+   * `times` (default 1) is how many consecutive captures fail. It exists
+   * because the route retries a failed capture ONCE: with a single-shot lever
+   * the retry always succeeds and the `pending` tail — the whole reason the
+   * reconciler exists — is unreachable from any test.
+   */
+  throwOnCapture(times?: number): void;
   /** Replace what `retrievePaymentMethod` returns next. */
   setPaymentMethodSnapshot(snapshot: Partial<StripePaymentMethodSnapshot>): void;
   /**
@@ -324,11 +385,50 @@ function refundParamsFingerprint(
   return JSON.stringify([args.paymentIntentId, args.amountCents, args.reason ?? null]);
 }
 
+/**
+ * The statuses Stripe will cancel a PaymentIntent FROM, spelled out here
+ * INDEPENDENTLY of `enrollmentPartial.CANCELLABLE_STATUSES` — deliberately, and
+ * this is the one place in this file where duplication is the point. The
+ * production set is our BELIEF about Stripe; this one is the stub's model of
+ * Stripe. Importing the production set would make every test that exercises the
+ * cancel/capture race agree with itself by construction, and a wrong belief
+ * would pass its own test. (Everything the stub must not re-implement — the
+ * error normalizers, the blocker map — is still imported from production.)
+ *
+ * Source: Stripe cancels from `requires_payment_method`, `requires_capture`,
+ * `requires_confirmation`, and `requires_action`; it refuses `processing`,
+ * `succeeded`, and an already-`canceled` intent.
+ */
+const STUB_CANCELLABLE_STATUSES: ReadonlySet<StripePaymentIntentStatus> = new Set([
+  'requires_payment_method',
+  'requires_capture',
+  'requires_confirmation',
+  'requires_action',
+]);
+
+/** Stripe's `payment_intent_unexpected_state` — one spelling for the capture
+ *  refusal and the cancel refusal, since they are the same Stripe error. */
+function unexpectedStateError(
+  paymentIntentId: string,
+  status: StripePaymentIntentStatus,
+  verb: 'canceled' | 'captured',
+): Error {
+  return new Stripe.errors.StripeInvalidRequestError({
+    type: 'invalid_request_error',
+    code: 'payment_intent_unexpected_state',
+    message: `stub: PaymentIntent ${paymentIntentId} cannot be ${verb} in status ${status} (unexpected state)`,
+    statusCode: 400,
+  } as never);
+}
+
 /** One live PaymentIntent, as Stripe would hold it. */
 interface StubIntentState {
   status: StripePaymentIntentStatus;
   amountCents: number;
   clientSecret: string | null;
+  /** `metadata`, as Stripe holds it — the `retry_of` adopt arm asserts
+   *  `owner_id` off a RETRIEVED intent, so the stub must actually keep it. */
+  metadata?: Record<string, string>;
   /** Unix seconds, like Stripe's `created`. Stamped when the intent is minted
    *  and NEVER moved afterwards — a replay of a day-old intent must report the
    *  day-old creation time, which is the whole point of carrying it. */
@@ -345,7 +445,17 @@ export function makeStripeStub(): StripeStub {
   let nextIntentThrowsRecorded: RecordedScenarioKey | undefined;
   let nextIntentTransportError: Error | undefined;
   let nextIntentLandsThenThrows: { status: StripePaymentIntentStatus; err: Error } | undefined;
+  /**
+   * Did a lever SET the resting status for this call, or is it the default?
+   * The distinction only started mattering with manual capture: an authorize
+   * with no lever must rest at `requires_capture`, while an explicit
+   * `setNextIntentStatus('succeeded')` still means succeeded. Without this
+   * flag the two are the same value and the stub would have to guess.
+   */
+  let nextIntentStatusExplicit = false;
   const outcomeQueue: QueuedIntentOutcome[] = [];
+  /** Outcomes bound to an idempotency KEY — see `setIntentOutcomeForKey`. */
+  const outcomeByKey = new Map<string, QueuedIntentOutcome>();
   // Stripe's idempotency layer, modelled: key → (request fingerprint, the
   // response Stripe recorded). Same key + same params replays that response;
   // same key + DIFFERENT params is an `idempotency_error`. The old stub minted
@@ -363,6 +473,17 @@ export function makeStripeStub(): StripeStub {
   // to a correct one — a counterfeit for the one mechanism that keeps a retry
   // from becoming a second refund of somebody's money.
   const refundReplays = new Map<string, { fingerprint: string; result: StripeRefundResult }>();
+  /**
+   * Stripe's idempotency layer for CAPTURES. Same shape as the confirm and
+   * refund stores and there for the same reason: a same-key capture must
+   * replay, not move a second amount of money, and until this map existed a
+   * reconciler that re-captured instead of replaying would have looked
+   * identical to a correct one.
+   */
+  const captureReplays = new Map<
+    string,
+    { paymentIntentId: string; result: StripePaymentIntentResult }
+  >();
   /** Refunds Stripe EXECUTED. A replay adds nothing here; that is the point. */
   const executedRefundLog: StripeRefundResult[] = [];
   /** Cumulative executed refund cents per PaymentIntent. */
@@ -374,6 +495,8 @@ export function makeStripeStub(): StripeStub {
   let refundLandsThenThrowsErr: Error | undefined;
   let refundKeyInUse = false;
   let cancelShouldThrow = false;
+  let captureBeforeCancelPending = false;
+  let captureThrowsRemaining = 0;
   let pmSnapshotOverride: Partial<StripePaymentMethodSnapshot> = {};
   let setupIntentOverride: Partial<StripeSetupIntentSnapshot> = {};
   // `undefined` = no event queued; `null` = next call throws (bad signature);
@@ -388,9 +511,11 @@ export function makeStripeStub(): StripeStub {
     calls,
     setNextIntentStatus(status) {
       nextIntentStatus = status;
+      nextIntentStatusExplicit = true;
     },
     setNextIntentThrowsCardError(status, code = 'card_declined') {
       nextIntentStatus = status;
+      nextIntentStatusExplicit = true;
       nextIntentThrowsCardCode = code;
       nextIntentThrowsCard = true;
     },
@@ -399,6 +524,9 @@ export function makeStripeStub(): StripeStub {
     },
     queueIntentOutcomes(outcomes) {
       outcomeQueue.push(...outcomes);
+    },
+    setIntentOutcomeForKey(idempotencyKey, outcome) {
+      outcomeByKey.set(idempotencyKey, outcome);
     },
     setNextIntentThrowsTransport(err) {
       nextIntentTransportError =
@@ -420,6 +548,8 @@ export function makeStripeStub(): StripeStub {
         amountCents: existing?.amountCents ?? 0,
         clientSecret: existing?.clientSecret ?? null,
         createdSeconds: existing?.createdSeconds ?? nowSeconds(),
+        // Moving an intent's STATUS never changes whose it is.
+        ...(existing?.metadata !== undefined ? { metadata: existing.metadata } : {}),
         status,
         ...(opts?.failureCode !== undefined
           ? { failureCode: opts.failureCode }
@@ -452,6 +582,12 @@ export function makeStripeStub(): StripeStub {
     },
     throwOnCancel() {
       cancelShouldThrow = true;
+    },
+    captureBeforeCancel() {
+      captureBeforeCancelPending = true;
+    },
+    throwOnCapture(times = 1) {
+      captureThrowsRemaining = times;
     },
     setPaymentMethodSnapshot(snapshot) {
       pmSnapshotOverride = snapshot;
@@ -517,16 +653,21 @@ export function makeStripeStub(): StripeStub {
         // indistinguishable to every test that could have caught it.
         return { ...recorded.result, replayed: true };
       }
-      // A queued outcome (multi-dog enroll) overrides the single-shot levers
-      // for THIS call by setting them, so everything below stays one code path.
-      const queuedOutcome = outcomeQueue.shift();
+      // A keyed outcome (this dog) or a queued one (the Nth confirm) overrides
+      // the single-shot levers for THIS call by setting them, so everything
+      // below stays one code path. Keyed wins over queued: it names the call it
+      // means, and a test that sets both meant the specific one.
+      const keyedOutcome = outcomeByKey.get(idempotencyKey);
+      const queuedOutcome = keyedOutcome ?? outcomeQueue.shift();
       if (queuedOutcome !== undefined) {
         switch (queuedOutcome.kind) {
           case 'status':
             nextIntentStatus = queuedOutcome.status;
+            nextIntentStatusExplicit = true;
             break;
           case 'cardError':
             nextIntentStatus = queuedOutcome.status;
+            nextIntentStatusExplicit = true;
             nextIntentThrowsCardCode = queuedOutcome.code ?? 'card_declined';
             nextIntentThrowsCard = true;
             break;
@@ -534,6 +675,15 @@ export function makeStripeStub(): StripeStub {
             nextIntentThrowsRecorded = queuedOutcome.scenario;
             break;
         }
+      }
+      // The manual-capture default (2026-08-20): an authorize with no lever
+      // rests at `requires_capture` — funds held, nothing moved — because that
+      // is what Stripe does with `capture_method: 'manual'`. A stub that
+      // answered `succeeded` here would let the whole authorize→enroll→capture
+      // protocol pass its tests while capturing on confirm, which is the exact
+      // behavior the protocol exists to stop doing.
+      if (!nextIntentStatusExplicit && args.captureMethod === 'manual') {
+        nextIntentStatus = 'requires_capture';
       }
       const status = nextIntentStatus;
       const throwsCard = nextIntentThrowsCard;
@@ -544,6 +694,7 @@ export function makeStripeStub(): StripeStub {
       // Reset every lever for the next call — a stale one bleeding into a
       // route's SECOND confirm (multi-dog enroll, replay) would be a lie.
       nextIntentStatus = 'succeeded';
+      nextIntentStatusExplicit = false;
       nextIntentThrowsCard = false;
       nextIntentThrowsCardCode = 'card_declined';
       nextIntentThrowsRecorded = undefined;
@@ -572,6 +723,11 @@ export function makeStripeStub(): StripeStub {
           amountCents: executed.amountCents,
           clientSecret: executed.clientSecret,
           createdSeconds,
+          // Stripe keeps the metadata the CREATE sent, and a later retrieve
+          // reports it. The `retry_of` adopt arm reads `owner_id` off exactly
+          // that retrieve, so a stub that dropped it would make the
+          // cross-owner assertion untestable.
+          metadata: { ...args.metadata },
           ...(executed.failureCode !== undefined ? { failureCode: executed.failureCode } : {}),
         });
         return executed;
@@ -672,10 +828,70 @@ export function makeStripeStub(): StripeStub {
         client_secret: state.clientSecret,
         amount: state.amountCents,
         created: state.createdSeconds,
+        ...(state.metadata !== undefined ? { metadata: state.metadata } : {}),
         ...(state.failureCode !== undefined
           ? { last_payment_error: { code: state.failureCode } }
           : {}),
       } as unknown as Stripe.PaymentIntent);
+    },
+
+    async capturePaymentIntent(paymentIntentId, idempotencyKey): Promise<StripePaymentIntentResult> {
+      calls.push({ method: 'capturePaymentIntent', args: { paymentIntentId }, idempotencyKey });
+
+      // ── Stripe's idempotency layer, BEFORE anything else ──────────────────
+      // A replay is not a second capture. Modelled first, exactly as the
+      // confirm and refund verbs do, so a reconciler that re-fires under the
+      // stored key is provably not moving money twice.
+      const recorded = captureReplays.get(idempotencyKey);
+      if (recorded !== undefined) {
+        if (recorded.paymentIntentId !== paymentIntentId) {
+          throw new Stripe.errors.StripeIdempotencyError({
+            type: 'idempotency_error',
+            code: 'idempotency_error',
+            message:
+              'Keys for idempotent requests can only be used with the same parameters they were first used with.',
+            statusCode: 400,
+          } as never);
+        }
+        return { ...recorded.result, replayed: true };
+      }
+
+      if (captureThrowsRemaining > 0) {
+        // Never reached Stripe: nothing recorded, no key burned, and the hold
+        // is exactly as it was. The route's honest answer is `pending`.
+        captureThrowsRemaining -= 1;
+        throw new Error('stub: capture failed');
+      }
+
+      const state = intents.get(paymentIntentId);
+      if (state === undefined) {
+        throw new Stripe.errors.StripeInvalidRequestError({
+          type: 'invalid_request_error',
+          message: `stub: no such PaymentIntent ${paymentIntentId}`,
+          statusCode: 404,
+        } as never);
+      }
+      if (state.status !== 'requires_capture') {
+        // Stripe refuses a capture from any other state, and the two that most
+        // resemble "ready" are the dangerous ones: `succeeded` (someone already
+        // captured — a second capture would be a second charge if Stripe
+        // allowed it) and `canceled` (the hold is gone — nothing to take). This
+        // refusal is the floor beneath the caller's own retrieve-then-capture
+        // rule, not a substitute for it.
+        throw unexpectedStateError(paymentIntentId, state.status, 'captured');
+      }
+
+      intents.set(paymentIntentId, { ...state, status: 'succeeded' });
+      const result: StripePaymentIntentResult = {
+        id: paymentIntentId,
+        status: 'succeeded',
+        clientSecret: state.clientSecret,
+        amountCents: state.amountCents,
+        createdAt: new Date(state.createdSeconds * 1000),
+        replayed: false,
+      };
+      captureReplays.set(idempotencyKey, { paymentIntentId, result });
+      return result;
     },
 
     async detachPaymentMethod(paymentMethodId) {
@@ -700,14 +916,37 @@ export function makeStripeStub(): StripeStub {
         cancelShouldThrow = false;
         throw new Error('stub: cancel failed');
       }
+      const state = intents.get(paymentIntentId);
+      if (captureBeforeCancelPending && state !== undefined) {
+        // The race, staged: a capture landed between the caller's retrieve and
+        // this cancel. Stripe would already hold the money by now, and the
+        // cancel refuses.
+        captureBeforeCancelPending = false;
+        intents.set(paymentIntentId, { ...state, status: 'succeeded' });
+        throw unexpectedStateError(paymentIntentId, 'succeeded', 'canceled');
+      }
+      // ── Stripe's real refusal, modelled (2026-08-21) ─────────────────────
+      // Until ADDENDUM 3 this verb quietly no-op'd on `succeeded` and happily
+      // "cancelled" a `processing` or already-`canceled` intent. Both are
+      // fictions, and the second one matters: the withdraw arm and the
+      // reconciler now READ a cancel's throw as evidence about who won a race,
+      // so a stub that never throws would make every race look like a clean
+      // release and prove the opposite of what the tests claim.
+      if (state === undefined) {
+        throw new Stripe.errors.StripeInvalidRequestError({
+          type: 'invalid_request_error',
+          message: `stub: no such PaymentIntent ${paymentIntentId}`,
+          statusCode: 404,
+        } as never);
+      }
+      if (!STUB_CANCELLABLE_STATUSES.has(state.status)) {
+        throw unexpectedStateError(paymentIntentId, state.status, 'canceled');
+      }
       // A cancel that RETURNS moved the money-safety needle: the intent is dead
       // and a later retrieve must say so. (A cancel that throws leaves the
       // state alone, which is the whole reason callers treat its success as
       // evidence and its failure as none.)
-      const state = intents.get(paymentIntentId);
-      if (state !== undefined && state.status !== 'succeeded') {
-        intents.set(paymentIntentId, { ...state, status: 'canceled' });
-      }
+      intents.set(paymentIntentId, { ...state, status: 'canceled' });
     },
 
     async createRefund(args, idempotencyKey): Promise<StripeRefundResult> {

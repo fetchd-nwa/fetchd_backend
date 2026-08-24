@@ -1020,6 +1020,11 @@ payment_method_id: uuid, pay_later?: boolean }` (default pay-now). Amount
    unpaid pay-later invoice (`refunded_cents=0`, never charged) or REFUNDs a
    succeeded charge (`refunds` row at 'pending' + post-commit Stripe refund,
    mirroring the booking-cancel money-back branch).
+   **AMENDED 2026-08-21 (wire 1.12.0) — see the withdraw-settlement amendment
+   below.** The two-arm settlement described here (void OR refund) was written
+   for automatic capture and is no longer the whole table: under manual capture
+   a `'requires_payment'` group-class charge is a LIVE AUTHORIZATION, and the
+   response now names which of five things happened to the money.
 3. **NEW `GET /enrollments` `[auth]`** → `Enrollment[]` (§B), the owner's
    current per-(cohort, dog) enrollments for the mobile "Currently enrolled"
    section. Owner-only.
@@ -3774,13 +3779,22 @@ believed it had closed.
 - **The accepted `Idempotency-Key` header shrank from 255 to 204 characters —
   the only client-visible behavior change in this design (2026-08-20).** The
   bound is computed: Stripe's own 255-char key limit minus the longest suffix
-  any route appends before handing a derived key to Stripe (currently
-  `:enroll-unwind:<uuid>` at 51 — the list is `STRIPE_DERIVED_KEY_SUFFIXES`,
-  `src/db/mutation.ts`). A 255-char client key used to mint derived keys
-  Stripe rejects outright; once `refunds.stripe_idempotency_key` stores such
-  a key, the sweep would re-send an unsendable key for the full 24h window.
-  Over-length keys now 400 at the door with the arithmetic in the message.
-  Both clients mint 36-char uuids, so real traffic has ~5.6× headroom.
+  any route appends before handing a derived key to Stripe (at the time of this
+  design, `:enroll-unwind:<uuid>` at 51 — the list is
+  `STRIPE_DERIVED_KEY_SUFFIXES`, `src/db/mutation.ts`). A 255-char client key
+  used to mint derived keys Stripe rejects outright; once
+  `refunds.stripe_idempotency_key` stores such a key, the sweep would re-send
+  an unsendable key for the full 24h window. Over-length keys now 400 at the
+  door with the arithmetic in the message. Both clients mint 36-char uuids, so
+  real traffic has ~5.6× headroom.
+  **Superseded the same day — the accepted bound is now 206, see §L.4.** Wire
+  1.11.0 deleted `unwindCapturedIntents` and with it the `:enroll-unwind:<uuid>`
+  suffix, and added `:dog:<uuid>:capture` at 49. The number here is left
+  standing rather than silently overwritten because the point of this list is
+  that the bound is DERIVED from what the code sends: it moves whenever the
+  suffixes move, and a paragraph asserting a stale derivation next to the words
+  "the bound is computed" is the same class of instrument dishonesty the list
+  exists to prevent.
 - **The `never-sent` class survives in the code but should always read 0.** The
   flip empties it at the top of the same tick; it remains as the honest answer
   for a row a batched flip has not reached yet, not as a standing class. The
@@ -3827,3 +3841,839 @@ believed it had closed.
   under any answer; P1 is the only one that could change the build (a refund
   that does not replay would mean disabling the sweep). The ~24h key lifetime
   itself remains documented, never measured.
+
+## L. Per-dog partial success on enrollment + manual capture (wire 1.11.0, 2026-08-20)
+
+Allison, 2026-08-12, verbatim: *"it shoudl report per dog. make as granular as
+possible. the idea is to book in bulk, but if one dog fails a check, that should
+be surfaced, not transactional where we fail the entire ting"* — under her
+standing money rule: *"i dont want money charged on accident or things not
+getting charged."* Design: `designs/partial-success-enrollment.md`.
+
+### L.1 `allow_partial` is the degrade boundary, not the version
+
+`POST /enrollments` body gains optional **`allow_partial?: boolean`** (default
+`false`).
+
+- **With it:** the route enrolls every dog that passes its checks and reports
+  every dog that doesn't, per dog, with the exact reason. Response is
+  `EnrollmentResultWire` — **201 when ≥1 dog enrolled, 200 when none did.**
+  Never an error status: `withIdempotency` cannot store a thrown response, and
+  mobile's `apiClient` throws on any non-2xx, so a 422-with-successes would
+  deliver committed enrollments inside an exception and discard them.
+- **Without it:** today's `201 BookingWire[]` and all-or-nothing semantics,
+  byte-for-byte. Old mobile does `raw.map(toBooking)` on this response; handed
+  an envelope it would TypeError into its submit catch and render "something
+  went wrong" while dogs were enrolled and charged. The opt-in field makes that
+  degrade unreachable — old clients never send it, so they are never handed one.
+- Omitting the field hashes identically to a pre-1.11.0 body, so no in-flight
+  `Idempotency-Key` changes meaning.
+
+### L.2 The per-dog reason vocabulary
+
+`EnrollmentDogFailureReason`, one per unenrolled dog. Anti-enumeration is
+preserved per-dog: `not_found` answers identically for "not yours" and "doesn't
+exist".
+
+| reason | when | detail carried |
+|---|---|---|
+| `not_found` | dog is not the caller's, or doesn't exist | — |
+| `already_enrolled` | live bookings for this (cohort, dog) | — |
+| `eligibility_missing` | R7: completed none of the class's OR-prereqs | `missing_prereq_alternatives` |
+| `vaccine_missing` | group-class-gating vaccine absent/expired | `missing_vaccines` (omitted on the trigger-race path, which has no structured detail) |
+| `seat_shortfall` | more passing dogs than seats — **nobody seated** | `seats_remaining` |
+| `charge_failed` | the authorization was refused, released, or belongs to an earlier request | `charge_blocker`: `declined` / `authentication_required`, **or OMITTED** |
+| `charge_unverified` | the authorization is still verifying | — |
+
+**`charge_blocker` is optional, and an absent one is a real answer** (round-1
+panel, R5). Two arms reach `charge_failed` with no cause to name, and both used
+to fabricate `declined`: a hold found `canceled` (a same-key sibling's failure
+path released it, or Stripe expired it — the card was never asked), and an
+adopted `succeeded` intent whose money is already recorded against an earlier
+request (§L.4, replay table row 6). Telling an owner their card was declined
+sends them to change a working card, which is the exact category error wire
+1.9.0 was cut to fix. Clients must render a blockerless `charge_failed` with a
+neutral sentence and must never infer a decline from the reason alone.
+
+`charge_unverified` is the manual-capture answer to `processing`, and it is a
+sentence that could not be said before: an authorization still verifying holds
+**no captured money and cannot capture itself**, so nothing will be charged, the
+hold expires on its own, and the owner may retry shortly. `charge_blocker` never
+carries `processing` — its copy sends an owner to another card, and doing that
+while money may be moving is the reachable double charge.
+
+Enrolled dogs carry `payment_state`: `'paid'` (captured), `'pay-later'` (open
+invoice), `'pending'` (enrolled, capture unfinished — the reconciler owns it).
+`total_captured_cents` counts **only money that actually moved**; a `pending`
+dog contributes zero. Order of `results` is REQUEST order — the order the owner
+picked their dogs — not work order.
+
+### L.3 Capacity: the server never auto-picks
+
+More passing dogs than seats → **nothing is seated, nothing is captured**, and
+every passing dog reports `seat_shortfall` + `seats_remaining`. "2 seats left —
+choose which dogs take them" is a sentence an owner can act on; "we alphabetized
+your dogs by internal id" is not. Checked twice: advisory (before any Stripe
+call, so the choice never touches a card) and authoritatively under the cohort
+row lock. The schema CHECK `filled <= capacity` remains the unbypassable floor.
+
+The authoritative arm **returns** its 200 envelope rather than throwing, which
+is a deliberate departure from the design's §3.5.2 (ratified by the round-1
+panel). Throwing rolls back the idempotency claim, so a same-key retry re-runs
+the pre-tx phase, re-asks Stripe under `<K>:dog:<id>`, and meets the holds this
+request just cancelled — reporting every dog `charge_failed` instead of
+`seat_shortfall`. The retry would be strictly *less* true than the first answer.
+Nothing but the claim is written on that path, so committing costs nothing and
+makes the answer stable.
+
+**Every refusal envelope is idempotency-recorded, not just that one** (R10,
+2026-08-20). The three arms that answer 200 with nobody enrolled — advisory seat
+shortfall, every dog failing a check, every survivor's card refusing — used to
+return before the mutation layer ran at all, so nothing recorded the answer. A
+same-key duplicate arriving after the state changed (a seat frees, a prereq
+clears) therefore re-ran the whole pre-tx phase and could DIVERGE into a real
+enrollment and a real charge, behind a screen that had already said nothing was
+charged. Same key, same answer; these arms claim and store their 200 with no
+Stripe traffic and no domain writes. A dog whose problem is FIXED resubmits
+under a fresh key, which is what mobile mints (§4 row 2, unchanged).
+
+### L.4 The money layer: authorize → enroll → capture
+
+Both response shapes go through **one** money layer. `POST /enrollments` pay-now
+is now **manual capture** — the enrollments slice of
+`designs/money-safety-rollback-and-replay.md`.
+
+1. **Peek** `peekCompletedIdempotency` before any Stripe call.
+2. **Owner-level gates** (card on file, agreements) — whole-request, thrown.
+   There is no per-dog story for them: no dog can enroll without a card.
+   (R14 amendment: only the per-dog gates — vaccine, eligibility — split.)
+3. **Advisory per-dog pre-flight** on the pool. Dogs that fail here never reach
+   Stripe, which is what keeps failed checks off the owner's card statement.
+4. **Authorize** one PaymentIntent per surviving dog, `capture_method: manual`,
+   key `<K>:dog:<dogId>`. Resting status `requires_capture` — funds held,
+   nothing moved.
+5. **One transaction** under the cohort row lock: authoritative per-dog
+   re-checks, capacity, then one **SAVEPOINT per dog** (Drizzle's nested
+   `.transaction()`, verified against the driver — a dog whose insert trips a
+   gate trigger fails alone and its siblings' rows survive the same tx).
+   Pay-now writes its `charges` row at `'requires_payment'`, the honest status
+   for a hold.
+6. **Capture after commit**, key `<K>:dog:<dogId>:capture`, then flip the row to
+   `'succeeded'` and amend the stored idempotency response so a later replay
+   tells post-capture truth (`updateStoredResponse`, new).
+
+**Three invariants, enforced and asserted (not narrated):**
+
+1. **Capture only an intent whose RETRIEVED status is `requires_capture`.** Not
+   the status a confirm returned — that can be a Stripe idempotency replay of a
+   state that has since moved.
+2. **Cancel only holds this request created or adopted; never a captured one.**
+   Release RETRIEVES first for the same reason capture does: a snapshot can
+   name a state that has moved, and `succeeded` / `canceled` / `processing` are
+   all uncancellable for different reasons.
+3. **`createRefund` is never called from any enrollment failure path.**
+   Structural: `lib/enrollmentPartial.ts` does not import it. `refunds` rows
+   stay exclusive to the withdraw arm (R35).
+
+**A declined dog fails alone with ZERO unwind** — nothing was held for it, and
+its siblings' holds are still wanted. A dog whose authorization rests at
+`requires_action` is the one refusal that IS cancelled (R2): that intent can
+still advance on its own, and under manual capture advancing lands it at
+`requires_capture` — a live hold nobody owns — while the `charge_failed` copy
+has already sent the owner to mint a second one on a fresh key.
+
+**Hold release is registry-scoped, not catch-scoped** (R1, the round-1
+BLOCKER). Every intent this request learns the id of is recorded the instant
+Stripe returns one, BEFORE anything interprets the result, tagged with
+provenance read off `Idempotency-Replayed`: `fresh` (Stripe executed our
+confirm), `replayed` (an earlier request under this same `<K>:dog:<id>` created
+it), `adopted` (we could not tell — reachable only from the thrown card fork,
+which never carries a live hold). The outermost boundary of BOTH response
+shapes releases whatever is still undecided in a `finally`, so a Stripe
+transport failure on dog N's confirm releases dogs 1..N−1's authorizations
+instead of stranding them for ~7 days with nothing in the system holding their
+ids. A `replayed` intent is never cancelled by us.
+
+**Two arms hand everything back instead of releasing**: a committed enrollment
+(its holds are captured or the reconciler's) and `idempotency_inflight` / a
+replayed claim (a sibling under this key is enrolling against these intents).
+The second stays WHOLESALE rather than narrowing to "release the fresh ones",
+because two concurrent same-key requests both authorize before either claims:
+the one that confirmed FIRST holds a genuinely `fresh` intent the other has
+already replayed and is capturing. Being wrong in this direction costs a hold
+that expires; being wrong in the other costs a dog in class nobody was charged
+for.
+
+**The accepted `Idempotency-Key` header is 206 characters** (was 204 before
+this design; see the §K bullet it supersedes). Derived, not chosen: Stripe's
+255-char limit minus the longest suffix any route appends, which is now
+`:dog:<uuid>:capture` at 49. `:enroll-unwind:<uuid>` (51) was deleted with
+`unwindCapturedIntents` — manual capture releases a hold, and
+`cancelPaymentIntent` takes no idempotency key at all. Leaving a dead suffix in
+the list to "be safe" would defeat the list. Both clients mint 36-char uuids,
+so real traffic is unaffected either way.
+
+**The replay table's rows 6 and 9 are corrected** (R4). A same-key retry that
+lands past our own 24h idempotency sweep while Stripe's key window is still
+open can retrieve a `succeeded` intent whose money an EARLIER request already
+recorded — money that may since have been refunded at withdraw. Writing a
+second `charges` row for it trips `stripe_payment_intent_id UNIQUE`; that
+violation is read as the signal it is. The dog is NOT enrolled, its savepoint
+rolls back, and it reports `charge_failed` with the blocker OMITTED. No 500,
+and no enrollment on money that did not move.
+
+### L.5 What changed for existing clients
+
+One statement-visible change reaches even clients that never send
+`allow_partial`: **a failed enrollment now releases a hold instead of refunding
+a capture.** An owner who used to see "charged $360" followed by "refunded $360"
+now sees a pending authorization that quietly disappears. Strictly safer; flagged
+to Allison as Q4 of the design.
+
+Consequently the claim that "the existing enrollment suite runs unmodified" is
+**false**, and three of its tests were amended rather than deleted or skipped:
+the full-cohort unwind and the post-capture in-tx failure now assert
+`cancelPaymentIntent` + **zero** refunds, and the declined-plus-processing test
+asserts **one** cancel, not two — no cancel is attempted on a `processing`
+intent, which is precisely the call the old unwind made and could not complete
+(its failure arm was `log.fatal('STRANDED MONEY')`). The round-1 panel ratified
+all three amendments: each keeps its subject and TIGHTENS it (`createRefund ===
+0` and `capturePaymentIntent === 0` were added where neither existed), nothing
+was deleted and nothing was skipped, and the design's §9.10 "unmodified" claim
+was the error.
+
+The `charge_blocker` change in §L.2 is the second statement-visible one, and it
+reaches `allow_partial` clients only: a `charge_failed` row may now arrive with
+no blocker at all. A client that treated `reason === 'charge_failed'` as
+"declined" would show a false decline; the field, not the reason, is the cause.
+
+### L.6 The capture reconciler
+
+New scheduler phase (`workers/captureReconciler.ts`), between the verify lane
+and the charge lane. Manual capture creates exactly one new state — enrolled,
+capture unfinished — and this phase owns it. Per tick it claims group-class
+enrollment charges at `'requires_payment'` with a PaymentIntent, older than 5
+minutes, retrieves each, and:
+
+- `requires_capture` → capture under `reconcile:charge:<id>:capture` (derived
+  from OUR row id, because the client's key may be swept past Stripe's window)
+  and flip to `'succeeded'`;
+- `succeeded` → already captured; write the missing flip, never a second
+  capture;
+- `canceled` **and the dog is still enrolled, with no open invoice AND no
+  succeeded charge for that (cohort, dog)** → **ERROR alarm, loud once per
+  process.** This is money we will never collect for a class we will deliver —
+  the "things not getting charged" half of the rule, and the one state here that
+  needs a human. The third clause is R6: without it, an ordinary sequence
+  (pay-later enroll → Pay now → 3DS/decline writes a dead `requires_payment`
+  row → owner retries on another card and the invoice is paid) pages a human
+  about money already in the bank, and an alarm that fires wrongly stops being
+  read;
+- anything else → left alone, quietly. `POST /invoices/:id/pay` writes
+  `'requires_payment'` group-class rows too, on automatic-capture intents it
+  then cancels; a phase that shouted about another lane's rows once a minute
+  would bury the alarm that matters. The `succeeded` arm above is the one
+  deliberate exception: it is lane-agnostic, because if a foreign row's intent
+  really did succeed then `'succeeded'` is the honest status for it and the
+  webhook would have written the same flip.
+
+**The worklist has a lease and an exit** (R3). The claim takes the oldest rows
+by `updated_at` and bumps them, so working a row sends it to the back of the
+queue — the lease IS the rotation, and no row can hold the front. A row still
+stuck 24 hours after it was minted stops being claimed and is REPORTED instead:
+named individually the first time this process sees it, split by whether a human
+actually has money to collect (an enrolled, uninvoiced, uncollected dog) or the
+row is bookkeeping (withdrawn, invoice-covered, or paid on another row), with a
+re-alarm when the population GROWS past what this process last announced.
+Neither existed in the first build, and without them a `lost-hold` — which
+writes nothing, by design — held the front of a `created_at`-ordered page
+forever while newer capturable holds were never scanned. Both halves mirror
+`duplicateRefundRetry`. The 24h bound here is about ATTENTION, not key safety:
+the capture key is derived from our own row id and every capture retrieves
+first, so nothing about age makes a retry dangerous — it just makes it futile.
+
+**The claim cannot fully separate the lanes, and does not pretend to.** It
+filters `purpose = 'group-class'`, but the invoice lane writes rows with the
+same purpose and the same cohort/dog stamps and `charges` has no `invoice_id`
+to discriminate on. The retrieve is therefore the authority for what gets acted
+on, and the abandon window is what stops a foreign row from occupying the
+worklist forever. Closing it properly is DDL work and deliberately out of scope.
+
+**No DDL.** `'requires_payment'` is an existing `charge_status`; the envelope is
+response shape only; the reconciler reads existing columns (`status`,
+`stripe_payment_intent_id`, `cohort_id`, `dog_id`, `created_at`, `updated_at`).
+
+### L.7 Per-dog copy — APPROVED AS DRAFTED (Allison, 2026-08-20)
+
+The backend emits **no** per-dog prose: `EnrollmentDogResultWire` carries a
+reason code and structured detail, and the sentences are mobile's to render.
+
+**Allison ruled on this table 2026-08-20: approved as drafted, and it is the
+copy OF RECORD, verbatim.** Implemented client strings conform to these rows;
+an approved next action that turns out to be technically impossible is stopped
+on and reported to her, never quietly substituted. (The round-1 panel found all
+nine implemented mobile strings diverging from this table, two of them swapping
+the approved next action — that is a mobile-repo finding, recorded here because
+this table is where the ruling lives.)
+
+One row this table does not yet cover, added by R5: a `charge_failed` with
+`charge_blocker` OMITTED. It needs a neutral sentence that asserts no cause —
+drafted by the mobile lane and flagged for Allison, not approved here.
+
+| reason | sentence | next action |
+|---|---|---|
+| `not_found` | "We couldn't find this dog on your account." | Back to dog picker |
+| `already_enrolled` | "Already in this class." | none — a calm fact, not an error |
+| `eligibility_missing` | "{Dog} needs to finish {Class} first." | Deep-link to that class |
+| `vaccine_missing` | "{Dog} is missing {Vaccine}." | Deep-link to add that vaccine |
+| `seat_shortfall` | "Only {n} seats left — choose which dogs take them." | Back to select-dogs, survivors preselected |
+| `charge_failed` (`declined`) | "{Dog}'s card was declined." | Change card |
+| `charge_failed` (`authentication_required`) | "{Dog}'s card needs verification." | Change card |
+| `charge_unverified` | "Still checking with the bank — no charge will complete. Try again in a minute." | Retry later; **never** "try a different card" |
+| `payment_state: 'pending'` | "{Dog} is enrolled — payment is still completing." | none; never a green check on money |
+
+
+### L.8 What this does NOT close (round-1 fix round, 2026-08-20)
+
+Named rather than implied, because every one of these looks like coverage from
+the outside.
+
+- **A confirm that LANDS at Stripe and then loses its response** strands that
+  one dog's authorization. The registry can only hold ids Stripe told us; a
+  `StripeConnectionError` raised after the intent exists never gives us one, so
+  nothing can cancel it and it expires on the card network (~7 days,
+  documented, never probed on this account). Recovering it would mean
+  re-issuing the confirm under the same key purely to learn the id, which can
+  CREATE the intent when the first attempt never landed. Not built.
+- **A losing same-key request leaks the holds it minted for dogs the winner
+  never authorized.** The `idempotency_inflight` / replayed carve-out is
+  wholesale (§L.4), so a loser whose survivor set is a superset of the winner's
+  — a dog whose vaccine cleared between the two advisory pre-flights — leaves a
+  hold nobody will capture or cancel. It expires. Narrowing it to "release the
+  fresh ones" was tried and rejected: it re-opens the enrolled-and-never-charged
+  race the carve-out exists for, which was proven against the suite.
+  **"Tried and rejected" is true of the PROVENANCE-based narrowing only.** A
+  second narrowing remains AVAILABLE and unimplemented: the winner's stored
+  envelope enumerates the dogs it actually sent to Stripe, so a registered hold
+  for a dog ABSENT from that list cannot be the winner's capture target and is
+  safe for the loser to release — which is a fact about the outcome rather than
+  about who executed a confirm, and so does not re-open the race above.
+  Defence-in-depth only, left at the round cap (design ADDENDUM 2, 2026-08-20);
+  the hold it would recover expires on its own either way.
+- **Per-intent provenance rests entirely on `Idempotency-Replayed`.** That
+  header's real spelling was measured live (2026-08-13); nothing re-measures it.
+  If it regressed to unread, every replay would read as `fresh`. The two arms
+  above release nothing at all, which is what keeps that regression from
+  becoming a cancelled hold the winner needed.
+- **The reconciler's worklist still cannot exclude the invoice lane** (§L.6).
+  Foreign rows are leased, resolve to `released` / `not-capturable` each tick,
+  and age out at 24h into the bookkeeping half of the abandon report.
+- **The abandon report's uncollected/bookkeeping split is computed for the
+  capped page only.** The total is unbounded and honest; the split is not, and
+  says so. Since the round-2 fix the ERROR-class growth re-alarm keys off the
+  UNCOLLECTED count rather than the total (it fired for pure bookkeeping
+  otherwise), so this bound now also bounds that alarm: uncollected money
+  arriving BEHIND the page cap raises the total, not the split, and is
+  reported at INFO instead of ERROR. Closing it needs a SQL-side count of the
+  three-part `owed` predicate, which does not exist.
+- **A crash between the enroll commit and the capture leaves the STORED
+  idempotency body understating the money.** The transaction stores
+  `payment_state: 'pending'` + `total_captured_cents: 0`; the post-commit
+  capture amends it. If the process dies in between — or the amend itself
+  throws, which is now swallowed rather than 500ing — the capture reconciler
+  takes the money minutes later and **never touches the stored body**, so a
+  same-key replay keeps replaying the pre-capture snapshot until the 24h
+  idempotency sweep drops the row. Mobile renders its pending line for a card
+  that WAS charged. Transparency residual only: the money cell holds (one
+  capture, one charge row), `GET /enrollments` and the charges rows are
+  correct throughout, and a fresh key gets fresh truth. Not fixed — amending
+  another request's stored body from a worker means the worker owning a
+  response shape it has no other reason to know.
+- **Nothing here has been run against real Stripe, real concurrency, or a
+  device.** Manual-capture behavior, the ~7-day authorization expiry, and
+  Stripe's ~24h key lifetime are documented and stub-modelled, never measured.
+
+## M. Withdraw settlement under manual capture (wire 1.12.0, 2026-08-21)
+
+The withdraw arm's money settlement, respecified. Design of record:
+`designs/partial-success-enrollment.md` ADDENDUM 3. This section AMENDS the
+2026-06-09 amendment's item 2 (§ "group-class enrollment payments + per-dog
+withdraw"), which described a two-arm settlement written for automatic capture.
+
+**Why it had to change.** Manual capture (1.11.0) changed what a
+`'requires_payment'` group-class charge row MEANS — from a dead attempt to a
+live authorization on the owner's card — and the withdraw arm was never
+respecified for it. Proven end-to-end on 2026-08-20: enroll pay-now with both
+capture attempts failing → withdraw returns `200 {refunded_cents: 0}` having
+cancelled nothing → the next capture-reconciler tick CAPTURES 12000c for a dog
+with zero live bookings, reports it as an ordinary `'captured'`, raises no
+alarm, and no verb can recover it. Allison's ruling the same day: *"as a user it
+should be very clear what is happening with my money. no uncertains"*.
+
+### M.1 The response
+
+`POST /enrollments/:cohortId/withdraw` → 200 `EnrollmentWithdrawResultWire`
+(the shape's first appearance in `wire.ts`; it lived as an inline route type
+until now, a DRIFT-26-class gap this partially closes):
+
+```
+{ withdrawn: true, refunded_cents: integer, money_outcome, released_cents? }
+```
+
+`money_outcome ∈ 'refunded' | 'released' | 'release_pending' | 'voided' |
+'refund_manual' | 'none'` — exactly one per withdraw. `released_cents` is
+present **iff** the outcome is `'released'` or `'release_pending'`;
+`owed_cents` **iff** `'refund_manual'`. `refunded_cents` keeps its R30
+semantics exactly (cents on their way back to the card) and is 0 for every
+non-`'refunded'` outcome.
+
+**Two invariants the arms enforce structurally, not by discipline** (§A3.15,
+2026-08-21):
+
+- **`'refunded'` is asserted iff THIS request minted a pending refund**, and
+  `refunded_cents` equals that mint. A computed `maxRefund` of 0 mints nothing
+  and reports `'none'` — true, nothing is left to return — rather than "your
+  $0.00 refund is on its way". Every arm reads its outcome off the mint's
+  return value, so the wire's own `refunded ⇒ refunded_cents > 0` rule cannot
+  be violated by adding an arm.
+- **Row flips are independent of the envelope.** An arm that specifies a status
+  flip applies it whatever the mint decides: ledger honesty is not contingent
+  on what the owner is told.
+
+Strictly additive: old clients read the old two fields unchanged, and mobile
+≤1.11.0 discards the body entirely, so the degrade is a non-event. Reusing bare
+`refunded_cents` was rejected because `0` is the same byte for "never charged",
+"hold released", "invoice voided", and "we captured your money and told no one"
+— and the last of those was the bug.
+
+### M.2 The settle table, exhaustive by charge-row state
+
+Priority order; **at most one arm fires**, which is why the two `${K}:refund`
+mint sites cannot collide inside one request.
+
+| In-tx state (authoritative) | Action | Envelope |
+|---|---|---|
+| Open invoice, `markVoid` flips it | void (unchanged, R29/R11) | `voided`, refunded 0 |
+| Succeeded charge **already covered** by non-failed refunds | **SKIP — already settled.** Continue the priority order | (falls through to the next row) |
+| Succeeded charge, PI non-null | mint pending refund, `maxRefund = amount − sumNonFailed` (R9), stored key `${K}:refund`; fired post-commit, sweep re-fires | `refunded`, refunded `maxRefund` |
+| Succeeded charge, PI NULL | one ERROR naming owner/charge/amount — the tripwire; **nothing is minted** (see M.5) | `refund_manual`, `owed_cents` = R9 remainder, refunded 0 |
+| Capture-pending row, pre-tx verdict `released` | flip the row `'failed'` — the established canceled→failed mapping (`stripe.ts` `stripeIntentStatusToChargeStatus`), which also ends the reconciler's claim on it | `released`, `released_cents` = amount |
+| Capture-pending row, pre-tx verdict `refunded` | flip the row `'succeeded'` (the money DID move), then mint the refund exactly as the succeeded arm does | `refunded`, refunded `maxRefund` |
+| Capture-pending row, pre-tx verdict `release_pending` | row LEFT at `'requires_payment'` deliberately — the reconciler must keep claiming it (M.4) | `release_pending`, `released_cents` = amount |
+| None of the above | — | `none`, refunded 0 |
+
+**No DDL.** The release flip reuses `'failed'`; `refunds.stripe_idempotency_key`
+already exists. A `'canceled'` arm on `charge_status` was rejected: it is
+permanent enum surgery, it forks the established mapping, and every reader of
+`'failed'` already means "no money moved on this charge" — exactly true of a
+released authorization.
+
+### M.3 Request order, and where the Stripe calls live
+
+1. **Peek** (`peekCompletedIdempotency`) before any Stripe call. A replayed
+   withdraw returns its stored answer with ZERO Stripe traffic instead of
+   re-deriving a verdict against state its own first attempt moved.
+2. **Advisory guards** on the pool — cohort live, dog owned, live bookings
+   exist, pre-start window open. The same four the transaction re-checks
+   authoritatively under the cohort lock (R22); running them first is the money
+   rule that **no Stripe verb ever fires for a request the tx would refuse**.
+3. **Advisory money-state read**, in the table's priority order. Only a live
+   authorization needs Stripe.
+4. **Pre-tx Stripe settle** (`lib/withdrawSettlement.ts`): retrieve, then act on
+   the LIVE status. Cancellable → cancel now; the cancel returning IS the
+   release. Cancel throws → re-retrieve once: `succeeded` ⇒ refunded,
+   `canceled` ⇒ released, `processing` ⇒ release_pending.
+5. **The transaction** — unchanged skeleton (lock → guards → soft-cancel
+   bookings → `bumpFilled(-1)`) plus the M.2 table.
+
+Every Stripe verb is pre-tx or post-commit: R5 (no Stripe call inside a DB
+transaction) holds. Cancelling INSIDE the tx was rejected for that reason —
+Stripe's own cancel/capture mutual exclusion already buys the same
+exactly-one-of-two without a Stripe call under a held cohort lock.
+
+**The race.** Cancel and capture are mutually exclusive terminal transitions on
+one PaymentIntent and Stripe serializes them; that is the lock, and no DB lock
+is added. Cancel wins ⇒ any capture meets `canceled` and refuses ⇒ the owner was
+told `released`, truthfully. Capture wins ⇒ the cancel throws, the re-retrieve
+reads `succeeded`, the withdraw takes the refund leg ⇒ the owner was told
+`refunded`, truthfully. The pre-tx placement is also what closes the
+enroll-commit → withdraw → `captureHeldDogs` amplification: by the time any
+capture reaches Stripe the intent is already terminal. `captureHeldDogs` itself
+needs no change, and should not be "fixed".
+
+**Abort rule.** A retrieve or cancel with no readable answer ABORTS the whole
+withdraw (rethrow; the tx has not run, so nothing changed and the owner
+retries). Named residual: a cancel that LANDED before its response was lost
+leaves a released hold on a still-enrolled dog — the reconciler's
+`canceled`+owed arm pages that as LOST HOLD (loud, never silent), and the
+owner's retry heals it (`canceled` at retrieve ⇒ released).
+
+### M.4 The capture reconciler gains a precondition and two arms
+
+- **`requires_capture` asks `enrollmentStillOwesMoney` FIRST.** Owed → capture,
+  exactly as before. **Not owed → release**: cancel, flip the row `'failed'`,
+  outcome `'withdrawn-released'`. A cancel that genuinely fails is
+  `'still-failing'` and retried; **capture is never attempted on a not-owed
+  row.** ~~The predicate itself is unchanged — it is asked at two new
+  moments.~~ **SUPERSEDED (§A3.16, 2026-08-22): the predicate's succeeded
+  clause IS respecified** — it consumes
+  `chargesRepository.findUnsettledSucceededCharge` (the ONE succeeded-class
+  money read: newest-first, first positive-remainder row), so a
+  fully-refund-covered charge reads NOT collected and the shadow-window
+  re-enrollment is captured, never released. The raw
+  `findSucceededForCohortDog` is DELETED — a read that can answer "paid" for
+  money already returned must not stay reachable. Consumer walk and the
+  design record: `designs/partial-success-enrollment.md` §A3.16.
+  _(This supersession was typed by the orchestrator per Allison's 2026-08-20
+  scale-down ruling — the §A3.16 builder was stopped before its doc pass;
+  the code and tests it describes were verified landed: scoped 115/115,
+  gate 1194/1194.)_
+- **AMENDED AGAIN (§A3.17, 2026-08-22) — the predicate is ENROLLMENT-scoped,
+  and so is every arm that consumes it.** §A3.16 unified the read but left it
+  keyed on `(cohort, dog)`, and a `(cohort, dog)` is **not an enrollment**:
+  withdraw + re-enroll mints a second one under the same key, and the read fell
+  through a fully-covered newest row to ANY older remainder-positive one —
+  including the previous enrollment's. Two legitimate old-remainder shapes
+  reach it, neither anomalous: a `refund_manual` NULL-PI row (remainder-positive
+  forever, §A3.15 finding 1) and a refund the bank terminally FAILED (drops out
+  of `sumNonFailedForCharge`, R18/R19). Measured end-to-end: an enrolled dog's
+  live authorization was CANCELLED, the class delivered, nothing collected, and
+  the LOST-HOLD alarm could not fire because it lives behind the same predicate
+  that lied.
+  - **Identity, not time.** Every group-class charge now stamps
+    `charges.booking_id` with its enrollment's **anchor** (the
+    earliest-scheduled booking row minted in the same tx/savepoint) at all four
+    mint sites — both enroll paths and both invoice-lane paths, the latter
+    resolving the anchor at mint time and writing NULL under the R11
+    worker/withdraw race. A charge belongs to an enrollment iff its anchor is in
+    the current live booking set, or — for legacy NULL-anchor rows only —
+    `created_at >= min(created_at)` over that set (`>=` is inclusive because
+    Postgres `now()` is transaction-start-stable, so a legacy enroll tx's
+    bookings and its charge carry EQUAL timestamps). One rule, one module:
+    `src/lib/enrollmentIdentity.ts`. **No DDL, no migration, no backfill** — the
+    column already existed and the time rule retires itself as those rows age
+    out. `invoices.booking_id` is deliberately NOT stamped.
+  - `findUnsettledSucceededCharge` takes a **required** `enrollment` argument
+    (the compiler migrated every consumer); within-enrollment newest-first
+    fall-through survives, cross-enrollment fall-through is abolished, and the
+    read's own doc-comment promise — "an older partial remainder … is not this
+    withdraw's business" — is true for the first time.
+    `findPendingCaptureForCohortDog` refuses a STAMPED row of another
+    enrollment; its documented bounded-failure window narrows to
+    within-enrollment rows and is otherwise unchanged.
+  - **All three reconciler arms ask a ROW-SCOPED question first** — "is the
+    enrollment THIS CHARGE belongs to still live?" — before any money question.
+    Capture arm: dead enrollment ⇒ release, never capture, **regardless of what
+    the current enrollment owes** (this closes a double-collect: a withdrawn
+    enrollment's `release_pending` hold was captured beside a re-enrollment's
+    own failing one). LOST-HOLD arm: a canceled row of a dead enrollment is
+    quiet `'released'`; a canceled row of the LIVE enrollment pages even when an
+    old remainder exists. Abandon split: uncollected iff the row's own
+    enrollment is live AND owed. `settlePostWithdrawRefund`'s `stillEnrolled` is
+    row-scoped too, so an old `release_pending` capture completing after a
+    re-enroll now REFUNDS instead of silently paying for the new class (Q-E,
+    default YES — Q-B extended to the re-enrolled case). The release arm's log
+    line was reworded to state the branch's actual basis.
+  - **The withdraw settle** takes THIS withdraw's identity (the pre-cancel live
+    set), advisory and in-tx from the same source so they cannot diverge. A
+    second withdraw after a re-enroll now falls through to the capture-pending
+    class and reports `'released'` + `released_cents` instead of re-answering
+    `'refund_manual'` for a previous enrollment's money and re-firing its ERROR
+    page. A bank-failed old refund is never auto-re-minted — that remainder
+    belongs to the `stripe-failed` human queue by R18/R19's own ruling.
+  - **`GET /enrollments.payment_status`** (a sixth consumer no round had named)
+    gained the same membership rule in SQL: a re-enrolled dog resting on a
+    pending hold reads `'pending'`, not `'paid'` off the previous enrollment's
+    charge. **Enum values, wire shape, and mobile are unchanged** — the fix
+    makes the documented meaning true. Remainder-awareness of `'paid'` stays out
+    of scope (portal surface, Adjudication 8).
+  - **Wire delta: NONE.** No `wire.ts` edit, no version bump, no CHANGELOG
+    entry, no mobile change. Design record:
+    `designs/partial-success-enrollment.md` §A3.17.
+- **AMENDED AGAIN (§A3.18, 2026-08-22) — the adversary round's five rulings.**
+  The §A3.17 build gated GREEN and every R4-3 probe path stayed dead; both
+  enroll mint sites were unbreakable and the `booking_id` consumer sweep found
+  exactly one true positive, already guarded. What survived was design-level:
+  - **D1 (BLOCKER) — the invoice learns its enrollment at MINT time.** §A3.17
+    resolved a group-class charge's anchor from the CURRENT live set at settle
+    time. The webhook lane deliberately settles VOIDED invoices, so
+    `pay-later enroll → PI in flight → withdraw ('voided') → re-enroll → late
+    settle` filed E1's money under E2: E2 read `'paid'` off E1's charge, a
+    terminally-failed duplicate refund reopened the remainder and the
+    reconciler cancelled E2's live hold (**R4-3's shape, resurrected**), and
+    E2's own withdraw refunded E1's money while leaving E2's hold standing.
+    Stamping NULL was executably refuted too — a late settle post-dates E2's
+    birth, so the legacy time rule claims it by construction. **Both
+    group-class `createOpen` sites now stamp the anchor, every invoice-lane
+    charge copies `invoice.booking_id`, and the settle-time resolver is
+    DELETED.** A late settle anchors to E1's CANCELLED row: membership false,
+    row-scoped dead, and the pre-existing void-arm refund returns the money
+    with no new rule anywhere. `ledgerRepository`'s invoice-branch join gains
+    the same `ne(purpose,'group-class')` exclusion the charge branch already
+    had, so ledger output stays byte-identical.
+  - **D2 (HIGH) — R9's cap is a read-modify-write and now holds the row
+    lock.** Two genuinely overlapping transactions (API withdraw vs the
+    scheduler's `settlePostWithdrawRefund`) both read `sumNonFailed = 0` and
+    both committed a full refund under DISTINCT keys — Stripe would execute
+    both. One shared helper (`refundsRepository.mintCappedPendingRefund`:
+    `SELECT … FOR UPDATE` → sum → cap → `createPending`, one transaction)
+    replaces the open-coded sequence at all six mint legs. R5 preserved: no
+    Stripe call under the lock; R35 unchanged.
+  - **D3 (HIGH) — one precision, the database's.** Membership instants are DB
+    MICROSECONDS end to end (`created_at_us` on every identity-feeding
+    projection, `EnrollmentIdentity.bornAtUs`, integer compares); `new Date()`
+    is off the membership path. `Date`'s millisecond truncation had JS calling
+    a charge a member that Postgres said PREDATED the enrollment, and a live
+    hold was released for a dog with four live sessions. SQL sites keep native
+    `timestamptz`.
+  - **D4 (MEDIUM, Q-F default shipped) — the race-won surplus refunds
+    itself.** When the reconciler decided NOT to capture and its release lost
+    to a capture on a still-live enrollment, the build KEPT the money
+    (`'already-captured'`, 24000c for one 12000c class, nothing paged). It now
+    mints an R9-capped, D2-locked refund and reports `'refunded-surplus'` with
+    a loud ERROR. **Worker-internal `CaptureReconcileOutcome`, not a wire
+    value.**
+  - **D5/D6/D7** — `findPendingCaptureForCohortDog` gains the FULL membership
+    rule (a legacy foreign hold was being reported as this withdraw's
+    `released_cents`; it now answers `'none'` and the reconciler releases the
+    foreign hold row-scoped); a partial index
+    `charges_booking_id_idx … WHERE booking_id IS NOT NULL`; and the three
+    "NULL = legacy-only" comments become TRUE under D1 and say so, with the
+    `23503` FK edge documented for ops.
+  - **Wire delta: NONE, verified.** No `wire.ts` edit, no version bump, no
+    CHANGELOG entry, no mobile change. Migrations: **one additive partial
+    index** ⇒ `docker compose down -v` before the gate. Design record:
+    `designs/partial-success-enrollment.md` §A3.18.
+- **AMENDED AGAIN (§A3.19, 2026-08-22) — the last two, both from the design's
+  own sentences.** §A3.18 gated GREEN and every round-1 finding is executably
+  dead; two design-level findings survived.
+  - **F1 (HIGH) — the surplus is a STATE, not a producer.** §A3.18.4's ruling
+    sentence ("when the reconciler ITSELF decided not-owed and its release lost
+    the race") was implemented faithfully as a flag, and that literal scope was
+    the defect: the succeeded-at-retrieve caller reached the IDENTICAL state
+    (row's enrollment live, not owed, money in hand) and returned
+    `'already-captured'` silently. Its ordinary producer is the invoice pay
+    route's async arm — a `processing` intent survives its cancel, the charge
+    rests `requires_payment`, the invoice stays open, the intent succeeds later.
+    Result: 12000c held, the covering invoice still OPEN so `invoiceAutoCharge`
+    would collect the same class again at `due_at`, `payment_status` reading
+    `'paid'`, no page — **and a withdraw from that state answering `'voided'`
+    ("you were never charged") while 12000c sat succeeded with zero refunds.**
+    Now both callers reach one state-scoped decision, and the disposition
+    follows the not-owed SOURCE, which is exhaustive by construction: **open
+    invoice ⇒ this money is the invoice's own payment arrived late ⇒ SETTLE it**
+    (outcome `'settled-invoice'`, atomic `markPaid` claim, `paidChargeId`, the
+    "Payment received" receipt, payment-due teardown — the settle-half of
+    `settleInvoiceCharge` factored so this arm and the pay lane share ONE
+    implementation); **collected elsewhere ⇒ true duplicate ⇒
+    `'refunded-surplus'`**, R9-capped under the D2 lock, now from both callers.
+    Claim returns 0 ⇒ re-read state ⇒ the existing arms. Belt-and-braces: the
+    invoice's anchor must belong to the charge's enrollment, else it is treated
+    as collected-elsewhere and WARN'd. **Q-F updated in place (Q-F′, still
+    default-shipped, still awaiting Allison): money in hand pays the open
+    invoice; true duplicates refund themselves.**
+  - **F2 (MEDIUM) — "no post-deploy path mints a NULL anchor" was false through
+    two doors**, both executed: group-class invoices minted BEFORE the §A3.18
+    stamp existed (a population draining over WEEKS on `due_at` horizons), and
+    `invoices.booking_id`'s `ON DELETE SET NULL` silently orphaning an invoice
+    when an ops script hard-deletes an anchor row. Either way the settle copies
+    NULL, the charge is minted NOW, and the legacy time rule hands it to
+    whatever enrollment is live — the adjudicated-BLOCKER shape. Closed at every
+    invoice-lane mint by an exact **same-transaction witness**: bookings of
+    `(cohort_id, lead_dog_id)` whose `created_at` EQUALS the invoice's
+    `issued_at` (ANY status; `issued_at` is the invoice's transaction stamp —
+    `invoices` has no `created_at`), earliest `scheduled_at` is the anchor. One
+    mechanism covers both doors: a legacy invoice resolves its own CANCELLED
+    rows exactly, an orphan resolves the surviving siblings of the same enroll
+    tx. Miss ⇒ NULL + **WARN naming the invoice**, with the legacy time rule as
+    the net. No backfill (rejected: a data migration in a repo with no migration
+    machinery, for benefit the settle fallback already delivers).
+  - **Riders:** the capped-mint helper's deadlock comment corrected to the TRUE
+    invariant — three of four legs hold other locks first, so the charge is the
+    LAST contended lock, and safety rests on **the helper never waiting on an
+    existing `refunds` row** (a future refunds-row lock or blocking unique index
+    would create a live deadlock pair with the webhook's reverse-order write);
+    plus a note that the cap is serialized against MINTERS only, the webhook's
+    `pending → failed` flip being unlocked with under-refund as the safe stale
+    direction. The µs projections drop their float hop
+    (`::numeric * 1000000`). The overlap barrier's timeout now FAILS instead of
+    silently degrading an overlap proof to a sequential one.
+  - **Wire delta: NONE, verified** — `'settled-invoice'` joins
+    `CaptureReconcileOutcome` (worker-internal); the receipt rides the EXISTING
+    `payment-succeeded` notification type. **Mobile untouched** —
+    `payment_status` becomes true where it was false, same enum, same shapes.
+    Migrations: none beyond §A3.18's index. Design record: §A3.19.
+- **The `succeeded` arm** still flips the row (the honest ledger) and then asks
+  whether the enrollment is GONE (live bookings only — an enrolled dog with an
+  open invoice owes money and must never be refunded here). If gone:
+  `maxRefund = amount − sumNonFailed` (R9 — a withdraw that already minted the
+  refund makes this 0 and the arm a no-op), minted with a ROW-DERIVED stored key
+  `withdraw-refund:<refundId>` and fired immediately; the sweep re-fires it
+  under the same key. Outcome `'refunded-post-withdraw'`. Allison ruled this
+  unattended refund YES (Q-B, 2026-08-21).
+- Tick result gains `withdrawnReleased` and `refundedPostWithdraw`.
+
+`withdraw-refund:<uuid>` is **not** a member of `STRIPE_DERIVED_KEY_SUFFIXES`
+(§K, `db/mutation.ts`): that list is the suffixes appended to a CLIENT's
+`Idempotency-Key`, and this key is minted whole from a uuid we own — exactly
+like `reconcile:charge:<id>:capture` and `dup-settle-refund:<id>`, neither of
+which is in the list either. The client-keyed withdraw refund (`${K}:refund`)
+was already counted there and is unchanged, so **§K's arithmetic is untouched by
+1.12.0**.
+
+Round-2 semantics are preserved point by point: the claim's lease/ordering/
+abandon bounds, the grace, the page caps, the loud-once sets, the
+uncollected-vs-bookkeeping split and both high-water re-alarms. §L.8's residuals
+stand unchanged; the capped-page split is if anything RELIEVED, since
+post-withdraw rows now resolve instead of aging into the bookkeeping population.
+The LOST HOLD alarm gains one new legitimate producer (the crash-after-cancel
+window above), whose printed instruction — "withdraw the dogs" — is already the
+right one.
+
+### M.5 `retry_of` — re-verify before minting (§A3.13, amended by §A3.14)
+
+`POST /enrollments` body gains optional `retry_of: string` — **the client
+`Idempotency-Key` under which this dog's latest EXECUTED payment attempt ran**,
+sent by mobile on an automatic retry. Request bodies remain outside `wire.ts`
+(the §1.2 known gap, unchanged); the field is documented in the [1.12.0]
+CHANGELOG entry beside the response shapes. Bounded by
+`IDEMPOTENCY_KEY_MAX_LEN` for the same reason the header is —
+`${retry_of}:dog:${dogId}` goes to Stripe, and the ADOPTED hold's capture key is
+derived from the REQUEST's own key, so neither derived key can exceed 255.
+**Omitting it hashes identically to a pre-1.12.0 body**, so no in-flight key
+changes meaning; a body that carries it is a different request (both directions
+pinned in the suite).
+
+**It is NOT "the original request's key"** (§A3.14 supersedes §A3.13 on this
+point, after the mobile builder proved the flaw): a chain that always names the
+FIRST attempt re-verifies a dead intent the moment any attempt mints a fresh
+one, and mints a third hold beside the live second. Naming the PREVIOUS
+attempt's key is broken too — an attempt that found the prior intent still
+`processing` minted nothing, so its key names a never-used derived key, which
+confirms FRESH. The client does not infer it at all: **the server names the live
+attempt per dog** (M.5.1), and the client echoes that value.
+
+It exists because Allison overruled the `charge_unverified` exclusion (Q-D:
+*"retry 3 times before settling for yes or no"*), and a retry that simply
+re-authorized under a fresh key would mint a SECOND hold while the first was
+still verifying. So for each dog the authorize step FIRST re-issues the confirm
+under `${retry_of}:dog:${dogId}`, which replays the original intent inside
+Stripe's key window, then RETRIEVES live truth and classifies:
+
+- live `requires_capture` — the verification settled: **adopt** the original
+  hold, enroll on it, capture it. **Zero new intents.**
+- `processing` — still verifying: `charge_unverified` again, nothing minted.
+- `succeeded` — §4 row 3 unchanged: never captured again, never cancelled.
+- terminal (`canceled`, or a refusal resting state) — the prior attempt is dead,
+  so a fresh attempt is minted under `${K2}:dog:${dogId}` and classified
+  normally. The blockerless `charge_failed` arm converges here, unchanged.
+
+**The re-verify is KEY-AGNOSTIC by construction.** The server re-verifies
+whatever `retry_of` arrives and never assumes which attempt that key names; the
+classify matrix above is byte-identical before and after §A3.14. That is what
+makes the echo rule safe to change without touching the money path.
+
+**Cross-owner:** a forged `retry_of` cannot replay another owner's intent — the
+confirm carries THIS principal's customer and payment-method ids, so Stripe
+answers same-key-different-params with `idempotency_error` and no money moves.
+Belt-and-braces, every arm that ADOPTS an intent asserts its `metadata.owner_id`
+against the principal (422 `invalid_payload` otherwise); an ABSENT owner_id is
+refused too, because adoption requires evidence.
+
+**Stripe's idempotency answer is MAPPED, not leaked** (2026-08-21). `retry_of`
+is a client-supplied Idempotency-Key, so the re-verify confirm's
+`idempotency_error` is answered in this API's existing vocabulary for its own
+key store — no new error code, no wire change:
+
+| `stripeIdempotencyErrorKind` | route answer | why |
+|---|---|---|
+| `params-mismatch` | **422 `idempotency_mismatch`** | the key was first used with different parameters, so it is not this request's own earlier attempt; the client must stop, never re-send under a fresh key |
+| `concurrent-request` | **409 `idempotency_inflight`** | two of the owner's own taps racing; the outcome is unknown, the other request owns it, "ask again" is the honest answer |
+
+Non-idempotency errors (transport, configuration) are rethrown untouched and
+remain whole-request failures — unchanged, and deliberately: we do not know
+whether an authorization exists. **Only the re-verify lane is mapped.** A
+params-mismatch on a FRESH mint under this request's own key means our
+bookkeeping and Stripe's disagree about our own attempt, which is not a
+client-input error and keeps its existing loud handling.
+
+Before this, an unhandled `StripeIdempotencyError` reached Fastify, which
+answered with Stripe's own HTTP status (400 or 409) and a body reading
+`{"error":{"code":"internal","message":"Internal Server Error"}}` — a status and
+an envelope that contradicted each other, on a field the client supplies.
+
+**Known, bounded disclosure:** a `retry_of` naming a key Stripe has never seen
+executes fresh; one it HAS seen with other parameters is refused. The two are
+distinguishable, as they were before this mapping. Reaching it means guessing a
+36-char uuid, and what it reveals is only "some request used this string" —
+never whose, never what it bought.
+
+### M.5.1 `verify_key` — the server names the live attempt (§A3.14)
+
+`EnrollmentDogResultWire` gains optional `verify_key: string`, present **iff
+`reason === 'charge_unverified'`** — the only refusal that leaves a LIVE,
+non-terminal intent for this dog. Every other refusal leaves nothing live: a
+decline holds nothing, `requires_action` is cancelled per R2, a found-canceled
+hold is terminal, and an R4 collision is another request's money.
+
+Its value is the client key under which that live intent EXECUTED:
+
+- **this request's own `Idempotency-Key`** when the mint happened now — a fresh
+  authorize whose intent rests at `processing`;
+- **the incoming `retry_of`, carried** when a re-verify found the prior intent
+  still `processing`, because this request minted nothing to name.
+
+The client rule collapses to an echo: `retry_of := the verify_key on that dog's
+latest result row; omitted when absent`. Consequence, superseding §A3.13's "both
+arms" sentence: **blockerless `charge_failed` retries send NO `retry_of`** —
+nothing live exists to re-verify and the fresh mint IS the repair.
+
+The distinction cannot be inferred client-side, which is why it is on the wire:
+a FRESH mint whose own intent goes `processing` is reported `charge_unverified`
+byte-identically to a no-mint still-processing re-verify, so a client carrying
+`retry_of` forward on both would re-verify a dead intent and mint beside a live
+one. The constructor takes `verifyKey` as a REQUIRED parameter for the same
+reason — a caller that had to remember would eventually not.
+
+The value is always a key this client itself minted, so echoing it discloses
+nothing. **Invariant guaranteed:** at any instant along an envelope-carrying
+retry chain, at most one live non-terminal PaymentIntent exists per dog. The
+lost-response path (no envelope arrives, so the loop stops) inherits §L.8's
+stranded-hold residual — named, bounded, money-safe, and not created here.
+
+### M.6 Cross-note to §L.8 — what 1.12.0 does NOT close
+
+Every §L.8 residual stands. Additionally:
+
+- **The withdraw's advisory money-state read is single-row and newest-first.** A
+  (cohort, dog) can carry both an enrollment hold and an invoice-lane
+  bookkeeping row, and this query cannot tell them apart (§L.6). Newest-first
+  picks the live attempt in every ordinary sequence; when it does not, the
+  withdraw truthfully reports on the row it settled and the reconciler's
+  not-owed arm releases the other within a tick. Bounded, covered, not
+  eliminated.
+- **The NULL-PI succeeded arm still cannot return money.** The queued
+  withdraw-NULL-PI design owns the fix; the interim is one ERROR line at the
+  moment it becomes true, so the gap is loud rather than silent. Since
+  §A3.15 the OWNER is told the truth about it too — `'refund_manual'` with
+  `owed_cents` commits to the refund and is honest that a human makes it —
+  but no machinery was added, and `'refund_manual'` stays the correct outcome
+  value when the queued design lands.
+- **An out-of-band PARTIAL refund plus the re-enroll shadow** yields a true
+  `'refunded'` sentence for the OLD charge's remainder while the new live hold
+  is released later by the reconciler (`'withdrawn-released'`) without being
+  mentioned in the withdraw response. Four conditions must coincide;
+  money-correct, statement-quiet. Accepted at this round, same class as the Q4
+  statement-visibility flag.
+- **A `retry_of` whose original CRASHED before settling its own
+  `requires_action` refusal** leaves an intent that can still advance to a hold
+  nobody owns. It belongs to the original request (provenance `'replayed'`), so
+  R1 forbids cancelling it; it expires on the card network. Same class as §L.8's
+  first bullet.
+- **Real-Stripe cancel semantics per status, and the cancel-vs-capture race at
+  the real API, are stub-modelled and unmeasured.** So are the copy's
+  timeframes (5–10 business days for a refund; ~a week for a hold release),
+  which are card-network norms Allison approved as drafted, not probe results.
+  The §12 Stripe probe extension now has three questions worth adding:
+  cancel-of-`processing` refusal, the cancel-vs-capture race, and statement
+  visibility of a released hold.

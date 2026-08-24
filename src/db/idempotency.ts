@@ -1,4 +1,4 @@
-import { eq, lt, sql } from 'drizzle-orm';
+import { and, eq, isNotNull, lt, sql } from 'drizzle-orm';
 import { db } from './client.js';
 import { ApiError } from '../lib/errors.js';
 import { idempotencyKeys } from './schema/schema.js';
@@ -169,6 +169,55 @@ export async function peekCompletedIdempotency<T>(
     body: existing.responseBody as T,
     replayed: true,
   };
+}
+
+/**
+ * Amend the STORED response of an already-completed idempotency record
+ * (2026-08-20, manual-capture enrollments).
+ *
+ * `withIdempotency` stores the response at COMMIT time, which is the honest
+ * moment for every mutation whose truth is complete at commit. Manual capture
+ * introduces one that isn't: `POST /enrollments` commits the enrollment and
+ * then captures each dog's authorization, so the body stored in-tx says
+ * `payment_state: 'pending'` and `total_captured_cents: 0` for money that moves
+ * a few hundred milliseconds later. Without this, a client that retried after
+ * the capture would replay a body claiming nothing had been charged while the
+ * charge rows said otherwise — a replay that is *less* true than the original
+ * response, which defeats the point of storing one.
+ *
+ * Deliberately narrow, because this rewrites the record a client's retry is
+ * answered from:
+ *   - Only a row that is **already completed** is touched. An in-flight claim
+ *     belongs to the request executing under it.
+ *   - `endpoint` + `requestHash` must match, same as `peekCompletedIdempotency`
+ *     — a key that has since been reused for a different request is a client
+ *     bug and must not have its record overwritten by this one.
+ *   - The **status is not changed.** 201 stays 201. Capture completing does
+ *     not change what happened; it changes what is true about the money.
+ *
+ * Pool runner: this fires post-commit, outside the request transaction, and
+ * must not be able to roll back the enrollment it is describing. Returns
+ * whether a row was amended, so the caller can log the miss rather than assume.
+ */
+export async function updateStoredResponse<T>(args: {
+  key: string;
+  endpoint: string;
+  requestHash: string;
+  body: T;
+}): Promise<boolean> {
+  const updated = await db
+    .update(idempotencyKeys)
+    .set({ responseBody: args.body as unknown })
+    .where(
+      and(
+        eq(idempotencyKeys.key, args.key),
+        eq(idempotencyKeys.endpoint, args.endpoint),
+        eq(idempotencyKeys.requestHash, args.requestHash),
+        isNotNull(idempotencyKeys.completedAt),
+      ),
+    )
+    .returning({ key: idempotencyKeys.key });
+  return updated.length > 0;
 }
 
 /**

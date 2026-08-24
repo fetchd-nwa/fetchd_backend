@@ -1120,6 +1120,38 @@ CREATE TABLE charges (
   currency                text NOT NULL DEFAULT 'usd',
   status                  charge_status NOT NULL DEFAULT 'requires_payment',
   purpose                 charge_purpose NOT NULL,
+  -- Δ 2026-08-22 (ADDENDUM 3 §A3.17, amended by §A3.18): on a GROUP-CLASS
+  -- charge this is the enrollment's ANCHOR — the earliest-scheduled booking row
+  -- minted in the same tx/savepoint — NOT a booking-lane link. It is the
+  -- enrollment's IDENTITY: a (cohort, dog) is not an enrollment (withdraw +
+  -- re-enroll mints a second one under the same key), and without an anchor
+  -- every money read fell through from one enrollment to the previous one's
+  -- charge. Membership rule, in `src/lib/enrollmentIdentity.ts`: anchor ∈ the
+  -- current live booking set, or — for LEGACY rows, which carry NULL —
+  -- created_at >= the enrollment's birth, compared in DB microseconds.
+  --
+  -- **NULL means legacy — nearly.** §A3.17 left one live producer of fresh
+  -- NULLs: the invoice lane resolved this column from the CURRENT live set at
+  -- settle time. A late settle of a VOIDED invoice therefore filed a dead
+  -- enrollment's money onto the live one — and NULL was no better, because a
+  -- late settle post-dates the new enrollment's birth and the time rule claimed
+  -- it anyway. §A3.18 D1 made group-class INVOICES carry their own anchor from
+  -- mint time, with every invoice-lane charge copying it.
+  --
+  -- **That still left two doors (§A3.19 F2), both executed:** invoices minted
+  -- BEFORE the stamp existed (draining over WEEKS on due_at horizons), and
+  -- `invoices.booking_id`'s ON DELETE SET NULL silently orphaning an invoice
+  -- when an ops script hard-deletes an anchor row. Both are closed at the mint
+  -- by an exact same-transaction witness: bookings of (cohort_id, lead_dog_id)
+  -- whose created_at EQUALS the invoice's issued_at, ANY status. So a
+  -- post-deploy NULL here now means only that the witness found nothing — and
+  -- that mint WARNs, naming the invoice. No backfill.
+  --
+  -- **FK edge, for ops:** this reference has no ON DELETE, so hard-deleting a
+  -- booking row that an anchored charge points at raises 23503. Production
+  -- soft-cancels (`status`/`expired_at`) and never hard-deletes, but scripts and
+  -- test teardowns must drop charges BEFORE bookings. (`invoices.booking_id` is
+  -- ON DELETE SET NULL, so the invoice side degrades instead of throwing.)
   booking_id              uuid REFERENCES bookings(id),
   -- Δ 2026-06-09: group-class enrollment is paid per-(cohort, dog) so a single
   -- dog can be unenrolled + refunded independently. Both NULL for non-enrollment
@@ -1130,6 +1162,14 @@ CREATE TABLE charges (
   updated_at              timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX charges_owner_idx ON charges (owner_id);
+-- Δ 2026-08-22 (ADDENDUM 3 §A3.18 D6). `booking_id` stopped being a passive
+-- back-reference when §A3.17 made it money-path IDENTITY: it is read by the
+-- enrollment-membership rule on every withdraw, every reconciler tick and every
+-- `payment_status` render, and it is scanned by the FK check behind every
+-- bookings DELETE (`findSucceededForBooking` seq-scanned it). PARTIAL because
+-- NULL dominates legacy populations and a NULL anchor answers no question worth
+-- indexing. Additive; no behavioral surface.
+CREATE INDEX charges_booking_id_idx ON charges (booking_id) WHERE booking_id IS NOT NULL;
 
 ALTER TABLE credit_ledger
   ADD CONSTRAINT credit_ledger_charge_fk

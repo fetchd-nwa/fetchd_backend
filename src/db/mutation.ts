@@ -15,7 +15,7 @@ import { withActor, type Tx } from './tx.js';
  * **The bound is DERIVED, not chosen (2026-08-20).** Routes do not send the
  * client's key to Stripe; they send SUFFIXED keys built from it
  * (`` `${idempotencyKey}:refund` ``, `` `${idempotencyKey}:payment-intent` ``,
- * `` `${idempotencyKey}:enroll-unwind:${dogId}` ``, …). Stripe's own limit is
+ * `` `${idempotencyKey}:dog:${dogId}:capture` ``, …). Stripe's own limit is
  * 255, so accepting a 255-char client key mints derived keys of up to 306
  * characters — keys Stripe rejects outright.
  *
@@ -49,9 +49,21 @@ export const STRIPE_DERIVED_KEY_SUFFIXES = [
   ':customer', // paymentMethods
   ':setup-intent', // paymentMethods
   ':confirm-unwind', // requestConfirmPayment
-  `:enroll-unwind:${'x'.repeat(36)}`, // enrollments — suffix + a uuid dog id
-  `:dog:${'x'.repeat(36)}`, // enrollments — per-dog pay-now charge loop
+  `:dog:${'x'.repeat(36)}`, // enrollments — per-dog pay-now AUTHORIZE
+  `:dog:${'x'.repeat(36)}:capture`, // enrollments — that dog's CAPTURE (1.11.0)
 ] as const;
+// Removed 2026-08-20 with the code that minted it: `:enroll-unwind:<uuid>` was
+// `unwindCapturedIntents`'s refund key, and manual capture deleted the unwind
+// (a failed enrollment now releases a HOLD — `cancelPaymentIntent` takes no
+// idempotency key at all). It was the longest suffix at 51, so dropping it on
+// its own would have moved the bound from 204 to 214; adding
+// `:dog:<uuid>:capture` at 49 — the new longest — puts it at 206. Net for
+// wire 1.11.0: 204 → 206, a two-character LOOSENING, not a tightening.
+// Nothing real moves either way, since both clients mint 36-char uuids. The
+// point is that the number is DERIVED from what the code actually sends:
+// leaving a dead suffix here to "be safe" would keep the bound at 204 by
+// describing a key no route can produce, which is the dishonesty this list
+// exists to prevent. (DATA-CONTRACT §K and §L.4 state the same arithmetic.)
 
 const LONGEST_DERIVED_SUFFIX = Math.max(...STRIPE_DERIVED_KEY_SUFFIXES.map((x) => x.length));
 

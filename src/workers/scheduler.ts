@@ -34,6 +34,10 @@ import {
 } from '../lib/expoPush.js';
 import type { R2Client } from '../lib/r2.js';
 import type { StripeClient } from '../lib/stripe.js';
+import {
+  runCaptureReconcilerOnce,
+  type CaptureReconcilerTickResult,
+} from './captureReconciler.js';
 import { runInvoiceAutoChargeOnce, type InvoiceAutoChargeTickResult } from './invoiceAutoCharge.js';
 import {
   runInvoiceAttemptVerifyOnce,
@@ -77,6 +81,14 @@ interface WorkerLogger {
  *      Deliberately BEFORE the charge pass: the charge lane refuses to charge
  *      an invoice with an unresolved attempt, so resolving doubt first is what
  *      keeps that refusal from also meaning "and therefore never charged".
+ *
+ *   3a-ter. **Capture reconciler** (2026-08-20, wire 1.11.0). Finish
+ *      collecting money we already HOLD. Manual capture on `POST /enrollments`
+ *      leaves one new state behind — a dog enrolled with its authorization not
+ *      yet captured — and this phase captures it, or raises the one alarm a
+ *      human must see: an enrolled dog whose hold is GONE will never be
+ *      charged. Before the charge pass for the same reason as its neighbours:
+ *      resolve what is already in flight before starting anything new.
  *
  *   3a-bis. **Duplicate-refund retry** (2026-08-12). Re-fire lost-race refund
  *      rows still `pending` with no `stripe_refund_id`, under the SAME
@@ -160,6 +172,7 @@ export interface SchedulerTickResult {
   invoiceOverdue: EnqueueInvoiceOverdueWarningsResult;
   cardExpiry: EnqueueCardExpiryWarningsResult;
   invoiceAttemptVerify: InvoiceAttemptVerifyTickResult;
+  captureReconciler: CaptureReconcilerTickResult;
   duplicateRefundRetry: DuplicateRefundRetryTickResult;
   invoiceAutoCharge: InvoiceAutoChargeTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
@@ -241,6 +254,43 @@ export async function runSchedulerTickOnce(
         err: err instanceof Error ? err.message : String(err),
       },
       'invoice-attempt-verify phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 3a-ter — finish collecting money we already HOLD, before anything
+  // else touches a card. Manual capture (wire 1.11.0) leaves exactly one new
+  // state behind — a dog enrolled with its authorization not yet captured —
+  // and this is the phase that closes it or names it. It runs before the
+  // charge lane for the same reason the verify lane does: resolve what is
+  // already in flight before starting anything new. Own log-and-swallow
+  // boundary like every sibling.
+  let captureReconcilerResult: CaptureReconcilerTickResult = {
+    scanned: 0,
+    captured: 0,
+    lostHolds: 0,
+    withdrawnReleased: 0,
+    refundedPostWithdraw: 0,
+    refundedSurplus: 0,
+    settledInvoices: 0,
+    abandoned: 0,
+    abandonedTruncated: false,
+    abandonedUncollected: 0,
+    results: [],
+  };
+  try {
+    captureReconcilerResult = await runCaptureReconcilerOnce({
+      ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
+      now,
+      log,
+    });
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'capture-reconciler',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'capture-reconciler phase threw at the worker boundary; will retry next tick',
     );
   }
 
@@ -477,6 +527,7 @@ export async function runSchedulerTickOnce(
     scheduledNotifications: notificationsResult,
     membershipRoll: membershipRollResult,
     invoiceAttemptVerify: invoiceAttemptVerifyResult,
+    captureReconciler: captureReconcilerResult,
     duplicateRefundRetry: duplicateRefundRetryResult,
     invoiceAutoCharge: invoiceResult,
     mediaDerivatives: mediaDerivativesResult,
