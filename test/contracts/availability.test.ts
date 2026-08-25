@@ -267,9 +267,9 @@ async function insertBookingAt(opts: {
     durationMinutes: 540,
     location: 'fayetteville',
   });
-  await db.insert(bookingDogsTable).values(
-    opts.dogIds.map((dogId, i) => ({ bookingId, dogId, isLead: i === 0 })),
-  );
+  await db
+    .insert(bookingDogsTable)
+    .values(opts.dogIds.map((dogId, i) => ({ bookingId, dogId, isLead: i === 0 })));
   return bookingId;
 }
 
@@ -416,9 +416,12 @@ test(
     // Two bookings ONE HOUR apart straddle it:
     //   04:30Z = 2026-10-31 23:30 CDT → Chicago date 10-31, OUTSIDE the window
     //   05:30Z = 2026-11-01 00:30 CDT → Chicago date 11-01, INSIDE it
-    // Only the second may consume a seat. Hard-code a UTC-6 lower bound and
-    // the first one gets pulled in and this reads 1; drop the lower bound and
-    // it reads 1 as well.
+    // Only the second may consume a seat. The proven failure mode (executed,
+    // r2-item2-mutation-fixedoffset.log): swap the zone for permanent-CST
+    // America/Regina and the lower bound lands at 06:00Z instead of 05:00Z —
+    // the 00:30 CDT booking falls OUT of the window and school_remaining
+    // reads 3, failing exactly this test. (An earlier draft of this comment
+    // mis-stated the direction; 2.6 final pass corrected it.)
     const overrideDate = '2026-11-01';
     await db.insert(dayCapacityTable).values({
       location: 'fayetteville',
@@ -461,7 +464,10 @@ test(
       await db
         .delete(dayCapacityTable)
         .where(
-          and(eq(dayCapacityTable.location, 'fayetteville'), eq(dayCapacityTable.date, overrideDate)),
+          and(
+            eq(dayCapacityTable.location, 'fayetteville'),
+            eq(dayCapacityTable.date, overrideDate),
+          ),
         );
       await invalidatePattern('avail:fayetteville:*');
     }

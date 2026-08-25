@@ -180,6 +180,35 @@ Fix round 1 (2.6 adversary, both lanes; 2026-08-25):
   orphaned `refund_manual` continuation line so the money vocabulary reads
   correctly. The §13 #2 audit reads this block against THIS exception.
 
+Fix round 2 + final pass (2.6 adversary re-verify; 2026-08-25 afternoon):
+
+- Round 2 (backend `2a0e99c`): the notification dismissal's DEAD-DOG arm
+  closed — `findOwnerIdAnyInTx` (lifecycle-blind owner lookup; a dead dog
+  still names its owner) replaces the live-filtered lookup on the
+  report-delete retraction path, red-first against the adversary's exact
+  reproduction, the false "rides its own dog's disappearance" comment
+  deleted, and the two sibling live-filter callers audited as correct
+  (creation gates, loud 404s). `findBookedCountsInRange`'s date window
+  rewritten SARGABLE (Postgres-side timestamptz bounds — single tz
+  authority with the GROUP BY bucket; EXPLAIN: window moved from Filter
+  into Index Cond, bound params included; DST equivalence proven by a
+  20-year Chicago-midnight sweep + a 5,094-instant transition sweep, 0
+  mismatches; new fall-back-night guard test proven by zone mutation).
+  Straggler citations repaired. Gate GREEN 1372/1372.
+- Final pass (both lanes, own probes): every round-2 finding re-killed
+  independently (isolated-tree red-first re-run; parameterized EXPLAIN on
+  a purpose-built 120k-row table; all three repos' wire bodies
+  sha-identical at 1.13.0). Verdict CLEAN TO CLOSE — remaining items were
+  doc-accuracy only, fixed at close: the dead-dog safety comment's false
+  NOT NULL claim corrected (owner_id is NULLABLE in DDL — staff-owned
+  dogs; the write-path immutability argument stands), the DST guard
+  comment's mis-stated failure modes replaced with the executed one, the
+  "no Filter at all" EXPLAIN overstatement scoped to the date window, the
+  bidirectional coupling note restored on `assertCapacityWithinLock`, the
+  notifications mutation inventory updated, and two schema.sql citations
+  re-anchored (+45 drift). The umbrella + backend instruction files'
+  "portal has no contract sync" claims retired (2.5 built it).
+
 NOTE ON NUMBERING: the completion plan (2026-08-20) reserved "1.12.0" for
 this bump; 1.12.0 shipped 2026-08-21 with the withdraw settlement envelope.
 Read every plan citation of "wire 1.12.0" in its Phase 2/§8 as 1.13.0, and

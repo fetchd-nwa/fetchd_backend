@@ -453,10 +453,15 @@ async function findOwnerIdInTx(tx: Tx, dogId: string): Promise<string | undefine
  * nothing, and no notification read joins `dogs` — nothing else was ever
  * going to clean that row up.
  *
- * Safe by column semantics, not by luck: `dogs.owner_id` is NOT NULL and no
- * write path changes it — `DogUpdate` (:71-81) has no `ownerId` member, and
- * none of the four `update(dogs)` sites set one. A dog names the same owner
- * for its whole life, dead or alive.
+ * Safe by write-path semantics, not by luck: no write path changes
+ * `dogs.owner_id` — `DogUpdate` (:71-81) has no `ownerId` member, and none of
+ * the four `update(dogs)` sites set one. A dog names the same owner for its
+ * whole life, dead or alive. (The DDL itself leaves `owner_id` NULLABLE —
+ * `schema.sql:290` has no NOT NULL, because staff-owned dogs carry
+ * `staff_owner_id` instead — so callers on paths reachable by staff-owned
+ * dogs must handle `undefined`; the report-delete path cannot be, since
+ * POST /staff/reports 404s staff-owned dogs. 2.6 final pass corrected an
+ * earlier draft of this comment that claimed NOT NULL.)
  */
 async function findOwnerIdAnyInTx(tx: Tx, dogId: string): Promise<string | undefined> {
   const [row] = await tx

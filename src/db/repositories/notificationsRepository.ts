@@ -2,7 +2,10 @@ import { and, asc, count, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle
 import { db } from '../client.js';
 import { notificationDogs, notifications } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
-import type { NotificationDeepLinkKind, NotificationRowForWire } from '../../lib/notificationWire.js';
+import type {
+  NotificationDeepLinkKind,
+  NotificationRowForWire,
+} from '../../lib/notificationWire.js';
 
 type NotificationType = (typeof notifications.$inferInsert)['type'] extends infer T
   ? T & string
@@ -69,11 +72,7 @@ export const notificationsRepository = {
       .select(NOTIFICATION_PROJECTION)
       .from(notifications)
       .where(
-        and(
-          eq(notifications.ownerId, ownerId),
-          isNull(notifications.dismissedAt),
-          cursorCondition,
-        ),
+        and(eq(notifications.ownerId, ownerId), isNull(notifications.dismissedAt), cursorCondition),
       )
       .orderBy(desc(notifications.receivedAt), desc(notifications.id))
       .limit(limit);
@@ -207,7 +206,9 @@ export const notificationsRepository = {
    * INSERT a notifications row (+ optional notification_dogs join
    * rows). The feed is content-immutable; the only mutations are read
    * (`markReadForOwner` / `markAllReadForOwner`) and dismiss
-   * (`dismissForOwner`, a soft tombstone) — the row is never destroyed.
+   * (`dismissForOwner` and, since the 1.13.0 fix round,
+   * `dismissByDeepLinkTarget` — both soft tombstones) — the row is never
+   * destroyed.
    *
    * Day 12 added the first write path: the staff approve verb enqueues
    * a `booking-confirmed` notification when a non-B&T request converts

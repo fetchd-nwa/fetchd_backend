@@ -36,9 +36,9 @@ client repo — a candidate for extraction to the umbrella alongside
 - The DEV-RESET `DROP SCHEMA` preamble in `schema.sql` stays **commented** in
   git — CI asserts this before every schema load.
 - `src/contracts/wire.ts` is dependency-free by construction (it is copied
-  verbatim into client bundles). Today only the mobile app generates from it;
-  the canonical portal (`fetchd_staff_portal_desktop`) has no
-  `sync-contracts.mjs` yet — when built it copies wire.ts verbatim (env override
+  verbatim into client bundles). BOTH clients generate from it —
+  mobile and, since wire 1.13.0 (2.5), the portal (`fetchd_staff_portal_desktop`,
+  its `sync-contracts.mjs` resolving this repo ONE level up; env override
   `FETCHD_API_WIRE`). Changing a wire shape means editing it HERE and
   re-running each client's sync — never editing a generated copy.
 - Tests are `node:test`, sequential (`--test-concurrency=1`), against the
@@ -52,13 +52,13 @@ client repo — a candidate for extraction to the umbrella alongside
 - `src/contracts/wire.ts` is THE versioned API contract for all three repos.
   Every edit to it bumps `WIRE_CONTRACT_VERSION` (semver: major =
   remove/rename/retype, minor = additive, patch = doc-only), adds an entry to
-  `src/contracts/CHANGELOG.md`, and requires resyncing every generated client — today the mobile app via `npm run sync:contracts` (the portal joins once its sync exists — to-build), in their own repos' commits — plus a row in the orchestrator's `STATUS.md`.
+  `src/contracts/CHANGELOG.md`, and requires resyncing every generated client — mobile AND the portal, each via its own `npm run sync:contracts` (both exist since wire 1.13.0), in their own repos' commits — plus a row in the orchestrator's `STATUS.md`.
 - The operating manual is `<umbrella>/ORCHESTRATOR.md`; the shared alignment
   log is `<umbrella>/STATUS.md` next to it — both live in the umbrella repo.
   Read STATUS.md at session start when doing contract-touching work; update it
   at session end.
 - Wire-contract changes ripple to the mobile app's repository layer today, and
-  to the portal once its `sync-contracts.mjs` exists (to-build). Flag both in
+  to the portal's generated `src/api/contracts.ts` (sync built in wire 1.13.0's 2.5). Flag both in
   the handoff when you change `src/contracts/wire.ts`.
 - The monorepo's `api/` folder was **removed 2026-07-18** — the extraction is
   complete and this repo is the only backend. (The monorepo still carries a

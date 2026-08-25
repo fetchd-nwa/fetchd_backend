@@ -4243,7 +4243,7 @@ export interface StaffRateHistoryWire extends StaffRateWire {
  * seats left.** Each `*_openings` number is the live `day_capacity` override
  * row for (location, date) or, where no override exists, the API default
  * rule — weekend (Sat/Sun) = 0/0 closed, weekday = 3/3
- * (`lib/availability.ts:16-49`; `schema.sql:815`; R4 @
+ * (`lib/availability.ts:16-49`; `schema.sql:860`; R4 @
  * BUSINESS-LOGIC/bookings-scheduling.md:52, R22 @ :94). Nothing is
  * subtracted from `*_openings` for dogs already booked — a fully-booked day
  * still reports its full configured openings THERE, and D9 @
@@ -4291,7 +4291,7 @@ export interface DayCapacityWire {
  *
  * Staff-only: owner principals get 403 on both verbs
  * (`staffCancelWindow.ts:90, :109`). The list is always 7 rows — one per
- * `service_category`, seeded at 48h flat (`schema.sql:844`, seed `:851-858`;
+ * `service_category`, seeded at 48h flat (`schema.sql:889`, seed `:896-903`;
  * BUSINESS-LOGIC/bookings-scheduling.md:14).
  *
  * `updated_at` is ISO-8601, converted from the pg timestamp

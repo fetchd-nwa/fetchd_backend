@@ -155,9 +155,12 @@ export const dayCapacityRepository = {
    *
    *   before → `Index Cond: (location = …)`
    *            `Filter: ((scheduled_at AT TIME ZONE …)::date >= … AND <= …)`
-   *   after  → `Index Cond: (location = … AND scheduled_at >= … AND < …)`,
-   *            no Filter at all — verified with bound parameters, not just
-   *            literals.
+   *   after  → `Index Cond: (location = … AND scheduled_at >= … AND < …)` —
+   *            the DATE WINDOW moved from the Filter into the Index Cond
+   *            (verified with bound parameters, not just literals). The full
+   *            query's node still carries a residual Filter for its
+   *            non-indexed predicates (status, live, category) — that part
+   *            is inherent, not the finding this rewrite fixed.
    *
    * **Why the two forms select exactly the same rows.** An instant falls on
    * Chicago calendar date D iff it is in `[midnight(D), midnight(D+1))`, so
@@ -251,6 +254,12 @@ export const dayCapacityRepository = {
    * encoding so the calendar bucket the route stamps equals the calendar
    * bucket the capacity check counts against — both are
    * `bucketToChicagoDate(bookings.scheduled_at)`.
+   *
+   * COUPLING (bidirectional): `findBookedCountsInRange` above counts THIS
+   * predicate's exact population through a sargable instant-range spelling —
+   * if you edit either WHERE clause, re-prove the row sets equal and update
+   * BOTH doc blocks (the calendar starts lying in a new direction the day
+   * they diverge; 2.6 final pass).
    *
    * Throws `insufficient_capacity` 422 with structured details on the
    * failing path; returns normally on success. Idempotent within a tx —

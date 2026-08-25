@@ -385,8 +385,10 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
         // outcome of `DELETE /dogs/:id`, not an exotic one (2.6 adversary,
         // fix round 2). Nothing else would have caught it: soft-expire is an
         // UPDATE, so no FK cascade fires, and no notification read joins
-        // `dogs`. `undefined` here now means only "no such dog id", which
-        // cannot happen behind a live report's FK.
+        // `dogs`. `undefined` here now means "no such dog id" or a
+        // staff-owned dog (`owner_id` is nullable in DDL for those) —
+        // neither can exist behind a live report, since POST /staff/reports
+        // 404s both; the guard below stays for defense in depth.
         const ownerId = await dogsRepository.findOwnerIdAnyInTx(tx, expired.dogId);
         if (ownerId !== undefined) {
           await notificationsRepository.dismissByDeepLinkTarget(tx, {
