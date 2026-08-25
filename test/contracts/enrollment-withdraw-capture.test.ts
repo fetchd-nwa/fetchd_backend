@@ -20,6 +20,7 @@ import { runCaptureReconcilerOnce } from '../../src/workers/captureReconciler.js
 import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRetry.js';
 import { bookingsRepository } from '../../src/db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
+import { refundsRepository } from '../../src/db/repositories/refundsRepository.js';
 import { enrollmentIdentityOf } from '../../src/lib/enrollmentIdentity.js';
 import { withActor } from '../../src/db/tx.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
@@ -222,6 +223,7 @@ async function refundRows(
     chargeId: string;
     amountCents: number;
     status: string;
+    reason: string | null;
     stripeIdempotencyKey: string | null;
     stripeRefundId: string | null;
   }[]
@@ -238,6 +240,7 @@ async function refundRows(
         chargeId: refundsTable.chargeId,
         amountCents: refundsTable.amountCents,
         status: refundsTable.status,
+        reason: refundsTable.reason,
         stripeIdempotencyKey: refundsTable.stripeIdempotencyKey,
         stripeRefundId: refundsTable.stripeRefundId,
       })
@@ -1848,8 +1851,13 @@ test(
     // AMENDS §A3.9 test 8, which pinned `'none'`. R4-1 finding 1: `'none'`
     // renders "There's no charge on file to return." — affirmatively FALSE to
     // an owner who IS owed money, and the one sentence in this build that
-    // would make them stop pursuing it. The money handling is unchanged (the
-    // queued unroutable design still owns the mint); only the SENTENCE is.
+    // would make them stop pursuing it.
+    //
+    // AMENDED AGAIN by money-residue 1.2 (2026-08-24): the sentence was the
+    // only thing that changed in 2026-08-21, and the clause "this arm STILL
+    // MINTS NOTHING" is now retired. The obligation is a terminal `'unroutable'`
+    // ROW, minted through the one capped-mint helper under the charge row's
+    // lock — the same shape `cancelBookingService` has used since 2026-08-19.
     const cohort = await makeCohort();
     const capture = makeLogCapture();
     const { app, stripe } = trackedApp(capture);
@@ -1891,8 +1899,17 @@ test(
       );
       assert.equal(body.refunded_cents, 0, 'nothing was minted — refunded_cents keeps its invariant');
       assert.equal(countCalls(stripe, 'createRefund'), 0, 'there is nowhere to send it');
-      const noMint = await refundRows(cohort.id);
-      assert.equal(noMint.length, 0, 'the queued unroutable design owns the mint, not this arm');
+      // THE MINT (money-residue 1.2). The promise is a ROW now, not a log line:
+      // the abandon report can see it, a restart cannot forget it, and — the
+      // money half — it counts against R9's cap so no later leg can promise
+      // the same money twice.
+      const minted = await refundRows(cohort.id);
+      assert.equal(minted.length, 1, 'the hand-made promise is RECORDED');
+      assert.equal(minted[0]!.status, 'unroutable', 'terminal at birth — no sweep, no webhook');
+      assert.equal(minted[0]!.amountCents, PUPPY_PRICE_PER_DOG_CENTS, 'the LOCKED cap');
+      assert.equal(minted[0]!.reason, 'cancel', 'the same reason string the cancel lane writes');
+      assert.equal(minted[0]!.stripeIdempotencyKey, null, 'there is no Stripe call to key');
+      assert.equal(minted[0]!.stripeRefundId, null);
 
       const alarms = capture.lines.filter(
         (line) =>
@@ -3198,6 +3215,233 @@ test(
         (withField.json() as { error: { code: string } }).error.code,
         'idempotency_mismatch',
         'because retry_of IS part of the body, and a body that carries it is a different mutation',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// money-residue 1.2 — the withdraw NULL-PI gap
+//
+// The `refund_manual` arm recorded the obligation NOWHERE: one ERROR log, no
+// row, and R9's cap left wide open forever (`chargesRepository`'s own comment
+// said "remainder-positive forever, by design" — a design this lane retires).
+// Everything below either proves the row exists and closes the cap, or proves
+// the row stays out of every worklist it has no business in.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * A withdrawn enrollment whose money sat on a succeeded charge with NO
+ * PaymentIntent — pre-Stripe-wire seed money. Returns the charge and what the
+ * withdraw answered.
+ */
+async function withdrawNullPiEnrollment(opts: {
+  cohortId: string;
+  app: ReturnType<typeof makeContractApp>['app'];
+  key: string;
+  amountCents?: number;
+  priorRefundCents?: number;
+}): Promise<{ chargeId: string; body: EnrollmentWithdrawResultWire; statusCode: number }> {
+  const res = await enroll({
+    app: opts.app,
+    cohortId: opts.cohortId,
+    dogIds: [FIXTURE_IDS.dog1Id],
+    key: `nullpi-${randomUUID()}`,
+    payLater: true,
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, opts.cohortId));
+  const chargeId = randomUUID();
+  await db.insert(chargesTable).values({
+    id: chargeId,
+    ownerId: FIXTURE_IDS.ownerId,
+    stripePaymentIntentId: null,
+    amountCents: opts.amountCents ?? PUPPY_PRICE_PER_DOG_CENTS,
+    status: 'succeeded',
+    purpose: 'group-class',
+    cohortId: opts.cohortId,
+    dogId: FIXTURE_IDS.dog1Id,
+  });
+  if (opts.priorRefundCents !== undefined) {
+    await db.insert(refundsTable).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: opts.priorRefundCents,
+      status: 'succeeded',
+      reason: 'cancel',
+      stripeIdempotencyKey: null,
+    });
+  }
+  const out = await withdraw({
+    app: opts.app,
+    cohortId: opts.cohortId,
+    dogId: FIXTURE_IDS.dog1Id,
+    key: opts.key,
+  });
+  return {
+    chargeId,
+    statusCode: out.statusCode,
+    body: out.json() as EnrollmentWithdrawResultWire,
+  };
+}
+
+test(
+  'money-residue 1.2 — the unroutable row CLOSES the cap: nothing can ever mint against this charge again',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort();
+    const { app } = trackedApp();
+    try {
+      const { chargeId, body } = await withdrawNullPiEnrollment({
+        cohortId: cohort.id,
+        app,
+        key: `nullpi-cap-${randomUUID()}`,
+      });
+      assert.equal(body.money_outcome, 'refund_manual');
+
+      // THE structural close. Before this lane the helper answered
+      // `'no-payment-intent'` with the FULL amount, every time, forever — so a
+      // portal staff-refund verb (or any future leg) would see the whole
+      // remainder with no record that a manual refund was already promised.
+      const second = await withActor('system:scheduler', (tx) =>
+        refundsRepository.mintCappedPendingRefund(tx, {
+          chargeId,
+          ownerId: FIXTURE_IDS.ownerId,
+          bookingId: null,
+          reason: 'cancel',
+          stripeIdempotencyKey: () => `probe-${randomUUID()}`,
+        }),
+      );
+      assert.equal(
+        second.kind,
+        'nothing-to-refund',
+        'RED before 1.2: `no-payment-intent` with the full amount again — the double-refund door',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'money-residue 1.2 — a partial prior refund: the row and owed_cents are both the REMAINDER',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort();
+    const { app } = trackedApp();
+    try {
+      const { body } = await withdrawNullPiEnrollment({
+        cohortId: cohort.id,
+        app,
+        key: `nullpi-part-${randomUUID()}`,
+        priorRefundCents: 4_000,
+      });
+      assert.equal(body.money_outcome, 'refund_manual');
+      assert.equal(body.owed_cents, PUPPY_PRICE_PER_DOG_CENTS - 4_000, 'the R9 remainder');
+
+      const rows = (await refundRows(cohort.id)).filter((r) => r.status === 'unroutable');
+      assert.equal(rows.length, 1);
+      assert.equal(
+        rows[0]!.amountCents,
+        PUPPY_PRICE_PER_DOG_CENTS - 4_000,
+        'the row records the remainder, not the charge — and it is the LOCKED cap, not the pool read',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'money-residue 1.2 — report discipline: the born-terminal row joins no abandon class, no batch, no sweep',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort();
+    const { app } = trackedApp();
+    try {
+      await withdrawNullPiEnrollment({
+        cohortId: cohort.id,
+        app,
+        key: `nullpi-report-${randomUUID()}`,
+      });
+      const [row] = (await refundRows(cohort.id)).filter((r) => r.status === 'unroutable');
+      assert.ok(row, 'staged: one born-terminal unroutable row');
+
+      // Age it far past every window, so "it did not appear" cannot be an
+      // artifact of the row being too young for any of them.
+      await db
+        .update(refundsTable)
+        .set({ createdAt: new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString() })
+        .where(eq(refundsTable.id, row.id));
+
+      const sweeper = makeStripeStub();
+      const tick = await runDuplicateRefundRetryOnce({
+        stripe: sweeper,
+        now: new Date(Date.now() + 10 * 60 * 1000),
+      });
+      assert.equal(tick.scanned, 0, 'no sweep claims a terminal row');
+      assert.equal(countCalls(sweeper, 'createRefund'), 0);
+
+      const { rows: abandoned } = await refundsRepository.findAbandonedPending(db, {
+        mintedBefore: new Date(Date.now() + 60 * 60 * 1000),
+      });
+      assert.equal(
+        abandoned.filter((r) => r.id === row.id).length,
+        0,
+        'announced ONCE at mint; the abandon report excludes unroutable rows by construction',
+      );
+
+      const flipped = await withActor('system:scheduler', (tx) =>
+        refundsRepository.markUnroutable(tx),
+      );
+      assert.equal(
+        flipped.filter((r) => r.id === row.id).length,
+        0,
+        'the batch flip only touches `pending` rows — it can never re-announce a born-terminal one',
+      );
+    } finally {
+      await cleanup(cohort.id);
+    }
+  },
+);
+
+test(
+  'money-residue 1.2 — a replayed withdraw mints ONE row and pages ONCE',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort();
+    const capture = makeLogCapture();
+    const { app } = trackedApp(capture);
+    const key = `nullpi-replay-${randomUUID()}`;
+    try {
+      const first = await withdrawNullPiEnrollment({ cohortId: cohort.id, app, key });
+      assert.equal(first.statusCode, 200);
+
+      const replay = await withdraw({
+        app,
+        cohortId: cohort.id,
+        dogId: FIXTURE_IDS.dog1Id,
+        key,
+      });
+      assert.equal(replay.statusCode, 200, replay.body);
+      assert.deepEqual(
+        replay.json(),
+        first.body,
+        'the stored body is peeked, not recomputed',
+      );
+
+      const rows = (await refundRows(cohort.id)).filter((r) => r.status === 'unroutable');
+      assert.equal(rows.length, 1, 'exactly ONE obligation for one debt');
+      const alarms = capture.lines.filter(
+        (line) => line.level === 50 && String(line.msg).includes('no Stripe route'),
+      );
+      assert.equal(
+        alarms.length,
+        1,
+        'in-tx announcement + replay compose: the replay skips postCommit AND re-runs no transaction',
       );
     } finally {
       await cleanup(cohort.id);

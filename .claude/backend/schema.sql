@@ -173,7 +173,19 @@ CREATE TYPE ledger_reason      AS ENUM ('purchase','booking-debit','cancel-refun
 -- them forever with an instruction nobody could follow. `ADD VALUE` is
 -- effectively irreversible (Postgres cannot drop an enum value without a type
 -- rebuild) — accepted, because the arm names a real, permanent business state.
-CREATE TYPE refund_status      AS ENUM ('pending','succeeded','failed','unroutable');
+-- Δ 2026-08-24 (`designs/money-residue.md` §4): 'resolved-external' — TERMINAL,
+-- staff-only, and the one exit two otherwise exit-less classes never had. A
+-- 'failed' refund (Stripe created it, then failed it — a closed card account,
+-- R18/R19) shouts on the abandon report FOREVER, unbounded by age, and its
+-- amount drops back out of the cumulative cap (`ne('failed')`) so a future
+-- automatic leg could re-mint money a human has already returned. An
+-- 'unroutable' row is terminal at birth with no way to record the promise as
+-- KEPT. This value means exactly one thing: *the money behind this row was
+-- returned OUTSIDE our Stripe machinery, attested by a named human* — written
+-- only by `refundsRepository.markResolvedExternal`, only from 'failed' or
+-- 'unroutable', and only with a non-empty `resolution_note`. It counts in
+-- `sumNonFailedForCharge`, so an attested return CLOSES the cap.
+CREATE TYPE refund_status      AS ENUM ('pending','succeeded','failed','unroutable','resolved-external');
 CREATE TYPE rate_unit          AS ENUM ('per-day','per-night','per-session','per-week','flat');
 CREATE TYPE media_kind         AS ENUM ('image', 'video');
 CREATE TYPE media_purpose      AS ENUM ('dog-profile','owner-avatar','report-photo','report-video','message-attachment');
@@ -1392,6 +1404,29 @@ CREATE TABLE refunds (
   amount_cents     integer NOT NULL CHECK (amount_cents > 0),
   reason           text,
   status           refund_status NOT NULL DEFAULT 'pending',
+  -- The human's EVIDENCE for a 'resolved-external' row: "dashboard re_1abc",
+  -- "check #1042", "credited to the account 2026-08-24" (2026-08-24,
+  -- `designs/money-residue.md` §4.3). Required non-empty at the verb, NULL for
+  -- every pre-existing row and for every row that never leaves the automatic
+  -- machinery.
+  resolution_note  text,
+  -- WHO and WHEN attested it (MR-A1.1, 2026-08-24 — §4.8.5 REVERSED).
+  --
+  -- The design claimed "the audit log + `updated_at` already carry WHO and
+  -- WHEN". They do not: this very file excludes `refunds` from audit_capture by
+  -- name (see the trigger block below), which the attack lane executed —
+  -- `markResolvedExternal` under `withActor` wrote ZERO audit_log rows. A wrong
+  -- resolution is the one dangerous verb on this table, and the absent
+  -- mitigation was the one that identifies the attester.
+  --
+  -- Nullable, no backfill. `resolved_by_staff_id` NULL means "resolved before
+  -- the portal route existed" — the interim-ops era is SQL/script-mediated and
+  -- the required `note` names the human by convention; the §4.6 route makes it
+  -- REQUIRED (the principal's). `resolved_at` is stamped by the verb always,
+  -- and is the WHEN of record — `updated_at` stays what it is, a touch column
+  -- any later write moves.
+  resolved_by_staff_id uuid REFERENCES staff(id),
+  resolved_at      timestamptz,
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now()
 );
@@ -1821,6 +1856,17 @@ END $$;
 -- is idempotency_keys (transport dedupe, TTL-pruned). day_capacity is
 -- included — it carries expired_at. service_rates is included so closing an
 -- effective_to is audited.
+--
+-- Δ 2026-08-24 (MR-A1.1), one honest clause about `refunds` in that list: it is
+-- NOT immutable — the webhook flips its status, `markUnroutable` flips it,
+-- `markStripeId` stamps it. It stays excluded because its transitions are
+-- FIRST-CLASS STATES written by constant system actors
+-- ('system:stripe-webhook', 'system:scheduler'), so audit rows would carry no
+-- fact the row does not already carry. The one HUMAN-attested transition —
+-- 'resolved-external' — carries its own attribution columns instead
+-- (`resolved_by_staff_id` / `resolved_at`), because a trigger keyed on
+-- `app.actor` records nothing for the ops-mediated resolutions this era
+-- actually performs (a psql session sets no actor).
 DO $$
 DECLARE t text;
 BEGIN

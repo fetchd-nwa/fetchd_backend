@@ -2671,8 +2671,12 @@ invisible to the repository layer.
 - `GET /charges` · `GET|POST /memberships` · `DELETE /memberships/:id` —
   **§J.1 BUILT 2026-07-14**: `POST /memberships` `{dog_id, package_key,
   location, term_months(3|6|9|12), payment_method_id}` [$, idempotent] —
-  month-1 charges SYNCHRONOUSLY (non-succeeded intent ⇒ PI cancelled + 422,
-  no async-reconcile arm for creation — v1 limit); creates the active
+  month-1 charges SYNCHRONOUSLY (non-succeeded intent ⇒ the intent is RESOLVED
+  and `payment_failed`/**402** answered — `422` here was always wrong,
+  `errors.ts:101` maps `payment_failed` to 402, corrected MR-A1.6.1; since
+  §N.1 an un-cancellable `processing` intent is RECORDED before that answer and
+  the webhook adjudicates it; no async-reconcile arm for creation — v1 limit);
+  creates the active
   membership + the month's `membership-grant` lot (`expires_at =
   current_period_end`, alumni NULL). `GET` lists the owner's; `DELETE`
   cancels (status flip; granted lots stay). Renewals are self-billed:
@@ -4652,13 +4656,18 @@ Every §L.8 residual stands. Additionally:
   withdraw truthfully reports on the row it settled and the reconciler's
   not-owed arm releases the other within a tick. Bounded, covered, not
   eliminated.
-- **The NULL-PI succeeded arm still cannot return money.** The queued
+- ~~**The NULL-PI succeeded arm still cannot return money.** The queued
   withdraw-NULL-PI design owns the fix; the interim is one ERROR line at the
   moment it becomes true, so the gap is loud rather than silent. Since
   §A3.15 the OWNER is told the truth about it too — `'refund_manual'` with
   `owed_cents` commits to the refund and is honest that a human makes it —
   but no machinery was added, and `'refund_manual'` stays the correct outcome
-  value when the queued design lands.
+  value when the queued design lands.~~ **CLOSED 2026-08-24 by §N.2.** The arm
+  mints a terminal `'unroutable'` refunds row for the LOCKED remainder, so the
+  obligation is a record rather than a log line and R9's cap is no longer left
+  open. `'refund_manual'` stayed the correct outcome value, exactly as
+  predicted; the wire did not move. A human still sends the money — that half
+  was never the defect.
 - **An out-of-band PARTIAL refund plus the re-enroll shadow** yields a true
   `'refunded'` sentence for the OLD charge's remainder while the new live hold
   is released later by the reconciler (`'withdrawn-released'`) without being
@@ -4677,3 +4686,563 @@ Every §L.8 residual stands. Additionally:
   The §12 Stripe probe extension now has three questions worth adding:
   cancel-of-`processing` refusal, the cancel-vs-capture race, and statement
   visibility of a released hold.
+
+## N. Money residue — the three lanes where money could still strand (2026-08-24)
+
+`designs/money-residue.md`, Phase 1 of the completion plan. **Wire delta: NONE
+in shape, all three lanes** — no `wire.ts` edit, no version bump. One doc-only
+correction rides Phase 2's 1.13.0 skeleton (§N.2). Backend only: mobile
+untouched, portal untouched.
+
+### N.1 The memberships month-1 orphan — the invariant
+
+> **A membership month-1 charge row never commits `'succeeded'` without either
+> its membership or its refund row in the same transaction. A
+> `'requires_payment'` membership charge is an adjudication PENDING, and whoever
+> flips it terminal adjudicates the money — under the charge row's lock.**
+
+THE DEFECT, walked: `POST /memberships` requires a synchronously-succeeding
+charge (the ruled §J.1 v1 constraint). The non-succeeded arm cancelled the
+PaymentIntent BEST-EFFORT inside a swallowing `catch`, and **Stripe refuses to
+cancel a `processing` PaymentIntent** — the same fact the withdraw machinery
+(§M) is built on. So an ordinary slow card network produced: cancel throws, catch
+swallows, owner gets 402 "try a different card", **no `charges` row is written at
+all** (the route only writes inside `withMutation`, which the throw never
+reaches), and hours later the PI settles. The webhook then found no charge row,
+the invoice arm passed (a month-1 PI carries no `invoice_id`), the package
+reconstruct deliberately skips `purpose: 'membership'`, and the event dropped as
+`orphan-event`. **Money captured at Stripe; no membership, no credits, no charge
+row, no refund, no notification, no record anywhere** — and an owner who obeyed
+the 402 and used a second card was double-charged with one membership.
+
+What landed:
+
+- **The cancel arm RESOLVES** (`routes/memberships.ts`,
+  `resolveUnsettledMonthOneIntent`). Cancellable statuses go through the shared
+  `withdrawSettlement.cancelAndConfirm`, so the cancel/capture race has ONE
+  reading in the codebase. `canceled` → today's 402, byte-compatible.
+  **`captured` → fall through and COMPLETE the subscribe** (the owner asked to
+  subscribe and paid). `processing` → the recorded arm below. An unreadable
+  cancel PROPAGATES: nothing recorded, nothing claimed (§A3.2 abort posture),
+  the webhook backstop covers it.
+- **`processing` is RECORDED before the 402.** `insertIfAbsentByPaymentIntent`
+  at `'requires_payment'` (through `stripeIntentStatusToChargeStatus`), with
+  `dog_id`, **in its own `withActor` transaction** — not `withMutation`'s, which
+  the 402 rolls back; a failure record that exists only when the request
+  succeeds records nothing. No cancel is attempted, because Stripe would refuse
+  it. `charge_blocker: 'processing'` (wire 1.8.0, already on the wire) is the one
+  blocker that refuses a retry.
+- **The success path resolves the charge row FIRST, under `SELECT … FOR UPDATE`**
+  (`chargesRepository.findByStripePaymentIntentIdForUpdate`, new). No row →
+  today's flow. `'requires_payment'` → **ADOPT** (flip + continue; this was a
+  unique-violation 500). `'succeeded'`/`'refunded'` → the webhook already
+  adjudicated, so assert a refund exists (else throw loud) and answer **409**:
+  *"that subscription payment didn't complete in time and has been returned to
+  your card — please start again."* `'failed'` + succeeded intent → contradiction,
+  throw loud. The uniqueness lost-race branch uses the same resolved row.
+- **The webhook gained two month-1 arms** (`webhooks/stripeEventHandlers.ts`),
+  outcome `'refunded-orphaned-membership-charge'`. The FLIP arm fires on a
+  non-terminal `purpose='membership'` row whose event carries no `invoice_id`;
+  the ORPHAN arm fires in the charge-missing path on
+  `purpose: 'membership'` + no `invoice_id` + non-empty `owner_id`/`dog_id`,
+  through `insertIfAbsentByPaymentIntent` (`created === false` ⇒ another writer
+  owns the PI ⇒ decide by its status). Both converge on
+  `adjudicateMonthOneMembershipCharge`: lock the charge, flip `'succeeded'`, mint
+  through the ONE capped-mint helper (§A3.18 D2) with reason
+  `'membership-month1-orphan'` and the ROW-DERIVED stored key
+  `membership-orphan-refund:<refundId>` (sweep lane 1 by construction), enqueue
+  the owner push, and **log at ERROR** — unattended money movement always pages
+  (Q-B).
+- **Disposition is REFUND, never reconstruct** (Q-M1 default, the ruled §J.1 v1
+  stance applied to the async tail). Reconstructing would make the delivered 402
+  retroactively false, double-subscribe whoever obeyed it, and invent a period
+  anchor the owner never chose.
+- **The `invoice_id` guard is load-bearing.** Membership RENEWAL charges are also
+  `purpose='membership'` at `'requires_payment'` (the invoice pay route's async
+  arm) but their PIs carry `invoice_id`. They keep today's flip untouched and the
+  §A3.19 webhook-flip residual stays exactly as queued — neither widened nor
+  claimed fixed.
+- **Owner push** (Allison's copy nod): type `payment-failed`, trigger
+  `membership-orphan-refund`, dedupe `membership-orphan-refund:<chargeId>` (one
+  per charge, ever), deep link `credits`/`dog_id`, title **"Subscription payment
+  returned"**, body **"Your $X subscription payment didn't complete — we've sent
+  it back to your card. No subscription was started and no credits were added.
+  You can start again anytime from Buy Credits."**
+
+**Pre-deploy stranded orphans are a HUMAN step**, not code: a month-1 PI already
+dropped as `orphan-event` is marked processed and will not redeliver. Ops search
+the Stripe dashboard for succeeded PIs with `purpose: membership` metadata and no
+matching charge row. No backfill (the no-rewrites posture).
+
+### N.2 The withdraw NULL-PI gap — one mint call, three honest answers
+
+The group-class withdraw's `refund_manual` arm answered the owner honestly since
+§A3.15 and **recorded the obligation NOWHERE**: one ERROR line, no row, and R9's
+cumulative cap left open forever (`chargesRepository`'s own comment said
+"remainder-positive forever, by design"). Two costs: the promise was invisible to
+every report and forgotten by every restart, and any future leg — the portal's
+staff-refund verb (Adjudication 8) — would see the full remainder with no record
+that a manual refund was already promised. `owed_cents` was also computed outside
+any charge lock, from the pool-read remainder.
+
+The arm stops branching on `stripe_payment_intent_id` and calls the ONE capped
+helper, which answers all three cases under the charge row's lock:
+
+| answer | what the arm does |
+|---|---|
+| `'minted'` | the existing refunded outcome, byte-identical |
+| `'no-payment-intent'` | `createUnroutable` under that same lock + `logUnroutableRefundMint` **in-tx** (the ruled placement — post-commit is lost permanently on crash-then-replay); `money_outcome: 'refund_manual'`, `owed_cents` = the **LOCKED** cap |
+| `'nothing-to-refund'` | `'none'` — unreachable via `findUnsettledSucceededCharge`'s positive-remainder contract, kept because the invariant is the wire's |
+
+This is `cancelBookingService`'s money-back branch transplanted verbatim — same
+helper, same terminal row, same in-tx announcement, same `reason: 'cancel'` — so
+"money owed with no Stripe route" has ONE shape codebase-wide.
+
+**What closes structurally:** the unroutable row counts in
+`sumNonFailedForCharge`, so no leg present or future can double-mint against that
+charge; `findUnsettledSucceededCharge` sees the charge as covered, so a later
+withdraw of a re-enrollment can never re-answer `refund_manual` for the same
+money; the abandon report excludes unroutable rows by construction and
+`markUnroutable`'s batch never touches a born-terminal one, so announced-once
+holds. `refunds` reached three mint sites for `'unroutable'`; `mintRefund` in
+`routes/enrollments.ts` now returns the helper's VERDICT rather than a cent
+figure, because `'nothing-to-refund'` and `'no-payment-intent'` have opposite
+consequences and both used to be `0`.
+
+**Wire: unchanged. Mobile: ZERO changes.** `'refund_manual'` still means "a refund
+is owed and will be made BY HAND — no automatic machinery exists for this
+charge", and every clause survives: the row RECORDS the hand-made promise, a
+human still moves the money. **One doc-only correction is owed on
+`wire.ts:878-881`** — it says the remainder is "computed for the owner's
+sentence, NOT minted; the manual step owns the mint", and after this lane the
+mint happens at withdraw time and the manual step owns only the SEND. Patch-class
+content, deliberately NOT minted as its own bump: it rides Phase 2's 1.13.0
+skeleton with the CHANGELOG line *"doc: `owed_cents` remainder is recorded as a
+terminal `unroutable` refunds row at withdraw time (money-residue 1.2); semantics
+of the sentence unchanged."*
+
+### N.3 Out-of-band resolution — the exit two terminal classes never had
+
+Two refund classes were terminal with no exit. A `'failed'` row (Stripe created
+the refund and then failed it — closed card account, R18/R19) shouts on the
+abandon report FOREVER, unbounded by age, and its amount drops back OUT of the
+cap (`ne('failed')`) — so an automatic leg could re-mint money a human already
+returned. An `'unroutable'` row is terminal at birth with no way to record the
+promise as KEPT. And the likeliest resolution mechanism was itself broken: a
+staff dashboard refund fires `charge.refund.updated` with a `re_*` we never
+minted, and the handler's not-found arm threw `WebhookRetryError` → 500 → Stripe
+redelivered for days while the returned money reached neither ledger nor cap.
+
+**DDL (the phase's only schema change).** `refund_status` gains
+`'resolved-external'`; `refunds` gains `resolution_note text` (NULL for every
+pre-existing row). Hand-mirrored into `src/db/schema/schema.ts` — `db:introspect`
+is broken, the `'unroutable'` precedent. **Deploy-checklist rider** (rides beside
+the `REFUND_SWEEP_FLOOR` advance; the live DBs are hand-ALTERed and no gate can
+prove them):
+
+```sql
+ALTER TYPE refund_status ADD VALUE 'resolved-external';
+ALTER TABLE refunds ADD COLUMN resolution_note text;
+-- MR-A1.1 (§N.5), same window:
+ALTER TABLE refunds ADD COLUMN resolved_by_staff_id uuid REFERENCES staff(id);
+ALTER TABLE refunds ADD COLUMN resolved_at timestamptz;
+```
+
+**The complete state machine — nothing else transitions:**
+
+| From | To | Actor | Mechanism |
+|---|---|---|---|
+| `pending` | `succeeded` / `failed` | Stripe webhook | `charge.refund.updated` (unchanged) |
+| `pending` | `unroutable` | system | born terminal (`createUnroutable`) or `markUnroutable`'s flip |
+| `failed` | **`resolved-external`** | **staff only** | `markResolvedExternal` (note required) |
+| `unroutable` | **`resolved-external`** | **staff only** | same verb |
+| `resolved-external` | — | nobody | terminal; webhook events on it no-op |
+
+`'resolved-external'` means exactly: **the money behind this row was returned
+outside our Stripe machinery, attested by a named human.**
+
+- **`refundsRepository.markResolvedExternal(tx, {id, note, staffId?})`** — one
+  guarded UPDATE with the guard re-asserted at write time (`markUnroutable`'s
+  discipline), **under the charge row's lock**. Non-empty `note` REQUIRED at the
+  verb: it is the human's evidence ("dashboard re_…", "check #1042").
+  ~~Actor attribution via `withActor` into the audit log; **no
+  `resolved_by`/`resolved_at` columns** — `updated_at` + the audit log already
+  carry both.~~ **REVERSED by MR-A1.1 (§N.5).** `refunds` is excluded from
+  `audit_capture` by name, so this verb wrote ZERO audit rows; WHO and WHEN are
+  now first-class columns. Two riders in the same tx: **the cap closes**
+  (`'resolved-external'` counts in `ne('failed')`, so returned money blocks future
+  mints) and **the ledger finishes the story** (returned coverage ≥ charge ⇒
+  charge flips `'refunded'`, through the ONE shared helper all three cumulative
+  tails use).
+- **The abandon report gets its exit.** Its WHERE selects `pending`/`failed`
+  only, so a resolved row leaves the page and `totalByClass['stripe-failed']`
+  drops — the round-6 alarm can finally clear. Sweep claim (`status='pending'`)
+  and `markUnroutable` (`status='pending'`) are untouched by construction.
+- **Webhook stale-event guard.** `handleChargeRefundUpdated` no-ops on a row at
+  `'resolved-external'`. A redelivered terminal event must never overwrite a
+  human's attestation — flipping it back to `'failed'` would silently REOPEN the
+  remainder.
+- **The adoption arm** (`maybeAdoptOutOfBandRefund`, outcome
+  `'adopted-out-of-band-refund'`). When both lookups miss: no PaymentIntent on the
+  event → `WebhookRetryError`, unchanged; no charge for the PI →
+  `WebhookRetryError`, unchanged; **any `'pending'` refund on the charge at ANY
+  amount** → `WebhookRetryError`, unchanged (never adopt over an in-flight
+  automatic refund — a guard that now lives INSIDE the repo verb, under the
+  charge lock, per §N.5); otherwise **ADOPT** via `adoptExternalRefundCapped` — born
+  terminal at the event's mapped status, `stripe_refund_id` stored, reason
+  `'out-of-band'`, `stripe_idempotency_key` **NULL** (nothing will ever fire it;
+  the refund already exists AT Stripe). On `succeeded` the existing cumulative
+  flip tail runs. Idempotent by the `stripe_refund_id` UNIQUE + `stripe_events`
+  dedupe. **This is the money-correctness half:** the cap closes the moment
+  Stripe confirms, independent of whether the human flips anything. If both
+  happen the sums can exceed the charge; the cap's direction is
+  refuse-further-refunds, the safe one — **and the exceed case is alarmed at
+  ERROR (MR-A3.3, tested), never silent.**
+- **Named residual, disclosed not fixed:** a dashboard refund issued while an
+  automatic pending refund of a DIFFERENT amount is in flight on the same charge
+  stays unadopted (retried until Stripe's redelivery window expires, then
+  unrecorded). The guard is deliberately conservative; the resolve verb still
+  records the return.
+- **The dangerous verb is a WRONG resolution** — staff attesting a return that
+  did not happen closes the remainder and strands the owner's money. Mitigated by
+  staff-only + required note + **the attribution columns** (§N.5 — *not* audit
+  attribution, which this table never had) + the two live-coverage guards + the
+  guarded state machine. Named, not waved off; any second-approver policy belongs
+  to the portal wave.
+
+**NO HTTP ROUTE this phase** (Q-M2 default). The verb's production caller is the
+portal wave's resolve endpoint, behind the Shanthi gate. Until then the abandon
+report is the worklist and resolution-by-ops means SQL — **interim ops SQL must
+mirror the verb's WHERE guard** (`status IN ('failed','unroutable')`) and must
+write a note. The portal-surface contract is DEFINED in `designs/money-residue.md`
+§4.6 (`GET /staff/refunds?status=failed,unroutable`,
+`POST /staff/refunds/:id/resolve`, additive minor when it lands, NOT in 1.13.0)
+so that build is a transcription rather than a design.
+
+### N.4 What no gate can prove here
+
+- Real Stripe's `processing` lifecycle and cancel-refusal semantics — asserted
+  from the withdraw build's established premise and stub-modelled, never
+  re-probed live.
+- That production PAGES on the new ERROR lines. Round 6 proved the worker tick
+  channel; the webhook receiver logs through the same pino fd, but nothing pages
+  anywhere until Day-20 lands.
+- Dev/prod schema equality for the N.3 DDL — the live DBs are hand-ALTERed;
+  `db:dev:check` before any dev-DB read, and the rider above is a human step.
+- Whether any pre-deploy month-1 orphans exist — findable only in the Stripe
+  dashboard (§N.1).
+
+### N.5 Amendment MR-A1 (attack round 1, fix round 1 — 2026-08-24)
+
+Attack round 1 returned no blocker and four MEDIUMs, all **claim-vs-delivery**:
+the money mechanics held under execution (the month-1 invariant under both entry
+shapes, the D2 capped mint, sweep lane 1 re-firing under stored keys, the
+adoption dispositions, the resolved-external overwrite guard, replay/dedupe).
+What broke were five things the build *claimed*. All are ruled in
+`designs/money-residue.md` § MR-A1 and built here.
+
+**MR-A1.1 — attribution: §4.8.5 REVERSED, two nullable columns added.** The
+design rested on "the audit log + `updated_at` already carry WHO and WHEN".
+`schema.sql` excludes `refunds` from `audit_capture` **by name**, and the attack
+lane executed it: `markResolvedExternal` under `withActor` writes ZERO
+`audit_log` rows. So `refunds` gains `resolved_by_staff_id uuid REFERENCES
+staff(id)` (NULL = resolved before the portal route existed; the note names the
+human by convention) and `resolved_at timestamptz` (stamped by the verb,
+always). `updated_at` stops being claimed as the WHEN of record. Rejected
+alternatives, for the record: adding `refunds` to the audit trigger records
+nothing for ops-mediated SQL (a psql session sets no `app.actor`) and mints
+noise rows for every system-actor status flip; an app-code attestation INSERT
+breaks the trigger-only convention and still is not queryable for the §4.6
+worklist. The audit-exclusion comment gains one honest clause: `refunds` is not
+immutable, it is *system-written*, and its one human-attested transition now
+carries its own attribution.
+
+**MR-A1.2 — serialization: one global lock order, charges → refunds.**
+`markResolvedExternal` moved a row INTO `sumNonFailedForCharge` with no charge
+lock and no coverage guard. Executed: interleaved with an open
+`mintCappedPendingRefund`, both commit — **16000c of non-failed refunds on a
+10000c charge** — and `claimStalePendingForRetry` CLAIMED the over-minted
+pending row. Stripe cannot bound that: the `resolved-external` 6000c moved
+outside Stripe, so Stripe would send the full 10000c again. Money leaves twice.
+The naive fix (a charge lock inside the verb alone) would have constructed AB-BA
+against `handleChargeRefundUpdated`'s refunds-then-charges order, so the ruling
+is broader:
+
+- **(i) The cap-entering rule.** Any transaction that INSERTs a row into, or
+  moves a row INTO, the non-failed set must hold that charge's row lock at the
+  time of the write. Cap-LEAVING flips (`pending → failed`) stay lock-free on
+  purpose — an opening cap can only defer a refund, never double one.
+- **(ii) One global order.** `handleChargeRefundUpdated` is CONVERTED: match the
+  refund row unlocked (both existing reads), resolve the `chargeId`, `SELECT
+  charges FOR UPDATE`, **re-read the refund row under the held lock**, guarded
+  write, cumulative tail under the same lock. The adoption arm's guard AND
+  insert move inside `adoptExternalRefundCapped`, which takes the lock itself.
+  Inventory after conversion — mint `C→(insert R)`, resolve `C→R`, webhook
+  `C→R`, adoption `C→(guard, insert R)`. Refunds-ONLY writers
+  (`claimStalePendingForRetry` with `FOR UPDATE SKIP LOCKED`, `markStripeId`,
+  `markUnroutable`) never subsequently take a charges lock. **This RETIRES the
+  §A3.18-era carve-out** ("the mint helper never waits on refunds rows, so the
+  webhook's reverse order is safe") in favour of the stronger uniform order;
+  both comment sites are corrected.
+- **(iii) Two live-coverage guards on the verb,** under the held lock — refuse
+  (count 0 here, **409** on the future §4.6 route) when a `'pending'` refund is
+  in flight on the charge, or when the row's amount exceeds the charge's live
+  remainder. **The remainder is computed IGNORING the row's own contribution**,
+  because `'failed'` sits outside the non-failed set and `'unroutable'` sits
+  inside it: resolving an unroutable row is a RELABEL that changes the cap by
+  nothing, and the naive comparison would refuse every one of them.
+
+**MR-A1.3 — the retry arc: replays return the ORIGINAL snapshot.** §2.2(b)
+premised the 409 on a same-key retry receiving a now-`succeeded` PaymentIntent
+from Stripe's cache. This repo documents the opposite
+(`enrollmentPartial.ts:343-344`), and the attack lane executed the cost: after
+the webhook returned the money, the owner's same-key tap replayed `processing`,
+the idempotent record no-op'd, and they were told **"try a different card" over
+money already going back**. Arm (a) now READS THE ROW BACK when `created ===
+false` and answers from it: terminal + non-failed refunds → **409**
+(`MONTH_ONE_RETURNED_SENTENCE`, the same string arm (b) throws); terminal with
+NO refunds → loud invariant throw; `'failed'` → 402 `declined`;
+`'requires_payment'` → 402 `processing`. A plain read suffices — the arm writes
+no cap state, so MR-A1.2's lock rule does not apply. **The ADOPT arm's real
+door**, named so the false one cannot be cited again: request 1's confirm yields
+a CANCELLABLE snapshot, the cancel is refused mid-race, the live re-retrieve
+reads `processing` → recorded row + 402; the same-key retry REPLAYS the
+cancellable snapshot, forcing the cancel again → refused → the live re-retrieve
+now reads `succeeded` → `{kind:'captured'}` → the locked read finds the recorded
+row → ADOPT → 201. The live RETRIEVE, never the replay, carries current truth.
+
+**MR-A1.4 — the flip arm demands POSITIVE month-1 evidence.** The gate was
+`purpose='membership'` + `invoice_id` ABSENT: negative evidence over a
+third-party-mutable input. Executed — a renewal-shaped charge whose succeeded
+event arrived with an EMPTY metadata bag took the month-1 adjudication: an
+unattended 9900c refund of money a renewal invoice was owed, the invoice left
+open for a second collection, zero pushes. (`metadataString` reads `''` as
+missing, so blanking one field sufficed.) The arm now requires the fingerprint
+the route actually stamps: `purpose='membership'` AND no `invoice_id` AND
+**`package_key` PRESENT** (`memberships.ts` stamps it on every month-1 PI; no
+renewal minter stamps it). **Metadata loss degrades to the GENERIC flip** —
+money still recorded, invoice machinery still owns settlement, §A3.19's
+webhook-flip residual neither widened nor claimed fixed. Fold: the push and deep
+link key `dog_id` off the **locked charge row** (`ChargeRow` gains `dogId`),
+with event metadata as fallback only — a push keyed off absent metadata simply
+never fired, which is how an unattended refund happened with no notification.
+
+**MR-A1.5 — the alarm nets against returned coverage.** New quiet class
+`'covered'`: a `'failed'` row whose charge's RETURNED COVERAGE meets its amount
+is owed nothing, so it leaves `stripe-failed`, is counted in the summary,
+INFO-logged, and never on the named page or in the ERROR totals — which is what
+finally lets the round-6 alarm clear. `AbandonedRefundRow` gains
+`remainingCents` (the charge's live remainder), and the worklist sentence names
+it: *"return the OWED REMAINDER named on each row — that figure, not the row
+amount"*. Its old safety clause ("safe because … Stripe refuses over-refunding")
+is CORRECTED: Stripe bounds only Stripe-side refunds, and `resolved-external`
+money is invisible to it — which is precisely why the netting must be ours.
+
+**MR-A1.6 — folded corrections.** (1) **402, not 422** — `payment_failed` maps
+to 402 (`errors.ts:101`); the §2 echoes are corrected. (2) The
+nothing-to-refund branch returns the honest handler-internal literal
+`'membership-orphan-already-covered'` instead of claiming a refund it did not
+make. (3) **One definition of coverage** — `sumReturnedCoverageForCharge`
+(succeeded + resolved-external) now feeds ALL THREE charge→`'refunded'` tails;
+before, resolve-then-adopt left a fully-returned charge reading `'succeeded'` in
+the owner ledger. (4) **The route-create loser is mapped, not a 500** —
+`resolveChargeRow`'s no-row branch uses `insertIfAbsentByPaymentIntent` and
+re-dispatches `created === false` through the same terminal arms as the locked
+read, so the webhook winning the sub-millisecond gap yields a definite answer
+in-request instead of a transient unique-violation 500.
+
+**Wire delta: still NONE**, re-verified — every literal touched is
+`WebhookHandlerResult`-internal, and the two new columns reach no wire shape
+until §4.6's future `RefundWire` lists them as optionals.
+
+### N.6 Amendment MR-A2 (attack round 2, fix round 3 — 2026-08-24)
+
+Round 2 confirmed every MR-A1 ruling closed **by the finders' own unmodified
+probes**, proved the AB-BA the uniform lock order prevents is real (a live
+40P01), and held guard (b) under every composition. What it found were the two
+writers the MR-A1.2 inventory missed, one predicate conflating two questions,
+and instruction figures that did not match their own rule. All ruled in
+`designs/money-residue.md` § MR-A2 and built here — the last fix round in the
+cap. **No DDL this round**; wire delta still NONE.
+
+**MR-A2.1 — the loser fall-through RE-LOCKS before it re-dispatches.**
+MR-A1.6.4 dispatched from `insertIfAbsentByPaymentIntent`'s conflict fallback,
+which is a PLAIN read. Executed: the webhook's locked flip+mint commits inside
+the loser's read→dispatch window, the route adopts the stale
+`'requires_payment'` answer and grants — **membership AND refund both stand and
+the school eats one month's fee.** §2.2 always said the adjudication happens
+"under the charge row's lock"; A1.6.4's text omitted it and the build followed
+the text. The fall-through now re-takes `findByStripePaymentIntentIdForUpdate`
+and answers from the locked row. **The plain fallback inside the repo verb stays
+as-is**, with the rule stated at the seam and all four callers re-verified in
+its doc: the package reconstruct ignores the status entirely; the webhook orphan
+arm re-reads under the lock inside `adjudicateMonthOneMembershipCharge` (and a
+plain read can only lag, while the terminal statuses are absorbing, so
+"terminal" is never a stale lie); arm (b)'s fall-through is the fix; arm (a)'s
+read-back is answer-only and writes no cap state (ruled sufficient at MR-A1.3).
+
+**MR-A2.2 — adjudication counts refund ROWS, not the non-failed sum.** Both
+dispatch sites asked "did a writer already decide this money?" with
+`sumNonFailedForCharge > 0`, which EXCLUDES `'failed'`. So a month-1 orphan
+whose refund Stripe failed — the R18/R19 class the abandon report exists for —
+read as "never adjudicated" and took the invariant throw: **a 500 with no
+idempotency record, re-500ing on every retry forever** while an operator chased
+corruption that did not exist. Executed on both arms (Q4-D, Q7-b). The two
+questions now use two verbs: **adjudication** = `countAnyForCharge > 0` (a row
+exists at ANY status — a failed refund still proves a writer decided, and its
+DELIVERY is the refund machinery's problem, with its own worklist and alarms);
+**money** = `sumNonFailedForCharge`, unchanged. The invariant throw survives for
+the one genuinely broken state: terminal charge, ZERO refund rows.
+
+**MR-A2.3 — the worklist figure is the per-row obligation clipped by the cap.**
+MR-A1.5's sentence ordered "return the OWED REMAINDER named on each row", and
+the figure printed was the CHARGE-level remainder: a 6000c failed partial on an
+untouched 10000c charge printed 10000c, and obeying it over-returns 4000c the
+row never promised. One actionable number now: `actionableCents =
+min(row.amountCents, remainingCents)`, plus `clippedByRemainder` so the human
+sees which input won. Remainder above the row → the row wins (the rest was never
+promised back; minting more is the automatic machinery's decision). Remainder
+below the row → the cap wins (returning the row's figure would pass it).
+
+**MR-A2.4 — the failed→succeeded flip: FLIP AND ALARM, never refuse.**
+`markStatus` in the succeeded branch has no prior-status guard, so `failed →
+succeeded` re-enters the cap over money a re-mint may already have spent
+(staged: 20000c on a 10000c charge). The arm RECORDS: the event is
+signature-verified Stripe truth, so if Stripe says the refund succeeded the
+money LEFT, and writing "10000c returned" while 20000c left is the false ledger
+this design exists to kill. Refusing would also protect nothing — the cap is
+already fully covered before the late event lands. The surplus sits with the
+OWNER, so nothing self-corrects server-side and **the alarm IS the remedy** (the
+F′ record-and-page family): an ERROR naming charge, owner, amounts, the delta
+and the contributing rows, deduped by delivery, with the charge still flipping
+`'refunded'`. The arm's comment cites why the arc is believed unreachable from
+real Stripe (a refund's `failed` is documented terminal) **and** why the guard
+exists anyway — the cap-entering invariant is universal and the input is
+third-party-shaped, which is the MR-A1.4 lesson applied to ourselves.
+
+**MR-A2.5 — copy and comment truth.** (a) The `covered` instruction is
+rewritten: "resolve each with a note" could not be obeyed, because guard (b)
+correctly refuses resolving any row on a fully-covered charge; a covered row
+needs **no action** — the reclassification IS its resolution. (b) **`'covered'`
+is the CAP question and the doc moved to the code**, with the false
+"equivalently" deleted: classification gates a HUMAN INSTRUCTION whose safety
+bound is the cap (a failed row whose remainder is closed by a PENDING re-mint
+must be quiet — ordering a human to act mid-automation is the double-movement
+invitation — and it self-heals, re-shouting if that refund fails). RETURNED
+coverage remains the LEDGER question and only that: `'covered'` = live
+non-failed remainder ≤ 0; ledger-refunded = returned coverage ≥ amount. (c)
+MR2-F5 confirmed a **disclosed-by-design residual** (below). (d) Six cosmetics:
+the audit-exclusion clause moved after the closing paren with the list intact;
+the `MONTH_ONE_RETURNED_SENTENCE` tense flagged to the §6 copy bundle (string
+unchanged until Allison rules); `markUnroutable`'s `remainingCents: 0` comment
+corrected to say the row itself now covers the remainder rather than that
+nothing is owed; `monthOneAnswerForExistingCharge`'s jsdoc updated to the new
+predicate; `abandonedTruncated` computed over SHOUTING classes only (a page
+overflow of `covered` rows is not a truncation worth alarming); and the month-1
+orphan arm's unstated premise pinned — **no renewal minter stamps
+month-1-shaped metadata**, so a future renewal-lane change trips over the
+sentence instead of discovering it in production.
+
+**Named residuals leaving this cycle (complete, nothing silent):** MR2-F5 — an
+adopted dashboard refund covering the money of a coexisting `unroutable` row
+leaves that row open-but-quiet (excluded from the report by construction, and
+guard (b) refuses resolving it at remainder 0); the money story is closed and
+the promise row awaits the portal wave, because closing it now would mean
+auto-resolving a human-promise row on machine evidence — the attestation
+shortcut MR-A1.1 exists to prevent. Plus: §4.4's different-amount
+adoption-during-pending; the §A3.19 webhook-flip door; pre-deploy stranded
+month-1 orphans (ops dashboard search); and the `MONTH_ONE_RETURNED_SENTENCE`
+tense (copy bundle, Allison).
+
+### N.7 Amendment MR-A3 (attack round 2 fix-round-3 close → round 4 — 2026-08-24 late)
+
+Round 3 returned BLOCKED from both lanes at the cap; **Allison authorized round
+4 the same evening.** MR-A3 rules exactly the blocking set from
+`attack-fable-p1c/` + `attack-opus-p1c/` (all executed) and nothing else — an
+authorized continuation, not a reopening. **No DDL; wire delta NONE.**
+
+**MR-A3.1 — the last uncapped cap-entering write.** The duplicate-subscribe
+winner branch called `createPending` RAW at `intent.amountCents`. The charge
+LOCK was held (via `resolveChargeRow`) — the AMOUNT was unguarded, and
+MR-A1.2(i)'s inventory listed the site as compliant on the lock and missed the
+cap. Executed: a charge already carrying an adopted 4000c dashboard refund → the
+lost-race minted 9900c → **13900c of non-failed refunds on a 9900c charge**, and
+the post-commit fire sent it. The branch now routes through
+`mintCappedPendingRefund` with the CLIENT-KEYED factory (`() =>
+refundIdempotencyKey`, the withdraw-leg precedent — the factory ignores the row
+id, so replay semantics are unchanged; re-locking the already-held row is a
+no-op and nothing about lock order moves). Three answers: `'minted'` → today's
+flow at `minted.amountCents` (a partial clip means part of this charge's money
+was already returned or promised, so the refund that MOVES is the remainder);
+`'nothing-to-refund'` → **still 201 winner + `charge_refunded: true`, no mint,
+no fire, one WARN** — not the 409, because the winner membership EXISTS and the
+dog IS subscribed, so "start again" would be false, while `charge_refunded`
+stays true in substance (full prior coverage means the return is already
+recorded and the card nets one charge); `'no-payment-intent'` → unreachable,
+asserted with a loud throw.
+
+**MR-A3.2 — the actionable figure: per-row remainder EXCLUDING SELF, plus greedy
+allocation.** MR-A2.3's `min(row.amount, remainingCents)` was wrong in BOTH
+directions, each executed: (a) the charge-level remainder excludes ALL failed
+rows, so failed SIBLINGS were invisible to each other and Σ over-instructed by
++10000c (two 10000c failed rows on a 10000c charge) and +3000c (three 3000c
+partials on a 9000c charge); (b) it INCLUDES the row itself when the row is
+pending, so a full-amount pending by-hand row printed **$0** — an instruction to
+return nothing on the one row whose whole point is a by-hand return. Now, in the
+report's assembly pass: **joint cap** = `amount − Σ non-failed rows NOT in the
+shouting set`, floored at 0 (computed as `remainderRaw + Σ shouting non-failed`
+— no new SQL); **allocation** over the shouting set in `created_at ASC, id ASC`
+order, `actionable_i = max(0, min(row_i.amount, jointCap − Σ allocated))`. The
+properties are the ruling: every printed figure ≤ its row's obligation, and **Σ
+printed ≤ the true cap, always** — a human who robotically obeys every row
+returns at most what the charge can owe, with no cross-referencing required.
+Chosen over a "one live return per charge" note because a note's safety depends
+on a tired reader noticing a cross-row warning and doing the arithmetic
+themselves. `clippedByRemainder` generalizes to `clipped` + a reason enum
+(`covered-elsewhere` | `allocated-to-older`), and each row renders an
+`instruction` in words — a fully-clipped row reads **"return NOTHING on this
+row"** plus the reason, never a bare $0, because on a worklist a bare 0 reads as
+a bug and a reader resolves a bug by guessing.
+
+**MR-A3.3 — the adoption tail gets the identical surplus alarm.** MR-A2.4's
+check + ERROR lived only in the ordinary flip tail, so an adopt that pushed
+returned coverage past the charge was SILENT. The Fable lane executed it with no
+Stripe anomaly at all (resolve 6000c by hand, then adopt a dashboard refund):
+20000c returned on a 10000c charge, zero alarm lines, the resolved row already
+off the abandon report, the charge reading a truthful `'refunded'` — nothing
+would ever surface it. The check-and-log is now ONE shared helper
+(`settleReturnedCoverage`) called from BOTH tails under their already-held charge
+locks, so the two cannot drift again. Its log object carries per-row `status`
+(A3.5(b)) so the narrative names WHICH rows compose the surplus — a Stripe
+refund, an adopted dashboard refund and a hand-attested return are three
+different reconciliations.
+
+**MR-A3.4 — one movement, one alarm.** The early return fired only when
+`backfillStripeId === undefined`, computed from the UNLOCKED match, so a
+race-recovery delivery skipped it even when the LOCKED re-read showed the row
+already at the target status with its `re_*` backfilled by a concurrent
+delivery — re-running the flip and the surplus check. Executed: two identical
+ERRORs for one movement of money. Both no-op conditions are now recomputed from
+the locked re-read: a backfill is needed only while the locked row's
+`stripe_refund_id` is still NULL, and a locked row already at `mappedStatus`
+with an id present early-returns as the no-op it is. Chosen over an
+idempotent-alarm key because the second delivery genuinely IS a no-op — making
+it one is smaller and truer than deduplicating its noise.
+
+**MR-A3.5 — recorded and folded.** Opus F5 is **RECORDED as a residual, not
+built**: the generic-flip-door composition (a partial adopted refund + a
+metadata-blanked `payment_intent.succeeded` that MR-A1.4 correctly degrades to
+the generic flip + a same-key retry answering 409 over 8900c still held, with no
+worklist row) is the already-queued §A3.19 webhook-flip door composing with
+MR-A1.4's deliberate conservative fallback; its fix belongs to that family's own
+design, and the residual entry below gains this executed composition as its
+citation so the eventual design inherits the probe. Folded: the covered-class
+message names both substates (covered by a COMPLETED return vs by an IN-FLIGHT
+return that re-shouts if it fails); the surplus helper's per-row `status`. The
+push/sentence tense item is unchanged — MR-A2.5(d)2, §6 copy bundle, Allison's.
+
+**Residual list, amended:** MR2-F5 now cites the round-3 executed composition
+(partial adopted refund + blanked metadata + same-key 409 over held money, no
+worklist row) as its inherited probe. Otherwise unchanged: §4.4's
+different-amount adoption-during-pending; the §A3.19 webhook-flip door;
+pre-deploy stranded month-1 orphans; the `MONTH_ONE_RETURNED_SENTENCE` tense.

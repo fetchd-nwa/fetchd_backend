@@ -1032,6 +1032,14 @@ function withdrawRefundIdempotencyKey(refundId: string): string {
  * enrollment's identity, derived here from the live booking set this function
  * already had to fetch, and passed IN rather than re-read so the two questions
  * in {@link readRowMoneyState} cannot answer off two different reads of it.
+ *
+ * **Δ 2026-08-24 (money-residue 1.2):** the NULL-PI example above is no longer
+ * a standing source of remainder-positive rows. The withdraw's `refund_manual`
+ * arm now mints a terminal `'unroutable'` refund for the remainder, which
+ * `sumNonFailedForCharge` counts — so such a charge reads remainder ZERO from
+ * the mint onward. The identity rule is unchanged and still load-bearing for
+ * the OTHER example, a Stripe-failed refund, whose amount genuinely drops back
+ * out of the cap (`ne('failed')`) until a human resolves it.
  */
 async function enrollmentStillOwesMoney(
   tx: Parameters<typeof bookingsRepository.findLiveBookingsForCohortDog>[0],

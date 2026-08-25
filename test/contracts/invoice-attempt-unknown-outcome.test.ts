@@ -2257,6 +2257,9 @@ test(
       'client-keyed': 1,
       'never-sent': 0,
       'stripe-failed': 0,
+      // MR-A1.5: the quiet class is on every tick's summary — a `'failed'` row
+      // whose charge is already covered by returned money. Zero here.
+      covered: 0,
     });
     assert.equal(sweeper.calls.filter((c) => c.method === 'createRefund').length, 0);
 

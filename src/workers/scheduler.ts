@@ -309,6 +309,7 @@ export async function runSchedulerTickOnce(
       'client-keyed': 0,
       'never-sent': 0,
       'stripe-failed': 0,
+      covered: 0,
     },
     results: [],
   };

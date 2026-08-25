@@ -101,7 +101,9 @@ export async function firePendingRefundPostCommit(args: {
  * path will ever send it. Money owed with no route is a page-once event, at the
  * moment it becomes true — not a line that repeats on every worker tick forever.
  *
- * Called IN-TRANSACTION at the mint (`cancelBookingService`), never from a
+ * Called IN-TRANSACTION at the mint (`cancelBookingService`'s money-back
+ * branch, and since 2026-08-24 the group-class withdraw's `refund_manual` arm —
+ * `designs/money-residue.md` §3), never from a
  * post-commit seam — ruled by the 2026-08-20 adversary panel, which proved the
  * post-commit placement loses the announcement PERMANENTLY on the
  * crash-then-replay arc (`withMutation` replays skip postCommit, and no report

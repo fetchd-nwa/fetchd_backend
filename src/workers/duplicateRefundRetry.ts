@@ -197,6 +197,16 @@ export async function runDuplicateRefundRetryOnce(
     mintedBefore: windowFloor,
   });
   const abandonedTotal = ABANDONED_CLASSES.reduce((sum, c) => sum + totalByClass[c], 0);
+  // TRUNCATION is a claim about ACTIONABLE rows the page could not show
+  // (MR-A2.5(d)5). `covered` rows are excluded from the page BY CONSTRUCTION
+  // and need no action, so counting them here raised the flag on a report whose
+  // hidden rows were all "nothing to do" — a truncation alarm that is false
+  // exactly when it is loudest.
+  const shoutingTotal = ABANDONED_CLASSES.filter((c) => !QUIET_CLASSES.has(c)).reduce(
+    (sum, c) => sum + totalByClass[c],
+    0,
+  );
+  const abandonedTruncated = shoutingTotal > abandoned.length;
   reportAbandoned(abandoned, totalByClass, log);
 
   const sent = results.filter((r) => r.outcome === 'sent').length;
@@ -209,7 +219,7 @@ export async function runDuplicateRefundRetryOnce(
       // and can be saturated by never-sent seed rows, which is exactly when the
       // number must not flatter.
       abandoned: abandonedTotal,
-      abandonedTruncated: abandonedTotal > abandoned.length,
+      abandonedTruncated,
     },
     'duplicate refund retry sweep complete',
   );
@@ -218,7 +228,7 @@ export async function runDuplicateRefundRetryOnce(
     sent,
     abandoned: abandonedTotal,
     abandonedByClass: totalByClass,
-    abandonedTruncated: abandonedTotal > abandoned.length,
+    abandonedTruncated,
     results,
   };
 }
@@ -384,7 +394,16 @@ const ABANDONED_CLASS_MESSAGE: Record<AbandonedRefundClass, string> = {
   'never-sent':
     'duplicate refund retry: refund rows with no Stripe charge behind them are still pending — the charge carries no PaymentIntent (pre-Stripe-wire seed money), so there is nothing to refund in the dashboard and no automatic path applies; these record an intent to return money that never moved through Stripe and must be resolved out of band',
   'stripe-failed':
-    'duplicate refund retry: Stripe reported these refunds FAILED after creating them — the money did NOT return to the owner and nothing retries them (the refund identity is spent); CHECK the listed PaymentIntent for an existing manual refund first (this alarm repeats per process restart, so a colleague may already have re-sent it), then issue a FRESH refund from the Stripe dashboard — safe because a failed refund drops out of the cumulative refundable cap and Stripe refuses over-refunding',
+    'duplicate refund retry: Stripe reported these refunds FAILED after creating them — the money did NOT return to the owner and nothing retries them (the refund identity is spent); CHECK the listed PaymentIntent for an existing manual refund first (this alarm repeats per process restart, so a colleague may already have re-sent it), then follow each row\'s `instruction` EXACTLY — it names the one figure to return on that row, and rows sharing a charge have already had the charge\'s capacity divided between them oldest-first, so obeying every row on this page is safe both individually and in total. A row reading "return NOTHING" means exactly that. **The bound is OURS to compute, not Stripe\'s**: Stripe limits only refunds that pass through Stripe, and `resolved-external` money (a check, an account credit) is invisible to it — an earlier version of this sentence claimed "Stripe refuses over-refunding" as the safety net, which is false for exactly the returns this class attracts',
+  // MR-A2.5(a): the previous text ended "resolve each with a note if you want
+  // it off the books explicitly", which a human CANNOT obey — guard (b)
+  // correctly refuses resolving any row on a fully-covered charge (its amount
+  // necessarily exceeds a remainder of 0). An instruction nobody can follow is
+  // worse than no instruction: it sends someone to try, fail, and distrust the
+  // report. A covered row needs no action at all — the reclassification IS its
+  // resolution.
+  covered:
+    'duplicate refund retry: refunds Stripe FAILED whose charge has no live remainder left — NO ACTION NEEDED on any of them. Two substates, both quiet for the same reason: covered by a COMPLETED return (an adopted dashboard refund, or a resolved-external attestation — the money is with the owner and this row is history), or covered by an IN-FLIGHT return (a re-mint the sweep still owns — the money has not moved yet, and acting now is the double-movement this class exists to prevent). Either way the row reclassified automatically and re-shouts on the next tick if the covering refund fails',
 };
 
 /**
@@ -426,6 +445,7 @@ const ABANDONED_CLASS_QUERY: Record<AbandonedRefundClass, string> = {
   'never-sent':
     "SELECT * FROM refunds WHERE status='pending' AND stripe_refund_id IS NULL ORDER BY created_at DESC",
   'stripe-failed': "SELECT * FROM refunds WHERE status='failed' ORDER BY created_at DESC",
+  covered: "SELECT * FROM refunds WHERE status='failed' ORDER BY created_at DESC",
 };
 
 const ABANDONED_CLASSES: readonly AbandonedRefundClass[] = [
@@ -433,7 +453,54 @@ const ABANDONED_CLASSES: readonly AbandonedRefundClass[] = [
   'client-keyed',
   'never-sent',
   'stripe-failed',
+  // MR-A1.5. Counted in the summary and INFO-logged, NEVER alarmed: see
+  // `QUIET_CLASSES`.
+  'covered',
 ];
+
+/**
+ * Classes that are reported but never ALARMED (MR-A1.5).
+ *
+ * `covered` is money that already went back — an adopted dashboard refund or a
+ * `resolved-external` attestation meets the charge — so the `'failed'` row that
+ * remains records an unsuccessful ATTEMPT at a debt that no longer exists.
+ * Before this class existed, `totalByClass['stripe-failed']` could not reach
+ * zero even after the return, so the round-6 alarm could never clear and the
+ * page kept telling a human to send the money a second time.
+ *
+ * It is still COUNTED in every tick's summary and INFO line: the condition is
+ * never invisible, it is merely not an emergency.
+ */
+const QUIET_CLASSES: ReadonlySet<AbandonedRefundClass> = new Set(['covered']);
+
+/** Dollars, for a sentence a human reads rather than a field they parse. */
+function dollars(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+/**
+ * The row's instruction IN WORDS (MR-A3.2 presentation rule).
+ *
+ * A fully-clipped row must never print a bare `$0`: on a worklist that reads as
+ * a bug, and the reader resolves a bug by guessing — which on this page means
+ * returning the row's own amount, the exact over-return the allocation exists
+ * to prevent. So a zero says "return NOTHING on this row" and says why; a
+ * partially-clipped row names both figures so the human can see the arithmetic
+ * rather than having to trust it.
+ */
+function actionableInstruction(row: AbandonedRefundRow): string {
+  const because =
+    row.clipReason === 'allocated-to-older'
+      ? 'it is allocated to an older row on the same charge'
+      : 'the money is already returned, attested, or still owned by automation';
+  if (row.actionableCents === 0) {
+    return `return NOTHING on this row — ${because}`;
+  }
+  if (row.clipped) {
+    return `return ${dollars(row.actionableCents)} of this row's ${dollars(row.amountCents)} — the rest is not available on this charge: ${because}`;
+  }
+  return `return ${dollars(row.actionableCents)}`;
+}
 
 /**
  * The ONE durable announcement for a refund that was owed with no route to send
@@ -472,6 +539,16 @@ function reportAbandoned(
     const inClass = rows.filter((r) => r.refundClass === refundClass);
     const total = totalByClass[refundClass];
     if (total === 0) continue;
+    if (QUIET_CLASSES.has(refundClass)) {
+      // Counted, never alarmed. `findAbandonedPending` also keeps these off the
+      // named page, so `inClass` is empty by construction — the count is the
+      // whole report, which is exactly right for money that is no longer owed.
+      log.info(
+        { workerTick: 'duplicate-refund-retry', refundClass, abandonedCount: total },
+        ABANDONED_CLASS_MESSAGE[refundClass],
+      );
+      continue;
+    }
     const unreported = inClass.filter((r) => !ALARMED_REFUND_IDS.has(r.id));
     if (unreported.length === 0) {
       // Nothing NEW to name by row. Two very different situations reach here and
@@ -530,6 +607,15 @@ function reportAbandoned(
           ownerId: r.ownerId,
           chargeId: r.chargeId,
           amountCents: r.amountCents,
+          // THE FIGURE TO RETURN (MR-A2.3, allocated MR-A3.2). Both inputs are
+          // still reported as context, and `instruction` renders the figure in
+          // words — because a bare `0` on a worklist reads as a typo, and a
+          // human resolves a typo by guessing.
+          actionableCents: r.actionableCents,
+          clipped: r.clipped,
+          clipReason: r.clipReason,
+          instruction: actionableInstruction(r),
+          remainingCents: r.remainingCents,
           paymentIntentId: r.stripePaymentIntentId,
           // The key the human is being told to search for. Stored on the row
           // for everything minted since 2026-08-19; derived for the legacy

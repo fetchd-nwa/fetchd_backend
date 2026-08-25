@@ -13,6 +13,7 @@ import {
   memberships,
   notifications,
   refunds,
+  scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import { membershipsRepository } from '../../src/db/repositories/membershipsRepository.js';
 import {
@@ -32,6 +33,7 @@ import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
+import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
 import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRetry.js';
 import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
@@ -956,9 +958,37 @@ test(
     assert.match(JSON.stringify(alarm.obj.refunds), new RegExp(row!.id));
     assert.match(JSON.stringify(alarm.obj.refunds), new RegExp(failedRefundId));
     assert.match(alarm.msg ?? '', /did NOT return/);
-    assert.match(alarm.msg ?? '', /fresh refund/i, 'and the instruction is one a human can run');
+    // AMENDED by MR-A1.5: the instruction used to say "issue a FRESH refund",
+    // which names no amount — so a human returned the ROW's figure even when
+    // something else had already come back. It now names the OWED REMAINDER,
+    // and the row carries it.
+    // AMENDED AGAIN by MR-A2.3: the instruction names `actionableCents` —
+    // `min(row amount, charge remainder)` — because the charge-level remainder
+    // alone over-returns whenever the row is a PARTIAL refund of a larger
+    // charge (executed at 4000c). Here nothing else came back, so all three
+    // figures coincide.
+    // AMENDED by MR-A3.2: the sentence no longer names a FIELD, it points at
+    // each row's rendered `instruction` — because a fully-clipped row has to
+    // read "return NOTHING", which no bare number can say.
+    assert.match(
+      alarm.msg ?? '',
+      /instruction/,
+      'the instruction says how much, not just "refund it"',
+    );
+    const namedFigures = (
+      alarm.obj.refunds as { remainingCents?: number; actionableCents?: number }[]
+    )[0];
+    assert.equal(namedFigures?.actionableCents, 2_500, 'the one figure to obey');
+    assert.equal(namedFigures?.remainingCents, 2_500, 'and the cap agrees with it here');
 
-    // A fresh dashboard refund is SAFE because a failed row drops out of the cap.
+    // The failed amount frees its headroom again — that is what makes a
+    // hand-sent return possible at all.
+    //
+    // **What this does NOT establish** (MR-A1.5 correction): that Stripe would
+    // refuse an over-refund. Stripe bounds only money that moves THROUGH
+    // Stripe; a `resolved-external` return (a check, an account credit) is
+    // invisible to it. The netting has to be ours, which is why the remainder
+    // above is computed here and named in the alarm.
     const summed = await withActor('system:scheduler', (tx) =>
       refundsRepository.sumNonFailedForCharge(tx, charge!.id),
     );
@@ -1132,6 +1162,8 @@ test(
       'client-keyed': 0,
       'never-sent': 0,
       'stripe-failed': 0,
+      // MR-A1.5: the quiet class exists on every tick's summary, at 0 here.
+      covered: 0,
     });
     await cleanup();
   },
@@ -1665,6 +1697,824 @@ test(
       'function',
       'the real implementation is restored',
     );
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// 6. The month-1 membership orphan refund joins lane 1
+//    (`designs/money-residue.md` §2.5/10)
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'membership month-1 orphan: a webhook-minted refund whose fire fails is re-fired under the SAME stored key',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const { app: hookApp } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    const stripe = makeStripeStub();
+    registerStripeWebhookRoute(hookApp, { stripe });
+    const piId = `pi_test_m1sweep_${randomUUID().slice(0, 8)}`;
+    const eventId = `evt_test_${randomUUID().slice(0, 8)}`;
+
+    // The post-commit fire fails — before the stored key, a refund minted by an
+    // unattended webhook arm would have been unretryable by anything.
+    stripe.throwOnRefund();
+    stripe.setNextEvent({
+      id: eventId,
+      type: 'payment_intent.succeeded',
+      paymentIntentId: piId,
+      amountCents: 12_000,
+      metadata: {
+        owner_id: FIXTURE_IDS.ownerId,
+        dog_id: FIXTURE_IDS.dog1Id,
+        purpose: 'membership',
+        package_id: FIXTURE_IDS.creditPackageSchool5Id,
+        package_key: FIXTURE_IDS.creditPackageSchool5Key,
+        term_months: '3',
+        credits: '5',
+        mode: 'school',
+        location: 'fayetteville',
+      },
+    });
+    const res = await hookApp.inject({
+      method: 'POST',
+      url: '/webhooks/stripe',
+      headers: { 'stripe-signature': 't=1,v1=fake' },
+      payload: { id: eventId, type: 'payment_intent.succeeded' },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(
+      (res.json() as { outcome: string }).outcome,
+      'refunded-orphaned-membership-charge',
+    );
+
+    const row = await theOnlyRefund();
+    assert.equal(row.status, 'pending');
+    assert.equal(row.stripeRefundId, null, 'nothing at Stripe knows about this refund');
+    assert.equal(
+      row.stripeIdempotencyKey,
+      `membership-orphan-refund:${row.id}`,
+      'ROW-DERIVED and stored in the minting tx — lane 1 by construction',
+    );
+
+    await ageIntoTheClaimWindow(row.id);
+    const sweeper = makeStripeStub();
+    armRefundCap(piId, 12_000, stripe, sweeper);
+    const tick = await runDuplicateRefundRetryOnce({ stripe: sweeper, now: sweepNow() });
+    assert.equal(tick.scanned, 1, 'lane 1 claims it — the stored key is the whole licence');
+    assert.equal(tick.sent, 1);
+    const retried = sweeper.calls.filter((c) => c.method === 'createRefund');
+    assert.equal(retried.length, 1);
+    assert.equal(retried[0]?.idempotencyKey, `membership-orphan-refund:${row.id}`);
+    assert.ok((await readRefund(row.id))?.stripeRefundId, 'the re_* id closes the row');
+
+    await db
+      .delete(scheduledNotifications)
+      .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// 7. MR-A1.5 — the worklist stops inviting a SECOND movement of money
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'MR-A1.5 worklist: a fully-covered failed row is counted quietly, not shouted at with "issue a FRESH refund"',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const chargeId = randomUUID();
+    await db.insert(charges).values({
+      id: chargeId,
+      ownerId: FIXTURE_IDS.ownerId,
+      stripePaymentIntentId: `pi_test_covered_${randomUUID().slice(0, 8)}`,
+      amountCents: 10_000,
+      status: 'succeeded',
+      purpose: 'package',
+    });
+    // Our refund was created at Stripe and then FAILED…
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'failed',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+    // …and a human already returned the money out of band.
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'resolved-external',
+      reason: 'cancel',
+      resolutionNote: 'check #1042',
+      stripeRefundId: null,
+      stripeIdempotencyKey: null,
+    });
+
+    const logs = collectLogs();
+    const tick = await runDuplicateRefundRetryOnce({
+      stripe: makeStripeStub(),
+      now: sweepNow(),
+      log: logs.log,
+    });
+    assert.equal(
+      tick.abandonedByClass['stripe-failed'],
+      0,
+      'RED today: 1 — the alarm cannot clear even though the money went back',
+    );
+    assert.equal(tick.abandonedByClass.covered, 1, 'counted, quietly');
+    assert.equal(
+      logs.error('stripe-failed'),
+      undefined,
+      'and no ERROR tells a human to send this money a second time',
+    );
+    assert.ok(
+      logs.infos.some((i) => i.obj.refundClass === 'covered'),
+      'the condition is never invisible — it is INFO, not silence',
+    );
+
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A1.5 worklist: a partially-covered failed row still shouts, and names the LIVE remainder',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const chargeId = randomUUID();
+    await db.insert(charges).values({
+      id: chargeId,
+      ownerId: FIXTURE_IDS.ownerId,
+      stripePaymentIntentId: `pi_test_partial_${randomUUID().slice(0, 8)}`,
+      amountCents: 10_000,
+      status: 'succeeded',
+      purpose: 'package',
+    });
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'failed',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 4_000,
+      status: 'succeeded',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+
+    const logs = collectLogs();
+    const tick = await runDuplicateRefundRetryOnce({
+      stripe: makeStripeStub(),
+      now: sweepNow(),
+      log: logs.log,
+    });
+    assert.equal(tick.abandonedByClass['stripe-failed'], 1, 'still owed');
+    const alarm = logs.error('stripe-failed');
+    assert.ok(alarm, 'and still loud');
+    const named = (alarm!.obj.refunds as {
+      remainingCents?: number;
+      actionableCents?: number;
+    })[0] as { remainingCents?: number; actionableCents?: number } | undefined;
+    assert.equal(
+      named?.remainingCents,
+      6_000,
+      'the charge-level cap, reported as context',
+    );
+    // MR-A2.3: the row promised 10000c and only 6000c is still returnable, so
+    // the CAP is the smaller number and it wins.
+    assert.equal(named?.actionableCents, 6_000, 'the one figure to obey');
+    assert.match(
+      String(alarm!.msg),
+      /instruction/,
+      'the instruction says how much, not just "refund it"',
+    );
+    assert.match(
+      String((alarm!.obj.refunds as { instruction?: string }[])[0]?.instruction),
+      /return \$60\.00 of this row's \$100\.00/,
+      'and the row renders both figures in words',
+    );
+
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// 8. MR-A2.3 — the worklist figure is the per-row obligation CLIPPED by the cap
+//
+// MR-A1.5's sentence ordered "return the OWED REMAINDER named on each row —
+// that figure, not the row amount", but the figure it printed was the
+// CHARGE-level remainder. The Opus lane executed the cost (Q5-C): a 6000c
+// failed partial on an otherwise-untouched 10000c charge printed 10000c, and
+// obeying the instruction over-returns 4000c the row never promised.
+//
+// One actionable number: `min(row.amountCents, remainingCents)`. The row's
+// amount is the recorded obligation; the live remainder is the cap; the safe
+// instruction is always the smaller.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** A succeeded charge with a `'failed'` refund of `failedCents`, plus an
+ *  optional succeeded refund that shrinks the live remainder. */
+async function seedFailedPartial(opts: {
+  chargeCents: number;
+  failedCents: number;
+  alsoReturnedCents?: number;
+}): Promise<{ chargeId: string; failedId: string }> {
+  const chargeId = randomUUID();
+  await db.insert(charges).values({
+    id: chargeId,
+    ownerId: FIXTURE_IDS.ownerId,
+    stripePaymentIntentId: `pi_test_clip_${randomUUID().slice(0, 8)}`,
+    amountCents: opts.chargeCents,
+    status: 'succeeded',
+    purpose: 'package',
+  });
+  const [failed] = await db
+    .insert(refunds)
+    .values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: opts.failedCents,
+      status: 'failed',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    })
+    .returning({ id: refunds.id });
+  if (opts.alsoReturnedCents !== undefined) {
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: opts.alsoReturnedCents,
+      status: 'succeeded',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+  }
+  return { chargeId, failedId: failed!.id };
+}
+
+function namedRow(alarm: { obj: Record<string, unknown> } | undefined): Record<string, unknown> {
+  assert.ok(alarm, 'the stripe-failed alarm fired');
+  const rows = alarm!.obj.refunds as Record<string, unknown>[];
+  assert.equal(rows.length, 1, 'exactly one row named');
+  return rows[0]!;
+}
+
+test(
+  'MR-A2.3 — remainder ABOVE the row: the figure is the ROW amount (the executed Q5-C, inverted)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // 6000c failed partial on an otherwise-untouched 10000c charge. The rest of
+    // the charge was never promised back — minting more is the automatic
+    // machinery's decision, never a dashboard sentence's.
+    await seedFailedPartial({ chargeCents: 10_000, failedCents: 6_000 });
+
+    const logs = collectLogs();
+    const tick = await runDuplicateRefundRetryOnce({
+      stripe: makeStripeStub(),
+      now: sweepNow(),
+      log: logs.log,
+    });
+    assert.equal(tick.abandonedByClass['stripe-failed'], 1);
+    const row = namedRow(logs.error('stripe-failed'));
+    assert.equal(
+      row.actionableCents,
+      6_000,
+      'RED (Q5-C executed): the line printed the charge remainder 10000c — obeying it over-returns 4000c',
+    );
+    assert.equal(row.amountCents, 6_000);
+    assert.equal(row.remainingCents, 10_000, 'the cap is still reported, as context');
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A2.3 — remainder BELOW the row: the figure is the REMAINDER, and the line says why',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // 6000c failed, but 6000c already came back another way: only 4000c of the
+    // charge is still returnable. Returning the row's figure would pass the cap.
+    await seedFailedPartial({
+      chargeCents: 10_000,
+      failedCents: 6_000,
+      alsoReturnedCents: 6_000,
+    });
+
+    const logs = collectLogs();
+    const tick = await runDuplicateRefundRetryOnce({
+      stripe: makeStripeStub(),
+      now: sweepNow(),
+      log: logs.log,
+    });
+    assert.equal(tick.abandonedByClass['stripe-failed'], 1, 'still owed something');
+    const row = namedRow(logs.error('stripe-failed'));
+    assert.equal(row.actionableCents, 4_000, 'the cap wins when it is the smaller number');
+    // Renamed by MR-A3.2: `clippedByRemainder` generalized to `clipped` + a
+    // reason, because the cap is no longer the only thing that can clip a row.
+    assert.equal(row.clipped, true, 'and the clip is FLAGGED, not silent');
+    assert.equal(row.clipReason, 'covered-elsewhere');
+    assert.equal(row.amountCents, 6_000, 'both figures are named so the human sees WHY');
+    assert.equal(row.remainingCents, 4_000);
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// 9. MR-A2.5(a)/(b) — the covered class: instruction and definition
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'MR-A2.5(a) — the covered instruction asks for NO human action (the old one could not be obeyed)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const chargeId = randomUUID();
+    await db.insert(charges).values({
+      id: chargeId,
+      ownerId: FIXTURE_IDS.ownerId,
+      stripePaymentIntentId: `pi_test_covmsg_${randomUUID().slice(0, 8)}`,
+      amountCents: 10_000,
+      status: 'succeeded',
+      purpose: 'package',
+    });
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'failed',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'resolved-external',
+      reason: 'cancel',
+      resolutionNote: 'check #1042',
+      stripeRefundId: null,
+      stripeIdempotencyKey: null,
+    });
+
+    const logs = collectLogs();
+    await runDuplicateRefundRetryOnce({
+      stripe: makeStripeStub(),
+      now: sweepNow(),
+      log: logs.log,
+    });
+    const info = logs.infos.find((i) => i.obj.refundClass === 'covered');
+    assert.ok(info, 'reported quietly');
+    assert.match(
+      info!.msg ?? '',
+      /no action needed/i,
+      'RED today: "resolve each with a note" — which guard (b) correctly REFUSES on a covered charge',
+    );
+    assert.doesNotMatch(
+      info!.msg ?? '',
+      /resolve (each|it) with a note/i,
+      'the unfollowable instruction is gone',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A2.5(b) — `covered` is the CAP question: a PENDING row closing the remainder makes a failed row quiet',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const chargeId = randomUUID();
+    await db.insert(charges).values({
+      id: chargeId,
+      ownerId: FIXTURE_IDS.ownerId,
+      stripePaymentIntentId: `pi_test_capq_${randomUUID().slice(0, 8)}`,
+      amountCents: 10_000,
+      status: 'succeeded',
+      purpose: 'package',
+    });
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'failed',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+    // A PENDING re-mint covers the reopened remainder. Returned coverage is
+    // still ZERO — nothing has actually gone back — but ordering a human to act
+    // while automation is mid-flight is the double-movement invitation, which
+    // is why classification asks the CAP question, not the ledger one.
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'pending',
+      reason: 'cancel',
+      stripeRefundId: null,
+      stripeIdempotencyKey: `k-${randomUUID()}`,
+    });
+
+    const { totalByClass } = await refundsRepository.findAbandonedPending(db, {
+      mintedBefore: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    assert.equal(
+      totalByClass['stripe-failed'],
+      0,
+      'quiet while the automatic refund is in flight — and it re-shouts if that refund fails',
+    );
+    assert.equal(totalByClass.covered, 1);
+    // The LEDGER question is the other one, and it is untouched: nothing came
+    // back, so the charge is still `'succeeded'`.
+    const [chargeRow] = await db
+      .select({ status: charges.status })
+      .from(charges)
+      .where(eq(charges.id, chargeId));
+    assert.equal(chargeRow?.status, 'succeeded');
+    await cleanup();
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// 10. MR-A3.2 — the actionable figure: per-row remainder EXCLUDING SELF,
+//     plus greedy allocation across shouting siblings.
+//
+// MR-A2.3's `min(row.amount, remainingCents)` was wrong in BOTH directions,
+// each executed by the Opus lane:
+//
+//   (a) the charge-level remainder excludes ALL failed rows, so failed SIBLINGS
+//       are invisible to each other and each prints against the full remainder
+//       — Σ over-instructed by +10000c and +3000c in the staged compositions;
+//   (b) it INCLUDES the row itself when the row is PENDING, so a full-amount
+//       pending row in the refund-by-hand class printed **$0** — an instruction
+//       to return nothing on the one row whose whole point is a by-hand return.
+//
+// The fix is a self-excluded per-row remainder plus deterministic greedy
+// allocation over the charge's shouting set. The property that matters: every
+// printed figure ≤ its row's obligation, AND Σ printed ≤ the charge's true cap
+// — so a human who robotically obeys every row returns at most what is owed,
+// with no cross-referencing required.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Seed a charge and a list of refund rows on it, oldest-first in the order
+ *  given, and return their ids. */
+async function seedChargeWithRows(
+  chargeCents: number,
+  rows: { cents: number; status: 'failed' | 'pending' | 'succeeded' | 'resolved-external' }[],
+): Promise<{ chargeId: string; refundIds: string[] }> {
+  const chargeId = randomUUID();
+  await db.insert(charges).values({
+    id: chargeId,
+    ownerId: FIXTURE_IDS.ownerId,
+    stripePaymentIntentId: `pi_test_alloc_${randomUUID().slice(0, 8)}`,
+    amountCents: chargeCents,
+    status: 'succeeded',
+    purpose: 'package',
+  });
+  const refundIds: string[] = [];
+  let offsetMs = rows.length * 1000;
+  for (const row of rows) {
+    const [inserted] = await db
+      .insert(refunds)
+      .values({
+        ownerId: FIXTURE_IDS.ownerId,
+        chargeId,
+        bookingId: null,
+        amountCents: row.cents,
+        status: row.status,
+        reason: 'cancel',
+        // Deterministic oldest-first ordering, spaced so `created_at ASC` is
+        // unambiguous.
+        createdAt: new Date(Date.now() - offsetMs).toISOString(),
+        stripeRefundId:
+          row.status === 'failed' || row.status === 'succeeded'
+            ? `re_test_${randomUUID().slice(0, 8)}`
+            : null,
+        stripeIdempotencyKey: row.status === 'pending' ? `k-${randomUUID()}` : null,
+        ...(row.status === 'resolved-external' ? { resolutionNote: 'check #1042' } : {}),
+      })
+      .returning({ id: refunds.id });
+    refundIds.push(inserted!.id);
+    offsetMs -= 1000;
+  }
+  return { chargeId, refundIds };
+}
+
+/** The report's named rows for one charge, keyed by refund id. */
+async function reportRows(): Promise<
+  Map<string, { amountCents: number; actionableCents: number; clipped: boolean; clipReason: string | null }>
+> {
+  const { rows } = await refundsRepository.findAbandonedPending(db, {
+    mintedBefore: new Date(Date.now() + 60 * 60 * 1000),
+  });
+  return new Map(
+    rows.map((r) => [
+      r.id,
+      {
+        amountCents: r.amountCents,
+        actionableCents: r.actionableCents,
+        clipped: r.clipped,
+        clipReason: r.clipReason,
+      },
+    ]),
+  );
+}
+
+test(
+  'MR-A3.2 (i) — single failed row, remainder above it → the ROW amount, unclipped',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const { refundIds } = await seedChargeWithRows(10_000, [{ cents: 6_000, status: 'failed' }]);
+    const seen = (await reportRows()).get(refundIds[0]!);
+    assert.ok(seen);
+    assert.equal(seen!.actionableCents, 6_000);
+    assert.equal(seen!.clipped, false);
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.2 (ii) — coverage elsewhere clips the row, and says so',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const { refundIds } = await seedChargeWithRows(10_000, [
+      { cents: 6_000, status: 'succeeded' },
+      { cents: 6_000, status: 'failed' },
+    ]);
+    const seen = (await reportRows()).get(refundIds[1]!);
+    assert.ok(seen);
+    assert.equal(seen!.actionableCents, 4_000);
+    assert.equal(seen!.clipped, true);
+    assert.equal(seen!.clipReason, 'covered-elsewhere');
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.2 (iii) — a full-amount PENDING by-hand row prints its FULL amount, never $0',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // The executed inversion: the row is itself in the non-failed sum, so the
+    // charge remainder had already netted it out and `min(row, remainder)` was
+    // structurally 0 for every full-amount pending row — while the class
+    // sentence orders "return exactly that figure and no other".
+    const { refundIds } = await seedChargeWithRows(10_000, [{ cents: 10_000, status: 'pending' }]);
+    await db
+      .update(refunds)
+      .set({ createdAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString() })
+      .where(eq(refunds.id, refundIds[0]!));
+    const seen = (await reportRows()).get(refundIds[0]!);
+    assert.ok(seen, 'the by-hand row is on the page');
+    assert.equal(
+      seen!.actionableCents,
+      10_000,
+      'RED (R3-C executed): a 10000c refund that NEVER LEFT was instructed at $0',
+    );
+    assert.equal(seen!.clipped, false);
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.2 (iv) — two failed siblings 6000+5000 on an untouched 10000c charge → 6000+4000, Σ exactly 10000',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const { refundIds } = await seedChargeWithRows(10_000, [
+      { cents: 6_000, status: 'failed' },
+      { cents: 5_000, status: 'failed' },
+    ]);
+    const seen = await reportRows();
+    const older = seen.get(refundIds[0]!);
+    const newer = seen.get(refundIds[1]!);
+    assert.ok(older && newer);
+    assert.equal(older!.actionableCents, 6_000, 'oldest-first takes its full obligation');
+    assert.equal(
+      newer!.actionableCents,
+      4_000,
+      'RED (R3-D executed): each sibling printed its own full figure, Σ=11000 on a 10000c charge',
+    );
+    assert.equal(newer!.clipped, true);
+    assert.equal(newer!.clipReason, 'allocated-to-older');
+    assert.equal(
+      older!.actionableCents + newer!.actionableCents,
+      10_000,
+      'a human obeying every row returns at most what the charge can owe',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.2 (iv-b) — the executed Σ-over shapes: 10000+10000 → 10000+NOTHING; three 3000c + succeeded 3000c on 9000c → Σ 6000',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const twin = await seedChargeWithRows(10_000, [
+      { cents: 10_000, status: 'failed' },
+      { cents: 10_000, status: 'failed' },
+    ]);
+    let seen = await reportRows();
+    assert.equal(seen.get(twin.refundIds[0]!)!.actionableCents, 10_000);
+    const second = seen.get(twin.refundIds[1]!)!;
+    assert.equal(second.actionableCents, 0, 'RED (R3-D): Σ was 20000c on a 10000c charge');
+    assert.equal(second.clipped, true);
+    assert.equal(second.clipReason, 'allocated-to-older');
+    await cleanup();
+
+    const trio = await seedChargeWithRows(9_000, [
+      { cents: 3_000, status: 'succeeded' },
+      { cents: 3_000, status: 'failed' },
+      { cents: 3_000, status: 'failed' },
+      { cents: 3_000, status: 'failed' },
+    ]);
+    seen = await reportRows();
+    const figures = trio.refundIds.slice(1).map((id) => seen.get(id)!.actionableCents);
+    assert.deepStrictEqual(
+      figures,
+      [3_000, 3_000, 0],
+      'RED (R3-E): Σ was 9000c against a live cap of 6000c',
+    );
+    assert.equal(
+      figures.reduce((a, b) => a + b, 0),
+      6_000,
+      'Σ printed equals the charge`s true remaining cap',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.2 (v) — a NON-shouting pending sibling is subtracted from the joint cap',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    // The pending row is FRESH (inside the key window), so it is not abandoned
+    // and never reaches the page — its money is still automation's, and the
+    // joint cap must not offer it to a human.
+    const { chargeId, refundIds } = await seedChargeWithRows(10_000, [
+      { cents: 6_000, status: 'failed' },
+    ]);
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 5_000,
+      status: 'pending',
+      reason: 'cancel',
+      stripeRefundId: null,
+      stripeIdempotencyKey: `k-${randomUUID()}`,
+    });
+
+    const { rows } = await refundsRepository.findAbandonedPending(db, {
+      // A cutoff BEFORE the fresh pending row was minted, so it is not abandoned.
+      mintedBefore: new Date(Date.now() - 60 * 1000),
+    });
+    const seen = rows.find((r) => r.id === refundIds[0]!);
+    assert.ok(seen, 'the failed row is unbounded by age and still on the page');
+    assert.equal(
+      rows.filter((r) => r.status === 'pending').length,
+      0,
+      'staged: the pending sibling is NOT in this report pass',
+    );
+    assert.equal(seen!.actionableCents, 5_000, 'the joint cap subtracts money automation still owns');
+    assert.equal(seen!.clipped, true);
+    assert.equal(seen!.clipReason, 'covered-elsewhere');
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.2 (vi) — ordering is stable: the same inputs produce the same figures across passes',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const { refundIds } = await seedChargeWithRows(10_000, [
+      { cents: 6_000, status: 'failed' },
+      { cents: 5_000, status: 'failed' },
+    ]);
+    const pass1 = await reportRows();
+    const pass2 = await reportRows();
+    for (const id of refundIds) {
+      assert.equal(
+        pass1.get(id)!.actionableCents,
+        pass2.get(id)!.actionableCents,
+        'a worklist figure that moves between ticks is a worklist nobody can act on',
+      );
+    }
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.2 — a fully-clipped row is told to return NOTHING, explicitly, never a bare $0',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    await seedChargeWithRows(10_000, [
+      { cents: 10_000, status: 'failed' },
+      { cents: 10_000, status: 'failed' },
+    ]);
+    const logs = collectLogs();
+    await runDuplicateRefundRetryOnce({
+      stripe: makeStripeStub(),
+      now: sweepNow(),
+      log: logs.log,
+    });
+    const alarm = logs.error('stripe-failed');
+    assert.ok(alarm);
+    const named = alarm!.obj.refunds as { actionableCents?: number; instruction?: string }[];
+    const zero = named.find((r) => r.actionableCents === 0);
+    assert.ok(zero, 'the fully-allocated sibling is still named');
+    assert.match(
+      String(zero!.instruction),
+      /return NOTHING on this row/i,
+      'RED today: a bare 0 reads as a typo, and a human resolves it by guessing',
+    );
+    assert.match(String(zero!.instruction), /allocated/i, 'and it says WHY');
+    await cleanup();
+  },
+);
+
+test(
+  'MR-A3.5(a) — the covered message names its SUBSTATE: completed return vs in-flight return',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const chargeId = randomUUID();
+    await db.insert(charges).values({
+      id: chargeId,
+      ownerId: FIXTURE_IDS.ownerId,
+      stripePaymentIntentId: `pi_test_sub_${randomUUID().slice(0, 8)}`,
+      amountCents: 10_000,
+      status: 'succeeded',
+      purpose: 'package',
+    });
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'failed',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+    await db.insert(refunds).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId,
+      bookingId: null,
+      amountCents: 10_000,
+      status: 'pending',
+      reason: 'cancel',
+      stripeRefundId: null,
+      stripeIdempotencyKey: `k-${randomUUID()}`,
+    });
+
+    const logs = collectLogs();
+    await runDuplicateRefundRetryOnce({
+      stripe: makeStripeStub(),
+      now: sweepNow(),
+      log: logs.log,
+    });
+    const info = logs.infos.find((i) => i.obj.refundClass === 'covered');
+    assert.ok(info);
+    assert.match(
+      info!.msg ?? '',
+      /in-flight/i,
+      'RED today: one sentence for two substates — "already returned" is false while the return is still moving',
+    );
+    assert.match(info!.msg ?? '', /re-shouts/i, 'and it says what happens if that return fails');
     await cleanup();
   },
 );

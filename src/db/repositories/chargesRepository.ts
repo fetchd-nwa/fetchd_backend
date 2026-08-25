@@ -118,6 +118,15 @@ export interface ChargeRow {
   bookingId: string | null;
   stripePaymentIntentId: string | null;
   purpose: ChargePurpose;
+  /**
+   * The dog this money is for, when the charge is per-dog (membership,
+   * group-class). Added 2026-08-24 (MR-A1.4 fold) because the webhook's
+   * month-1 push has to key its deep link off the ROW rather than off event
+   * metadata: metadata crosses a trust boundary and can arrive empty, and a
+   * push keyed off an absent field simply never fires — which is how an
+   * unattended refund happened with no notification at all.
+   */
+  dogId: string | null;
 }
 
 const CHARGE_PROJECTION = {
@@ -128,6 +137,7 @@ const CHARGE_PROJECTION = {
   bookingId: charges.bookingId,
   stripePaymentIntentId: charges.stripePaymentIntentId,
   purpose: charges.purpose,
+  dogId: charges.dogId,
 } as const;
 
 /** `CHARGE_PROJECTION` plus the second half of the enrollment-membership rule
@@ -248,6 +258,39 @@ export const chargesRepository = {
    * the money is taken with no record and no credits. Safe under a concurrent
    * client retry: the unique PI makes the second INSERT a no-op (`DO NOTHING`)
    * that falls through to the re-SELECT, so the grant is written exactly once.
+   *
+   * `created` is load-bearing for the membership month-1 arms
+   * (`designs/money-residue.md` §2.2c): `false` means ANOTHER writer owns this
+   * PaymentIntent — the route committing concurrently, or a prior delivery —
+   * and the caller must decide by the found row's status instead of by its own
+   * intent. That re-check is what makes the ordinary subscribe race-safe: a
+   * webhook arriving before the route's commit BLOCKS on the route's
+   * uncommitted unique insert, then reads the committed `'succeeded'` row and
+   * no-ops, so it can never refund a charge whose membership exists.
+   *
+   * **THE CONFLICT FALLBACK BELOW IS A PLAIN READ, AND STAYS ONE** (MR-A2.1,
+   * 2026-08-24). It is not a lock, so a caller that ADJUDICATES money from it
+   * decides while holding nothing — which is exactly the defect MR-A2.1 fixed
+   * in `memberships.ts`. Rather than lock here (which would take the charge
+   * lock on paths that do not need it, including the webhook's own inserts),
+   * the rule is stated at the seam and re-verified per caller. All four,
+   * checked this pass:
+   *
+   *   1. `stripeEventHandlers.maybeReconstructOrphanedPackagePurchase` — ignores
+   *      `created` entirely and uses only `charge.id`; the grant it feeds is
+   *      itself no-op-if-present. Nothing is adjudicated from the status.
+   *   2. `stripeEventHandlers.maybeRefundOrphanedMembershipCharge` — reads the
+   *      status only as a fast-path bail, then hands off to
+   *      `adjudicateMonthOneMembershipCharge`, which RE-READS the row under
+   *      `findByStripePaymentIntentIdForUpdate` and re-decides there. Safe in
+   *      both directions: a plain read can only lag, and the terminal statuses
+   *      are absorbing, so "terminal" can never be a stale lie.
+   *   3. `memberships.ts` arm (b)'s loser fall-through — **re-takes the locked
+   *      read before dispatching** (the MR-A2.1 fix).
+   *   4. `memberships.ts` arm (a)'s `recordProcessingMonthOneCharge` — an
+   *      ANSWER-ONLY read that writes no cap state, ruled sufficient at
+   *      MR-A1.3: a flip racing it at worst answers 402 where 409 just became
+   *      true, and the owner's next tap heals it.
    */
   async insertIfAbsentByPaymentIntent(
     tx: Tx,
@@ -257,6 +300,14 @@ export const chargesRepository = {
       status: ChargeStatus;
       purpose: ChargePurpose;
       stripePaymentIntentId: string;
+      /**
+       * The dog this money is for. Additive (2026-08-24, money-residue §2.2):
+       * a membership charge is per-dog and the orphan arm has the id in hand
+       * from the PaymentIntent metadata, so the reconstructed row carries the
+       * same stamp the route would have written. The package-reconstruct caller
+       * keeps omitting it — a package purchase's dog lives on the ledger row.
+       */
+      dogId?: string | null;
     },
   ): Promise<{ charge: ChargeRow; created: boolean }> {
     const [inserted] = await tx
@@ -268,6 +319,7 @@ export const chargesRepository = {
         status: args.status,
         purpose: args.purpose,
         stripePaymentIntentId: args.stripePaymentIntentId,
+        dogId: args.dogId ?? null,
       })
       .onConflictDoNothing({ target: charges.stripePaymentIntentId })
       .returning(CHARGE_PROJECTION);
@@ -318,11 +370,22 @@ export const chargesRepository = {
    *      was FALSE when it was written** (ADDENDUM 3 §A3.17, 2026-08-22): the
    *      scan fell through a fully-covered newest row to ANY older
    *      remainder-positive one, including a previous enrollment's — so a
-   *      `refund_manual` NULL-PI row (remainder-positive forever, by design) or
-   *      a refund the bank terminally failed answered "money in hand" for the
-   *      CURRENT enrollment, and the reconciler cancelled a live authorization
-   *      for a dog sitting in the class. A (cohort, dog) is not an enrollment;
-   *      withdraw + re-enroll mints a second one under the same key.
+   *      `refund_manual` NULL-PI row (remainder-positive forever, by design at
+   *      the time) or a refund the bank terminally failed answered "money in
+   *      hand" for the CURRENT enrollment, and the reconciler cancelled a live
+   *      authorization for a dog sitting in the class. A (cohort, dog) is not
+   *      an enrollment; withdraw + re-enroll mints a second one under the same
+   *      key.
+   *
+   *      **Δ 2026-08-24 (money-residue 1.2): the NULL-PI half of that is now
+   *      closed at the source.** The withdraw's `refund_manual` arm mints a
+   *      terminal `'unroutable'` refunds row for the remainder, and
+   *      `sumNonFailedForCharge` counts it — so such a charge reads REMAINDER
+   *      ZERO from the next instant onward and can never again answer "money in
+   *      hand" to anybody. The identity rule above is not weakened by that and
+   *      is still the thing doing the work for the `stripe-failed` half, which
+   *      genuinely does reopen a remainder (`ne('failed')`) until a human
+   *      resolves it.
    *
    *      Membership is now decided by {@link chargeBelongsToEnrollment} — the
    *      charge's anchor is in the enrollment's live booking set, or (legacy,
@@ -512,6 +575,36 @@ export const chargesRepository = {
   },
 
   /**
+   * The same lookup, under the row's LOCK — the membership month-1 invariant's
+   * serialization point (`designs/money-residue.md` §2.2b).
+   *
+   * A `'requires_payment'` membership charge is an adjudication PENDING, and
+   * whoever flips it terminal adjudicates the money. Three writers can reach
+   * one: the owner's same-key retry (adopt), the webhook's flip arm (refund),
+   * and the uniqueness lost-race branch. Reading it unlocked lets two of them
+   * decide from the same stale answer and both act — which for this row means
+   * a membership AND a refund, or two refunds. `FOR UPDATE` makes the second
+   * arrival block until the first commits and then read what it decided.
+   *
+   * **Charge FIRST, `refunds` never `FOR UPDATE`** — the §A3.19 R1 deadlock
+   * invariant. Callers take this lock, then mint through
+   * `mintCappedPendingRefund` (which re-takes the same row lock it already
+   * holds), so no leg can ever wait on a `refunds` row while holding a charge.
+   */
+  async findByStripePaymentIntentIdForUpdate(
+    tx: Tx,
+    stripePaymentIntentId: string,
+  ): Promise<ChargeRow | undefined> {
+    const [row] = await tx
+      .select(CHARGE_PROJECTION)
+      .from(charges)
+      .where(eq(charges.stripePaymentIntentId, stripePaymentIntentId))
+      .limit(1)
+      .for('update');
+    return row;
+  },
+
+  /**
    * Flip a charge's status (`requires_payment` → `succeeded` / `failed`).
    * Stamps `updated_at = now()`. Idempotent — calling with the same target
    * status is a no-op write. Used by Day-15 webhook on terminal Stripe
@@ -652,6 +745,35 @@ export const chargesRepository = {
       .from(charges)
       .where(eq(charges.id, id))
       .limit(1);
+    return row;
+  },
+
+  /**
+   * Read a charge by primary key, under the row's LOCK — the acquisition point
+   * for the **one global lock order, charges → refunds** (MR-A1.2(ii)).
+   *
+   * Every transaction that locks rows in BOTH tables takes the charge first.
+   * `handleChargeRefundUpdated` uses this: it matches the refund row unlocked
+   * (its write-time status guards are what make that safe, the `markUnroutable`
+   * pattern), resolves the charge id, locks HERE, then re-reads the refund row
+   * under the held lock before writing. Before the conversion that handler wrote
+   * refunds-then-charges, which made a charge-first lock inside
+   * `markResolvedExternal` an AB-BA deadlock pair — so the fix for one had to be
+   * the fix for both.
+   *
+   * The refunds-ONLY writers are outside this order by construction and must
+   * stay that way: `claimStalePendingForRetry` (`FOR UPDATE SKIP LOCKED` on
+   * refunds, never touches charges), `markStripeId`, and `markUnroutable` — none
+   * of them subsequently acquires a charges lock. A future edit that gives any
+   * of them one creates a cycle.
+   */
+  async findByIdForUpdate(tx: Tx, id: string): Promise<ChargeRow | undefined> {
+    const [row] = await tx
+      .select(CHARGE_PROJECTION)
+      .from(charges)
+      .where(eq(charges.id, id))
+      .limit(1)
+      .for('update');
     return row;
   },
 };

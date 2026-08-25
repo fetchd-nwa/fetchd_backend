@@ -37,7 +37,10 @@ import {
 } from '../db/repositories/groupClassesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
-import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import {
+  refundsRepository,
+  type CappedRefundMint,
+} from '../db/repositories/refundsRepository.js';
 import { withActor } from '../db/tx.js';
 import {
   agreementUnsignedError,
@@ -75,6 +78,7 @@ import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import {
   firePendingRefundPostCommit,
+  logUnroutableRefundMint,
   type PendingStripeRefund,
 } from '../lib/pendingRefund.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
@@ -498,9 +502,13 @@ export function registerEnrollmentsRoute(
 
           /** The refund mint, identical for every arm that reaches it (R35
            *  pending-row-as-commitment, the client-keyed recovery machinery).
-           *  Returns the cents ACTUALLY put on their way back — 0 when there
-           *  was nothing left to return, which is what the callers read the
-           *  outcome off (§A3.15 finding 2, the structural half).
+           *
+           *  **Returns the helper's VERDICT, not a cent figure** (money-residue
+           *  1.2). It used to collapse all three answers to a number, which
+           *  made `'nothing-to-refund'` and `'no-payment-intent'` — two states
+           *  with opposite consequences — indistinguishable to every caller. A
+           *  charge with no PaymentIntent owes money that must be RECORDED;
+           *  a fully-covered one owes nothing. Both were `0`.
            *
            *  **The R9 cap is computed under the charge row's LOCK** (§A3.18
            *  D2), inside the shared helper, because it is a read-modify-write:
@@ -515,7 +523,10 @@ export function registerEnrollmentsRoute(
            *  one request (two taps can both capture) and one key across two
            *  refunds is how one debt becomes one refund. Both spellings are
            *  deterministic per request, which is what makes a retry replay. */
-          const mintRefund = async (charge: { id: string }, stripeKey: string): Promise<number> => {
+          const mintRefund = async (
+            charge: { id: string },
+            stripeKey: string,
+          ): Promise<CappedRefundMint> => {
             const minted = await refundsRepository.mintCappedPendingRefund(tx, {
               chargeId: charge.id,
               ownerId: principal.ownerId,
@@ -526,14 +537,59 @@ export function registerEnrollmentsRoute(
               // because this key lives only in this request's closure.
               stripeIdempotencyKey: () => stripeKey,
             });
-            if (minted.kind !== 'minted') return 0;
-            pendingStripeRefunds.push({
-              refundId: minted.refundId,
-              paymentIntentId: minted.paymentIntentId,
-              amountCents: minted.amountCents,
-              stripeIdempotencyKey: minted.stripeIdempotencyKey,
+            if (minted.kind === 'minted') {
+              pendingStripeRefunds.push({
+                refundId: minted.refundId,
+                paymentIntentId: minted.paymentIntentId,
+                amountCents: minted.amountCents,
+                stripeIdempotencyKey: minted.stripeIdempotencyKey,
+              });
+            }
+            return minted;
+          };
+
+          /**
+           * Record a refund the school OWES on a charge with no Stripe route
+           * home — `designs/money-residue.md` §3, transplanted verbatim from
+           * `cancelBookingService`'s money-back branch so "money owed with no
+           * Stripe route" has ONE shape in this codebase rather than one per
+           * lane.
+           *
+           * Written TERMINAL at `'unroutable'`, under the charge row's lock
+           * that {@link mintRefund}'s helper already took, with the amount the
+           * helper computed under that lock (never the pool-read remainder).
+           * `'pending'` here would be a worklist entry no sweep could send and
+           * no webhook could close.
+           *
+           * The ERROR is emitted IN-TRANSACTION, at the moment the obligation
+           * becomes true — the ruled `logUnroutableRefundMint` placement. A
+           * post-commit page is lost permanently on the crash-then-replay arc,
+           * because `withMutation` replays skip `postCommit` entirely, and an
+           * `'unroutable'` row appears in no report class ever again. The cost
+           * is one false alarm if this transaction rolls back: loud and
+           * recoverable, traded for silent and permanent.
+           */
+          const recordUnroutableRefund = async (
+            charge: { id: string },
+            amountCents: number,
+          ): Promise<void> => {
+            const refund = await refundsRepository.createUnroutable(tx, {
+              ownerId: principal.ownerId,
+              chargeId: charge.id,
+              bookingId: null,
+              amountCents,
+              reason: 'cancel',
             });
-            return minted.amountCents;
+            logUnroutableRefundMint(
+              request.log,
+              {
+                refundId: refund.id,
+                ownerId: principal.ownerId,
+                chargeId: charge.id,
+                amountCents,
+              },
+              { cohortId, dogId, refundPath: 'group-class-withdraw' },
+            );
           };
 
           /**
@@ -580,12 +636,19 @@ export function registerEnrollmentsRoute(
                     status: 'succeeded',
                   });
                   anyRefunded = true;
-                  mintedCents += await mintRefund(
-                    row.charge,
-                    settlement.lane === 'invoice'
-                      ? `${refundIdempotencyKey}:${row.charge.id}`
-                      : refundIdempotencyKey,
-                  );
+                  {
+                    // `'no-payment-intent'` is unreachable here by
+                    // construction: every row in this settlement came from a
+                    // `'requires_payment'` read that filters
+                    // `stripe_payment_intent_id IS NOT NULL`.
+                    const minted = await mintRefund(
+                      row.charge,
+                      settlement.lane === 'invoice'
+                        ? `${refundIdempotencyKey}:${row.charge.id}`
+                        : refundIdempotencyKey,
+                    );
+                    if (minted.kind === 'minted') mintedCents += minted.amountCents;
+                  }
                   break;
                 case 'release_pending':
                   livePending ??= { amountCents: row.charge.amountCents };
@@ -720,41 +783,45 @@ export function registerEnrollmentsRoute(
               dogId,
               enrollment: enrollmentIdentityOf(enrolledBookings),
             });
-            if (charge !== undefined && charge.stripePaymentIntentId !== null) {
+            if (charge !== undefined) {
+              // ── money-residue 1.2 ───────────────────────────────────────
+              // ONE mint call, three honest answers. This arm used to branch
+              // on `charge.stripePaymentIntentId` ITSELF and, on the NULL
+              // branch, record the obligation NOWHERE: one ERROR line, no row,
+              // R9's cap left open forever — so any future leg (the portal's
+              // staff-refund verb, Adjudication 8) would see the whole
+              // remainder with no record that a manual refund was already
+              // promised. That is the double-refund shape, one surface away.
+              // `owed_cents` was also computed OUTSIDE any charge lock, from
+              // the pool-read remainder — a §A3.18 D2 read-modify-write in
+              // miniature.
+              //
               // The landed `${K}:refund` spelling, deliberately. §A2.1/5's
               // per-charge key belongs to the multi-row settle arm; this arm
               // mints for exactly one already-succeeded charge and its key is
               // pinned by tests on both lanes.
-              refundedCents = await mintRefund({ id: charge.id }, refundIdempotencyKey);
-              // Asserted iff THIS request minted. The skip above makes the
-              // zero branch unreachable here; the guard stays because the
-              // invariant is the wire's, not this arm's.
-              moneyOutcome = refundedCents > 0 ? 'refunded' : 'none';
-            } else if (charge !== undefined) {
-              // Succeeded charge, NULL PaymentIntent — pre-Stripe-wire money
-              // with no route home. The queued withdraw-NULL-PI design owns
-              // the real fix (§A3.11) and this arm STILL MINTS NOTHING; what
-              // changed on 2026-08-21 (§A3.15 finding 1) is only the sentence.
-              // `'none'` renders "There's no charge on file to return." — to an
-              // owner who IS owed money, that is affirmatively false and the
-              // one sentence that would make them stop asking. `'refund_manual'`
-              // commits to the refund and is honest about the mechanism: a
-              // human makes it.
-              moneyOutcome = 'refund_manual';
-              owedCents = charge.remainingCents;
-              // The tripwire stays exactly as it was — this is still a gap, and
-              // the ERROR is the human's page (logged in-tx at the moment it
-              // becomes true, the `logUnroutableRefundMint` placement rule).
-              request.log.error(
-                {
-                  cohortId,
-                  dogId,
-                  ownerId: principal.ownerId,
-                  chargeId: charge.id,
-                  amountCents: charge.amountCents,
-                },
-                'group-class withdraw: this enrollment was PAID on a charge with no PaymentIntent, so there is no automatic route to return it — a human must refund this money out of band',
-              );
+              const minted = await mintRefund({ id: charge.id }, refundIdempotencyKey);
+              if (minted.kind === 'minted') {
+                refundedCents = minted.amountCents;
+                moneyOutcome = 'refunded';
+              } else if (minted.kind === 'no-payment-intent') {
+                // Succeeded charge, NULL PaymentIntent — pre-Stripe-wire money
+                // with no route home. `'none'` renders "There's no charge on
+                // file to return." — to an owner who IS owed money that is
+                // affirmatively false and the one sentence that would make them
+                // stop asking. `'refund_manual'` commits to the refund and is
+                // honest about the mechanism: a human makes it. It is now also
+                // RECORDED, so the commitment stops being amnesiac — and
+                // `owed_cents` is the LOCKED cap, not the pool read.
+                await recordUnroutableRefund({ id: charge.id }, minted.amountCents);
+                moneyOutcome = 'refund_manual';
+                owedCents = minted.amountCents;
+              } else {
+                // `'nothing-to-refund'`. Unreachable via
+                // `findUnsettledSucceededCharge`'s positive-remainder contract;
+                // kept because the invariant is the WIRE's, not this arm's.
+                moneyOutcome = 'none';
+              }
             } else if (preTx !== undefined) {
               // **The fall-through speaks the LANE's sentences, not the pay-now
               // lane's** (§A2.2). A1 routed invoice-lane verdicts here, where

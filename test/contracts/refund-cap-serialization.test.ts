@@ -374,3 +374,259 @@ test(
     }
   },
 );
+
+// ══════════════════════════════════════════════════════════════════════════
+// MR-A1.2 — the invariant WIDENS: every cap-ENTERING write takes the charge
+// lock, and one global lock order (charges → refunds) makes that safe.
+//
+// The Fable attack lane executed the hole D2 left open
+// (`attack-fable-p1/probe-resolve-vs-mint.{ts,log}`): `markResolvedExternal`
+// moves a row INTO `sumNonFailedForCharge` (`failed → resolved-external`) with
+// NO charge lock and NO coverage guard. Interleaved with a still-open
+// `mintCappedPendingRefund`, both commit: **16000c of non-failed refunds on a
+// 10000c charge**, and `claimStalePendingForRetry` CLAIMED the over-minted
+// pending row — the sweep would fire it. Stripe cannot bound this: the
+// resolved-external 6000c moved OUTSIDE Stripe (a check), so Stripe would
+// happily send the full 10000c. Money leaves twice.
+// ══════════════════════════════════════════════════════════════════════════
+
+/** A standalone succeeded charge (no cohort), the probe's shape. */
+async function seedPlainCharge(amountCents: number): Promise<{ id: string; pi: string }> {
+  const id = randomUUID();
+  const pi = `pi_test_mra1_${randomUUID().slice(0, 8)}`;
+  await db.insert(chargesTable).values({
+    id,
+    ownerId: FIXTURE_IDS.ownerId,
+    stripePaymentIntentId: pi,
+    amountCents,
+    status: 'succeeded',
+    purpose: 'package',
+  });
+  return { id, pi };
+}
+
+async function seedFailedRefund(chargeId: string, amountCents: number): Promise<string> {
+  const id = randomUUID();
+  await db.insert(refundsTable).values({
+    id,
+    ownerId: FIXTURE_IDS.ownerId,
+    chargeId,
+    bookingId: null,
+    amountCents,
+    status: 'failed',
+    reason: 'cancel',
+    stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+    stripeIdempotencyKey: null,
+  });
+  return id;
+}
+
+async function dropCharge(chargeId: string): Promise<void> {
+  await db.delete(refundsTable).where(eq(refundsTable.chargeId, chargeId));
+  await db.delete(chargesTable).where(eq(chargesTable.id, chargeId));
+}
+
+test(
+  '§MR-A1.2a (Fable probe promoted) a resolve OVERLAPPING an open mint can never push non-failed past the charge',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const charge = await seedPlainCharge(10_000);
+    const failedId = await seedFailedRefund(charge.id, 6_000);
+    try {
+      const barrier = makeBarrier();
+      // Tx A — the automatic leg (the withdraw route's tx): mint early, then
+      // hold the tx open exactly as a real route tx does for many more
+      // statements.
+      const mintTx = withActor('system:scheduler', async (tx) => {
+        await tx.execute(sql`SELECT 1`);
+        await barrier.arrive('mint');
+        return refundsRepository.mintCappedPendingRefund(tx, {
+          chargeId: charge.id,
+          ownerId: FIXTURE_IDS.ownerId,
+          bookingId: null,
+          reason: 'cancel',
+          stripeIdempotencyKey: (refundId) => `withdraw-refund:${refundId}`,
+        });
+      });
+      // Tx B — the staff resolve, landing inside A's window.
+      const resolveTx = withActor('staff:probe-resolver', async (tx) => {
+        await tx.execute(sql`SELECT 1`);
+        await barrier.arrive('resolve');
+        return refundsRepository.markResolvedExternal(tx, {
+          id: failedId,
+          note: 'returned by check #1042',
+        });
+      });
+
+      const [mint, resolvedCount] = await Promise.all([mintTx, resolveTx]);
+      assert.equal(barrier.arrived(), 2, 'the two transactions genuinely overlapped');
+
+      const rows = await refundsFor(charge.id);
+      const nonFailed = rows
+        .filter((r) => r.status !== 'failed')
+        .reduce((sum, r) => sum + r.amountCents, 0);
+      assert.ok(
+        nonFailed <= 10_000,
+        `RED (executed): non-failed summed ${nonFailed} on a 10000c charge — money would leave twice ` +
+          `(mint=${JSON.stringify(mint)}, resolvedCount=${resolvedCount})`,
+      );
+
+      // And whichever order won, the outcome is COHERENT: either the resolve
+      // landed first and the mint capped itself to the live remainder, or the
+      // mint landed first and the resolve REFUSED (a refund is in flight).
+      if (resolvedCount === 1) {
+        assert.ok(
+          mint.kind !== 'minted' || mint.amountCents <= 4_000,
+          'a mint behind a committed resolve sees the resolved row in the cap',
+        );
+      } else {
+        assert.equal(mint.kind, 'minted', 'the mint won, so the resolve must be the refuser');
+        assert.equal(resolvedCount, 0, 'and it refuses rather than stacking on an in-flight refund');
+      }
+
+      // The over-minted row is what the sweep would have fired.
+      const claimable = rows.filter((r) => r.status === 'pending');
+      assert.ok(
+        claimable.reduce((s, r) => s + r.amountCents, 0) <= 10_000,
+        'no pending row exceeds what the charge can still return',
+      );
+    } finally {
+      await dropCharge(charge.id);
+    }
+  },
+);
+
+test(
+  '§MR-A1.2b the verb REFUSES while an automatic refund is in flight (guard a)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const charge = await seedPlainCharge(10_000);
+    const failedId = await seedFailedRefund(charge.id, 6_000);
+    try {
+      const minted = await withActor('system:scheduler', (tx) =>
+        refundsRepository.mintCappedPendingRefund(tx, {
+          chargeId: charge.id,
+          ownerId: FIXTURE_IDS.ownerId,
+          bookingId: null,
+          reason: 'cancel',
+          stripeIdempotencyKey: (refundId) => `withdraw-refund:${refundId}`,
+        }),
+      );
+      assert.equal(minted.kind, 'minted', 'staged: a pending refund is in flight');
+
+      const count = await withActor('staff:resolver', (tx) =>
+        refundsRepository.markResolvedExternal(tx, { id: failedId, note: 'check #1042' }),
+      );
+      assert.equal(
+        count,
+        0,
+        'RED today: 1 — resolving under an in-flight refund is exactly the executed interleave',
+      );
+      const rows = await refundsFor(charge.id);
+      assert.equal(
+        rows.find((r) => r.id === failedId)?.status,
+        'failed',
+        'untouched — let the automatic refund settle first',
+      );
+    } finally {
+      await dropCharge(charge.id);
+    }
+  },
+);
+
+test(
+  '§MR-A1.2c the verb REFUSES to attest more money than the charge is owed (guard b)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const charge = await seedPlainCharge(10_000);
+    // 6000c already came back through Stripe; the live remainder is 4000c.
+    await db.insert(refundsTable).values({
+      ownerId: FIXTURE_IDS.ownerId,
+      chargeId: charge.id,
+      bookingId: null,
+      amountCents: 6_000,
+      status: 'succeeded',
+      reason: 'cancel',
+      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+      stripeIdempotencyKey: null,
+    });
+    const oversizedFailed = await seedFailedRefund(charge.id, 6_000);
+    try {
+      const count = await withActor('staff:resolver', (tx) =>
+        refundsRepository.markResolvedExternal(tx, {
+          id: oversizedFailed,
+          note: 'attesting 6000c against a 4000c remainder',
+        }),
+      );
+      assert.equal(count, 0, 'RED today: 1 — non-failed would sum to 12000c on a 10000c charge');
+      assert.equal(
+        (await refundsFor(charge.id)).find((r) => r.id === oversizedFailed)?.status,
+        'failed',
+        'it stays on the worklist, which now shows the LIVE remainder',
+      );
+    } finally {
+      await dropCharge(charge.id);
+    }
+  },
+);
+
+test(
+  '§MR-A1.2d the ADOPTION insert is a cap-entering write and takes the charge lock too',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const charge = await seedPlainCharge(10_000);
+    try {
+      const barrier = makeBarrier();
+      const mintTx = withActor('system:scheduler', async (tx) => {
+        await tx.execute(sql`SELECT 1`);
+        await barrier.arrive('mint');
+        return refundsRepository.mintCappedPendingRefund(tx, {
+          chargeId: charge.id,
+          ownerId: FIXTURE_IDS.ownerId,
+          bookingId: null,
+          reason: 'cancel',
+          stripeIdempotencyKey: (refundId) => `withdraw-refund:${refundId}`,
+        });
+      });
+      const adoptTx = withActor('system:stripe-webhook', async (tx) => {
+        await tx.execute(sql`SELECT 1`);
+        await barrier.arrive('adopt');
+        return refundsRepository.adoptExternalRefundCapped(tx, {
+          chargeId: charge.id,
+          ownerId: FIXTURE_IDS.ownerId,
+          amountCents: 10_000,
+          status: 'succeeded',
+          stripeRefundId: `re_test_dash_${randomUUID().slice(0, 8)}`,
+        });
+      });
+
+      // Settle BOTH before asserting: a rejection from either one must not let
+      // the teardown race a still-open transaction into an FK error that
+      // replaces the real failure with a plumbing one.
+      const [mintOutcome, adoptOutcome] = await Promise.allSettled([mintTx, adoptTx]);
+      if (mintOutcome.status === 'rejected') throw mintOutcome.reason as Error;
+      if (adoptOutcome.status === 'rejected') throw adoptOutcome.reason as Error;
+      const mint = mintOutcome.value;
+      const adopted = adoptOutcome.value;
+      assert.equal(barrier.arrived(), 2, 'the two transactions genuinely overlapped');
+      const rows = await refundsFor(charge.id);
+      const nonFailed = rows
+        .filter((r) => r.status !== 'failed')
+        .reduce((sum, r) => sum + r.amountCents, 0);
+      assert.ok(
+        nonFailed <= 10_000,
+        `non-failed summed ${nonFailed} on a 10000c charge (mint=${mint.kind}, adopt=${adopted.kind})`,
+      );
+      // Exactly one of the two writers may commit a cap-entering row here: the
+      // adoption records money that ALREADY moved at Stripe, so if it wins the
+      // mint must cap to 0; if the mint wins the adoption refuses in-flight.
+      assert.equal(
+        [mint.kind === 'minted', adopted.kind === 'adopted'].filter(Boolean).length,
+        1,
+        'exactly one cap-entering writer commits',
+      );
+    } finally {
+      await dropCharge(charge.id);
+    }
+  },
+);
