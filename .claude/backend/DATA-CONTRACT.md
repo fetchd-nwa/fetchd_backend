@@ -2634,8 +2634,8 @@ invisible to the repository layer.
 
 **Reports**
 
-- `GET /dogs/:id/reports` · `GET /reports/:id` · `GET /dogs/:id/reports/latest` · `GET /dogs/:id/reports/resolve?reportId=&program=`
-- `POST /staff/reports` [staff] — **portal verb 2**, base + results|content by program; links bookings.report_id/session_report_id · `PATCH /staff/reports/:id` [staff]
+- `GET /dogs/:id/reports` · `GET /reports/:id` (staff branch since 1.13.0/2.3b: a staff principal reads any LIVE report cross-owner, byte-identical to the owner read) · `GET /dogs/:id/reports/latest` · `GET /dogs/:id/reports/resolve?reportId=&program=`
+- `POST /staff/reports` [staff] — **portal verb 2**, base + results|content by program; links bookings.report_id/session_report_id · `PATCH /staff/reports/:id` [staff] · `GET /staff/reports?dog_id=` [staff] — 2.3b, dog_id REQUIRED (WC-A5; unscoped 400s), program/category filters · `DELETE /staff/reports/:id` [staff] — 2.3b, 204, soft-expire via reports.expired_at
 - `GET /staff/dogs` [staff] — cross-owner dog directory (Day-19b) · `GET /staff/dogs/:dogId/session-count?category=` [staff] — past-session count for the report author's auto visit number (post-19c)
 
 **Messaging**

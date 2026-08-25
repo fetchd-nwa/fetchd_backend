@@ -13,8 +13,11 @@ import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { toReportWire, type ReportProgram, type ReportWire } from '../lib/reportWire.js';
+import { formatZodIssues } from '../lib/zodIssues.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import type {
+  GetStaffReportsQuery,
+  GetStaffReportsResponse,
   PatchStaffReportsRequest,
   PostStaffReportsRequest,
   ReportResultsEnvelopeWire,
@@ -22,10 +25,13 @@ import type {
 } from '../contracts/wire.js';
 
 /**
- * Day-19 staff portal verb 2 — report authoring (DATA-CONTRACT R2).
+ * Day-19 staff portal verb 2 — report authoring (DATA-CONTRACT R2), plus the
+ * wire-1.13.0 staff read/delete surface (design §9, phase 2.3b).
  *
- *   POST  /staff/reports       — author a report (base + results|content)
- *   PATCH /staff/reports/:id   — edit an existing report's content fields
+ *   GET    /staff/reports      — the dog-scoped, cross-owner report list
+ *   POST   /staff/reports      — author a report (base + results|content)
+ *   PATCH  /staff/reports/:id  — edit an existing report's content fields
+ *   DELETE /staff/reports/:id  — soft-delete (stamp expired_at), 204
  *
  * R2 is a discriminated union on `program`. Two program families:
  *   - SESSION programs carry a `content` variant doc (REQUIRED).
@@ -60,6 +66,23 @@ const MAX_FULL_TEXT_LEN = 20000;
 const MAX_VERDICT_LEN = 500;
 
 const uuidParamSchema = z.object({ id: z.string().uuid() });
+
+/**
+ * `GET /staff/reports` query. `dog_id` is REQUIRED — Allison's 2026-08-25
+ * ruling (wire-contract-completion WC-A5): staff name a dog to list its
+ * reports; an unscoped cross-owner dump 400s, the `GET /staff/invoices?parked`
+ * precedent (`staffInvoices.ts:66-70`). Zod's own required-key failure IS that
+ * 400, so there is no second hand-rolled guard.
+ *
+ * NOT `.strict()`, matching every other query schema on this surface
+ * (`bookings.ts:80`, `requests.ts:52`, `staffRequests.ts:82`): an unknown key
+ * is dropped, not rejected. `staffInvoices` is the lone strict outlier.
+ */
+const getReportsQuerySchema = z.object({
+  dog_id: z.string().uuid(),
+  program: z.enum(REPORT_PROGRAM_VALUES).optional(),
+  category: z.enum(SERVICE_CATEGORY_VALUES).optional(),
+});
 
 const skillResultSchema = z
   .object({
@@ -124,6 +147,9 @@ type PatchReportBody = z.infer<typeof patchReportBodySchema>;
  * exported wire type with no server-side link to any validator until now —
  * a live contract rather than documentation.
  */
+export type GetStaffReportsQueryConformance = Expect<
+  Equal<z.input<typeof getReportsQuerySchema>, GetStaffReportsQuery>
+>;
 export type StaffReportSkillResultConformance = Expect<
   Equal<z.input<typeof skillResultSchema>, SkillResult>
 >;
@@ -139,6 +165,33 @@ export type PatchStaffReportsBodyConformance = Expect<
 
 export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
+
+  // --- GET /staff/reports -------------------------------------------------
+  //
+  // The cross-owner report list, scoped to ONE dog (`GetStaffReportsQuery`).
+  // A bare array, no envelope, no pagination — the house shape every staff
+  // list already uses (`staffDogs.ts:45`, `staffThreads.ts:54`,
+  // `staffBookings.ts`, `staffInvoices.ts:59`). Live rows only.
+  //
+  // A dog id that matches nothing returns `[]`, not 404: the read has no way
+  // to tell "no such dog" from "no reports yet" without a second query, and
+  // the empty list is the honest answer to both.
+  app.get(
+    '/staff/reports',
+    { preHandler: [authHook] },
+    async (request): Promise<GetStaffReportsResponse> => {
+      const principal = requirePrincipal(request);
+      requireStaff(principal, 'read the staff report list');
+      const query = parseGetReportsQuery(request.query);
+      const rows = await reportsRepository.findLiveForDog(query.dog_id, {
+        program: query.program,
+        category: query.category,
+      });
+      if (rows.length === 0) return [];
+      const trainerName = await staffRepository.resolveTrainerNames(rows);
+      return rows.map((row) => toReportWire(row, trainerName(row.trainerStaffId)));
+    },
+  );
 
   // --- POST /staff/reports ------------------------------------------------
   app.post(
@@ -281,6 +334,45 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
       return outcome.body;
     },
   );
+
+  // --- DELETE /staff/reports/:id ------------------------------------------
+  //
+  // SOFT delete (`DeleteStaffReportsResponse`, wire 1.13.0): stamps
+  // `reports.expired_at`, the row is retained, and it drops out of every read
+  // — owner list, owner by-id, latest, resolve, and the staff list — because
+  // all of them filter `live(reports)`. No DDL: the column already exists
+  // (`schema.sql:589`).
+  //
+  // 404 when there is no LIVE report with that id, so a second delete says so
+  // rather than reporting success on an already-expired row. No
+  // re-notification and no un-publish verb: the drafts/publish model is a
+  // separate portal-wave design (Adjudication 6).
+  app.delete('/staff/reports/:id', { preHandler: [authHook] }, async (request, reply) => {
+    const principal = requirePrincipal(request);
+    requireStaff(principal, 'delete a report');
+    const { id } = parseUuidParam(request.params);
+    const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+
+    // cache-noop: report reads aren't in the §3 cache map (see POST).
+    const outcome = await withMutation<null>(
+      {
+        principal,
+        idempotencyKey,
+        endpoint: 'DELETE /staff/reports/:id',
+        requestHash: hashRequestBody({ id }),
+      },
+      async (tx) => {
+        const expired = await reportsRepository.softExpire(tx, id);
+        if (!expired) {
+          throw new ApiError('not_found', `report ${id} not found`);
+        }
+        return { status: 204, body: null };
+      },
+    );
+
+    reply.code(outcome.status);
+    return outcome.body;
+  });
 }
 
 /**
@@ -338,6 +430,20 @@ function parseUuidParam(params: unknown): { id: string } {
   const parsed = uuidParamSchema.safeParse(params);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid path: ${parsed.error.message}`);
+  }
+  return parsed.data;
+}
+
+/**
+ * Query parse for `GET /staff/reports`. `bad_request`, not `invalid_payload`
+ * — the route-query convention (`bookings.ts:666`, `requests.ts:518`,
+ * `staffRequests.ts:590`); bodies use `invalid_payload`. A missing `dog_id`
+ * lands here as a Zod required-key failure, which IS the WC-A5 400.
+ */
+function parseGetReportsQuery(query: unknown): z.infer<typeof getReportsQuerySchema> {
+  const parsed = getReportsQuerySchema.safeParse(query);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid query: ${formatZodIssues(parsed.error)}`);
   }
   return parsed.data;
 }

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import type { Principal } from '../../src/auth/principal.js';
 import { registerReportsRoute } from '../../src/routes/reports.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -142,15 +144,73 @@ test('GET /reports/:id for an unknown UUID returns 404 not_found', SKIP_WHEN_NO_
   assert.equal(body.error?.code, 'not_found');
 });
 
-test('GET /reports/:id as a staff principal returns 404 not_found', SKIP_WHEN_NO_DB, async () => {
-  const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
-  registerReportsRoute(app, { authenticate });
-  const res = await app.inject({
-    method: 'GET',
-    url: `/reports/${FIXTURE_IDS.reportFoundationId}`,
-  });
-  assert.equal(res.statusCode, 404);
-});
+// Wire 1.13.0 / 2.3b — the staff branch. Through 1.12.0 `reports.ts:125-127`
+// 404'd EVERY non-owner principal; staff now read any LIVE report cross-owner
+// (design §9, reports patch item 3). The three tests below are the whole
+// behavior change: staff read the same bytes an owner reads, an unknown id is
+// still 404, and the OWNER branch's tenancy is untouched.
+
+test(
+  'GET /reports/:id as a staff principal reads any live report, cross-owner, byte-identical to the owner read',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const staff = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+    registerReportsRoute(staff.app, { authenticate: staff.authenticate });
+    const owner = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerReportsRoute(owner.app, { authenticate: owner.authenticate });
+
+    const url = `/reports/${FIXTURE_IDS.reportFoundationId}`;
+    const staffRes = await staff.app.inject({ method: 'GET', url });
+    assert.equal(staffRes.statusCode, 200, staffRes.body);
+    const ownerRes = await owner.app.inject({ method: 'GET', url });
+    assert.equal(ownerRes.statusCode, 200, ownerRes.body);
+    assert.deepStrictEqual(
+      staffRes.json(),
+      ownerRes.json(),
+      'staff get the same ReportWire, not a staff-only shape',
+    );
+    // ...and the dog belongs to the fixture OWNER, not to the staff principal —
+    // this read has no owner scope at all.
+    assert.deepStrictEqual(staffRes.json(), loadSnapshot('report-foundation'));
+  },
+);
+
+test(
+  'GET /reports/:id as a staff principal for an unknown id → 404 not_found',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+    registerReportsRoute(app, { authenticate });
+    const res = await app.inject({ method: 'GET', url: `/reports/${randomUUID()}` });
+    assert.equal(res.statusCode, 404, res.body);
+    const body = res.json() as { error?: { code?: string } };
+    assert.equal(body.error?.code, 'not_found');
+  },
+);
+
+test(
+  'GET /reports/:id — KEEP-GREEN: the OWNER branch still scopes by owner_id (another owner → 404, no id leak)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // A principal that is an owner but owns nothing here. The staff branch
+    // must not have loosened the owner path: an owner who does not own the
+    // dog gets the same 404 as for a nonexistent id.
+    const otherOwner: Principal = {
+      kind: 'owner',
+      ownerId: randomUUID(),
+      supabaseUid: randomUUID(),
+    };
+    const { app, authenticate } = makeContractApp(otherOwner);
+    registerReportsRoute(app, { authenticate });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/reports/${FIXTURE_IDS.reportFoundationId}`,
+    });
+    assert.equal(res.statusCode, 404, res.body);
+    const body = res.json() as { error?: { code?: string } };
+    assert.equal(body.error?.code, 'not_found');
+  },
+);
 
 // --- GET /dogs/:id/reports/latest -------------------------------------
 

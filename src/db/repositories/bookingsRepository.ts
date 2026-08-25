@@ -60,6 +60,20 @@ export interface BookingFullRow extends BookingRow {
   expiredAt: string | null;
 }
 
+/**
+ * The `GET /staff/bookings` server-side filters (`GetStaffBookingsQuery`,
+ * wire 1.13.0). Every key optional; all-omitted reproduces the pre-1.13.0
+ * unfiltered queue exactly. The date fields are named `*ChicagoDate` rather
+ * than `from`/`to` so a caller cannot pass a UTC ISO instant by accident —
+ * they are `YYYY-MM-DD` America/Chicago calendar days, INCLUSIVE both ends.
+ */
+export interface StaffBookingFilters {
+  fromChicagoDate?: string;
+  toChicagoDate?: string;
+  category?: ServiceCategory;
+  location?: LocationKey;
+}
+
 /** A `booking_dogs` join row — lead + additional per booking. */
 export interface BookingDogJoinRow {
   bookingId: string;
@@ -117,12 +131,38 @@ export const bookingsRepository = {
    * staff-portal queue read (`GET /staff/bookings`). Cross-owner by
    * design (`requireStaff` gates the route); the owner-scoped sibling is
    * `findLiveActiveByOwner`. The route sorts by scheduled_at.
+   *
+   * Δ wire 1.13.0 (`GetStaffBookingsQuery`, built in 2.3b): the four optional
+   * filters. They only ever NARROW — the base predicate pair
+   * (`status <> 'cancelled'` AND live) is unconditional, so no filter can
+   * surface a cancelled or soft-expired row. `findLiveActive()` with no
+   * argument is byte-for-byte the pre-1.13.0 query.
    */
-  async findLiveActive(): Promise<BookingRow[]> {
+  async findLiveActive(filters: StaffBookingFilters = {}): Promise<BookingRow[]> {
+    const conditions = [ne(bookings.status, 'cancelled'), live(bookings)];
+    // `from`/`to` are America/Chicago CALENDAR DAYS, inclusive on both ends,
+    // compared against the Chicago day `scheduled_at` falls on — never the UTC
+    // day, which would file a 7pm booking under tomorrow. Same
+    // `(col AT TIME ZONE 'America/Chicago')::date` expression the day-capacity
+    // count and the conflict scan use (`dayCapacityRepository.ts:166`).
+    if (filters.fromChicagoDate !== undefined) {
+      conditions.push(
+        sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date >= ${filters.fromChicagoDate}::date`,
+      );
+    }
+    if (filters.toChicagoDate !== undefined) {
+      conditions.push(
+        sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date <= ${filters.toChicagoDate}::date`,
+      );
+    }
+    if (filters.category !== undefined) conditions.push(eq(bookings.category, filters.category));
+    // Exact match on a nullable column: a booking with no location (private
+    // lessons at home) is correctly excluded by a location filter.
+    if (filters.location !== undefined) conditions.push(eq(bookings.location, filters.location));
     return db
       .select(BOOKING_PROJECTION)
       .from(bookings)
-      .where(and(ne(bookings.status, 'cancelled'), live(bookings)));
+      .where(and(...conditions));
   },
 
   /**

@@ -11,10 +11,13 @@ import { reportProgram } from '../db/schema/schema.js';
 
 /**
  * `GET /dogs/:id/reports` `[auth]` and three companions — the reports
- * read surface (DATA-CONTRACT §C reports). Owner-scoped through the dog
- * FK; staff principals get an empty list / null / 404 (Day-19 staff
- * portal uses `/staff/reports/*` for cross-owner access — out of scope
- * here).
+ * read surface (DATA-CONTRACT §C reports). The three DOG-scoped reads are
+ * owner-scoped through the dog FK; staff principals get an empty list / null
+ * there and use the dog-scoped `GET /staff/reports` instead.
+ *
+ * Δ wire 1.13.0 (design §9): `GET /reports/:id` is the exception — a staff
+ * principal now reads any LIVE report cross-owner through it. The owner
+ * branch is untouched.
  *
  * R2 rehydration is the new ground (Day 6b): the DB stores curriculum
  * keys in a `reports.results` JSONB envelope and the variant doc in
@@ -116,16 +119,25 @@ export function registerReportsRoute(app: FastifyInstance, opts: AuthRouteOption
   );
 
   // --- GET /reports/:id --------------------------------------------------
-  // Single report by id, owner-scoped through the dog FK. Returns 404 if
-  // the report doesn't exist OR doesn't belong to a dog this owner owns —
-  // same response so an attacker can't enumerate ids.
+  // Single report by id. Two branches, one wire shape:
+  //
+  //   owner — scoped through the dog FK. 404 if the report doesn't exist OR
+  //     doesn't belong to a dog this owner owns — same response so an
+  //     attacker can't enumerate ids. UNCHANGED at 1.13.0.
+  //   staff — any LIVE report, cross-owner (wire 1.13.0 / design §9). Through
+  //     1.12.0 this branch 404'd every non-owner principal and pushed staff at
+  //     `/staff/reports/*`, which only ever listed BY DOG — so a portal surface
+  //     holding a bare report id had nowhere to resolve it. A staff principal
+  //     has no owner scope, so there is nothing here to scope against.
+  //
+  // A soft-deleted report is 404 for BOTH (`live(reports)` in either query).
   app.get('/reports/:id', { preHandler: [authHook] }, async (request): Promise<ReportWire> => {
     const principal = requirePrincipal(request);
     const { id } = parseReportIdParam(request.params);
-    if (principal.kind !== 'owner') {
-      throw new ApiError('not_found', `report ${id} not found`);
-    }
-    const row = await reportsRepository.findByIdForOwner(id, principal.ownerId);
+    const row =
+      principal.kind === 'staff'
+        ? await reportsRepository.findLiveById(id)
+        : await reportsRepository.findByIdForOwner(id, principal.ownerId);
     if (row === undefined) {
       throw new ApiError('not_found', `report ${id} not found`);
     }

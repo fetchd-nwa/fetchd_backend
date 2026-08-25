@@ -4,19 +4,24 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
+import { LOCATION_SLUGS, serviceCategory } from '../db/schema/schema.js';
 import { type BookingWire } from '../lib/bookingWire.js';
 import type {
   AttendanceWire,
+  GetStaffBookingsQuery,
   PostStaffBookingsAttendanceRequest,
   PostStaffBookingsCancelRequest,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
+import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
+import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
+import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
  * Day-19 staff portal verb 4 — bookings. Cross-owner reads/writes gated by
@@ -43,6 +48,39 @@ import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBook
 
 const uuidParamSchema = z.object({ id: z.string().uuid() });
 
+const SERVICE_CATEGORY_VALUES = pgEnumTuple(serviceCategory);
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * A Chicago calendar day. The regex pins the SHAPE; `isValidCalendarDate`
+ * rejects the shapes that aren't real days (`2027-13-40` passes a regex).
+ * Same pair as `availability.ts:52-55` and `staffRates.ts:79-80`.
+ */
+const chicagoDayField = z
+  .string()
+  .regex(ISO_DATE, 'must be YYYY-MM-DD')
+  .refine(isValidCalendarDate, 'not a real calendar date');
+
+/**
+ * `GET /staff/bookings` query — the four server-side filters
+ * (`GetStaffBookingsQuery`, wire 1.13.0; built here in 2.3b). Every key is
+ * optional and an all-omitted query returns the unfiltered queue, which is
+ * what makes this build ADDITIVE (design §14.1: promotion never tightens).
+ *
+ * Deliberately NOT `.strict()`, for the same reason: today the handler parses
+ * no query at all, so `?anything=x` is accepted and ignored. Rejecting unknown
+ * keys would turn a working request into a 400 — a behavior change wearing a
+ * validation change's clothes. It also keeps `?search=` (Allison ruling WC-A5:
+ * deferred to phase 3, needs a search domain + matching rule before it can be
+ * contracted) inert rather than an error.
+ */
+const bookingsQuerySchema = z.object({
+  from: chicagoDayField.optional(),
+  to: chicagoDayField.optional(),
+  category: z.enum(SERVICE_CATEGORY_VALUES).optional(),
+  location: z.enum(LOCATION_SLUGS).optional(),
+});
+
 const attendanceBodySchema = z
   .object({
     dog_id: z.string().uuid(),
@@ -65,7 +103,14 @@ const cancelBodySchema = z
 // AttendanceWire is owned by the single-source contract (contracts/wire.ts).
 
 /** §5.1.3 pins — see `PostBookingsBodyConformance` in `routes/bookings.ts`.
- *  Unlike the deny verb's `reason`, THIS `reason` is persisted and comes back
+ *  The QUERY pin is what stops the four filters drifting from the contract in
+ *  either direction: add a fifth key here (`search`, say) or drop one and
+ *  `tsc` fails with TS2344 before any test runs. */
+export type GetStaffBookingsQueryConformance = Expect<
+  Equal<z.input<typeof bookingsQuerySchema>, GetStaffBookingsQuery>
+>;
+
+/** Unlike the deny verb's `reason`, THIS `reason` is persisted and comes back
  *  as `BookingWire.cancel_reason`. */
 export type PostStaffBookingsAttendanceBodyConformance = Expect<
   Equal<z.input<typeof attendanceBodySchema>, PostStaffBookingsAttendanceRequest>
@@ -99,16 +144,23 @@ export function registerStaffBookingsRoute(
   // --- GET /staff/bookings ------------------------------------------------
   //
   // The cross-owner triage queue: every live, non-cancelled booking,
-  // soonest scheduled first. No view/date filter today — the portal is the
-  // "dumbest viable" client and filters client-side; a server-side window
-  // (?from=&to=) is a Day-20 hardening item if the row count grows.
+  // soonest scheduled first. Δ wire 1.13.0 (2.3b) — the Day-20 hardening item
+  // this comment used to defer is built: four optional server-side filters
+  // (`GetStaffBookingsQuery`), all of which NARROW the same base queue. Omit
+  // them all and the response is what it has always been.
   app.get(
     '/staff/bookings',
     { preHandler: [authHook] },
     async (request): Promise<BookingWire[]> => {
       const principal = requirePrincipal(request);
       requireStaff(principal, 'read the staff booking queue');
-      const rows = await bookingsRepository.findLiveActive();
+      const query = parseBookingsQuery(request.query);
+      const rows = await bookingsRepository.findLiveActive({
+        fromChicagoDate: query.from,
+        toChicagoDate: query.to,
+        category: query.category,
+        location: query.location,
+      });
       const sorted = sortBookingsByScheduledAt(rows, 'asc');
       return wireManyBookings(sorted);
     },
@@ -304,6 +356,19 @@ function parseUuidParam(params: unknown): { id: string } {
   const parsed = uuidParamSchema.safeParse(params);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid path: ${parsed.error.message}`);
+  }
+  return parsed.data;
+}
+
+/**
+ * Query parse for `GET /staff/bookings`. A malformed VALUE is 400
+ * `bad_request` — the query convention (`bookings.ts:666`, `requests.ts:518`,
+ * `staffRequests.ts:590`); route BODIES use `invalid_payload`.
+ */
+function parseBookingsQuery(query: unknown): z.infer<typeof bookingsQuerySchema> {
+  const parsed = bookingsQuerySchema.safeParse(query);
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid query: ${formatZodIssues(parsed.error)}`);
   }
   return parsed.data;
 }

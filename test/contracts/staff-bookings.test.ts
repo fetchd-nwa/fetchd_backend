@@ -59,6 +59,7 @@ async function seedBooking(args: {
   confirmedAt?: string | null;
   cancelDeadlineAt?: string | null;
   leadDogId?: string;
+  location?: 'fayetteville' | 'bentonville';
 }): Promise<string> {
   const id = randomUUID();
   const leadDogId = args.leadDogId ?? FIXTURE_IDS.dog1Id;
@@ -69,7 +70,7 @@ async function seedBooking(args: {
     category: args.category ?? 'day-school',
     status: args.status ?? 'upcoming',
     scheduledAt: args.scheduledAt ?? new Date(REAL_NOW_MS + 72 * ONE_HOUR_MS).toISOString(),
-    location: 'fayetteville',
+    location: args.location ?? 'fayetteville',
     ...(args.confirmedAt !== undefined ? { confirmedAt: args.confirmedAt } : {}),
     ...(args.cancelDeadlineAt !== undefined ? { cancelDeadlineAt: args.cancelDeadlineAt } : {}),
   });
@@ -139,6 +140,179 @@ test('GET /staff/bookings — owner principal → 403', SKIP_WHEN_NO_DB, async (
   const res = await app.inject({ method: 'GET', url: '/staff/bookings' });
   assert.equal(res.statusCode, 403, res.body);
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// GET /staff/bookings — server-side filters (wire 1.13.0 `GetStaffBookingsQuery`,
+// built in 2.3b). Exactly four keys, all OPTIONAL:
+//   from / to — YYYY-MM-DD America/Chicago calendar days, INCLUSIVE both ends
+//   category / location — exact-match single values
+// `?search=` is deliberately absent (Allison ruling WC-A5 — deferred to
+// phase 3), and an all-omitted query must reproduce the old response exactly.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Fetch the queue and return just the ids, asserting a 200. */
+async function queueIds(
+  app: ReturnType<typeof makeContractApp>['app'],
+  query = '',
+): Promise<string[]> {
+  const res = await app.inject({ method: 'GET', url: `/staff/bookings${query}` });
+  assert.equal(res.statusCode, 200, res.body);
+  return (res.json() as { id: string }[]).map((r) => r.id);
+}
+
+test(
+  'GET /staff/bookings — KEEP-GREEN: no query reproduces the unfiltered queue',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const boarding = await seedBooking({ category: 'boarding', location: 'bentonville' });
+    const lesson = await seedBooking({ category: 'private-lesson', location: 'fayetteville' });
+    const cancelled = await seedBooking({ status: 'cancelled' });
+    const { app } = staffBookingsApp();
+    const ids = await queueIds(app);
+    assert.ok(ids.includes(boarding), 'unfiltered queue still carries every live category');
+    assert.ok(ids.includes(lesson), 'unfiltered queue still carries every live location');
+    assert.ok(!ids.includes(cancelled), 'and still excludes cancelled rows');
+  },
+);
+
+test(
+  'GET /staff/bookings — KEEP-GREEN: an uncontracted query key is ignored, not rejected (§14.1 — no tightening; ?search= is WC-A5-deferred)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const id = await seedBooking({ category: 'private-lesson' });
+    const { app } = staffBookingsApp();
+    const ids = await queueIds(app, '?search=waffles');
+    assert.ok(ids.includes(id), 'an unknown key yields the unfiltered queue, not a 400');
+  },
+);
+
+test('GET /staff/bookings?category= — exact-match filter', SKIP_WHEN_NO_DB, async () => {
+  const boarding = await seedBooking({ category: 'boarding' });
+  const lesson = await seedBooking({ category: 'private-lesson' });
+  const { app } = staffBookingsApp();
+  const ids = await queueIds(app, '?category=boarding');
+  assert.ok(ids.includes(boarding), 'matching category kept');
+  assert.ok(!ids.includes(lesson), 'non-matching category filtered out');
+});
+
+test('GET /staff/bookings?location= — exact-match filter', SKIP_WHEN_NO_DB, async () => {
+  const benton = await seedBooking({ location: 'bentonville' });
+  const fay = await seedBooking({ location: 'fayetteville' });
+  const { app } = staffBookingsApp();
+  const ids = await queueIds(app, '?location=bentonville');
+  assert.ok(ids.includes(benton), 'matching location kept');
+  assert.ok(!ids.includes(fay), 'non-matching location filtered out');
+});
+
+test(
+  'GET /staff/bookings?from=&to= — inclusive on BOTH ends, bucketed to the America/Chicago calendar day (not UTC)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // 04:00Z on 07-15 is 23:00 CDT on 07-14 — the whole point of the Chicago
+    // bucket. A UTC-truncating implementation files this under 2027-07-15 and
+    // both assertions below flip.
+    const lateEvening = await seedBooking({ scheduledAt: '2027-07-15T04:00:00Z' }); // Chicago 07-14
+    const middle = await seedBooking({ scheduledAt: '2027-07-15T17:00:00Z' }); // Chicago 07-15
+    const upperEdge = await seedBooking({ scheduledAt: '2027-07-16T17:00:00Z' }); // Chicago 07-16
+    const outside = await seedBooking({ scheduledAt: '2027-07-18T17:00:00Z' }); // Chicago 07-18
+    const { app } = staffBookingsApp();
+
+    const inRange = await queueIds(app, '?from=2027-07-14&to=2027-07-16');
+    assert.ok(inRange.includes(lateEvening), 'lower bound is INCLUSIVE, on the Chicago day');
+    assert.ok(inRange.includes(middle), 'interior day kept');
+    assert.ok(inRange.includes(upperEdge), 'upper bound is INCLUSIVE');
+    assert.ok(!inRange.includes(outside), 'past the upper bound, dropped');
+
+    const fromChicagoNextDay = await queueIds(app, '?from=2027-07-15');
+    assert.ok(
+      !fromChicagoNextDay.includes(lateEvening),
+      'the 04:00Z row is a 07-14 booking in Chicago — a UTC bucket would have kept it',
+    );
+    assert.ok(fromChicagoNextDay.includes(middle), 'open-ended `from` alone keeps everything after');
+    assert.ok(fromChicagoNextDay.includes(outside), 'and has no implicit upper bound');
+  },
+);
+
+test('GET /staff/bookings?to= alone — open-ended lower bound', SKIP_WHEN_NO_DB, async () => {
+  const early = await seedBooking({ scheduledAt: '2027-08-02T17:00:00Z' });
+  const late = await seedBooking({ scheduledAt: '2027-08-20T17:00:00Z' });
+  const { app } = staffBookingsApp();
+  const ids = await queueIds(app, '?to=2027-08-02');
+  assert.ok(ids.includes(early), 'inclusive upper bound with no lower bound');
+  assert.ok(!ids.includes(late), 'after the upper bound, dropped');
+});
+
+test(
+  'GET /staff/bookings — filters compose (category AND location AND range)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const match = await seedBooking({
+      category: 'boarding',
+      location: 'bentonville',
+      scheduledAt: '2027-09-10T17:00:00Z',
+    });
+    const wrongLocation = await seedBooking({
+      category: 'boarding',
+      location: 'fayetteville',
+      scheduledAt: '2027-09-10T17:00:00Z',
+    });
+    const wrongDay = await seedBooking({
+      category: 'boarding',
+      location: 'bentonville',
+      scheduledAt: '2027-09-12T17:00:00Z',
+    });
+    const { app } = staffBookingsApp();
+    const ids = await queueIds(
+      app,
+      '?category=boarding&location=bentonville&from=2027-09-10&to=2027-09-10',
+    );
+    assert.ok(ids.includes(match));
+    assert.ok(!ids.includes(wrongLocation));
+    assert.ok(!ids.includes(wrongDay));
+  },
+);
+
+test(
+  'GET /staff/bookings — a filter never widens: a cancelled row stays out of a matching range',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cancelled = await seedBooking({
+      status: 'cancelled',
+      scheduledAt: '2027-10-05T17:00:00Z',
+    });
+    const { app } = staffBookingsApp();
+    const ids = await queueIds(app, '?from=2027-10-05&to=2027-10-05');
+    assert.ok(!ids.includes(cancelled), 'filters narrow the live queue, they never widen it');
+  },
+);
+
+test(
+  'GET /staff/bookings — malformed `from` → 400 bad_request (query convention, not invalid_payload)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffBookingsApp();
+    for (const bad of ['?from=07-15-2027', '?from=2027-13-40', '?to=nope']) {
+      const res = await app.inject({ method: 'GET', url: `/staff/bookings${bad}` });
+      assert.equal(res.statusCode, 400, `${bad}: ${res.body}`);
+      const body = res.json() as { error?: { code?: string } };
+      assert.equal(body.error?.code, 'bad_request', bad);
+    }
+  },
+);
+
+test(
+  'GET /staff/bookings — unknown category/location VALUE → 400 bad_request',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffBookingsApp();
+    for (const bad of ['?category=grooming', '?location=springdale']) {
+      const res = await app.inject({ method: 'GET', url: `/staff/bookings${bad}` });
+      assert.equal(res.statusCode, 400, `${bad}: ${res.body}`);
+      const body = res.json() as { error?: { code?: string } };
+      assert.equal(body.error?.code, 'bad_request', bad);
+    }
+  },
+);
 
 // ──────────────────────────────────────────────────────────────────────────
 // POST /staff/bookings/:id/confirm

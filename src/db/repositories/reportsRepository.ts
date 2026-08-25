@@ -109,6 +109,55 @@ export const reportsRepository = {
   },
 
   // -------------------------------------------------------------------
+  // Wire 1.13.0 / 2.3b — the staff read surface. Cross-owner by design:
+  // `requireStaff` gates the routes, so there is no owner scope to enforce
+  // and no `dogs` INNER JOIN. That mirrors `findByIdInTx` below, the
+  // pre-existing staff-context read, rather than the owner reads above.
+  // -------------------------------------------------------------------
+
+  /**
+   * Every live report for ONE dog, cross-owner, newest first — the
+   * `GET /staff/reports` list. `dogId` is required by the contract
+   * (`GetStaffReportsQuery`, Allison ruling WC-A5): there is deliberately no
+   * unscoped variant of this query, so no caller can dump every report in the
+   * system. Served by `reports_dog_date_idx` (`schema.sql:598` — `(dog_id,
+   * date DESC)`); the optional `program`/`category` predicates filter the few
+   * rows that index returns.
+   *
+   * Unlike `findLiveForOwnedDog` this does NOT join `dogs`: a soft-expired dog
+   * is still a dog staff may read the history of, and the owner-scoping the
+   * join exists for has no meaning for a staff principal.
+   */
+  async findLiveForDog(
+    dogId: string,
+    filters: { program?: ReportProgram; category?: ServiceCategory } = {},
+  ): Promise<ReportRow[]> {
+    const conditions = [eq(reports.dogId, dogId), live(reports)];
+    if (filters.program !== undefined) conditions.push(eq(reports.program, filters.program));
+    if (filters.category !== undefined) conditions.push(eq(reports.category, filters.category));
+    return db
+      .select(REPORT_PROJECTION)
+      .from(reports)
+      .where(and(...conditions))
+      .orderBy(desc(reports.date));
+  },
+
+  /**
+   * Single LIVE report by id, cross-owner — the staff branch of
+   * `GET /reports/:id`. `undefined` for both "doesn't exist" and
+   * "soft-deleted", which the route surfaces as the same 404 the owner branch
+   * emits. The non-tx sibling of `findByIdInTx`.
+   */
+  async findLiveById(id: string): Promise<ReportRow | undefined> {
+    const rows = await db
+      .select(REPORT_PROJECTION)
+      .from(reports)
+      .where(and(eq(reports.id, id), live(reports)))
+      .limit(1);
+    return rows[0];
+  },
+
+  // -------------------------------------------------------------------
   // Day 19 — staff portal verb 2 (report authoring). Tx-only writes
   // compose inside `withMutation`; the route validates the R2 shape
   // (content-by-program) above this layer.
@@ -193,5 +242,26 @@ export const reportsRepository = {
       .update(reports)
       .set({ ...set, updatedAt: sql`now()` })
       .where(eq(reports.id, id));
+  },
+
+  /**
+   * Soft-delete one report — `DELETE /staff/reports/:id` (wire 1.13.0).
+   * Stamps `expired_at`; the row is RETAINED (`schema.sql` LIFECYCLE
+   * CONVENTION — the API never hard-deletes) and drops out of every read
+   * because all of them filter `live(reports)`.
+   *
+   * The `live(reports)` predicate in the WHERE is what makes a second delete
+   * a 404 instead of a silent success: an already-expired row matches nothing,
+   * so `false` comes back and the route raises `not_found`. Mirrors
+   * `dogsRepository.softExpire`; `updated_at` moves via the `reports_touch`
+   * trigger (`schema.sql:1836-1847`), not by hand.
+   */
+  async softExpire(tx: Tx, id: string): Promise<boolean> {
+    const rows = await tx
+      .update(reports)
+      .set({ expiredAt: sql`now()` })
+      .where(and(eq(reports.id, id), live(reports)))
+      .returning({ id: reports.id });
+    return rows.length > 0;
   },
 };
