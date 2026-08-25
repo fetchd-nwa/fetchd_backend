@@ -77,7 +77,15 @@ export const WIRE_CONTRACT_VERSION = '1.13.0';
 //     · missing, non-string, or empty        → 400 `bad_request`
 //     · longer than 206 characters           → 400 `bad_request`; the error
 //       message names the live number — read it rather than hard-coding this one
-//     · sent more than once on one request   → the FIRST value wins (`mutation.ts:81`)
+//     · sent more than once on one request   → the values are JOINED: Node
+//       delivers duplicate non-set-cookie headers as ONE comma-joined string,
+//       so the key becomes `"A, B"` — matching NEITHER attempt. mutation.ts:81's
+//       array branch is unreachable for this header. SEND THE HEADER EXACTLY
+//       ONCE: a proxy or client that duplicates it with a differing value
+//       defeats the replay guarantee (the retry becomes a NEW mutation — on a
+//       money endpoint, a second charge). 2.6 adversary finding, fix round 1;
+//       server-side rejection of comma-joined keys is a phase-3 hardening
+//       candidate.
 //     · same key + a different `METHOD path`, or a different canonical-JSON body
 //       hash                                 → 422 `idempotency_mismatch`
 //     · same key still executing             → 409 `idempotency_inflight`
@@ -169,18 +177,29 @@ export const API_ERROR_CODES = [
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
- * The HTTP status each code rides. CONTRACTUAL: changing a status is a wire
- * change (major unless the code is new in the same bump). Promoted verbatim
- * from `lib/errors.ts` STATUS_BY_CODE (which now imports THIS table) +
- * `internal: 500`. The 4xx family notes, preserved: the gate failures +
- * capacity/credit/duplicate assertions are all 422 — the request was
- * syntactically fine but semantically blocked by current state.
+ * The HTTP status each THROWN code rides. CONTRACTUAL for the 23 ApiError
+ * codes: changing one is a wire change (major unless the code is new in the
+ * same bump). Promoted verbatim from `lib/errors.ts` STATUS_BY_CODE (which
+ * now imports THIS table). The 4xx family notes, preserved: the gate
+ * failures + capacity/credit/duplicate assertions are all 422 — the request
+ * was syntactically fine but semantically blocked by current state.
  * `payment_failed` is 402, the one code whose meaning is about MONEY rather
  * than state: the card WAS charged, the charge did not complete, and nothing
  * was created or settled behind it — every other 4xx here means "we didn't
  * try".
+ *
+ * **`internal` is the exception — 500 is its DEFAULT, not a guarantee**
+ * (2.6 adversary finding, fix round 1). The serializer's fallback branch
+ * passes a Fastify-originated `err.statusCode` through unchanged
+ * (`auth/plugin.ts`): malformed JSON → 400, unsupported Content-Type → 415,
+ * an over-limit upload body → 413 — each with `code: 'internal'`. Clients
+ * branching on this table must treat `internal` as "any status, read the
+ * HTTP status itself"; the pinned truth is `test/contracts/
+ * error-envelope.test.ts`'s pass-through arm. Making the fallback force 500
+ * would be a production behavior change — out of a promotion bump (§14.1);
+ * candidate for a future cycle if a single status is ever wanted.
  */
-export const API_ERROR_STATUS: Record<ApiErrorCode, number> = {
+export const API_ERROR_STATUS = {
   unauthenticated: 401,
   not_provisioned: 403,
   forbidden: 403,
@@ -204,8 +223,10 @@ export const API_ERROR_STATUS: Record<ApiErrorCode, number> = {
   already_requested: 422,
   event_full: 422,
   payment_failed: 402,
+  // The DEFAULT for the fallback — see the doc block above; 400/413/415 are
+  // reachable with code 'internal' via Fastify-originated errors.
   internal: 500,
-};
+} as const satisfies Record<ApiErrorCode, number>;
 
 /**
  * The error half of every non-2xx response. `details` is OMITTED when absent
@@ -862,8 +883,9 @@ export interface MeWire {
    *  `OwnerPushPrefs.pushNotificationCategories: unknown` @ :81). Typing it
    *  `Record<string, unknown>` here does not compile against the real emission
    *  (proof: patch Evidence E4). The TIGHTENING IS FILED, NOT ENACTED (§14.1):
-   *  §6-batch #4 rules the vocabulary, phase 3 adds the CHECK, and only then
-   *  can this narrow.
+   *  the approved §6-batch #4 collapsed the toggle PANEL to 2 + master; the
+   *  wire KEY vocabulary remains genuinely open (2.6 adversary, fix round 1),
+   *  phase 3 rules it + adds the CHECK, and only then can this narrow.
    *
    *  LIVE KEYS, for readers who need them today: the account screen's six
    *  toggles — `booking-confirmations`, `booking-reminders`, `report-cards`,
@@ -996,7 +1018,8 @@ export interface PatchMeRequest {
    *  string key, any JSON value, no vocabulary enforced, written straight to
    *  the jsonb column. This is the truthful transcription of what the endpoint
    *  ACCEPTS, and it is deliberately NOT tightened to the six live toggles
-   *  (§14.1; the vocabulary is §6-batch #4). See `MeWire.push_notification_categories`
+   *  (§14.1; the vocabulary is a phase-3 ruling — approved §6-batch #4
+   *  collapsed the panel only). See `MeWire.push_notification_categories`
    *  for the live key list and the opt-OUT semantics. Note the ASYMMETRY with
    *  the response, which is `unknown`: the request is what this route validates,
    *  the response is what the unconstrained column may hold. */
@@ -1490,8 +1513,10 @@ export interface PostStaffRequestsApproveRequest {
  * calls it "reserved for future use" and `markCancelled` never receives it
  * (`staffRequests.ts:385`), so a denial reason typed by a staffer is lost.
  * This is documented, not fixed: persisting it needs DDL (`deny_reason` does
- * not exist on `pending_requests`, schema.sql:795-830) and is deferred to the
- * §6 decision batch #7 / phase 3. Already on the ledger —
+ * not exist on `pending_requests`, schema.sql:795-830) and is deferred to
+ * phase 3. (An earlier draft cited "§6-batch #7" — the delivered batch's
+ * item 7 contains no requests-policy discussion; corrected in the 1.13.0
+ * fix round, 2.6 adversary.) Already on the ledger —
  * BUSINESS-LOGIC/DISCREPANCIES.md:671; do not re-file it as new.
  *
  * The one thing `reason` DOES affect: it rides the idempotency request hash
@@ -1549,11 +1574,13 @@ export interface PostStaffBookingsCancelRequest {
 
 /**
  * `GET /staff/bookings` query `[staff]` — the server-side filters for the
- * cross-owner triage queue (digest bookings/S). **Contract-first: this shape
- * lands at 1.13.0; the route that reads it is built in phase 2.3b**
- * (designs/wire-contract-completion.md §9). Today the handler parses NO query
- * at all (`routes/staffBookings.ts:92-102`), so at 1.13.0 every key here is
- * inert — a client sending them gets the unfiltered queue, not an error.
+ * cross-owner triage queue (digest bookings/S). Contract-first at 1.13.0 and
+ * BUILT in 2.3b: the handler parses this query, filters on the four keys,
+ * and a malformed value on any of them is a 400 `bad_request`
+ * (`routes/staffBookings.ts` + `staff-bookings.test.ts`). Keys OUTSIDE this
+ * contract remain inert (the schema is deliberately non-strict, §14.1).
+ * `from > to` is legal and returns `[]` — an empty range is empty, not an
+ * error; a staffer seeing an unexpectedly empty queue should check the pair.
  *
  * Every key is OPTIONAL and all-omitted must reproduce today's response
  * exactly: every live, non-cancelled booking across all owners, soonest
@@ -2547,8 +2574,9 @@ export type WithdrawMoneyOutcome =
   | 'refunded' // a captured charge is being returned; refunded_cents > 0
   | 'released' // an uncaptured authorization was cancelled — never charged
   | 'release_pending' // payment was still settling; automatic release-or-full-refund committed
-  | 'refund_manual' // a refund is owed and will be made BY HAND — no automatic
-  // machinery exists for this charge (predates Stripe wiring)
+  // refund_manual: a refund is owed and will be made BY HAND — no automatic
+  // machinery exists for this charge (predates Stripe wiring).
+  | 'refund_manual'
   | 'voided' // the open pay-later invoice was voided — never charged
   | 'none'; // no live money is attached to this enrollment
 
@@ -4223,22 +4251,33 @@ export interface StaffRateHistoryWire extends StaffRateWire {
  * `insufficient_capacity` at POST is where the owner first learns otherwise
  * (D9 @ bookings-scheduling.md:237, NOTE-2 @ DISCREPANCIES.md:651).
  *
- * Whether this endpoint should instead report REMAINING seats is Allison's
- * open §6-batch decision #3 (wire-contract-completion.md §16 item 2);
- * 1.13.0 deliberately promotes the shape as-is rather than pre-deciding it
- * by adding `*_booked` fields. The runtime test that would stop this
- * sentence from silently becoming false is named phase-3 debt (digest
- * rates-availability test/S).
+ * Since the 1.13.0 fix round the response ALSO carries `*_remaining` —
+ * Allison's §6-batch decision #3, option C, APPROVED 2026-08-24
+ * (designs/decision-batch-2026-08.md item 3; adversary round 2.6 caught the
+ * lanes carrying the pre-approval DEFER label — wire-contract-completion.md
+ * WC-A7). `*_remaining` = configured openings − live booked count for
+ * (location, date, mode), floored at 0. ADVISORY, not authoritative: it is
+ * computed outside any booking lock, so a concurrent booking can stale it
+ * between read and POST — the authoritative arithmetic still runs inside the
+ * booking transaction (`dayCapacityRepository.assertCapacityWithinLock`) and
+ * the 422 `insufficient_capacity` remains the source of truth at write time.
+ * Mobile's calendar `classifyStatus` points at `*_remaining` (option C's
+ * second half), so a fully-booked day finally renders as full instead of the
+ * owner learning at the 422.
  *
- * Both columns always emit: the `mode` query param validates but does not
- * filter (`availability.ts:76` destructures `from`/`to`/`location` only), so
- * the client picks which number to display.
+ * All four columns always emit: the `mode` query param validates but does
+ * not filter (`availability.ts` destructures `from`/`to`/`location` only),
+ * so the client picks which numbers to display.
  */
 export interface DayCapacityWire {
   location: LocationKey;
   date: string;
   school_openings: number;
   daycare_openings: number;
+  /** Configured openings minus live booked, floored at 0 — advisory (see doc). */
+  school_remaining: number;
+  /** Configured openings minus live booked, floored at 0 — advisory (see doc). */
+  daycare_remaining: number;
 }
 
 /**

@@ -146,6 +146,39 @@ dispositioned — the 2.6 adversary audits 39/39):
   400-vs-422 discrepancy (new ledger item); the fifth `MediaPurpose`
   declaration behind the repository seam; the `LocationDisplay` dedupe.
 
+Fix round 1 (2.6 adversary, both lanes; 2026-08-25):
+
+- New: `DayCapacityWire.school_remaining` + `.daycare_remaining` — Allison's
+  APPROVED §6-batch #3 option C, which the lanes had mistakenly carried as
+  still-deferred (Fable-lane HIGH, requirement drift; WC-A7). Advisory
+  (computed outside the booking lock); the authoritative arithmetic stays in
+  the booking transaction. Mobile's calendar `classifyStatus` repoints to
+  them.
+- Contract-truth corrections (all doc-only, Opus-lane findings):
+  `API_ERROR_STATUS.internal` documented as a DEFAULT, not a guarantee — the
+  serializer fallback passes Fastify-originated statuses through (400/413/
+  415 reachable with `code: 'internal'`), now runtime-pinned; the table
+  itself becomes `as const satisfies` (immutable + exhaustive);
+  `GetStaffBookingsQuery`'s pre-2.3b "every key is inert" prose retired
+  (filters are live, malformed values 400, `from > to` returns `[]`); the
+  §0 Idempotency-Key block's "FIRST value wins" corrected to Node's real
+  comma-join behavior with a SEND-EXACTLY-ONCE warning (duplicated
+  differing values defeat replay — server-side rejection is a phase-3
+  hardening candidate); two stale §6-batch citations repaired (deny-reason
+  "batch #7"; push-categories "#4 rules the vocabulary").
+- `DELETE /staff/reports/:id` now also DISMISSES the report's
+  `report-published` notification rows (`dismissed_at`, the feed's
+  established soft-hide — `notifications` is append-only and has no
+  `expired_at`) in the same transaction — the orphaned push whose deep link
+  silently resolved to a DIFFERENT report (Opus-lane MEDIUM) dies with its
+  subject.
+- NAMED EXCEPTION 4 (cosmetic, undeclared until the adversary's symbol
+  audit caught it): `WithdrawMoneyOutcome`'s attached comments were
+  prettier-reflowed during the fence merge (member values, order, and
+  comment TEXT unchanged); the fix round additionally re-attached the
+  orphaned `refund_manual` continuation line so the money vocabulary reads
+  correctly. The §13 #2 audit reads this block against THIS exception.
+
 NOTE ON NUMBERING: the completion plan (2026-08-20) reserved "1.12.0" for
 this bump; 1.12.0 shipped 2026-08-21 with the withdraw settlement envelope.
 Read every plan citation of "wire 1.12.0" in its Phase 2/§8 as 1.13.0, and

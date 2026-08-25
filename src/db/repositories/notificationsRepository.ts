@@ -161,6 +161,49 @@ export const notificationsRepository = {
   },
 
   /**
+   * Soft-hide every LIVE notification whose structured deep link points at
+   * one target — the cascade a "the thing this notification links to is
+   * gone" delete owes the owner.
+   *
+   * `dismissed_at` is the mechanism, not a new one: it is the same tombstone
+   * `dismissForOwner` stamps, and the two reads that define "live" for the
+   * feed (`findLiveByOwnerCursor` :74, `findUnreadCountByOwner` :94) already
+   * filter it. The row is retained for audit; only its visibility ends.
+   * `notifications` has no `expired_at`, so `live()` does not apply here
+   * (schema line 984-985, append-only feed).
+   *
+   * Owner-scoped on top of `(kind, id)`. The id alone is a UUID and already
+   * unique, so the owner predicate is defense in depth — it makes a wrong
+   * `deep_link_id` unable to reach across owners even in principle.
+   *
+   * Returns how many rows this call newly hid (already-dismissed rows are
+   * excluded by the WHERE, so a repeat call reports 0 rather than
+   * re-stamping a fresh instant over the owner's own dismissal).
+   *
+   * First caller: `DELETE /staff/reports/:id` (2.6 adversary, fix round 1) —
+   * before it, deleting a report stranded the owner's `report-published`
+   * bell entry and its already-delivered push on a dead deep link.
+   */
+  async dismissByDeepLinkTarget(
+    tx: Tx,
+    args: { ownerId: string; kind: NotificationDeepLinkKind; targetId: string },
+  ): Promise<number> {
+    const rows = await tx
+      .update(notifications)
+      .set({ dismissedAt: sql`now()` })
+      .where(
+        and(
+          eq(notifications.ownerId, args.ownerId),
+          eq(notifications.deepLinkKind, args.kind),
+          eq(notifications.deepLinkId, args.targetId),
+          isNull(notifications.dismissedAt),
+        ),
+      )
+      .returning({ id: notifications.id });
+    return rows.length;
+  },
+
+  /**
    * INSERT a notifications row (+ optional notification_dogs join
    * rows). The feed is content-immutable; the only mutations are read
    * (`markReadForOwner` / `markAllReadForOwner`) and dismiss

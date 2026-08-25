@@ -1,9 +1,10 @@
-import { and, between, eq, ne, sql } from 'drizzle-orm';
+import { and, between, eq, inArray, ne, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { readThrough } from '../../lib/cache.js';
 import { defaultDayCapacity } from '../../lib/availability.js';
 import { insufficientCapacityError } from '../../lib/bookingErrors.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
+import type { DayProgramCategory } from '../../lib/bookingSchedule.js';
 import { db } from '../client.js';
 import { bookingDogs, bookings, dayCapacity, dogs, type LocationKey } from '../schema/schema.js';
 import { live } from '../softExpire.js';
@@ -24,6 +25,32 @@ export interface DayCapacityOverrideRow {
   school_openings: number;
   daycare_openings: number;
 }
+
+/**
+ * Booked seats per calendar date for one location, split by booking mode —
+ * the subtrahend behind `DayCapacityWire.*_remaining` (wire 1.13.0, §6-batch
+ * decision #3 option C). Deliberately shaped like `DayCapacityOverrideRow` so
+ * the route folds both maps the same way.
+ *
+ * A date with no day-program bookings is ABSENT from the result, not present
+ * as a pair of zeroes — the caller defaults a miss to 0.
+ */
+export interface DayBookedCountRow {
+  date: string;
+  school_booked: number;
+  daycare_booked: number;
+}
+
+/**
+ * The two day-program categories, typed as `DayProgramCategory` so renaming a
+ * `service_category` member is a compile error here rather than a count that
+ * silently returns zero. `dayProgramCategoryToMode` is the mapping of record;
+ * these constants are the same mapping read the other way (category → the
+ * column its seats come out of), and they are spelled exactly as
+ * `assertCapacityWithinLock` spells it below.
+ */
+const SCHOOL_CATEGORY: DayProgramCategory = 'day-school';
+const DAYCARE_CATEGORY: DayProgramCategory = 'day-care';
 
 /**
  * Day-8 cache: availability is the hottest read in the system — every
@@ -92,6 +119,63 @@ export const dayCapacityRepository = {
             ),
           ),
     );
+  },
+
+  /**
+   * Live booked seats per (date, mode) for one location across `[from, to]`
+   * inclusive — the read-side half of the capacity arithmetic, feeding
+   * `DayCapacityWire.school_remaining` / `daycare_remaining`.
+   *
+   * **The population is `assertCapacityWithinLock`'s, exactly**, just outside
+   * the lock and grouped instead of filtered to one date: live, non-cancelled
+   * `booking_dogs` on live day-program bookings at this location whose
+   * `scheduled_at` bucket-to-Chicago-date falls in the range, excluding
+   * staff-owned (capacity-exempt) dogs. If those two predicates ever diverge,
+   * the calendar starts lying in a NEW direction — keep them edited together.
+   *
+   * `to_char(...)` rather than a bare `::date` cast so the grouping key comes
+   * back as the same `YYYY-MM-DD` string the route's date list is made of;
+   * a raw `date` column has no per-column Drizzle mode here to force it.
+   *
+   * **NOT cached, on purpose** (§6-batch #3's load note): the `avail:*` range
+   * cache is invalidated by `day_capacity` writes only, so a cached booked
+   * count would resurrect the very lie this field exists to kill — as
+   * staleness, which is harder to see. One aggregate over ≤92 dates per
+   * request, served by `bookings_location_time_idx`.
+   *
+   * Advisory by construction: no lock is held, so a booking committing
+   * between this read and the client's POST makes it stale. The authority is
+   * still `assertCapacityWithinLock` inside the booking transaction.
+   */
+  async findBookedCountsInRange(
+    location: LocationKey,
+    from: string,
+    to: string,
+  ): Promise<DayBookedCountRow[]> {
+    const chicagoDate = sql<string>`to_char((${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date, 'YYYY-MM-DD')`;
+    return db
+      .select({
+        date: chicagoDate,
+        school_booked: sql<number>`count(*) FILTER (WHERE ${bookings.category} = ${SCHOOL_CATEGORY})::int`,
+        daycare_booked: sql<number>`count(*) FILTER (WHERE ${bookings.category} = ${DAYCARE_CATEGORY})::int`,
+      })
+      .from(bookingDogs)
+      .innerJoin(bookings, eq(bookings.id, bookingDogs.bookingId))
+      .innerJoin(dogs, eq(dogs.id, bookingDogs.dogId))
+      .where(
+        and(
+          eq(bookings.location, location),
+          inArray(bookings.category, [SCHOOL_CATEGORY, DAYCARE_CATEGORY]),
+          sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date BETWEEN ${from}::date AND ${to}::date`,
+          ne(bookings.status, 'cancelled'),
+          live(bookings),
+          live(bookingDogs),
+          // Staff dogs are capacity-exempt — same exclusion, same reason as
+          // `assertCapacityWithinLock` (schema.sql lines 1192-1198).
+          sql`${dogs.staffOwnerId} IS NULL`,
+        ),
+      )
+      .groupBy(chicagoDate);
   },
 
   /**

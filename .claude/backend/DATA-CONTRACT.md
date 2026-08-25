@@ -2445,7 +2445,8 @@ mode, remaining, expires_at }]` — the dog's LIVE expiring lots (count + lapse
   on the same window as the server's `credits-expiring` push. Additive; the
   FE falls back to its client-side 60-day default when absent (mock mode).
 
-**DayCapacity** — `{ location, date:'YYYY-MM-DD', school_openings, daycare_openings }`.
+**DayCapacity** — `{ location, date:'YYYY-MM-DD', school_openings, daycare_openings,
+school_remaining, daycare_remaining }`.
 API applies the **per-location** business rule (weekend=closed, default 3)
 over sparse `day_capacity` overrides now keyed `(location, date)`. Δ
 2026-05-19: `location` added; availability queries take `&location=`. The
@@ -2461,6 +2462,26 @@ service; the wire shape is otherwise unchanged.
   up to 3 months in advance" requirement; larger windows return 422
   `invalid_payload`. Reversed bounds (`to < from`) also 422
   `invalid_payload`. The 60-day prior estimate was superseded.
+
+- Δ 2026-08-25 (wire 1.13.0 fix round): **additive** `school_remaining` /
+  `daycare_remaining` (both required ints) — Allison's §6-batch decision #3,
+  option C, approved 2026-08-24. `*_remaining` = the day's configured
+  openings minus the live booked seats for `(location, date, mode)`, floored
+  at 0. `*_openings` keeps its existing meaning (the CONFIGURED cap), which
+  is what makes this minor rather than major; option B — redefining
+  `*_openings` as remaining — was rejected for exactly that reason. All four
+  columns always emit; `mode` still does not filter.
+  **`*_remaining` is ADVISORY**: it is read outside any booking lock, so a
+  concurrent booking stales it. `dayCapacityRepository.assertCapacityWithinLock`
+  inside the booking transaction stays authoritative and its 422
+  `insufficient_capacity` is still the truth at write time — the field exists
+  so a full day stops rendering open, not to replace the check. Its booked
+  count is deliberately **uncached** (the `avail:{location}:*` range cache is
+  invalidated by `day_capacity` writes only, so caching the count would
+  reintroduce the same falsehood as staleness). Pinned by
+  `test/contracts/availability.test.ts` (snapshots + full-day + floor cases),
+  which retires the phase-3 "configured, not remaining" test debt item by
+  superseding it.
 
 **CreditPackage** (Δ 2026-05-20, Day 5) — `{ key, mode, credits, price_cents, label, is_popular }`.
 `GET /credit-packages` filters to `active = true` server-side (retired packs
@@ -2635,7 +2656,7 @@ invisible to the repository layer.
 **Reports**
 
 - `GET /dogs/:id/reports` · `GET /reports/:id` (staff branch since 1.13.0/2.3b: a staff principal reads any LIVE report cross-owner, byte-identical to the owner read) · `GET /dogs/:id/reports/latest` · `GET /dogs/:id/reports/resolve?reportId=&program=`
-- `POST /staff/reports` [staff] — **portal verb 2**, base + results|content by program; links bookings.report_id/session_report_id · `PATCH /staff/reports/:id` [staff] · `GET /staff/reports?dog_id=` [staff] — 2.3b, dog_id REQUIRED (WC-A5; unscoped 400s), program/category filters · `DELETE /staff/reports/:id` [staff] — 2.3b, 204, soft-expire via reports.expired_at
+- `POST /staff/reports` [staff] — **portal verb 2**, base + results|content by program; links bookings.report_id/session_report_id · `PATCH /staff/reports/:id` [staff] · `GET /staff/reports?dog_id=` [staff] — 2.3b, dog_id REQUIRED (WC-A5; unscoped 400s), program/category filters · `DELETE /staff/reports/:id` [staff] — 2.3b, 204, soft-expire via reports.expired_at; Δ 2026-08-25 (1.13.0 fix round) the SAME transaction also soft-hides the owner's `report-published` notification for that report (`notifications.dismissed_at`, matched on `deep_link_kind='report'` + `deep_link_id`, owner-scoped) — otherwise the bell entry and the already-delivered push survive as a dead deep link
 - `GET /staff/dogs` [staff] — cross-owner dog directory (Day-19b) · `GET /staff/dogs/:dogId/session-count?category=` [staff] — past-session count for the report author's auto visit number (post-19c)
 
 **Messaging**

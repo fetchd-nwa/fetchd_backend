@@ -252,16 +252,22 @@ export const reportsRepository = {
    *
    * The `live(reports)` predicate in the WHERE is what makes a second delete
    * a 404 instead of a silent success: an already-expired row matches nothing,
-   * so `false` comes back and the route raises `not_found`. Mirrors
+   * so `undefined` comes back and the route raises `not_found`. Mirrors
    * `dogsRepository.softExpire`; `updated_at` moves via the `reports_touch`
    * trigger (`schema.sql:1836-1847`), not by hand.
+   *
+   * Returns the expired row's `dogId` rather than a bare boolean: presence IS
+   * the existence signal, and the caller needs the dog to resolve the owner
+   * whose `report-published` notification this delete has to take down with
+   * it (2.6 adversary, fix round 1). One statement, no follow-up SELECT to
+   * race against the stamp.
    */
-  async softExpire(tx: Tx, id: string): Promise<boolean> {
-    const rows = await tx
+  async softExpire(tx: Tx, id: string): Promise<{ dogId: string } | undefined> {
+    const [row] = await tx
       .update(reports)
       .set({ expiredAt: sql`now()` })
       .where(and(eq(reports.id, id), live(reports)))
-      .returning({ id: reports.id });
-    return rows.length > 0;
+      .returning({ dogId: reports.dogId });
+    return row;
   },
 };

@@ -347,6 +347,14 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
   // rather than reporting success on an already-expired row. No
   // re-notification and no un-publish verb: the drafts/publish model is a
   // separate portal-wave design (Adjudication 6).
+  //
+  // It DOES take the publish notification down with it, in the same
+  // transaction (2.6 adversary, fix round 1). POST enqueued a
+  // `report-published` row deep-linked at `{kind:'report', id}`; leaving it
+  // live after the delete left the owner a bell entry — and an already-
+  // delivered push — pointing at a report that no longer resolves. The
+  // notification is soft-hidden (`dismissed_at`), never deleted, so the audit
+  // trail of "she was told" survives the retraction.
   app.delete('/staff/reports/:id', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
     requireStaff(principal, 'delete a report');
@@ -363,8 +371,21 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
       },
       async (tx) => {
         const expired = await reportsRepository.softExpire(tx, id);
-        if (!expired) {
+        if (expired === undefined) {
           throw new ApiError('not_found', `report ${id} not found`);
+        }
+
+        // Same tx as the `expired_at` stamp: the report and its announcement
+        // are retracted together or not at all. A soft-expired dog resolves
+        // to no owner, in which case there is nothing owner-scoped to hide
+        // and the notification rides its own dog's disappearance.
+        const ownerId = await dogsRepository.findOwnerIdInTx(tx, expired.dogId);
+        if (ownerId !== undefined) {
+          await notificationsRepository.dismissByDeepLinkTarget(tx, {
+            ownerId,
+            kind: 'report',
+            targetId: id,
+          });
         }
         return { status: 204, body: null };
       },

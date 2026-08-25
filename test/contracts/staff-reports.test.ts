@@ -9,6 +9,7 @@ import {
   notifications as notificationsTable,
   reports as reportsTable,
 } from '../../src/db/schema/schema.js';
+import { registerNotificationsRoute } from '../../src/routes/notifications.js';
 import { registerReportsRoute } from '../../src/routes/reports.js';
 import { registerStaffReportsRoute } from '../../src/routes/staffReports.js';
 import { FIXTURE_IDS } from './_fixture.js';
@@ -739,5 +740,108 @@ test(
 
     const staffById = await staffApp.inject({ method: 'GET', url: `/reports/${id}` });
     assert.equal(staffById.statusCode, 404, 'gone from the staff by-id read too');
+  },
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// DELETE also expires the report's notification (2.6 adversary, fix round 1)
+//
+// POST enqueues a `report-published` row whose deep link is
+// `{kind:'report', id:<reportId>}`. Before this fix the DELETE left that row
+// live: the owner kept a bell entry — and a push already on her phone —
+// pointing at a report that no longer resolves. `dismissed_at` is the feed's
+// soft-hide (`notificationsRepository` :74, :94 filter it), so the row is
+// retained for audit and stops being live. No DDL.
+// ──────────────────────────────────────────────────────────────────────────
+
+/** The `notifications` rows deep-linking at one report, live-ness included. */
+async function notificationsForReport(
+  reportId: string,
+): Promise<{ id: string; dismissedAt: string | null }[]> {
+  return db
+    .select({ id: notificationsTable.id, dismissedAt: notificationsTable.dismissedAt })
+    .from(notificationsTable)
+    .where(
+      and(
+        eq(notificationsTable.deepLinkKind, 'report'),
+        eq(notificationsTable.deepLinkId, reportId),
+      ),
+    );
+}
+
+/** The owner's live bell feed, as ids — the product-visible truth. */
+async function ownerFeedIds(
+  app: ReturnType<typeof makeContractApp>['app'],
+): Promise<string[]> {
+  const res = await app.inject({ method: 'GET', url: '/notifications?limit=200' });
+  assert.equal(res.statusCode, 200, res.body);
+  return (res.json() as { items: { id: string }[] }).items.map((n) => n.id);
+}
+
+function ownerFeedApp(): ReturnType<typeof makeContractApp>['app'] {
+  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  registerNotificationsRoute(app, { authenticate });
+  return app;
+}
+
+test(
+  "DELETE /staff/reports/:id — the owner's report-published notification stops being live",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const staffApp = staffReportsApp();
+    const feedApp = ownerFeedApp();
+    const id = await seedReportViaApi(staffApp);
+
+    const before = await notificationsForReport(id);
+    assert.equal(before.length, 1, 'POST enqueued exactly one report-published row');
+    assert.equal(before[0]!.dismissedAt, null, 'and it starts LIVE — the precondition');
+    assert.ok(
+      (await ownerFeedIds(feedApp)).includes(before[0]!.id),
+      'the owner can see it in her bell feed while the report exists',
+    );
+
+    const del = await deleteReport({ app: staffApp, id, idempotencyKey: `rp-note-${randomUUID()}` });
+    assert.equal(del.statusCode, 204, del.body);
+
+    const after = await notificationsForReport(id);
+    assert.equal(after.length, 1, 'the row is RETAINED — soft-hidden, never deleted');
+    assert.ok(after[0]!.dismissedAt !== null, 'dismissed_at stamped in the delete transaction');
+    assert.ok(
+      !(await ownerFeedIds(feedApp)).includes(before[0]!.id),
+      'and it is gone from the feed — no bell entry pointing at a deleted report',
+    );
+  },
+);
+
+test(
+  "DELETE /staff/reports/:id — a SIBLING report's notification is untouched",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const staffApp = staffReportsApp();
+    const feedApp = ownerFeedApp();
+    const doomedId = await seedReportViaApi(staffApp);
+    const survivorId = await seedReportViaApi(staffApp);
+    assert.notEqual(doomedId, survivorId);
+
+    const [survivorNote] = await notificationsForReport(survivorId);
+    assert.ok(survivorNote, "the sibling's notification exists");
+
+    const del = await deleteReport({
+      app: staffApp,
+      id: doomedId,
+      idempotencyKey: `rp-sib-${randomUUID()}`,
+    });
+    assert.equal(del.statusCode, 204, del.body);
+
+    const [after] = await notificationsForReport(survivorId);
+    assert.equal(
+      after?.dismissedAt,
+      null,
+      'deleting one report must not sweep every report notification the owner has',
+    );
+    assert.ok(
+      (await ownerFeedIds(feedApp)).includes(survivorNote.id),
+      "the sibling is still in the owner's feed",
+    );
   },
 );
