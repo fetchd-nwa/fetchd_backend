@@ -1,6 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import type { CancelWindowSettingWire, PatchStaffCancelWindowRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import type { ServiceCategory } from '../lib/bookingBucket.js';
@@ -52,12 +54,15 @@ const patchBodySchema = z
   })
   .strict();
 
-interface CancelWindowSettingWire {
-  category: ServiceCategory;
-  hours_before: number;
-  updated_at: string;
-  updated_by_staff_id: string | null;
-}
+/** Wire 1.13.0 §5.1.3 — the body type and this schema are the same shape or
+ *  `tsc` fails here. `z.input`, not `z.infer`: the wire documents what a
+ *  client may SEND. Exported so no unused-symbol rule can eat the pin. */
+export type PatchStaffCancelWindowBodyConformance = Expect<
+  Equal<z.input<typeof patchBodySchema>, PatchStaffCancelWindowRequest>
+>;
+
+// CancelWindowSettingWire is owned by the single-source contract
+// (contracts/wire.ts) as of 1.13.0.
 
 function toWire(row: {
   category: ServiceCategory;

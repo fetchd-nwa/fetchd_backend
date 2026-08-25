@@ -10,6 +10,7 @@ import { pgTimestampToIso } from '../../src/lib/pgTimestamp.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { registerStaffCreditExpiryRoute } from '../../src/routes/staffCreditExpiry.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import type { CreditExpirySettingWire } from '../../src/contracts/wire.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -73,13 +74,10 @@ async function cleanupChargesAndLedger(): Promise<void> {
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
 }
 
-interface SettingWire {
-  location: string | null;
-  expiry_window_months: number;
-  warning_lead_days: number;
-  updated_at: string;
-  updated_by_staff_id: string | null;
-}
+// Was a hand mirror of the route's private wire type; contract-owned since
+// 1.13.0. (This file is type-erased at runtime — the alias documents intent,
+// it does not check anything.)
+type SettingWire = CreditExpirySettingWire;
 
 // ──────────────────────────────────────────────────────────────────────────
 // GET /staff/credit-expiry-settings

@@ -1,7 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import type { StaffRateWire, StaffRateHistoryWire } from '../contracts/wire.js';
+import type {
+  PostStaffRatesRequest,
+  StaffRateWire,
+  StaffRateHistoryWire,
+} from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { withServiceRateLock } from '../db/locks.js';
 import {
@@ -84,6 +89,15 @@ const historyQuerySchema = z.object({
 });
 
 const uuidParamSchema = z.object({ id: z.string().uuid() });
+
+/** Wire 1.13.0 §5.1.3 — the body type and `postBodySchema` are the same shape
+ *  or `tsc` fails here. `z.input`, not `z.infer`: `effective_from` and `note`
+ *  are optional on the WIRE because a client may omit them, even though the
+ *  route defaults `effective_from` to today-in-Chicago afterwards. Exported so
+ *  no unused-symbol rule can eat the pin. */
+export type PostStaffRatesBodyConformance = Expect<
+  Equal<z.input<typeof postBodySchema>, PostStaffRatesRequest>
+>;
 
 // StaffRateWire + StaffRateHistoryWire are owned by the single-source contract
 // (contracts/wire.ts).

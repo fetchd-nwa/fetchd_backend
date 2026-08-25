@@ -5,6 +5,8 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { requestStatus } from '../db/schema/schema.js';
+import type { PatchRequestsRequest, PostRequestsRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import {
   alreadyRequestedError,
   evaluationRequiredError,
@@ -141,6 +143,12 @@ const postRequestBodySchema = z
 
 type PostRequestBody = z.infer<typeof postRequestBodySchema>;
 
+/** §5.1.3 pin — `z.input`, not `z.infer`; see `PostBookingsBodyConformance`
+ *  in `routes/bookings.ts` for the full rationale. */
+export type PostRequestsBodyConformance = Expect<
+  Equal<z.input<typeof postRequestBodySchema>, PostRequestsRequest>
+>;
+
 const patchRequestBodySchema = z
   .object({
     preferred_dates: z.array(isoDateTimeSchema).min(1).max(MAX_PREFERRED_DATES).optional(),
@@ -159,6 +167,13 @@ const patchRequestBodySchema = z
   .strict();
 
 type PatchRequestBody = z.infer<typeof patchRequestBodySchema>;
+
+/** §5.1.3 pin. The three identity keys are `unknown` on both sides on
+ *  purpose: the schema accepts them so the route can 422 them with a specific
+ *  message instead of Zod's generic unrecognized-key error. */
+export type PatchRequestsBodyConformance = Expect<
+  Equal<z.input<typeof patchRequestBodySchema>, PatchRequestsRequest>
+>;
 
 export interface RequestsRouteOptions extends AuthRouteOptions {
   /**

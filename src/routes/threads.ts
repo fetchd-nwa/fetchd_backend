@@ -4,6 +4,8 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
+import type { PostThreadsMessagesRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { type MessageWire, type ThreadWire } from '../lib/threadWire.js';
 import { wireManyMessages, wireManyThreads } from '../lib/wireManyThreads.js';
 import { messagesRepository, type MessageRow } from '../db/repositories/messagesRepository.js';
@@ -57,6 +59,15 @@ const messageBodySchema = z
       (body.attachment_media_ids !== undefined && body.attachment_media_ids.length > 0),
     { message: 'a message must have text or at least one attachment' },
   );
+
+/** Zod ↔ wire pin (designs/wire-contract-completion.md §5.1.3). `z.input`, not
+ *  `z.infer`: the wire documents what a client may SEND, pre-trim. Exported so
+ *  no unused-locals rule can eat it. If this stops compiling, the WIRE TYPE is
+ *  wrong — never the schema (§14.1). The `.refine`'s one-required rule is not
+ *  representable here and rides as a doc comment on the wire type (§4 rule 6). */
+export type PostThreadsMessagesBodyConformance = Expect<
+  Equal<z.input<typeof messageBodySchema>, PostThreadsMessagesRequest>
+>;
 
 export interface ThreadsRouteOpts extends AuthRouteOptions {
   /** Override the R2 client (contract tests inject the stub for URL signing). */

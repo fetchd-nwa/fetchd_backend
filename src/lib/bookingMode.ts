@@ -1,6 +1,6 @@
 import { assertNever } from './assertNever.js';
 import type { DayProgramCategory } from './bookingSchedule.js';
-import type { bookingMode } from '../db/schema/schema.js';
+import type { BookingMode } from '../contracts/wire.js';
 
 /**
  * Map a day-program service category to its credit-axis booking mode
@@ -25,7 +25,10 @@ import type { bookingMode } from '../db/schema/schema.js';
  * programs — better to narrow the input type and let the type system
  * reject the rest.
  */
-export type BookingMode = (typeof bookingMode.enumValues)[number];
+// Wire 1.13.0 (§5.3): `BookingMode` is contract-owned now — re-exported from
+// wire.ts (the `ChargeStatus`/`chargesRepository` precedent); `conformance.ts`
+// pins it to the `booking_mode` pgEnum, so DB ↔ wire drift stays a `tsc` error.
+export type { BookingMode };
 
 export function dayProgramCategoryToMode(category: DayProgramCategory): BookingMode {
   switch (category) {

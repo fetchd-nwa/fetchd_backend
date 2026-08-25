@@ -6,7 +6,9 @@ import {
   creditExpirySettingsRepository,
   type CreditExpirySettingRow,
 } from '../db/repositories/creditExpirySettingsRepository.js';
-import { LOCATION_SLUGS, type LocationKey } from '../db/schema/schema.js';
+import { LOCATION_SLUGS } from '../db/schema/schema.js';
+import type { CreditExpirySettingWire, PostStaffCreditExpiryRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
@@ -64,13 +66,19 @@ const postBodySchema = z
   })
   .strict();
 
-interface CreditExpirySettingWire {
-  location: LocationKey | null;
-  expiry_window_months: number;
-  warning_lead_days: number;
-  updated_at: string;
-  updated_by_staff_id: string | null;
-}
+/**
+ * Zod ↔ wire pin for the upsert body (design §5.1.3, `z.input`). `location` is
+ * required-and-nullable, not optional — the pin is what keeps that distinction
+ * from rotting into `location?:`.
+ */
+export type PostStaffCreditExpiryBodyConformance = Expect<
+  Equal<z.input<typeof postBodySchema>, PostStaffCreditExpiryRequest>
+>;
+
+// `CreditExpirySettingWire` used to be declared right here — module-private,
+// with no client and no portal consumer, which is why no drift guard covered
+// it. Since 1.13.0 it lives in `contracts/wire.ts` (shape unchanged by the
+// move); `toWire` below is unchanged.
 
 function toWire(row: CreditExpirySettingRow): CreditExpirySettingWire {
   return {

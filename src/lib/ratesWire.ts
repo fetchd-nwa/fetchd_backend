@@ -1,33 +1,19 @@
-import { rateUnit, serviceCategory, type LocationKey } from '../db/schema/schema.js';
+import type { RateWire } from '../contracts/wire.js';
 import type { ServiceRateRow } from '../db/repositories/serviceRatesRepository.js';
 
-type ServiceCategory = (typeof serviceCategory.enumValues)[number];
-type RateUnit = (typeof rateUnit.enumValues)[number];
-
 /**
- * Wire shape for `GET /rates` (DATA-CONTRACT §B Rate Δ 2026-05-20). Lives
- * in `lib/` because the `note?` optional-omit + the `location: null` not-
- * omitted exception are real wire decisions, not a rename — extracting
- * them keeps the route file in pure dispatch shape (parse → repo →
- * respond) and centralizes the §B conventions a future reader/Day-18 FE
- * adapter can grep.
+ * Wire 1.13.0 (§6): `RateWire` is contract-owned now — declared in
+ * `contracts/wire.ts` and re-exported here so no consumer moves
+ * (the `ChargeStatus`/`chargesRepository` and `BookingMode` precedent).
+ * The two §B conventions that used to be documented here — `location`
+ * emitting as `null` rather than omitted, and `note?` omitting on NULL or
+ * empty string — travelled with the declaration into its wire doc comment.
  *
- * Two §B conventions to remember:
- *   • `location` emits as `null` (not omitted) when the matched row has
- *     `service_rates.location IS NULL` — the documented Day-4a exception
- *     because `null` here is meaningful data ("applies to all
- *     locations"), not absence.
- *   • `note?` omits when null or empty string (Day-4a optional-omit
- *     default).
+ * What stays in `lib/` is the mapper: `toRateWire` is where the `note?`
+ * omit is actually ENFORCED, which is why the route file can stay in pure
+ * dispatch shape (parse → repo → respond).
  */
-export interface RateWire {
-  category: ServiceCategory;
-  location: LocationKey | null;
-  amount_cents: number;
-  unit: RateUnit;
-  effective_from: string;
-  note?: string;
-}
+export type { RateWire };
 
 export function toRateWire(row: ServiceRateRow): RateWire {
   const wire: RateWire = {

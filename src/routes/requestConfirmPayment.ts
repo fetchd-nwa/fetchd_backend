@@ -2,7 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import { deepLinkToPath } from '../contracts/wire.js';
+import { deepLinkToPath, type PostRequestsConfirmPaymentRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
@@ -17,11 +18,7 @@ import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMappin
 import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
-import {
-  chargeBlockerForConfirm,
-  defaultStripeClient,
-  type StripeClient,
-} from '../lib/stripe.js';
+import { chargeBlockerForConfirm, defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { groupRequestDogs } from '../lib/requestWire.js';
 import { wireOneRequest } from '../lib/wireOneRequest.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
@@ -95,6 +92,14 @@ const confirmBodySchema = z
     message: 'pickup_at must be strictly after dropoff_at',
     path: ['pickup_at'],
   });
+
+/** §5.1.3 pin. THE case the `z.input` rule exists for: `pay_later` is
+ *  `z.boolean().optional().default(false)`, so `z.infer` would make it
+ *  REQUIRED and the wire would lie about what a client must send. Proven:
+ *  typing it `pay_later: boolean` fails this pin with TS2344. */
+export type PostRequestsConfirmPaymentBodyConformance = Expect<
+  Equal<z.input<typeof confirmBodySchema>, PostRequestsConfirmPaymentRequest>
+>;
 
 export function registerRequestConfirmPaymentRoute(
   app: FastifyInstance,

@@ -1,7 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import { deepLinkToPath } from '../contracts/wire.js';
+import {
+  deepLinkToPath,
+  type PostStaffRequestsApproveRequest,
+  type PostStaffRequestsDenyRequest,
+} from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import {
@@ -100,6 +105,11 @@ const approveBodySchema = z
 
 type ApproveBody = z.infer<typeof approveBodySchema>;
 
+/** §5.1.3 pin — see `PostBookingsBodyConformance` in `routes/bookings.ts`. */
+export type PostStaffRequestsApproveBodyConformance = Expect<
+  Equal<z.input<typeof approveBodySchema>, PostStaffRequestsApproveRequest>
+>;
+
 const denyBodySchema = z
   .object({
     // Reserved for future use (deny reason). Empty body is the default
@@ -107,6 +117,14 @@ const denyBodySchema = z
     reason: z.string().max(500).optional(),
   })
   .strict();
+
+/** §5.1.3 pin. `reason` is accepted and DISCARDED — no column stores it
+ *  (DISCREPANCIES.md:671); persisting it needs DDL and is deferred to §6
+ *  batch #7 / phase 3. The wire type documents the embarrassment rather than
+ *  removing the field, which would be a tightening (§14.1). */
+export type PostStaffRequestsDenyBodyConformance = Expect<
+  Equal<z.input<typeof denyBodySchema>, PostStaffRequestsDenyRequest>
+>;
 
 export function registerStaffRequestsRoute(
   app: FastifyInstance,

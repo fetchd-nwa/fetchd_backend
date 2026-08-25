@@ -24,6 +24,13 @@ import {
   mediaPurpose,
   mediaKind,
   notificationType,
+  bookingMode,
+  evaluationStatus,
+  groupClassKey,
+  refundStatus,
+  invoiceStatus,
+  chargePurpose,
+  announcementCategory,
   LOCATION_SLUGS,
 } from '../db/schema/schema.js';
 import type {
@@ -39,6 +46,13 @@ import type {
   MediaPurpose,
   MediaKind,
   NotificationType,
+  BookingMode,
+  EvaluationStatus,
+  GroupClassKey,
+  RefundStatus,
+  InvoiceStatus,
+  ChargePurpose,
+  AnnouncementCategory,
   LocationKey,
 } from './wire.js';
 
@@ -72,4 +86,14 @@ export type ContractEnumConformance = [
   Expect<Equal<NotificationType, DrizzleEnum<typeof notificationType>>>,
   Expect<Equal<AttendanceStatus, Exclude<DrizzleEnum<typeof bookingAttendance>, 'pending'>>>,
   Expect<Equal<LocationKey, (typeof LOCATION_SLUGS)[number]>>,
+  // 1.13.0 skeleton (§5.3): the three shared unions promoted into wire.ts §2.
+  Expect<Equal<BookingMode, DrizzleEnum<typeof bookingMode>>>,
+  Expect<Equal<EvaluationStatus, DrizzleEnum<typeof evaluationStatus>>>,
+  Expect<Equal<GroupClassKey, DrizzleEnum<typeof groupClassKey>>>,
+  // 1.13.0 lane CONFORMANCE ADDs (§8): pgEnum-backed unions promoted by the
+  // refunds, payments-invoices, and notifications lanes.
+  Expect<Equal<RefundStatus, DrizzleEnum<typeof refundStatus>>>,
+  Expect<Equal<InvoiceStatus, DrizzleEnum<typeof invoiceStatus>>>,
+  Expect<Equal<ChargePurpose, DrizzleEnum<typeof chargePurpose>>>,
+  Expect<Equal<AnnouncementCategory, DrizzleEnum<typeof announcementCategory>>>,
 ];

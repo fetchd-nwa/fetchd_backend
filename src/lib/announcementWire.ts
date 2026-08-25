@@ -1,46 +1,35 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
-import { announcementCategory } from '../db/schema/schema.js';
 
 /**
- * Wire shape for `Announcement` per DATA-CONTRACT §B (line 289-292 — "wire
- * keys exactly as the current `toX()` translators read them") + the FE
- * `announcementRepository.ts` Raw type.
+ * Backend adapter for the Announcement wire shape. As of contract 1.13.0 the wire types
+ * themselves — `AnnouncementCategory`, `AnnouncementCtaKind`, `AnnouncementCtaWire` and
+ * `AnnouncementWire` — live in `src/contracts/wire.ts` (their single source of truth,
+ * generated verbatim into both clients), and the emit conventions + the "NOT emitted"
+ * list travel with them there. This module re-exports the four so existing importers keep
+ * their `../lib/announcementWire.js` path, and keeps the two backend-only pieces the
+ * contract has no home for: the camelCase DB-row projection (`AnnouncementRowForWire`) and
+ * the `toAnnouncementWire` shaper. Same split as `notificationWire.ts`.
  *
- * Conventions (Day-5a/4a wire-shape rules):
- *   - Required keys: always emit. (`id`, `category`, `title`, `published_at`).
- *   - Optional `?` keys: omit when null/empty. `body?` and `deep_link_path?`.
- *   - `cta?` (Day 19e) — the Recent-Updates detail CTA. Emitted as a nested
- *     object so its three correlated fields travel as a unit (the DB CHECK
- *     guarantees all-or-none). The FE parses `kind`+`target` into a typed
- *     discriminated union at its wire boundary (route allowlist enforced there).
- *
- * NOT emitted (server-side concerns):
- *   - `target_location` — server uses it for the `?location=` query filter;
- *     the FE doesn't display per-row location targeting.
- *   - `is_pinned` — drives server-side sort; FE displays in returned order.
- *   - `created_at` / `expired_at` — internal lifecycle metadata.
+ * Wire-shape rules (Day-5a/4a) that `toAnnouncementWire` implements:
+ *   - Required keys always emit: `id`, `category`, `title`, `published_at`.
+ *   - Optional `?` keys are OMITTED when null/empty: `body`, `deep_link_path`.
+ *   - `cta` (Day 19e) is emitted as a nested object only when all three columns are
+ *     present — the DB CHECK guarantees all-or-none. The FE parses `kind` + `target` into
+ *     a typed discriminated union at its wire boundary (route allowlist enforced there).
  */
 
-export type AnnouncementCategory = (typeof announcementCategory.enumValues)[number];
+export type {
+  AnnouncementCategory,
+  AnnouncementCtaKind,
+  AnnouncementCtaWire,
+  AnnouncementWire,
+} from '../contracts/wire.js';
 
-/** CTA target discriminator. See `announcements.cta_kind` (schema.sql). */
-export type AnnouncementCtaKind = 'enroll' | 'route' | 'external';
-
-export interface AnnouncementCtaWire {
-  label: string;
-  kind: AnnouncementCtaKind;
-  target: string;
-}
-
-export interface AnnouncementWire {
-  id: string;
-  category: AnnouncementCategory;
-  title: string;
-  body?: string;
-  published_at: string;
-  deep_link_path?: string;
-  cta?: AnnouncementCtaWire;
-}
+import type {
+  AnnouncementCategory,
+  AnnouncementCtaKind,
+  AnnouncementWire,
+} from '../contracts/wire.js';
 
 /**
  * Subset of `announcements` columns the wire helper consumes. Structural —

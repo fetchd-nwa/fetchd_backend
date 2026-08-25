@@ -1,12 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { BOOKING_MODES, type DayCapacityWire } from '../contracts/wire.js';
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
-import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { defaultDayCapacity, enumerateRangeWithCap } from '../lib/availability.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
-import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
+import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.js';
 
 /**
@@ -39,7 +39,12 @@ import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.
  * drive-by. Flagged 2026-07-31.
  */
 
-const MODES = pgEnumTuple(bookingMode);
+// Wire 1.13.0 §5.4: the mode vocabulary now comes from the contract tuple
+// rather than being re-derived from the pgEnum here. Member-for-member
+// identical to `bookingMode.enumValues` (proof in the lane patch), and
+// `conformance.ts` pins `BookingMode` to that pgEnum, so DB ↔ wire drift is
+// a compile error rather than a silent validation change.
+const MODES = BOOKING_MODES;
 const LOCATIONS = LOCATION_SLUGS;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -56,14 +61,9 @@ const querySchema = z.object({
   location: z.enum(LOCATIONS),
 });
 
-type LocationKey = (typeof LOCATIONS)[number];
-
-export interface DayCapacityWire {
-  location: LocationKey;
-  date: string;
-  school_openings: number;
-  daycare_openings: number;
-}
+// Wire 1.13.0 (§6): `DayCapacityWire` is contract-owned now — re-exported so
+// no consumer of this route module has to move.
+export type { DayCapacityWire };
 
 export function registerAvailabilityRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);

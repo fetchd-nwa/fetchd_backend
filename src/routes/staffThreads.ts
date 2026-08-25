@@ -8,6 +8,8 @@ import { notificationsRepository } from '../db/repositories/notificationsReposit
 import { threadsRepository } from '../db/repositories/threadsRepository.js';
 import { ApiError } from '../lib/errors.js';
 import { requireStaff } from '../lib/principalNarrows.js';
+import type { PostStaffThreadsMessagesRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { type MessageWire, type ThreadWire } from '../lib/threadWire.js';
 import { wireManyMessages, wireManyThreads } from '../lib/wireManyThreads.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
@@ -33,6 +35,13 @@ const uuidParamSchema = z.object({ id: z.string().uuid() });
 const messageBodySchema = z
   .object({ text: z.string().trim().min(1).max(MAX_MESSAGE_LEN) })
   .strict();
+
+/** Zod ↔ wire pin (designs/wire-contract-completion.md §5.1.3) — the STAFF
+ *  reply grammar, deliberately narrower than the owner send's (ledger NOTE-29).
+ *  `z.input` so the pin describes what a staffer may SEND, pre-trim. */
+export type PostStaffThreadsMessagesBodyConformance = Expect<
+  Equal<z.input<typeof messageBodySchema>, PostStaffThreadsMessagesRequest>
+>;
 
 export interface StaffThreadsRouteOpts extends AuthRouteOptions {
   /** Override the R2 client (contract tests inject the stub for URL signing). */

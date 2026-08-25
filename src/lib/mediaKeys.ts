@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { MediaPurpose } from '../contracts/wire.js';
 import { ApiError } from './errors.js';
 
 /**
@@ -14,12 +15,10 @@ import { ApiError } from './errors.js';
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB — generous for high-res phone photos
 
-export type MediaPurpose =
-  | 'dog-profile'
-  | 'owner-avatar'
-  | 'report-photo'
-  | 'report-video'
-  | 'message-attachment';
+// Promoted to the contract at 1.13.0 — re-exported so no consumer moves
+// (designs/wire-contract-completion.md §6; digest reports/S). Member-for-member
+// identical to the union it replaces.
+export type { MediaPurpose };
 
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
 const VIDEO_TYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);

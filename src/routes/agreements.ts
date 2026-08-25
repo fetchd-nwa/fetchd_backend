@@ -1,11 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { and, asc, eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import {
-  agreementDocuments,
-  agreementSignatures,
-  type serviceCategory,
-} from '../db/schema/schema.js';
+import type { AgreementWire } from '../contracts/wire.js';
+import { agreementDocuments, agreementSignatures } from '../db/schema/schema.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { live } from '../db/softExpire.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
@@ -34,17 +31,10 @@ import { pgTimestampToIso } from '../lib/pgTimestamp.js';
  * touch it. Revisit if the portal adds a "see who hasn't signed" view.
  */
 
-type ServiceCategory = (typeof serviceCategory.enumValues)[number];
-
-interface AgreementWire {
-  key: string;
-  label: string;
-  current_version: number;
-  required: boolean;
-  applies_to: ServiceCategory[];
-  signed_version: number | null;
-  signed_at: string | null;
-}
+// Promoted to `contracts/wire.ts` in 1.13.0 (digest dogs-profile/S). The local
+// `ServiceCategory` alias goes with it — the wire union is pinned to the pgEnum
+// in `contracts/conformance.ts`, which is a stronger guarantee than the local
+// re-derivation was.
 
 export function registerAgreementsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);

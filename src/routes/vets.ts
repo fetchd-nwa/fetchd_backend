@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
+import type { GetVetsQuery, PatchVetsRequest, PostVetsRequest } from '../contracts/wire.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { vetsRepository } from '../db/repositories/vetsRepository.js';
@@ -44,6 +46,10 @@ const searchQuerySchema = z.object({
   q: z.string().trim().min(1).optional(),
 });
 
+export type GetVetsQueryConformance = Expect<
+  Equal<z.input<typeof searchQuerySchema>, GetVetsQuery>
+>;
+
 const paramsSchema = z.object({
   id: z.string().uuid(),
 });
@@ -63,6 +69,10 @@ const postBodySchema = z
   })
   .strict();
 
+export type PostVetsBodyConformance = Expect<
+  Equal<z.input<typeof postBodySchema>, PostVetsRequest>
+>;
+
 const patchBodySchema = z
   .object({
     name: z.string().trim().min(1),
@@ -73,6 +83,10 @@ const patchBodySchema = z
   })
   .strict()
   .partial();
+
+export type PatchVetsBodyConformance = Expect<
+  Equal<z.input<typeof patchBodySchema>, PatchVetsRequest>
+>;
 
 export function registerVetsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);

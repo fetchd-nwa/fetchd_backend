@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import { ne } from 'drizzle-orm';
+import type { RefundStatus } from '../../contracts/wire.js';
 import { db } from '../client.js';
 import { pgTimestampToDate } from '../../lib/pgTimestamp.js';
 import { charges, refunds } from '../schema/schema.js';
@@ -54,12 +55,14 @@ export type CappedRefundMint =
  *   failed | unroutable → resolved-external   (STAFF, note required)
  *   resolved-external → ∅             (terminal; webhook events on it no-op)
  */
-export type RefundStatus =
-  | 'pending'
-  | 'succeeded'
-  | 'failed'
-  | 'unroutable'
-  | 'resolved-external';
+// Re-exported, not redeclared: `RefundStatus` moved into the wire contract in
+// 1.13.0 (digest refunds/S), and `conformance.ts` pins it against the
+// `refund_status` pgEnum. Two copies could drift apart while both still
+// compiled — the `ChargeStatus`/`chargesRepository` precedent
+// (`chargesRepository.ts:107-111`). Consumers are unchanged: this export keeps
+// `webhooks/stripeEventHandlers.ts:25` and `workers/duplicateRefundRetry.ts:4-8`
+// importing the name from here.
+export type { RefundStatus } from '../../contracts/wire.js';
 
 /**
  * Data-access seam for `refunds` (schema.sql ~line 778). Append-only
@@ -379,10 +382,15 @@ function allocateActionableFigures(rows: ClassifiedRow[]): AbandonedRefundRow[] 
     if (group === undefined) byCharge.set(row.chargeId, [row]);
     else group.push(row);
   }
-  const allocated = new Map<string, { actionableCents: number; clipped: boolean; clipReason: AbandonedRefundRow['clipReason'] }>();
+  const allocated = new Map<
+    string,
+    { actionableCents: number; clipped: boolean; clipReason: AbandonedRefundRow['clipReason'] }
+  >();
   for (const group of byCharge.values()) {
     const ordered = [...group].sort((a, b) =>
-      a.createdAt === b.createdAt ? a.id.localeCompare(b.id) : a.createdAt.localeCompare(b.createdAt),
+      a.createdAt === b.createdAt
+        ? a.id.localeCompare(b.id)
+        : a.createdAt.localeCompare(b.createdAt),
     );
     const shoutingNonFailed = ordered
       .filter((row) => row.status !== 'failed')
@@ -803,7 +811,9 @@ export const refundsRepository = {
       })
       .returning(REFUND_PROJECTION);
     if (!row) {
-      throw new Error('refundsRepository.adoptExternalRefundCapped: refunds INSERT returned no row');
+      throw new Error(
+        'refundsRepository.adoptExternalRefundCapped: refunds INSERT returned no row',
+      );
     }
     return { kind: 'adopted', refund: row };
   },
@@ -853,7 +863,9 @@ export const refundsRepository = {
   async findReturnedRowsForCharge(
     tx: Runner,
     chargeId: string,
-  ): Promise<{ id: string; status: RefundStatus; amountCents: number; stripeRefundId: string | null }[]> {
+  ): Promise<
+    { id: string; status: RefundStatus; amountCents: number; stripeRefundId: string | null }[]
+  > {
     return tx
       .select({
         id: refunds.id,
@@ -1467,7 +1479,11 @@ export const refundsRepository = {
    * is true now.
    */
   async findById(tx: Tx, id: string): Promise<RefundRow | undefined> {
-    const [row] = await tx.select(REFUND_PROJECTION).from(refunds).where(eq(refunds.id, id)).limit(1);
+    const [row] = await tx
+      .select(REFUND_PROJECTION)
+      .from(refunds)
+      .where(eq(refunds.id, id))
+      .limit(1);
     return row;
   },
 

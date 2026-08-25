@@ -1,7 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
-import type { CreditPurchaseWire } from '../contracts/wire.js';
+import type {
+  CreditPackageWire,
+  CreditPurchaseWire,
+  GetCreditPackagesQuery,
+  PostCreditPackagesPurchaseRequest,
+} from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
@@ -53,15 +59,10 @@ type LocationKey = (typeof LOCATION_KEYS)[number];
  * caches one.
  */
 
-export interface CreditPackageWire {
-  key: string;
-  location: LocationKey;
-  mode: BookingMode;
-  credits: number;
-  price_cents: number;
-  label: string;
-  is_popular: boolean;
-}
+// `CreditPackageWire` used to be declared right here. Since 1.13.0 it lives in
+// `contracts/wire.ts` (shape unchanged by the move) and this route re-exports
+// it, exactly like the `CreditPurchaseWire` note below.
+export type { CreditPackageWire };
 
 // `CreditPurchaseWire` used to be declared right here — a money response
 // outside the versioned contract, which is why no client's `check:contracts`
@@ -91,6 +92,11 @@ const keyParamSchema = z.object({
 // by school). The owner app passes its selected location.
 const packagesQuerySchema = z.object({ location: z.enum(LOCATION_KEYS) });
 
+/** Zod ↔ wire pin for the catalog query (design §5.1.3, `z.input`). */
+export type GetCreditPackagesQueryConformance = Expect<
+  Equal<z.input<typeof packagesQuerySchema>, GetCreditPackagesQuery>
+>;
+
 // Upper bound for a single purchase's unit count — matches the app's
 // "choose your own amount" wheel (1–100 of the single-day pack).
 const PURCHASE_QUANTITY_MAX = 100;
@@ -106,6 +112,15 @@ const purchaseBodySchema = z
     quantity: z.number().int().min(1).max(PURCHASE_QUANTITY_MAX).default(1),
   })
   .strict();
+
+/**
+ * Zod ↔ wire pin for the purchase body (design §5.1.3). `z.input`, not
+ * `z.infer`: `quantity` is optional to a CLIENT (pre-default) and always
+ * present to the handler (post-default) — the wire documents the former.
+ */
+export type PostCreditPackagesPurchaseBodyConformance = Expect<
+  Equal<z.input<typeof purchaseBodySchema>, PostCreditPackagesPurchaseRequest>
+>;
 
 export function registerCreditPackagesRoute(
   app: FastifyInstance,

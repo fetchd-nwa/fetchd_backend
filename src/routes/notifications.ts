@@ -10,7 +10,9 @@ import type {
   NotificationWire,
   NotificationListResponse,
   UnreadCountResponse,
+  GetNotificationsQuery,
 } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import {
   notificationsRepository,
   type NotificationCursor,
@@ -44,6 +46,15 @@ const listQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(LIMIT_MAX).optional().default(LIMIT_DEFAULT),
 });
+
+/**
+ * §5.1.3 pin — `GetNotificationsQuery` IS this schema's input, or the build fails.
+ * `z.input`, not `z.infer`: post-parse `limit` is always present (default 50), but what a
+ * client may SEND is `limit?`.
+ */
+export type GetNotificationsQueryConformance = Expect<
+  Equal<z.input<typeof listQuerySchema>, GetNotificationsQuery>
+>;
 
 export function registerNotificationsRoute(
   app: FastifyInstance,

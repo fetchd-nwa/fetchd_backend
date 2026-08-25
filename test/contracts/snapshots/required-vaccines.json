@@ -2,11 +2,13 @@
   {
     "key": "test-bordetella",
     "label": "Bordetella (fixture)",
-    "gates_categories": ["day-care", "day-school", "boarding"]
+    "gates_categories": ["day-care", "day-school", "boarding"],
+    "exempt_class_keys": []
   },
   {
     "key": "test-rabies",
     "label": "Rabies (fixture)",
-    "gates_categories": ["day-care", "day-school", "boarding", "board-and-train"]
+    "gates_categories": ["day-care", "day-school", "boarding", "board-and-train"],
+    "exempt_class_keys": []
   }
 ]

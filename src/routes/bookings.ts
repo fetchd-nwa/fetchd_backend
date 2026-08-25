@@ -13,7 +13,10 @@ import type {
   BookingDivertPreviewDogWire,
   BookingDivertPreviewWire,
   DivertedBookingWire,
+  PostBookingsPreviewRequest,
+  PostBookingsRequest,
 } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { isInView } from '../lib/bookingBucket.js';
 import { resolveApprovalDivert } from '../lib/bookingApprovalDivert.js';
 import { alreadyRequestedError } from '../lib/bookingErrors.js';
@@ -30,10 +33,7 @@ import {
 } from '../lib/bookingSchedule.js';
 import type { BookingWire } from '../lib/bookingWire.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
-import {
-  firePendingRefundPostCommit,
-  type PendingStripeRefund,
-} from '../lib/pendingRefund.js';
+import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import {
   createDayProgramBookings,
   resolvePaygPlan,
@@ -158,6 +158,16 @@ const postBookingBodySchema = z
 
 type PostBookingBody = z.infer<typeof postBookingBodySchema>;
 
+/** §5.1.3 pin (designs/wire-contract-completion.md) — the wire's
+ *  `PostBookingsRequest` IS this schema's INPUT type. `z.input`, never
+ *  `z.infer`: the wire documents what a client may SEND (pre-default,
+ *  pre-transform). Exported so no unused-locals rule can eat it (the
+ *  `ContractEnumConformance` precedent). If this stops compiling, the WIRE
+ *  TYPE is wrong — fix the type to the schema's truth, never the schema. */
+export type PostBookingsBodyConformance = Expect<
+  Equal<z.input<typeof postBookingBodySchema>, PostBookingsRequest>
+>;
+
 // POST /bookings/preview body — just the roster; the divert check is
 // category/date-agnostic (see the route comment).
 const previewBodySchema = z
@@ -165,6 +175,11 @@ const previewBodySchema = z
     dog_ids: z.array(z.string().uuid()).min(1).max(MAX_DOGS_PER_REQUEST),
   })
   .strict();
+
+/** §5.1.3 pin — see `PostBookingsBodyConformance`. */
+export type PostBookingsPreviewBodyConformance = Expect<
+  Equal<z.input<typeof previewBodySchema>, PostBookingsPreviewRequest>
+>;
 
 export interface BookingsRouteOptions extends AuthRouteOptions {
   now?: () => Date;

@@ -5246,3 +5246,49 @@ push/sentence tense item is unchanged — MR-A2.5(d)2, §6 copy bundle, Allison'
 worklist row) as its inherited probe. Otherwise unchanged: §4.4's
 different-amount adoption-during-pending; the §A3.19 webhook-flip door;
 pre-deploy stranded month-1 orphans; the `MONTH_ONE_RETURNED_SENTENCE` tense.
+
+## O. The wire contract completed — 1.13.0 (2026-08-24/25; lanes MERGED)
+
+`designs/wire-contract-completion.md` (the rulebook; Phase 2 of the
+completion plan). Skeleton landed on backend branch
+`wire-1.13.0-contract-completion`; the 13 domain lanes fill the fenced
+sections next (read-only patch artifacts, orchestrator splices), then the
+2.3b endpoint builds, mobile mirror deletion (2.4), portal sync (2.5), and
+the two-lane adversary (2.6). This section gains the lane roll-up at close.
+
+- **THE error contract is contractual** (rulebook §3): `ApiErrorCode` (the
+  23 thrown codes + `'internal'`, the serializer fallback),
+  `API_ERROR_STATUS` (one table — a status change is a wire change),
+  `ApiErrorWire`/`ApiErrorEnvelope`, and the closed 13-arm
+  `ApiErrorDetailWire` union, item shapes promoted under their existing
+  `lib/bookingErrors.ts` names. Fold-in: `lib/errors.ts` imports all three
+  from wire.ts, so an invented details literal is a `tsc` error at the
+  construction site (mutant proven). Envelope byte shape pinned by
+  `test/contracts/error-envelope.test.ts` (three serializer branches,
+  red-first: the details-null variant failed before the true
+  key-absent pin landed).
+- **Shared enums promoted** (rulebook §5.3): `BookingMode`,
+  `EvaluationStatus`, `GroupClassKey` + pgEnum pins in `conformance.ts`
+  (member-removal mutant proven); value tuples `API_ERROR_CODES`,
+  `BOOKING_MODES`, `GROUP_CLASS_KEYS`, `NOTIFICATION_TYPES`,
+  `MEDIA_PURPOSES`, `CHARGE_BLOCKERS`, `WITHDRAW_MONEY_OUTCOMES`; and
+  `WireTupleConformance` (§16 in-file set-equality pins).
+- **WC-A1 (design amendment, instrument):** tuples use
+  `as const satisfies readonly [X, ...X[]]` — the old annotated form made
+  every tuple↔union pin TAUTOLOGICAL (a missing member passed `tsc`;
+  executed). Six pre-1.13.0 tuples changed FORM only; values identical.
+- The §N.2 `owed_cents` doc correction landed with this skeleton, its
+  CHANGELOG line verbatim.
+
+Merge of record (2026-08-25): all 13 lane patches spliced + 143 domain-file
+edits applied; four new pgEnum pins (RefundStatus proven red-first);
+`GetStaffReportsQuery` minted with `dog_id` REQUIRED (WC-A5). Gate evidence:
+merged tree GREEN 1337/1337 (0 skipped/todo/cancelled, fresh volume,
+`backend-gate-merged-rerun.log`) minutes after the pristine base's control
+GREEN 1320/1320 in the same window. FILED FINDING, not absorbed: two
+small-hours gate runs each dropped ONE money-count test (`§9.23b`
+enrollment-partial; `MR-A3.2 (v)` refund-retry-client-keyed — different test
+each run, both solo-green, both green in the morning runs) — a
+flake class clustered ~01:30–02:10, queued for the shifted-clock/flake
+sweep (phase 3.2) with all four gate logs preserved in the session
+scratchpad. The 17 net-new suite tests over 1.12.0's 1320 = 1337.

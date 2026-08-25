@@ -12,6 +12,8 @@ import {
   type EventRsvpWire,
   type EventWire,
 } from '../lib/eventWire.js';
+import type { DeleteEventsRsvpResponse, PostEventsRsvpRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { eventsRepository } from '../db/repositories/eventsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 
@@ -45,6 +47,17 @@ const MAX_RSVP_DOGS = 5;
 const rsvpBodySchema = z.object({
   dog_ids: z.array(z.string().uuid()).min(1).max(MAX_RSVP_DOGS),
 });
+
+/**
+ * Wire 1.13.0 §5.1.3 pin: the contract type and this schema are one shape, or
+ * `tsc` fails here. `z.input`, never `z.infer` — the wire documents what a
+ * client may SEND (pre-default, pre-transform). Exported so a `noUnusedLocals`
+ * rule can't eat it (the `ContractEnumConformance` precedent). If this ever
+ * goes red, the WIRE TYPE is what moves — the schema is production behavior.
+ */
+export type PostEventsRsvpBodyConformance = Expect<
+  Equal<z.input<typeof rsvpBodySchema>, PostEventsRsvpRequest>
+>;
 
 export function registerEventsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
@@ -164,7 +177,7 @@ export function registerEventsRoute(app: FastifyInstance, opts: AuthRouteOptions
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     // cache-noop: events / event_rsvps aren't read-through cached (no §3 cache map entry).
-    const outcome = await withMutation<{ ok: true }>(
+    const outcome = await withMutation<DeleteEventsRsvpResponse>(
       {
         principal,
         idempotencyKey,

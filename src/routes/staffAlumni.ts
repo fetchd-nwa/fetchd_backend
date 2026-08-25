@@ -1,6 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
+import type {
+  CompletedProgramsWire,
+  CurriculumProgram,
+  PostStaffDogsCompletedProgramsRequest,
+} from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
@@ -44,12 +50,28 @@ const programParamSchema = z.object({
 
 const recordBodySchema = z.object({ program: z.enum(CURRICULUM_PROGRAMS) }).strict();
 
-interface CompletedProgramsWire {
-  dog_id: string;
-  is_alumni: boolean;
-  completed_programs: { program: string; completed_at: string }[];
-  alumni_attendance_flagged_at?: string;
-}
+/** §5.1.3 body pin. */
+export type PostStaffCompletedProgramsBodyConformance = Expect<
+  Equal<z.input<typeof recordBodySchema>, PostStaffDogsCompletedProgramsRequest>
+>;
+
+/**
+ * The wire's `CurriculumProgram` is hand-listed (it must be — the DB floor is a
+ * CHECK, not a pgEnum, so `conformance.ts`'s DrizzleEnum pin has nothing to
+ * bite on). THIS is its drift guard: `lib/alumni.ts`'s `CURRICULUM_PROGRAMS`
+ * drives the route's Zod enum, the repository row type and the alumni count, so
+ * pinning the wire union to it makes any future divergence a `tsc` error here.
+ * Proven breakable: deleting a member from either side fails with TS2344.
+ */
+export type CurriculumProgramConformance = Expect<
+  Equal<CurriculumProgram, (typeof CURRICULUM_PROGRAMS)[number]>
+>;
+
+// CompletedProgramsWire promoted to `contracts/wire.ts` in 1.13.0 (digest
+// dogs-profile/S) with `completed_programs[].program` typed `CurriculumProgram`
+// instead of `string` — the repository row type already said so
+// (dogProgramsRepository.ts:22-25) and the DB CHECK (schema.sql:475-476)
+// enforces it.
 
 /**
  * Assemble the wire from the two repo halves (programs list + dogs-row flag).

@@ -25,9 +25,11 @@ import type { ServiceCategory } from '../../lib/bookingBucket.js';
  * `findByIdForOwner`, child-row resolvers). Day 12 extends with the
  * mutation primitives composing inside `withMutation`:
  *
- *   - `findFullByIdInTx` — full row read with `ownerId` /
- *     `approvedByStaffId` (the wire helper doesn't need these, the
- *     route's owner-scope assertion and state-machine guard do).
+ *   - `findFullByIdInTx` — full row read with `ownerId` / `expiredAt` /
+ *     `paymentMethodId` (the wire helper doesn't need these, the route's
+ *     owner-scope assertion and state-machine guard do). `approvedByStaffId`
+ *     moved DOWN into the base projection at wire 1.13.0 — it is on the wire
+ *     now (`PendingRequestWire.approved_by_staff_id`).
  *   - `lockById(tx, id)` — `SELECT ... FOR UPDATE` on the request row.
  *     Concurrent approve attempts on the same request serialize here.
  *   - `create(tx, values)` — INSERT a new pending_requests row at
@@ -49,16 +51,16 @@ import type { ServiceCategory } from '../../lib/bookingBucket.js';
 export type PendingRequestRow = PendingRequestRowForWire;
 
 /**
- * Full row projection — includes `ownerId` and `approvedByStaffId` not
- * exposed on the wire. The route uses `ownerId` for cross-owner
- * defense (404 same response as not-found) and `approvedByStaffId` to
- * distinguish owner-cancel from staff-deny on the same `cancelled`
- * status.
+ * Full row projection — the columns the ROUTES need and the wire helper does
+ * not: `ownerId` for the cross-owner defense (404, the same response as
+ * not-found), `leadDogId`, `expiredAt` for the live check, and the PAYG card.
+ * `approvedByStaffId` used to live here; wire 1.13.0 promoted it into the base
+ * projection because it is emitted now, so it arrives through
+ * `PendingRequestRow` and is deliberately NOT re-declared.
  */
 export interface PendingRequestFullRow extends PendingRequestRow {
   ownerId: string;
   leadDogId: string;
-  approvedByStaffId: string | null;
   expiredAt: string | null;
   /** PAYG divert requests carry the card to auto-charge; never on the wire. */
   paymentMethodId: string | null;
@@ -76,6 +78,8 @@ const PENDING_REQUEST_PROJECTION = {
   lengthWeeks: pendingRequests.lengthWeeks,
   lessonSetting: pendingRequests.lessonSetting,
   approvedAt: pendingRequests.approvedAt,
+  // Wire 1.13.0: on the wire now — the deny-vs-owner-cancel discriminator.
+  approvedByStaffId: pendingRequests.approvedByStaffId,
   convertedBookingId: pendingRequests.convertedBookingId,
   // Day-program divert columns (Shanthi 2026-07-14).
   location: pendingRequests.location,
@@ -87,7 +91,6 @@ const PENDING_REQUEST_FULL_PROJECTION = {
   ...PENDING_REQUEST_PROJECTION,
   ownerId: pendingRequests.ownerId,
   leadDogId: pendingRequests.leadDogId,
-  approvedByStaffId: pendingRequests.approvedByStaffId,
   expiredAt: pendingRequests.expiredAt,
   paymentMethodId: pendingRequests.paymentMethodId,
 } as const;

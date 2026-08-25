@@ -1,7 +1,9 @@
 import { assertNever } from './assertNever.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
-import { senderKind, threadCategory, staffRole } from '../db/schema/schema.js';
+import { senderKind } from '../db/schema/schema.js';
 import type {
+  StaffRole,
+  ThreadCategory,
   ThreadParticipantWire,
   ThreadWire,
   MessageAttachmentWire,
@@ -26,12 +28,29 @@ import type {
  * AND `read_at IS NULL`. The repo computes this per-thread; the wire emits
  * the resolved integer.
  */
-export type ThreadCategory = (typeof threadCategory.enumValues)[number];
+/** Schema-internal. `sender_kind` is normalized in the DB and FLATTENED away by
+ *  `toMessageWire` — it is never emitted, so it deliberately stays OUT of
+ *  wire.ts (designs/wire-contract-completion.md §6, threadWire row). */
 export type SenderKind = (typeof senderKind.enumValues)[number];
-export type StaffRoleValue = (typeof staffRole.enumValues)[number];
+
+/** Re-alias of the wire union, kept under this file's historical name so no
+ *  consumer moves this pass (§6). `StaffRoleValue` === `StaffRole`. */
+export type StaffRoleValue = StaffRole;
 
 // These wire shapes are owned by the single-source contract (contracts/wire.ts).
-export type { ThreadParticipantWire, ThreadWire, MessageAttachmentWire, MessageWire };
+// `ThreadCategory` joins them in 1.13.0: the local `(typeof
+// threadCategory.enumValues)[number]` copy was type-identical to the wire union
+// by construction — conformance.ts:71 pins `Equal<ThreadCategory,
+// DrizzleEnum<typeof threadCategory>>` and `DrizzleEnum<E>` is defined
+// (conformance.ts:57) as `E['enumValues'][number]`, the very expression these
+// lines used. Zero behavior change; the pin now guards one declaration, not two.
+export type {
+  ThreadCategory,
+  ThreadParticipantWire,
+  ThreadWire,
+  MessageAttachmentWire,
+  MessageWire,
+};
 
 /**
  * Row shape the repo emits for thread rows (subset of the Drizzle projection).

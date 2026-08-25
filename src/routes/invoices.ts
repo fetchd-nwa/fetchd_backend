@@ -4,8 +4,10 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import {
   deepLinkToPath,
   type InvoiceDeepLinkReason,
+  type InvoicePayRequest,
   type InvoicePayWire,
 } from '../contracts/wire.js';
+import type { Expect, Equal } from '../contracts/typeAsserts.js';
 import { db } from '../db/client.js';
 import { bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { peekCompletedIdempotency } from '../db/idempotency.js';
@@ -94,6 +96,16 @@ const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
 const paySchema = z
   .object({ payment_method_id: z.string().uuid('payment_method_id must be a UUID').optional() })
   .strict();
+
+/**
+ * §5.1.3 Zod ↔ wire pin. Until 1.13.0 `InvoicePayRequest` was dead code
+ * server-side — nothing tied the wire's description of this body to the schema
+ * that actually validates it, so the two could drift silently on the system's
+ * highest-consequence endpoint. This is that tie. `z.input`, not `z.infer`:
+ * the wire documents what a client may SEND. If it flips red, the WIRE TYPE is
+ * wrong, never the schema (§14.1).
+ */
+export type InvoicePayBodyConformance = Expect<Equal<z.input<typeof paySchema>, InvoicePayRequest>>;
 
 /**
  * Parse the optional pay body. `undefined`/null/empty body → no card chosen.

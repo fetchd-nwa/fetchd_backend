@@ -15,6 +15,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import { redis } from '../../src/redis.js';
 import { chicagoWallTimeToUtc } from '../../src/lib/chicagoDate.js';
+import { POST_BOOKINGS_ERROR_DETAIL_KINDS } from '../../src/contracts/wire.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import {
   futureWeekday,
@@ -932,6 +933,14 @@ test(
     };
     assert.equal(body.error.code, 'insufficient_credits');
     assert.equal(body.error.details.kind, 'insufficient_credits');
+    // §3.5 alias pin: the emitted arm must be a member of THIS endpoint's
+    // declared 422 vocabulary (`PostBookingsErrorDetails`, runtime twin
+    // POST_BOOKINGS_ERROR_DETAIL_KINDS). Asserted at runtime, not by tsc —
+    // backend `test/` is type-ERASED (rulebook §14.5).
+    assert.ok(
+      (POST_BOOKINGS_ERROR_DETAIL_KINDS as readonly string[]).includes(body.error.details.kind),
+      `${body.error.details.kind} is not an arm of PostBookingsErrorDetails`,
+    );
     assert.equal(body.error.details.gaps.length, 1);
     assert.equal(body.error.details.gaps[0]!.dog_id, FIXTURE_IDS.dog2Id);
     assert.equal(body.error.details.gaps[0]!.mode, 'school');

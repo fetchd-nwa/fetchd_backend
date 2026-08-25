@@ -1,6 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
+import {
+  MEDIA_PURPOSES,
+  type UploadsSignRequest,
+  type UploadsSignResponse,
+} from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { ApiError } from '../lib/errors.js';
 import {
   MAX_UPLOAD_BYTES,
@@ -31,13 +37,10 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 
 const PUT_URL_TTL_SECONDS = 60 * 15; // 15 min — long enough for a slow connection
 
-const mediaPurposeSchema = z.enum([
-  'dog-profile',
-  'owner-avatar',
-  'report-photo',
-  'report-video',
-  'message-attachment',
-]);
+// §5.4 swap (1.13.0): the hand-listed enum collapsed onto the contract tuple.
+// Member-for-member identical to the list it replaces (proof in the lane patch),
+// so accept/reject behavior is unchanged — this is not a tightening (§14.1).
+const mediaPurposeSchema = z.enum(MEDIA_PURPOSES);
 
 const bodySchema = z
   .object({
@@ -47,25 +50,16 @@ const bodySchema = z
   })
   .strict();
 
-export interface UploadsSignRequest {
-  purpose: z.infer<typeof mediaPurposeSchema>;
-  content_type: string;
-  byte_size: number;
-}
+// Both shapes promoted to the contract at 1.13.0 under their original names
+// (§4.4 grandfathering) and re-exported so no consumer moves.
+export type { UploadsSignRequest, UploadsSignResponse } from '../contracts/wire.js';
 
-export interface UploadsSignResponse {
-  /** Presigned PUT URL — the client PUTs bytes directly to this URL. */
-  url: string;
-  /** Headers the client MUST send with the PUT (signed-in Content-Type). */
-  headers: Record<string, string>;
-  /**
-   * The R2 object key the upload lands at. Pass this to POST /media after
-   * the PUT completes. Server-generated — clients cannot specify.
-   */
-  key: string;
-  /** ISO timestamp at which the presigned URL stops working. */
-  expires_at: string;
-}
+// §5.1.3 — the wire request type IS this schema's input. `z.input`, not
+// `z.infer`: the wire documents what a client may SEND. Exported so no
+// unused-locals rule can eat the pin.
+export type UploadsSignBodyConformance = Expect<
+  Equal<z.input<typeof bodySchema>, UploadsSignRequest>
+>;
 
 export interface UploadsSignRouteOpts extends AuthRouteOptions {
   /** Override the R2 client (contract tests inject the stub). */

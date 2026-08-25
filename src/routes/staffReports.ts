@@ -13,6 +13,13 @@ import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { toReportWire, type ReportProgram, type ReportWire } from '../lib/reportWire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
+import type {
+  PatchStaffReportsRequest,
+  PostStaffReportsRequest,
+  ReportResultsEnvelopeWire,
+  SkillResult,
+} from '../contracts/wire.js';
 
 /**
  * Day-19 staff portal verb 2 — report authoring (DATA-CONTRACT R2).
@@ -105,6 +112,30 @@ const patchReportBodySchema = z
   .strict();
 
 type PatchReportBody = z.infer<typeof patchReportBodySchema>;
+
+/**
+ * §5.1.3 Zod ↔ wire request-body pins. `z.input`, not `z.infer` — the wire
+ * documents what a client may SEND. Exported so an unused-locals rule cannot
+ * eat them (the `ContractEnumConformance` precedent). Change either side alone
+ * and `tsc` fails with TS2344; if a pin breaks, the WIRE TYPE is wrong — fix
+ * the type to the schema's truth, never the schema (§14.1).
+ *
+ * The `skillResultSchema` pin is the one that makes `SkillResult` — an
+ * exported wire type with no server-side link to any validator until now —
+ * a live contract rather than documentation.
+ */
+export type StaffReportSkillResultConformance = Expect<
+  Equal<z.input<typeof skillResultSchema>, SkillResult>
+>;
+export type StaffReportResultsEnvelopeConformance = Expect<
+  Equal<z.input<typeof resultsEnvelopeSchema>, ReportResultsEnvelopeWire>
+>;
+export type PostStaffReportsBodyConformance = Expect<
+  Equal<z.input<typeof postReportBodySchema>, PostStaffReportsRequest>
+>;
+export type PatchStaffReportsBodyConformance = Expect<
+  Equal<z.input<typeof patchReportBodySchema>, PatchStaffReportsRequest>
+>;
 
 export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);

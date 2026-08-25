@@ -1,7 +1,13 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
-import type { MediaWire } from '../contracts/wire.js';
+import {
+  MEDIA_PURPOSES,
+  type MediaWire,
+  type PostMediaRequest,
+  type PostMediaUploadQuery,
+} from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import {
   mediaAssetsRepository,
@@ -73,13 +79,9 @@ const paramsSchema = z.object({
   id: z.string().uuid(),
 });
 
-const mediaPurposeSchema = z.enum([
-  'dog-profile',
-  'owner-avatar',
-  'report-photo',
-  'report-video',
-  'message-attachment',
-]);
+// §5.4 swap (1.13.0) — see uploadsSign.ts for the identical collapse. Member
+// set, and therefore accept/reject behavior, is unchanged.
+const mediaPurposeSchema = z.enum(MEDIA_PURPOSES);
 
 const postBodySchema = z
   .object({
@@ -91,6 +93,13 @@ const postBodySchema = z
   .strict();
 
 type PostMediaBody = z.infer<typeof postBodySchema>;
+
+// §5.1.3 — `PostMediaRequest` (wire) IS this schema's input. `z.input`, not
+// `z.infer`; `PostMediaBody` above stays `z.infer` because it types the
+// POST-PARSE value the handlers pass around.
+export type PostMediaBodyConformance = Expect<
+  Equal<z.input<typeof postBodySchema>, PostMediaRequest>
+>;
 
 /**
  * POST /media/upload query — the staff report-media proxy. The bytes ride in
@@ -106,6 +115,11 @@ const uploadQuerySchema = z
   .strict();
 
 type UploadQuery = z.infer<typeof uploadQuerySchema>;
+
+// §5.1.3 — the query half of the staff proxy path.
+export type PostMediaUploadQueryConformance = Expect<
+  Equal<z.input<typeof uploadQuerySchema>, PostMediaUploadQuery>
+>;
 
 // MediaWire is owned by the single-source contract (contracts/wire.ts).
 export type { MediaWire };

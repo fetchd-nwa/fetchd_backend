@@ -8,7 +8,8 @@ import type { Tx } from '../db/tx.js';
 import { ApiError } from '../lib/errors.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireStaff } from '../lib/principalNarrows.js';
-import { loadMembershipPackage, toMembershipWire, type MembershipWire } from './memberships.js';
+import type { StaffMembershipWire } from '../contracts/wire.js';
+import { loadMembershipPackage, toMembershipWire } from './memberships.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
@@ -25,14 +26,14 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *
  * Wire = the owner MembershipWire + `owner_id` (staff work cross-owner and
  * need the owner context the owner shape leaves implicit). Follows the
- * staff-route conventions (requireStaff, withMutation + Idempotency-Key,
- * inline wire — NOT portal-mirrored yet; the portal UI lives in the other
- * repo).
+ * staff-route conventions (requireStaff, withMutation + Idempotency-Key;
+ * the wire shape is contract-owned since 1.13.0 — the portal UI still lives
+ * in the other repo and does not consume it yet).
  */
 
-interface StaffMembershipWire extends MembershipWire {
-  owner_id: string;
-}
+// `StaffMembershipWire` is contract-owned as of 1.13.0 (wire.ts
+// § domain:memberships) — it was module-private here, and freezing it is what
+// lets the portal wave consume the pause/resume responses.
 
 const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
 

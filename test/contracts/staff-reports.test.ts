@@ -69,6 +69,24 @@ function patchReport(opts: {
   });
 }
 
+/**
+ * Runtime shape check for the `private_lesson_content` this file POSTs and
+ * reads back. `sessionPayload()` authors the doc, so the expected shape is
+ * local knowledge — a mismatch here means the wire type or the payload drifted.
+ */
+function assertPrivateLessonContentShape(value: unknown): void {
+  assert.equal(typeof value, 'object', 'private_lesson_content: expected an object');
+  assert.ok(value !== null && !Array.isArray(value), 'private_lesson_content: expected an object');
+  const content = value as Record<string, unknown>;
+  assert.equal(typeof content['session_focus'], 'string', 'session_focus must be a string');
+  assert.ok(Array.isArray(content['topics']), 'topics must be an array');
+  for (const topic of content['topics'] as Record<string, unknown>[]) {
+    assert.equal(typeof topic['id'], 'string', 'topic.id must be a string');
+    assert.equal(typeof topic['title'], 'string', 'topic.title must be a string');
+    assert.ok(Array.isArray(topic['sections']), 'topic.sections must be an array');
+  }
+}
+
 const curriculumPayload = (): Record<string, unknown> => ({
   dog_id: FIXTURE_IDS.dog1Id,
   date: REPORT_DATE,
@@ -90,7 +108,23 @@ const sessionPayload = (): Record<string, unknown> => ({
   program: 'private-lesson',
   excerpt: 'Focused 1:1 on door manners.',
   full_text: 'Worked thresholds; strong impulse control by the end.',
-  content: { sections: [{ heading: 'Door manners', body: 'Calm exits.' }] },
+  // 1.13.0: authors a doc that satisfies PrivateLessonContentWire — the shape
+  // the owner app actually renders (mobile RawPrivateLessonContent requires
+  // session_focus + topics). The pre-1.13.0 payload here authored
+  // `{ sections: [...] }`, a doc the client cannot render, and the opaque
+  // `unknown` typing let it pass — BUG-13's write hole demonstrated by this
+  // suite's own fixture. The write path still does not validate (that fix is
+  // filed, not enacted); this payload is simply now REPRESENTATIVE.
+  content: {
+    session_focus: 'Door manners + threshold impulse control',
+    topics: [
+      {
+        id: 'door-manners',
+        title: 'Door manners',
+        sections: [{ kind: 'note', text: 'Calm exits.' }],
+      },
+    ],
+  },
 });
 
 async function seedBookingForDog(dogId: string): Promise<string> {
@@ -187,9 +221,7 @@ test(
     assert.ok(
       notes.some(
         (n) =>
-          n.type === 'report-published' &&
-          n.deepLinkKind === 'report' &&
-          n.deepLinkId === body.id,
+          n.type === 'report-published' && n.deepLinkKind === 'report' && n.deepLinkId === body.id,
       ),
       'report-published notification enqueued',
     );
@@ -210,6 +242,11 @@ test(
     const body = res.json() as { program: string; private_lesson_content?: unknown };
     assert.equal(body.program, 'private-lesson');
     assert.ok(body.private_lesson_content, 'variant content emitted under the program-keyed field');
+    // 1.13.0: the field is `PrivateLessonContentWire`, not `unknown`. The type
+    // annotation above is erased (test/ is in no tsconfig), so the shape is
+    // asserted at runtime — this is the write-path half of the §14.2-A pins in
+    // `report-content-types.test.ts`.
+    assertPrivateLessonContentShape(body.private_lesson_content);
   },
 );
 

@@ -1,4 +1,5 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
+import type { EventLocationWire, EventRsvpWire, EventWire } from '../contracts/wire.js';
 
 /**
  * Wire shapes for `Event` + `EventRsvp` per DATA-CONTRACT §B + the FE
@@ -26,31 +27,10 @@ import { pgTimestampToIso } from './pgTimestamp.js';
  * trusts that rows passed in already belong to the requester.
  */
 
-export interface EventLocationWire {
-  label: string;
-  address: string;
-  latitude: number;
-  longitude: number;
-}
-
-export interface EventWire {
-  id: string;
-  name: string;
-  date: string;
-  duration_minutes: number;
-  location: EventLocationWire;
-  description?: string;
-  is_recurring: boolean;
-  capacity?: number; // soft cap; omitted when NULL (uncapped)
-  spots_filled: number; // live RSVP'd dog count
-}
-
-export interface EventRsvpWire {
-  id: string;
-  event_id: string;
-  dog_ids: string[];
-  rsvpd_at: string;
-}
+// The Event / EventRsvp wire shapes are owned by the single-source contract
+// (contracts/wire.ts — promoted there 1.13.0, with the flattening + soft-cap
+// prose). This module owns only the DB-row → wire shaping below.
+export type { EventLocationWire, EventWire, EventRsvpWire };
 
 /**
  * Subset of `events` columns the wire helper consumes. Structural —

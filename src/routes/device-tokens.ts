@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import {
   deviceTokensRepository,
-  type DevicePlatform,
   type RegisteredDeviceTokenRow,
 } from '../db/repositories/deviceTokensRepository.js';
 import { ApiError } from '../lib/errors.js';
@@ -11,6 +10,8 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
+import type { DeviceTokenWire, PostDeviceTokensRequest } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 
 /**
  * `POST /device-tokens` `[auth]` · `DELETE /device-tokens/:token` `[auth]` —
@@ -30,21 +31,15 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * `registered_at` ↔ column `created_at`. DATA-CONTRACT §B pins only the two
  * paths + the `:token` param, not the response field names, so these names
  * are this route's to choose; they mirror how every other route renames
- * (e.g. `payment_methods.exp_month`). One call site → wire helper stays
- * inline (promote to `lib/deviceTokenWire.ts` at a third caller).
+ * (e.g. `payment_methods.exp_month`). As of contract 1.13.0 the SHAPES live in
+ * `src/contracts/wire.ts` (`DeviceTokenWire`, `PostDeviceTokensRequest` and
+ * `DevicePlatform`) and the body is pinned to `postBodySchema` below; the
+ * one-call-site `toDeviceTokenWire` mapper stays here.
  */
 
 // Expo push tokens are ~40-50 chars (`ExponentPushToken[…]`); cap generously
 // so a hostile client can't push arbitrarily large strings into `text`.
 const DEVICE_TOKEN_MAX_LEN = 512;
-
-interface DeviceTokenWire {
-  id: string;
-  owner_id: string;
-  token: string;
-  platform: DevicePlatform;
-  registered_at: string;
-}
 
 const postBodySchema = z
   .object({
@@ -52,6 +47,14 @@ const postBodySchema = z
     platform: z.enum(['ios', 'android']),
   })
   .strict();
+
+/**
+ * §5.1.3 pin — `PostDeviceTokensRequest` IS this schema's input, or the build fails.
+ * `z.input`, not `z.infer`: the wire documents what a client may SEND.
+ */
+export type PostDeviceTokensBodyConformance = Expect<
+  Equal<z.input<typeof postBodySchema>, PostDeviceTokensRequest>
+>;
 
 const tokenParamSchema = z.object({
   token: z.string().min(1).max(DEVICE_TOKEN_MAX_LEN),

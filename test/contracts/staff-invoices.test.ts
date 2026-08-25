@@ -15,6 +15,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import type { Principal } from '../../src/auth/principal.js';
+import type { ParkedInvoiceWire } from '../../src/contracts/wire.js';
 
 /**
  * Credit-expiry Phase-3 — `GET /staff/invoices?parked` (the parked-invoice
@@ -72,17 +73,6 @@ async function seedInvoice(args: { parked: boolean; amountCents?: number }): Pro
   return id;
 }
 
-interface ParkedWire {
-  id: string;
-  owner_id: string;
-  amount_cents: number;
-  status: string;
-  purpose: string;
-  dog_id: string | null;
-  due_at: string;
-  auto_charge_attempts: number;
-}
-
 test(
   'GET /staff/invoices?parked — returns only parked invoices (attempts >= MAX)',
   SKIP_WHEN_NO_DB,
@@ -95,7 +85,7 @@ test(
     const { app } = staffApp();
     const res = await app.inject({ method: 'GET', url: '/staff/invoices?parked' });
     assert.equal(res.statusCode, 200, res.body);
-    const body = res.json() as ParkedWire[];
+    const body = res.json() as ParkedInvoiceWire[];
     assert.equal(body.length, 1, 'only the parked invoice');
     assert.equal(body[0]?.id, parkedId);
     assert.equal(body[0]?.status, 'open', 'parked stays open');
@@ -144,7 +134,7 @@ test(
     const { app } = staffApp();
     const res = await app.inject({ method: 'GET', url: '/staff/invoices?parked' });
     assert.equal(res.statusCode, 200, res.body);
-    const body = res.json() as ParkedWire[];
+    const body = res.json() as ParkedInvoiceWire[];
     assert.equal(body.length, 1, 'the missing-card park is visible despite attempts < MAX');
     assert.equal(body[0]?.id, id);
     assert.equal(body[0]?.auto_charge_attempts, 1);

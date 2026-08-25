@@ -18,6 +18,16 @@ import { dogsRepository, type DogUpdate } from '../db/repositories/dogsRepositor
 import { requiredVaccinesRepository } from '../db/repositories/requiredVaccinesRepository.js';
 import { vetsRepository } from '../db/repositories/vetsRepository.js';
 import { evaluationStatus } from '../db/schema/schema.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
+import type {
+  PatchDogsMedicationsRequest,
+  PatchDogsRequest,
+  PatchDogsVaccinesRequest,
+  PostDogsMedicationsRequest,
+  PostDogsRequest,
+  PostDogsVaccinesRequest,
+  PutDogsFeedingRequest,
+} from '../contracts/wire.js';
 import {
   toDogWire,
   toFeedingWire,
@@ -158,6 +168,13 @@ const postDogBodySchema = z
     path: ['birthdate'],
   });
 
+/** §5.1.3 — the wire request type IS this schema's input. `z.input`, not
+ *  `z.infer`: `evaluation_status`/`special_notes` defaults are applied AFTER
+ *  parse, in the route, so they are not part of what a client must send. */
+export type PostDogsBodyConformance = Expect<
+  Equal<z.input<typeof postDogBodySchema>, PostDogsRequest>
+>;
+
 const patchDogBodySchema = z
   .object({
     name: z.string().trim().min(1),
@@ -175,6 +192,10 @@ const patchDogBodySchema = z
   })
   .strict()
   .partial();
+
+export type PatchDogsBodyConformance = Expect<
+  Equal<z.input<typeof patchDogBodySchema>, PatchDogsRequest>
+>;
 
 /**
  * Cross-field floor for the spay pair, mirroring the dogs CHECK
@@ -204,6 +225,10 @@ const postVaccineBodySchema = z
   })
   .strict();
 
+export type PostDogsVaccinesBodyConformance = Expect<
+  Equal<z.input<typeof postVaccineBodySchema>, PostDogsVaccinesRequest>
+>;
+
 const patchVaccineBodySchema = z
   .object({
     name: z.string().trim().min(1),
@@ -213,6 +238,10 @@ const patchVaccineBodySchema = z
   .strict()
   .partial();
 
+export type PatchDogsVaccinesBodyConformance = Expect<
+  Equal<z.input<typeof patchVaccineBodySchema>, PatchDogsVaccinesRequest>
+>;
+
 const postMedicationBodySchema = z
   .object({
     name: z.string().trim().min(1),
@@ -221,7 +250,15 @@ const postMedicationBodySchema = z
   })
   .strict();
 
+export type PostDogsMedicationsBodyConformance = Expect<
+  Equal<z.input<typeof postMedicationBodySchema>, PostDogsMedicationsRequest>
+>;
+
 const patchMedicationBodySchema = postMedicationBodySchema.partial();
+
+export type PatchDogsMedicationsBodyConformance = Expect<
+  Equal<z.input<typeof patchMedicationBodySchema>, PatchDogsMedicationsRequest>
+>;
 
 const feedingBodySchema = z
   .object({
@@ -231,6 +268,10 @@ const feedingBodySchema = z
     notes: optionalText.optional(),
   })
   .strict();
+
+export type PutDogsFeedingBodyConformance = Expect<
+  Equal<z.input<typeof feedingBodySchema>, PutDogsFeedingRequest>
+>;
 
 export interface DogsRouteOptions extends AuthRouteOptions {
   /**

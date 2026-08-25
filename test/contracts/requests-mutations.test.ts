@@ -14,6 +14,7 @@ import {
   pendingRequestPreferredDates as pendingRequestPreferredDatesTable,
   pendingRequests as pendingRequestsTable,
 } from '../../src/db/schema/schema.js';
+import { POST_REQUESTS_ERROR_DETAIL_KINDS } from '../../src/contracts/wire.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
 import { registerStaffRequestsRoute } from '../../src/routes/staffRequests.js';
 import type { Principal } from '../../src/auth/principal.js';
@@ -347,6 +348,14 @@ test(
       error: { code: string; details: { kind: string; category: string; dog_ids: string[] } };
     };
     assert.equal(dup.error.code, 'already_requested');
+    // §3.5 alias pin: the emitted arm must be a member of THIS endpoint's
+    // declared 422 vocabulary (`PostRequestsErrorDetails`, runtime twin
+    // POST_REQUESTS_ERROR_DETAIL_KINDS). Asserted at runtime, not by tsc —
+    // backend `test/` is type-ERASED (rulebook §14.5).
+    assert.ok(
+      (POST_REQUESTS_ERROR_DETAIL_KINDS as readonly string[]).includes(dup.error.details.kind),
+      `${dup.error.details.kind} is not an arm of PostRequestsErrorDetails`,
+    );
     assert.equal(dup.error.details.category, 'board-and-train');
     assert.deepEqual(dup.error.details.dog_ids, [FIXTURE_IDS.dog1Id]);
 
@@ -553,8 +562,14 @@ test('POST /requests/:id/cancel — happy → status=cancelled', SKIP_WHEN_NO_DB
     idempotencyKey: `pr-cancel-${randomUUID()}`,
   });
   assert.equal(res.statusCode, 200, res.body);
-  const body = res.json() as { status: string };
+  const body = res.json() as { status: string; approved_by_staff_id?: string };
   assert.equal(body.status, 'cancelled');
+  // Wire 1.13.0: omit-on-null. An owner self-cancel has no staff actor, so the
+  // key must be ABSENT — not null, not empty string. Absence is the signal.
+  assert.ok(
+    !('approved_by_staff_id' in body),
+    'owner self-cancel must not emit approved_by_staff_id',
+  );
 
   // approved_by_staff_id stays NULL (owner self-cancel, not staff deny)
   const [row] = await db
@@ -866,8 +881,17 @@ test(
       idempotencyKey: `pr-deny-${randomUUID()}`,
     });
     assert.equal(res.statusCode, 200, res.body);
-    const body = res.json() as { status: string };
+    const body = res.json() as { status: string; approved_by_staff_id?: string };
     assert.equal(body.status, 'cancelled');
+    // Wire 1.13.0 (digest bookings/S; closes DRIFT-8 @ DISCREPANCIES.md:291):
+    // the discriminator is on the WIRE now, not only in the DB. Without it a
+    // client cannot tell a staff denial from an owner self-cancel, because
+    // `request_status` has no 'denied' member (DATA-CONTRACT.md:1217-1222).
+    assert.equal(
+      body.approved_by_staff_id,
+      FIXTURE_IDS.staffDonavanId,
+      'staff deny must surface the staff actor on the wire',
+    );
     const [pr] = await db
       .select({ approvedByStaffId: pendingRequestsTable.approvedByStaffId })
       .from(pendingRequestsTable)

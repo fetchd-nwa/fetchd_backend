@@ -1,54 +1,23 @@
 import { pgTimestampToIso } from './pgTimestamp.js';
+import type {
+  CohortWire,
+  GroupClassEnrollmentType,
+  GroupClassWire,
+  GroupEligibilityWire,
+} from '../contracts/wire.js';
 import type { GroupClassKey, GroupClassRow } from '../db/repositories/groupClassesRepository.js';
 import type { CohortRow } from '../db/repositories/cohortsRepository.js';
-import type { LocationKey } from './bookingWire.js';
 
 /**
- * Wire shapes for `GroupClass`, `Cohort`, and `GroupEligibility` per
- * DATA-CONTRACT §B (Δ 2026-05-20, Day 6a):
- *
- *   - GroupClass: `price_per_dog_cents` is cents-on-wire (financial-amount
- *     convention). `age_range?` is optional-omit (omitted when null). The
- *     wire deliberately does NOT carry prereqs — those are server-derived
- *     via the eligibility endpoint and depend on the dog, not the class.
- *
- *   - Cohort: `capacity` is additive (Day-6a) — server-of-record per
- *     cohort, in case a future cohort runs at a custom cap. `end_date?` is
- *     optional-omit. Open-enrollment cohorts have a null `end_date`.
- *
- *   - GroupEligibility: `eligible: true` → `missing_prereq_options` is
- *     omitted (Day-4a convention). `eligible: false` → emits the OR-list
- *     the dog could complete to unlock the class (enum-natural-ordered).
+ * Mappers for the group-class read surface. The three wire SHAPES —
+ * `GroupClassWire`, `CohortWire`, `GroupEligibilityWire` — moved into the
+ * versioned contract at wire 1.13.0 (`src/contracts/wire.ts`, domain fence
+ * `enrollments`), and the DATA-CONTRACT §B (Δ 2026-05-20, Day 6a) design notes
+ * that used to live here travel with them. They are re-exported below so no
+ * consumer moves this pass (designs/wire-contract-completion.md §6).
  */
 
-export interface GroupClassWire {
-  key: GroupClassKey;
-  name: string;
-  weeks: number;
-  price_per_dog_cents: number;
-  capacity: number;
-  age_range?: string;
-  description: string;
-  enrollment_type: string; // 'open' | 'cohort' per the CHECK constraint
-}
-
-export interface CohortWire {
-  id: string;
-  class_key: GroupClassKey;
-  location: LocationKey;
-  start_date: string;
-  end_date?: string;
-  weekly_time: string;
-  weeks: number;
-  capacity: number;
-  filled: number;
-}
-
-export interface GroupEligibilityWire {
-  class_key: GroupClassKey;
-  eligible: boolean;
-  missing_prereq_options?: GroupClassKey[];
-}
+export type { CohortWire, GroupClassWire, GroupEligibilityWire };
 
 export function toGroupClassWire(row: GroupClassRow): GroupClassWire {
   const wire: GroupClassWire = {
@@ -58,7 +27,11 @@ export function toGroupClassWire(row: GroupClassRow): GroupClassWire {
     price_per_dog_cents: row.pricePerDogCents,
     capacity: row.capacity,
     description: row.description,
-    enrollment_type: row.enrollmentType,
+    // `GroupClassRow.enrollmentType` is `string` because its row parser is
+    // `z.string()` — untouched (§14.1). The narrowing's guarantee is the table
+    // CHECK `enrollment_type IN ('open','cohort')` (schema.sql:497); its runtime
+    // pin is test/contracts/group-class-wire-narrowing.test.ts.
+    enrollment_type: row.enrollmentType as GroupClassEnrollmentType,
   };
   if (row.ageRange !== null && row.ageRange !== '') wire.age_range = row.ageRange;
   return wire;

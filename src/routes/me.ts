@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { owners, staff } from '../db/schema/schema.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
+import type { MeWire, PatchMeRequest, StaffMeWire } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
@@ -32,7 +34,13 @@ async function withResolvedAvatar(
   return { ...profile, avatar_image_path: resolve(profile.avatar_image_path) };
 }
 
-function ownerProfile(row: typeof owners.$inferSelect) {
+// The return annotation is the RESPONSE-side half of the 1.13.0 promotion: it
+// makes `tsc` prove this projection still satisfies `MeWire`. One-directional
+// by nature (it catches a wire type that claims MORE than the emission, e.g.
+// `Record<string, unknown>` for the jsonb columns; a wire type that claims LESS
+// is caught by conformance.ts's bidirectional enum pins). Type-only — zero
+// runtime bytes change.
+function ownerProfile(row: typeof owners.$inferSelect): MeWire {
   return {
     id: row.id,
     name: row.name,
@@ -62,11 +70,13 @@ function ownerProfile(row: typeof owners.$inferSelect) {
 }
 
 /**
- * Staff `/me` has no FE translator yet (the staff portal is Day 19, no DS), so
- * this shape is a Day-2 design choice, not a frozen contract — the mirror row
- * the portal will need to render "who am I". Ratify when the portal lands.
+ * Staff `/me` — the mirror row the portal renders "who am I" from. RATIFIED AND
+ * FROZEN at wire 1.13.0 as `StaffMeWire` (contracts/wire.ts, domain:auth-media),
+ * discharging NOTE-35's "ratify before the portal consumes it". The shape was
+ * frozen exactly as it was already emitted; nothing was added or renamed. Any
+ * change from here is a contract change with a version bump.
  */
-function staffProfile(row: typeof staff.$inferSelect) {
+function staffProfile(row: typeof staff.$inferSelect): StaffMeWire {
   return {
     id: row.id,
     name: row.name,
@@ -107,6 +117,10 @@ const patchMeSchema = z
   })
   .strict()
   .partial();
+
+// §5.1.3 — `PatchMeRequest` (wire) IS this schema's input. `toOwnerUpdate`
+// below keeps `z.infer` deliberately: it consumes the POST-PARSE value.
+export type PatchMeBodyConformance = Expect<Equal<z.input<typeof patchMeSchema>, PatchMeRequest>>;
 
 function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof owners.$inferInsert> {
   const set: Partial<typeof owners.$inferInsert> = {};

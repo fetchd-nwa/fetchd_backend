@@ -12,6 +12,146 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [1.13.0] — 2026-08-25
+
+Additive. The whole-truth bump (`designs/wire-contract-completion.md`, the
+rulebook): every owner-facing JSON shape and request body enters the
+versioned contract, wire.ts reorganizes into 13 alphabetical fenced domain
+sections, and THE error contract is promoted from runtime truth.
+
+Skeleton (orchestrator-typed, branch `wire-1.13.0-contract-completion`):
+
+- One-time reorganization (§2): fixed section order — §1 error contract, §2
+  shared enums + tuples, §3–§15 fenced domain sections (alphabetical, also
+  the lane-merge order), §16 tuple conformance. Every 1.12.0 exported
+  declaration relocated BYTE-IDENTICAL, doc comments included, with exactly
+  the named exceptions below.
+- New: `ApiErrorCode` — the 23 thrown codes (`lib/errors.ts`, verbatim) +
+  `'internal'`, the serializer's fallback (api-conventions.md:151's
+  documented trap, closed); `API_ERROR_CODES`; `API_ERROR_STATUS` (statuses
+  are now CONTRACTUAL); `ApiErrorWire`; `ApiErrorEnvelope`; the closed
+  13-arm `ApiErrorDetailWire` union with its item shapes promoted under
+  their existing exported names from `lib/bookingErrors.ts` (`VaccineGap`,
+  `AgreementGap`, `CreditGap`, `CapacityGap`, `CohortFullDetails` + the
+  `CohortFullDetails_` flat arm, `EligibilityGap`,
+  `UnpassedEvaluationStatus`, `EvaluationGap`, `AlreadyBookedConflict`,
+  `AlreadyEnrolledDetails`, `AlreadyRequestedDetails`,
+  `PaymentFailedDetails`, `MediaUploadMissingDetails`). The two coexisting
+  detail grammars (nested vs flat-spread), the kebab-case
+  `media-upload-missing` kind, and kind≠code non-invariance are PINNED as
+  documented truths, not fixed.
+- Fold-in (server-side, §3.3): `lib/errors.ts` now imports the code union,
+  status table, and details union FROM the wire — a route inventing a
+  details literal outside the contract is a `tsc` error at the construction
+  site (proven: mutant kind fails TS2820). `lib/bookingErrors.ts` re-exports
+  the promoted shapes; constructors unchanged in behavior.
+- New shared enums (§5.3): `BookingMode`, `EvaluationStatus`,
+  `GroupClassKey` — promoted from `lib/bookingMode.ts:28` and
+  `lib/dogWire.ts:27-28` module-privates that were already leaking
+  structurally; each pinned to its pgEnum in `conformance.ts` (proven:
+  member removal fails the pin).
+- New value tuples: `API_ERROR_CODES`, `BOOKING_MODES`, `GROUP_CLASS_KEYS`,
+  `NOTIFICATION_TYPES`, `MEDIA_PURPOSES`, `CHARGE_BLOCKERS`,
+  `WITHDRAW_MONEY_OUTCOMES`. New `WireTupleConformance` (§16): tuple ↔
+  union SET equality pinned in-file with local `Expect`/`Equal`,
+  self-contained, so the guard travels with every generated client copy.
+- NAMED EXCEPTION 1 (instrument fix, design amendment WC-A1, proven
+  red-first): the six pre-1.13.0 value tuples change declaration FORM from
+  `: readonly [X, ...X[]] = […]` to `= […] as const satisfies readonly
+  [X, ...X[]]` — member values byte-identical, runtime value identical,
+  element type narrows compile-time-only. Required because under the old
+  annotation every §16 pin is TAUTOLOGICAL — `(typeof TUPLE)[number]`
+  widens to the union, so a tuple missing a member passed `tsc` (executed
+  in the skeleton session; the same mutant now fails TS2344). This also
+  retro-closes the pre-existing hole on the six old tuples
+  (`SESSION_PROGRAMS` already used the working form).
+- NAMED EXCEPTION 2 (doc-only, on record since money-residue §1.2): doc:
+  `owed_cents` remainder is recorded as a terminal `unroutable` refunds row
+  at withdraw time (money-residue 1.2); semantics of the sentence unchanged.
+- NAMED EXCEPTION 3 (additive field on a 1.12.0 declaration, bookings lane):
+  `PendingRequestWire` gains optional `approved_by_staff_id?: string`
+  (digest bookings/S; closes DRIFT-8 @ DISCREPANCIES.md:291). Additive at
+  the type level — every 1.12.0 client compiles unchanged — and
+  omit-on-null on the wire, so no emission changes for a request no staffer
+  has touched. The §13 #2 verbatim-block audit reads this declaration
+  against THIS exception.
+- New (server-side, not wire): `contracts/typeAsserts.ts` — `Expect`/`Equal`
+  for the route-side Zod ↔ wire request-body pins (§5.1.3; `z.input`, never
+  `z.infer`); `test/contracts/error-envelope.test.ts` — pins the three
+  serializer branches (details present / details OMITTED-not-null /
+  `'internal'` fallback) through the live `registerAuth` mapper, proven
+  red-first (the details-null variant failed before the true pin landed).
+
+Lanes (13 read-only patch builders → `designs/wire-1.13.0-patches/`, merged
+alphabetically 2026-08-25 per the §8 protocol; every digest contract item
+dispositioned — the 2.6 adversary audits 39/39):
+
+- Entity/response wires promoted under their existing names, per §6's sweep:
+  `MeWire` + `StaffMeWire` (the NOTE-35 freeze, ratified) +
+  `MeEmergencyContactWire`/`MeAddressWire`/`GetMeResponse`;
+  `UploadsSignRequest`/`UploadsSignResponse`; the dog family (`DogWire`,
+  `VaccineWire`, `MedicationWire`, `FeedingWire`, `VetWire`),
+  `AgreementWire`, `RequiredVaccineWire` — plus its `exempt_class_keys`
+  additive EMISSION (the phase's one runtime-byte change, red-first
+  tested); `CompletedProgramsWire` + `CurriculumProgram`;
+  `WelcomeDogWire`; `EventWire`/`EventLocationWire`/`EventRsvpWire` +
+  `DeleteEventsRsvpResponse`; `MembershipWire`/`MembershipCreateWire`/
+  `StaffMembershipWire`/`MembershipStatus` (no DB pin possible —
+  CHECK-less text, documented; phase 3 adds both);
+  `AnnouncementWire`/`AnnouncementCtaWire`/`AnnouncementCtaKind`
+  (CHECK-backed, no pin possible, documented)/`AnnouncementCategory`
+  (pgEnum pin landed); `DeviceTokenWire`/`DevicePlatform`;
+  `LedgerEntryWire` + its unions (incl. `group_class_name`),
+  `ParkedInvoiceWire`, `PaymentMethodWire`,
+  `PostPaymentMethodsSetupIntentResponse`, `InvoiceStatus` +
+  `ChargePurpose` (pgEnum pins landed); `RateWire` (its
+  `location: LocationKey | null` non-omit exception documented),
+  `DayCapacityWire` ("configured, not remaining" pinned in doc),
+  `CancelWindowSettingWire`; `CreditsWire`/`CreditLotWire`/
+  `CreditPackageWire`/`CreditExpirySettingWire`; `GroupClassWire`/
+  `CohortWire`/`GroupEligibilityWire`/`EnrollmentWire` +
+  `GroupClassEnrollmentType`/`EnrollmentPaymentStatus`; `RefundStatus`
+  (pgEnum pin landed; promoted on explicit instruction — no wire field
+  consumes it yet, stated on the declaration); the four `ReportWire`
+  content types (`PrivateLessonContentWire`, `BoardingSessionContentWire`,
+  `BoardTrainSessionContentWire` — a deliberate alias of boarding —
+  `GroupClassSessionContentWire`) + `GetStaffReportsResponse` +
+  the DELETE envelope shapes for 2.3b.
+- Request bodies + query shapes across all 13 domains (~35 declarations),
+  each with an exported `z.input` §5.1.3 pin beside its schema — including
+  the pin that makes the pre-existing `InvoicePayRequest` live for the
+  first time, and `PostEnrollmentsRequest` finally typing `allow_partial` +
+  `retry_of` (previously CHANGELOG prose only). Per-endpoint 422 aliases:
+  `PostBookingsErrorDetails` (8 arms — runtime truth over the design's
+  7-arm sketch, §14.1), `PostRequestsErrorDetails`,
+  `PostEnrollmentsErrorDetails`, `PostEventsRsvpErrorDetails` (= `never`;
+  `event_full` carries no details, pinned as such) + their arm-kind tuples
+  and §16 pins. `GetStaffReportsQuery` with `dog_id` REQUIRED (Allison
+  ruling, WC-A5 — the staff-invoices precedent).
+- §14.2 sanctioned narrowings, each with runtime + compile proofs:
+  `ReportWire` content ×4 (Class A — the only edits to 1.12.0
+  declarations beyond the named exceptions);
+  `EnrollmentWire.location`/`class_key`, `GroupClassWire.enrollment_type`,
+  `CompletedProgramsWire.program` (Class B; the fourth is design
+  amendment WC-A2).
+- §5.4 equality-proven z.enum swaps, the only Zod bytes moved anywhere:
+  `MediaPurpose` ×3 sites (auth-media, member diffs quoted) and
+  `pgEnumTuple(bookingMode)` → `BOOKING_MODES` (availability.ts:42).
+- §0 conventions gained the Idempotency-Key contract (206-char bound,
+  DERIVED: 255 − 49, enforcement-cited to `db/mutation.ts`).
+- Named phase-3 contract debt (WC-A3/WC-A5, deliberate): `GetBookingsQuery`,
+  `GetRequestsQuery`, `GetStaffRequestsQuery`, `GetStaffInvoicesQuery`,
+  `GetAnnouncementsQuery`; `?search=` on staff bookings; an
+  `IDEMPOTENCY_KEY_MAX_LEN` wire export; the messaging owner/staff
+  400-vs-422 discrepancy (new ledger item); the fifth `MediaPurpose`
+  declaration behind the repository seam; the `LocationDisplay` dedupe.
+
+NOTE ON NUMBERING: the completion plan (2026-08-20) reserved "1.12.0" for
+this bump; 1.12.0 shipped 2026-08-21 with the withdraw settlement envelope.
+Read every plan citation of "wire 1.12.0" in its Phase 2/§8 as 1.13.0, and
+its §2.6 "verified against 1.11.0" as against 1.12.0 (adjudicated,
+`designs/wire-contract-completion.md` §1).
+
 ## [1.12.0] — 2026-08-21
 
 Additive. The withdraw response states what happened to the owner's money

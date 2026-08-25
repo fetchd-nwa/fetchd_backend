@@ -1,12 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import type { CreditLotWire, CreditsWire, GetCreditsQuery } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import { creditsRepository } from '../db/repositories/creditsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
-import type { BookingMode } from '../lib/bookingMode.js';
 
 /**
  * `GET /dogs/:id/credits?location=<key>` `[auth]` — per-dog, per-mode,
@@ -29,33 +30,22 @@ type LocationKey = (typeof LOCATION_KEYS)[number];
 const uuidParamSchema = z.object({ id: z.string().uuid() });
 const creditsQuerySchema = z.object({ location: z.enum(LOCATION_KEYS) });
 
-/** A live expiring lot's remaining credits + lapse date (soonest-first list). */
-export interface CreditLotWire {
-  mode: BookingMode;
-  remaining: number;
-  expires_at: string;
-}
+// `CreditLotWire` + `CreditsWire` used to be declared right here — the credits
+// READ surface living outside the versioned contract, which is why no client's
+// `check:contracts` could ever guard it (NOTE-12). Since 1.13.0 they live in
+// `contracts/wire.ts` (shape and doc comments unchanged by the move) and this
+// route re-exports them so no consumer moved — the `CreditPurchaseWire`
+// precedent at `creditPackages.ts:66-69`.
+export type { CreditLotWire, CreditsWire };
 
-export interface CreditsWire {
-  dog_id: string;
-  location: LocationKey;
-  school: number;
-  daycare: number;
-  /**
-   * Live lots that EXPIRE (count + date), soonest first. Never-expiring credits
-   * are omitted — they're in `school`/`daycare` but have nothing to warn about.
-   * Δ 2026-06-18 (credit-expiry lot model).
-   */
-  expiring_lots: CreditLotWire[];
-  /**
-   * The staff-tuned warning lead for THIS location (per-location override →
-   * org default → server default), in days. The app's "expiring soon" chip
-   * uses the same window the server's `credits-expiring` push scan does, so
-   * the two surfaces warn in lockstep. Δ 2026-07-16 (closes the "no client
-   * consumer" note on `staffCreditExpiry`).
-   */
-  warning_lead_days: number;
-}
+/**
+ * Zod ↔ wire pin for the query string (design §5.1.3). `z.input`, not
+ * `z.infer` — the wire documents what a client may SEND. Exported so no
+ * unused-locals rule can eat it.
+ */
+export type GetCreditsQueryConformance = Expect<
+  Equal<z.input<typeof creditsQuerySchema>, GetCreditsQuery>
+>;
 
 export function registerCreditsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);

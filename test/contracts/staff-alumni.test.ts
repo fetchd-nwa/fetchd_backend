@@ -18,6 +18,7 @@ import {
 } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
 import type { Principal } from '../../src/auth/principal.js';
+import type { CompletedProgramsWire } from '../../src/contracts/wire.js';
 
 /**
  * §J.3 staff alumni verbs + the derived-alumni effects:
@@ -53,12 +54,10 @@ function purchaseApp(): { app: ReturnType<typeof makeContractApp>['app'] } {
 
 const PROGRAMS_URL = `/staff/dogs/${FIXTURE_IDS.dog1Id}/completed-programs`;
 
-interface ProgramsWire {
-  dog_id: string;
-  is_alumni: boolean;
-  completed_programs: { program: string; completed_at: string }[];
-  alumni_attendance_flagged_at?: string;
-}
+// The hand mirror is gone — 1.13.0 promoted the real shape (digest
+// dogs-profile/S). Aliased so the 6 existing `as ProgramsWire` casts in this
+// file keep reading naturally.
+type ProgramsWire = CompletedProgramsWire;
 
 async function resetAlumniState(): Promise<void> {
   await db.delete(dogCompletedPrograms).where(eq(dogCompletedPrograms.dogId, FIXTURE_IDS.dog1Id));
@@ -291,3 +290,25 @@ test('clear-alumni-flag — clears, surfaces on the wire, idempotent', SKIP_WHEN
   });
   assert.equal(again.statusCode, 200, again.body);
 });
+
+test(
+  'completed_programs[].program is always a CURRICULUM_PROGRAMS member (wire narrowing pin)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await resetAlumniState();
+    const { app } = staffApp();
+    for (const program of CURRICULUM_PROGRAMS) {
+      await recordProgram(app, program);
+    }
+    const res = await app.inject({ method: 'GET', url: PROGRAMS_URL });
+    assert.equal(res.statusCode, 200, res.body);
+    const wire = res.json() as ProgramsWire;
+    assert.equal(wire.completed_programs.length, CURRICULUM_PROGRAMS.length);
+    for (const entry of wire.completed_programs) {
+      assert.ok(
+        (CURRICULUM_PROGRAMS as readonly string[]).includes(entry.program),
+        `emitted program ${entry.program} is outside CurriculumProgram`,
+      );
+    }
+  },
+);

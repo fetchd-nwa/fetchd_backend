@@ -2,7 +2,15 @@ import { assertNever } from './assertNever.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { reportProgram } from '../db/schema/schema.js';
 import type { ServiceCategory } from './bookingBucket.js';
-import type { SkillResult, PracticeItem, ReportWire } from '../contracts/wire.js';
+import type {
+  SkillResult,
+  PracticeItem,
+  ReportWire,
+  PrivateLessonContentWire,
+  BoardingSessionContentWire,
+  BoardTrainSessionContentWire,
+  GroupClassSessionContentWire,
+} from '../contracts/wire.js';
 
 /**
  * Wire shape for `Report` per DATA-CONTRACT §B Report (R2 JSONB
@@ -126,6 +134,31 @@ function spreadCurriculumEnvelope(rawResults: unknown, wire: ReportWire): void {
 }
 
 /**
+ * Cast the `reports.content` JSONB to a program's variant-doc wire type. One
+ * trust boundary instead of four inner `as` casts — the same contract
+ * `asEnvelope` keeps for the `results` envelope above.
+ *
+ * Unlike `asEnvelope` this deliberately does NOT throw on a non-object. The
+ * column is opaque the whole way down: the write path validates only
+ * `z.record(z.unknown())` (`routes/staffReports.ts:75`) and the schema CHECK
+ * asserts presence, never shape (`schema.sql:591-596`). Adding a guard here
+ * would turn a storable row into a 500 — a behavior change, which a promotion
+ * may not make (designs/wire-contract-completion.md §14.1).
+ *
+ * So the four `*ContentWire` types transcribe what is EMITTED (pinned byte-wise
+ * by `test/contracts/snapshots/report-{private-lesson,boarding,board-train,
+ * group-class}.json`, and structurally by
+ * `test/contracts/report-content-types.test.ts`) — they are NOT enforced on
+ * write. That gap is DISCREPANCIES BUG-13; closing it is write-side validation,
+ * filed, not enacted here. This corrects the module doc above, which claims
+ * "Day-12 … pins the Zod validator that authors must satisfy" — no such
+ * validator exists (digest reports fix/S, phase 3).
+ */
+function asVariantContent<T>(content: unknown): T {
+  return content as T;
+}
+
+/**
  * Attach the variant doc under the program-keyed wire field, or no
  * variant key for curriculum programs. The switch is exhaustive over
  * `report_program`; `assertNever` catches a future enum addition at
@@ -142,16 +175,16 @@ function attachVariantContent(program: ReportProgram, content: unknown, wire: Re
       // `content` for these — even if present, we don't emit it.
       return;
     case 'private-lesson':
-      wire.private_lesson_content = content;
+      wire.private_lesson_content = asVariantContent<PrivateLessonContentWire>(content);
       return;
     case 'boarding-session':
-      wire.boarding_session_content = content;
+      wire.boarding_session_content = asVariantContent<BoardingSessionContentWire>(content);
       return;
     case 'board-train-session':
-      wire.board_train_session_content = content;
+      wire.board_train_session_content = asVariantContent<BoardTrainSessionContentWire>(content);
       return;
     case 'group-class-session':
-      wire.group_class_session_content = content;
+      wire.group_class_session_content = asVariantContent<GroupClassSessionContentWire>(content);
       return;
     default:
       assertNever(program);

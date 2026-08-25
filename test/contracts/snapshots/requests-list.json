@@ -30,6 +30,7 @@
     "length_weeks": 2,
     "status": "converted",
     "approved_at": "2026-04-12T17:00:00.000Z",
+    "approved_by_staff_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
     "converted_booking_id": "77777777-7777-4777-8777-777777777771"
   }
 ]

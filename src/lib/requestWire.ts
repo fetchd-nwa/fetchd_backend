@@ -27,6 +27,10 @@ import type {
  *   - `length_weeks?` — board-and-train-only on the FE; omit when null.
  *   - `approved_at?`, `converted_booking_id?` — emit only after the
  *     staff portal converts the request.
+ *   - `approved_by_staff_id?` (wire 1.13.0) — emit only when a STAFF actor
+ *     resolved the request (approve OR deny). Its ABSENCE on a `'cancelled'`
+ *     row is what says "the owner withdrew this" — the discriminator
+ *     DATA-CONTRACT.md:1221 pins, now actually on the wire (DRIFT-8).
  */
 export type RequestStatus = (typeof requestStatus.enumValues)[number];
 
@@ -50,6 +54,7 @@ export interface PendingRequestRowForWire {
   lengthWeeks: number | null;
   lessonSetting: 'home' | 'public' | null;
   approvedAt: string | null;
+  approvedByStaffId: string | null;
   convertedBookingId: string | null;
   // Day-program divert columns (Shanthi 2026-07-14); NULL/empty on the
   // classic request categories.
@@ -105,6 +110,9 @@ export function toRequestWire(
   if (row.lengthWeeks !== null) wire.length_weeks = row.lengthWeeks;
   if (row.lessonSetting !== null) wire.lesson_setting = row.lessonSetting;
   if (row.approvedAt !== null) wire.approved_at = pgTimestampToIso(row.approvedAt);
+  // Wire 1.13.0 — the staff actor, omit-on-null. Present ⇒ a staffer approved
+  // or denied; absent ⇒ the owner self-cancelled, or nobody has acted yet.
+  if (row.approvedByStaffId !== null) wire.approved_by_staff_id = row.approvedByStaffId;
   if (row.convertedBookingId !== null) wire.converted_booking_id = row.convertedBookingId;
   // Day-program divert fields — omit-on-null keeps every classic request's
   // wire byte-identical to pre-divert (snapshots unchanged).

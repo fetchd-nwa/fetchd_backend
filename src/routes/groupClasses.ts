@@ -16,6 +16,8 @@ import { groupClassesRepository } from '../db/repositories/groupClassesRepositor
 import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { dogCompletedClassesRepository } from '../db/repositories/dogCompletedClassesRepository.js';
 import { groupClassKey } from '../db/schema/schema.js';
+import type { GetDogsGroupEligibilityQuery } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 
 /**
  * Group-class read surface (DATA-CONTRACT §C group-classes):
@@ -52,6 +54,12 @@ const uuidParamSchema = z.object({
 const eligibilityQuerySchema = z.object({
   class: z.enum(GROUP_CLASS_KEY_VALUES),
 });
+
+/** Zod ↔ wire pin (designs/wire-contract-completion.md §5.1.3), query-string
+ *  half. `z.input`, not `z.infer`; exported so no unused-locals rule eats it. */
+export type GetDogsGroupEligibilityQueryConformance = Expect<
+  Equal<z.input<typeof eligibilityQuerySchema>, GetDogsGroupEligibilityQuery>
+>;
 
 export function registerGroupClassesRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);

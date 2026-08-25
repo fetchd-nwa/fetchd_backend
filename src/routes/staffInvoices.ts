@@ -1,9 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import type { ParkedInvoiceWire } from '../contracts/wire.js';
 import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
-import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
-import type { InvoiceStatus } from '../db/repositories/invoicesRepository.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { ApiError } from '../lib/errors.js';
@@ -37,17 +36,6 @@ const querySchema = z
     parked: z.string().optional(),
   })
   .strict();
-
-interface ParkedInvoiceWire {
-  id: string;
-  owner_id: string;
-  amount_cents: number;
-  status: InvoiceStatus;
-  purpose: ChargePurpose;
-  dog_id: string | null;
-  due_at: string;
-  auto_charge_attempts: number;
-}
 
 function toWire(row: InvoiceRow): ParkedInvoiceWire {
   return {

@@ -1,9 +1,9 @@
-import type { evaluationStatus, groupClassKey } from '../db/schema/schema.js';
+import type { DogWire, FeedingWire, MedicationWire, VaccineWire } from '../contracts/wire.js';
 import type { AssembledDog } from '../db/repositories/dogsRepository.js';
 import { ageInMonths } from './ageMonths.js';
 import { CURRICULUM_PROGRAMS } from './alumni.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
-import { toVetWire, type VetWire } from './vetWire.js';
+import { toVetWire } from './vetWire.js';
 
 /**
  * Dog wire shape per DATA-CONTRACT §B Dog. Required keys always emit;
@@ -24,61 +24,13 @@ import { toVetWire, type VetWire } from './vetWire.js';
  * consumes it.
  */
 
-type EvaluationStatus = (typeof evaluationStatus.enumValues)[number];
-type GroupClassKey = (typeof groupClassKey.enumValues)[number];
-
-export interface VaccineWire {
-  id: string;
-  name: string;
-  expires_at: string;
-  /** Omit-on-null per §A: surfaces the `dog_vaccines.requirement_key` FK to
-   * `required_vaccines.key` (Day-9d amendment 2026-05-22). Display-only
-   * today; the booking gate trigger reads the DB column directly. */
-  requirement_key?: string;
-}
-
-export interface MedicationWire {
-  id: string;
-  name: string;
-  dose: string;
-  frequency: string;
-}
-
-export interface FeedingWire {
-  brand: string;
-  amount: string;
-  frequency: string;
-  notes: string | null;
-}
-
-export interface DogWire {
-  id: string;
-  name: string;
-  breed: string;
-  age_months: number;
-  profile_image_path: string;
-  vaccines: VaccineWire[];
-  medications: MedicationWire[];
-  feeding: FeedingWire;
-  special_notes: string;
-  evaluation_status: EvaluationStatus;
-  boarding_enabled: boolean;
-  /** §J.3: derived — the dog has all 5 live day-school curriculum completions. */
-  is_alumni: boolean;
-  evaluation_date?: string;
-  completed_class_keys?: GroupClassKey[];
-  vet?: VetWire;
-  /** §J.3 attendance flag (omit-on-null): set when an alumni dog attended <2
-   * qualifying sessions in a Chicago month — staff re-check before the next
-   * booking. Soft surface only in v1 (no booking 422). */
-  alumni_attendance_flagged_at?: string;
-  /** Shanthi 2026-07-14 (omit-on-null = unanswered): explicit false diverts
-   * day-program bookings to the staff-approval lane. */
-  spayed_neutered?: boolean;
-  /** YYYY-MM-DD (omit-on-null): the owner's stated spay/neuter date — a
-   * reminder to update the profile fires that morning. */
-  spay_neuter_planned_on?: string;
-}
+// The wire shapes moved to `contracts/wire.ts` in 1.13.0 (digest
+// dogs-profile/L). Re-exported here so every existing importer keeps working
+// unchanged; this module keeps the mappers, which is all it ever really owned.
+// `EvaluationStatus` / `GroupClassKey` are now §2 shared unions pinned to their
+// pgEnums in `contracts/conformance.ts` — the module-private aliases that used
+// to live here are gone, not duplicated.
+export type { DogWire, FeedingWire, MedicationWire, VaccineWire } from '../contracts/wire.js';
 
 export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
   const { dog, vet, vaccines, medications, feeding, completedClasses, completedPrograms } =

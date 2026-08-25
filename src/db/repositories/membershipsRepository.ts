@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, isNotNull, isNull, notExists, sql } from 'drizzle-orm';
+import type { MembershipStatus } from '../../contracts/wire.js';
 import { db } from '../client.js';
 import { invoices, memberships } from '../schema/schema.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
@@ -39,7 +40,13 @@ type Runner = Tx | typeof db;
  * non-null, so downstream code sees the narrowed `MembershipRow`.
  */
 
-export type MembershipStatus = 'active' | 'completed' | 'canceled';
+// Re-exported, not redeclared: `MembershipStatus` moved into the wire contract
+// in 1.13.0 with the membership shapes (it IS `MembershipWire.status`), so the
+// row type and the wire cannot drift apart while both still compile — the
+// `ChargeStatus`/`chargesRepository` precedent. NOTE: unlike `ChargeStatus`
+// there is no conformance pin behind it, because `memberships.status` is
+// CHECK-less `text` (schema.sql:1354) — phase-3 fix 3.1.
+export type { MembershipStatus } from '../../contracts/wire.js';
 
 export interface MembershipRow {
   id: string;

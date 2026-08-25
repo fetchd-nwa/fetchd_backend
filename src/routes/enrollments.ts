@@ -6,9 +6,14 @@ import type {
   ChargeBlocker,
   EnrollmentDogResultWire,
   EnrollmentResultWire,
+  EnrollmentWire,
   EnrollmentWithdrawResultWire,
+  LocationKey,
+  PostEnrollmentsRequest,
+  PostEnrollmentsWithdrawRequest,
   WithdrawMoneyOutcome,
 } from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 // NOT `updateStoredResponse`: the post-capture amend goes through
 // `amendStoredEnvelopeAfterCapture` below, which cannot throw into the
 // post-commit path. Importing the raw statement here again would put the 500
@@ -27,20 +32,14 @@ import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { dogCompletedClassesRepository } from '../db/repositories/dogCompletedClassesRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import {
-  enrollmentsRepository,
-  type EnrollmentPaymentStatus,
-} from '../db/repositories/enrollmentsRepository.js';
+import { enrollmentsRepository } from '../db/repositories/enrollmentsRepository.js';
 import {
   groupClassesRepository,
   type GroupClassKey,
 } from '../db/repositories/groupClassesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
-import {
-  refundsRepository,
-  type CappedRefundMint,
-} from '../db/repositories/refundsRepository.js';
+import { refundsRepository, type CappedRefundMint } from '../db/repositories/refundsRepository.js';
 import { withActor } from '../db/tx.js';
 import {
   agreementUnsignedError,
@@ -88,10 +87,7 @@ import {
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
-import {
-  settleCapturePendingHold,
-  type WithdrawSettleVerdict,
-} from '../lib/withdrawSettlement.js';
+import { settleCapturePendingHold, type WithdrawSettleVerdict } from '../lib/withdrawSettlement.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -247,6 +243,13 @@ const postEnrollmentBodySchema = z
 
 type PostEnrollmentBody = z.infer<typeof postEnrollmentBodySchema>;
 
+/** Zod ↔ wire pin (designs/wire-contract-completion.md §5.1.3). `z.input`, not
+ *  `z.infer` — the wire documents what a client may SEND. Exported so no
+ *  unused-locals rule can eat it. */
+export type PostEnrollmentsBodyConformance = Expect<
+  Equal<z.input<typeof postEnrollmentBodySchema>, PostEnrollmentsRequest>
+>;
+
 export interface EnrollmentsRouteOptions extends AuthRouteOptions {
   /** Stripe seam (Δ 2026-06-09 pay-now / withdraw refund). Tests inject a stub. */
   stripe?: StripeClient;
@@ -260,6 +263,11 @@ export interface EnrollmentsRouteOptions extends AuthRouteOptions {
 
 const cohortIdParamSchema = z.object({ cohortId: z.string().uuid('cohortId must be a UUID') });
 const withdrawBodySchema = z.object({ dog_id: z.string().uuid('dog_id must be a UUID') }).strict();
+
+/** Zod ↔ wire pin (§5.1.3). */
+export type PostEnrollmentsWithdrawBodyConformance = Expect<
+  Equal<z.input<typeof withdrawBodySchema>, PostEnrollmentsWithdrawRequest>
+>;
 
 export function registerEnrollmentsRoute(
   app: FastifyInstance,
@@ -718,8 +726,7 @@ export function registerEnrollmentsRoute(
             // `markVoid` above ran FIRST and unchanged, so R10 (void, never
             // refund, for an unpaid invoice) and R11 (the void/refund race) are
             // exactly as they were; only the report and the row actions are new.
-            const settled =
-              preTx === undefined ? undefined : await applySettledRows(preTx);
+            const settled = preTx === undefined ? undefined : await applySettledRows(preTx);
             const lateRow = await pendingSurvivesCommit(settled?.settledIds ?? []);
 
             if (settled?.anyRefunded === true) {
@@ -1093,9 +1100,7 @@ async function settleWithdrawMoneyBeforeTx(args: {
       dogId: args.dogId,
       enrollment,
     });
-    return hold === undefined
-      ? undefined
-      : { lane: 'auth-hold' as const, pending: [hold] };
+    return hold === undefined ? undefined : { lane: 'auth-hold' as const, pending: [hold] };
   });
 
   if (capturePending === undefined || capturePending.pending.length === 0) return undefined;
@@ -1122,25 +1127,11 @@ async function settleWithdrawMoneyBeforeTx(args: {
   return { lane: capturePending.lane, rows };
 }
 
-/**
- * The "Currently enrolled" wire row. `payment_status` is `paid` (charged) /
- * `pay-later` (card-backed open invoice, auto-charges before the first session)
- * / `pending` (async charge not yet settled). `can_withdraw` is the self-serve
- * window — true until the first session's instant.
- */
-export interface EnrollmentWire {
-  cohort_id: string;
-  dog_id: string;
-  class_key: string;
-  class_name: string;
-  location: string;
-  start_date: string;
-  weekly_time: string | null;
-  weeks: number;
-  first_session_at: string;
-  payment_status: EnrollmentPaymentStatus;
-  can_withdraw: boolean;
-}
+// The "Currently enrolled" wire row moved into the versioned contract at wire
+// 1.13.0 (`src/contracts/wire.ts`, domain fence `enrollments`) — where its
+// `payment_status` / `can_withdraw` semantics and the NOTE-19 "no current
+// filter" caveat now live. Re-exported so no consumer moves (§6).
+export type { EnrollmentWire };
 
 function toEnrollmentWire(
   row: Awaited<ReturnType<typeof enrollmentsRepository.listForOwner>>[number],
@@ -1149,9 +1140,16 @@ function toEnrollmentWire(
   return {
     cohort_id: row.cohortId,
     dog_id: row.dogId,
-    class_key: row.classKey,
+    // Both casts are §14.2-B promotion-time narrowings, erased at runtime. The
+    // row parser widens each to `string` (`enrollmentsRepository.ts:48,50`) and
+    // stays untouched (§14.1); the guarantees are `cohorts.class_key`
+    // (`group_class_key` pgEnum, schema.sql:547) and `cohorts.location`
+    // (FK → locations.slug, schema.sql:548) — the same column `CohortWire`
+    // already types as `LocationKey`. Runtime pin: the repointed
+    // 'GET /enrollments — lists the owner current enrollments…' contract test.
+    class_key: row.classKey as GroupClassKey,
     class_name: row.className,
-    location: row.location,
+    location: row.location as LocationKey,
     start_date: row.startDate,
     weekly_time: row.weeklyTime,
     weeks: row.weeks,
@@ -1737,7 +1735,8 @@ async function runPartialEnrollmentInner(
   const advisorySeats = Math.max(0, cohort.capacity - cohort.filled);
   if (survivors.length > advisorySeats) {
     const shortfall = new Map(preTxFailures);
-    for (const dogId of survivors) shortfall.set(dogId, dogSeatShortfallResult(dogId, advisorySeats));
+    for (const dogId of survivors)
+      shortfall.set(dogId, dogSeatShortfallResult(dogId, advisorySeats));
     return recordRefusalEnvelope(ctx, buildEnrollmentEnvelope(ctx, shortfall, [], 0));
   }
   if (survivors.length === 0) {

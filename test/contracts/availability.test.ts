@@ -185,3 +185,25 @@ test(
     assert.equal(body.error?.code, 'bad_request');
   },
 );
+
+// Wire 1.13.0 §5.4 guard: `mode` is validated against the contract tuple
+// BOOKING_MODES instead of a re-derivation of the booking_mode pgEnum. The
+// suite pinned a bad `location` but never a bad `mode`, so nothing would have
+// caught the swap widening or narrowing the accepted set. Both members are
+// exercised as accepted above (mode=school, mode=daycare).
+test(
+  'GET /availability with a non-member mode returns 400 bad_request',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerAvailabilityRoute(app, { authenticate });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/availability?from=2026-05-15&to=2026-05-21&mode=boarding&location=fayetteville',
+    });
+    assert.equal(res.statusCode, 400);
+    const body = res.json() as { error?: { code?: string } };
+    assert.equal(body.error?.code, 'bad_request');
+  },
+);

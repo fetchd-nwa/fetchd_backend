@@ -19,6 +19,8 @@ import { and as andOp } from 'drizzle-orm';
 import { hashRequestBody } from '../../src/db/mutation.js';
 import { withActor } from '../../src/db/tx.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
+import { GROUP_CLASS_KEYS, LOCATIONS } from '../../src/contracts/wire.js';
+import type { EnrollmentPaymentStatus, EnrollmentWire } from '../../src/contracts/wire.js';
 import type { GroupClassKey } from '../../src/db/repositories/groupClassesRepository.js';
 import type { StripeClient, StripePaymentIntentResult } from '../../src/lib/stripe.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
@@ -982,18 +984,31 @@ test(
 
     const res = await app.inject({ method: 'GET', url: '/enrollments' });
     assert.equal(res.statusCode, 200, res.body);
-    const rows = res.json() as Array<{
-      cohort_id: string;
-      dog_id: string;
-      class_key: string;
-      payment_status: string;
-      can_withdraw: boolean;
-    }>;
+    const rows = res.json() as EnrollmentWire[];
     const mine = rows.find((r) => r.cohort_id === cohort.id && r.dog_id === FIXTURE_IDS.dog1Id);
     assert.ok(mine, 'the new enrollment is listed');
     assert.equal(mine!.class_key, 'puppy');
     assert.equal(mine!.payment_status, 'pay-later');
     assert.equal(mine!.can_withdraw, true, 'future cohort → still withdrawable');
+
+    // Wire 1.13.0 §14.2-B runtime pins: `class_key` and `location` narrowed
+    // from `string` to `GroupClassKey` / `LocationKey`, and `payment_status`
+    // promoted as `EnrollmentPaymentStatus`. `test/` runs type-ERASED (§14.5),
+    // so these must be VALUE checks — and over EVERY row this owner can see,
+    // not only the one this test enrolled.
+    for (const row of rows) {
+      assert.ok(
+        GROUP_CLASS_KEYS.includes(row.class_key),
+        `class_key ${row.class_key} is outside GROUP_CLASS_KEYS`,
+      );
+      assert.ok(LOCATIONS.includes(row.location), `location ${row.location} is outside LOCATIONS`);
+      assert.ok(
+        (['paid', 'pay-later', 'pending'] as readonly EnrollmentPaymentStatus[]).includes(
+          row.payment_status,
+        ),
+        `payment_status ${row.payment_status} is outside EnrollmentPaymentStatus`,
+      );
+    }
 
     await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohort.id));
   },
@@ -1300,7 +1315,11 @@ test(
 
     assert.equal(res.statusCode, 402, res.body);
     const body = res.json() as { error: { details: { charge_blocker: string } } };
-    assert.equal(body.error.details.charge_blocker, 'authentication_required', 'first dog wins ties');
+    assert.equal(
+      body.error.details.charge_blocker,
+      'authentication_required',
+      'first dog wins ties',
+    );
     assert.equal(stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length, 2);
   },
 );

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { and, eq, isNotNull, sql } from 'drizzle-orm';
+import type { WelcomeDogWire } from '../contracts/wire.js';
 import { db } from '../db/client.js';
 import { dogs, owners } from '../db/schema/schema.js';
 import { live } from '../db/softExpire.js';
@@ -10,12 +11,9 @@ import { defaultR2Client, type R2Client } from '../lib/r2.js';
 // call and stays cheap; shuffled so the same dogs don't always lead.
 const WELCOME_DOGS_LIMIT = 60;
 
-export interface WelcomeDogWire {
-  id: string;
-  name: string;
-  /** Signed URL (uploaded photo) or a bundled asset path; '' when none. */
-  photo: string;
-}
+// Promoted to `contracts/wire.ts` in 1.13.0 (§6: public, tiny, and mobile
+// mirrors it). Re-exported so this module's public surface is unchanged.
+export type { WelcomeDogWire } from '../contracts/wire.js';
 
 export interface WelcomeDogsRouteOpts {
   /** R2 seam — contract tests inject the stub for photo-URL signing. */

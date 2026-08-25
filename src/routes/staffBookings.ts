@@ -5,13 +5,15 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { type BookingWire } from '../lib/bookingWire.js';
-import type { AttendanceWire } from '../contracts/wire.js';
+import type {
+  AttendanceWire,
+  PostStaffBookingsAttendanceRequest,
+  PostStaffBookingsCancelRequest,
+} from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { ApiError } from '../lib/errors.js';
-import {
-  firePendingRefundPostCommit,
-  type PendingStripeRefund,
-} from '../lib/pendingRefund.js';
+import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
@@ -61,6 +63,17 @@ const cancelBodySchema = z
   .strict();
 
 // AttendanceWire is owned by the single-source contract (contracts/wire.ts).
+
+/** §5.1.3 pins — see `PostBookingsBodyConformance` in `routes/bookings.ts`.
+ *  Unlike the deny verb's `reason`, THIS `reason` is persisted and comes back
+ *  as `BookingWire.cancel_reason`. */
+export type PostStaffBookingsAttendanceBodyConformance = Expect<
+  Equal<z.input<typeof attendanceBodySchema>, PostStaffBookingsAttendanceRequest>
+>;
+
+export type PostStaffBookingsCancelBodyConformance = Expect<
+  Equal<z.input<typeof cancelBodySchema>, PostStaffBookingsCancelRequest>
+>;
 
 export interface StaffBookingsRouteOptions extends AuthRouteOptions {
   /** Stripe seam for the cancel money-back postCommit (mirrors bookings). */

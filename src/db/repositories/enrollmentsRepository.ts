@@ -1,4 +1,5 @@
 import { sql } from 'drizzle-orm';
+import type { EnrollmentPaymentStatus } from '../../contracts/wire.js';
 import { z } from 'zod';
 import { db } from '../client.js';
 
@@ -27,7 +28,10 @@ import { db } from '../client.js';
  * portal surface, Adjudication 8.)
  */
 
-export type EnrollmentPaymentStatus = 'paid' | 'pay-later' | 'pending';
+// Promoted to the versioned contract at wire 1.13.0 (fence `enrollments`);
+// re-exported here so no consumer moves — the `ChargeStatus` /
+// `chargesRepository.ts:111` precedent.
+export type { EnrollmentPaymentStatus };
 
 export interface EnrollmentRow {
   cohortId: string;

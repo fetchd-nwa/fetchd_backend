@@ -1,3 +1,4 @@
+import type { VetWire } from '../contracts/wire.js';
 import type { vets } from '../db/schema/schema.js';
 
 /**
@@ -10,14 +11,9 @@ import type { vets } from '../db/schema/schema.js';
  * Extracted Day-4b at the rule-of-two; was previously inline in
  * `routes/dogs.ts`.
  */
-export interface VetWire {
-  id: string;
-  name: string;
-  phone?: string;
-  email?: string;
-  address?: string;
-  notes?: string;
-}
+// Promoted to `contracts/wire.ts` in 1.13.0 (digest dogs-profile/L); re-exported
+// so `routes/vets.ts` and `lib/dogWire.ts` keep their existing imports.
+export type { VetWire } from '../contracts/wire.js';
 
 export function toVetWire(row: typeof vets.$inferSelect): VetWire {
   const wire: VetWire = { id: row.id, name: row.name };

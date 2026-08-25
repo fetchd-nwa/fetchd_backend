@@ -292,3 +292,86 @@ test(
     });
   },
 );
+
+// --- wire 1.13.0 contract pins ------------------------------------------
+// The three shapes this bump contracted for events, pinned against real
+// emissions: the DELETE envelope, the event_full envelope's ABSENT details,
+// and the deliberately non-strict body (§14.1 — a promotion must not tighten).
+
+test(
+  'DELETE /events/:id/rsvp emits exactly { ok: true } (DeleteEventsRsvpResponse)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerEventsRoute(app, { authenticate });
+    await app.inject({
+      method: 'POST',
+      url: `/events/${FIXTURE_IDS.eventYappyHourId}/rsvp`,
+      headers: rsvpHeaders(),
+      payload: { dog_ids: [FIXTURE_IDS.dog1Id] },
+    });
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/events/${FIXTURE_IDS.eventYappyHourId}/rsvp`,
+      headers: rsvpHeaders(),
+    });
+    assert.equal(res.statusCode, 200);
+    // Byte shape, not a subset check — the envelope IS the contract now.
+    assert.deepStrictEqual(res.json(), { ok: true });
+    assert.equal(await spotsFor(app, FIXTURE_IDS.eventYappyHourId), 0);
+  },
+);
+
+test(
+  'POST /events/:id/rsvp 422 event_full carries NO details key (PostEventsRsvpErrorDetails = never)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerEventsRoute(app, { authenticate });
+    // eventCapped has capacity 1; two dogs overflow it.
+    const res = await app.inject({
+      method: 'POST',
+      url: `/events/${FIXTURE_IDS.eventCappedId}/rsvp`,
+      headers: rsvpHeaders(),
+      payload: { dog_ids: [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id] },
+    });
+    assert.equal(res.statusCode, 422);
+    const body = res.json() as { error: Record<string, unknown> };
+    assert.equal(body.error.code, 'event_full');
+    // `details` is ABSENT, not null and not {} — the serializer omits the key
+    // when the ApiError carries none (auth/plugin.ts:196-198). This is what
+    // makes `PostEventsRsvpErrorDetails = never` the truthful alias.
+    assert.deepStrictEqual(Object.keys(body.error).sort(), ['code', 'message']);
+  },
+);
+
+test(
+  'POST /events/:id/rsvp still accepts an unknown extra body key (non-strict schema — §14.1)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerEventsRoute(app, { authenticate });
+    const res = await app.inject({
+      method: 'POST',
+      url: `/events/${FIXTURE_IDS.eventYappyHourId}/rsvp`,
+      headers: rsvpHeaders(),
+      payload: { dog_ids: [FIXTURE_IDS.dog1Id], surprise: 'still legal' },
+    });
+    // Accepted, and the unknown key is stripped rather than echoed. If a future
+    // change adds `.strict()` here this goes red — which is the point: the
+    // tightening is filed (phase 3), and must be a visible decision.
+    assert.equal(res.statusCode, 200);
+    assert.deepStrictEqual(Object.keys(res.json() as object).sort(), [
+      'dog_ids',
+      'event_id',
+      'id',
+      'rsvpd_at',
+    ]);
+
+    await app.inject({
+      method: 'DELETE',
+      url: `/events/${FIXTURE_IDS.eventYappyHourId}/rsvp`,
+      headers: rsvpHeaders(),
+    });
+  },
+);

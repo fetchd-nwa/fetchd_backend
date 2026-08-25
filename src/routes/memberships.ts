@@ -1,5 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import type {
+  MembershipCreateWire,
+  MembershipWire,
+  PostMembershipsRequest,
+} from '../contracts/wire.js';
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { actorOf } from '../auth/principal.js';
 import { db } from '../db/client.js';
@@ -22,9 +28,8 @@ import {
 } from '../db/repositories/membershipsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { withMembershipCreateLock } from '../db/locks.js';
-import { LOCATION_SLUGS, type LocationKey } from '../db/schema/schema.js';
+import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import { withActor } from '../db/tx.js';
-import type { BookingMode } from '../lib/bookingMode.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { CANCELLABLE_STATUSES } from '../lib/enrollmentPartial.js';
@@ -104,47 +109,14 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * unique index `memberships_one_active_per_dog_mode` as the constraint floor.
  */
 
-export interface MembershipWire {
-  id: string;
-  dog_id: string;
-  mode: BookingMode;
-  location: LocationKey;
-  package_key: string;
-  package_label: string;
-  credits_per_month: number;
-  price_cents: number;
-  term_months: number;
-  status: 'active' | 'completed' | 'canceled';
-  started_at: string;
-  current_period_start: string;
-  current_period_end: string;
-  ends_at: string;
-  /** Omit-on-null: present ⇒ staff-paused (rolls skip until staff resume). */
-  paused_at?: string;
-  /**
-   * §J.1: the card this subscription's rolled invoices bill (memberships pin
-   * their payment method at POST). Omitted when the bound card is no longer
-   * live — the dunning lane owns that state, the list stays honest.
-   */
-  payment_method?: { brand: string; last4: string };
-}
-
-export interface MembershipCreateWire {
-  membership: MembershipWire;
-  charge_id: string;
-  charge_status: 'succeeded';
-  stripe_payment_intent_id: string;
-  credits_granted: number;
-  /**
-   * True only on the uniqueness lost-race branch: a concurrent subscribe for
-   * the same (dog, mode) won during THIS request's Stripe round-trip, so this
-   * charge is a duplicate being refunded post-commit. `membership` then
-   * carries the WINNER's row (the dog IS subscribed) and `credits_granted` is
-   * 0 (only the winning charge granted). Mirrors the invoice-pay wire's
-   * honest lost-race signal.
-   */
-  charge_refunded: boolean;
-}
+// Re-exported, not redeclared: the membership wire shapes moved into the
+// versioned contract in 1.13.0 (wire.ts § domain:memberships, digest
+// memberships/M), so both clients generate them instead of hand-mirroring.
+// Every existing importer — `staffMemberships.ts`, the contract tests — keeps
+// importing them from this module unchanged. Two copies could drift apart
+// while both still compiled (the `ChargeStatus`/`chargesRepository`
+// precedent).
+export type { MembershipCreateWire, MembershipWire } from '../contracts/wire.js';
 
 export function toMembershipWire(
   row: MembershipRow,
@@ -206,6 +178,19 @@ const createBodySchema = z
     payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
   })
   .strict();
+
+/**
+ * §5.1.3 Zod ↔ wire pin: `PostMembershipsRequest` is exactly what this schema
+ * ACCEPTS. `z.input`, not `z.infer` — the wire documents what a client may
+ * send. Exported so no unused-locals rule can eat it. If this ever stops
+ * compiling the WIRE TYPE is wrong (§14.1) — the schema is the truth.
+ * Proven breakable before it was trusted: widening `term_months` to `number`,
+ * dropping `payment_method_id`, widening `location` to `string`, and adding an
+ * optional key each produce TS2344 (lane scratchpad, 2026-08-25).
+ */
+export type PostMembershipsBodyConformance = Expect<
+  Equal<z.input<typeof createBodySchema>, PostMembershipsRequest>
+>;
 
 export interface MembershipsRouteOptions extends AuthRouteOptions {
   /** Stripe seam. Contract tests inject a stub. */

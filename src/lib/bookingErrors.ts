@@ -1,8 +1,39 @@
 import { ApiError } from './errors.js';
-import type { ChargeBlocker, EnrollmentDogResultWire } from '../contracts/wire.js';
-import type { BookingMode } from './bookingMode.js';
-import type { GroupClassKey } from '../db/repositories/groupClassesRepository.js';
-import type { LocationKey } from '../db/schema/schema.js';
+import type {
+  AgreementGap,
+  AlreadyBookedConflict,
+  AlreadyEnrolledDetails,
+  AlreadyRequestedDetails,
+  CapacityGap,
+  ChargeBlocker,
+  CohortFullDetails,
+  CreditGap,
+  EligibilityGap,
+  EnrollmentDogResultWire,
+  EvaluationGap,
+  UnpassedEvaluationStatus,
+  VaccineGap,
+} from '../contracts/wire.js';
+
+// Wire 1.13.0 fold-in (§3.3): the detail shapes are THE CONTRACT now — they
+// live in wire.ts §1 with their prose and are re-exported here so this file's
+// importers keep one import seam. The constructors below are unchanged in
+// behavior; `ApiError.details` is typed as the closed `ApiErrorDetailWire`
+// union, so a literal drifting from the contract fails `tsc` at the
+// construction site.
+export type {
+  AgreementGap,
+  AlreadyBookedConflict,
+  AlreadyEnrolledDetails,
+  AlreadyRequestedDetails,
+  CapacityGap,
+  CohortFullDetails,
+  CreditGap,
+  EligibilityGap,
+  EvaluationGap,
+  UnpassedEvaluationStatus,
+  VaccineGap,
+};
 
 /**
  * Typed `details` payloads for the booking-write surface (Day 10+). The
@@ -24,128 +55,6 @@ import type { LocationKey } from '../db/schema/schema.js';
  * without restructuring (add a `multi_gate_block` arm + a `code: 'invalid_payload'`
  * path, the existing single-gate arms stay valid).
  */
-
-/**
- * One missing vaccine for one dog. `requirement_key` lets the FE deep-
- * link to the right `/dogs/{dog_id}/vaccines` add flow with the
- * requirement pre-selected; `label` is the human-readable copy
- * (`required_vaccines.label`); `dog_id` carries multi-dog disambiguation
- * (a 3-dog booking surfaces missing vaccines by dog).
- */
-export interface VaccineGap {
-  readonly dog_id: string;
-  readonly requirement_key: string;
-  readonly label: string;
-}
-
-/** One unsigned required agreement. `document_key` matches `agreement_documents.key`. */
-export interface AgreementGap {
-  readonly document_key: string;
-  readonly label: string;
-}
-
-/**
- * One under-balance dog-mode pair. `required` is the number of credits
- * the booking would consume (debits across all requested dates for this
- * dog × this mode); `balance` is the dog's current balance before the
- * mutation. `balance < required` ⇒ blocked.
- */
-export interface CreditGap {
-  readonly dog_id: string;
-  readonly mode: BookingMode;
-  readonly balance: number;
-  readonly required: number;
-}
-
-/**
- * Day-program capacity exhaustion for one date. The FE can branch on
- * this to render "Day School is full on Tue Aug 12 in Fayetteville — try
- * another date" with a deep link back into the calendar picker.
- *
- * `openings_remaining` is the number of seats still free at the moment
- * the check fired (≥ 0 — if zero, the request asked for at least one
- * over the cap). Useful for "1 seat left, you asked for 2" messaging.
- */
-export interface CapacityGap {
-  readonly location: LocationKey;
-  readonly date: string;
-  readonly mode: BookingMode;
-  readonly openings_remaining: number;
-  readonly requested: number;
-}
-
-/**
- * Day-11 cohort capacity gap — the M:N enrollment counterpart to
- * `CapacityGap`. Same shape intent (seats remaining vs requested) but
- * scoped to one cohort row, not a (location, date, mode) bucket. The
- * cohort row's `filled` is checked against `capacity` under the cohort
- * row lock (`lockCohort`); this details payload is what surfaces when
- * the assertion fails. FE branch: "Spring '26 Manners-2 is full —
- * here are other cohorts to consider."
- */
-export interface CohortFullDetails {
-  readonly cohort_id: string;
-  readonly capacity: number;
-  readonly filled: number;
-  readonly requested: number;
-}
-
-/**
- * Day-11 R7 eligibility gap for one dog. The cohort's class has at
- * least one `class_prereq_options` row (OR-alternatives) and this dog
- * has not completed ANY of the listed prereqs. `missing_alternatives`
- * is the list of class keys the dog could complete to unlock this
- * cohort (e.g., `['manners-1']` for Manners-2). FE branch: link the
- * dog to the missing class catalog + show prereq path.
- */
-export interface EligibilityGap {
-  readonly dog_id: string;
-  readonly missing_alternatives: readonly GroupClassKey[];
-}
-
-/**
- * Day-12b evaluation gap for one dog. `evaluation_status` carries the
- * non-passed state so the FE renders the right copy variant:
- *   - `'not-evaluated'` → "Book free evaluation"
- *   - `'pending'`       → "Evaluation in progress"
- *   - `'failed'`        → "Evaluation needs to be repeated" (staff-mediated retry)
- * The `'passed'` value is excluded by construction — a passing dog has no gap.
- */
-export type UnpassedEvaluationStatus = 'not-evaluated' | 'pending' | 'failed';
-
-export interface EvaluationGap {
-  readonly dog_id: string;
-  readonly evaluation_status: UnpassedEvaluationStatus;
-}
-
-/**
- * Day-19d duplicate guard — one day-program slot the dog is already booked
- * into. A "live" booking is any non-cancelled row, so a dog can re-book a day
- * it previously cancelled. `category` + `date` (YYYY-MM-DD, Chicago) let the
- * FE name the exact collision ("Waffles is already booked for Day School on
- * Jun 8").
- */
-export interface AlreadyBookedConflict {
-  readonly dog_id: string;
-  readonly category: string;
-  readonly date: string;
-}
-
-/** Day-19d duplicate guard — the dog(s) already enrolled in this cohort. */
-export interface AlreadyEnrolledDetails {
-  readonly cohort_id: string;
-  readonly dog_ids: readonly string[];
-}
-
-/**
- * Day-19d duplicate guard — the dog(s) that already have an OPEN request of
- * this category (a second identical request can't be submitted until the
- * first resolves). `category` is the requested service category.
- */
-export interface AlreadyRequestedDetails {
-  readonly category: string;
-  readonly dog_ids: readonly string[];
-}
 
 // ---- Constructors --------------------------------------------------------
 //
@@ -281,7 +190,7 @@ export function alreadyBookedError(conflicts: readonly AlreadyBookedConflict[]):
   });
 }
 
-export function alreadyEnrolledError(details: AlreadyEnrolledDetails): ApiError {
+export function alreadyEnrolledError(details: Omit<AlreadyEnrolledDetails, 'kind'>): ApiError {
   return new ApiError(
     'already_enrolled',
     details.dog_ids.length === 1
@@ -291,7 +200,7 @@ export function alreadyEnrolledError(details: AlreadyEnrolledDetails): ApiError 
   );
 }
 
-export function alreadyRequestedError(details: AlreadyRequestedDetails): ApiError {
+export function alreadyRequestedError(details: Omit<AlreadyRequestedDetails, 'kind'>): ApiError {
   return new ApiError(
     'already_requested',
     details.dog_ids.length === 1

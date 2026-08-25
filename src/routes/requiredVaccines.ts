@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import { requiredVaccinesRepository } from '../db/repositories/requiredVaccinesRepository.js';
-import type { serviceCategory } from '../db/schema/schema.js';
+import type { RequiredVaccineWire } from '../contracts/wire.js';
 
 /**
  * `GET /required-vaccines` `[auth]` — the gating-vaccine catalog the FE reads
@@ -19,13 +19,7 @@ import type { serviceCategory } from '../db/schema/schema.js';
  * `keyIsLive` powers the Day-9d vaccine `requirement_key` FK guard.
  */
 
-type ServiceCategory = (typeof serviceCategory.enumValues)[number];
-
-interface RequiredVaccineWire {
-  key: string;
-  label: string;
-  gates_categories: ServiceCategory[];
-}
+// Shape promoted to `contracts/wire.ts` in 1.13.0 (digest dogs-profile/S).
 
 export function registerRequiredVaccinesRoute(
   app: FastifyInstance,
@@ -42,6 +36,12 @@ export function registerRequiredVaccinesRoute(
         key: row.key,
         label: row.label,
         gates_categories: row.gatesCategories,
+        // 1.13.0 (digest dogs-profile/S): the puppy-class exemption list was
+        // read from the DB but never emitted (BUSINESS-LOGIC/dogs-evaluations.md
+        // :195 recorded the omission). `findAllLive` already selects the whole
+        // row — no query, repository or DDL change. NOT NULL DEFAULT '{}', so
+        // "no exemptions" is `[]`.
+        exempt_class_keys: row.exemptClassKeys,
       }));
     },
   );

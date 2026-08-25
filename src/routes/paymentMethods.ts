@@ -14,6 +14,13 @@ import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
+import type { Expect, Equal } from '../contracts/typeAsserts.js';
+import type {
+  PatchPaymentMethodsRequest,
+  PaymentMethodWire,
+  PostPaymentMethodsConfirmRequest,
+  PostPaymentMethodsSetupIntentResponse,
+} from '../contracts/wire.js';
 
 /**
  * `GET /payment-methods` `[auth]` — owner's stored cards (DATA-CONTRACT §C
@@ -38,15 +45,11 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * `lib/paymentMethodWire.ts` if a third call site appears.
  */
 
-export interface PaymentMethodWire {
-  id: string;
-  brand: string;
-  last4: string;
-  exp_month: number;
-  exp_year: number;
-  cardholder_name: string;
-  is_default: boolean;
-}
+/**
+ * Promoted to `contracts/wire.ts` in 1.13.0 (§6). Re-exported, not redeclared,
+ * so this module's public surface is unchanged for any future importer.
+ */
+export type { PaymentMethodWire } from '../contracts/wire.js';
 
 export interface PaymentMethodsRouteOptions extends AuthRouteOptions {
   /**
@@ -57,16 +60,23 @@ export interface PaymentMethodsRouteOptions extends AuthRouteOptions {
   stripe?: StripeClient;
 }
 
-interface SetupIntentResponseBody {
-  setup_intent_id: string;
-  client_secret: string;
-}
-
 const uuidParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
 
 const patchBodySchema = z.object({ is_default: z.literal(true) }).strict();
 
 const confirmBodySchema = z.object({ setup_intent_id: z.string().min(1) }).strict();
+
+/**
+ * §5.1.3 Zod ↔ wire request-body pins. `z.input`, not `z.infer` — the wire
+ * documents what a client may SEND. Exported so no unused-locals rule can eat
+ * them. If either flips red, the WIRE TYPE is wrong, never the schema (§14.1).
+ */
+export type PatchPaymentMethodsBodyConformance = Expect<
+  Equal<z.input<typeof patchBodySchema>, PatchPaymentMethodsRequest>
+>;
+export type PostPaymentMethodsConfirmBodyConformance = Expect<
+  Equal<z.input<typeof confirmBodySchema>, PostPaymentMethodsConfirmRequest>
+>;
 
 export function registerPaymentMethodsRoute(
   app: FastifyInstance,
@@ -110,7 +120,7 @@ export function registerPaymentMethodsRoute(
   app.post(
     '/payment-methods/setup-intent',
     { preHandler: [authHook] },
-    async (request, reply): Promise<SetupIntentResponseBody> => {
+    async (request, reply): Promise<PostPaymentMethodsSetupIntentResponse> => {
       const principal = requirePrincipal(request);
       requireOwner(principal, 'create a setup intent');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
@@ -118,7 +128,7 @@ export function registerPaymentMethodsRoute(
       // cache-noop: stripe_customers + payment_methods aren't in the §3
       // cache map (Day-8 `lib/cache.ts`); payment_methods rows are only
       // written here / by Day-15 webhook, never cached.
-      const outcome = await withMutation<SetupIntentResponseBody>(
+      const outcome = await withMutation<PostPaymentMethodsSetupIntentResponse>(
         {
           principal,
           idempotencyKey,
