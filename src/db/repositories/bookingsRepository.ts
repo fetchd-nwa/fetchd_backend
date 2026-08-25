@@ -143,8 +143,14 @@ export const bookingsRepository = {
     // `from`/`to` are America/Chicago CALENDAR DAYS, inclusive on both ends,
     // compared against the Chicago day `scheduled_at` falls on — never the UTC
     // day, which would file a 7pm booking under tomorrow. Same
-    // `(col AT TIME ZONE 'America/Chicago')::date` expression the day-capacity
-    // count and the conflict scan use (`dayCapacityRepository.ts:166`).
+    // `(col AT TIME ZONE 'America/Chicago')::date` expression the conflict
+    // scan and `dayCapacityRepository.assertCapacityWithinLock` use
+    // (`dayCapacityRepository.ts:296`). NOTE: the sibling read-side count,
+    // `findBookedCountsInRange`, expresses the SAME Chicago-day window as a
+    // half-open `scheduled_at` range instead — equivalent rows, but sargable
+    // (2.6 adversary, fix round 2). This filter is a candidate for the same
+    // treatment; it is not done here because that is a `GET /staff/bookings`
+    // change and this round is scoped to availability.
     if (filters.fromChicagoDate !== undefined) {
       conditions.push(
         sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date >= ${filters.fromChicagoDate}::date`,

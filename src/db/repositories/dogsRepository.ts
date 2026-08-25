@@ -439,6 +439,35 @@ async function findOwnerIdInTx(tx: Tx, dogId: string): Promise<string | undefine
 }
 
 /**
+ * Resolve ANY dog's `owner_id` inside a tx — live or soft-expired. The
+ * lifecycle-blind sibling of `findOwnerIdInTx`, in the same spirit as
+ * `findNameInTx` below: `undefined` means "no such dog id has ever existed",
+ * never "that dog was removed".
+ *
+ * Why this exists (2.6 adversary, fix round 2). A caller that has to REACH
+ * the owner — to retract something already sent to her — must not lose her
+ * because the dog was soft-expired in between. `DELETE /staff/reports/:id`
+ * used the live-filtered lookup, so deleting the report of a removed dog
+ * skipped the notification dismissal silently and left the owner a bell entry
+ * on a dead deep link. Soft-expiring a dog is an UPDATE, so it cascades to
+ * nothing, and no notification read joins `dogs` — nothing else was ever
+ * going to clean that row up.
+ *
+ * Safe by column semantics, not by luck: `dogs.owner_id` is NOT NULL and no
+ * write path changes it — `DogUpdate` (:71-81) has no `ownerId` member, and
+ * none of the four `update(dogs)` sites set one. A dog names the same owner
+ * for its whole life, dead or alive.
+ */
+async function findOwnerIdAnyInTx(tx: Tx, dogId: string): Promise<string | undefined> {
+  const [row] = await tx
+    .select({ ownerId: dogs.ownerId })
+    .from(dogs)
+    .where(eq(dogs.id, dogId))
+    .limit(1);
+  return row?.ownerId ?? undefined;
+}
+
+/**
  * Resolve a dog's display name inside a tx, cross-owner. `undefined` when the
  * dog id doesn't exist at all.
  *
@@ -509,6 +538,7 @@ export const dogsRepository = {
   findEvaluationStatusInTx,
   findApprovalDivertFieldsInTx,
   findOwnerIdInTx,
+  findOwnerIdAnyInTx,
   findNameInTx,
   findAlumniFlagForStaff,
   lockForAlumniUpdate,

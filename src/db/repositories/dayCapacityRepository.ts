@@ -132,16 +132,58 @@ export const dayCapacityRepository = {
    * `scheduled_at` bucket-to-Chicago-date falls in the range, excluding
    * staff-owned (capacity-exempt) dogs. If those two predicates ever diverge,
    * the calendar starts lying in a NEW direction — keep them edited together.
+   * They are now spelled DIFFERENTLY on the date axis — that one asserts a
+   * single Chicago day by casting the column, this one an equivalent
+   * half-open instant range (below) — so a reader diffing them should compare
+   * the row SETS, which are proven identical, not the SQL text.
    *
    * `to_char(...)` rather than a bare `::date` cast so the grouping key comes
    * back as the same `YYYY-MM-DD` string the route's date list is made of;
    * a raw `date` column has no per-column Drizzle mode here to force it.
+   * That expression is the row's LABEL only — it is deliberately not what
+   * selects the rows (see next paragraph).
+   *
+   * **The window is a half-open `scheduled_at` range, not a date cast on the
+   * column** (2.6 adversary, fix round 2). Writing it the obvious way —
+   * `(scheduled_at AT TIME ZONE 'America/Chicago')::date BETWEEN from AND to`
+   * — wraps the indexed column in an expression, so `bookings_location_time_idx
+   * (location, scheduled_at)` could supply only the location equality and every
+   * matching-location row was then re-checked by a Filter. An earlier version
+   * of THIS comment claimed the index served the window; `EXPLAIN` said
+   * otherwise, which is the whole reason the claim is now written as one that
+   * can be checked:
+   *
+   *   before → `Index Cond: (location = …)`
+   *            `Filter: ((scheduled_at AT TIME ZONE …)::date >= … AND <= …)`
+   *   after  → `Index Cond: (location = … AND scheduled_at >= … AND < …)`,
+   *            no Filter at all — verified with bound parameters, not just
+   *            literals.
+   *
+   * **Why the two forms select exactly the same rows.** An instant falls on
+   * Chicago calendar date D iff it is in `[midnight(D), midnight(D+1))`, so
+   * the union over `D ∈ [from, to]` is `[midnight(from), midnight(to+1))`.
+   * That holds only because Chicago midnight always exists and is unique —
+   * US transitions fire at 02:00 local, never at 00:00. Proven, not assumed:
+   * every Chicago midnight 2015-2035 round-trips to 00:00 (0 failures; day
+   * lengths are only 23/24/25h), and a 15-minute sweep across both 2026
+   * transitions, the fixture window and a year boundary found 0 disagreements
+   * between the old predicate and this one.
+   *
+   * The bounds are computed **in SQL** (`$n::date::timestamp AT TIME ZONE
+   * 'America/Chicago'`) rather than from `lib/chicagoDate`'s
+   * `chicagoWallTimeToUtc`, though the two agree to the millisecond on every
+   * date probed including both transition days. One timezone authority: the
+   * label expression and `assertCapacityWithinLock`'s bucket are Postgres-
+   * side, so keeping the bounds Postgres-side means a Node-ICU-vs-Postgres
+   * tzdata skew cannot desynchronize the window from the buckets it is
+   * supposed to cover. Still a constant-folded expression on the PARAMETER
+   * side of the comparison, so sargability is unaffected.
    *
    * **NOT cached, on purpose** (§6-batch #3's load note): the `avail:*` range
    * cache is invalidated by `day_capacity` writes only, so a cached booked
    * count would resurrect the very lie this field exists to kill — as
    * staleness, which is harder to see. One aggregate over ≤92 dates per
-   * request, served by `bookings_location_time_idx`.
+   * request, now genuinely served by `bookings_location_time_idx`.
    *
    * Advisory by construction: no lock is held, so a booking committing
    * between this read and the client's POST makes it stale. The authority is
@@ -166,7 +208,11 @@ export const dayCapacityRepository = {
         and(
           eq(bookings.location, location),
           inArray(bookings.category, [SCHOOL_CATEGORY, DAYCARE_CATEGORY]),
-          sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date BETWEEN ${from}::date AND ${to}::date`,
+          // Half-open [midnight(from), midnight(to+1)) in Chicago wall time.
+          // Bare column on the left = index bound; see the doc block above for
+          // the EXPLAIN before/after and the equivalence proof.
+          sql`${bookings.scheduledAt} >= (${from}::date::timestamp AT TIME ZONE 'America/Chicago')`,
+          sql`${bookings.scheduledAt} < ((${to}::date + 1)::timestamp AT TIME ZONE 'America/Chicago')`,
           ne(bookings.status, 'cancelled'),
           live(bookings),
           live(bookingDogs),

@@ -4239,17 +4239,16 @@ export interface StaffRateHistoryWire extends StaffRateWire {
  * was hand-mirrored in mobile (`availabilityRepository.ts:20 RawCapacity`),
  * so a change bypassed the version bump entirely.
  *
- * **These are CONFIGURED openings, not remaining seats.** Each number is the
- * live `day_capacity` override row for (location, date) or, where no
- * override exists, the API default rule — weekend (Sat/Sun) = 0/0 closed,
- * weekday = 3/3 (`lib/availability.ts:16-49`; `schema.sql:815`; R4 @
- * BUSINESS-LOGIC/bookings-scheduling.md:52, R22 @ :94). **Nothing is
- * subtracted for dogs already booked.** The authoritative seat arithmetic
- * (openings − booked) runs only inside the booking transaction
- * (`dayCapacityRepository.assertCapacityWithinLock`), so a fully-booked day
- * still reports its full configured openings here and the 422
- * `insufficient_capacity` at POST is where the owner first learns otherwise
- * (D9 @ bookings-scheduling.md:237, NOTE-2 @ DISCREPANCIES.md:651).
+ * **The `*_openings` pair is CONFIGURED capacity; the `*_remaining` pair is
+ * seats left.** Each `*_openings` number is the live `day_capacity` override
+ * row for (location, date) or, where no override exists, the API default
+ * rule — weekend (Sat/Sun) = 0/0 closed, weekday = 3/3
+ * (`lib/availability.ts:16-49`; `schema.sql:815`; R4 @
+ * BUSINESS-LOGIC/bookings-scheduling.md:52, R22 @ :94). Nothing is
+ * subtracted from `*_openings` for dogs already booked — a fully-booked day
+ * still reports its full configured openings THERE, and D9 @
+ * bookings-scheduling.md:237 / NOTE-2 @ DISCREPANCIES.md:651 describe that
+ * pre-1.13.0-fix-round state, when these two were the only fields.
  *
  * Since the 1.13.0 fix round the response ALSO carries `*_remaining` —
  * Allison's §6-batch decision #3, option C, APPROVED 2026-08-24

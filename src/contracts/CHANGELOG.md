@@ -106,7 +106,8 @@ dispositioned — the 2.6 adversary audits 39/39):
   `PostPaymentMethodsSetupIntentResponse`, `InvoiceStatus` +
   `ChargePurpose` (pgEnum pins landed); `RateWire` (its
   `location: LocationKey | null` non-omit exception documented),
-  `DayCapacityWire` ("configured, not remaining" pinned in doc),
+  `DayCapacityWire` (promoted as configured-only; superseded in the fix
+  round below, which adds the `*_remaining` pair),
   `CancelWindowSettingWire`; `CreditsWire`/`CreditLotWire`/
   `CreditPackageWire`/`CreditExpirySettingWire`; `GroupClassWire`/
   `CohortWire`/`GroupEligibilityWire`/`EnrollmentWire` +

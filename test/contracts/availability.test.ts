@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   bookings as bookingsTable,
@@ -250,36 +250,46 @@ test(
  * `date`: the same `(scheduled_at AT TIME ZONE 'America/Chicago')::date`
  * encoding `assertCapacityWithinLock` counts against.
  */
-async function seedBookedDay(opts: {
-  date: string;
+/** Insert one day-program booking at an exact instant. Returns its id. */
+async function insertBookingAt(opts: {
+  scheduledAtIso: string;
   category: 'day-school' | 'day-care';
   dogIds: string[];
-  openings: { school: number; daycare: number };
-}): Promise<() => Promise<void>> {
+}): Promise<string> {
   const bookingId = randomUUID();
-  await db.insert(dayCapacityTable).values({
-    location: 'fayetteville',
-    date: opts.date,
-    schoolOpenings: opts.openings.school,
-    daycareOpenings: opts.openings.daycare,
-  });
   await db.insert(bookingsTable).values({
     id: bookingId,
     ownerId: FIXTURE_IDS.ownerId,
     leadDogId: opts.dogIds[0]!,
     category: opts.category,
     status: 'upcoming',
-    scheduledAt: `${opts.date}T13:00:00Z`,
+    scheduledAt: opts.scheduledAtIso,
     durationMinutes: 540,
     location: 'fayetteville',
   });
   await db.insert(bookingDogsTable).values(
-    opts.dogIds.map((dogId, i) => ({
-      bookingId,
-      dogId,
-      isLead: i === 0,
-    })),
+    opts.dogIds.map((dogId, i) => ({ bookingId, dogId, isLead: i === 0 })),
   );
+  return bookingId;
+}
+
+async function seedBookedDay(opts: {
+  date: string;
+  category: 'day-school' | 'day-care';
+  dogIds: string[];
+  openings: { school: number; daycare: number };
+}): Promise<() => Promise<void>> {
+  await db.insert(dayCapacityTable).values({
+    location: 'fayetteville',
+    date: opts.date,
+    schoolOpenings: opts.openings.school,
+    daycareOpenings: opts.openings.daycare,
+  });
+  const bookingId = await insertBookingAt({
+    scheduledAtIso: `${opts.date}T13:00:00Z`,
+    category: opts.category,
+    dogIds: opts.dogIds,
+  });
   // The override read is cached (`avail:{location}:*`, 5 min); the booked
   // count deliberately is not. Wipe the prefix anyway so nothing this file
   // read earlier can serve a pre-seed override row.
@@ -358,8 +368,10 @@ test(
     // "< dogCount" today, but it would leak a nonsense number to the client
     // and invert the moment anyone writes `remaining > 0 ? … : …` on a
     // signed value. `Math.max(0, …)` is also exactly what the 422's
-    // `openings_remaining` detail already does
-    // (`dayCapacityRepository.ts:183`), so the two agree.
+    // `openings_remaining` detail already does — applied in
+    // `dayCapacityRepository.assertCapacityWithinLock` (:313), which feeds
+    // `insufficientCapacityError` (`lib/bookingErrors.ts:119`) — so the
+    // advisory read and the authoritative error agree on "full".
     const cleanup = await seedBookedDay({
       date: '2026-06-04',
       category: 'day-care',
@@ -384,6 +396,74 @@ test(
       ]);
     } finally {
       await cleanup();
+    }
+  },
+);
+
+test(
+  'GET /availability — the booked window splits on CHICAGO midnight, including a DST day',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerAvailabilityRoute(app, { authenticate });
+
+    // Guards the fix-round-2 rewrite of the date predicate from a Chicago-date
+    // cast on the column to a half-open `scheduled_at` range. The two select
+    // identical rows only because Chicago midnight always exists — and on
+    // 2026-11-01 (fall-back) that midnight is 05:00Z, NOT the 06:00Z a
+    // fixed-offset shortcut would compute.
+    //
+    // Two bookings ONE HOUR apart straddle it:
+    //   04:30Z = 2026-10-31 23:30 CDT → Chicago date 10-31, OUTSIDE the window
+    //   05:30Z = 2026-11-01 00:30 CDT → Chicago date 11-01, INSIDE it
+    // Only the second may consume a seat. Hard-code a UTC-6 lower bound and
+    // the first one gets pulled in and this reads 1; drop the lower bound and
+    // it reads 1 as well.
+    const overrideDate = '2026-11-01';
+    await db.insert(dayCapacityTable).values({
+      location: 'fayetteville',
+      date: overrideDate,
+      schoolOpenings: 3,
+      daycareOpenings: 3,
+    });
+    const beforeMidnight = await insertBookingAt({
+      scheduledAtIso: '2026-11-01T04:30:00Z',
+      category: 'day-school',
+      dogIds: [FIXTURE_IDS.dog1Id],
+    });
+    const afterMidnight = await insertBookingAt({
+      scheduledAtIso: '2026-11-01T05:30:00Z',
+      category: 'day-school',
+      dogIds: [FIXTURE_IDS.dog2Id],
+    });
+    await invalidatePattern('avail:fayetteville:*');
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/availability?from=2026-11-01&to=2026-11-01&mode=school&location=fayetteville',
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepStrictEqual(res.json(), [
+        {
+          location: 'fayetteville',
+          date: '2026-11-01',
+          school_openings: 3,
+          daycare_openings: 3,
+          // 3 configured − exactly ONE booked (the 00:30 CDT one).
+          school_remaining: 2,
+          daycare_remaining: 3,
+        },
+      ]);
+    } finally {
+      const ids = [beforeMidnight, afterMidnight];
+      await db.delete(bookingDogsTable).where(inArray(bookingDogsTable.bookingId, ids));
+      await db.delete(bookingsTable).where(inArray(bookingsTable.id, ids));
+      await db
+        .delete(dayCapacityTable)
+        .where(
+          and(eq(dayCapacityTable.location, 'fayetteville'), eq(dayCapacityTable.date, overrideDate)),
+        );
+      await invalidatePattern('avail:fayetteville:*');
     }
   },
 );

@@ -119,9 +119,12 @@ const denyBodySchema = z
   .strict();
 
 /** §5.1.3 pin. `reason` is accepted and DISCARDED — no column stores it
- *  (DISCREPANCIES.md:671); persisting it needs DDL and is deferred to §6
- *  batch #7 / phase 3. The wire type documents the embarrassment rather than
- *  removing the field, which would be a tightening (§14.1). */
+ *  (DISCREPANCIES.md:671); persisting it needs DDL and is deferred to phase 3.
+ *  (An earlier draft cited "§6 batch #7" — the delivered batch's item 7 is
+ *  scope confirmations and contains no requests-policy content; corrected in
+ *  the 1.13.0 fix round, 2.6 adversary, same repair `wire.ts` got.) The wire
+ *  type documents the embarrassment rather than removing the field, which
+ *  would be a tightening (§14.1). */
 export type PostStaffRequestsDenyBodyConformance = Expect<
   Equal<z.input<typeof denyBodySchema>, PostStaffRequestsDenyRequest>
 >;

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
+  dogs as dogsTable,
+  notificationDogs as notificationDogsTable,
   notifications as notificationsTable,
   reports as reportsTable,
 } from '../../src/db/schema/schema.js';
@@ -843,5 +845,93 @@ test(
       (await ownerFeedIds(feedApp)).includes(survivorNote.id),
       "the sibling is still in the owner's feed",
     );
+  },
+);
+
+/**
+ * A throwaway dog owned by the fixture owner. No vaccine rows — this suite
+ * authors reports, and reports have no gate; the vaccine/eval gates are on
+ * `bookings` INSERT. `reports.dog_id` is `ON DELETE CASCADE`
+ * (`schema.sql:574`), so teardown's `delete(dogs) where owner_id` reaps
+ * anything left behind, but each test cleans up its own rows anyway.
+ */
+async function seedThrowawayDog(): Promise<string> {
+  const dogId = randomUUID();
+  await db.insert(dogsTable).values({
+    id: dogId,
+    ownerId: FIXTURE_IDS.ownerId,
+    name: `Ghost ${dogId.slice(0, 8)}`,
+    breed: 'Test Breed',
+    birthdate: '2023-01-01',
+    evaluationStatus: 'passed',
+  });
+  return dogId;
+}
+
+test(
+  'DELETE /staff/reports/:id — the notification is dismissed even when the DOG is soft-expired',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The dead-dog arm (2.6 adversary, fix round 2). The owner lookup behind
+    // the dismissal used to filter `live(dogs)`, so a soft-expired dog
+    // resolved to NO owner and the dismissal was skipped entirely — silently,
+    // because the skip was the `ownerId !== undefined` guard rather than an
+    // error. The route comment excused it as "the notification rides its own
+    // dog's disappearance", which is false twice over: no feed read joins
+    // `dogs`, and a dog soft-expire cascades to nothing (soft-expire is an
+    // UPDATE — the `ON DELETE CASCADE` above never fires).
+    //
+    // A dog is soft-expired far more often than never: it is the ordinary
+    // "remove this dog" verb (`DELETE /dogs/:id`). So this arm is the common
+    // case for any report belonging to a dog the owner later removes.
+    const staffApp = staffReportsApp();
+    const feedApp = ownerFeedApp();
+    const dogId = await seedThrowawayDog();
+    let reportId: string | undefined;
+    try {
+      const created = await postReport({
+        app: staffApp,
+        payload: { ...curriculumPayload(), dog_id: dogId },
+        idempotencyKey: `rp-deaddog-${randomUUID()}`,
+      });
+      assert.equal(created.statusCode, 201, created.body);
+      reportId = (created.json() as { id: string }).id;
+
+      const before = await notificationsForReport(reportId);
+      assert.equal(before.length, 1, 'POST enqueued the report-published row');
+      assert.equal(before[0]!.dismissedAt, null, 'it starts LIVE — the precondition');
+
+      // The owner removes the dog. `expired_at` only; the row and every
+      // child row (including the notification) stay exactly where they were.
+      await db
+        .update(dogsTable)
+        .set({ expiredAt: sql`now()` })
+        .where(eq(dogsTable.id, dogId));
+
+      const del = await deleteReport({
+        app: staffApp,
+        id: reportId,
+        idempotencyKey: `rp-deaddog-del-${randomUUID()}`,
+      });
+      assert.equal(del.statusCode, 204, del.body);
+
+      const after = await notificationsForReport(reportId);
+      assert.equal(after.length, 1, 'the row is retained');
+      assert.ok(
+        after[0]!.dismissedAt !== null,
+        'dismissed anyway — a dead dog still names its owner, so the retraction still lands',
+      );
+      assert.ok(
+        !(await ownerFeedIds(feedApp)).includes(before[0]!.id),
+        'and it is gone from the feed, exactly as it is for a live dog',
+      );
+    } finally {
+      await db.delete(notificationDogsTable).where(eq(notificationDogsTable.dogId, dogId));
+      if (reportId !== undefined) {
+        await db.delete(notificationsTable).where(eq(notificationsTable.deepLinkId, reportId));
+      }
+      await db.delete(reportsTable).where(eq(reportsTable.dogId, dogId));
+      await db.delete(dogsTable).where(eq(dogsTable.id, dogId));
+    }
   },
 );

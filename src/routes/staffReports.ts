@@ -376,10 +376,18 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
         }
 
         // Same tx as the `expired_at` stamp: the report and its announcement
-        // are retracted together or not at all. A soft-expired dog resolves
-        // to no owner, in which case there is nothing owner-scoped to hide
-        // and the notification rides its own dog's disappearance.
-        const ownerId = await dogsRepository.findOwnerIdInTx(tx, expired.dogId);
+        // are retracted together or not at all.
+        //
+        // `findOwnerIdAnyInTx`, NOT the live-filtered `findOwnerIdInTx`: a
+        // soft-expired dog still names its owner, and she still has the bell
+        // entry. Filtering `live(dogs)` here made the dismissal a silent
+        // no-op for every report whose dog had been removed — the ordinary
+        // outcome of `DELETE /dogs/:id`, not an exotic one (2.6 adversary,
+        // fix round 2). Nothing else would have caught it: soft-expire is an
+        // UPDATE, so no FK cascade fires, and no notification read joins
+        // `dogs`. `undefined` here now means only "no such dog id", which
+        // cannot happen behind a live report's FK.
+        const ownerId = await dogsRepository.findOwnerIdAnyInTx(tx, expired.dogId);
         if (ownerId !== undefined) {
           await notificationsRepository.dismissByDeepLinkTarget(tx, {
             ownerId,
