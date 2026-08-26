@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { env } from './env.js';
+import { alarmForwardingHooks, isPagerInstalled } from './lib/observability.js';
 import { registerAuth } from './auth/plugin.js';
 import { registerAuthWebhook } from './routes/authWebhook.js';
 import { registerAgreementsRoute } from './routes/agreements.js';
@@ -14,6 +15,7 @@ import { registerEventsRoute } from './routes/events.js';
 import { registerDeviceTokensRoute } from './routes/device-tokens.js';
 import { registerGroupClassesRoute } from './routes/groupClasses.js';
 import { registerHealthRoute } from './routes/health.js';
+import { registerHealthWatchdogRoute } from './routes/healthWatchdog.js';
 import { registerInvoicesRoute } from './routes/invoices.js';
 import { registerMediaRoute } from './routes/media.js';
 import { registerMembershipsRoute } from './routes/memberships.js';
@@ -49,8 +51,27 @@ import { registerWorkersTickRoute } from './routes/workersTick.js';
  * shape contract tests on Day 4 will use `app.inject()` against this factory.
  */
 export function buildApp(): FastifyInstance {
+  // D20-A3 §A3.2: `initObservability()` in `index.ts` was a bare statement in
+  // a file no test can reach — delete it and production runs with `SENTRY_DSN`
+  // set, `env.ts`'s guard satisfied, `/health` green, and every money alarm
+  // going nowhere. Round 6 closed that exact class by making the omission a
+  // compile error; `buildApp()` is called from ~100 test sites, so this is the
+  // boot-failure form instead. Production without a pager does not serve.
+  if (env.NODE_ENV === 'production' && !isPagerInstalled()) {
+    throw new Error(
+      'refusing to build the production app: no pager is installed. ' +
+        'initObservability() must run before buildApp() (see src/index.ts) — without it ' +
+        'captureAlarm is a no-op and every money alarm (SURPLUS REFUND, LOST HOLD, ' +
+        'abandoned refunds) reaches nobody, exactly as on 2026-08-24.',
+    );
+  }
+
   const app = Fastify({
-    logger: { level: env.LOG_LEVEL },
+    // Day-20: `hooks` taps the log at pino level ≥ 50 and forwards to the
+    // pager (`lib/observability.ts`). Child loggers inherit it, so every
+    // `request.log.error` — including the worker alarms the tick route hands
+    // `request.log` — pages without any route or worker knowing this exists.
+    logger: { level: env.LOG_LEVEL, hooks: alarmForwardingHooks() },
     disableRequestLogging: false,
   });
 
@@ -58,6 +79,7 @@ export function buildApp(): FastifyInstance {
   // ApiError→HTTP mapper every route relies on.
   registerAuth(app);
   registerHealthRoute(app); // [public] — no auth guard
+  registerHealthWatchdogRoute(app); // [public] — Day-20 scheduler + pager watchdog; NOT /health
   registerWelcomeDogsRoute(app); // [public] — pre-login welcome gallery
   registerAuthWebhook(app); // [public, signed] — own raw-body scope
   registerStripeWebhookRoute(app); // [public, signed] — Day-15; own raw-body scope

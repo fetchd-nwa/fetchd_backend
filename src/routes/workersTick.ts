@@ -4,6 +4,7 @@ import { env } from '../env.js';
 import { ApiError } from '../lib/errors.js';
 import { defaultExpoPushClient, type ExpoPushClient } from '../lib/expoPush.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import { recordSchedulerTick } from '../lib/schedulerHeartbeat.js';
 import type { WorkerLogger } from '../workers/invoiceAutoCharge.js';
 import { runSchedulerTickOnce, type SchedulerTickResult } from '../workers/scheduler.js';
 
@@ -26,6 +27,12 @@ import { runSchedulerTickOnce, type SchedulerTickResult } from '../workers/sched
  * worker boundary; this route always returns 200 on a valid auth so a
  * partial failure doesn't trigger pg_cron's own retry loop (pg_cron's
  * retry isn't aware of per-phase semantics; the worker is).
+ *
+ * Day-20 (D20-A2 §A2.3): after the completion log line, the route stamps a
+ * Redis heartbeat that `GET /health/watchdog` reads. A tick that RAN records
+ * it even when phases errored — phase failures raise their own alarms; that
+ * key answers only "did the tick happen at all", which is the question
+ * production could not answer on 2026-08-24 and the reason nobody knew.
  */
 
 export interface WorkersTickOpts {
@@ -90,6 +97,15 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
       // the "scheduler tick complete" line below lands in.
       log: request.log,
     });
+    // EVERY phase's counters (D20-A3 §A3.4.1). This line is nominated by the
+    // ops SQL, the design's proof plan, and Allison's runbook as THE authority
+    // on whether a tick ran — all three called it "the same counters" as the
+    // JSON body while it reported five of twelve phases, omitting
+    // `captureReconciler` and `duplicateRefundRetry`: the two money phases
+    // whose alarms this cycle exists to page on. (Pre-existing as
+    // DISCREPANCIES NOTE-39; nominating the line as the authority made closing
+    // it this cycle's job.) Additive only — every pre-existing key keeps its
+    // name and meaning, so anything already reading them still works.
     request.log.info(
       {
         workerTick: 'scheduler',
@@ -97,14 +113,44 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
         scheduledSent: result.scheduledNotifications.sent,
         pushTicketsOk: result.scheduledNotifications.pushTicketsOk,
         pushTicketsError: result.scheduledNotifications.pushTicketsError,
+        membershipRollScanned: result.membershipRoll.scanned,
+        membershipRolled: result.membershipRoll.rolled,
+        membershipCompleted: result.membershipRoll.completed,
+        invoiceAttemptVerifyScanned: result.invoiceAttemptVerify.scanned,
+        captureReconcilerScanned: result.captureReconciler.scanned,
+        captureReconcilerCaptured: result.captureReconciler.captured,
+        captureReconcilerLostHolds: result.captureReconciler.lostHolds,
+        captureReconcilerWithdrawnReleased: result.captureReconciler.withdrawnReleased,
+        captureReconcilerRefundedPostWithdraw: result.captureReconciler.refundedPostWithdraw,
+        captureReconcilerRefundedSurplus: result.captureReconciler.refundedSurplus,
+        captureReconcilerSettledInvoices: result.captureReconciler.settledInvoices,
+        captureReconcilerAbandoned: result.captureReconciler.abandoned,
+        captureReconcilerAbandonedUncollected: result.captureReconciler.abandonedUncollected,
+        duplicateRefundRetryScanned: result.duplicateRefundRetry.scanned,
+        duplicateRefundRetrySent: result.duplicateRefundRetry.sent,
+        duplicateRefundRetryAbandoned: result.duplicateRefundRetry.abandoned,
         invoicesScanned: result.invoiceAutoCharge.scanned,
         mediaDerivativesScanned: result.mediaDerivatives.scanned,
         creditExpiryWarningsScanned: result.creditExpiryWarnings.scanned,
         creditExpiryWarningsEnqueued: result.creditExpiryWarnings.enqueued,
+        alumniAttendanceRan: result.alumniAttendance.ran,
+        alumniAttendanceScanned: result.alumniAttendance.scanned,
+        alumniAttendanceEnqueued: result.alumniAttendance.enqueued,
+        alumniAttendanceFlagged: result.alumniAttendance.flagged,
+        invoiceOverdueScanned: result.invoiceOverdue.scanned,
+        invoiceOverdueEnqueued: result.invoiceOverdue.enqueued,
+        cardExpiryScanned: result.cardExpiry.scanned,
+        cardExpiryEnqueued: result.cardExpiry.enqueued,
         idempotencyKeysSwept: result.idempotencyKeysSwept,
       },
       'scheduler tick complete',
     );
+    // The heartbeat the external monitor reads through `GET /health/watchdog`
+    // (D20-A2 §A2.3). LAST, after the log line; it cannot fail the tick, and
+    // since D20-A4 §A4.3 it cannot WEDGE it either — the write is raced against
+    // a 1s timeout inside `recordSchedulerTick`, because a Redis that is
+    // reachable but silent used to hold this await open indefinitely.
+    await recordSchedulerTick(request.log);
     return reply.code(200).send(result);
   });
 }

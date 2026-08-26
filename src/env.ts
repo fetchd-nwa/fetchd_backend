@@ -54,62 +54,130 @@ export const envSources: ReadonlyArray<EnvFileLoad> = envFileLoads;
  * reserved now, exercised Day 14/17). A missing or malformed value fails the
  * process fast — there is no half-booted server. See `.env.example`.
  */
-const envSchema = z.object({
-  NODE_ENV: z.enum(['development', 'test', 'staging', 'production']).default('development'),
-  PORT: z.coerce.number().int().positive().default(3000),
-  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+const envSchema = z
+  .object({
+    NODE_ENV: z.enum(['development', 'test', 'staging', 'production']).default('development'),
+    PORT: z.coerce.number().int().positive().default(3000),
+    LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 
-  // Postgres — Supabase's bundled Postgres, app-owned access (Day-0 lock #3).
-  DATABASE_URL: z.string().url(),
-  // Path to the CA cert that signed the Postgres server cert. Supabase's
-  // direct connection uses Supabase's own CA (not in Node's trust store), so
-  // this is required there for verified TLS. Optional: unset OR empty string
-  // = no explicit CA (a plaintext/locally-trusted Postgres, e.g. the
-  // docker-compose dev container). The empty-string branch is the lever
-  // `.env.local` uses to disable TLS for local dev without editing `.env`.
-  DATABASE_SSL_CA: z
-    .string()
-    .optional()
-    .transform((v) => (v !== undefined && v.length > 0 ? v : undefined)),
+    // Postgres — Supabase's bundled Postgres, app-owned access (Day-0 lock #3).
+    DATABASE_URL: z.string().url(),
+    // Path to the CA cert that signed the Postgres server cert. Supabase's
+    // direct connection uses Supabase's own CA (not in Node's trust store), so
+    // this is required there for verified TLS. Optional: unset OR empty string
+    // = no explicit CA (a plaintext/locally-trusted Postgres, e.g. the
+    // docker-compose dev container). The empty-string branch is the lever
+    // `.env.local` uses to disable TLS for local dev without editing `.env`.
+    DATABASE_SSL_CA: z
+      .string()
+      .optional()
+      .transform((v) => (v !== undefined && v.length > 0 ? v : undefined)),
 
-  // Redis — server-side cache + rate limit + sessions.
-  REDIS_URL: z.string().url(),
+    // Redis — server-side cache + rate limit + sessions.
+    REDIS_URL: z.string().url(),
 
-  // Supabase Auth — JWKS verify (Day-0 lock #2). Wired Day 2a.
-  SUPABASE_JWKS_URL: z.string().url(),
-  SUPABASE_JWT_AUD: z.string().min(1),
-  SUPABASE_JWT_ISS: z.string().url(),
-  // Standard Webhooks signing secret for the Supabase "user created" auth
-  // hook (`POST /auth/webhook` [public, signed]). `whsec_<base64>` form.
-  // Wired Day 2b.
-  SUPABASE_AUTH_WEBHOOK_SECRET: z.string().min(1),
+    // Supabase Auth — JWKS verify (Day-0 lock #2). Wired Day 2a.
+    SUPABASE_JWKS_URL: z.string().url(),
+    SUPABASE_JWT_AUD: z.string().min(1),
+    SUPABASE_JWT_ISS: z.string().url(),
+    // Standard Webhooks signing secret for the Supabase "user created" auth
+    // hook (`POST /auth/webhook` [public, signed]). `whsec_<base64>` form.
+    // Wired Day 2b.
+    SUPABASE_AUTH_WEBHOOK_SECRET: z.string().min(1),
 
-  // Stripe — test keys in dev/staging. Reserved; wired Day 14/15.
-  STRIPE_SECRET_KEY: z.string().min(1),
-  STRIPE_WEBHOOK_SECRET: z.string().min(1),
+    // Stripe — test keys in dev/staging. Reserved; wired Day 14/15.
+    STRIPE_SECRET_KEY: z.string().min(1),
+    STRIPE_WEBHOOK_SECRET: z.string().min(1),
 
-  // Day-16: signed bearer secret on `POST /workers/tick`. pg_cron + pg_net
-  // POSTs from inside Postgres with this header so the scheduler endpoint
-  // can't be hit by anyone else. Local dev / tests use a placeholder; rotate
-  // in staging/prod via the hosting env. Constant-time compare in the route.
-  SCHEDULER_WEBHOOK_SECRET: z.string().min(1),
+    // Day-16: signed bearer secret on `POST /workers/tick`. pg_cron + pg_net
+    // POSTs from inside Postgres with this header so the scheduler endpoint
+    // can't be hit by anyone else. Local dev / tests use a placeholder; rotate
+    // in staging/prod via the hosting env. Constant-time compare in the route.
+    SCHEDULER_WEBHOOK_SECRET: z.string().min(1),
 
-  // Cloudflare R2 — private media. Reserved; wired Day 17.
-  R2_ACCOUNT_ID: z.string().min(1),
-  R2_ACCESS_KEY_ID: z.string().min(1),
-  R2_SECRET_ACCESS_KEY: z.string().min(1),
-  R2_BUCKET: z.string().min(1),
+    // Cloudflare R2 — private media. Reserved; wired Day 17.
+    R2_ACCOUNT_ID: z.string().min(1),
+    R2_ACCESS_KEY_ID: z.string().min(1),
+    R2_SECRET_ACCESS_KEY: z.string().min(1),
+    R2_BUCKET: z.string().min(1),
 
-  // Day-7a: `X-Dev-Principal` header bypass. Lets dev/test curl any [auth]
-  // route by passing a header like `owner:<uuid>` — no Supabase JWT setup
-  // needed. The hard gate is in `bypassHeaderEnabled` below (forced off when
-  // NODE_ENV=production regardless of this setting). The raw env var
-  // defaults UNSET; the resolved boolean defaults true for dev/test.
-  BYPASS_HEADER_ENABLED: z
-    .enum(['true', 'false'])
-    .optional()
-    .transform((v) => (v === undefined ? undefined : v === 'true')),
-});
+    // Day-7a: `X-Dev-Principal` header bypass. Lets dev/test curl any [auth]
+    // route by passing a header like `owner:<uuid>` — no Supabase JWT setup
+    // needed. The hard gate is in `bypassHeaderEnabled` below (forced off when
+    // NODE_ENV=production regardless of this setting). The raw env var
+    // defaults UNSET; the resolved boolean defaults true for dev/test.
+    BYPASS_HEADER_ENABLED: z
+      .enum(['true', 'false'])
+      .optional()
+      .transform((v) => (v === undefined ? undefined : v === 'true')),
+
+    // Day-20: the pager. `https://<key>@<host>/<project_id>` — see
+    // `lib/observability.ts`. Optional in dev/test/staging (unset = the seam is
+    // a no-op and emits zero network traffic); REQUIRED in production by the
+    // superRefine below.
+    SENTRY_DSN: z.string().url().optional(),
+
+    // Day-20: one-shot production proof of the whole paging channel. When
+    // true, `index.ts` fires exactly one error-level alarm after listen so
+    // Allison can watch a deployed process page her phone, then unset it.
+    //
+    // **Case-INSENSITIVE, unlike BYPASS_HEADER_ENABLED above** (D20-A4 §A4.4.2).
+    // This one is a diagnostic a non-engineer types into a dashboard, and as a
+    // strict enum `TRUE` or `True` meant four crash-boots and a FAILED DEPLOY
+    // (`railway.json` sets `restartPolicyMaxRetries: 3`) for a capitalisation —
+    // with the explanation on stderr only, landing on her in the middle of
+    // production surgery. That is D20-A2 §A2.2's failure shape again: a refusal
+    // that is right in principle and unrecoverable in practice. The refusal
+    // message below names the accepted values so a boot that IS refused
+    // explains itself from the Railway log.
+    SENTRY_BOOT_SMOKE: z
+      .string()
+      .optional()
+      .transform((v) => (v === undefined ? undefined : v.trim().toLowerCase()))
+      .refine((v) => v === undefined || v === 'true' || v === 'false', {
+        message:
+          "must be 'true' or 'false' (case-insensitive — 'true', 'TRUE' and 'True' are all " +
+          "accepted, as are 'false', 'FALSE' and 'False'), or left unset. It is the one-shot " +
+          'paging smoke test: set it, redeploy, watch for the page, then unset it',
+      })
+      .transform((v) => (v === undefined ? undefined : v === 'true')),
+  })
+  // ---- Day-20 production paging guards -------------------------------------
+  //
+  // Both of these refuse the BOOT, not a request, because both describe a
+  // process that would run happily while paging nobody — the `?? NOOP_LOG`
+  // class of defect (2026-08-24) moved to the config layer. "No half-booted
+  // server" already covers a missing DATABASE_URL; a missing pager in
+  // production is the same kind of missing.
+  .superRefine((value, ctx) => {
+    if (value.NODE_ENV !== 'production') return;
+    if (value.SENTRY_DSN === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SENTRY_DSN'],
+        message:
+          'required in production — without it the observability seam is a no-op and every ' +
+          'money alarm (SURPLUS REFUND, LOST HOLD, abandoned refunds) pages nobody',
+      });
+    }
+    if (value.LOG_LEVEL === 'fatal') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['LOG_LEVEL'],
+        message:
+          "'fatal' is refused in production — pino does not run the logMethod hook for calls " +
+          'suppressed below the active level, so error-level alarms would never reach the ' +
+          'pager. Demotion-by-config is the sibling of the demotion-by-code closed in round 6',
+      });
+    }
+    // The sibling hole this guard does NOT cover, named so it isn't reinvented
+    // (D20-A3 §N1, executed): Fastify's per-route `logLevel` option demotes one
+    // route's logger independently of `LOG_LEVEL`, and `app.route({ logLevel:
+    // 'fatal' })` makes the tap see nothing on that route while this refusal
+    // stays satisfied. No route in this repo sets it, and a global env guard
+    // cannot see a per-route option — so this is a comment, not code. If a
+    // route ever needs `logLevel`, the alarm channel is what you are changing.
+  });
 
 export type Env = z.infer<typeof envSchema>;
 

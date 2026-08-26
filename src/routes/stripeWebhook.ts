@@ -59,10 +59,26 @@ export function registerStripeWebhookRoute(
       try {
         done(null, JSON.parse(request.rawBody));
       } catch {
-        // Signature verification needs the raw body even when the JSON
-        // is malformed — but signature is verified first in the handler,
-        // so a non-JSON body falls through to 400 here cleanly.
-        done(new Error('invalid JSON body'), undefined);
+        // Signature verification needs the raw body even when the JSON is
+        // malformed, so the parser records `rawBody` before it tries to parse.
+        //
+        // D20-A4 §A4.2 — the comment that stood here claimed a non-JSON body
+        // "falls through to 400 here cleanly". **It did not, and that was
+        // proven by execution, not by reading**: a BARE `Error` carries no
+        // `statusCode`, so `auth/plugin.ts`'s mapper computed 500 and logged at
+        // error — which, since the Day-20 tap, PAGES A HUMAN. An 854-injection
+        // sweep across all 178 route entries found exactly four such reachable
+        // spots: this route and `/auth/webhook`, on malformed-JSON and
+        // empty-body. Sustained, that is 43,200 events/month against a
+        // 5,000/month tier — an anonymous `curl` draining in ~3.5 days the same
+        // quota the SURPLUS REFUND page spends from.
+        //
+        // A client's malformed JSON is not our error (the reasoning D20-A2
+        // §A2.1(a) applied to `auth/plugin.ts`, simply not carried here).
+        // Attaching the status makes the mapper answer 400 and log at warn.
+        // Genuine Stripe traffic is unaffected: Stripe does not send malformed
+        // JSON, and the signature check runs after parsing regardless.
+        done(Object.assign(new Error('invalid JSON body'), { statusCode: 400 }), undefined);
       }
     });
 

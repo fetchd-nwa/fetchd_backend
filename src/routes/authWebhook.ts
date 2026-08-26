@@ -31,9 +31,18 @@ export function registerAuthWebhook(app: FastifyInstance, verify: Verify = verif
       try {
         done(null, JSON.parse(request.rawBody));
       } catch {
-        // Signature is checked first in the handler regardless; a body that
-        // isn't JSON still gets a 400 here, before any work.
-        done(new Error('invalid JSON body'), undefined);
+        // D20-A4 §A4.2 — the comment that stood here claimed a body that isn't
+        // JSON "still gets a 400 here". **It did not, and that was proven by
+        // execution, not by reading**: a BARE `Error` carries no `statusCode`,
+        // so `auth/plugin.ts`'s mapper computed 500 and logged at error —
+        // which, since the Day-20 tap, PAGES A HUMAN. An 854-injection sweep
+        // across all 178 route entries found exactly four such reachable spots:
+        // this route and `/webhooks/stripe`, on malformed-JSON and empty-body,
+        // worth 43,200 events/month against a 5,000/month tier from an
+        // anonymous `curl`. A client's malformed JSON is not our error (D20-A2
+        // §A2.1(a)'s reasoning, simply not carried here). The signature is
+        // still checked first in the handler for every body that DOES parse.
+        done(Object.assign(new Error('invalid JSON body'), { statusCode: 400 }), undefined);
       }
     });
 

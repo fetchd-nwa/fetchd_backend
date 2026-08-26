@@ -77,7 +77,8 @@ observable behavior, not "looks right."
 | 19c | Staff-author media arm (report-photo/video upload on `/media` + portal UI) | Claude | ☑ |
 | 19d | Real-mode completion + full-app smoke (close mock-only holes; verify every owner flow against the live API) + duplicate guards + group-class event cards | Claude | ☑ |
 | 19e | Real-mode QA + change pass (walk every owner flow; log + batch-fix all bugs/change-requests before go-live) | Claude (fixes) + Allison (finds) | ☐ |
-| 20 | Observability + deploy hardening + go-live gate | Allison | ☐ |
+| 20a | Production scheduler + paging (the go-live hard blocker): observability seam + pino tap + prod env guards + committed ops SQL | Claude | ☑ code |
+| 20 | Observability + deploy hardening + go-live gate (remainder: rate-limit, backups/PITR, prod CORS, R2 sweep, live Stripe) | Allison | ☐ |
 
 ---
 
@@ -2327,16 +2328,281 @@ card shows the set-location pool.
   retire → 4). `CalendarIcon`/`LocationIcon`/`CheckIcon`/`DogRow`/`ConfirmView`
   duplicated between `info/yappy-hour` + `event/[id]` — resolve when yappy-hour retires.
 
+### Day 20a — Production scheduler + paging (the go-live hard blocker) ☑ code (2026-08-25)
+- **Owner:** Claude
+- **Depends on:** Day 16 (the tick + the signed entrypoint), the round-6
+  alarm-channel warrant (`test/contracts/workers-tick-alarms.test.ts`).
+- **Governing design:** `designs/day-20-production-scheduler-and-paging.md`
+  (umbrella). Branch `day-20-observability` off main @ `78fea4f`.
+- **Goal:** two facts made this a hard blocker on any paying client, both
+  Allison's own findings (2026-08-24): **pg_cron and pg_net are NOT installed
+  in the production Supabase project** — no cron job, no scheduler, production
+  has never ticked once — and the money alarms print at ERROR but **nothing
+  pages**. A tick that never runs can't collect; a tick that runs unattended
+  refunds 12000c and tells nobody. Day-20a closes exactly those two, and
+  nothing else (see the Day-20 remainder below).
+- **Landed:**
+  - **`src/lib/observability.ts` — the pager.** Interface + default impl +
+    injectable stub. (It is **not** the `lib/expoPush.ts` / `lib/r2.ts` shape,
+    as this entry first claimed — those inject per call site with no init and
+    no module state. This is a lazily initialised module singleton, nearer
+    `redis.ts`, because alarms are raised from four layers; corrected D20-A3
+    §A3.4.5, and the hazard that shape creates is closed under fix round 1.)
+    `AlarmEvent` / `AlarmTransport`; `initObservability` /
+    `captureAlarm` (fire-and-forget, NEVER throws) / `alarmForwardingHooks` /
+    `flushObservability`. The default transport is a **hand-rolled ~60-line
+    Sentry envelope POST**, not `@sentry/node`: the SDK v8+ auto-instruments
+    HTTP via OpenTelemetry, i.e. monkey-patches every request path of a system
+    whose money paths just closed CLEAN, and "the SDK doesn't interfere" is
+    unprovable by our gate. Adopting the SDK later = swapping one default impl.
+  - **The tap is ADDITIVE, not a reroute.** `server.ts` gained one field —
+    `logger: { level, hooks: alarmForwardingHooks() }`. Every pino call at
+    level ≥ 50 forwards to `captureAlarm`, then `method.apply(this, args)`
+    unchanged. Child loggers inherit hooks (proven against the installed pino
+    10.3.1, not assumed), and `request.log` IS a child — so every worker alarm
+    the tick route hands `request.log` pages **without editing a single file
+    under `src/workers/`**. Those files closed CLEAN in prior cycles and stay
+    closed. `workers-tick-alarms.test.ts` is byte-unmodified and still green.
+  - **Two production boot refusals in `src/env.ts`.** `NODE_ENV=production`
+    now requires `SENTRY_DSN` (a prod process with no pager is the `?? NOOP_LOG`
+    silent no-op moved to the config layer) and refuses `LOG_LEVEL=fatal`
+    (pino does not run the hook for calls suppressed below the active level, so
+    `fatal` would kill error-level paging while the process looked healthy —
+    demotion-by-config, the sibling of round 6's demotion-by-code). Both
+    messages name the reason. `SENTRY_BOOT_SMOKE` fires one error-level alarm
+    after listen, for the production channel proof.
+  - **`src/db/mutation.ts`'s three post-commit swallows now page** (`:245`,
+    `:262`, `:273`) — each keeps its stderr line as the record and adds
+    `captureAlarm` with `{ endpoint, idempotencyKey, err }`. This is what the
+    three "Day-20 routes this through the observability seam" annotations in
+    that file were waiting for. The third is money-adjacent (Stripe detach /
+    refund after commit).
+  - **`scripts/ops/production-scheduler.sql`** — committed, production-only,
+    documentation-grade, and deliberately NOT merged into `schema.sql` (the
+    Day-16 lock: the cron extension must never become a prerequisite of the
+    contract-test schema load). Extensions, the minutely tick job, a weekly
+    `cron.job_run_details` purge (a minutely job writes ~525k rows/year),
+    verification queries, and a rotation runbook. The secret comes from
+    **Supabase Vault**, superseding the Day-16 sketch's
+    `current_setting('app.scheduler_secret')` GUC — `ALTER DATABASE … SET`
+    stores the plaintext in `pg_db_role_setting` and its SET statement in
+    query history. `<PRODUCTION_API_URL>` stays a placeholder in git.
+- **Env-selection ratification (the Day-4b deferral at this file's Day-4b
+  entry, "ratify in ARCHITECTURE.md or here at Day 20"):** RATIFIED as
+  implemented — host-injected env is the sole source of truth in
+  staging/production, `dotenv` (`.env.local` then `.env`) loads only outside
+  those two. Two things earned the ratification rather than merely allowing
+  it: a stray `.env` in a deployed container cannot shadow host config, and
+  the production paging guards above are only meaningful if production env
+  comes from ONE place a person can read in a dashboard. Written up in
+  `BACKEND-ARCHITECTURE.md` § "Observability + paging seam".
+- **Fix round 1 (2026-08-25), after two adversary lanes — D20-A2 + D20-A3.**
+  Two blockers, and the blocker in both cases was the same shape: an
+  instrument that reads green on a broken system.
+  - **A client's 4xx no longer pages** (`src/auth/plugin.ts`, the ONE
+    sanctioned edit in that directory). `authenticate` is a preHandler, so body
+    parsing runs BEFORE auth: an anonymous malformed-JSON POST hit the
+    non-`ApiError` branch, which logged EVERY error at level 50 — so once the
+    Day-20 tap existed, **200 anonymous malformed POSTs queued 200 pages in
+    18 ms**. Sentry's free tier is 5,000 events/month consumed AT INGEST, and a
+    drained quota drops the SURPLUS REFUND page to one stderr line. The branch
+    now mirrors the `ApiError` branch above it: ≥ 500 pages, 4xx warns.
+    Response bodies and status codes are unchanged.
+  - **The pager bounded its own budget with a token bucket.** *Superseded and
+    DELETED in fix round 2 — see the D20-A4 entry below. The scheme described
+    here dropped money alarms; it is recorded only so the reasoning that
+    replaced it can be read against it.*
+  - **`initObservability()` is no longer an optional wire-up.** It was a bare
+    statement in `src/index.ts`, a file reachable from NONE of the 107 test
+    entry files: delete it and the gate stays green while production sends zero
+    envelopes with `SENTRY_DSN` set and `/health` green — round 6's `?? NOOP_LOG`
+    one layer up. Now `buildApp()` **throws** in production when no pager is
+    installed (`isPagerInstalled()`), the watchdog reports it, and a subprocess
+    test **boots the real `src/index.ts`** against a local HTTP listener
+    standing in for Sentry ingest and asserts an envelope arrives.
+  - **`GET /health/watchdog` `[public]`** (new `src/routes/healthWatchdog.ts`)
+    — the answer to "how would I find out this happened again?". `POST
+    /workers/tick` writes a Redis heartbeat after its completion line; the
+    endpoint reports `last_tick_at` / `staleness_s` / pager health and 503s when
+    the last tick is older than 10 minutes, when the pager has failed 3 sends in
+    a row, or when production has no pager. **It deliberately does NOT ride
+    `GET /health`** — `railway.json` uses that as the DEPLOY healthcheck, and a
+    fresh deploy has no recent tick by definition, so folding them together
+    would make every deploy roll itself back. A test pins the separation.
+  - **The boot smoke goes through `app.log.error`**, not `captureAlarm`
+    directly. It is the one production proof of the channel, and calling the
+    last hop proved transport → Sentry → phone while proving nothing about the
+    tap, the `hooks:` wiring, or the effective `LOG_LEVEL`.
+  - **The completion log line carries every phase** (24 counters, additive) —
+    it reported 5 of 12, omitting `captureReconciler` and `duplicateRefundRetry`,
+    the two money phases this cycle exists to page on, while the ops SQL, the
+    design and the runbook all called it "the same counters" and named it THE
+    authority. **`DISCREPANCIES.md` NOTE-39 is closed by this** (the ledger is
+    a generated umbrella snapshot — regenerate rather than hand-patch).
+  - **The ops SQL stops reporting success on a broken install.** §3 is one `DO`
+    block that RAISEs if `<PRODUCTION_API_URL>` is still un-substituted (pg_cron
+    accepts the placeholder and every check below then reads green); §5 gained
+    `error_msg` + `timed_out`, the two columns that separate "still waiting"
+    from "this will never work", and the annotation that told Allison to
+    dismiss a NULL `status_code` as the async case is corrected. Also: the
+    purge predicate is now `end_time < …` **OR** a `runid` watermark (both
+    timestamps are nullable with no default, so no timestamp predicate is
+    total); `pg_net.ttl` = 6h is documented (the table with the diagnosis
+    empties itself the same evening); the §2 confirm query reads
+    `vault.decrypted_secrets`, the view whose grant actually matters.
+  - Also: strict DSN parse (trailing slash / non-numeric project id now fail
+    CLOSED at boot — `.../42/` was building `/api/42//envelope/`, a silent
+    permanent 404); a cycle guard in the JSON replacer (a circular `extra` used
+    to lose the page while the module's doc listed it as handled); `log.error()`
+    with no args no longer pages the literal string "undefined"; the crash path
+    flushes for 500 ms rather than 2 s (a process with an uncaught exception is
+    still SERVING while its exit is deferred); and the seam-shape claim in this
+    module and in `BACKEND-ARCHITECTURE.md` is corrected to what it IS — a
+    lazily initialised module singleton, nearer `redis.ts` than `expoPush.ts`.
+- **Exit:** ☑ code complete and gated on the branch. Every instrument was
+  proven RED FIRST — the tap (remove the `hooks:` line → the buildApp test
+  captures `[]`), both env refusals (comment the `superRefine` → production
+  boots with no pager, `stdout: ENV_OK`), never-throws (remove the guards →
+  the tick returns **500 `synthetic pager outage`**, which is precisely the
+  hazard the guard exists for), the mutation sites (revert one to stderr-only
+  → `exactly one alarm; got []`), the no-op guarantee, and the Sentry envelope
+  framing. Each mutation was confirmed landed, then restored and verified
+  byte-identical with `cmp` before the green re-run.
+  Fix round 1 added **11 more mutants**, same discipline — delete the
+  `initObservability()` line, revert the smoke to `captureAlarm`, drop the
+  `buildApp` pager guard, drop the heartbeat write, drop the rate limiter, the
+  in-flight ceiling, the failure counters, the cycle guard, the DSN shape
+  checks, the no-args fallback — each proven to turn the suite red, restored
+  `cmp`-identical. One of them (the in-flight ceiling) went GREEN on the first
+  attempt and the TEST was wrong, not the code: it was bounded by the token
+  bucket rather than the ceiling, and had to be rewritten against a mocked
+  clock before it could fail. The ops SQL's guard and purge predicate were
+  executed against a **real Supabase Postgres 17.6** (non-superuser `postgres`,
+  rolled-back transaction): the guard RAISEs un-substituted and schedules both
+  jobs substituted, and on a three-row fixture the old predicate deletes 1, the
+  A2.4.3 `start_time` swap also deletes 1 (the leak moves), and the shipped
+  disjunction deletes 2 — including the NULL/NULL `starting` row.
+- **Fix round 2 (2026-08-25), after attack round 2 — D20-A4.** The round-1
+  rate limiter WAS the defect. Round 1 put a scarcity gate on the money path
+  and then reasoned about which alarms could afford it; both versions of that
+  reasoning were inverted from how the sources actually work, and both dropped
+  money alarms. Verified at the sources rather than on report:
+  `captureReconciler.ts:649`'s LOST HOLD sentence is a CONSTANT (identity lives
+  in the merge object at `:641-648`), so **12 distinct lost holds paged 5 and
+  lost 7 — permanently**, because `:636-637` adds the charge to
+  `ALARMED_CHARGE_IDS` before the log call and regardless of delivery; while
+  `duplicateRefundRetry.ts:583` templates counts INTO its sentence, minting a
+  FRESH fingerprint every tick, so two fresh fingerprints per minutely tick
+  starved a ceiling refilling 1/minute and a first-ever LOST HOLD — and the
+  `uncaughtException` page — were dropped behind it. The suite was 1414/1414
+  green and blind to all of it, because the one test that "proved" the scheme
+  safe used a hand-written message and a single money alarm.
+  - **The mechanism is replaced, not tuned. Suppression is DE-DUPLICATION
+    ONLY**, under one invariant that fits in a sentence — *the pager never
+    withholds an event unless it has already sent an identical one recently.*
+    Fingerprint = `logger` + the message with its digits normalised (`\d+` →
+    `N`, so a count-templated sentence stops minting fingerprints) + `extra`'s
+    identifying scalars **un-normalised** (so `ch_1` and `ch_2` stay distinct),
+    minus per-request keys like `reqId`. Bias deliberately toward
+    over-uniqueness: extra quota use is recoverable, a dropped money alarm is
+    not. Three identical events per ten-minute window page; the fourth is
+    counted and reported when the window rolls. **A first-ever event of any
+    fingerprint is never withheld**, and `level: 'fatal'` bypasses every gate.
+  - **The global token bucket is DELETED.** In its place a circuit breaker,
+    not a budget: `CATASTROPHIC_HOURLY_CEILING = 1000`/hour, far above any
+    legitimate volume, which emits one notice on trip and is a
+    `/health/watchdog` 503 condition — at that volume something is badly wrong
+    and "the alarms went quiet" must not read as healthy. `MAX_IN_FLIGHT`
+    rises to 256 and stays a true concurrency bound, exact rather than
+    off-by-one, with drops counted and watchdog-visible.
+  - **Two public routes still paged anonymously** (`stripeWebhook.ts:65`,
+    `authWebhook.ts:36`): a bare `Error` with no `statusCode` made the mapper
+    answer 500 and page, for a body an anonymous client chose. An 854-injection
+    sweep over all 178 route entries found exactly these four spots, worth a
+    measured **43,200 events/month against a 5,000/month tier — the quota gone
+    in ~3.5 days, from `curl`.** Both files carried comments asserting they
+    already 400'd; both were false and both are corrected in the same diff.
+  - **The heartbeat could WEDGE the money tick.** `recordSchedulerTick`'s
+    try/catch handles a rejection, not a hang: against a TCP blackhole (a
+    socket that accepts and never answers) the tick route never returned — 45
+    seconds and counting, with cron stacking a fresh tick every minute. Now a
+    1s `Promise.race` INSIDE `recordSchedulerTick` — deliberately not
+    `commandTimeout` on the shared client, which would change behavior for
+    every Redis consumer in the app. Pinned by a subprocess test against a real
+    blackhole listener: 20s SIGKILL before, 1.4s after.
+  - **The watchdog answered 200 on conditions it exists to catch**: sustained
+    dropped alarms (75 drops, `status=ok`, to a monitor that reads only a
+    status code) now 503 at a named threshold; a FUTURE-dated heartbeat, which
+    bought a dead scheduler that much silence, is its own reason; and a
+    corrupted heartbeat key no longer reports "no scheduler tick has been
+    recorded", which sent the reader to the wrong system.
+  - **The ops SQL's placeholder guard is now a POSITIVE assertion** — the job
+    text must match a real `url := 'https?://…/workers/tick'`. The negative
+    check was defeatable by a plausible edit, executed against real Supabase
+    PG 17.6: a find-and-replace-all is caught, but a double-click select leaves
+    the angle brackets and `'<https://…>/workers/tick'` scheduled with the
+    guard SILENT. All three edit shapes were re-executed against the same real
+    Postgres after the fix: un-substituted RAISES, brackets-survive RAISES,
+    correct passes.
+  - **Smaller, all executed:** a synchronous throw from the transport now
+    shares the rejection path (`Promise.resolve(send())` did NOT route it,
+    and the latent cost was losing a suppression count AND the real event
+    behind it); `SENTRY_BOOT_SMOKE` accepts true/false case-insensitively,
+    because a capitalisation on a diagnostic variable meant four crash-boots
+    and a failed deploy, and the refusal now names the accepted values; a
+    leading-zero Sentry project id (`0042`) fails CLOSED at boot instead of
+    404ing in silence forever; and the module's fingerprint separator was a
+    literal **NUL byte** in the source, which made `grep` and `file` treat
+    `observability.ts` as BINARY — every search of it silently returned
+    nothing, which is this repo's "absence is never established by a search"
+    rule with a byte behind it.
+- **What no gate can prove, and therefore what is NOT claimed here:** that
+  Sentry pages Allison's phone (only the production boot smoke proves that);
+  that pg_cron fires in her Supabase (only running this SQL proves that); that
+  Railway's env carries the right values; cross-PROCESS tick overlap under
+  real concurrency (Phase 4 / JMeter — `'* * * * *'` with a tick that can
+  exceed 60s means overlap is possible; phase 1 claims under `FOR UPDATE SKIP
+  LOCKED` and the money phases carry leases + idempotency keys, and Railway
+  runs one replica, but that is a named acceptance, not a proof).
+  Added by fix round 1: that **her hosted** Supabase grants the same rights the
+  local image does (the SQL was executed against a real Supabase 17.6 as
+  non-superuser `postgres`, which is evidence, not proof — the runbook's
+  permission pre-flight is the only instrument for her project); that real
+  Sentry ingest accepts our envelope (a local listener accepted it and the
+  bytes are a valid envelope, but only §B3 in production proves ingest); and
+  that a money alarm raised DURING an active suppression window still pages —
+  it does not, by design, and the pino line plus the suppression notice are
+  what carry it instead.
+- **Handoff note — the order is load-bearing, and it is SENTRY FIRST:**
+  (1) create the Sentry project and set `SENTRY_DSN` **in Railway, against the
+  still-running OLD build** — which ignores a variable it does not know, so
+  staging it costs nothing; optionally stage `SENTRY_BOOT_SMOKE=true` in the
+  same pass to save a redeploy; (2) THEN merge + deploy this to Railway,
+  receive the boot-smoke page, unset the smoke; (3) point a free uptime monitor
+  at `<PRODUCTION_API_URL>/health/watchdog` (5-min interval); (4) create the
+  Vault secret + run `scripts/ops/production-scheduler.sql` with the URL
+  substituted. The first ticks that ever fire in production must fire with
+  paging already live — not before it exists.
+  **This paragraph said the opposite until 2026-08-25** ("(1) merge + deploy;
+  (2) set `SENTRY_DSN`"), which **cannot execute**: the Day-20a build refuses
+  to boot in production without a DSN, so a deploy-first order is four
+  crash-boots and a failed deploy (`railway.json` retries 3), landing on
+  Allison mid-production-surgery with the explanation on stderr only, because
+  no pager exists yet. D20-A2 §A2.2 corrected the design and the runbook and
+  **claimed this file was corrected too; it was not** (D20-A3 §A3.0.1). The one
+  copy of the three that outlives the session was the one left wrong.
+
 ### Day 20 — Observability + deploy hardening + go-live gate
 - **Owner:** Allison
 - **Depends on:** Day 19d (real-mode must be verified end-to-end FIRST — a
-  go-live gate over a half-wired real path isn't a gate).
+  go-live gate over a half-wired real path isn't a gate). **Day 20a shipped
+  the Sentry seam + the production scheduler SQL**; what is listed below is
+  the remainder.
 - **Governing contract:** ARCHITECTURE launch scope; PHASE-PLAN next-phase
 - **Goal:** Production-ready: monitored, rate-limited, recoverable, gated.
-- **Work:** Sentry via `src/lib/observability.ts` seam; structured logs;
-  Redis rate-limit; backups/PITR; staging→prod env split (finalize the
-  env-selection decision opened Day 4 — host-injected env is the lean,
-  `dotenv` dev-only; depends on the deploy-host choice made this day);
+- **Work:** ~~Sentry via `src/lib/observability.ts` seam~~ (☑ Day 20a);
+  ~~staging→prod env split / the Day-4 env-selection decision~~ (☑ ratified
+  at Day 20a); structured logs; Redis rate-limit; backups/PITR;
   **CORS for prod** (portal→API; the Vite dev-proxy is dev-only — the media
   upload proxies through the API so there's no browser→R2 CORS, but tighten the
   dev R2 bucket's `*` CORS for prod) + R2 cleanup sweep (orphaned + long-expired

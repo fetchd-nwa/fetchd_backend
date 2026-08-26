@@ -199,8 +199,18 @@ export function registerAuth(app: FastifyInstance): void {
           : { error: { code: err.code, message: err.message, details: err.details } };
       return reply.code(err.status).send(body);
     }
-    request.log.error({ err }, 'unhandled error');
+    // Level split, mirroring the `ApiError` branch above (`:193`). `authenticate`
+    // is a preHandler, so body parsing and schema validation run BEFORE auth:
+    // an anonymous malformed-JSON POST raises a Fastify 400 and lands right
+    // here. Logging that at error was always a small lie — a client's broken
+    // request is not our fault — and became dangerous on 2026-08-25, when
+    // Day-20 made level 50 mean "wake a human": 200 anonymous malformed POSTs
+    // queued 200 pages in 18 ms, and Sentry's quota is consumed at ingest, so
+    // draining it silently disables the SURPLUS REFUND page. 5xx is ours and
+    // pages; 4xx is the client's and warns. Bodies and status codes unchanged.
     const status = typeof err.statusCode === 'number' ? err.statusCode : 500;
+    if (status >= 500) request.log.error({ err }, 'unhandled error');
+    else request.log.warn({ err }, 'client error');
     return reply
       .code(status)
       .send({ error: { code: 'internal', message: 'Internal Server Error' } });

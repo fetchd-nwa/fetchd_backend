@@ -433,3 +433,176 @@ SKIPS locally (independent builds) but HARD-FAILS under `FETCHD_REQUIRE_WIRE=1`
 Single api consumers of a shared concept import from `wire.ts` (e.g.
 `staffReports` uses `isSessionProgram`) so the single source is live-consumed —
 never a parallel copy that can silently diverge.
+
+## Observability + paging seam (LOCKED — Day-20a, 2026-08-25)
+
+### The decision: tap the log, don't reroute it
+
+`src/lib/observability.ts` is the one place this API knows how to tell a
+**human** something went wrong. It exists because on 2026-08-24 the money
+alarms were proven to PRINT and proven to reach nobody: a scheduler tick
+refunded 12000c of an owner's money and the only artifact was a line in a log
+stream no one watches.
+
+**What shape it actually is** (corrected 2026-08-25, D20-A3 §A3.4.5 — the
+first version of this section claimed the `lib/expoPush.ts` / `lib/r2.ts`
+pattern, and that was half-true). Those modules export `interface +
+defaultXClient` and inject **per call site**: no init step, no mutable module
+state. This one is a **lazily initialised module singleton**, nearer
+`redis.ts`: a mutable `let` plus an imperative `initObservability()`. That is a
+genuinely different shape and it was chosen for a reason — alarms are raised
+from FOUR layers (routes, workers, the `mutation.ts` seam, process crash
+handlers) and threading a transport through all of them would mean editing
+every one, including the money workers that closed CLEAN and stay closed.
+
+What carries over from the locked pattern is the part that matters for
+substitution: `AlarmTransport.send` is the only outbound surface, the default
+impl is one function, and tests inject a stub. `captureAlarm` is
+fire-and-forget and **never throws**.
+
+The hazard that shape creates — init never called ⇒ a silent no-op, which is
+round 6's `?? NOOP_LOG` defect one layer up — is closed rather than tolerated:
+`buildApp()` throws in production when `isPagerInstalled()` is false,
+`GET /health/watchdog` reports the same fact to an external monitor, and a
+subprocess test boots the real `src/index.ts` against a local ingest listener
+and asserts an envelope arrives.
+
+Two properties are load-bearing and each is pinned by a red-first test:
+
+1. **Additive, never a reroute.** Round 6 established the request logger AS
+   the alarm channel and made deleting the wire-up a compile error
+   (`routes/workersTick.ts`). Day-20a does not move that channel; it taps it.
+   `server.ts` passes `hooks: alarmForwardingHooks()` to Fastify's logger, the
+   hook forwards every call at pino level ≥ 50 and then calls
+   `method.apply(this, args)` unchanged. Child loggers inherit hooks —
+   verified against the installed pino 10.3.1 at runtime, not from docs — and
+   `request.log` is a child, so **every** worker alarm, phase-boundary
+   swallow, and 500-mapper line pages without a single edit under
+   `src/workers/`. The money workers closed CLEAN in prior cycles; reopening
+   them to add per-site Sentry calls would have been the rejected design.
+2. **Observability never takes down the observed system.** The hook body is
+   try/catch-wrapped and `captureAlarm` swallows independently, because a
+   throwing hook breaks ALL logging for every request — the one way this seam
+   could hurt the app. A transport failure writes one stderr line and is
+   otherwise dropped; the send carries a 5s `AbortSignal.timeout`. **The log
+   is the record; Sentry is the pager. Neither replaces the other.**
+3. **Suppression is de-duplication, never rationing** (LOCKED, D20-A4). One
+   invariant, stated in one sentence because that is the test of whether it is
+   right: ***the pager never withholds an event unless it has already sent an
+   identical one recently.*** Two earlier versions of this file described a
+   token bucket instead — a scarcity gate on the money path, with reasoning
+   about which alarms could afford it — and both were inverted from how the
+   alarm sources actually work. `captureReconciler.ts:649`'s LOST HOLD
+   sentence is a CONSTANT with the identity in its merge object, so N distinct
+   lost holds were ONE fingerprint sharing one budget (executed: 12 in, 5
+   paged, 7 permanently unpaged, because the source marks a charge alarmed
+   BEFORE the log call and never retries). Meanwhile the noisy source templates
+   counts into its sentence and minted a FRESH fingerprint every tick, starving
+   the global ceiling that was supposed to protect the money alarms.
+
+   What is here now: fingerprint = `logger` + the message with digits
+   normalised + `extra`'s identifying scalars left UN-normalised (so `ch_1` and
+   `ch_2` are different money) minus per-request keys, biased deliberately
+   toward over-uniqueness — extra quota use is recoverable, a dropped money
+   alarm is not. Three identical events per ten-minute window page; the rest
+   are counted and reported when the window rolls. A first-ever event of any
+   fingerprint is never withheld, `level: 'fatal'` bypasses every gate, and the
+   only global limit is a CIRCUIT BREAKER (1000 events/hour, far above any
+   legitimate volume) that trips loudly and 503s the watchdog rather than
+   rationing quietly. `MAX_IN_FLIGHT = 256` remains a true concurrency bound on
+   memory, with its drops counted and watchdog-visible.
+
+**Rejected: `@sentry/node`.** v8+ auto-instruments HTTP via OpenTelemetry —
+monkey-patching every request path of a system whose money paths just closed
+CLEAN — and "the SDK doesn't interfere" is not a claim our gate can evaluate.
+The default transport is instead ~60 lines of hand-rolled Sentry envelope POST
+(DSN parse → `X-Sentry-Auth` → three NDJSON lines → global `fetch`), the only
+place the Sentry wire format exists in this repo, and pinned by one unit test.
+Cost accepted: no built-in retry or buffer. Adopting the SDK later is replacing
+one default impl behind an unchanged interface.
+
+### Env-selection: host-injected in staging/prod (RATIFIED, the Day-4b deferral)
+
+Opened Day 1, decided Day 4b, implemented in `env.ts`, and deferred for
+ratification "in ARCHITECTURE.md or at Day 20" (`IMPLEMENTATION.md`, Day-4b).
+**Ratified here as implemented:** host-injected env is the sole source of truth
+in `staging` and `production`; `dotenv` loads `.env.local` then `.env` only
+outside those two.
+
+What earned the ratification rather than merely permitting it: a stray `.env`
+in a deployed container cannot shadow host config (defense against a real ops
+mistake, not a hypothetical), and the Day-20a production boot guards below are
+only meaningful if production configuration comes from ONE place a person can
+read in a dashboard. Process env still trumps both files in dev; the first
+file loaded wins per-key, since `dotenv` never overrides an existing value.
+
+### The two production boot refusals
+
+`env.ts` already refused to half-boot on a missing `DATABASE_URL`. Day-20a
+extends the same rule to the pager, because both describe a process that would
+run happily while being unable to do its job:
+
+- **`NODE_ENV=production` requires `SENTRY_DSN`.** A production API with no
+  pager is the `?? NOOP_LOG` silent no-op relocated to the config layer, where
+  it can be refused instead of discovered after the money moves. Optional in
+  dev/test/staging — staging has no paging duty, and requiring it there would
+  add friction with no invariant behind it.
+- **`NODE_ENV=production` refuses `LOG_LEVEL=fatal`.** pino does not invoke
+  the `logMethod` hook for calls suppressed below the active level, so `fatal`
+  silently kills error-level paging while every health check stays green.
+  Demotion-by-config — the sibling of the demotion-by-code closed in round 6.
+
+Both messages name the reason, so the next person cannot "fix" the refusal by
+setting a dummy value and reinventing the failure it prevents.
+
+Neither guard covers Fastify's **per-route `logLevel`**, which demotes one
+route's logger independently of `LOG_LEVEL` (executed: `app.route({ logLevel:
+'fatal' })` and the tap sees nothing on that route). No route in this repo sets
+it; a global env guard cannot see a per-route option, so the defence is a
+comment at the `superRefine`. If a route ever needs `logLevel`, the thing being
+changed is the alarm channel.
+
+### `GET /health/watchdog` — the instrument that outlives the others (LOCKED)
+
+`GET /health` answers "is this process up". It cannot answer the question
+Allison's 2026-08-24 finding actually asked, which was not *"the cron is
+missing"* but ***"production ticks have NEVER fired and nobody knew."*** Every
+way the tick can stop — secret drift (the 401 never reaches the app), a wrong
+URL (a 404 the process never sees), a deactivated `cron.job` row, a dropped
+extension, a paused project — produces zero alarms, because the alarm channel
+lives inside a process nothing is calling. One level out, the pager has the
+same blind spot: after boot, a transport failure is a stderr line read by
+nobody, and the boot smoke proves the channel once, at setup, and never again.
+
+So `POST /workers/tick` writes a Redis heartbeat (`scheduler:last_tick_at`,
+24h TTL) immediately after its completion log line — a write that is logged and
+swallowed, because a watchdog must never be able to fail the thing it watches —
+and `GET /health/watchdog` `[public]` reports `last_tick_at`, `staleness_s`,
+pager health, and a `reasons` array. **503** when the last tick is older than
+10 minutes; when the heartbeat is ABSENT, UNPARSEABLE, or dated in the FUTURE
+(each its own reason — a corrupt key must not report "the scheduler never ran",
+and a forward clock jump must not buy a dead scheduler that much silence); when
+the pager has failed 3 sends in a row; when it has dropped 200 alarms in the
+last hour; when its circuit breaker is tripped; or when production has no pager
+installed. 200 otherwise. A free external uptime monitor watches it on a
+5-minute interval — external to both this process and Sentry, which is what
+makes it the one instrument that survives either dying.
+
+The drop and breaker conditions were added in D20-A4: the endpoint reported
+`dropped_alarms` in its body and answered 200, i.e. reported a number to an
+instrument that can only read a status code — 75 dropped alarms read as
+`status=ok`. The threshold is 200/hour rather than something tight because
+de-duplicating ONE persistent minutely condition legitimately drops ~42 an
+hour, and a threshold that fires on the mechanism working is a threshold its
+reader learns to ignore.
+
+**It must never be folded into `GET /health`.** `railway.json` points its
+DEPLOY healthcheck at `/health`, and a fresh deploy has no recent tick by
+definition — folding staleness in would make every deploy fail its own
+healthcheck and roll itself back. Separate endpoint, separate status code, no
+interaction. A contract test pins that the watchdog can be 503 while `/health`
+is 200, because that is the trap that makes the obvious version of this
+endpoint worse than not having one.
+
+Listed in `DATA-CONTRACT.md` beside `/health`; `wire.ts` is not involved (no
+client generates it, there is no wire shape).

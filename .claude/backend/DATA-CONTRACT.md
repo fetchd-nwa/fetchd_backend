@@ -2604,7 +2604,7 @@ invisible to the repository layer.
 
 **Identity / session**
 
-- `GET /health` [public] · `POST /auth/webhook` [public, signed] — Supabase "user created" → upsert mirror row
+- `GET /health` [public] · `GET /health/watchdog` [public] — Day-20 scheduler + pager watchdog for an external uptime monitor; 503 on a stale, absent, unparseable, or FUTURE-dated tick heartbeat / a failing pager / sustained dropped alarms / a tripped pager circuit breaker / no pager in production, each with its own entry in the body's `reasons` array. Deliberately separate from `/health`, which `railway.json` uses as the deploy healthcheck. Not in `wire.ts` (no client generates it) · `POST /auth/webhook` [public, signed] — Supabase "user created" → upsert mirror row
 - `GET /me` [auth] — owner|staff profile + mirror row · `PATCH /me` — profile / emergency contact / notification prefs
 
 **Dogs**
@@ -2723,7 +2723,7 @@ invisible to the repository layer.
 - `POST /invoices/:id/pay-in-person` — **Notifications Phase 4c (2026-07-27, R3)**: owner elects cash/check at drop-off. Charges nothing — flips `invoices.payment_expected` → 'in-person' + enqueues the `payment-due` reminder (~1h before the linked booking's drop-off, else the invoice's `due_at`; past → now) in one tx. Bodyless 204; repeat under a new key → 409. See §A Amendment 2026-07-27 (Phase 4c).
 - `POST /requests/:id/confirm-payment` — **Day 15** — B&T `approved-awaiting-payment` → `converted`. Server-authoritative pricing via `lib/boardTrainPricing.ts`. Pay-now (charges row + booking) or pay-later (open invoice + booking).
 - `GET /refunds` — refund history; refunds are created by the cancel txn (`POST /bookings/:id/cancel`), not a direct client endpoint. Past the `cancel_deadline_at` window the booking is `cancel_forfeited` (no refund); within it → credit `cancel-refund` (credit bookings) or a `refunds` row + Stripe refund (money bookings). **Day 14**: cancel route's money-back branch now fires `stripe.createRefund` post-commit (Day-13 stubbed the seam).
-- `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**7 phases as of §J 2026-07-14**: `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / `idempotency_keys` TTL sweep). Worker runs under `system:scheduler` actor.
+- `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**12 phases, one result field each on `SchedulerTickResult`** — corrected 2026-08-25, D20-A3 §L5; this line said 7, frozen at §J 2026-07-14, and the Day-20 design said 9): `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice-attempt verify / capture reconciler / duplicate-refund retry / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / invoice-overdue scan / card-expiry scan / `idempotency_keys` TTL sweep. The tick's Railway completion log line carries all twelve phases' counters as of the same date (it carried five, omitting both money phases — DISCREPANCIES NOTE-39). Worker runs under `system:scheduler` actor.
 
 > `scheduled_notifications` + `media_derivative_jobs` are server-internal
 > worker queues — no client endpoints; the worker emits pushes /

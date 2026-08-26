@@ -4,6 +4,7 @@ import {
   invalidatePattern as invalidateCachePattern,
 } from '../lib/cache.js';
 import { ApiError } from '../lib/errors.js';
+import { captureAlarm } from '../lib/observability.js';
 import { actorOf, type Principal } from '../auth/principal.js';
 import { withIdempotency, type IdempotencyOutcome, type MutationResponse } from './idempotency.js';
 import { withActor, type Tx } from './tx.js';
@@ -245,12 +246,18 @@ export async function withMutation<T>(
       } catch (err) {
         // Mutation already committed — we do NOT propagate. See the
         // `keysToInvalidate` doc on MutationParams for the full rationale.
-        // The log line is the only signal an operator gets until Day-20
-        // wires the observability seam; keep it loud + contextual.
-        process.stderr.write(
+        // The stderr line stays the durable record; Day-20's `captureAlarm`
+        // beside it is what makes a human hear about it.
+        const message =
           `[withMutation] post-commit invalidate failed for ${params.endpoint} ` +
-            `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
-        );
+          `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`;
+        process.stderr.write(`${message}\n`);
+        captureAlarm({
+          message,
+          level: 'error',
+          logger: 'withMutation',
+          extra: { endpoint: params.endpoint, idempotencyKey: params.idempotencyKey, err },
+        });
       }
     }
     if (params.patternsToInvalidate !== undefined) {
@@ -264,10 +271,16 @@ export async function withMutation<T>(
         // wipes are an additional cleanup pass — the mutation committed
         // either way, and the SCAN-based wipe self-completes on retry
         // (the cache also self-heals via TTL).
-        process.stderr.write(
+        const message =
           `[withMutation] post-commit pattern-invalidate failed for ${params.endpoint} ` +
-            `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
-        );
+          `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`;
+        process.stderr.write(`${message}\n`);
+        captureAlarm({
+          message,
+          level: 'error',
+          logger: 'withMutation',
+          extra: { endpoint: params.endpoint, idempotencyKey: params.idempotencyKey, err },
+        });
       }
     }
     if (params.postCommit !== undefined) {
@@ -278,12 +291,19 @@ export async function withMutation<T>(
         // ...) failed AFTER the DB commit. Same swallow-and-log policy
         // as cache invalidation — the DB is the source of truth; the
         // side effect reconciles via webhook (Day-15) or admin retry.
-        // Day-20 will route this through the observability seam so
-        // Sentry catches the drift.
-        process.stderr.write(
+        // This is the money-adjacent one of the three: a swallowed Stripe
+        // detach/refund is drift a person has to resolve, so Day-20 pages
+        // on it rather than leaving it in a log stream nobody watches.
+        const message =
           `[withMutation] post-commit side-effect failed for ${params.endpoint} ` +
-            `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
-        );
+          `(idempotency_key=${params.idempotencyKey}): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`;
+        process.stderr.write(`${message}\n`);
+        captureAlarm({
+          message,
+          level: 'error',
+          logger: 'withMutation',
+          extra: { endpoint: params.endpoint, idempotencyKey: params.idempotencyKey, err },
+        });
       }
     }
   }
