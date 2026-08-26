@@ -619,12 +619,21 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
         settledInvoices: 57,
         abandoned: 58,
         abandonedUncollected: 59,
+        abandonedTruncated: true,
       },
       duplicateRefundRetry: {
         ...TICK_RESULT.duplicateRefundRetry,
         scanned: 61,
         sent: 62,
         abandoned: 63,
+        abandonedTruncated: true,
+        abandonedByClass: {
+          'row-keyed': 81,
+          'client-keyed': 82,
+          'never-sent': 83,
+          'stripe-failed': 84,
+          covered: 85,
+        },
       },
       alumniAttendance: { ran: true, scanned: 71, enqueued: 72, flagged: 73 },
     }),
@@ -662,6 +671,20 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
   assert.equal(complete['duplicateRefundRetryScanned'], 61);
   assert.equal(complete['duplicateRefundRetrySent'], 62);
   assert.equal(complete['duplicateRefundRetryAbandoned'], 63);
+
+  // D20-A7.2: "EVERY phase's counters" means every LEAF. All 11 phases were
+  // present while these 7 were not — the truncation flags say whether the alarm
+  // beside them could name rows or only classes, and the class split says which
+  // remediation a human owes. No total understated, but this line is the
+  // NOMINATED authority, so a leaf missing from it is a leaf nobody reading the
+  // log can reach.
+  assert.equal(complete['captureReconcilerAbandonedTruncated'], true);
+  assert.equal(complete['duplicateRefundRetryAbandonedTruncated'], true);
+  assert.equal(complete['duplicateRefundRetryAbandonedRowKeyed'], 81);
+  assert.equal(complete['duplicateRefundRetryAbandonedClientKeyed'], 82);
+  assert.equal(complete['duplicateRefundRetryAbandonedNeverSent'], 83);
+  assert.equal(complete['duplicateRefundRetryAbandonedStripeFailed'], 84);
+  assert.equal(complete['duplicateRefundRetryAbandonedCovered'], 85);
   assert.equal(complete['alumniAttendanceRan'], true);
   assert.equal(complete['alumniAttendanceScanned'], 71);
   assert.equal(complete['alumniAttendanceEnqueued'], 72);

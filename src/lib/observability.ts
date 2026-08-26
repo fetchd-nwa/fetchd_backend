@@ -283,13 +283,21 @@ let catastrophicSent = 0;
 let catastrophicTrippedAt: string | null = null;
 
 /**
- * The current {@link DROP_WINDOW_MS} window: when it opened, and the two ways a
+ * The current {@link DROP_WINDOW_MS} window: when it opened, and the ways a
  * page is lost inside it — chosen (suppressed, at a ceiling) and attempted
- * (handed to the transport and rejected). One window, two counters, because
+ * (handed to the transport and rejected). One window, several counters, because
  * they answer different questions and the watchdog judges them separately.
+ *
+ * `droppedAtCeilingInWindow` is a STRICT SUBSET of `droppedInWindow`, split out
+ * by D20-A7.1: at {@link MAX_IN_FLIGHT} the pager sheds an event it has never
+ * sent, which is the one thing §A4.1's invariant says must not happen, and
+ * folding it into the aggregate hid it — that threshold is 200, so a single
+ * such drop moved a counter nothing was watching. Its own counter with its own
+ * small threshold is the only shape that can make ONE of them visible.
  */
 let dropWindowStartedMs = Date.now();
 let droppedInWindow = 0;
+let droppedAtCeilingInWindow = 0;
 let transportFailuresInWindow = 0;
 
 /**
@@ -301,7 +309,14 @@ let transportFailuresInWindow = 0;
 export interface PagerHealth {
   /** False ⇒ `captureAlarm` is a no-op. In production that is a hard fault. */
   installed: boolean;
-  /** Reset to 0 by any successful send. ≥ 3 is the watchdog's 503 threshold. */
+  /**
+   * Reset to 0 by any successful send — and, since D20-A7.2, aged out with the
+   * rest of the {@link DROP_WINDOW_MS} window, so an hour of SILENCE clears it
+   * too. Without that it was the one 503 reason with no clearing path at all:
+   * in a system where alarms are rare by design, "the next successful send"
+   * can be days away, and three blips latched the watchdog red for all of it.
+   * ≥ 3 is the watchdog's 503 threshold.
+   */
   consecutive_transport_failures: number;
   /**
    * Sends attempted and LOST inside the current {@link DROP_WINDOW_MS},
@@ -322,6 +337,19 @@ export interface PagerHealth {
    * that only ever climbs would latch the 503 forever after one storm.
    */
   dropped_alarms_recent: number;
+  /**
+   * The subset of {@link dropped_alarms_recent} shed at {@link MAX_IN_FLIGHT} —
+   * events the pager has NEVER sent, withheld because too many sends were
+   * unsettled (D20-A7.1). Counted separately because the aggregate above is
+   * dominated by de-duplication, where a drop means the mechanism WORKING and
+   * an identical page already went out; that is why its threshold is 200. A
+   * drop here is the opposite — a first-ever page reaching nobody — so the
+   * watchdog 503s on {@link MAX_RECENT_CEILING_DROPS} of them: the same SHAPE
+   * as `MAX_RECENT_TRANSPORT_FAILURES`, but a threshold of ONE rather than
+   * three, for the reason set out beside that constant. Round 4 executed the
+   * hole: one shed money alarm, `200 ok`, `reasons: []`.
+   */
+  dropped_at_ceiling_recent: number;
   drop_window_s: number;
   last_drop_at: string | null;
   /**
@@ -371,6 +399,7 @@ export function pagerHealth(): PagerHealth {
     last_failure_at: lastFailureAt,
     dropped_alarms: droppedAlarms,
     dropped_alarms_recent: windowExpired ? 0 : droppedInWindow,
+    dropped_at_ceiling_recent: windowExpired ? 0 : droppedAtCeilingInWindow,
     drop_window_s: DROP_WINDOW_MS / 1000,
     last_drop_at: lastDropAt,
     catastrophic_ceiling_tripped_at:
@@ -418,6 +447,7 @@ export function initObservability(opts: InitObservabilityOptions = {}): void {
   catastrophicTrippedAt = null;
   dropWindowStartedMs = nowMs;
   droppedInWindow = 0;
+  droppedAtCeilingInWindow = 0;
   transportFailuresInWindow = 0;
   // Sends started against the PREVIOUS transport are orphaned by definition —
   // nothing will flush them anywhere useful, and leaving them in the set would
@@ -480,7 +510,11 @@ export function captureAlarm(event: AlarmEvent): void {
     }
     const nowMs = Date.now();
     if (breakerIsOpen(active, nowMs)) {
-      recordDrop(event, `catastrophic ceiling (${CATASTROPHIC_HOURLY_CEILING}/hour) tripped`, nowMs);
+      recordDrop(
+        event,
+        `catastrophic ceiling (${CATASTROPHIC_HOURLY_CEILING}/hour) tripped`,
+        nowMs,
+      );
       return;
     }
     // Records its own drop — only it knows the count standing behind it — and
@@ -520,6 +554,11 @@ function dispatch(
 ): void {
   if (opts.bypassCeiling !== true && inFlight.size >= MAX_IN_FLIGHT) {
     recordDrop(event, `in-flight ceiling (${MAX_IN_FLIGHT}) reached`, Date.now());
+    // AFTER `recordDrop`, never before: it is what rolls the shared window, and
+    // incrementing first would have this drop zeroed by its own roll. D20-A7.1
+    // — the aggregate counter `recordDrop` moves has a threshold of 200, so
+    // this one is what the watchdog can actually see a single drop through.
+    droppedAtCeilingInWindow += 1;
     return;
   }
   countTowardBreaker(Date.now());
@@ -572,14 +611,30 @@ function dispatch(
  *      `TypeError` and `Error` are different faults.
  *
  * **The bias is deliberately toward over-uniqueness**, and this is the honest
- * statement of how far that goes: scalars split, a nested `Error` splits, and
- * every OTHER nested object is still ignored rather than hashed — two events
- * differing only inside a nested non-`Error` object still collapse. That
- * residue is named rather than claimed away. (The first version of this
+ * statement of how far that goes. Three residues, not one:
+ *
+ *   - Two events differing only inside a nested **non-`Error` object** still
+ *     collapse: scalars split and a nested `Error` splits, but every other
+ *     nested object is ignored rather than hashed.
+ *   - Two events differing only inside a **key that could not be read** still
+ *     collapse — both render `<unreadable>` (D20-A7.2).
+ *   - **Digit normalisation collapses genuinely different faults whose
+ *     messages differ only in digits** (D20-A7.2). Executed: six distinct
+ *     `ECONNREFUSED` faults on ports 5432/6379/443/9000/8080/25 → **3 of 6
+ *     paged**, the other three withheld as identical. That is RULED behavior
+ *     (D20-A5.1) and stays — a port is exactly the kind of varying digit that
+ *     would otherwise mint a fresh fingerprint per occurrence — but it must be
+ *     named here, because a single network partition takes out several
+ *     services at once and is precisely the multi-fault case this understates.
+ *     The log remains the record for the withheld ones, and the rolled-window
+ *     notice says how many were hidden.
+ *
+ * Those residues are named rather than claimed away. (The first version of this
  * paragraph asserted over-uniqueness in one sentence and refuted it in the
  * next, describing the `err` collapse as though it were the bias rather than an
- * exception to it.) The direction is chosen because extra quota use is
- * detectable and recoverable, and a dropped money alarm is neither.
+ * exception to it; the second named only the nested-object case.) The direction
+ * is chosen because extra quota use is detectable and recoverable, and a
+ * dropped money alarm is neither.
  *
  * Composed with `JSON.stringify` over an array rather than by concatenating
  * around a separator. The separator the first version used was a literal NUL
@@ -614,18 +669,39 @@ function identifyingExtra(extra: Record<string, unknown> | undefined): string[] 
   const parts: string[] = [];
   for (const key of Object.keys(extra).sort()) {
     if (NON_IDENTIFYING_EXTRA_KEYS.has(key)) continue;
-    const value = extra[key];
-    if (value instanceof Error) {
-      // The 5xx path's ONLY identity (D20-A5.1). `name` raw — `TypeError` is not
-      // `Error` — and the message digit-normalised, exactly as the alarm
-      // sentence is, so one bug storming with a different id or port in its
-      // text still collapses to one fingerprint.
-      parts.push(JSON.stringify([key, value.name, value.message.replace(/\d+/g, 'N')]));
-      continue;
-    }
-    const kind = typeof value;
-    if (kind === 'string' || kind === 'number' || kind === 'boolean' || kind === 'bigint') {
-      parts.push(JSON.stringify([key, String(value)]));
+    // D20-A7.2. Reading and rendering ONE key is the whole of what can throw
+    // here, and until this guard existed a throw escaped the fingerprint core
+    // to `captureAlarm`'s catch — which treats every exception as a TRANSPORT
+    // failure. The consequences were all wrong at once: the alarm was never
+    // handed over, so it reached nobody; it was ABSENT from drop accounting,
+    // so nothing counted it as withheld; and it incremented the delivery
+    // counters, so three of them produced a 503 reading "pager LOST 3 alarms
+    // to failed delivery" about events the transport never saw. Executed with
+    // `Error.message` as a number, `undefined`, and a `Symbol` (a library
+    // assigning a non-string `message`), and with a throwing getter in `extra`.
+    //
+    // A weird payload must degrade the FINGERPRINT, never lose the page: an
+    // unreadable key still contributes a stable, distinct part, so the event
+    // stays de-duplicable against its own repeats and distinct from events
+    // whose other keys differ. Two events unreadable at the same key do
+    // collapse — that is strictly the existing nested-object residue, and it
+    // sheds precision, not pages.
+    try {
+      const value = extra[key];
+      if (value instanceof Error) {
+        // The 5xx path's ONLY identity (D20-A5.1). `name` raw — `TypeError` is not
+        // `Error` — and the message digit-normalised, exactly as the alarm
+        // sentence is, so one bug storming with a different id or port in its
+        // text still collapses to one fingerprint.
+        parts.push(JSON.stringify([key, value.name, value.message.replace(/\d+/g, 'N')]));
+        continue;
+      }
+      const kind = typeof value;
+      if (kind === 'string' || kind === 'number' || kind === 'boolean' || kind === 'bigint') {
+        parts.push(JSON.stringify([key, String(value)]));
+      }
+    } catch {
+      parts.push(JSON.stringify([key, '<unreadable>']));
     }
   }
   return parts;
@@ -808,16 +884,38 @@ function recordDrop(event: AlarmEvent, reason: string, nowMs: number): void {
 }
 
 /**
- * Both drop counters live in one fixed {@link DROP_WINDOW_MS} window, rolled by
+ * Every loss counter lives in one fixed {@link DROP_WINDOW_MS} window, rolled by
  * whichever kind of loss arrives first after it expires. Fixed rather than
- * sliding: one counter, one reset, and {@link pagerHealth} reads it without
+ * sliding: one window, one reset, and {@link pagerHealth} reads it without
  * mutating — a health check that advanced the pager's own state would make the
  * reading depend on how often it was read.
+ *
+ * `consecutiveTransportFailures` DELIBERATELY does NOT age out here.
+ *
+ * D20-A7.2 ruled that it should, to stop one transient blip latching the
+ * watchdog red until the next alarm happened to be raised. The builder shipped
+ * that, measured the consequence, and reported it rather than letting it pass:
+ * with BOTH counters windowed, a transport failing every single send while
+ * alarms arrive SPARSER THAN ONCE AN HOUR reaches neither threshold, because
+ * each failure rolls the window it would have accumulated in. **A permanently
+ * dead pager would read healthy in exactly the low-traffic regime this system
+ * is designed for** — which is the defect this whole cycle exists to abolish,
+ * reintroduced one gate over.
+ *
+ * So A7.2 was REVERSED (D20-A8) and the streak stays sticky. The reasoning:
+ * a latched 503 is not a false positive at all. It says "the pager failed and
+ * nothing has proven it works since", which is TRUE, and its clearing
+ * condition — a send that actually succeeds — is exactly the right one. For a
+ * pager, a nuisance true positive beats a comfortable false negative every
+ * time. The real improvement is a periodic synthetic liveness send whose
+ * success clears the streak; that is a design change, filed rather than
+ * smuggled in here.
  */
 function rollDropWindow(nowMs: number): void {
   if (nowMs - dropWindowStartedMs < DROP_WINDOW_MS) return;
   dropWindowStartedMs = nowMs;
   droppedInWindow = 0;
+  droppedAtCeilingInWindow = 0;
   transportFailuresInWindow = 0;
 }
 
@@ -910,8 +1008,14 @@ function parseDsn(dsn: string): ParsedDsn {
   const publicKey = url.username;
   // Trailing slashes are the failure D20-A2 §A2.4.1 executed: `.../42/` built
   // `POST /api/42//envelope/`, which Sentry 404s — silently, forever, on a
-  // process that believes it has a pager. A non-empty check is not a shape
-  // check, so this asserts the SHAPE and refuses at boot: fail CLOSED.
+  // process that believes it has a pager. They are STRIPPED here, not refused:
+  // `https://<key>@<host>/42/` is a well-formed DSN that a copy-paste picked up
+  // a slash on, and it names project 42 unambiguously, so normalising it is
+  // right. What is refused, below, is a URL that is not a DSN at all — no key,
+  // no project id, or a non-numeric one. A non-empty check is not a shape
+  // check; those are the SHAPE checks, and they fail CLOSED at boot.
+  // (D20-A7.2: this paragraph used to attach "refuses at boot: fail CLOSED" to
+  // the trailing slash, describing a refusal that never happens.)
   const projectId = url.pathname.replace(/^\/+/, '').replace(/\/+$/, '');
   if (publicKey.length === 0 || projectId.length === 0) {
     throw new Error(
@@ -1153,8 +1257,14 @@ function fallbackMessage(extra: Record<string, unknown>): string {
  */
 function reportTransportFailure(event: AlarmEvent, err: unknown): void {
   const nowMs = Date.now();
-  consecutiveTransportFailures += 1;
+  // Roll FIRST, count after — both counters, since D20-A7.2 put
+  // `consecutiveTransportFailures` inside this window too. Incrementing before
+  // the roll would let a failure be zeroed by its own roll: the first failure
+  // after an idle hour would read 0 instead of 1, which is the same
+  // "recorded into a counter that immediately forgot it" shape as the finding
+  // this round exists to close.
   rollDropWindow(nowMs);
+  consecutiveTransportFailures += 1;
   transportFailuresInWindow += 1;
   lastFailureAt = new Date(nowMs).toISOString();
   try {

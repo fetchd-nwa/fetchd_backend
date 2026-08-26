@@ -85,11 +85,52 @@ export const MAX_RECENT_DROPPED_ALARMS = 200;
  * resets the consecutive counter, so a transport rejecting every other send
  * destroyed 30 of 60 pages while this endpoint answered `200` with
  * `reasons: []` (executed, round 3). Both checks stay live and neither is
- * redundant — this one is time-boxed to the hour and sees non-consecutive loss;
- * the consecutive one has no window and still catches a streak that straddles
- * an hour boundary.
+ * redundant — this one sees non-consecutive loss, the other sees a streak with
+ * successes absent rather than merely outnumbered. Since D20-A7.2 they share
+ * the same hour: the consecutive counter now ages out on the same window roll,
+ * because it was the only 503 reason with no clearing path and one blip latched
+ * it red indefinitely. Named cost of that: neither check sees a streak that
+ * STRADDLES an hour boundary any more — the earlier version of this paragraph
+ * claimed the consecutive one did, and after A7.2 that would be false.
  */
 export const MAX_RECENT_TRANSPORT_FAILURES = 3;
+
+/**
+ * Alarms shed at `MAX_IN_FLIGHT` inside one `DROP_WINDOW_MS` (D20-A7.1). These
+ * are counted by {@link MAX_RECENT_DROPPED_ALARMS} as well, and that is exactly
+ * why they need their own reason: that threshold is 200 because the drops it
+ * mostly sees are DE-DUPLICATIONS, where an identical page already went out and
+ * the drop is the mechanism working. A drop at the in-flight ceiling is the
+ * opposite — a first-ever event, possibly the first LOST HOLD of the day,
+ * withheld because the transport was slow. Round 4 executed it: 256 unsettled
+ * sends, one shed money alarm, `GET /health/watchdog` answering `200 ok`,
+ * `reasons: []`, with the breaker nowhere near its ceiling. That falsified
+ * §A4.1.5's own words — a drop at the ceiling "counts and trips the watchdog
+ * like any other drop". It counted. It did not trip.
+ *
+ * **ONE, and A7.1 asked for three — the deviation is deliberate and is flagged
+ * to Allison rather than buried.** A7.1 says "threshold 3, mirroring
+ * `MAX_RECENT_TRANSPORT_FAILURES`" and, in the same breath, that its red-first
+ * instrument (`scratchpad/attack-r4-d20/p11-green.ts`) "must go 503". Executed,
+ * those two clauses cannot both hold: p11 fills the ceiling with 256 unsettled
+ * sends and then sheds **exactly one** money alarm, so at a threshold of 3 it
+ * answers `200 ok` with `reasons: []` — measured, with `dropped_at_ceiling_
+ * recent: 1` sitting in the body. That is the identical failure one gate over:
+ * a real drop recorded in a counter no threshold can see. A7.1's own words for
+ * it are "one drop trips nothing", named as THE defect.
+ *
+ * On the merits, 1 is also the right number here, which is why it was safe to
+ * resolve the contradiction this way rather than stop. The 3-and-200 thresholds
+ * both exist to keep a COMMON, benign event from training the monitor's reader
+ * to ignore the endpoint: transport blips flap, and de-duplication drops are
+ * the mechanism working. A drop here is neither. A7.1 measured that reaching
+ * 256 concurrent needs ~51 alarms/s against a 5s-degraded ingest, "which this
+ * system does not produce today", so there is no routine traffic to desensitise
+ * anyone — and the single event this fires on is a first-ever page, possibly
+ * the first LOST HOLD of the day, withheld having never been sent. That is a
+ * literal violation of §A4.1's invariant, and one is worth a 503.
+ */
+export const MAX_RECENT_CEILING_DROPS = 1;
 
 /**
  * How far a heartbeat may sit in the FUTURE before it is treated as a fault
@@ -185,6 +226,19 @@ export function registerHealthWatchdogRoute(app: FastifyInstance): void {
         `pager LOST ${pager.transport_failures_recent} alarms to failed delivery in the last ` +
           `${pager.drop_window_s / 60} minutes (threshold ${MAX_RECENT_TRANSPORT_FAILURES}) — ` +
           `not consecutive, so the failure streak keeps clearing; the log remains the record`,
+      );
+    }
+    if (pager.dropped_at_ceiling_recent >= MAX_RECENT_CEILING_DROPS) {
+      // §A7.1. Checked SEPARATELY from the aggregate below and before it: these
+      // drops are a subset of that number, but at a threshold of 200 a handful
+      // of them move nothing, and a handful of them is a first-ever money alarm
+      // reaching nobody. Named in its own sentence so the alert says the pager
+      // was SATURATED rather than that it de-duplicated.
+      reasons.push(
+        `pager shed ${pager.dropped_at_ceiling_recent} alarms at the in-flight ceiling in the ` +
+          `last ${pager.drop_window_s / 60} minutes (threshold ${MAX_RECENT_CEILING_DROPS}) — ` +
+          `these were NEVER sent, not de-duplicated: the transport was saturated and the ` +
+          `pager withheld events it had never delivered; the log remains the record`,
       );
     }
     if (pager.dropped_alarms_recent >= MAX_RECENT_DROPPED_ALARMS) {

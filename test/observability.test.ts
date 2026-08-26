@@ -11,12 +11,16 @@ import {
   pagerHealth,
   CATASTROPHIC_HOURLY_CEILING,
   DEDUPE_WINDOW_MS,
+  DROP_WINDOW_MS,
   IDENTICAL_ALLOWANCE,
   MAX_IN_FLIGHT,
   type AlarmEvent,
   type AlarmTransport,
 } from '../src/lib/observability.js';
-import { MAX_CONSECUTIVE_TRANSPORT_FAILURES } from '../src/routes/healthWatchdog.js';
+import {
+  MAX_CONSECUTIVE_TRANSPORT_FAILURES,
+  MAX_RECENT_CEILING_DROPS,
+} from '../src/routes/healthWatchdog.js';
 
 /**
  * Unit coverage for the Day-20 pager (`src/lib/observability.ts`). Pure — no
@@ -460,7 +464,20 @@ test('dedupe: 12 DISTINCT lost holds all page — the sentence is shared, the mo
   const chargeIds = transport.events.map((e) => (e.extra as Record<string, unknown>)['chargeId']);
   assert.deepStrictEqual(
     [...new Set(chargeIds)].sort(),
-    ['ch_1', 'ch_10', 'ch_11', 'ch_12', 'ch_2', 'ch_3', 'ch_4', 'ch_5', 'ch_6', 'ch_7', 'ch_8', 'ch_9'],
+    [
+      'ch_1',
+      'ch_10',
+      'ch_11',
+      'ch_12',
+      'ch_2',
+      'ch_3',
+      'ch_4',
+      'ch_5',
+      'ch_6',
+      'ch_7',
+      'ch_8',
+      'ch_9',
+    ],
     'all twelve charges, none collapsed',
   );
 });
@@ -523,7 +540,11 @@ test('dedupe: a fatal page arrives after every other alarm has been suppressed',
   // withheld. `drain()` between them because the allowance is spent on DELIVERY
   // now (§A5.3), and an unsettled send has not delivered anything.
   for (let i = 0; i < 60; i += 1) {
-    captureAlarm({ message: `phase boundary: worker phase ${i} threw`, level: 'error', logger: 'pino' });
+    captureAlarm({
+      message: `phase boundary: worker phase ${i} threw`,
+      level: 'error',
+      logger: 'pino',
+    });
     await drain();
   }
   const beforeCrash = transport.events.length;
@@ -591,7 +612,12 @@ test('dedupe: three FAILED deliveries do not burn the allowance (§A5.3)', async
 
   await withCapturedStderr(async () => {
     for (let i = 0; i < 3 * IDENTICAL_ALLOWANCE; i += 1) {
-      captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { chargeId: 'ch_1' } });
+      captureAlarm({
+        message: 'LOST HOLD',
+        level: 'error',
+        logger: 'pino',
+        extra: { chargeId: 'ch_1' },
+      });
       await drain();
     }
   });
@@ -607,7 +633,12 @@ test('dedupe: three FAILED deliveries do not burn the allowance (§A5.3)', async
   rejecting = false;
   attempts.length = 0;
   for (let i = 0; i < 20; i += 1) {
-    captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { chargeId: 'ch_1' } });
+    captureAlarm({
+      message: 'LOST HOLD',
+      level: 'error',
+      logger: 'pino',
+      extra: { chargeId: 'ch_1' },
+    });
     await drain();
   }
   assert.equal(
@@ -683,7 +714,12 @@ test('dedupe: DIFFERENT nested errors under one sentence are different alarms (�
     new Error('invoice settle: refund exceeded charge amount'),
   ];
   for (const err of faults) {
-    captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino', extra: { reqId: 'req-1', err } });
+    captureAlarm({
+      message: 'unhandled error',
+      level: 'error',
+      logger: 'pino',
+      extra: { reqId: 'req-1', err },
+    });
     await drain();
   }
   assert.equal(
@@ -714,9 +750,19 @@ test('dedupe: DIFFERENT nested errors under one sentence are different alarms (�
 
   // …and a TypeError is not an Error, even word for word.
   transport.events.length = 0;
-  captureAlarm({ message: 'boom', level: 'error', logger: 'pino', extra: { err: new Error('same words') } });
+  captureAlarm({
+    message: 'boom',
+    level: 'error',
+    logger: 'pino',
+    extra: { err: new Error('same words') },
+  });
   await drain();
-  captureAlarm({ message: 'boom', level: 'error', logger: 'pino', extra: { err: new TypeError('same words') } });
+  captureAlarm({
+    message: 'boom',
+    level: 'error',
+    logger: 'pino',
+    extra: { err: new TypeError('same words') },
+  });
   await drain();
   assert.equal(transport.events.length, 2, 'the error CLASS is part of the identity');
 });
@@ -964,7 +1010,11 @@ test('MAX_IN_FLIGHT: unsettled sends stop accumulating, exactly at the bound, co
     }
   });
 
-  assert.equal(started, MAX_IN_FLIGHT, `at most MAX_IN_FLIGHT concurrent sends; started ${started}`);
+  assert.equal(
+    started,
+    MAX_IN_FLIGHT,
+    `at most MAX_IN_FLIGHT concurrent sends; started ${started}`,
+  );
   const health = pagerHealth();
   assert.equal(health.in_flight, MAX_IN_FLIGHT, 'never MAX_IN_FLIGHT + 1');
   assert.equal(
@@ -1109,7 +1159,12 @@ test('pagerHealth: a FLAPPING transport is counted, though the failure streak ke
     for (let i = 0; i < 60; i += 1) {
       // Distinct money, so nothing here is de-duplication: sixty alarms, sixty
       // sends, thirty of them lost.
-      captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { chargeId: `ch_${i}` } });
+      captureAlarm({
+        message: 'LOST HOLD',
+        level: 'error',
+        logger: 'pino',
+        extra: { chargeId: `ch_${i}` },
+      });
       await drain();
     }
   });
@@ -1150,4 +1205,327 @@ test('flushObservability: awaits in-flight sends, and gives up at the timeout', 
   release?.();
   await flushObservability(500);
   assert.equal(settled, true);
+});
+
+// ---- D20-A7: the two scarcity gates, and the counters that can see them ----
+
+test('MAX_IN_FLIGHT: ONE drop at the ceiling is visible to the watchdog (§A7.1)', async () => {
+  // Round 4's finding. `dropped_alarms_recent` counts this drop, but its
+  // threshold is 200 because the drops it mostly sees are de-duplications —
+  // the mechanism WORKING, an identical page already delivered. A drop here is
+  // the opposite: a first-ever event the pager never sent. Folded together, one
+  // shed money alarm moved a number nothing was watching and `GET
+  // /health/watchdog` answered 200 `ok`, `reasons: []`.
+  const hanging: AlarmTransport = {
+    send(): Promise<void> {
+      return new Promise<void>(() => undefined);
+    },
+  };
+  initObservability({ transport: hanging, installProcessHandlers: false });
+
+  await withCapturedStderr(() => {
+    for (let i = 0; i < MAX_IN_FLIGHT; i += 1) {
+      captureAlarm({
+        message: 'a distinct alarm',
+        level: 'error',
+        logger: 'pino',
+        extra: { conditionId: `c-${String.fromCharCode(97 + (i % 26))}${i}` },
+      });
+    }
+    // A FIRST-EVER money alarm, arriving at a saturated transport.
+    captureAlarm({
+      message: 'LOST HOLD: a dog is enrolled and its authorization is CANCELLED',
+      level: 'error',
+      logger: 'pino',
+      extra: { chargeId: 'ch_never_seen_before', amountCents: 12000 },
+    });
+  });
+
+  const health = pagerHealth();
+  assert.equal(health.dropped_at_ceiling_recent, 1, 'the ceiling drop has its own counter');
+  assert.equal(health.dropped_alarms_recent, 1, 'and is still part of the aggregate');
+  assert.ok(
+    health.dropped_at_ceiling_recent >= MAX_RECENT_CEILING_DROPS,
+    `ONE such drop must reach the watchdog's threshold — that is the whole finding. ` +
+      `Counter read ${health.dropped_at_ceiling_recent}, threshold ${MAX_RECENT_CEILING_DROPS}`,
+  );
+});
+
+test('MAX_IN_FLIGHT: a fatal page bypasses the ceiling WITHOUT counting a ceiling drop', async () => {
+  // The bypass must not be accounted as a shed page, or the crash handler would
+  // 503 the watchdog on its way out and libel a transport that took the event.
+  const hanging: AlarmTransport = {
+    send(): Promise<void> {
+      return new Promise<void>(() => undefined);
+    },
+  };
+  initObservability({ transport: hanging, installProcessHandlers: false });
+
+  await withCapturedStderr(() => {
+    for (let i = 0; i < MAX_IN_FLIGHT; i += 1) {
+      captureAlarm({
+        message: 'a distinct alarm',
+        level: 'error',
+        logger: 'pino',
+        extra: { conditionId: `c-${String.fromCharCode(97 + (i % 26))}${i}` },
+      });
+    }
+    captureAlarm({ message: 'uncaughtException: boom', level: 'fatal', logger: 'process' });
+  });
+
+  assert.equal(pagerHealth().dropped_at_ceiling_recent, 0, 'a bypass is not a drop');
+});
+
+test('dedupe drops are NOT counted as ceiling drops — the two are judged apart (§A7.1)', async () => {
+  const transport = makeRecordingTransport();
+  initObservability({ transport, installProcessHandlers: false });
+
+  await withCapturedStderr(async () => {
+    for (let i = 0; i < IDENTICAL_ALLOWANCE + 5; i += 1) {
+      captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino' });
+      await drain();
+    }
+  });
+
+  const health = pagerHealth();
+  assert.equal(health.dropped_alarms_recent, 5, 'five suppressed by de-duplication');
+  assert.equal(
+    health.dropped_at_ceiling_recent,
+    0,
+    'a suppression is the mechanism working; conflating it with saturation would ' +
+      '503 the watchdog on ordinary de-duplication',
+  );
+});
+
+test('pagerHealth: the ceiling counter ages out with its window (§A7.1)', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  t.after(() => t.mock.timers.reset());
+
+  const hanging: AlarmTransport = {
+    send(): Promise<void> {
+      return new Promise<void>(() => undefined);
+    },
+  };
+  initObservability({ transport: hanging, installProcessHandlers: false });
+  await withCapturedStderr(() => {
+    for (let i = 0; i < MAX_IN_FLIGHT + 3; i += 1) {
+      captureAlarm({
+        message: 'a distinct alarm',
+        level: 'error',
+        logger: 'pino',
+        extra: { conditionId: `c-${String.fromCharCode(97 + (i % 26))}${i}` },
+      });
+    }
+  });
+  assert.equal(pagerHealth().dropped_at_ceiling_recent, 3);
+
+  // A cumulative counter that only ever climbs would latch the 503 forever
+  // after one degraded hour — the same trap `dropped_alarms_recent` avoids.
+  t.mock.timers.tick(DROP_WINDOW_MS);
+  assert.equal(pagerHealth().dropped_at_ceiling_recent, 0, 'the window rolled');
+});
+
+test('pagerHealth: a failure streak is STICKY — silence must NOT clear it (§A8, reversing §A7.2)', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  t.after(() => t.mock.timers.reset());
+
+  const rejecting: AlarmTransport = {
+    send(): Promise<void> {
+      return Promise.reject(new Error('transient blip'));
+    },
+  };
+  initObservability({ transport: rejecting, installProcessHandlers: false });
+
+  await withCapturedStderr(async () => {
+    for (let i = 0; i < MAX_CONSECUTIVE_TRANSPORT_FAILURES; i += 1) {
+      captureAlarm({ message: `blip ${i}`, level: 'error', logger: 'pino' });
+      await flushObservability(500);
+    }
+  });
+  assert.equal(
+    pagerHealth().consecutive_transport_failures,
+    MAX_CONSECUTIVE_TRANSPORT_FAILURES,
+    'three failed sends, watchdog red',
+  );
+
+  // §A7.2 ruled that an hour of silence should clear this, to stop one blip
+  // latching the watchdog red. Building it revealed the cost: with BOTH
+  // counters windowed, a transport failing EVERY send while alarms arrive
+  // sparser than once an hour reaches neither threshold — a permanently dead
+  // pager reading healthy in exactly the low-traffic regime this system is
+  // designed for. That is this cycle's own defect, one gate over, so §A7.2 was
+  // REVERSED (§A8).
+  //
+  // A latched 503 is not a false positive: it says "the pager failed and
+  // nothing has proven it works since", which is TRUE. Its clearing condition
+  // is a send that actually succeeds — which is the assertion below, and the
+  // only honest one.
+  t.mock.timers.tick(DROP_WINDOW_MS * 2);
+  assert.equal(
+    pagerHealth().consecutive_transport_failures,
+    MAX_CONSECUTIVE_TRANSPORT_FAILURES,
+    'silence must NOT clear the streak — a dead pager reading healthy is the defect this cycle exists to abolish',
+  );
+  assert.equal(
+    pagerHealth().transport_failures_recent,
+    0,
+    'the WINDOWED sibling still ages — the two counters answer different questions',
+  );
+
+  // Only a delivered page clears it.
+  initObservability({
+    transport: {
+      send(): Promise<void> {
+        return Promise.resolve();
+      },
+    },
+    installProcessHandlers: false,
+  });
+  captureAlarm({ message: 'a page that lands', level: 'error', logger: 'pino' });
+  await flushObservability(500);
+  assert.equal(
+    pagerHealth().consecutive_transport_failures,
+    0,
+    'a send that actually succeeded is the one honest clearing condition',
+  );
+});
+
+test('pagerHealth: the first failure after an idle window COUNTS as 1, not 0 (§A7.2)', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  t.after(() => t.mock.timers.reset());
+
+  const rejecting: AlarmTransport = {
+    send(): Promise<void> {
+      return Promise.reject(new Error('blip'));
+    },
+  };
+  initObservability({ transport: rejecting, installProcessHandlers: false });
+
+  // Putting the streak counter inside the drop window means the failure path
+  // now both ROLLS and COUNTS. Get that order wrong — count, then roll — and a
+  // failure arriving after an idle hour is zeroed by its own roll and reads 0.
+  // That is the same "recorded into a counter that immediately forgot it" shape
+  // as §A7.1 itself, one line over, so it is pinned rather than reasoned about.
+  //
+  // §A8 then reversed A7.2 and took the streak back OUT of the window, so the
+  // two counters now answer different questions and this pins BOTH: the
+  // windowed sibling restarts each hour, the sticky streak accumulates across
+  // hours until a send actually succeeds.
+  await withCapturedStderr(async () => {
+    captureAlarm({ message: 'first blip of the hour', level: 'error', logger: 'pino' });
+    await flushObservability(500);
+  });
+  assert.equal(pagerHealth().consecutive_transport_failures, 1);
+  assert.equal(pagerHealth().transport_failures_recent, 1);
+
+  t.mock.timers.tick(DROP_WINDOW_MS);
+  await withCapturedStderr(async () => {
+    captureAlarm({ message: 'first blip of the NEXT hour', level: 'error', logger: 'pino' });
+    await flushObservability(500);
+  });
+  const health = pagerHealth();
+  assert.equal(
+    health.consecutive_transport_failures,
+    2,
+    'the streak is STICKY: it crosses the hour boundary, because nothing has succeeded yet',
+  );
+  assert.equal(
+    health.transport_failures_recent,
+    1,
+    'the WINDOWED sibling restarts at 1 — and never at 0, which is the roll-then-count ordering this pins',
+  );
+});
+
+// ---- D20-A7.2: a weird payload degrades the fingerprint, never loses the page ----
+
+/** An `Error` whose `message` is not a string — what a library can hand us. */
+function errorWithMessage(message: unknown): Error {
+  const err = new Error('placeholder');
+  Object.defineProperty(err, 'message', { value: message, enumerable: false, configurable: true });
+  return err;
+}
+
+test('fingerprint: a non-string Error.message cannot lose the alarm (§A7.2)', async () => {
+  // The throw escaped `identifyingExtra` to `captureAlarm`'s catch, which treats
+  // every exception as a TRANSPORT failure. Three consequences, all wrong: the
+  // event was never handed over, it was ABSENT from drop accounting, and it
+  // incremented the delivery counters — so three of them produced a 503 reading
+  // "pager LOST 3 alarms to failed delivery" about events the transport never
+  // saw.
+  const shapes: Array<[string, Record<string, unknown>]> = [
+    ['message: number', { err: errorWithMessage(42) }],
+    ['message: undefined', { err: errorWithMessage(undefined) }],
+    ['message: Symbol', { err: errorWithMessage(Symbol('boom')) }],
+    [
+      'a throwing getter in extra',
+      Object.defineProperty({}, 'chargeId', {
+        get(): never {
+          throw new Error('getter exploded');
+        },
+        enumerable: true,
+      }) as Record<string, unknown>,
+    ],
+  ];
+
+  for (const [label, extra] of shapes) {
+    const transport = makeRecordingTransport();
+    initObservability({ transport, installProcessHandlers: false });
+    await withCapturedStderr(async () => {
+      captureAlarm({ message: 'LOST HOLD: money is stuck', level: 'error', logger: 'pino', extra });
+      await flushObservability(500);
+    });
+
+    assert.equal(transport.events.length, 1, `${label}: the page must still go out`);
+    const health = pagerHealth();
+    assert.equal(health.transport_failures_recent, 0, `${label}: the transport never failed`);
+    assert.equal(health.consecutive_transport_failures, 0, `${label}: nor did it fail in a row`);
+    assert.equal(health.dropped_alarms, 0, `${label}: nothing was withheld either`);
+  }
+});
+
+test('fingerprint: an unreadable key still de-duplicates against its own repeats (§A7.2)', async () => {
+  // Degrading must not mean "every weird payload is one alarm forever, or a new
+  // alarm every time". An unreadable key contributes a stable part, so repeats
+  // collapse and a DIFFERENT readable key still splits.
+  const transport = makeRecordingTransport();
+  initObservability({ transport, installProcessHandlers: false });
+
+  const unreadable = (): Record<string, unknown> =>
+    Object.defineProperty({}, 'err', {
+      get(): never {
+        throw new Error('nope');
+      },
+      enumerable: true,
+    }) as Record<string, unknown>;
+
+  await withCapturedStderr(async () => {
+    for (let i = 0; i < IDENTICAL_ALLOWANCE + 2; i += 1) {
+      captureAlarm({
+        message: 'unhandled error',
+        level: 'error',
+        logger: 'pino',
+        extra: unreadable(),
+      });
+      await drain();
+    }
+  });
+  assert.equal(
+    transport.events.length,
+    IDENTICAL_ALLOWANCE,
+    'identical unreadable payloads de-duplicate like anything else',
+  );
+
+  // …and the money still splits: a readable identifying scalar beside the
+  // unreadable key keeps ch_1 and ch_2 apart.
+  for (const chargeId of ['ch_1', 'ch_2']) {
+    const extra = unreadable();
+    Object.defineProperty(extra, 'chargeId', { value: chargeId, enumerable: true });
+    captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino', extra });
+    await drain();
+  }
+  assert.equal(
+    transport.events.length,
+    IDENTICAL_ALLOWANCE + 2,
+    'ch_1 and ch_2 are different money, unreadable neighbour or not',
+  );
 });

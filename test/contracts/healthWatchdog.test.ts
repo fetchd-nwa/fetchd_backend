@@ -8,6 +8,7 @@ import {
   flushObservability,
   initObservability,
   IDENTICAL_ALLOWANCE,
+  MAX_IN_FLIGHT,
   type AlarmTransport,
 } from '../../src/lib/observability.js';
 import {
@@ -17,6 +18,7 @@ import {
 import { closeRedis, redis } from '../../src/redis.js';
 import { registerWorkersTickRoute } from '../../src/routes/workersTick.js';
 import {
+  MAX_RECENT_CEILING_DROPS,
   MAX_RECENT_DROPPED_ALARMS,
   SCHEDULER_STALE_AFTER_MS,
 } from '../../src/routes/healthWatchdog.js';
@@ -70,6 +72,7 @@ interface WatchdogBody {
     transport_failures_recent: number;
     dropped_alarms: number;
     dropped_alarms_recent: number;
+    dropped_at_ceiling_recent: number;
     catastrophic_ceiling_tripped_at: string | null;
   };
   reasons: string[];
@@ -213,6 +216,67 @@ test('sustained dropped alarms → 503, because the only consumer reads a status
   );
   // The scheduler half is untouched — the endpoint separates its conditions.
   assert.ok(!body.reasons.some((r) => r.includes('scheduler tick')));
+});
+
+test('ONE alarm shed at the in-flight ceiling → 503, not a silent 200 (§A7.1)', async () => {
+  // Round 4's finding, and the second exception to §A4.1's invariant. A slow
+  // ingest fills MAX_IN_FLIGHT with unsettled sends; the very next event — a
+  // FIRST-EVER lost hold, nothing identical ever delivered — is shed. It landed
+  // only in `dropped_alarms_recent`, whose threshold is 200 for de-duplication's
+  // sake, so this endpoint answered `200 ok`, `reasons: []` with the breaker
+  // nowhere near its ceiling. That falsified §A4.1.5's own words: a drop at the
+  // ceiling "counts and trips the watchdog like any other drop". It counted. It
+  // did not trip.
+  const hanging: AlarmTransport = {
+    send(): Promise<void> {
+      return new Promise<void>(() => undefined);
+    },
+  };
+  initObservability({ transport: hanging, installProcessHandlers: false });
+  await setHeartbeat(new Date());
+
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    for (let i = 0; i < MAX_IN_FLIGHT; i += 1) {
+      captureAlarm({
+        message: 'a distinct alarm',
+        level: 'error',
+        logger: 'pino',
+        extra: { conditionId: `c-${String.fromCharCode(97 + (i % 26))}${i}` },
+      });
+    }
+    captureAlarm({
+      message: 'LOST HOLD: a dog is enrolled and its authorization is CANCELLED',
+      level: 'error',
+      logger: 'pino',
+      extra: { chargeId: 'ch_never_seen_before', amountCents: 12000 },
+    });
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+
+  const { statusCode, body } = await readWatchdog();
+  assert.equal(
+    body.pager.dropped_at_ceiling_recent,
+    1,
+    `precondition: exactly one shed money alarm; got ${JSON.stringify(body.pager)}`,
+  );
+  assert.ok(
+    body.pager.dropped_alarms_recent < MAX_RECENT_DROPPED_ALARMS,
+    'and the aggregate counter is FAR below its own threshold — that is the finding',
+  );
+  assert.equal(statusCode, 503, JSON.stringify(body));
+  assert.ok(
+    body.reasons.some((r) => r.includes('in-flight ceiling')),
+    `the 503 must name the ceiling, not de-duplication; got ${JSON.stringify(body.reasons)}`,
+  );
+  assert.ok(
+    MAX_RECENT_CEILING_DROPS <= 1,
+    'a threshold above 1 cannot see this case, which is the whole finding',
+  );
+  // The breaker is a DIFFERENT scarcity gate and must not be implicated.
+  assert.equal(body.pager.catastrophic_ceiling_tripped_at, null);
 });
 
 test('a FLAPPING pager → 503, though every OTHER send succeeded (§A5.3)', async () => {

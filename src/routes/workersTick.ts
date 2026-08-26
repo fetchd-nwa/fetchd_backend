@@ -106,6 +106,14 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
     // DISCREPANCIES NOTE-39; nominating the line as the authority made closing
     // it this cycle's job.) Additive only — every pre-existing key keeps its
     // name and meaning, so anything already reading them still works.
+    //
+    // "EVERY phase's counters" means every LEAF, not every phase (D20-A7.2).
+    // All 11 phases were present while 7 leaves were not: both
+    // `abandonedTruncated` flags and all 5 `abandonedByClass` members. Nothing
+    // logged understated a total — `abandoned` is the true count — but this
+    // line is the nominated authority, so a leaf missing from it is a leaf a
+    // human reading the log cannot get to. Making the sentence true was the
+    // ruling both times it came up; weakening it was not.
     request.log.info(
       {
         workerTick: 'scheduler',
@@ -126,9 +134,25 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
         captureReconcilerSettledInvoices: result.captureReconciler.settledInvoices,
         captureReconcilerAbandoned: result.captureReconciler.abandoned,
         captureReconcilerAbandonedUncollected: result.captureReconciler.abandonedUncollected,
+        captureReconcilerAbandonedTruncated: result.captureReconciler.abandonedTruncated,
         duplicateRefundRetryScanned: result.duplicateRefundRetry.scanned,
         duplicateRefundRetrySent: result.duplicateRefundRetry.sent,
         duplicateRefundRetryAbandoned: result.duplicateRefundRetry.abandoned,
+        duplicateRefundRetryAbandonedTruncated: result.duplicateRefundRetry.abandonedTruncated,
+        // The abandoned rows split by what a human can DO about each. `abandoned`
+        // above is the true total and never understates, so these add WHICH
+        // remediation is owed, not how much — and the truncation flags say
+        // whether the alarm beside them could name rows or only classes.
+        duplicateRefundRetryAbandonedRowKeyed:
+          result.duplicateRefundRetry.abandonedByClass['row-keyed'],
+        duplicateRefundRetryAbandonedClientKeyed:
+          result.duplicateRefundRetry.abandonedByClass['client-keyed'],
+        duplicateRefundRetryAbandonedNeverSent:
+          result.duplicateRefundRetry.abandonedByClass['never-sent'],
+        duplicateRefundRetryAbandonedStripeFailed:
+          result.duplicateRefundRetry.abandonedByClass['stripe-failed'],
+        duplicateRefundRetryAbandonedCovered:
+          result.duplicateRefundRetry.abandonedByClass.covered,
         invoicesScanned: result.invoiceAutoCharge.scanned,
         mediaDerivativesScanned: result.mediaDerivatives.scanned,
         creditExpiryWarningsScanned: result.creditExpiryWarnings.scanned,

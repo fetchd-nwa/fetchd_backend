@@ -55,8 +55,27 @@ const TICK_RESULT_JSON = JSON.stringify({
     settledInvoices: 0,
     abandoned: 0,
     abandonedUncollected: 0,
+    abandonedTruncated: false,
   },
-  duplicateRefundRetry: { scanned: 0, sent: 0, abandoned: 0 },
+  // Every LEAF, not just every phase (D20-A7.2). This object is a JSON string
+  // spliced into a subprocess, so no typecheck guards it — when the completion
+  // line grew the two `abandonedTruncated` flags and the five `abandonedByClass`
+  // members, the omission surfaced as the tick answering 500 and BOTH tests
+  // here failing on "a heartbeat is not allowed to fail a tick that moved
+  // money", which is the wrong failure exactly as the note above predicts.
+  duplicateRefundRetry: {
+    scanned: 0,
+    sent: 0,
+    abandoned: 0,
+    abandonedTruncated: false,
+    abandonedByClass: {
+      'row-keyed': 0,
+      'client-keyed': 0,
+      'never-sent': 0,
+      'stripe-failed': 0,
+      covered: 0,
+    },
+  },
   invoiceAutoCharge: { scanned: 0 },
   mediaDerivatives: { scanned: 0 },
   creditExpiryWarnings: { scanned: 0, enqueued: 0 },
