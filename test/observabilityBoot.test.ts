@@ -53,8 +53,13 @@ const BASE_ENV: Record<string, string> = {
   R2_BUCKET: 'nwa-media-test',
 };
 
-/** Obviously fake, never dialed. `.invalid` is RFC 2606's reserved TLD. */
-const UNREACHABLE_DSN = 'https://not-a-real-key@example.sentry.invalid/0';
+/**
+ * Obviously fake, never dialed. `.invalid` is RFC 2606's reserved TLD. The
+ * project id is `424242` rather than `0` because `0` is Sentry's own example
+ * project id and now fails CLOSED at boot (D20-A5.4) — a DSN that no longer
+ * parses would fail these tests on the wrong step.
+ */
+const UNREACHABLE_DSN = 'https://not-a-real-key@example.sentry.invalid/424242';
 
 interface CapturedEnvelope {
   url: string;

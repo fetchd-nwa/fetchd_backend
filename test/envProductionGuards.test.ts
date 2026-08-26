@@ -40,8 +40,12 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
  * Obviously fake, never dialed. It exists only to satisfy `z.string().url()`;
  * `.invalid` is the reserved never-resolvable TLD (RFC 2606). A real DSN is a
  * write credential for a Sentry project and never belongs in a repo.
+ *
+ * The project id is `424242`, not `0`: `0` is the project id in Sentry's own
+ * example DSN and fails CLOSED at boot since D20-A5.4, which would make these
+ * guards refuse for a reason none of them is about.
  */
-const PLACEHOLDER_DSN = 'https://not-a-real-key@example.sentry.invalid/0';
+const PLACEHOLDER_DSN = 'https://not-a-real-key@example.sentry.invalid/424242';
 
 /**
  * Everything `env.ts` requires, minus the Day-20 vars under test. Values are

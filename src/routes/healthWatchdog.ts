@@ -72,6 +72,26 @@ export const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
 export const MAX_RECENT_DROPPED_ALARMS = 200;
 
 /**
+ * Sends the pager ATTEMPTED and lost inside one `DROP_WINDOW_MS`, consecutive
+ * or not, that make delivery itself the incident (D20-A5.3 — §A3.4.3 as it was
+ * originally ruled). Deliberately not folded into
+ * {@link MAX_RECENT_DROPPED_ALARMS}: the two counters mean opposite things. A
+ * suppression is the mechanism WORKING — an identical page already went out —
+ * which is why that threshold sits at 200. Every one of THESE is a page that
+ * reached nobody, so the honest threshold is small.
+ *
+ * Three, the same count as {@link MAX_CONSECUTIVE_TRANSPORT_FAILURES}, because
+ * the hole this closes is the pager that FLAPS rather than dies: any success
+ * resets the consecutive counter, so a transport rejecting every other send
+ * destroyed 30 of 60 pages while this endpoint answered `200` with
+ * `reasons: []` (executed, round 3). Both checks stay live and neither is
+ * redundant — this one is time-boxed to the hour and sees non-consecutive loss;
+ * the consecutive one has no window and still catches a streak that straddles
+ * an hour boundary.
+ */
+export const MAX_RECENT_TRANSPORT_FAILURES = 3;
+
+/**
  * How far a heartbeat may sit in the FUTURE before it is treated as a fault
  * rather than as noise. The writer and the reader are the same process family
  * on one clock, so a real negative reading means the clock moved — but an NTP
@@ -99,25 +119,29 @@ export function registerHealthWatchdogRoute(app: FastifyInstance): void {
     const pager = pagerHealth();
     const reasons: string[] = [];
 
-    let reading: HeartbeatReading | null = null;
-    try {
-      reading = await readSchedulerHeartbeat();
-    } catch {
-      // A watchdog that answers 200 when it cannot see is the instrument
-      // failure this endpoint exists to prevent. Fail closed.
-      reasons.push('heartbeat unreadable (redis)');
-    }
+    // Never rejects and never hangs since §A5.2 — "I cannot see" comes back as
+    // a reading of its own rather than as an exception the route has to guess
+    // the meaning of, or (against a reachable-but-silent Redis) as no answer at
+    // all. A watchdog that answers 200 when it cannot see is the instrument
+    // failure this endpoint exists to prevent; one that answers nothing is
+    // worse, because the monitor cannot tell it from a slow network.
+    const reading: HeartbeatReading = await readSchedulerHeartbeat();
 
-    const lastTickAt = reading !== null && reading.kind === 'recorded' ? reading.at : null;
+    const lastTickAt = reading.kind === 'recorded' ? reading.at : null;
     const stalenessMs = lastTickAt === null ? null : now.getTime() - lastTickAt.getTime();
 
-    if (reading !== null && reading.kind === 'absent') {
+    if (reading.kind === 'unreadable') {
+      reasons.push(
+        `scheduler heartbeat is UNREADABLE (${SCHEDULER_HEARTBEAT_KEY}): ${reading.reason} — ` +
+          `whether the scheduler is alive cannot be judged from here`,
+      );
+    } else if (reading.kind === 'absent') {
       // Absent, not merely old: the key's TTL is 24h, so "no key" means either
       // the scheduler has never run in this deployment or it has been silent
       // for a day. Both are the reported condition, and the first one IS
       // Allison's finding.
       reasons.push('no scheduler tick has been recorded');
-    } else if (reading !== null && reading.kind === 'unparseable') {
+    } else if (reading.kind === 'unparseable') {
       // §A4.5 L3. Its own reason, because "never recorded" would send the
       // reader to pg_cron for a fault that lives in this key.
       reasons.push(
@@ -150,6 +174,17 @@ export function registerHealthWatchdogRoute(app: FastifyInstance): void {
       reasons.push(
         `pager has failed ${pager.consecutive_transport_failures} consecutive sends ` +
           `(threshold ${MAX_CONSECUTIVE_TRANSPORT_FAILURES})`,
+      );
+    }
+    if (pager.transport_failures_recent >= MAX_RECENT_TRANSPORT_FAILURES) {
+      // §A3.4.3 as originally ruled, landed in §A5.3. The counter above resets
+      // on any success, so a FLAPPING pager — every other send rejected — kept
+      // it at 1 while half the pages went nowhere: 30 of 60 destroyed, `200`,
+      // `reasons: []`. Each of these is an alarm no human ever saw.
+      reasons.push(
+        `pager LOST ${pager.transport_failures_recent} alarms to failed delivery in the last ` +
+          `${pager.drop_window_s / 60} minutes (threshold ${MAX_RECENT_TRANSPORT_FAILURES}) — ` +
+          `not consecutive, so the failure streak keeps clearing; the log remains the record`,
       );
     }
     if (pager.dropped_alarms_recent >= MAX_RECENT_DROPPED_ALARMS) {

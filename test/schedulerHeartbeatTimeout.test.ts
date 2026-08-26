@@ -154,3 +154,95 @@ test('a WEDGED Redis cannot wedge the tick: 200 within 5s, heartbeat abandoned',
     );
   });
 });
+
+/**
+ * The same blackhole, one hop out: the READER (D20-A5.2).
+ *
+ * §A4.3 raced the write and left the read sixty lines below it untouched, so
+ * against a reachable-but-silent Redis `GET /health/watchdog` **never answered —
+ * still nothing after 45 seconds — and `app.close()` never returned either**.
+ * The endpoint whose entire job is to notice silence was the thing that went
+ * silent, and a monitor watching a status code cannot tell that from a slow
+ * network: no alert, ever.
+ *
+ * Subprocess for the same reason as above — `src/redis.ts` builds its client
+ * from `env.REDIS_URL` at module load — and the route is the REAL one.
+ */
+const WATCHDOG_PROGRAM = `
+  const { default: Fastify } = await import('fastify');
+  const { redis } = await import('./src/redis.js');
+  const { initObservability } = await import('./src/lib/observability.js');
+  const { registerHealthWatchdogRoute } = await import('./src/routes/healthWatchdog.js');
+  initObservability({ transport: { send: async () => {} }, installProcessHandlers: false });
+  const app = Fastify({ logger: false });
+  registerHealthWatchdogRoute(app);
+  await app.ready();
+  const startedAt = Date.now();
+  const response = await app.inject({ method: 'GET', url: '/health/watchdog' });
+  const answeredMs = Date.now() - startedAt;
+  const closedAt = Date.now();
+  await app.close();
+  process.stdout.write(JSON.stringify({
+    status: response.statusCode,
+    ms: answeredMs,
+    closeMs: Date.now() - closedAt,
+    reasons: JSON.parse(response.body).reasons,
+  }));
+  redis.disconnect();
+  process.exit(0);
+`;
+
+interface WatchdogOutcome {
+  status: number;
+  ms: number;
+  closeMs: number;
+  reasons: string[];
+}
+
+function runWatchdogAgainst(redisUrl: string): WatchdogOutcome | { killed: true } {
+  const result = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '-e', WATCHDOG_PROGRAM],
+    {
+      cwd: REPO_ROOT,
+      env: { ...process.env, REDIS_URL: redisUrl },
+      encoding: 'utf-8',
+      timeout: 20_000,
+      killSignal: 'SIGKILL',
+    },
+  );
+  if (result.stdout.trim().length === 0) return { killed: true };
+  return JSON.parse(result.stdout.trim()) as WatchdogOutcome;
+}
+
+test('control: against the real Redis the watchdog answers promptly', () => {
+  const redisUrl = process.env.REDIS_URL;
+  assert.ok(redisUrl !== undefined, 'this suite runs with REDIS_URL set');
+  const outcome = runWatchdogAgainst(redisUrl);
+  assert.ok(!('killed' in outcome), 'the control must not hang');
+  assert.ok(outcome.ms < 5_000, `control took ${outcome.ms}ms`);
+  assert.ok(
+    !outcome.reasons.some((r) => r.includes('UNREADABLE')),
+    `a readable Redis must never report unreadable; got ${JSON.stringify(outcome.reasons)}`,
+  );
+});
+
+test('a WEDGED Redis makes the watchdog say "I cannot see", not go silent (§A5.2)', async () => {
+  await withBlackhole((url) => {
+    const outcome = runWatchdogAgainst(url);
+    assert.ok(
+      !('killed' in outcome),
+      'the watchdog never answered against a blackhole — the monitor cannot tell that from a slow network, so nothing ever alerts',
+    );
+    assert.ok(outcome.ms < 5_000, `the read must be abandoned, not awaited forever; took ${outcome.ms}ms`);
+    assert.equal(outcome.status, 503, 'a watchdog that cannot see must fail CLOSED');
+    assert.ok(
+      outcome.reasons.some((r) => r.includes('UNREADABLE')),
+      `"I cannot see" must not masquerade as "the scheduler is dead"; got ${JSON.stringify(outcome.reasons)}`,
+    );
+    assert.ok(
+      outcome.closeMs < 5_000,
+      `app.close() must return — a wedged read held shutdown open too; took ${outcome.closeMs}ms`,
+    );
+  });
+});

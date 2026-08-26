@@ -173,6 +173,35 @@ test('buildApp(): the production app factory forwards request-level alarms to th
   );
 });
 
+test('buildApp(): a route that DEMOTES its own logger does not get to exist (§A5.5 I)', async () => {
+  // The sibling of `env.ts`'s `LOG_LEVEL=fatal` refusal. Fastify's per-route
+  // `logLevel` silences the tap on one route while the env guard stays
+  // satisfied — executed, `app.route({ logLevel: 'fatal' })` and the pager sees
+  // nothing. It used to be closed by a COMMENT saying no route sets it, which
+  // is an absence established by a search; this is the same claim as code.
+  const transport = makeRecordingTransport();
+  initObservability({ transport, installProcessHandlers: false });
+
+  const app = buildApp();
+  assert.throws(
+    () => app.get('/__d20-quiet-probe', { logLevel: 'fatal' }, async () => ({ ok: true })),
+    /logLevel/,
+    'a route that silences the pager must fail the build, not ship quietly',
+  );
+
+  // The control, and it is the load-bearing half: the guard must refuse ONLY
+  // that. An `onRoute` hook that threw on everything would also "pass" the
+  // assertion above while breaking every route in the app.
+  app.get('/__d20-loud-probe', async (request, reply) => {
+    request.log.error({ chargeId: 'ch_probe' }, 'LOST HOLD — probe alarm on an unguarded route');
+    return reply.code(204).send();
+  });
+  const response = await app.inject({ method: 'GET', url: '/__d20-loud-probe' });
+  await app.close();
+  assert.equal(response.statusCode, 204);
+  assert.equal(transport.events.length, 1, 'and a normal route still registers, and still pages');
+});
+
 // ---- 2. a worker alarm on POST /workers/tick reaches the pager -------------
 
 test('POST /workers/tick: a worker alarm on request.log reaches the pager, and the tick still 200s', async () => {

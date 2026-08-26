@@ -49,6 +49,16 @@ async function setHeartbeat(at: Date): Promise<void> {
   await redis.setex(SCHEDULER_HEARTBEAT_KEY, SCHEDULER_HEARTBEAT_TTL_S, at.toISOString());
 }
 
+/**
+ * Let every started send settle. The de-duplication allowance is spent when a
+ * send SUCCEEDS (D20-A5.3), so a loop that fires hundreds of alarms inside one
+ * event-loop turn de-duplicates nothing and measures `MAX_IN_FLIGHT` instead of
+ * the thing it meant to.
+ */
+async function drain(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 interface WatchdogBody {
   status: string;
   last_tick_at: string | null;
@@ -57,6 +67,7 @@ interface WatchdogBody {
   pager: {
     installed: boolean;
     consecutive_transport_failures: number;
+    transport_failures_recent: number;
     dropped_alarms: number;
     dropped_alarms_recent: number;
     catastrophic_ceiling_tripped_at: string | null;
@@ -178,10 +189,12 @@ test('sustained dropped alarms → 503, because the only consumer reads a status
   const originalWrite = process.stderr.write.bind(process.stderr);
   process.stderr.write = (() => true) as typeof process.stderr.write;
   try {
-    // One sentence, repeated far past the allowance: every copy after the
-    // third is a drop.
+    // One sentence, repeated far past the allowance: every copy after the third
+    // DELIVERED one is a drop, which is why each send is settled before the next
+    // is raised (§A5.3).
     for (let i = 0; i < MAX_RECENT_DROPPED_ALARMS + IDENTICAL_ALLOWANCE + 5; i += 1) {
       captureAlarm({ message: 'a repeated condition', level: 'error', logger: 'pino' });
+      await drain();
     }
     await flushObservability(500);
   } finally {
@@ -200,6 +213,78 @@ test('sustained dropped alarms → 503, because the only consumer reads a status
   );
   // The scheduler half is untouched — the endpoint separates its conditions.
   assert.ok(!body.reasons.some((r) => r.includes('scheduler tick')));
+});
+
+test('a FLAPPING pager → 503, though every OTHER send succeeded (§A5.3)', async () => {
+  // Round 3's finding C. `consecutive_transport_failures` is reset by any
+  // success, so a transport that rejects every other send destroyed 30 of 60
+  // pages and this endpoint answered 200 with `reasons: []`. D20-A3 §A3.4.3
+  // ruled transport failures countable and only the consecutive half was built.
+  let n = 0;
+  const flapping: AlarmTransport = {
+    send(): Promise<void> {
+      n += 1;
+      return n % 2 === 0 ? Promise.reject(new Error('ingest 503')) : Promise.resolve();
+    },
+  };
+  initObservability({ transport: flapping, installProcessHandlers: false });
+  await setHeartbeat(new Date());
+
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  try {
+    // Distinct money on every one: nothing here is de-duplication.
+    for (let i = 0; i < 60; i += 1) {
+      captureAlarm({
+        message: 'LOST HOLD',
+        level: 'error',
+        logger: 'pino',
+        extra: { chargeId: `ch_${i}` },
+      });
+      await drain();
+    }
+    await flushObservability(500);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+
+  const { statusCode, body } = await readWatchdog();
+  assert.ok(
+    body.pager.consecutive_transport_failures < 3,
+    `precondition: the streak counter cannot see this (it read ` +
+      `${body.pager.consecutive_transport_failures})`,
+  );
+  assert.equal(statusCode, 503, JSON.stringify(body));
+  assert.ok(
+    body.reasons.some((r) => r.includes('LOST') && r.includes('failed delivery')),
+    `half the pages were destroyed; the monitor must be told. Got ${JSON.stringify(body.reasons)}`,
+  );
+  // The scheduler half is untouched — the endpoint separates its conditions.
+  assert.ok(!body.reasons.some((r) => r.includes('scheduler tick')));
+});
+
+test('a heartbeat JS Date merely TOLERATES is corruption, not a 23-year-old tick (§A5.5 G)', async () => {
+  // `new Date('2026')` is a valid date, so a corrupted key came back as a
+  // `recorded` reading and the watchdog stated, as fact, *"last scheduler tick
+  // was 20544230s ago"* — sending whoever read it to pg_cron for a fault that
+  // lives in this key. The writer writes `toISOString()` and nothing else, so
+  // the reader accepts exactly that and calls everything else corrupt.
+  for (const raw of ['2026', '0', '1', 'December 17, 1995']) {
+    initObservability({ installProcessHandlers: false });
+    await redis.setex(SCHEDULER_HEARTBEAT_KEY, SCHEDULER_HEARTBEAT_TTL_S, raw);
+
+    const { statusCode, body } = await readWatchdog();
+    assert.equal(statusCode, 503, JSON.stringify(body));
+    assert.equal(body.last_tick_at, null, `${raw} is not a tick this system ever recorded`);
+    assert.ok(
+      body.reasons.some((r) => r.includes('unparseable')),
+      `${raw} must read as a corrupt key; got ${JSON.stringify(body.reasons)}`,
+    );
+    assert.ok(
+      !body.reasons.some((r) => r.includes('last scheduler tick was')),
+      `and must NOT report an age — that is the sentence that misdirects to pg_cron`,
+    );
+  }
 });
 
 test('a FUTURE-dated heartbeat → 503 with its own reason, not a silent 200 (§A4.4.4)', async () => {

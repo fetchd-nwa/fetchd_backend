@@ -502,12 +502,27 @@ Two properties are load-bearing and each is pinned by a red-first test:
 
    What is here now: fingerprint = `logger` + the message with digits
    normalised + `extra`'s identifying scalars left UN-normalised (so `ch_1` and
-   `ch_2` are different money) minus per-request keys, biased deliberately
-   toward over-uniqueness — extra quota use is recoverable, a dropped money
-   alarm is not. Three identical events per ten-minute window page; the rest
-   are counted and reported when the window rolls. A first-ever event of any
-   fingerprint is never withheld, `level: 'fatal'` bypasses every gate, and the
-   only global limit is a CIRCUIT BREAKER (1000 events/hour, far above any
+   `ch_2` are different money) + **any nested `Error`'s class and its
+   digit-normalised message** (D20-A5.1) minus per-request keys, each entry
+   framed as its own JSON array so a delimiter inside the data cannot forge a
+   collision (D20-A5.5 H). The `Error` contribution is not a refinement: it was
+   the whole 5xx surface. `auth/plugin.ts:212` logs the constant sentence
+   `'unhandled error'` with the fault nested under `err`, nested objects were
+   ignored, and six genuinely distinct first-ever 500s produced THREE pages
+   (executed). The bias is deliberately toward over-uniqueness — extra quota
+   use is recoverable, a dropped money alarm is not — and the residue is stated
+   rather than claimed away: two events differing only inside a nested
+   NON-`Error` object still collapse.
+
+   Three identical events per ten-minute window page; the rest are counted and
+   reported when the window rolls. **"Already sent" means DELIVERED** (D20-A5.3):
+   the allowance is spent on the transport's success path, because counting at
+   admission let three REJECTED sends burn it and withhold the fourth copy of an
+   alarm no human had ever seen. The accepted cost is that identical alarms
+   raised inside one transport round trip are all admitted — more sending, never
+   less, bounded by the breaker and the in-flight ceiling. A first-ever event of
+   any fingerprint is never withheld, `level: 'fatal'` bypasses every gate, and
+   the only global limit is a CIRCUIT BREAKER (1000 events/hour, far above any
    legitimate volume) that trips loudly and 503s the watchdog rather than
    rationing quietly. `MAX_IN_FLIGHT = 256` remains a true concurrency bound on
    memory, with its drops counted and watchdog-visible.
@@ -555,12 +570,16 @@ run happily while being unable to do its job:
 Both messages name the reason, so the next person cannot "fix" the refusal by
 setting a dummy value and reinventing the failure it prevents.
 
-Neither guard covers Fastify's **per-route `logLevel`**, which demotes one
+The third demotion is Fastify's **per-route `logLevel`**, which silences one
 route's logger independently of `LOG_LEVEL` (executed: `app.route({ logLevel:
-'fatal' })` and the tap sees nothing on that route). No route in this repo sets
-it; a global env guard cannot see a per-route option, so the defence is a
-comment at the `superRefine`. If a route ever needs `logLevel`, the thing being
-changed is the alarm channel.
+'fatal' })` and the tap sees nothing on that route). A global env guard cannot
+see a per-route option, so until D20-A5.5 the defence was a comment asserting
+that no route sets it — an ABSENCE established by a search, which this repo has
+ruled a search cannot establish. It is now an `onRoute` hook in `buildApp()`
+that THROWS on any route carrying `logLevel`: every route on the app or any
+child of it passes through it, at build time for the root instance and at
+`ready()` for an encapsulated plugin. If a route ever genuinely needs it, the
+thing being changed is the alarm channel, and the build says so.
 
 ### `GET /health/watchdog` — the instrument that outlives the others (LOCKED)
 
@@ -579,14 +598,31 @@ So `POST /workers/tick` writes a Redis heartbeat (`scheduler:last_tick_at`,
 swallowed, because a watchdog must never be able to fail the thing it watches —
 and `GET /health/watchdog` `[public]` reports `last_tick_at`, `staleness_s`,
 pager health, and a `reasons` array. **503** when the last tick is older than
-10 minutes; when the heartbeat is ABSENT, UNPARSEABLE, or dated in the FUTURE
-(each its own reason — a corrupt key must not report "the scheduler never ran",
-and a forward clock jump must not buy a dead scheduler that much silence); when
-the pager has failed 3 sends in a row; when it has dropped 200 alarms in the
-last hour; when its circuit breaker is tripped; or when production has no pager
-installed. 200 otherwise. A free external uptime monitor watches it on a
-5-minute interval — external to both this process and Sentry, which is what
-makes it the one instrument that survives either dying.
+10 minutes; when the heartbeat is ABSENT, UNPARSEABLE, UNREADABLE, or dated in
+the FUTURE (each its own reason — a corrupt key must not report "the scheduler
+never ran", "I cannot see the key" must not report either, and a forward clock
+jump must not buy a dead scheduler that much silence); when the pager has failed
+3 sends in a row; when it has LOST 3 sends to failed delivery in the last hour,
+consecutive or not; when it has dropped 200 alarms in the last hour; when its
+circuit breaker is tripped; or when production has no pager installed. 200
+otherwise. A free external uptime monitor watches it on a 5-minute interval —
+external to both this process and Sentry, which is what makes it the one
+instrument that survives either dying.
+
+Two of those conditions are D20-A5 and each was a way this endpoint reported
+health while pages were being lost. **UNREADABLE**: the heartbeat READER had no
+timeout, so against a reachable-but-silent Redis the watchdog never answered at
+all — 45 seconds and counting, `app.close()` wedged with it — and a monitor
+watching a status code cannot tell that from a slow network, so nothing ever
+alerts. Both the read and the write are now raced against a 1s deadline, and
+the reader accepts only what the writer could have written (an exact
+`toISOString()` round trip), because `new Date('2026')` parses and the endpoint
+was reporting a 23-year-old tick as fact. **Lost deliveries**:
+`consecutive_transport_failures` is reset by any success, so a pager rejecting
+every OTHER send destroyed 30 of 60 pages while this endpoint answered 200 with
+`reasons: []`. A windowed count of losses has no such reset. Its threshold is 3,
+not 200, because the two counters mean opposite things: a suppression is the
+mechanism working, and every lost delivery is an alarm nobody saw.
 
 The drop and breaker conditions were added in D20-A4: the endpoint reported
 `dropped_alarms` in its body and answered 200, i.e. reported a number to an

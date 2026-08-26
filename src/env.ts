@@ -170,13 +170,16 @@ const envSchema = z
           'pager. Demotion-by-config is the sibling of the demotion-by-code closed in round 6',
       });
     }
-    // The sibling hole this guard does NOT cover, named so it isn't reinvented
-    // (D20-A3 §N1, executed): Fastify's per-route `logLevel` option demotes one
-    // route's logger independently of `LOG_LEVEL`, and `app.route({ logLevel:
-    // 'fatal' })` makes the tap see nothing on that route while this refusal
-    // stays satisfied. No route in this repo sets it, and a global env guard
-    // cannot see a per-route option — so this is a comment, not code. If a
-    // route ever needs `logLevel`, the alarm channel is what you are changing.
+    // The sibling hole (D20-A3 §N1, executed): Fastify's per-route `logLevel`
+    // demotes one route's logger independently of `LOG_LEVEL`, and
+    // `app.route({ logLevel: 'fatal' })` makes the tap see nothing on that route
+    // while this refusal stays satisfied. A global env guard cannot see a
+    // per-route option, so this used to be a comment ending "no route in this
+    // repo sets it" — an ABSENCE established by a search, which this repo has
+    // ruled a search cannot establish (D20-A5.5 I). It is now closed where it
+    // can be seen: `server.ts`'s `onRoute` hook refuses to build an app
+    // containing such a route, so the pair of guards is total rather than one
+    // guard and one claim.
   });
 
 export type Env = z.infer<typeof envSchema>;

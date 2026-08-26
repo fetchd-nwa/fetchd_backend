@@ -126,8 +126,10 @@ CREATE EXTENSION IF NOT EXISTS pg_net;
 -- and the placeholder keeps the deployment's address out of git; the runbook
 -- handed to Allison carries it.
 --
--- THE JOB CANNOT BE SCHEDULED UNLESS THE URL IS REAL (D20-A3 §A3.1, made total
--- by D20-A4 §A4.4.3). Executed against a real Supabase Postgres 17.6:
+-- THE JOB CANNOT BE SCHEDULED UNLESS THE URL LOOKS REAL (D20-A3 §A3.1, D20-A4
+-- §A4.4.3, tightened by D20-A5.6 — "total" was overstated and is now scoped to
+-- what a pattern can actually decide). Executed against a real Supabase
+-- Postgres 17.6:
 -- `cron.schedule` SUCCEEDS with <PRODUCTION_API_URL> still in place — pg_cron
 -- never parses the command string. Every downstream checkpoint then reads GREEN
 -- on a completely broken install: §5's first check shows both jobs `active = t`,
@@ -140,16 +142,29 @@ CREATE EXTENSION IF NOT EXISTS pg_net;
 -- find-and-replace-all of <PRODUCTION_API_URL> is caught, but a DOUBLE-CLICK
 -- select of PRODUCTION_API_URL leaves the angle brackets behind, and
 -- '<https://…>/workers/tick' schedules with the old guard SILENT. Against real
--- Supabase PG 17.6, over the three edit shapes:
+-- Supabase PG 17.6, over twelve plausible paste shapes (the sweep is executed,
+-- not imagined; §A5.6 re-ran it after tightening the pattern):
 --
---     form                                  old guard   positive assertion
---     (a) un-substituted                      RAISES         RAISES
---     (b) double-click, brackets survive      silent         RAISES
---     (c) correctly substituted               silent         passes
+--     form                                  negative   `[^<>']+`   this file
+--     (a) un-substituted                     RAISES      RAISES      RAISES
+--     (b) double-click, brackets survive     silent      RAISES      RAISES
+--     (c) correctly substituted              silent      passes      passes
+--     (d) trailing slash → '//workers/tick'  silent      passes      RAISES
+--     (f) a space inside the host            silent      passes      RAISES
+--     (i) a space before '/workers/tick'     silent      passes      RAISES
+--     (g) scheme omitted                     silent      RAISES      RAISES
+--     (h) uppercase scheme                   silent      RAISES      RAISES
+--     (j) surrounding double quotes          silent      RAISES      RAISES
+--     (k) only the COMMENT substituted       RAISES      RAISES      RAISES
+--     (e) a path suffix   ('…app/api')       silent      passes      passes
+--     (l) a port          ('…app:8080')      silent      passes      passes
 --
--- So "UNRUNNABLE ON PURPOSE" is now true rather than overstated. The job text
--- is declared ONCE and asserted before it is scheduled, so there is no way to
--- substitute the URL in one copy and not the other.
+-- The job text is declared ONCE and asserted before it is scheduled, so there is
+-- no way to substitute the URL in one copy and not the other. The last two rows
+-- are the honest limit: they are legal URLs pointing somewhere wrong, which no
+-- pattern can tell from a legal URL pointing somewhere right. §5's checks and
+-- the 404 recorded in `net._http_response` are the instruments for those — and
+-- see the pg_net TTL note below, because that table is gone in six hours.
 --
 -- Job name matches the Day-16 handoff: 'scheduler-tick-every-minute'.
 -- `cron.schedule` UPSERTS by name, so re-running this block after changing the
@@ -189,11 +204,28 @@ BEGIN
   -- the quote. A check for the placeholder's ABSENCE could only ever catch the
   -- shapes it was written to imagine.
   --
+  -- WHITESPACE and a TRAILING SLASH are excluded too (D20-A5.6). The first
+  -- version of this assertion used `[^<>']+`, which admitted three paste shapes
+  -- this file's own instructions tell her to avoid — `…app/` (the trailing
+  -- slash, giving `//workers/tick`), `https://fetchd api…` and `…app /workers`
+  -- (a space anywhere in the pasted URL). All three were executed against real
+  -- Supabase PG 17.6 and all three SCHEDULED, while `:124` claimed the job
+  -- "CANNOT BE SCHEDULED UNLESS THE URL IS REAL". They 404 downstream, which is
+  -- detectable, but a guard that overstates its coverage is the instrument
+  -- failure, not the 404. `[^<>'\s]*[^<>'\s/]` requires at least one character
+  -- and forbids the last one from being a slash.
+  --
+  -- What it still admits, said plainly rather than claimed away: a legal URL
+  -- pointing at the WRONG place — a port (`…app:8080`) or a path prefix
+  -- (`…app/api`). Both are real URL shapes that no pattern can distinguish from
+  -- the right one; §5's checks and the 404 in `net._http_response` are what
+  -- catch those.
+  --
   -- The pattern is dollar-quoted ($re$…$re$) so it needs no escaping and, more
   -- importantly, contains no <PRODUCTION_API_URL> of its own: a
   -- find-and-replace-all in the SQL editor cannot rewrite the guard along with
   -- the job and quietly disarm it.
-  IF job_sql !~ $re$url\s*:=\s*'https?://[^<>']+/workers/tick'$re$ THEN
+  IF job_sql !~ $re$url\s*:=\s*'https?://[^<>'\s]*[^<>'\s/]/workers/tick'$re$ THEN
     RAISE EXCEPTION
       'the tick job URL is not a real URL — substitute <PRODUCTION_API_URL> with the Railway base URL (no angle brackets, no trailing slash) before running §3. %',
       'pg_cron accepts an unsubstituted command string and every verification query in §5 would still read green';

@@ -42,6 +42,20 @@ export const SCHEDULER_HEARTBEAT_TTL_S = 24 * 60 * 60;
 export const HEARTBEAT_WRITE_TIMEOUT_MS = 1_000;
 
 /**
+ * How long `GET /health/watchdog` will wait to READ the heartbeat before
+ * answering "I cannot see" (D20-A5.2). The writer got this race in §A4.3 and
+ * the reader — sixty lines below it — did not: executed against the same TCP
+ * blackhole, **the watchdog never answered; still nothing after 45 seconds**,
+ * and `app.close()` never returned either. A watchdog that hangs is worse than
+ * one that says it is blind, because a monitor watching a status code cannot
+ * tell a hang from a slow network and the alert never fires.
+ *
+ * One second, matching the writer: far beyond a healthy local GET, far below
+ * anything a 5-minute monitor interval cares about.
+ */
+export const HEARTBEAT_READ_TIMEOUT_MS = 1_000;
+
+/**
  * Stamp "a tick ran, at this instant". Called from `routes/workersTick.ts`
  * immediately after the completion log line — a tick that RAN records it even
  * when individual phases errored, because phase failures raise their own
@@ -106,28 +120,93 @@ export async function recordSchedulerTick(
 }
 
 /**
- * What the heartbeat key says. Three states, not two (D20-A4 §A4.5 L3): the
- * previous version mapped an UNPARSEABLE value to `null`, which is a safe
- * direction and a false sentence — the watchdog then reported "no scheduler
- * tick has been recorded", sending whoever read it to pg_cron when the actual
- * fault is the key. A corrupted instrument must say it is corrupted.
+ * What the heartbeat key says. FOUR states, and each one exists because the
+ * state below it used to masquerade as a different fault:
+ *
+ * - `unparseable` (D20-A4 §A4.5 L3) — the previous version mapped a corrupted
+ *   value to `null`, a safe direction and a false sentence: the watchdog then
+ *   reported "no scheduler tick has been recorded", sending whoever read it to
+ *   pg_cron when the fault lives in this key.
+ * - `unreadable` (D20-A5.2) — "I cannot see the key" is not "the scheduler is
+ *   dead", and until this existed the reader had no way to say the difference:
+ *   a rejection became a 503 whose reason blamed Redis in passing, and a HANG
+ *   became no answer at all.
  */
 export type HeartbeatReading =
   | { kind: 'absent' }
   | { kind: 'unparseable'; raw: string }
+  | { kind: 'unreadable'; reason: string }
   | { kind: 'recorded'; at: Date };
 
 /**
- * The last recorded tick, as one of {@link HeartbeatReading}'s three states.
+ * The last recorded tick, as one of {@link HeartbeatReading}'s four states.
  *
- * Rejects if Redis is unreachable — deliberately. The watchdog's caller turns
- * that into a 503: "I cannot tell whether the scheduler is alive" is a
- * watchdog failure, and a watchdog that answers 200 when it cannot see is the
- * exact instrument failure this endpoint exists to prevent.
+ * **Never rejects and never hangs** (D20-A5.2). It used to reject on an
+ * unreachable Redis, deliberately, so the caller could turn that into a 503 —
+ * but rejection is only the polite failure. A Redis that is REACHABLE and
+ * silent produced no rejection and no answer: the same TCP blackhole §A4.3
+ * fixed in the writer left this reader running after 45 seconds, and the
+ * watchdog that exists to notice silence was itself silent. So the read is
+ * raced against {@link HEARTBEAT_READ_TIMEOUT_MS} and both failure shapes come
+ * back as `unreadable`, which the route turns into a 503 that says exactly
+ * that.
+ *
+ * Both arms of the race resolve, as in `recordSchedulerTick`: once the timeout
+ * wins, a LATER rejection from the abandoned read would be an unhandled
+ * rejection, which with the Day-20 crash handlers installed takes the process
+ * down — the watchdog killing the thing it watches.
  */
 export async function readSchedulerHeartbeat(): Promise<HeartbeatReading> {
-  const raw = await redis.get(SCHEDULER_HEARTBEAT_KEY);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const read = redis.get(SCHEDULER_HEARTBEAT_KEY).then(
+      (raw: string | null) => ({ kind: 'read', raw }) as const,
+      (err: unknown) => ({ kind: 'failed', err }) as const,
+    );
+    const deadline = new Promise<{ kind: 'timeout' }>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: 'timeout' }), HEARTBEAT_READ_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([read, deadline]);
+    if (outcome.kind === 'timeout') {
+      return {
+        kind: 'unreadable',
+        reason: `redis did not answer within ${HEARTBEAT_READ_TIMEOUT_MS}ms (reachable but silent)`,
+      };
+    }
+    if (outcome.kind === 'failed') {
+      return {
+        kind: 'unreadable',
+        reason: outcome.err instanceof Error ? outcome.err.message : String(outcome.err),
+      };
+    }
+    return interpret(outcome.raw);
+  } catch (err) {
+    // Belt and braces, as in the writer: `get` throwing SYNCHRONOUSLY (a
+    // disconnected client can) would otherwise escape into the request path.
+    return { kind: 'unreadable', reason: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * The raw value, as a reading. The writer writes `Date.prototype.toISOString()`
+ * and nothing else, so the reader requires exactly that shape and treats every
+ * other string as corruption (D20-A5.5 G).
+ *
+ * `new Date(raw)` alone was too permissive to be an instrument. JS date parsing
+ * accepts `'2026'`, `'0'`, `'1'` and `'December 17, 1995'`, so a corrupted key
+ * came back as a valid `recorded` reading and the watchdog reported *"last
+ * scheduler tick was 20544230s ago"* — a 23-year-old tick, stated as fact,
+ * pointing whoever read it at pg_cron for a fault that lives in this key.
+ * Round-tripping through `toISOString()` is exact: only what the writer could
+ * have written survives it.
+ */
+function interpret(raw: string | null): HeartbeatReading {
   if (raw === null) return { kind: 'absent' };
   const parsed = new Date(raw);
-  return Number.isNaN(parsed.getTime()) ? { kind: 'unparseable', raw } : { kind: 'recorded', at: parsed };
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== raw) {
+    return { kind: 'unparseable', raw };
+  }
+  return { kind: 'recorded', at: parsed };
 }

@@ -16,6 +16,7 @@ import {
   type AlarmEvent,
   type AlarmTransport,
 } from '../src/lib/observability.js';
+import { MAX_CONSECUTIVE_TRANSPORT_FAILURES } from '../src/routes/healthWatchdog.js';
 
 /**
  * Unit coverage for the Day-20 pager (`src/lib/observability.ts`). Pure — no
@@ -211,6 +212,19 @@ test('createSentryTransport: a URL that is not a DSN is refused at construction'
     /leading zero/,
     'a leading-zero project id must fail CLOSED, not 404 in silence forever',
   );
+  // D20-A5.4: and `0` itself, which round 2 left accepted because the runbook's
+  // boot smoke would catch it. `0` is the project id in SENTRY'S OWN EXAMPLE
+  // DSN and was the literal placeholder in this repo's `.env.example` — the
+  // realistic failure is that she pastes the example instead of hers, the
+  // process boots clean, reports a healthy pager, and 404s forever. A procedure
+  // is not an instrument.
+  assert.throws(
+    () => createSentryTransport('https://examplepublickey@o0.ingest.sentry.io/0'),
+    /starts with a zero/,
+    "Sentry's own example DSN must fail CLOSED at boot",
+  );
+  // …and a low but real project id is still a project id.
+  assert.doesNotThrow(() => createSentryTransport('https://key@sentry.example.com/10'));
 });
 
 test('createSentryTransport: a path-prefixed (self-hosted) DSN is refused, deliberately (§A4.5 N2)', () => {
@@ -497,18 +511,20 @@ test('dedupe: a flood of FRESH fingerprints cannot starve a first-ever money ala
   assert.equal((paged[0]?.extra as Record<string, unknown>)['chargeId'], 'ch_starved');
 });
 
-test('dedupe: a fatal page arrives after every other alarm has been suppressed', () => {
+test('dedupe: a fatal page arrives after every other alarm has been suppressed', async () => {
   const transport = makeRecordingTransport();
   initObservability({ transport, installProcessHandlers: false });
 
-  // Drain the pager the way A4.0 proved it actually drains: with DISTINCT
-  // fingerprints. (Repeats of one sentence do NOT drain a global bucket — the
-  // per-fingerprint bucket empties first and the global one is never charged.
-  // The first version of this test used 500 identical alarms and passed on the
-  // very code it was written to indict; a test that cannot fail is not
-  // evidence.) 60 distinct sentences against a 20-token global ceiling.
+  // Drain the pager the way A4.0 proved it actually drains. (The first version
+  // of this test used 500 identical alarms against a global bucket and passed on
+  // the very code it was written to indict; a test that cannot fail is not
+  // evidence.) These sixty differ only in a DIGIT, so they normalise to one
+  // fingerprint — which is the point: sixty repeats, three pages, the rest
+  // withheld. `drain()` between them because the allowance is spent on DELIVERY
+  // now (§A5.3), and an unsettled send has not delivered anything.
   for (let i = 0; i < 60; i += 1) {
     captureAlarm({ message: `phase boundary: worker phase ${i} threw`, level: 'error', logger: 'pino' });
+    await drain();
   }
   const beforeCrash = transport.events.length;
   assert.ok(beforeCrash < 60, 'this test only means something once the pager is actually drained');
@@ -534,12 +550,17 @@ test('dedupe: a fatal page arrives after every other alarm has been suppressed',
 
 // ---- the mechanics of de-duplication (D20-A4 §A4.1) -----------------------
 
-test('dedupe: a repeated sentence pages IDENTICAL_ALLOWANCE times, then is withheld', () => {
+test('dedupe: a repeated sentence pages IDENTICAL_ALLOWANCE times, then is withheld', async () => {
   const transport = makeRecordingTransport();
   initObservability({ transport, installProcessHandlers: false });
 
+  // `drain()` between events because the allowance is spent when a send SUCCEEDS
+  // (§A5.3), not when the event is admitted — see the test below for why that
+  // distinction had to change, and `DedupeWindow.delivered` for the burst
+  // behaviour it deliberately accepts in exchange.
   for (let i = 0; i < 200; i += 1) {
     captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino' });
+    await drain();
   }
 
   assert.equal(
@@ -550,7 +571,53 @@ test('dedupe: a repeated sentence pages IDENTICAL_ALLOWANCE times, then is withh
   assert.equal(pagerHealth().dropped_alarms, 200 - IDENTICAL_ALLOWANCE);
 });
 
-test('dedupe: digits in the MESSAGE normalise, so a count-templated sentence is one alarm', (t) => {
+test('dedupe: three FAILED deliveries do not burn the allowance (§A5.3)', async () => {
+  // Round 3's finding E, stated against the invariant's own words: "the pager
+  // never withholds an event unless it has already SENT an identical one
+  // recently." Counting at ADMISSION made three rejected sends — three alarms
+  // that reached no human at all — spend the whole allowance, so the fourth copy
+  // was withheld on the strength of deliveries that never happened. On a
+  // permanently broken transport that is silence, indefinitely, about a
+  // condition nobody has ever been told about.
+  let rejecting = true;
+  const attempts: AlarmEvent[] = [];
+  const flapping: AlarmTransport = {
+    send(event: AlarmEvent): Promise<void> {
+      attempts.push(event);
+      return rejecting ? Promise.reject(new Error('ingest 503')) : Promise.resolve();
+    },
+  };
+  initObservability({ transport: flapping, installProcessHandlers: false });
+
+  await withCapturedStderr(async () => {
+    for (let i = 0; i < 3 * IDENTICAL_ALLOWANCE; i += 1) {
+      captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { chargeId: 'ch_1' } });
+      await drain();
+    }
+  });
+  assert.equal(
+    attempts.length,
+    3 * IDENTICAL_ALLOWANCE,
+    `every copy must be ATTEMPTED while none has been delivered; attempted ${attempts.length}`,
+  );
+
+  // …and once deliveries actually start landing, the allowance behaves exactly
+  // as before: three through, the rest withheld. Without this half the "fix"
+  // would be "de-duplication deleted", which is not what was asked for.
+  rejecting = false;
+  attempts.length = 0;
+  for (let i = 0; i < 20; i += 1) {
+    captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { chargeId: 'ch_1' } });
+    await drain();
+  }
+  assert.equal(
+    attempts.length,
+    IDENTICAL_ALLOWANCE,
+    `three DELIVERED copies still close the window; attempted ${attempts.length}`,
+  );
+});
+
+test('dedupe: digits in the MESSAGE normalise, so a count-templated sentence is one alarm', async (t) => {
   // `duplicateRefundRetry.ts:583` templates counts into its sentence. Un-
   // normalised, every tick was a FRESH fingerprint — which is what starved the
   // old global ceiling and, through it, the money alarms (§A4.0).
@@ -567,6 +634,7 @@ test('dedupe: digits in the MESSAGE normalise, so a count-templated sentence is 
       logger: 'pino',
       extra: { workerTick: 'duplicate-refund-retry', refundClass: 'partial' },
     });
+    await drain();
     t.mock.timers.tick(60_000);
   }
 
@@ -597,7 +665,91 @@ test('dedupe: digits in EXTRA do NOT normalise — ch_1 and ch_2 are different m
   assert.equal(transport.events.length, 5, 'five charges, five pages');
 });
 
-test('dedupe: reqId is excluded from the fingerprint, or nothing would ever dedupe', () => {
+test('dedupe: DIFFERENT nested errors under one sentence are different alarms (§A5.1)', async () => {
+  // Round 3's finding A, and it was the whole 5xx surface: `auth/plugin.ts:212`
+  // logs the CONSTANT sentence 'unhandled error' with the fault itself nested
+  // under `err`, and nested objects were ignored by the fingerprint. Executed
+  // through the real error handler: six genuinely distinct first-ever 500s →
+  // THREE paged. A Stripe outage and a null-pointer bug were "identical alarms".
+  const transport = makeRecordingTransport();
+  initObservability({ transport, installProcessHandlers: false });
+
+  const faults: Error[] = [
+    new Error('Stripe: connection error on POST /v1/refunds'),
+    new Error('pool exhausted: timeout acquiring client'),
+    new TypeError("Cannot read properties of undefined (reading 'ownerId')"),
+    new Error('READONLY You cannot write against a read only replica'),
+    new Error('R2 putObject failed: 403 SignatureDoesNotMatch'),
+    new Error('invoice settle: refund exceeded charge amount'),
+  ];
+  for (const err of faults) {
+    captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino', extra: { reqId: 'req-1', err } });
+    await drain();
+  }
+  assert.equal(
+    transport.events.length,
+    faults.length,
+    `six different faults are six alarms; paged ${transport.events.length}`,
+  );
+
+  // The other direction, which is why this is strictly better rather than a
+  // trade: ONE bug storming still collapses. The digits normalise for the same
+  // reason the alarm sentence's do — an id or a port inside the error text would
+  // otherwise mint a fresh fingerprint per occurrence and defeat dedupe.
+  transport.events.length = 0;
+  for (let i = 0; i < 20; i += 1) {
+    captureAlarm({
+      message: 'unhandled error',
+      level: 'error',
+      logger: 'pino',
+      extra: { reqId: `req-${i}`, err: new Error(`connect ETIMEDOUT 10.0.0.${i}:5432`) },
+    });
+    await drain();
+  }
+  assert.equal(
+    transport.events.length,
+    IDENTICAL_ALLOWANCE,
+    `one bug storming is still one alarm; paged ${transport.events.length}`,
+  );
+
+  // …and a TypeError is not an Error, even word for word.
+  transport.events.length = 0;
+  captureAlarm({ message: 'boom', level: 'error', logger: 'pino', extra: { err: new Error('same words') } });
+  await drain();
+  captureAlarm({ message: 'boom', level: 'error', logger: 'pino', extra: { err: new TypeError('same words') } });
+  await drain();
+  assert.equal(transport.events.length, 2, 'the error CLASS is part of the identity');
+});
+
+test('dedupe: a key/value delimiter inside extra cannot forge a fingerprint (§A5.5 H)', async () => {
+  // The `key=value` join these entries used had the NUL byte's shape one level
+  // up: `{ a: 'b=c' }` and `{ 'a=b': 'c' }` both rendered `a=b=c`, so two
+  // different events could collapse because of where a delimiter happened to
+  // fall inside the DATA. Every entry is its own JSON array now.
+  const transport = makeRecordingTransport();
+  initObservability({ transport, installProcessHandlers: false });
+
+  // The allowance has to be SPENT first, or this proves nothing: two colliding
+  // fingerprints both page anyway while the window is open, so a two-event
+  // version of this test passes on the very code it was written to indict.
+  // (It did — caught by its own mutant, which is why the loop is here.)
+  for (let i = 0; i < IDENTICAL_ALLOWANCE; i += 1) {
+    captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { a: 'b=c' } });
+    await drain();
+  }
+  const before = transport.events.length;
+  assert.equal(before, IDENTICAL_ALLOWANCE, 'precondition: that fingerprint is now at its limit');
+
+  captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { 'a=b': 'c' } });
+  await drain();
+  assert.equal(
+    transport.events.length,
+    before + 1,
+    'a different extra is a different alarm — it must not inherit a full window from where a delimiter fell',
+  );
+});
+
+test('dedupe: reqId is excluded from the fingerprint, or nothing would ever dedupe', async () => {
   const transport = makeRecordingTransport();
   initObservability({ transport, installProcessHandlers: false });
 
@@ -612,6 +764,7 @@ test('dedupe: reqId is excluded from the fingerprint, or nothing would ever dedu
       logger: 'pino',
       extra: { reqId: `req-${i}`, err: 'boom' },
     });
+    await drain();
   }
   assert.equal(
     transport.events.length,
@@ -620,7 +773,7 @@ test('dedupe: reqId is excluded from the fingerprint, or nothing would ever dedu
   );
 });
 
-test('dedupe: the suppression notice arrives when the window ROLLS, with the count', (t) => {
+test('dedupe: the suppression notice arrives when the window ROLLS, with the count', async (t) => {
   t.mock.timers.enable({ apis: ['Date'] });
   t.after(() => t.mock.timers.reset());
 
@@ -629,6 +782,7 @@ test('dedupe: the suppression notice arrives when the window ROLLS, with the cou
 
   for (let i = 0; i < 50; i += 1) {
     captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino' });
+    await drain();
   }
   const suppressed = 50 - IDENTICAL_ALLOWANCE;
   assert.equal(
@@ -665,9 +819,10 @@ test('dedupe: exactly one stderr line per drop window, not per suppressed event'
   const transport = makeRecordingTransport();
   initObservability({ transport, installProcessHandlers: false });
 
-  const captured = await withCapturedStderr(() => {
+  const captured = await withCapturedStderr(async () => {
     for (let i = 0; i < 100; i += 1) {
       captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino' });
+      await drain();
     }
   });
   assert.equal(
@@ -867,6 +1022,7 @@ test('dispatch: a SYNCHRONOUS throw from the transport cannot lose the next even
   const captured = await withCapturedStderr(async () => {
     for (let i = 0; i < 10; i += 1) {
       captureAlarm({ message: 'unhandled error', level: 'error', logger: 'pino' });
+      await drain();
     }
     t.mock.timers.tick(DEDUPE_WINDOW_MS);
     // This call rolls the window (notice throws) and must still page itself.
@@ -925,6 +1081,47 @@ test('pagerHealth: installed reflects the transport, and a failure streak clears
     0,
     'a delivered page clears the streak — otherwise one blip latches the alarm forever',
   );
+  // …and the streak clearing is exactly why a second counter had to exist: four
+  // sends were attempted, three of them were LOST, and the counter the watchdog
+  // used to read is back at zero.
+  assert.equal(
+    pagerHealth().transport_failures_recent,
+    3,
+    'a windowed loss count has no reset — that is the property that makes flapping visible',
+  );
+});
+
+test('pagerHealth: a FLAPPING transport is counted, though the failure streak keeps clearing (§A5.3)', async () => {
+  // Round 3's finding C, executed: a transport rejecting every OTHER send
+  // destroyed 30 of 60 pages, and `GET /health/watchdog` answered 200 with
+  // `reasons: []`, because the only failure counter it had was reset by every
+  // success. Half the money pages were gone and every instrument said healthy.
+  let n = 0;
+  const flapping: AlarmTransport = {
+    send(): Promise<void> {
+      n += 1;
+      return n % 2 === 0 ? Promise.reject(new Error('ingest 503')) : Promise.resolve();
+    },
+  };
+  initObservability({ transport: flapping, installProcessHandlers: false });
+
+  await withCapturedStderr(async () => {
+    for (let i = 0; i < 60; i += 1) {
+      // Distinct money, so nothing here is de-duplication: sixty alarms, sixty
+      // sends, thirty of them lost.
+      captureAlarm({ message: 'LOST HOLD', level: 'error', logger: 'pino', extra: { chargeId: `ch_${i}` } });
+      await drain();
+    }
+  });
+
+  const health = pagerHealth();
+  assert.equal(health.transport_failures_recent, 30, 'every lost page is counted');
+  assert.ok(
+    health.consecutive_transport_failures < MAX_CONSECUTIVE_TRANSPORT_FAILURES,
+    `the streak counter must be UNABLE to see this — that is the finding; it read ` +
+      `${health.consecutive_transport_failures}`,
+  );
+  assert.equal(health.dropped_alarms, 0, 'nothing was suppressed; these were attempted and lost');
 });
 
 test('flushObservability: awaits in-flight sends, and gives up at the timeout', async () => {

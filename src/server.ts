@@ -75,6 +75,34 @@ export function buildApp(): FastifyInstance {
     disableRequestLogging: false,
   });
 
+  // D20-A5.5 I — the sibling of `env.ts`'s `LOG_LEVEL=fatal` refusal, and the
+  // reason it is code rather than a comment. Fastify's per-route `logLevel`
+  // demotes ONE route's logger independently of `LOG_LEVEL`, so
+  // `app.route({ logLevel: 'fatal' })` makes the pager tap see nothing on that
+  // route while the env guard stays satisfied (executed). That hole used to be
+  // closed by a claim — "no route in this repo sets it" — established by a
+  // SEARCH, which is the one thing this repo has ruled cannot establish an
+  // absence. Three lines make it total: every route registered on this app or
+  // any child of it passes through here, at build time for the root instance
+  // and at `ready()` for an encapsulated plugin, and a route that demotes its
+  // own logger does not get to exist.
+  //
+  // The emptiness check is not defensive padding: Fastify 5.8.5 stamps
+  // `logLevel: ''` on EVERY route it registers (verified against the installed
+  // runtime, not the types), so a bare `!== undefined` would refuse every route
+  // in the app. A test registers a normal route beside the refused one for
+  // exactly that reason.
+  app.addHook('onRoute', (route) => {
+    if (typeof route.logLevel === 'string' && route.logLevel.length > 0) {
+      throw new Error(
+        `route ${route.method as string} ${route.url} sets logLevel='${route.logLevel}': ` +
+          'a per-route log level silences the Day-20 pager tap on that route while ' +
+          "env.ts's LOG_LEVEL guard still reads satisfied. If this route genuinely needs " +
+          'it, the alarm channel is what you are changing — say so in a design first.',
+      );
+    }
+  });
+
   // Auth first: it decorates `request.principal` and installs the one
   // ApiError→HTTP mapper every route relies on.
   registerAuth(app);

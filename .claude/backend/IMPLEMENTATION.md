@@ -2450,9 +2450,10 @@ card shows the set-location pool.
     total); `pg_net.ttl` = 6h is documented (the table with the diagnosis
     empties itself the same evening); the §2 confirm query reads
     `vault.decrypted_secrets`, the view whose grant actually matters.
-  - Also: strict DSN parse (trailing slash / non-numeric project id now fail
-    CLOSED at boot — `.../42/` was building `/api/42//envelope/`, a silent
-    permanent 404); a cycle guard in the JSON replacer (a circular `extra` used
+  - Also: strict DSN parse (trailing slash / non-numeric project id / any
+    project id starting with a zero now fail CLOSED at boot — `.../42/` was
+    building `/api/42//envelope/`, a silent permanent 404); a cycle guard in the
+    JSON replacer (a circular `extra` used
     to lose the page while the module's doc listed it as handled); `log.error()`
     with no args no longer pages the literal string "undefined"; the crash path
     flushes for 500 ms rather than 2 s (a process with an uncaught exception is
@@ -2503,7 +2504,9 @@ card shows the set-location pool.
     Fingerprint = `logger` + the message with its digits normalised (`\d+` →
     `N`, so a count-templated sentence stops minting fingerprints) + `extra`'s
     identifying scalars **un-normalised** (so `ch_1` and `ch_2` stay distinct),
-    minus per-request keys like `reqId`. Bias deliberately toward
+    minus per-request keys like `reqId` — plus, since fix round 3 below, any
+    nested `Error`'s class and digit-normalised message, without which every
+    5xx in the API shared one fingerprint. Bias deliberately toward
     over-uniqueness: extra quota use is recoverable, a dropped money alarm is
     not. Three identical events per ten-minute window page; the fourth is
     counted and reported when the window rolls. **A first-ever event of any
@@ -2543,7 +2546,8 @@ card shows the set-location pool.
     the angle brackets and `'<https://…>/workers/tick'` scheduled with the
     guard SILENT. All three edit shapes were re-executed against the same real
     Postgres after the fix: un-substituted RAISES, brackets-survive RAISES,
-    correct passes.
+    correct passes. (Fix round 3 below found the pattern still admitted three
+    whitespace/trailing-slash shapes and tightened it.)
   - **Smaller, all executed:** a synchronous throw from the transport now
     shares the rejection path (`Promise.resolve(send())` did NOT route it,
     and the latent cost was losing a suppression count AND the real event
@@ -2556,6 +2560,71 @@ card shows the set-location pool.
     `observability.ts` as BINARY — every search of it silently returned
     nothing, which is this repo's "absence is never established by a search"
     rule with a byte behind it.
+- **FIX ROUND 3 (2026-08-26, D20-A5)** — Allison authorized one more round on
+  round 3's findings. Every item below was SEEN failing on the previous code
+  first, and every test that pins one was re-run against a mutant that reverts
+  it (one of them survived its first mutant and was rewritten — a two-event
+  version of the delimiter test passed on the very code it indicted, because
+  two colliding fingerprints both page while the window is still open).
+  - **Every 5xx in the API shared ONE pager fingerprint.**
+    `auth/plugin.ts:212` logs the constant sentence `'unhandled error'` with the
+    fault nested under `err`, and `identifyingExtra` took scalars only — so a
+    Stripe outage, a null-pointer bug and a pool exhaustion were "identical
+    alarms". Executed through the real error handler: six genuinely distinct
+    first-ever 500s → **three paged**. Now a nested `Error` contributes its
+    class and its digit-normalised message, which splits different faults and
+    still collapses one bug storming (executed both ways). Each `extra` entry is
+    also framed as its own JSON array, so `{a:'b=c'}` and `{'a=b':'c'}` stop
+    sharing a fingerprint.
+  - **The watchdog READER could hang forever.** §A4.3 raced the heartbeat WRITE
+    and left the read sixty lines below it: against the same TCP blackhole
+    `GET /health/watchdog` never answered (45s and counting) and `app.close()`
+    wedged with it — the endpoint whose job is to notice silence, silent. Now
+    the read is raced against 1s and returns a fourth `HeartbeatReading` kind,
+    `unreadable`, with its own 503 reason: "I cannot see" must not masquerade as
+    "the scheduler is dead". Pinned by a subprocess test against a real
+    blackhole (SIGKILL at 20s before; 503 in ~1.0s after).
+    **`routes/health.ts:31` shares the property, is PRE-EXISTING, and is
+    deliberately NOT fixed here** (ruled out of scope: repairs inside a capped
+    fix round are how neighbours break) — measured still hanging, and filed.
+  - **A FLAPPING pager reported perfect health.** Transport failures only ever
+    incremented `consecutiveTransportFailures`, which any success resets, so a
+    transport rejecting every other send destroyed **30 of 60 pages** while the
+    watchdog answered `200` with `reasons: []`. §A3.4.3 ruled this countable and
+    only half of it was built. Now a windowed loss counter
+    (`transport_failures_recent`, threshold 3/hour, its own 503 reason), kept
+    separate from `dropped_alarms_recent` (threshold 200/hour) because a
+    suppression is the mechanism working and a lost delivery is an alarm nobody
+    saw.
+  - **The de-duplication allowance is now spent on DELIVERY, not admission.**
+    Three REJECTED sends used to burn the whole allowance, so the fourth copy of
+    an alarm that had reached no human was withheld — suppression standing in
+    for something that never happened. Accepted in exchange, and named rather
+    than discovered later: identical alarms raised inside one transport round
+    trip are all admitted, which is more sending, never less, and is bounded by
+    `MAX_IN_FLIGHT` and the circuit breaker.
+  - **A corrupt heartbeat could still report a 23-year-old tick.**
+    `new Date('2026')` parses, so values like `'2026'`, `'0'`, `'1'` came back
+    as valid readings and the watchdog stated *"last scheduler tick was
+    20544230s ago"* as fact — sending its reader to pg_cron for a fault in the
+    key. The reader now accepts only an exact `toISOString()` round trip.
+  - **`parseDsn` refuses project id `0`.** It is Sentry's own EXAMPLE project id
+    and was the literal placeholder in this repo's `.env.example`; boot was
+    clean, health was green, and ingest 404'd forever. Round 2 left it open
+    because the runbook's boot smoke catches it — a procedure, not an
+    instrument. The placeholder is now `424242`, as are the two boot tests.
+  - **The per-route `logLevel` hole is code, not a comment.** The claim "no
+    route in this repo sets it" was established by a SEARCH; it is now an
+    `onRoute` hook in `buildApp()` that throws on any route carrying
+    `logLevel`, covering both root-instance and encapsulated registration.
+  - **The ops SQL assertion no longer overstates itself.** `[^<>']+` admitted
+    three shapes this file's own instructions warn against — a trailing slash,
+    a space in the host, a space before the path — and all three SCHEDULED
+    against real Supabase PG 17.6. Tightened to `[^<>'\s]*[^<>'\s/]` and the
+    twelve-shape sweep re-run against the same Postgres: those three flip to
+    RAISE, the correct substitution still schedules. A port and a path suffix
+    still pass, and the file now says so instead of claiming totality — they are
+    legal URLs pointing somewhere wrong, which no pattern can decide.
 - **What no gate can prove, and therefore what is NOT claimed here:** that
   Sentry pages Allison's phone (only the production boot smoke proves that);
   that pg_cron fires in her Supabase (only running this SQL proves that); that

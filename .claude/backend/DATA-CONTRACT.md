@@ -2604,7 +2604,7 @@ invisible to the repository layer.
 
 **Identity / session**
 
-- `GET /health` [public] · `GET /health/watchdog` [public] — Day-20 scheduler + pager watchdog for an external uptime monitor; 503 on a stale, absent, unparseable, or FUTURE-dated tick heartbeat / a failing pager / sustained dropped alarms / a tripped pager circuit breaker / no pager in production, each with its own entry in the body's `reasons` array. Deliberately separate from `/health`, which `railway.json` uses as the deploy healthcheck. Not in `wire.ts` (no client generates it) · `POST /auth/webhook` [public, signed] — Supabase "user created" → upsert mirror row
+- `GET /health` [public] · `GET /health/watchdog` [public] — Day-20 scheduler + pager watchdog for an external uptime monitor; 503 on a stale, absent, unparseable, UNREADABLE, or FUTURE-dated tick heartbeat / a failing pager / sustained LOST deliveries / sustained dropped alarms / a tripped pager circuit breaker / no pager in production, each with its own entry in the body's `reasons` array. Deliberately separate from `/health`, which `railway.json` uses as the deploy healthcheck. Not in `wire.ts` (no client generates it) · `POST /auth/webhook` [public, signed] — Supabase "user created" → upsert mirror row
 - `GET /me` [auth] — owner|staff profile + mirror row · `PATCH /me` — profile / emergency contact / notification prefs
 
 **Dogs**
