@@ -77,7 +77,7 @@ observable behavior, not "looks right."
 | 19c | Staff-author media arm (report-photo/video upload on `/media` + portal UI) | Claude | ☑ |
 | 19d | Real-mode completion + full-app smoke (close mock-only holes; verify every owner flow against the live API) + duplicate guards + group-class event cards | Claude | ☑ |
 | 19e | Real-mode QA + change pass (walk every owner flow; log + batch-fix all bugs/change-requests before go-live) | Claude (fixes) + Allison (finds) | ☐ |
-| 20a | Production scheduler + paging (the go-live hard blocker): observability seam + pino tap + prod env guards + committed ops SQL | Claude | ☑ code |
+| 20a | Production scheduler + paging (the go-live hard blocker): observability seam + pino tap + prod env guards + committed ops SQL — runbook A–E run 2026-09-02/03: prod on Railway, schema rebuilt, first 200 tick, paging + watchdog monitor proven | Claude + Allison | ☑ |
 | 20 | Observability + deploy hardening + go-live gate (remainder: rate-limit, backups/PITR, prod CORS, R2 sweep, live Stripe) | Allison | ☐ |
 
 ---
