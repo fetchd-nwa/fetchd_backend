@@ -155,7 +155,19 @@ test(
     await resetCreditExpirySettings();
     const lotId = randomUUID();
     await clearScanState([lotId]);
-    const now = new Date('2026-06-20T12:00:00Z');
+    // Anchor `now` on the REAL clock, not a hardcoded literal. The injected
+    // `now` builds only the window CEILING (now + lead); the live-lot FLOOR is
+    // `lot.expires_at > now()` in Postgres real time
+    // (creditLedgerRepository.ts:~189), which no injected clock reaches. A fixed
+    // past literal therefore pins this lot's expiry to a calendar date the real
+    // clock eventually passes, after which the FLOOR — not the window — is what
+    // keeps it out, and `scanned === 0` goes on passing for the wrong reason: a
+    // vacuous assertion that can never go red. Proven 2026-09-08 in
+    // 0.2a-2-vacuity.log: with `now` = 2026-01-01 and a 30d lot — well INSIDE
+    // the 60d ceiling — this test still passed. Off the real clock, +200d is
+    // beyond the 60d default window on every calendar day and the floor never
+    // fires.
+    const now = new Date();
     // Expiry 200 days out — well beyond the 60-day window.
     await seedLot({ lotId, expiresAt: new Date(now.getTime() + 200 * ONE_DAY_MS), credits: 5 });
 
@@ -231,7 +243,16 @@ test(
     await resetCreditExpirySettings();
     const lotId = randomUUID();
     await clearScanState([lotId]);
-    const now = new Date('2026-06-20T12:00:00Z');
+    // Anchor `now` on the REAL clock, not a hardcoded literal — same mechanism
+    // as the beyond-window test above. The injected `now` moves only the
+    // CEILING; the FLOOR is `lot.expires_at > now()` in Postgres real time
+    // (creditLedgerRepository.ts:~189). With the old literal this lot expired on
+    // a fixed date (2026-06-20 + 100d = 2026-09-28), and the first real day past
+    // it the floor drops the lot, `afterOverride.enqueued` becomes 0, and the
+    // backend gate goes RED and stays red — a dated bomb, not a rot that hides.
+    // Off the real clock, +100d is outside the 60d default and inside the 120d
+    // override on every calendar day, and the floor never fires.
+    const now = new Date();
     // Expiry 100 days out — OUTSIDE the 60-day default but INSIDE a 120-day override.
     await seedLot({ lotId, expiresAt: new Date(now.getTime() + 100 * ONE_DAY_MS), credits: 3 });
 
