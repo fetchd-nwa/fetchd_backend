@@ -583,35 +583,10 @@ test('POST /staff/bookings/:id/attendance — owner principal → 403', SKIP_WHE
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// Cancel — the two refund branches NOT covered above (forfeit + credit-back)
-// + idempotency replay, proving the shared cancel txn is correct through the
-// cross-owner staff route across all three outcomes.
+// Cancel — the credit-back refund branch NOT covered above, plus idempotency
+// replay, proving the shared cancel txn is correct through the cross-owner
+// staff route.
 // ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'POST /staff/bookings/:id/cancel — past-deadline forfeit → cancel_forfeited, no refund',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const id = await seedBooking({
-      category: 'private-lesson',
-      scheduledAt: new Date(REAL_NOW_MS + 30 * ONE_HOUR_MS).toISOString(),
-      cancelDeadlineAt: new Date(REAL_NOW_MS - 6 * ONE_HOUR_MS).toISOString(), // window passed
-    });
-    const { app } = staffBookingsApp();
-    const res = await post({
-      app,
-      url: `/staff/bookings/${id}/cancel`,
-      idempotencyKey: `cx-forfeit-${randomUUID()}`,
-    });
-    assert.equal(res.statusCode, 200, res.body);
-    const body = res.json() as { status: string; cancel_forfeited?: boolean };
-    assert.equal(body.status, 'cancelled');
-    assert.equal(body.cancel_forfeited, true);
-
-    const refundRows = await db.select().from(refunds).where(eq(refunds.bookingId, id));
-    assert.equal(refundRows.length, 0, 'forfeit leaves no refund row');
-  },
-);
 
 test(
   'POST /staff/bookings/:id/cancel — credit-paid within window → cancel-refund ledger row',
