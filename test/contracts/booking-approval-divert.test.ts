@@ -105,6 +105,32 @@ function buildApps(): {
 }
 
 /**
+ * A vaccine expiry the DDL trigger will accept, computed off the REAL clock.
+ *
+ * `assert_vaccines_current` (schema.sql) compares `dog_vaccines.expires_at` to
+ * `(now() AT TIME ZONE 'America/Chicago')::date` in Postgres real time — the
+ * `FIXTURE_NOW` clock this file injects into its routes cannot reach a trigger.
+ * A hard-coded expiry therefore pins these dogs' vaccines to a fixed calendar
+ * date while the trigger's floor keeps advancing, and the first real day past
+ * it every `createTestDog()` in this file throws at the gate.
+ *
+ * That is not hypothetical: the three literals this replaced were '2027-01-01',
+ * and step 0.2-c proved the consequence by running the suite at +180 days
+ * (0.2c-6-bomb-red.log — 23 tests, 4 pass, 19 fail). Worse than the 19: the
+ * `requiredVaccines` insert at the top of the exempt_class_keys test sits
+ * OUTSIDE its own try/finally, so a throw from `createTestDog()` there leaks
+ * the group-class-gating 'Rabies (test)' row into the rest of the run and takes
+ * `enrollment-create`, `enrollment-partial` and `requiredVaccines` down with it.
+ *
+ * Same shape as `farFutureExpiry()` in enrollment-partial.test.ts, and the same
+ * real-clock anchor 0.2-a applied to the credit-expiry scan tests. Five years
+ * of headroom, recomputed on every call, so it can never rot.
+ */
+function farFutureExpiry(): string {
+  return new Date(Date.now() + 5 * 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+/**
  * A fresh fixture-owned dog. With no options it has NO attended day
  * programs → stale by definition (never seen). `freshAnchor` plants a
  * recently-attended day-school session; `alumni` grants all 5 curriculum
@@ -137,13 +163,13 @@ async function createTestDog(
       dogId,
       name: 'Rabies',
       requirementKey: FIXTURE_IDS.requiredVaccineRabiesKey,
-      expiresAt: '2027-01-01',
+      expiresAt: farFutureExpiry(),
     },
     {
       dogId,
       name: 'Bordetella',
       requirementKey: FIXTURE_IDS.requiredVaccineBordetellaKey,
-      expiresAt: '2027-01-01',
+      expiresAt: farFutureExpiry(),
     },
   ]);
   if (opts.alumni === true) {
@@ -775,7 +801,7 @@ test(
     await db.insert(dogVaccines).values({
       dogId,
       name: 'Rabies',
-      expiresAt: '2027-01-01',
+      expiresAt: farFutureExpiry(),
     });
     await topUpCredits(dogId, 'school', 5);
     const res = await postBooking(ownerApp, {
