@@ -27,11 +27,13 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  * (non-retroactive — already-stamped lots keep their expires_at). A POST
  * changes FUTURE grants only.
  *
- * `warning_lead_days` has two consumers: the credits-expiring push scan
- * (`enqueueCreditExpiryWarnings`, Phase 3) and — Δ 2026-07-16 — the owner
- * app's "expiring soon" chip, which reads the resolved per-location value
- * off `GET /dogs/:id/credits` (`warning_lead_days`), so both warning
- * surfaces move together when staff tune this.
+ * `warning_lead_days` has one consumer left: the owner app's "expiring soon"
+ * chip (Δ 2026-07-16), which reads the resolved per-location value off
+ * `GET /dogs/:id/credits` (`warning_lead_days`). The credits-expiring push
+ * scan (`enqueueCreditExpiryWarnings`) that also read it is retired at 2.0.0
+ * (S01): from then the notice lead is `cred.expiry_warning_lead_days` on
+ * `credit_settings`, and CRED-U13 builds that notice at 7.1.0. This route and
+ * its table go at 5.0.0 (S25, M4.07).
  *
  * Wire shape per row:
  *   { location, expiry_window_months, warning_lead_days, updated_at,

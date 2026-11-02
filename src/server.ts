@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { env } from './env.js';
 import { alarmForwardingHooks, isPagerInstalled } from './lib/observability.js';
 import { registerAuth } from './auth/plugin.js';
+import { registerCors } from './lib/cors.js';
 import { registerAuthWebhook } from './routes/authWebhook.js';
 import { registerAgreementsRoute } from './routes/agreements.js';
 import { registerAnnouncementsRoute } from './routes/announcements.js';
@@ -27,6 +28,7 @@ import { registerReportsRoute } from './routes/reports.js';
 import { registerRequestConfirmPaymentRoute } from './routes/requestConfirmPayment.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
+import { registerSettingsRoute } from './routes/settings.js';
 import { registerStaffAlumniRoute } from './routes/staffAlumni.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
@@ -37,6 +39,7 @@ import { registerStaffDogsRoute } from './routes/staffDogs.js';
 import { registerStaffRatesRoute } from './routes/staffRates.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
+import { registerStaffSettingsRoute } from './routes/staffSettings.js';
 import { registerStaffThreadsRoute } from './routes/staffThreads.js';
 import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
 import { registerThreadsRoute } from './routes/threads.js';
@@ -106,6 +109,10 @@ export function buildApp(): FastifyInstance {
   // Auth first: it decorates `request.principal` and installs the one
   // ApiError→HTTP mapper every route relies on.
   registerAuth(app);
+  // CORS before any route: the staff portal's preflights are answered here,
+  // and the allow header rides every response to an allow-listed origin —
+  // a 401/403 included, or the browser hides the refusal from the portal.
+  registerCors(app, env.PORTAL_ORIGIN);
   registerHealthRoute(app); // [public] — no auth guard
   registerHealthWatchdogRoute(app); // [public] — Day-20 scheduler + pager watchdog; NOT /health
   registerWelcomeDogsRoute(app); // [public] — pre-login welcome gallery
@@ -123,9 +130,11 @@ export function buildApp(): FastifyInstance {
   registerCreditPackagesRoute(app); // [auth] — catalog (owner + staff)
   registerRatesRoute(app); // [auth] — catalog (owner + staff)
   registerRequestsRoute(app); // [auth] — owner-only
+  registerSettingsRoute(app); // [auth] — the owner settings document (2.0.0), read from pg every call
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
   registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
   registerStaffCreditExpiryRoute(app); // [staff] — staff-tunable credit-expiry settings (2026-06-20)
+  registerStaffSettingsRoute(app); // [staff] — GET/PATCH /staff/settings/:domain[/:location] (2.0.0)
   registerStaffAlumniRoute(app); // [staff] — §J.3 completed-programs record + alumni-flag clear
   registerStaffMembershipsRoute(app); // [staff] — §J.1 pause / resume (staff-mediated)
   registerStaffInvoicesRoute(app); // [staff] — parked-invoice worklist (credit-expiry Phase 3)

@@ -13,10 +13,7 @@ import {
   enqueueAlumniAttendanceFlags,
   type AlumniAttendanceScanResult,
 } from '../lib/alumniAttendanceScan.js';
-import {
-  enqueueCreditExpiryWarnings,
-  type EnqueueCreditExpiryWarningsResult,
-} from '../lib/enqueueCreditExpiryWarnings.js';
+import { type EnqueueCreditExpiryWarningsResult } from '../lib/enqueueCreditExpiryWarnings.js';
 import {
   enqueueInvoiceOverdueWarnings,
   type EnqueueInvoiceOverdueWarningsResult,
@@ -107,8 +104,13 @@ interface WorkerLogger {
  *
  *   4. **Media derivatives** (Day 17). Claim → sharp → settle per job.
  *
- *   5. **Credit-expiry warnings** (credit-expiry Phase 3). Enqueue
- *      `credits-expiring` per lot inside its location's warning window.
+ *   5. **Credit-expiry warnings — retired at 2.0.0** (S01, design §2.1,
+ *      r3-fable #2). The scan read `credit_expiry_settings.warning_lead_days`
+ *      (60), a store no setting names from 2.0.0, so every one-month lot was
+ *      inside its window the day it was bought. The phase no longer runs; its
+ *      result stays `{scanned: 0, enqueued: 0}` so the tick log keeps its keys.
+ *      CRED-U13 builds the real notice off `cred.expiry_warning_lead_days` at
+ *      7.1.0; S25 (M4.07) removes the scan and its table.
  *
  *   6. **§J.3 alumni attendance** (monthly, self-gated on the 1st
  *      Chicago). Flag + notify alumni dogs under 2 attended qualifying
@@ -124,7 +126,7 @@ interface WorkerLogger {
  *      retry-safety window (24h default) per schema.sql lines ~918-920.
  *      One Postgres DELETE; runs on the pool runner outside any tx.
  *
- * Failures are logged-and-swallowed at each phase boundary — ALL twelve since
+ * Failures are logged-and-swallowed at each phase boundary — every phase since
  * 2026-09-03 (phase 1 was the lone exception, and that hole was the
  * 2026-09-02 production incident) — so a flaky Expo call can't block invoice
  * dunning, and a stuck dunning attempt can't block the TTL sweep. Returns a
@@ -468,37 +470,14 @@ export async function runSchedulerTickOnce(
     mediaDerivativesResult = { scanned: 0, results: [] };
   }
 
-  // Phase 5 — credit-expiry warnings (credit-expiry lane, its Phase 3). Scan live,
-  // non-exhausted credit lots within their location's warning window and
-  // enqueue a `credits-expiring` scheduled notification per lot (dedup-keyed
-  // on the lot id so a lot is warned exactly once across ticks). The enqueued
-  // rows are delivered by THIS tick's Phase-1 delivery on the NEXT tick
-  // (scheduled_for = now; the claim happens before this phase runs). Own tx,
-  // own log-and-swallow boundary so a scan failure can't block the TTL sweep.
-  let creditExpiryWarningsResult: EnqueueCreditExpiryWarningsResult = { scanned: 0, enqueued: 0 };
-  try {
-    creditExpiryWarningsResult = await withActor(SCHEDULER_ACTOR, (tx) =>
-      enqueueCreditExpiryWarnings(tx, now),
-    );
-    log.info(
-      {
-        workerTick: 'scheduler',
-        phase: 'credit-expiry-warnings',
-        scanned: creditExpiryWarningsResult.scanned,
-        enqueued: creditExpiryWarningsResult.enqueued,
-      },
-      'credit-expiry-warnings scan complete',
-    );
-  } catch (err) {
-    log.error(
-      {
-        workerTick: 'scheduler',
-        phase: 'credit-expiry-warnings',
-        err: err instanceof Error ? err.message : String(err),
-      },
-      'credit-expiry-warnings phase threw at the worker boundary; will retry next tick',
-    );
-  }
+  // Phase 5 — credit-expiry warnings: RETIRED at 2.0.0 (S01; see the header).
+  // `enqueueCreditExpiryWarnings` read the legacy 60-day lead, so it noticed a
+  // one-month lot the day it was bought. Nothing calls it from here; the result
+  // stays zero so `creditExpiryWarnings*` keep their place in the tick log.
+  const creditExpiryWarningsResult: EnqueueCreditExpiryWarningsResult = {
+    scanned: 0,
+    enqueued: 0,
+  };
 
   // Phase 6 — §J.3 alumni attendance (monthly). Self-gated on the 1st
   // (Chicago) inside the scan; every other day it returns `ran: false` at the

@@ -51,6 +51,8 @@ const BASE_ENV: Record<string, string> = {
   R2_ACCESS_KEY_ID: 'placeholder',
   R2_SECRET_ACCESS_KEY: 'placeholder',
   R2_BUCKET: 'nwa-media-test',
+  // Required in production since DECISIONS 67 (the staff portal's origin).
+  PORTAL_ORIGIN: 'https://portal.fetchd.invalid',
 };
 
 /**

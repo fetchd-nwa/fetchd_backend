@@ -79,6 +79,36 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- gen_random_uuid()
 
 -- ----------------------------------------------------------------------------
+-- Migration log + default privileges (LG1, wire 2.0.0; design §4 preamble).
+-- Every change after this file was locked reaches a live database as one
+-- committed step file under migrations/<group>/, applied by
+-- `npm run migrate:apply` (src/db/migrate.ts), which writes migrations_applied
+-- as the step's last statement. This file carries every step's result, so a
+-- fresh load equals a database that took the steps; `scripts/migrate-rehearse.sh`
+-- proves it (schema fingerprint, 0 differences). Requires the roles of
+-- 00-supabase-roles.sql (mounted ahead of this file in docker-compose.yml).
+-- ----------------------------------------------------------------------------
+-- M1.00 (S01) — the migration log, and no default grants to the API-less roles.
+-- design §4 preamble + LG1 table (design.md:6077-6092, :6130). Apply with
+-- `npm run migrate:apply -- <this file> --url … --project …`, never the SQL editor.
+--
+-- DECISIONS 51: written before production's pg_default_acl reading. The three
+-- IN SCHEMA public revokes are here; if that reading shows a global grant, the
+-- global form (no IN SCHEMA) is added to this step before its first production
+-- application. Rows whose grantor is supabase_admin are recorded, not altered.
+CREATE TABLE migrations_applied (
+  step_id     text PRIMARY KEY,
+  applied_at  timestamptz NOT NULL DEFAULT now(),
+  applied_by  text NOT NULL,
+  sql_sha256  text NOT NULL
+);
+REVOKE ALL ON migrations_applied FROM anon, authenticated;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM anon, authenticated;
+
+-- ----------------------------------------------------------------------------
 -- Enums
 -- ----------------------------------------------------------------------------
 CREATE TYPE service_category AS ENUM (
@@ -996,6 +1026,508 @@ INSERT INTO credit_expiry_settings (location, expiry_window_months, warning_lead
   VALUES (NULL, 12, 60);
 
 -- ----------------------------------------------------------------------------
+-- Settings — one table per domain (LG1, wire 2.0.0; SET-U01; design §2.1, §3,
+-- §4 M1.01–M1.16). Each is a singleton keyed `id boolean PRIMARY KEY DEFAULT
+-- true CHECK (id)`, or two tiers (`day`, `eval`: one global row with location
+-- NULL plus one per campus), or key/scope rows (`pay`), so audit_capture() can
+-- name every row (M1.18). Every key is a typed column seeded with §3's value;
+-- NOT SEEDED keys are NULL and no reader defaults them. Which role may edit a
+-- key and which keys are inert live in src/lib/settingsRegistry.ts. Each table
+-- is revoked from anon/authenticated as it is created (design §4 preamble).
+-- Not created in v1: boarding_settings, board_train_settings,
+-- private_lesson_settings (M1.03, M1.04, M1.14). staff_settings is P02's (M1.21).
+-- ----------------------------------------------------------------------------
+
+-- M1.01 (S01, SET-U01 ← ACCT-U02) — the `acct` settings domain.
+-- design §4 LG1 (design.md:6131), seeds §3.15. Every key is stored only in v1
+-- except acct.signup_field_requirement_map (signup_fields), which PATCH /me and
+-- the booking pre-check read. locked_account_view_mode is NOT SEEDED: NULL, and
+-- no reader may default it.
+CREATE TABLE account_settings (
+  id                                          boolean PRIMARY KEY DEFAULT true CHECK (id),
+  email_verification_grace_days               integer NOT NULL CHECK (email_verification_grace_days >= 0),
+  close_blocked_by_pending_refund_enabled     boolean NOT NULL,
+  close_auto_refund_fraction                  numeric NOT NULL CHECK (close_auto_refund_fraction BETWEEN 0 AND 1),
+  reactivation_restores_expired_value_enabled boolean NOT NULL,
+  locked_account_view_mode                    text CHECK (locked_account_view_mode IN ('lock_screen', 'actions_refused')),
+  -- service → 'refund' | 'none', for group-class and boarding
+  pause_reserved_service_return_mode          jsonb NOT NULL,
+  -- the signup field → 'off' | 'asked' | 'mandatory' map (acct.signup_field_requirement_map)
+  signup_fields                               jsonb NOT NULL,
+  updated_at                                  timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                         uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON account_settings FROM anon, authenticated;
+
+INSERT INTO account_settings (
+  email_verification_grace_days, close_blocked_by_pending_refund_enabled, close_auto_refund_fraction,
+  reactivation_restores_expired_value_enabled, locked_account_view_mode,
+  pause_reserved_service_return_mode, signup_fields
+) VALUES (
+  7, true, 0, false, NULL,
+  '{"group-class": "refund", "boarding": "refund"}',
+  '{"name": "mandatory", "phone": "mandatory", "email": "mandatory", "location": "mandatory", "emergency_contact": "mandatory", "address": "asked"}'
+);
+
+-- M1.02 (S01, SET-U01 ← ALUM-U06) — the `alum` settings domain.
+-- design §4 LG1 (design.md:6132), seeds §3.11.
+CREATE TABLE alumni_settings (
+  id                                      boolean PRIMARY KEY DEFAULT true CHECK (id),
+  recheck_after_months_unseen             integer NOT NULL CHECK (recheck_after_months_unseen > 0),
+  recheck_due_mirrors_reeval_due_enabled  boolean NOT NULL,
+  updated_at                              timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                     uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON alumni_settings FROM anon, authenticated;
+
+INSERT INTO alumni_settings (recheck_after_months_unseen, recheck_due_mirrors_reeval_due_enabled)
+VALUES (6, true);
+
+-- M1.05 (S01, SET-U01 ← CASH-U07) — the `cash` settings domain.
+-- design §4 LG1 (design.md:6133), seeds §3.9. Every column is stored only (R2:
+-- no in-person invoice exists in v1). cash.due_event is one jsonb column, service
+-- → due event (boarding NOT SEEDED: null); there is no cash_due_event_settings table.
+-- No package entry and no 'purchase' event: §1.1 never builds that rule
+-- (design.md:672, :729-730), which outranks §3.9's and M1.05's "package
+-- purchase" (DECISIONS 53, D1).
+CREATE TABLE cash_settings (
+  id                                boolean PRIMARY KEY DEFAULT true CHECK (id),
+  unpaid_checkout_block_enabled     boolean NOT NULL,
+  pack_grant_on_promise_enabled     boolean NOT NULL,
+  did_not_pay_undo_window_hours     integer NOT NULL CHECK (did_not_pay_undo_window_hours >= 0),
+  pack_partial_payment_destination  text NOT NULL CHECK (pack_partial_payment_destination IN ('account-credit', 'cash-refund')),
+  bounced_check_fee_cents           integer NOT NULL CHECK (bounced_check_fee_cents >= 0),
+  due_event_by_service              jsonb NOT NULL,
+  updated_at                        timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id               uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON cash_settings FROM anon, authenticated;
+
+INSERT INTO cash_settings (
+  unpaid_checkout_block_enabled, pack_grant_on_promise_enabled, did_not_pay_undo_window_hours,
+  pack_partial_payment_destination, bounced_check_fee_cents, due_event_by_service
+) VALUES (
+  true, false, 24, 'account-credit', 0,
+  '{"day-school": "drop-off", "day-care": "drop-off", "group-class": "first-meeting-start", "walk-in": "front-desk-or-pickup", "event": "event-start", "private-lesson": "close-out", "board-and-train": "close-out", "boarding": null}'
+);
+
+-- M1.06 (S01, SET-U01 ← CRED-U02) — the `cred` settings domain.
+-- design §4 LG1 (design.md:6134), seeds §3.5. Credits expire from day one
+-- (expiry_enforced_enabled true, answer 3) with one 7-day notice — and at least
+-- one notice, always: the lead list is never empty (DECISIONS 61); no clawback
+-- columns, no hand-grant cap (A3, R6, RULING §5). This is the one store of
+-- cred.expiry_warning_lead_days (question 35 → (b)): the legacy
+-- credit_expiry_settings is a store of no setting from here on.
+CREATE TABLE credit_settings (
+  id                                        boolean PRIMARY KEY DEFAULT true CHECK (id),
+  expiry_enforced_enabled                   boolean NOT NULL,
+  expiry_warning_lead_days                  integer[] NOT NULL
+    CHECK (cardinality(expiry_warning_lead_days) > 0
+           AND 0 <= ALL (expiry_warning_lead_days)
+           AND array_position(expiry_warning_lead_days, NULL) IS NULL),
+  manual_grant_expiry_months                integer NOT NULL CHECK (manual_grant_expiry_months > 0),
+  returned_credit_expiry_months             integer NOT NULL CHECK (returned_credit_expiry_months >= 0),
+  booking_outlives_lot_expiry_enabled       boolean NOT NULL,
+  single_day_purchase_max_count             integer NOT NULL CHECK (single_day_purchase_max_count > 0),
+  account_deletion_expires_credits_enabled  boolean NOT NULL,
+  dispute_auto_reversal_enabled             boolean NOT NULL,
+  pause_daily_expiry_extension_days         integer NOT NULL CHECK (pause_daily_expiry_extension_days >= 0),
+  unpaid_payment_auto_reversal_enabled      boolean NOT NULL,
+  updated_at                                timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                       uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON credit_settings FROM anon, authenticated;
+
+INSERT INTO credit_settings (
+  expiry_enforced_enabled, expiry_warning_lead_days, manual_grant_expiry_months,
+  returned_credit_expiry_months, booking_outlives_lot_expiry_enabled, single_day_purchase_max_count,
+  account_deletion_expires_credits_enabled, dispute_auto_reversal_enabled,
+  pause_daily_expiry_extension_days, unpaid_payment_auto_reversal_enabled
+) VALUES (
+  true, '{7}', 1,
+  1, false, 30,
+  true, false,
+  1, false
+);
+
+-- M1.07 (S01, SET-U01 ← DAY-U02, STAFF-U42) — the `day` settings domain.
+-- design §4 LG1 (design.md:6141), seeds §3.4, offerings E03 (design §2.6).
+-- Two tiers in one table, credit_expiry_settings' pattern: ONE global row
+-- (location NULL) and one row per campus, each tier's columns NOT NULL on its
+-- own rows and NULL on the other's (the tier CHECK). No day-school price column
+-- (the $60 single day is a credit_packages row, R1) and no lookback column.
+-- open_weekdays_list is ISO weekdays, 1 = Monday … 7 = Sunday. Times are
+-- America/Chicago wall-clock. `offerings` is the campus's service document,
+-- service → {offered, client_visible, name, description} (E03), every service at
+-- every campus. Whether a service runs at a campus has ONE store, its
+-- `offered` here: the §3.4 keys day.day_school_offered_flag and
+-- day.daycare_offered_flag are names for offerings['day-school'|'day-care']
+-- .offered, not columns (DECISIONS 53, D2). name and description are NOT SEEDED
+-- (no design line gives their text, D6): null, and no reader defaults them.
+-- No capacity_override_dogs column: its store is the per-date day_capacity row (D3).
+CREATE TABLE day_program_settings (
+  location                                   text REFERENCES locations(slug),  -- NULL = the global row
+  -- the global row
+  booking_horizon_months                     integer CHECK (booking_horizon_months > 0),
+  max_dogs_per_booking_count                 integer CHECK (max_dogs_per_booking_count > 0),
+  day_school_one_on_one_minutes              integer CHECK (day_school_one_on_one_minutes > 0),
+  occupied_block_end_time                    time,
+  midstay_day_charge_fraction                numeric CHECK (midstay_day_charge_fraction BETWEEN 0 AND 1),
+  sent_home_before_training_return_fraction  numeric CHECK (sent_home_before_training_return_fraction BETWEEN 0 AND 1),
+  sent_home_after_training_return_fraction   numeric CHECK (sent_home_after_training_return_fraction IN (0, 1)),
+  closure_return_fraction                    numeric CHECK (closure_return_fraction BETWEEN 0 AND 1),
+  after_school_price_cents                   integer CHECK (after_school_price_cents >= 0),
+  -- each campus row
+  offerings                                  jsonb,
+  open_weekdays_list                         integer[] CHECK (open_weekdays_list <@ ARRAY[1, 2, 3, 4, 5, 6, 7]),
+  daily_capacity_dogs                        integer CHECK (daily_capacity_dogs >= 0),
+  dropoff_open_time                          time,
+  dropoff_close_time                         time,
+  pickup_open_time                           time,
+  pickup_close_time                          time,
+  same_day_cutoff_time                       time,
+  late_pickup_call_time                      time,
+  late_pickup_grace_minutes                  integer CHECK (late_pickup_grace_minutes >= 0),
+  late_pickup_fee_cents                      integer CHECK (late_pickup_fee_cents >= 0),
+  after_school_start_time                    time,
+  after_school_end_time                      time,
+  after_school_capacity_count                integer CHECK (after_school_capacity_count >= 0),
+  updated_at                                 timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                        uuid REFERENCES staff(id) ON DELETE SET NULL,
+  CONSTRAINT day_program_settings_tier_check CHECK (
+    CASE WHEN location IS NULL THEN
+      num_nulls(booking_horizon_months, max_dogs_per_booking_count, day_school_one_on_one_minutes,
+                occupied_block_end_time, midstay_day_charge_fraction,
+                sent_home_before_training_return_fraction, sent_home_after_training_return_fraction,
+                closure_return_fraction, after_school_price_cents) = 0
+      AND num_nonnulls(offerings, open_weekdays_list, daily_capacity_dogs, dropoff_open_time,
+                       dropoff_close_time, pickup_open_time, pickup_close_time, same_day_cutoff_time,
+                       late_pickup_call_time, late_pickup_grace_minutes, late_pickup_fee_cents,
+                       after_school_start_time, after_school_end_time, after_school_capacity_count) = 0
+    ELSE
+      num_nulls(offerings, open_weekdays_list, daily_capacity_dogs, dropoff_open_time,
+                dropoff_close_time, pickup_open_time, pickup_close_time, same_day_cutoff_time,
+                late_pickup_call_time, late_pickup_grace_minutes, late_pickup_fee_cents,
+                after_school_start_time, after_school_end_time, after_school_capacity_count) = 0
+      AND num_nonnulls(booking_horizon_months, max_dogs_per_booking_count, day_school_one_on_one_minutes,
+                       occupied_block_end_time, midstay_day_charge_fraction,
+                       sent_home_before_training_return_fraction, sent_home_after_training_return_fraction,
+                       closure_return_fraction, after_school_price_cents) = 0
+    END
+  )
+);
+REVOKE ALL ON day_program_settings FROM anon, authenticated;
+
+-- Exactly one global row; at most one row per campus.
+CREATE UNIQUE INDEX day_program_settings_global_uniq
+  ON day_program_settings ((location IS NULL)) WHERE location IS NULL;
+CREATE UNIQUE INDEX day_program_settings_location_uniq
+  ON day_program_settings (location) WHERE location IS NOT NULL;
+
+INSERT INTO day_program_settings (
+  location, booking_horizon_months, max_dogs_per_booking_count, day_school_one_on_one_minutes,
+  occupied_block_end_time, midstay_day_charge_fraction, sent_home_before_training_return_fraction,
+  sent_home_after_training_return_fraction, closure_return_fraction, after_school_price_cents
+) VALUES (
+  NULL, 3, 5, 20,
+  '17:00', 1, 1,
+  0, 1, 0
+);
+
+INSERT INTO day_program_settings (
+  location, offerings, open_weekdays_list, daily_capacity_dogs,
+  dropoff_open_time, dropoff_close_time, pickup_open_time, pickup_close_time,
+  same_day_cutoff_time, late_pickup_call_time, late_pickup_grace_minutes, late_pickup_fee_cents,
+  after_school_start_time, after_school_end_time, after_school_capacity_count
+) VALUES (
+  'fayetteville',
+  '{"day-school": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "day-care": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "group-class": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "evaluation": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "private-lesson": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "board-and-train": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "boarding": {"offered": false, "client_visible": false, "name": null, "description": null}}',
+  '{1,2,3,4,5}', 15,
+  '07:30', '08:30', '16:30', '17:30',
+  '07:30', '17:30', 0, 0,
+  '17:30', '18:30', 10
+), (
+  'bentonville',
+  '{"day-school": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "day-care": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "group-class": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "evaluation": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "private-lesson": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "board-and-train": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "boarding": {"offered": false, "client_visible": false, "name": null, "description": null}}',
+  '{1,2,3,4,5}', 15,
+  '07:30', '08:30', '16:30', '17:30',
+  '07:30', '17:30', 0, 0,
+  '17:30', '18:30', 5
+);
+
+-- M1.08 (S01, SET-U01 ← DOG-U02, E01) — the `dog` settings domain.
+-- design §4 LG1 (design.md:6136), seeds §3.1. DOG-U02's table plus the four E01
+-- gate switches and card_required_for_evaluation_booking_enabled (true, 05- #8),
+-- which supersedes DOG-U02's nullable card_required_for_evaluation_booking (D4).
+-- No descriptor_list column (dog_descriptors is the one store), no
+-- intake_field_override_mode. The gate keys are inert until P06/P09 (re-cut 11-02).
+CREATE TABLE dog_gate_settings (
+  id                                            boolean PRIMARY KEY DEFAULT true CHECK (id),
+  spay_neuter_required_by_age_months            integer NOT NULL CHECK (spay_neuter_required_by_age_months > 0),
+  spay_neuter_gated_categories                  service_category[] NOT NULL,
+  spay_neuter_reminder_time                     time NOT NULL,  -- America/Chicago
+  card_required_at_board_train_confirm          boolean NOT NULL,
+  card_required_for_evaluation_booking_enabled  boolean NOT NULL DEFAULT true,
+  gate_card_on_file_enabled                     boolean NOT NULL,
+  gate_evaluation_enabled                       boolean NOT NULL,
+  gate_vaccines_enabled                         boolean NOT NULL,
+  gate_agreements_enabled                       boolean NOT NULL,
+  gate_override_allowed_gate_keys               text[] NOT NULL,
+  staff_dog_exempt_gate_keys                    text[] NOT NULL,
+  updated_at                                    timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                           uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON dog_gate_settings FROM anon, authenticated;
+
+INSERT INTO dog_gate_settings (
+  spay_neuter_required_by_age_months, spay_neuter_gated_categories, spay_neuter_reminder_time,
+  card_required_at_board_train_confirm, card_required_for_evaluation_booking_enabled,
+  gate_card_on_file_enabled, gate_evaluation_enabled, gate_vaccines_enabled, gate_agreements_enabled,
+  gate_override_allowed_gate_keys, staff_dog_exempt_gate_keys
+) VALUES (
+  6, '{day-school,day-care}', '09:00',
+  true, true,
+  true, true, true, true,
+  '{custom}', '{card-on-file}'
+);
+
+-- M1.09 (S01, SET-U01 ← EVAL-U08) — the `eval` settings domain.
+-- design §4 LG1 (design.md:6137), seeds §3.2. Two tiers with tier CHECKs: the
+-- global row (location NULL) carries reeval_after_months_unseen (NULL = the
+-- clock is off, EVAL-53; DECISIONS 62; seeded 3) and failed_rebook_wait_hours
+-- (required there); each campus row carries max_per_day_dogs (NULL = no limit,
+-- which is its seed). No price column — eval.price_cents is the
+-- campus's evaluation service_rates row — and no verdict_correction_window_hours.
+CREATE TABLE evaluation_settings (
+  location                     text REFERENCES locations(slug),  -- NULL = the global row
+  reeval_after_months_unseen   integer CHECK (reeval_after_months_unseen > 0),
+  failed_rebook_wait_hours     integer CHECK (failed_rebook_wait_hours >= 0),
+  max_per_day_dogs             integer CHECK (max_per_day_dogs > 0),
+  updated_at                   timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id          uuid REFERENCES staff(id) ON DELETE SET NULL,
+  CONSTRAINT evaluation_settings_tier_check CHECK (
+    CASE WHEN location IS NULL
+      THEN failed_rebook_wait_hours IS NOT NULL AND max_per_day_dogs IS NULL
+      ELSE reeval_after_months_unseen IS NULL AND failed_rebook_wait_hours IS NULL
+    END
+  )
+);
+REVOKE ALL ON evaluation_settings FROM anon, authenticated;
+
+-- Exactly one global row; at most one row per campus.
+CREATE UNIQUE INDEX evaluation_settings_global_uniq
+  ON evaluation_settings ((location IS NULL)) WHERE location IS NULL;
+CREATE UNIQUE INDEX evaluation_settings_location_uniq
+  ON evaluation_settings (location) WHERE location IS NOT NULL;
+
+INSERT INTO evaluation_settings (location, reeval_after_months_unseen, failed_rebook_wait_hours, max_per_day_dogs)
+VALUES
+  (NULL,           3,    0,    NULL),
+  ('fayetteville', NULL, NULL, NULL),
+  ('bentonville',  NULL, NULL, NULL);
+
+-- M1.10 (S01, SET-U01 ← MIG-U02) — the `mig` settings domain.
+-- design §4 LG1 (design.md:6138), seeds §3.16. No invite_link_lifetime_days,
+-- no expiry-anchor column and no migration_expiry_anchor type: every imported
+-- lot dates from its family's import (Allison s04, s06).
+CREATE TABLE migration_settings (
+  id                                boolean PRIMARY KEY DEFAULT true CHECK (id),
+  pilot_family_count                integer NOT NULL CHECK (pilot_family_count > 0),
+  full_transfer_after_pilot_months  integer NOT NULL CHECK (full_transfer_after_pilot_months > 0),
+  import_credit_balances_enabled    boolean NOT NULL,
+  imported_credit_expiry_months     integer NOT NULL CHECK (imported_credit_expiry_months > 0),
+  import_unpaid_balances_enabled    boolean NOT NULL,
+  invite_recent_within_months       integer NOT NULL CHECK (invite_recent_within_months > 0),
+  gingr_retention_billing_cycles    integer NOT NULL CHECK (gingr_retention_billing_cycles > 0),
+  updated_at                        timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id               uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON migration_settings FROM anon, authenticated;
+
+INSERT INTO migration_settings (
+  pilot_family_count, full_transfer_after_pilot_months, import_credit_balances_enabled,
+  imported_credit_expiry_months, import_unpaid_balances_enabled, invite_recent_within_months,
+  gingr_retention_billing_cycles
+) VALUES (5, 1, true, 1, true, 12, 1);
+
+-- M1.11 (S01, SET-U01 ← MSG-U02) — the `msg` settings domain.
+-- design §4 LG1 (design.md:6139), seeds §3.13. The two responders are set by
+-- `npm run staff:provision` after the staff rows exist, never by a migration.
+CREATE TABLE messaging_settings (
+  id                                 boolean PRIMARY KEY DEFAULT true CHECK (id),
+  referral_subtopic_enabled          boolean NOT NULL,
+  school_default_responder_staff_id  uuid REFERENCES staff(id) ON DELETE SET NULL,
+  school_backup_responder_staff_id   uuid REFERENCES staff(id) ON DELETE SET NULL,
+  school_default_responder_out       boolean NOT NULL,
+  video_max_duration_seconds         integer NOT NULL CHECK (video_max_duration_seconds > 0),
+  video_max_size_mb                  integer NOT NULL CHECK (video_max_size_mb > 0),
+  max_attachments_per_message        integer NOT NULL CHECK (max_attachments_per_message > 0),
+  max_text_length_chars              integer NOT NULL CHECK (max_text_length_chars > 0),
+  request_reply_window_hours         integer NOT NULL CHECK (request_reply_window_hours > 0),
+  reply_signature_mode               text NOT NULL DEFAULT 'staffer_first_name'
+    CHECK (reply_signature_mode IN ('staffer_first_name', 'school_name')),
+  updated_at                         timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON messaging_settings FROM anon, authenticated;
+
+INSERT INTO messaging_settings (
+  referral_subtopic_enabled, school_default_responder_staff_id, school_backup_responder_staff_id,
+  school_default_responder_out, video_max_duration_seconds, video_max_size_mb,
+  max_attachments_per_message, max_text_length_chars, request_reply_window_hours, reply_signature_mode
+) VALUES (false, NULL, NULL, false, 60, 100, 10, 4000, 24, 'staffer_first_name');
+
+-- M1.12 (S01, SET-U01 ← NOTIF-U02) — the `notif` settings domain.
+-- design §4 LG1 (design.md:6140), seeds §3.12. Times are America/Chicago.
+-- email_sender_address is NULL until Allison supplies it (the preflight refuses
+-- a pilot without it). No push_receipt_check_delay_minutes.
+CREATE TABLE notification_settings (
+  id                                    boolean PRIMARY KEY DEFAULT true CHECK (id),
+  quiet_hours_start_time                time NOT NULL,
+  quiet_hours_end_time                  time NOT NULL,
+  quiet_hours_bypass_types              text[] NOT NULL,
+  scan_send_time                        time NOT NULL,
+  booking_reminder_lead_hours           integer NOT NULL CHECK (booking_reminder_lead_hours >= 0),
+  card_expiry_warning_days_before       integer NOT NULL CHECK (card_expiry_warning_days_before >= 0),
+  email_sender_address                  text,
+  broadcast_audience_list               text[] NOT NULL
+    CHECK (broadcast_audience_list <@ ARRAY['everyone', 'campus', 'class', 'day-school-families']),
+  cash_payment_due_reminder_lead_hours  integer NOT NULL CHECK (cash_payment_due_reminder_lead_hours >= 0),
+  email_sender_display_name             text NOT NULL DEFAULT 'NWA School for Dogs',
+  -- program → 'push_only' | 'push_then_email'
+  reminder_channel_by_program           jsonb NOT NULL,
+  expiry_notice_channel                 text NOT NULL DEFAULT 'push_then_email'
+    CHECK (expiry_notice_channel IN ('push_only', 'push_then_email')),
+  email_inflight_alarm_minutes          integer NOT NULL DEFAULT 5 CHECK (email_inflight_alarm_minutes > 0),
+  updated_at                            timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                   uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON notification_settings FROM anon, authenticated;
+
+INSERT INTO notification_settings (
+  quiet_hours_start_time, quiet_hours_end_time, quiet_hours_bypass_types, scan_send_time,
+  booking_reminder_lead_hours, card_expiry_warning_days_before, email_sender_address,
+  broadcast_audience_list, cash_payment_due_reminder_lead_hours, email_sender_display_name,
+  reminder_channel_by_program, expiry_notice_channel, email_inflight_alarm_minutes
+) VALUES (
+  '21:00', '08:00', '{payment-failed,closure,staff-reply}', '08:00',
+  24, 7, NULL,
+  '{everyone,campus,class,day-school-families}', 24, 'NWA School for Dogs',
+  '{"day-school": "push_only", "day-care": "push_then_email", "group-class": "push_then_email", "evaluation": "push_then_email"}',
+  'push_then_email', 5
+);
+
+-- M1.13 (S01, SET-U01 ← PAY-U02; PAY-U05, PAY-U07, PAY-U14) — the `pay` domain.
+-- design §4 LG1 (design.md:6141), seeds §3.7. PAY-U02's key/value shape, scope
+-- 'global' for an org-wide row and a service (or 'package', 'retail', 'event')
+-- for charge_timing_mode, the one per-service key. Seeded whole here (M3.04's
+-- inserts move in). No payment_setting_changes table: audit_log is the history.
+-- max_sessions_per_booking_count, automatic_return_instrument_mode,
+-- charge_timing_mode and price_change_notice_days are stored only in v1.
+-- The value CHECK holds each seeded key's shape and bounds; a key with no
+-- clause is accepted as any jsonb (the store is generic by design).
+CREATE TABLE payment_settings (
+  key                  text NOT NULL,
+  scope                text NOT NULL DEFAULT 'global',
+  value                jsonb NOT NULL,
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id  uuid REFERENCES staff(id) ON DELETE SET NULL,
+  PRIMARY KEY (key, scope),
+  CONSTRAINT payment_settings_scope_check CHECK ((key = 'charge_timing_mode') = (scope <> 'global')),
+  CONSTRAINT payment_settings_value_check CHECK (
+    CASE
+      WHEN key IN ('card_attempts_max_count', 'seat_hold_max_minutes', 'processing_hold_max_minutes',
+                   'refund_any_role_limit_cents', 'price_change_notice_days',
+                   'max_sessions_per_booking_count')
+        THEN CASE
+          WHEN jsonb_typeof(value) <> 'number' THEN false
+          WHEN (value::text)::numeric <> trunc((value::text)::numeric) THEN false
+          WHEN key = 'card_attempts_max_count' THEN (value::text)::numeric BETWEEN 1 AND 5
+          WHEN key = 'seat_hold_max_minutes' THEN (value::text)::numeric BETWEEN 1 AND 5
+          WHEN key = 'processing_hold_max_minutes' THEN (value::text)::numeric BETWEEN 1 AND 60
+          WHEN key = 'max_sessions_per_booking_count' THEN (value::text)::numeric >= 1
+          ELSE (value::text)::numeric >= 0
+        END
+      WHEN key IN ('custom_invoice_kind_list', 'custom_invoice_card_kind_list')
+        THEN jsonb_typeof(value) = 'array'
+      WHEN key = 'charge_timing_mode'
+        THEN value IN ('"at_confirm"'::jsonb, '"at_close_out"'::jsonb)
+      WHEN key = 'automatic_return_instrument_mode'
+        THEN value = '"original_card"'::jsonb
+      ELSE true
+    END
+  )
+);
+REVOKE ALL ON payment_settings FROM anon, authenticated;
+
+INSERT INTO payment_settings (key, scope, value) VALUES
+  ('card_attempts_max_count',          'global',          '3'),
+  ('seat_hold_max_minutes',            'global',          '2'),
+  ('processing_hold_max_minutes',      'global',          '10'),
+  ('custom_invoice_kind_list',         'global',          '["vet-bill", "damage", "other"]'),
+  ('custom_invoice_card_kind_list',    'global',          '["vet-bill", "damage"]'),
+  ('refund_any_role_limit_cents',      'global',          '0'),
+  ('price_change_notice_days',         'global',          '30'),
+  ('max_sessions_per_booking_count',   'global',          '30'),
+  ('automatic_return_instrument_mode', 'global',          '"original_card"'),
+  ('charge_timing_mode',               'private-lesson',  '"at_close_out"'),
+  ('charge_timing_mode',               'board-and-train', '"at_close_out"'),
+  ('charge_timing_mode',               'day-school',      '"at_confirm"'),
+  ('charge_timing_mode',               'group-class',     '"at_confirm"'),
+  ('charge_timing_mode',               'package',         '"at_confirm"'),
+  ('charge_timing_mode',               'retail',          '"at_confirm"'),
+  ('charge_timing_mode',               'event',           '"at_confirm"');
+
+-- M1.15 (S01, SET-U01 ← RPT-U02) — the `rpt` settings domain.
+-- design §4 LG1 (design.md:6143), seeds §3.17. media_max_upload_megabytes is
+-- bounded 1..25, 25 being MAX_UPLOAD_BYTES: it can only be lowered in v1 (q101).
+-- curriculum_levels is M9.03's table, not a column here.
+CREATE TABLE reports_settings (
+  id                             boolean PRIMARY KEY DEFAULT true CHECK (id),
+  events_enabled                 boolean NOT NULL,
+  event_max_dogs_per_rsvp        integer NOT NULL CHECK (event_max_dogs_per_rsvp > 0),
+  gallery_enabled                boolean NOT NULL,
+  gallery_max_dogs               integer NOT NULL CHECK (gallery_max_dogs > 0),
+  gallery_rate_limit_per_minute  integer NOT NULL CHECK (gallery_rate_limit_per_minute > 0),
+  media_max_upload_megabytes     integer NOT NULL CHECK (media_max_upload_megabytes BETWEEN 1 AND 25),
+  updated_at                     timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id            uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON reports_settings FROM anon, authenticated;
+
+INSERT INTO reports_settings (
+  events_enabled, event_max_dogs_per_rsvp, gallery_enabled, gallery_max_dogs,
+  gallery_rate_limit_per_minute, media_max_upload_megabytes
+) VALUES (false, 5, false, 60, 60, 25);
+
+-- M1.16 (S01, SET-U01 ← VAX-U08) — the `vax` settings domain.
+-- design §4 LG1 (design.md:6144), seeds §3.3. The catalog keys (which vaccines,
+-- their labels, gate and exemption flags) are required_vaccines columns, not here.
+CREATE TABLE vaccine_settings (
+  id                                   boolean PRIMARY KEY DEFAULT true CHECK (id),
+  proof_file_types                     text[] NOT NULL,
+  typical_full_vaccination_age_months  integer NOT NULL CHECK (typical_full_vaccination_age_months > 0),
+  updated_at                           timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                  uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON vaccine_settings FROM anon, authenticated;
+
+INSERT INTO vaccine_settings (proof_file_types, typical_full_vaccination_age_months)
+VALUES ('{application/pdf,image/jpeg,image/png,image/heic,image/heif}', 4);
+
+-- ----------------------------------------------------------------------------
 -- Credits — append-only ledger (replaces the mock mutable counter)
 -- Δ 2026-06-18 (credit-expiry lot model): credits NOW expire, per Shanthi's
 -- business rule — superseding the 2026-05-19 "credits do not expire" decision.
@@ -1820,12 +2352,20 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX audit_log_table_row_idx ON audit_log (table_name, row_pk, at DESC);
 
+-- row_pk is the first arm that names the row. M1.18 (STAFF-U22) added the
+-- key/scope arm (payment_settings) BEFORE the bare key arm, and the category
+-- (cancel_window_settings), field_key (intake_field_settings) and location arms
+-- AFTER date — a NULL location is the '<global>' row of a two-tier settings
+-- table. A table none of the arms can name aborts every UPDATE (row_pk is NOT
+-- NULL), so a new audited table needs a key one of them reads.
 CREATE OR REPLACE FUNCTION audit_capture() RETURNS trigger AS $$
 BEGIN
   INSERT INTO audit_log (table_name, row_pk, op, before, actor)
   VALUES (
     TG_TABLE_NAME,
     COALESCE((to_jsonb(OLD) ->> 'id'),
+             CASE WHEN to_jsonb(OLD) ? 'scope'
+                  THEN (to_jsonb(OLD) ->> 'key') || '/' || (to_jsonb(OLD) ->> 'scope') END,
              (to_jsonb(OLD) ->> 'key'),
              (to_jsonb(OLD) ->> 'dog_id'),
              (to_jsonb(OLD) ->> 'booking_id'),
@@ -1833,7 +2373,11 @@ BEGIN
              (to_jsonb(OLD) ->> 'thread_id'),
              (to_jsonb(OLD) ->> 'rsvp_id'),
              (to_jsonb(OLD) ->> 'notification_id'),
-             (to_jsonb(OLD) ->> 'date')),
+             (to_jsonb(OLD) ->> 'date'),
+             (to_jsonb(OLD) ->> 'category'),
+             (to_jsonb(OLD) ->> 'field_key'),
+             CASE WHEN to_jsonb(OLD) ? 'location'
+                  THEN COALESCE(to_jsonb(OLD) ->> 'location', '<global>') END),
     TG_OP,
     to_jsonb(OLD),
     current_setting('app.actor', true)
@@ -1897,7 +2441,15 @@ BEGIN
     'pending_requests','pending_request_dogs','pending_request_preferred_dates',
     'day_capacity','payment_methods','memberships','agreement_documents',
     'service_rates','threads','thread_dogs','messages','event_series','events',
-    'event_rsvps','event_rsvp_dogs','announcements','device_tokens'
+    'event_rsvps','event_rsvp_dogs','announcements','device_tokens',
+    -- M1.18 (STAFF-U22): every settings edit keeps the value it replaced —
+    -- the four settings tables that predate LG1, and every table M1.01–M1.16
+    -- creates (src/lib/settingsRegistry.ts AUDITED_SETTINGS_TABLES).
+    'cancel_window_settings','credit_expiry_settings','intake_field_settings',
+    'dog_descriptors','account_settings','alumni_settings','cash_settings',
+    'credit_settings','day_program_settings','dog_gate_settings',
+    'evaluation_settings','migration_settings','messaging_settings',
+    'notification_settings','payment_settings','reports_settings','vaccine_settings'
   ]) LOOP
     EXECUTE format(
       'CREATE TRIGGER %I_audit AFTER UPDATE OR DELETE ON %I
@@ -2222,6 +2774,20 @@ COMMENT ON TABLE  pending_request_preferred_dates IS 'The owner ranked preferred
 COMMENT ON TABLE  day_capacity                   IS 'Sparse per-(location, calendar-day) capacity overrides for Day School/Care; the per-location default rule is applied in the API when no row exists.';
 COMMENT ON TABLE  cancel_window_settings         IS 'Owner-tunable per-category free-cancel hours (Day 13). One row per service_category; seeded 48h flat. API reads at booking creation to stamp bookings.cancel_deadline_at; the resolved deadline travels with the booking.';
 COMMENT ON TABLE  credit_expiry_settings         IS 'Staff-tunable credit-expiry window + warning lead (2026-06-20). One org-default row (location IS NULL) + optional per-location override rows; partial unique indexes enforce exactly-one-default and one-per-location. API resolves per-location → org-default → code default (12mo) to stamp credit_ledger lot expiry at purchase (non-retroactive). warning_lead_days has no P2 consumer (its reader is the Phase-3 expiry-warning notification).';
+COMMENT ON TABLE migrations_applied IS 'One row per migration step applied through npm run migrate:apply: the step id, who ran it, and the sha256 of the exact bytes sent. Written as the step''s last statement, in its transaction.';
+COMMENT ON TABLE account_settings IS 'The acct settings domain (singleton, id = true): account lifecycle switches and the signup field requirement map. Audited (STAFF-74); edited through PATCH /staff/settings/acct.';
+COMMENT ON TABLE alumni_settings IS 'The alum settings domain (singleton, id = true): the alumni re-check clock. Audited (STAFF-74); edited through PATCH /staff/settings/alum.';
+COMMENT ON TABLE cash_settings IS 'The cash settings domain (singleton, id = true): cash and check policy, every key stored only in v1 (R2). Audited (STAFF-74).';
+COMMENT ON TABLE credit_settings IS 'The cred settings domain (singleton, id = true): whether credits expire, the expiry notice leads, hand-grant and return expiry months. The one store of cred.expiry_warning_lead_days. Audited (STAFF-74).';
+COMMENT ON TABLE day_program_settings IS 'The day settings domain: one global row (location NULL) and one row per campus, every day.* key a typed column on its tier, plus each campus''s offerings document (E03). Audited (STAFF-74); edited through PATCH /staff/settings/day/:location.';
+COMMENT ON TABLE dog_gate_settings IS 'The dog settings domain (singleton, id = true): the booking gate switches, the card-for-evaluation rule and the spay/neuter policy. Audited (STAFF-74).';
+COMMENT ON TABLE evaluation_settings IS 'The eval settings domain: one global row (location NULL: re-evaluation clock, failed-rebook wait) and one row per campus (daily evaluation cap). The evaluation price is its service_rates row, not a column here. Audited (STAFF-74).';
+COMMENT ON TABLE migration_settings IS 'The mig settings domain (singleton, id = true): the Gingr pilot import''s limits and switches. Audited (STAFF-74).';
+COMMENT ON TABLE messaging_settings IS 'The msg settings domain (singleton, id = true): message limits, the reply signature, and the default and backup responders (set by staff:provision). Audited (STAFF-74).';
+COMMENT ON TABLE notification_settings IS 'The notif settings domain (singleton, id = true): send times, reminder and expiry-notice leads and channels, the email sender. Audited (STAFF-74).';
+COMMENT ON TABLE payment_settings IS 'The pay settings domain: one row per (key, scope), value jsonb; scope ''global'' except charge_timing_mode, which is per service. Seeded whole at M1.13. Audited (STAFF-74); audit_log is the change history.';
+COMMENT ON TABLE reports_settings IS 'The rpt settings domain (singleton, id = true): events and gallery switches and limits, the media upload cap. Audited (STAFF-74).';
+COMMENT ON TABLE vaccine_settings IS 'The vax settings domain (singleton, id = true): accepted proof file types and the typical full-vaccination age. Audited (STAFF-74).';
 COMMENT ON TABLE  credit_packages                IS 'Effective-dated catalog of purchasable credit packages (mode, credit count, price) per location. Reprice/retire by closing effective_to + inserting a new row — never edit a priced row.';
 COMMENT ON TABLE  credit_ledger                  IS 'Append-only credit transactions (purchase grants, booking debits, refunds) modeled as expiring LOTS (Δ 2026-06-18): a source row (delta>0, lot_id NULL) carries expires_at; debits/refunds carry lot_id. Balance counts only live lots. Corrections are reversing entries.';
 COMMENT ON TABLE  stripe_customers               IS 'Maps an owner to their Stripe customer id (1:1).';

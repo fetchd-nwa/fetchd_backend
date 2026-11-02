@@ -68,6 +68,8 @@ const BASE_ENV: Record<string, string> = {
   R2_ACCESS_KEY_ID: 'placeholder',
   R2_SECRET_ACCESS_KEY: 'placeholder',
   R2_BUCKET: 'nwa-media-test',
+  // Required in production since DECISIONS 67 (the staff portal's origin).
+  PORTAL_ORIGIN: 'https://portal.fetchd.invalid',
 };
 
 interface BootResult {
@@ -182,4 +184,78 @@ test('SENTRY_BOOT_SMOKE=1 is still refused, and the refusal NAMES the accepted v
   assert.match(boot.stderr, /true/, 'the message must say what IS accepted');
   assert.match(boot.stderr, /false/);
   assert.match(boot.stderr, /case-insensitive/i);
+});
+
+/**
+ * **`PORTAL_ORIGIN` is required in production** (DECISIONS 67; Fable L1).
+ * Unset, the API would boot with no CORS allow-list: the mobile app works,
+ * every portal call dies in the browser as a network error, and no log says
+ * why. Same shape as `SENTRY_DSN`: optional in dev/test/staging, refused
+ * unset in production, with the reason in the refusal.
+ */
+test('production without PORTAL_ORIGIN refuses to boot, naming the portal', () => {
+  const env: Record<string, string> = {
+    ...BASE_ENV,
+    NODE_ENV: 'production',
+    SENTRY_DSN: PLACEHOLDER_DSN,
+  };
+  delete env.PORTAL_ORIGIN;
+  const result = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', '-e', "await import('./src/env.js'); process.stdout.write('ENV_OK');"],
+    { cwd: REPO_ROOT, env, encoding: 'utf-8' },
+  );
+  assert.equal(result.status, 1, `expected exit 1; stdout: ${result.stdout}`);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /PORTAL_ORIGIN/);
+  assert.match(result.stderr, /portal/);
+});
+
+test('development and staging boot without PORTAL_ORIGIN (no cross-origin caller)', () => {
+  for (const nodeEnv of ['development', 'staging'] as const) {
+    const env: Record<string, string> = { ...BASE_ENV, NODE_ENV: nodeEnv };
+    delete env.PORTAL_ORIGIN;
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', '-e', "await import('./src/env.js'); process.stdout.write('ENV_OK');"],
+      { cwd: REPO_ROOT, env, encoding: 'utf-8' },
+    );
+    assert.equal(result.status, 0, `${nodeEnv}: ${result.stderr}`);
+  }
+});
+
+test('production refuses a plain-http PORTAL_ORIGIN (DECISIONS 71: https only in production)', () => {
+  for (const origin of [
+    'http://portal.fetchd.invalid',
+    'https://portal.fetchd.invalid,http://localhost:5173',
+  ]) {
+    const env: Record<string, string> = {
+      ...BASE_ENV,
+      NODE_ENV: 'production',
+      SENTRY_DSN: PLACEHOLDER_DSN,
+      PORTAL_ORIGIN: origin,
+    };
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', '-e', "await import('./src/env.js'); process.stdout.write('ENV_OK');"],
+      { cwd: REPO_ROOT, env, encoding: 'utf-8' },
+    );
+    assert.equal(result.status, 1, `${origin} booted: ${result.stdout}`);
+    assert.match(result.stderr, /PORTAL_ORIGIN/);
+    assert.match(result.stderr, /https/);
+  }
+});
+
+test('outside production an http origin is fine (the portal dev server)', () => {
+  const env: Record<string, string> = {
+    ...BASE_ENV,
+    NODE_ENV: 'staging',
+    PORTAL_ORIGIN: 'http://localhost:5173',
+  };
+  const result = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', '-e', "await import('./src/env.js'); process.stdout.write('ENV_OK');"],
+    { cwd: REPO_ROOT, env, encoding: 'utf-8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
 });

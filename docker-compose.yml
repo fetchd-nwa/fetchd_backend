@@ -9,7 +9,8 @@
 #     points at. Contract tests hard-DELETE their fixture rows on
 #     teardown — keeping that out of the dev DB means no risk of test
 #     scaffolding ever clobbering work you're mid-flight on.
-# Both ship the same schema (the same `.claude/backend/schema.sql` mount).
+# Both ship the same schema (the same `.claude/backend/schema.sql` mount),
+# preceded by the same `00-supabase-roles.sql` (the roles schema.sql revokes from).
 #
 # Quickstart:
 #   docker compose up -d           # spin up db + redis (dev stack)
@@ -38,6 +39,10 @@ services:
       - '5432:5432'
     volumes:
       - fetchd-pg-data:/var/lib/postgresql/data
+      # Supabase's anon/authenticated/service_role, which plain Postgres lacks:
+      # schema.sql REVOKEs from them, so this loads FIRST (00- sorts before
+      # 01-). Never run on production — the roles there are Supabase's.
+      - ./.claude/backend/00-supabase-roles.sql:/docker-entrypoint-initdb.d/00-supabase-roles.sql:ro
       # The canonical DDL. Auto-loaded on first init. The DEV-RESET preamble
       # (commented DROP SCHEMA at the top) stays commented in git — the
       # api-ci `schema-load` job asserts this, and a stray uncomment would
@@ -82,6 +87,7 @@ services:
       - '5433:5432'
     volumes:
       - fetchd-pg-test-data:/var/lib/postgresql/data
+      - ./.claude/backend/00-supabase-roles.sql:/docker-entrypoint-initdb.d/00-supabase-roles.sql:ro
       - ./.claude/backend/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     profiles:
       - test

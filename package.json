@@ -27,12 +27,15 @@
     "db:test:nuke": "docker compose --profile test rm -sf db-test && docker volume rm -f fetchd-pg-test-data",
     "smoke:r2": "tsx scripts/smoke-r2.mjs",
     "db:dev:check": "tsx scripts/check-dev-db.ts",
+    "migrate:apply": "tsx scripts/migrate-apply.ts",
+    "migrate:rehearse": "bash scripts/migrate-rehearse.sh",
     "gate": "bash scripts/gate.sh",
     "probe:stripe": "tsx scripts/probe-stripe-thrown-confirm.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1054.0",
     "@aws-sdk/s3-request-presigner": "^3.1054.0",
+    "@fastify/cors": "11.3.1",
     "blurhash": "^2.0.5",
     "dotenv": "^16.4.5",
     "drizzle-orm": "^0.36.4",
@@ -40,6 +43,7 @@
     "ioredis": "^5.4.1",
     "jose": "^5.10.0",
     "pg": "^8.13.1",
+    "pg-connection-string": "2.13.0",
     "sharp": "^0.34.5",
     "stripe": "^22.1.1",
     "zod": "^3.23.8"

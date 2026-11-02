@@ -49,6 +49,20 @@ if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'staging')
 export const envSources: ReadonlyArray<EnvFileLoad> = envFileLoads;
 
 /**
+ * True when `value` is a bare browser origin: http(s), and exactly what `URL`
+ * normalises it to (so no path, no query, no trailing slash, no wildcard).
+ */
+function isExactOrigin(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return (url.protocol === 'https:' || url.protocol === 'http:') && url.origin === value;
+}
+
+/**
  * The full Day-1 environment contract. Every var is required: the contract is
  * locked once here so later days don't each re-litigate it (Stripe/R2 are
  * reserved now, exercised Day 14/17). A missing or malformed value fails the
@@ -111,6 +125,39 @@ const envSchema = z
       .optional()
       .transform((v) => (v === undefined ? undefined : v === 'true')),
 
+    // S01 (design §2.10, DECISIONS 49): the browser origins allowed to call this
+    // API cross-origin — the staff portal's. Comma-separated EXACT origins
+    // (`scheme://host[:port]`: no path, no trailing slash, which a browser's
+    // `Origin` header never carries), never `*`. Unset or empty = no
+    // cross-origin caller is allowed (the mobile app is not a browser and needs
+    // no CORS) — allowed in dev/test/staging, REFUSED in production by the
+    // superRefine below (DECISIONS 67): a production API with no allow-list
+    // serves a portal that cannot reach it, and says so nowhere. In
+    // production every entry must also be https: (DECISIONS 71).
+    // Parsed to the list; `lib/cors.ts` is its one reader.
+    PORTAL_ORIGIN: z
+      .string()
+      .optional()
+      .transform((raw, ctx) => {
+        const entries = (raw ?? '')
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0);
+        const notOrigins = entries.filter((entry) => !isExactOrigin(entry));
+        if (notOrigins.length > 0) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message:
+              `${notOrigins.map((entry) => `'${entry}'`).join(', ')} ` +
+              "is not an exact origin. Each entry is 'https://host' or 'http://host:port' " +
+              "with no path and no trailing slash, and '*' is never allowed (the allow-list " +
+              'is the only thing between the API and every other site in a browser)',
+          });
+          return z.NEVER;
+        }
+        return entries;
+      }),
+
     // Day-20: the pager. `https://<key>@<host>/<project_id>` — see
     // `lib/observability.ts`. Optional in dev/test/staging (unset = the seam is
     // a no-op and emits zero network traffic); REQUIRED in production by the
@@ -158,6 +205,26 @@ const envSchema = z
         message:
           'required in production — without it the observability seam is a no-op and every ' +
           'money alarm (SURPLUS REFUND, LOST HOLD, abandoned refunds) pages nobody',
+      });
+    }
+    const plainHttp = value.PORTAL_ORIGIN.filter((origin) => !origin.startsWith('https:'));
+    if (plainHttp.length > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['PORTAL_ORIGIN'],
+        message:
+          `${plainHttp.join(', ')}: production allows https origins only — the portal sends its ` +
+          'staff bearer token with every call (DECISIONS 71)',
+      });
+    }
+    if (value.PORTAL_ORIGIN.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['PORTAL_ORIGIN'],
+        message:
+          "required in production — the staff portal's origin (e.g. https://portal.example.com). " +
+          'Without it the API answers no CORS preflight and every portal call fails in the ' +
+          'browser as a network error, with nothing in this log to say why (DECISIONS 67)',
       });
     }
     if (value.LOG_LEVEL === 'fatal') {

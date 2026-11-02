@@ -1,4 +1,4 @@
-import { pgTable, text, doublePrecision, boolean, timestamp, uniqueIndex, foreignKey, unique, uuid, jsonb, index, check, date, integer, smallint, bigint, primaryKey, pgView, pgEnum } from "drizzle-orm/pg-core"
+import { pgTable, text, doublePrecision, boolean, timestamp, uniqueIndex, foreignKey, unique, uuid, jsonb, index, check, date, integer, smallint, bigint, primaryKey, pgView, pgEnum, numeric, time } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
 import type { NotificationDeepLinkKind } from "../../lib/notificationWire.js"
 
@@ -728,6 +728,327 @@ export const creditExpirySettings = pgTable("credit_expiry_settings", {
 		}).onDelete("set null"),
 		creditExpirySettingsExpiryWindowMonthsCheck: check("credit_expiry_settings_expiry_window_months_check", sql`expiry_window_months > 0`),
 		creditExpirySettingsWarningLeadDaysCheck: check("credit_expiry_settings_warning_lead_days_check", sql`warning_lead_days >= 0`),
+	}
+});
+
+// ---- LG1 (wire 2.0.0) — hand-mirrored from schema.sql: M1.00 and the settings
+// tables M1.01–M1.16 (db:introspect is not usable on this tree). Columns, keys,
+// FKs and the tier unique indexes are mirrored; each table's CHECKs live in
+// schema.sql and are mirrored by the registry's value bounds
+// (src/lib/settingsRegistry.ts), not here.
+export const migrationsApplied = pgTable("migrations_applied", {
+	stepId: text("step_id").primaryKey().notNull(),
+	appliedAt: timestamp("applied_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	appliedBy: text("applied_by").notNull(),
+	sqlSha256: text("sql_sha256").notNull(),
+});
+
+export const accountSettings = pgTable("account_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	emailVerificationGraceDays: integer("email_verification_grace_days").notNull(),
+	closeBlockedByPendingRefundEnabled: boolean("close_blocked_by_pending_refund_enabled").notNull(),
+	closeAutoRefundFraction: numeric("close_auto_refund_fraction").notNull(),
+	reactivationRestoresExpiredValueEnabled: boolean("reactivation_restores_expired_value_enabled").notNull(),
+	lockedAccountViewMode: text("locked_account_view_mode"),
+	pauseReservedServiceReturnMode: jsonb("pause_reserved_service_return_mode").notNull(),
+	signupFields: jsonb("signup_fields").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		accountSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "account_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const alumniSettings = pgTable("alumni_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	recheckAfterMonthsUnseen: integer("recheck_after_months_unseen").notNull(),
+	recheckDueMirrorsReevalDueEnabled: boolean("recheck_due_mirrors_reeval_due_enabled").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		alumniSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "alumni_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const cashSettings = pgTable("cash_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	unpaidCheckoutBlockEnabled: boolean("unpaid_checkout_block_enabled").notNull(),
+	packGrantOnPromiseEnabled: boolean("pack_grant_on_promise_enabled").notNull(),
+	didNotPayUndoWindowHours: integer("did_not_pay_undo_window_hours").notNull(),
+	packPartialPaymentDestination: text("pack_partial_payment_destination").notNull(),
+	bouncedCheckFeeCents: integer("bounced_check_fee_cents").notNull(),
+	dueEventByService: jsonb("due_event_by_service").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		cashSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "cash_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const creditSettings = pgTable("credit_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	expiryEnforcedEnabled: boolean("expiry_enforced_enabled").notNull(),
+	expiryWarningLeadDays: integer("expiry_warning_lead_days").array().notNull(),
+	manualGrantExpiryMonths: integer("manual_grant_expiry_months").notNull(),
+	returnedCreditExpiryMonths: integer("returned_credit_expiry_months").notNull(),
+	bookingOutlivesLotExpiryEnabled: boolean("booking_outlives_lot_expiry_enabled").notNull(),
+	singleDayPurchaseMaxCount: integer("single_day_purchase_max_count").notNull(),
+	accountDeletionExpiresCreditsEnabled: boolean("account_deletion_expires_credits_enabled").notNull(),
+	disputeAutoReversalEnabled: boolean("dispute_auto_reversal_enabled").notNull(),
+	pauseDailyExpiryExtensionDays: integer("pause_daily_expiry_extension_days").notNull(),
+	unpaidPaymentAutoReversalEnabled: boolean("unpaid_payment_auto_reversal_enabled").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		creditSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "credit_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const dayProgramSettings = pgTable("day_program_settings", {
+	location: text().$type<LocationKey>(),
+	bookingHorizonMonths: integer("booking_horizon_months"),
+	maxDogsPerBookingCount: integer("max_dogs_per_booking_count"),
+	daySchoolOneOnOneMinutes: integer("day_school_one_on_one_minutes"),
+	occupiedBlockEndTime: time("occupied_block_end_time"),
+	midstayDayChargeFraction: numeric("midstay_day_charge_fraction"),
+	sentHomeBeforeTrainingReturnFraction: numeric("sent_home_before_training_return_fraction"),
+	sentHomeAfterTrainingReturnFraction: numeric("sent_home_after_training_return_fraction"),
+	closureReturnFraction: numeric("closure_return_fraction"),
+	afterSchoolPriceCents: integer("after_school_price_cents"),
+	offerings: jsonb(),
+	openWeekdaysList: integer("open_weekdays_list").array(),
+	dailyCapacityDogs: integer("daily_capacity_dogs"),
+	dropoffOpenTime: time("dropoff_open_time"),
+	dropoffCloseTime: time("dropoff_close_time"),
+	pickupOpenTime: time("pickup_open_time"),
+	pickupCloseTime: time("pickup_close_time"),
+	sameDayCutoffTime: time("same_day_cutoff_time"),
+	latePickupCallTime: time("late_pickup_call_time"),
+	latePickupGraceMinutes: integer("late_pickup_grace_minutes"),
+	latePickupFeeCents: integer("late_pickup_fee_cents"),
+	afterSchoolStartTime: time("after_school_start_time"),
+	afterSchoolEndTime: time("after_school_end_time"),
+	afterSchoolCapacityCount: integer("after_school_capacity_count"),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		globalUniq: uniqueIndex("day_program_settings_global_uniq").using("btree", sql`(location IS NULL)`).where(sql`(location IS NULL)`),
+		locationUniq: uniqueIndex("day_program_settings_location_uniq").using("btree", table.location.asc().nullsLast().op("text_ops")).where(sql`(location IS NOT NULL)`),
+		dayProgramSettingsLocationFkey: foreignKey({
+			columns: [table.location],
+			foreignColumns: [locations.slug],
+			name: "day_program_settings_location_fkey"
+		}),
+		dayProgramSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "day_program_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const dogGateSettings = pgTable("dog_gate_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	spayNeuterRequiredByAgeMonths: integer("spay_neuter_required_by_age_months").notNull(),
+	spayNeuterGatedCategories: serviceCategory("spay_neuter_gated_categories").array().notNull(),
+	spayNeuterReminderTime: time("spay_neuter_reminder_time").notNull(),
+	cardRequiredAtBoardTrainConfirm: boolean("card_required_at_board_train_confirm").notNull(),
+	cardRequiredForEvaluationBookingEnabled: boolean("card_required_for_evaluation_booking_enabled").default(true).notNull(),
+	gateCardOnFileEnabled: boolean("gate_card_on_file_enabled").notNull(),
+	gateEvaluationEnabled: boolean("gate_evaluation_enabled").notNull(),
+	gateVaccinesEnabled: boolean("gate_vaccines_enabled").notNull(),
+	gateAgreementsEnabled: boolean("gate_agreements_enabled").notNull(),
+	gateOverrideAllowedGateKeys: text("gate_override_allowed_gate_keys").array().notNull(),
+	staffDogExemptGateKeys: text("staff_dog_exempt_gate_keys").array().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		dogGateSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "dog_gate_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const evaluationSettings = pgTable("evaluation_settings", {
+	location: text().$type<LocationKey>(),
+	reevalAfterMonthsUnseen: integer("reeval_after_months_unseen"),
+	failedRebookWaitHours: integer("failed_rebook_wait_hours"),
+	maxPerDayDogs: integer("max_per_day_dogs"),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		globalUniq: uniqueIndex("evaluation_settings_global_uniq").using("btree", sql`(location IS NULL)`).where(sql`(location IS NULL)`),
+		locationUniq: uniqueIndex("evaluation_settings_location_uniq").using("btree", table.location.asc().nullsLast().op("text_ops")).where(sql`(location IS NOT NULL)`),
+		evaluationSettingsLocationFkey: foreignKey({
+			columns: [table.location],
+			foreignColumns: [locations.slug],
+			name: "evaluation_settings_location_fkey"
+		}),
+		evaluationSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "evaluation_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const migrationSettings = pgTable("migration_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	pilotFamilyCount: integer("pilot_family_count").notNull(),
+	fullTransferAfterPilotMonths: integer("full_transfer_after_pilot_months").notNull(),
+	importCreditBalancesEnabled: boolean("import_credit_balances_enabled").notNull(),
+	importedCreditExpiryMonths: integer("imported_credit_expiry_months").notNull(),
+	importUnpaidBalancesEnabled: boolean("import_unpaid_balances_enabled").notNull(),
+	inviteRecentWithinMonths: integer("invite_recent_within_months").notNull(),
+	gingrRetentionBillingCycles: integer("gingr_retention_billing_cycles").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		migrationSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "migration_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const messagingSettings = pgTable("messaging_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	referralSubtopicEnabled: boolean("referral_subtopic_enabled").notNull(),
+	schoolDefaultResponderStaffId: uuid("school_default_responder_staff_id"),
+	schoolBackupResponderStaffId: uuid("school_backup_responder_staff_id"),
+	schoolDefaultResponderOut: boolean("school_default_responder_out").notNull(),
+	videoMaxDurationSeconds: integer("video_max_duration_seconds").notNull(),
+	videoMaxSizeMb: integer("video_max_size_mb").notNull(),
+	maxAttachmentsPerMessage: integer("max_attachments_per_message").notNull(),
+	maxTextLengthChars: integer("max_text_length_chars").notNull(),
+	requestReplyWindowHours: integer("request_reply_window_hours").notNull(),
+	replySignatureMode: text("reply_signature_mode").default('staffer_first_name').notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		messagingSettingsSchoolDefaultResponderStaffIdFkey: foreignKey({
+			columns: [table.schoolDefaultResponderStaffId],
+			foreignColumns: [staff.id],
+			name: "messaging_settings_school_default_responder_staff_id_fkey"
+		}).onDelete("set null"),
+		messagingSettingsSchoolBackupResponderStaffIdFkey: foreignKey({
+			columns: [table.schoolBackupResponderStaffId],
+			foreignColumns: [staff.id],
+			name: "messaging_settings_school_backup_responder_staff_id_fkey"
+		}).onDelete("set null"),
+		messagingSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "messaging_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const notificationSettings = pgTable("notification_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	quietHoursStartTime: time("quiet_hours_start_time").notNull(),
+	quietHoursEndTime: time("quiet_hours_end_time").notNull(),
+	quietHoursBypassTypes: text("quiet_hours_bypass_types").array().notNull(),
+	scanSendTime: time("scan_send_time").notNull(),
+	bookingReminderLeadHours: integer("booking_reminder_lead_hours").notNull(),
+	cardExpiryWarningDaysBefore: integer("card_expiry_warning_days_before").notNull(),
+	emailSenderAddress: text("email_sender_address"),
+	broadcastAudienceList: text("broadcast_audience_list").array().notNull(),
+	cashPaymentDueReminderLeadHours: integer("cash_payment_due_reminder_lead_hours").notNull(),
+	emailSenderDisplayName: text("email_sender_display_name").default('NWA School for Dogs').notNull(),
+	reminderChannelByProgram: jsonb("reminder_channel_by_program").notNull(),
+	expiryNoticeChannel: text("expiry_notice_channel").default('push_then_email').notNull(),
+	emailInflightAlarmMinutes: integer("email_inflight_alarm_minutes").default(5).notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		notificationSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "notification_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const paymentSettings = pgTable("payment_settings", {
+	key: text().notNull(),
+	scope: text().default('global').notNull(),
+	value: jsonb().notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		paymentSettingsPkey: primaryKey({ columns: [table.key, table.scope], name: "payment_settings_pkey"}),
+		paymentSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "payment_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const reportsSettings = pgTable("reports_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	eventsEnabled: boolean("events_enabled").notNull(),
+	eventMaxDogsPerRsvp: integer("event_max_dogs_per_rsvp").notNull(),
+	galleryEnabled: boolean("gallery_enabled").notNull(),
+	galleryMaxDogs: integer("gallery_max_dogs").notNull(),
+	galleryRateLimitPerMinute: integer("gallery_rate_limit_per_minute").notNull(),
+	mediaMaxUploadMegabytes: integer("media_max_upload_megabytes").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		reportsSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "reports_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+export const vaccineSettings = pgTable("vaccine_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	proofFileTypes: text("proof_file_types").array().notNull(),
+	typicalFullVaccinationAgeMonths: integer("typical_full_vaccination_age_months").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		vaccineSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "vaccine_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
 	}
 });
 

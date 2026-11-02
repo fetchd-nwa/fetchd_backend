@@ -1,5 +1,6 @@
 import type { ZodType } from 'zod';
 import { redis } from '../redis.js';
+import { unlinkMatching } from './redisPattern.js';
 
 /**
  * Day-8 Redis read-through + invalidation. The server-side cache for
@@ -40,8 +41,6 @@ import { redis } from '../redis.js';
  * its row in this table; (3) prefer pattern-wipes on the entity prefix
  * unless invalidation truly is one-key-precise.
  */
-
-const SCAN_BATCH = 200; // ioredis default; tune if pattern wipes get hot.
 
 /**
  * One cache hit (the JSON round-trip succeeded and validate() passed) or a
@@ -129,12 +128,5 @@ export async function invalidate(keys: string[]): Promise<void> {
  * override write touches every range that spans that date).
  */
 export async function invalidatePattern(pattern: string): Promise<void> {
-  let cursor = '0';
-  do {
-    const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', SCAN_BATCH);
-    cursor = next;
-    if (batch.length > 0) {
-      await redis.unlink(...batch);
-    }
-  } while (cursor !== '0');
+  await unlinkMatching(redis, pattern);
 }

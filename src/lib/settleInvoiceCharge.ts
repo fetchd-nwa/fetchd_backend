@@ -365,8 +365,10 @@ export function duplicateRefundIdempotencyKey(refundId: string): string {
  * Late-settle floor: when the billed period has ALREADY ended at settle
  * time, the owner is paying a full month's price for it — grant a fresh
  * clamped month from `now` instead of dead credits. The period-scoped expiry
- * is what makes the "X days left to use X credits" reminder ride the
- * existing credits-expiring scan.
+ * is what a "X days left to use X credits" reminder would read — but the
+ * scheduler's credits-expiring scan is retired at 2.0.0 (S01: it read the
+ * legacy 60-day lead), so no such reminder is sent until CRED-U13 builds the
+ * real notice off `cred.expiry_warning_lead_days` (7.1.0).
  *
  * The late settle ALSO re-aligns the membership clock (roll-while-parked
  * ruling, 2026-07-16): while this invoice sat open the roll skipped the

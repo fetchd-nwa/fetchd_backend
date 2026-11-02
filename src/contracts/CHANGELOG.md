@@ -12,6 +12,116 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [2.0.0-lg1.1] — 2026-11-02
+
+Additive. LG1 step 1 of 3 toward 2.0.0 (plan unit P01, slice S01, ledger
+SET-U01; design §1.1 2.0.0, `designs/fetchd-v1-technical-design.md:608-684`).
+The settings domain section and its two error arms, for THIRTEEN domains:
+`acct`, `alum`, `cash`, `cred`, `day`, `dog`, `eval`, `mig`, `msg`, `notif`,
+`pay`, `rpt`, `vax`. The fourteenth, `staff` (`StaffSettingsWire`, M1.21),
+joins at 2.0.0-lg1.2 with P02, which owns the rebuilt `staff_role` enum it
+needs (build DECISIONS 47). Nothing of 2.0.0's breaking half is here:
+`StaffRole`, `StaffMeWire` and `capabilities` are untouched. Contract-first:
+no route serves the new shapes until P01's phase B. Every 1.13.0 client
+compiles unchanged. Resync both clients (`npm run sync:contracts` in mobile and
+portal).
+
+Changed:
+
+- `WIRE_CONTRACT_VERSION` `'1.13.0'` → `'2.0.0-lg1.1'`.
+- `ApiErrorCode`, `API_ERROR_CODES` and `API_ERROR_STATUS` gain
+  `'setting_inert'` (422). It is APPENDED after `'internal'`, so no existing
+  tuple position moves (§1.1:590-591, :641-644).
+- `ApiErrorDetailWire` gains two arms, appended: `RefusedKeysDetails`
+  `{kind: 'refused_keys'; refused_keys: string[]}`, which rides 403
+  `forbidden` (kind ≠ code, truth 3 of §1b), and `SettingInertDetails`
+  `{kind: 'setting_inert'; inert_keys: string[]}`, which rides 422
+  `setting_inert`.
+- File header layout: `settings` is listed as the last fenced domain
+  section, after `reports` and before §16. §16 keeps its label (§1.1:591-593).
+- §16 `WireTupleConformance` gains `SETTINGS_DOMAINS` ↔ `SettingsDomain` and
+  three key-set pins. `keyof SettingsWireByDomain` and
+  `keyof SettingsPatchByDomain` must each equal `SettingsDomain`, and
+  `keyof PatchStaffSettingsPayRequest` must equal `PaymentSettingKey`. So
+  P02's `'staff'` append fails `tsc` until both maps carry it. Proven red
+  first by five mutants (tuple missing a member; `'staff'` appended without
+  its maps; a pay body key dropped; `'setting_inert'` missing from the tuple;
+  and from the status table).
+
+Added (new fenced section `// >>> domain:settings`):
+
+- (a) `SettingsDomain` + `SETTINGS_DOMAINS` (13). Value unions:
+  `AccountLockedViewMode`, `SignupField`, `SignupFieldMode`,
+  `CashDueService`, `CashDueEvent` (no `'package'` / `'purchase'`,
+  §1.1:672, :729-730), `CashPackPartialPaymentDestination`,
+  `ReplySignatureMode`, `NotificationChannelMode`, `ReminderProgram`,
+  `QuietHoursClass`, `BroadcastAudienceKind`, `PaymentChargeTimingMode`.
+- (b) Staff row wires, each carrying `SettingsAuditWire` (`updated_at`,
+  `updated_by_staff_id: string | null`), with fields equal to the columns of
+  §4 M1.01–M1.16:
+  - `AccountSettingsWire`, `AlumniSettingsWire`, `CashSettingsWire`,
+    `CreditSettingsWire` (§1.1's ten keys), `DogGateSettingsWire` (four E01
+    gates plus `card_required_for_evaluation_booking_enabled`),
+    `MigrationSettingsWire`, `NotificationSettingsWire` (born with
+    `email_sender_display_name`, `reminder_channel_by_program`,
+    `expiry_notice_channel` and `email_inflight_alarm_minutes`),
+    `ReportsSettingsWire`, `VaccineSettingsWire`.
+  - `MessagingSettingsWire`, with `reply_signature_mode` and the two
+    server-resolved responder first names.
+  - Two tiers: `DayProgramSettingsWire` = `DayProgramGlobalSettingsWire`
+    (`location: null`) | `DayProgramCampusSettingsWire` (with
+    `ServiceOfferingWire` offerings, E03). `EvaluationSettingsWire` =
+    `EvaluationGlobalSettingsWire` | `EvaluationCampusSettingsWire` likewise.
+  - `PaymentSettingWire`, a `(key, scope, value)` row union discriminated on
+    `key`, with `PaymentSettingValueByKey` and `PaymentSettingKey`.
+    `scope: string`, `'global'` for org-wide rows.
+  - `SettingsWireByDomain` and the response aliases
+    `GetStaffSettingsResponse<D>` and `PatchStaffSettingsResponse<D>` for
+    `GET`/`PATCH /staff/settings/:domain[/:location]`. `day` and `eval`
+    address their global row on the bare path and a campus row on
+    `/:location`; `pay` returns every row.
+  - The owner document `OwnerSettingsWire`, `GET /settings` →
+    `GetSettingsResponse`, read from Postgres on every call on the ordinary
+    `authenticate` guard. Its sections are `offerings`, `day`, `gates`,
+    `eval` (per-campus evaluation `price_cents`, `null` until its
+    `service_rates` row exists), `cred`, `cls`, `msg`
+    (`OwnerMessagingSettingsWire`), `notif`, `rpt`, `vax` and `pay`. There is
+    no `cxl` section, no `mig` section and no day-school price. The section
+    types are `OwnerDaySettingsWire`, `OwnerDayCampusSettingsWire`,
+    `OwnerGateSettingsWire`, `OwnerEvaluationSettingsWire`,
+    `OwnerEvaluationCampusSettingsWire`, `OwnerCreditSettingsWire`,
+    `OwnerClassSettingsWire`, `OwnerMessagingSettingsWire`,
+    `OwnerNotificationSettingsWire`, `OwnerReportsSettingsWire`,
+    `OwnerVaccineSettingsWire` and `OwnerPaymentSettingsWire`.
+- (c) `PatchStaffSettingsRequest<D>` over `SettingsPatchByDomain`. Each body
+  is partial: every column optional, and every key sent is an edit. `day` and
+  `eval` take their tier's columns. The pay body is
+  `PatchStaffSettingsPayRequest`, and `SettingsAuditKey` names the two audit
+  fields. `Idempotency-Key` is required, and `requestHash` covers
+  `{domain, location, ...body}`. Refusal order: 400 → 403 `refused_keys` →
+  422 `setting_inert` → 422 `invalid_payload`.
+- (d) `PatchStaffSettingsErrorDetails` = `RefusedKeysDetails |
+  SettingInertDetails`.
+
+Not changed: `CancelWindowSettingWire`, `CreditExpirySettingWire` and their
+verbs stay until design 6.0.0 / 5.0.0 remove them (§1.1:682-684). Settings-key
+classes (`ops`/`money`/`price`/`roles`) and inertness live in the server
+registry, not on the wire.
+
+Not typed (build DECISIONS 53–58, the drafter's D1–D10): no `day_school_offered_flag` /
+`daycare_offered_flag` — `offerings[service].offered` is the one store (D2); no
+`capacity_override_dogs` column (D3, per-date `day_capacity`); no DOG-U02 nullable
+`card_required_for_evaluation_booking` (D4); no `vax.service_min_age_weeks` or
+`rpt.event_price_per_dog_cents` (D7/D8). `setting_inert` also covers the 11-02 re-cut's keys
+whose readers wait for P06, P07 and P09.
+
+
+Review fixes folded in before the first commit (no separate version; build DECISIONS 60–62, 69):
+`EvaluationGlobalSettingsWire.reeval_after_months_unseen` is `number | null` (null switches the
+clock off, EVAL-53). Documented: `expiry_warning_lead_days` non-empty and distinct;
+`refund_any_role_limit_cents` editable by the owner only; `CreditBalanceWire
+.warning_lead_days` doc no longer claims the retired `credits-expiring` scan runs.
+
 ## [1.13.0] — 2026-08-25
 
 Additive. The whole-truth bump (`designs/wire-contract-completion.md`, the

@@ -551,7 +551,7 @@ only meaningful if production configuration comes from ONE place a person can
 read in a dashboard. Process env still trumps both files in dev; the first
 file loaded wins per-key, since `dotenv` never overrides an existing value.
 
-### The two production boot refusals
+### The production boot refusals
 
 `env.ts` already refused to half-boot on a missing `DATABASE_URL`. Day-20a
 extends the same rule to the pager, because both describe a process that would
@@ -562,6 +562,11 @@ run happily while being unable to do its job:
   it can be refused instead of discovered after the money moves. Optional in
   dev/test/staging — staging has no paging duty, and requiring it there would
   add friction with no invariant behind it.
+- **`NODE_ENV=production` requires `PORTAL_ORIGIN`, every entry `https:`**
+  (wire 2.0.0; DECISIONS 67, 71). It is the staff portal's CORS allow-list;
+  unset, the API boots but answers no preflight and every portal call dies in
+  the browser. Set the Railway variable BEFORE the 2.0.0 deploy, or the deploy
+  fails its boot. Optional in dev/test/staging (unset = no cross-origin caller).
 - **`NODE_ENV=production` refuses `LOG_LEVEL=fatal`.** pino does not invoke
   the `logMethod` hook for calls suppressed below the active level, so `fatal`
   silently kills error-level paging while every health check stays green.
