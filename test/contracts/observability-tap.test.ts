@@ -71,7 +71,16 @@ function makeRecordingTransport(): RecordingTransport {
  * as a `TypeError` on an undefined phase rather than as a missing counter.
  */
 const TICK_RESULT: SchedulerTickResult = {
-  scheduledNotifications: { scanned: 0, sent: 0, pushTicketsOk: 0, pushTicketsError: 0 },
+  scheduledNotifications: {
+    scanned: 0,
+    sent: 0,
+    failed: 0,
+    parked: 0,
+    parkedTotal: 0,
+    queueOk: true,
+    pushTicketsOk: 0,
+    pushTicketsError: 0,
+  },
   membershipRoll: { scanned: 0, rolled: 0, completed: 0 },
   invoiceOverdue: { scanned: 0, enqueued: 0 },
   cardExpiry: { scanned: 0, enqueued: 0 },
@@ -604,6 +613,15 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
   registerWorkersTickRoute(app, {
     runTick: async () => ({
       ...TICK_RESULT,
+      // Non-zero, like every other counter here, so the leaf is proven to carry
+      // THIS phase's number rather than to agree with a default.
+      scheduledNotifications: {
+        ...TICK_RESULT.scheduledNotifications,
+        parkedTotal: 7,
+        // NOT the `true` default, so the leaf below is proven to carry THIS
+        // phase's answer rather than to agree with the fixture.
+        queueOk: false,
+      },
       membershipRoll: { scanned: 11, rolled: 12, completed: 13 },
       invoiceOverdue: { scanned: 21, enqueued: 22 },
       cardExpiry: { scanned: 31, enqueued: 32 },
@@ -689,6 +707,22 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
   assert.equal(complete['alumniAttendanceScanned'], 71);
   assert.equal(complete['alumniAttendanceEnqueued'], 72);
   assert.equal(complete['alumniAttendanceFlagged'], 73);
+
+  // Phase 1's poison-row leaves (2026-09-03). `scanned - sent` stopped meaning
+  // "still due" the moment a row could fail alone or park, so the two counters
+  // that say which are leaves of the nominated authority like every other.
+  assert.equal(complete['scheduledFailed'], 0);
+  assert.equal(complete['scheduledParked'], 0);
+  // …and the STANDING count (A1.6), which is a different question from
+  // `scheduledParked`: that one is this tick's delta and reads 0 on every tick
+  // after the one that parked, so without this leaf a human reading the log an
+  // hour later cannot tell a healthy queue from one with rows waiting on them.
+  assert.equal(complete['scheduledParkedTotal'], 7);
+  // …and whether the queue DELIVERED (A2.1). A leaf of the nominated authority
+  // like every other: the completion line is where a human reconstructs what a
+  // tick did, and "phase 1 ran but delivered nothing" is the state that used to
+  // reach no instrument at all once step 1 turned it from a 500 into a 200.
+  assert.equal(complete['scheduledQueueOk'], false);
 
   // …and the five it already had are ADDITIVE-preserved, not renamed. Anything
   // reading these today (an eye on a Railway log, a future alert) keeps working.

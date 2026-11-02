@@ -42,7 +42,20 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
  * wrong failure.
  */
 const TICK_RESULT_JSON = JSON.stringify({
-  scheduledNotifications: { scanned: 0, sent: 0, pushTicketsOk: 0, pushTicketsError: 0 },
+  scheduledNotifications: {
+    scanned: 0,
+    sent: 0,
+    failed: 0,
+    parked: 0,
+    parkedTotal: 0,
+    // `true`, so the route takes the branch that writes `scheduler:queue_ok_at`
+    // (A2.1) — this file measures the WEDGED-Redis cost of the route's Redis
+    // awaits, and a fixture that skipped one would measure a shorter route than
+    // production runs.
+    queueOk: true,
+    pushTicketsOk: 0,
+    pushTicketsError: 0,
+  },
   membershipRoll: { scanned: 0, rolled: 0, completed: 0 },
   invoiceAttemptVerify: { scanned: 0 },
   captureReconciler: {

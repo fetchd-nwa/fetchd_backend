@@ -2,9 +2,14 @@ import type { FastifyInstance } from 'fastify';
 import { env } from '../env.js';
 import { pagerHealth, type PagerHealth } from '../lib/observability.js';
 import {
+  readParkedTotal,
+  readQueueOk,
   readSchedulerHeartbeat,
   SCHEDULER_HEARTBEAT_KEY,
+  SCHEDULER_QUEUE_OK_KEY,
+  SCHEDULER_QUEUE_OK_TTL_S,
   type HeartbeatReading,
+  type ParkedTotalReading,
 } from '../lib/schedulerHeartbeat.js';
 
 /**
@@ -150,6 +155,13 @@ interface WatchdogBody {
   staleness_s: number | null;
   stale_after_s: number;
   pager: PagerHealth;
+  /** Scheduled notifications PARKED right now, as the last tick published it;
+   *  `null` when no tick has published one or the value cannot be read. */
+  parked_total: number | null;
+  /** ISO instant of the last tick whose phase 1 DELIVERED — ran to the end and
+   *  did not take the systemic branch (A2.1). `null` when no tick has published
+   *  one or the value cannot be read. */
+  queue_ok_at: string | null;
   /** Empty on 200. On 503, every reason, so the alert says what broke. */
   reasons: string[];
 }
@@ -166,10 +178,31 @@ export function registerHealthWatchdogRoute(app: FastifyInstance): void {
     // all. A watchdog that answers 200 when it cannot see is the instrument
     // failure this endpoint exists to prevent; one that answers nothing is
     // worse, because the monitor cannot tell it from a slow network.
-    const reading: HeartbeatReading = await readSchedulerHeartbeat();
+    //
+    // The standing parked-row signal (A1.6) is read beside it, under the same
+    // contract, and the two are raced TOGETHER rather than one after the other:
+    // each carries its own 1s deadline, so awaiting them in sequence would make
+    // a wedged Redis cost this endpoint two of them instead of one. Neither can
+    // reject, so `Promise.all` cannot either.
+    // The queue-freshness key (A2.1) joins the same race for the same reason:
+    // each read carries its own 1s deadline, so a THIRD sequential await would
+    // cost a wedged Redis three deadlines instead of one. None of them can
+    // reject, so `Promise.all` cannot either.
+    const [reading, parkedReading, queueOkReading]: [
+      HeartbeatReading,
+      ParkedTotalReading,
+      HeartbeatReading,
+    ] = await Promise.all([readSchedulerHeartbeat(), readParkedTotal(), readQueueOk()]);
 
     const lastTickAt = reading.kind === 'recorded' ? reading.at : null;
     const stalenessMs = lastTickAt === null ? null : now.getTime() - lastTickAt.getTime();
+
+    // True exactly when the chain below adds NO reason: the scheduler is
+    // ticking, recently, on a clock this endpoint can reason about. It gates
+    // the queue-freshness check (A3.1, A3.3), and it is set in that chain's
+    // final `else` rather than recomputed from the readings, so a heartbeat
+    // fault branch added here later gates the queue check for free.
+    let schedulerIsTicking = false;
 
     if (reading.kind === 'unreadable') {
       reasons.push(
@@ -202,6 +235,217 @@ export function registerHealthWatchdogRoute(app: FastifyInstance): void {
         `last scheduler tick was ${Math.round(stalenessMs / 1000)}s ago ` +
           `(threshold ${SCHEDULER_STALE_AFTER_MS / 1000}s)`,
       );
+    } else {
+      // Recorded, on this clock, inside the threshold. The tick is running.
+      schedulerIsTicking = true;
+    }
+
+    if (parkedReading.kind === 'recorded' && parkedReading.n > 0) {
+      // A parked row is a notification that will NEVER be delivered until a
+      // human un-parks or cancels it — a reminder nobody gets, or an owner who
+      // is never told their card failed. Its only other notice was ONE
+      // fire-and-forget page, which the pager itself documents can be shed or
+      // lost; this reason stands until the count goes back to zero. Allison's
+      // decision 4, ruled YES: a parked notification makes the monitor red.
+      reasons.push(
+        `parked scheduled notifications: ${parkedReading.n} — a human must un-park or cancel ` +
+          `them (see scripts/db in the umbrella)`,
+      );
+    }
+    // `absent`, `unparseable` and `unreadable` deliberately add NO reason —
+    // this one signal fails OPEN, and the honest justification is narrower than
+    // the one that stood here until A2.3.
+    //
+    // Absent is the normal state before a deployment's first tick publishes a
+    // count. Unparseable and unreadable are Redis faults, and the reason NOT to
+    // add a second 503 line for them is that this endpoint would have to say
+    // "there are parked rows" about rows it cannot see — the false sentence
+    // §A4.5 L3 exists to prevent — while "the parked count is unreadable" is
+    // not itself an availability condition.
+    //
+    // What that costs, named rather than implied, because the sentence here
+    // used to claim the heartbeat read "one branch up already reports it" and
+    // that is only true when BOTH reads fail: these are different keys read by
+    // different functions, so a FRESH heartbeat beside a corrupt or unreadable
+    // parked key answers 200 with `reasons: []`, and this file's own test pins
+    // exactly that. A standing parked-row alarm can therefore be silently lost
+    // to a corrupt key. That is A1.6's ruling as ruled; the queue-freshness
+    // check below is an independent signal and does not cover it either.
+
+    // ── the queue-freshness signal (A2.1, repaired by A3.1 / A3.2 / A3.3) ───
+    //
+    // Everything below is gated on `schedulerIsTicking`, and an ABSENT key is
+    // a reason. Both of those are round-3 repairs, and each closes a way this
+    // endpoint said something FALSE:
+    //
+    // **A3.1 — it must not fail OPEN.** This key is written by ONE caller and
+    // only when phase 1 DELIVERED, under a 24h TTL. Raise its reason only when
+    // the reading is `recorded` and the signal deletes itself: a continuing
+    // outage refreshes nothing, the TTL runs monotonically to zero, and the
+    // monitor goes GREEN — emailing "UP / resolved" over an outage that is
+    // still running. A Redis restart mid-outage does it immediately, because
+    // this is the one key of the three a broken queue never rewrites. The
+    // analogy to `scheduler:parked_total` that used to stand here was FALSE:
+    // that key is rewritten by every tick that can COUNT, so its absence means
+    // "nobody has published one"; this key is written only on HEALTH, so its
+    // absence means "nothing healthy has happened since it last expired".
+    // Opposite meanings.
+    //
+    // **A3.2 — a clock stepped forward must not read as fresh.** The heartbeat
+    // has had a skew branch since §A4.4.4 and this key did not, justified by a
+    // comment pointing at the heartbeat's. That cannot cover it: the heartbeat
+    // is rewritten on the FAILING path and this key is not. A clock stepped an
+    // hour forward at 06:59 lets the 07:00 tick stamp both keys 08:00; NTP
+    // corrects at 07:01; the 07:02 tick rewrites the heartbeat (fresh, silent)
+    // and, phase 1 having broken, leaves this key at 08:00 — which
+    // `staleness > threshold` reads as healthy for every negative number.
+    // Seventy minutes of green over a dead queue. Fixed HERE, in the reader,
+    // rather than by clamping the write: the writer has only the skewed clock
+    // to clamp against, so it cannot tell a stepped clock from a correct one.
+    //
+    // **A3.3 — a STOPPED scheduler must not be told to read a phase alarm.**
+    // When no tick runs at all (the 2026-08-24 fault: a rotated
+    // `SCHEDULER_WEBHOOK_SECRET`, every `net.http_post` 401s) this key ages out
+    // beside the heartbeat, and the queue sentence fired saying "every claimed
+    // row is failing, or phase 1 is throwing (see the phase alarm)" — with no
+    // phase alarm, because nothing is running. Whoever was paged went looking
+    // for a log line that cannot exist. The status code is unchanged by the
+    // gate in every case: whenever it suppresses this reason the heartbeat's
+    // own reason is already carrying the 503.
+    //
+    // **The whole table, so every cell can be checked for a TRUE sentence.**
+    // Pinned cell by cell in `test/contracts/healthWatchdog.test.ts`.
+    //
+    //                    | q fresh | q stale  | q future | q absent | q corrupt
+    //   ---------------- | ------- | -------- | -------- | -------- | ---------
+    //   hb fresh         | 200     | 503 q    | 503 q    | 503 q    | 503 q
+    //   hb stale         | 503 hb  | 503 hb   | 503 hb   | 503 hb   | 503 hb
+    //   hb future        | 503 hb  | 503 hb   | 503 hb   | 503 hb   | 503 hb
+    //   hb absent        | 503 hb  | 503 hb   | 503 hb   | 503 hb   | 503 hb
+    //   hb corrupt       | 503 hb  | 503 hb   | 503 hb   | 503 hb   | 503 hb
+    //   hb unreadable    | 503 hb  | 503 hb   | 503 hb   | 503 hb   | 503 hb
+    //
+    // Row by row, in words:
+    // - **hb fresh** — the tick is running, so the queue key is the only thing
+    //   that can say whether phase 1 is moving, and it is believed: fresh is
+    //   health; stale and absent are both "not delivering" (with different
+    //   sentences, because only one of them can state a duration); future is
+    //   clock skew on the key this endpoint is judging. Corrupt is a reason
+    //   too, in its own sentence (A4 (iii)): the same fact is true of a corrupt
+    //   key as of a missing one — while the scheduler ticks there is NO valid
+    //   delivery instant — and the fail-OPEN arm that used to stand here let a
+    //   single corrupt key silently delete a standing queue alarm.
+    // - **every other row** — the heartbeat has already said the true thing,
+    //   and it is the more fundamental one. Nothing is ticking (or the clock or
+    //   the key cannot be trusted), so no claim about the QUEUE is available:
+    //   "the queue has not delivered" would be true only vacuously, and its
+    //   second clause would be false. One fault, one sentence. The signal is
+    //   not lost — the moment the scheduler ticks again, a queue that is still
+    //   broken raises its own reason on the next read.
+    //
+    // `unreadable` is a row rather than a cell pair because both keys are read
+    // by one client in one `Promise.all` against one deadline: a Redis that
+    // cannot be read is unreadable for BOTH, so the mixed cells do not occur.
+    if (schedulerIsTicking) {
+      if (queueOkReading.kind === 'recorded') {
+        const queueStalenessMs = now.getTime() - queueOkReading.at.getTime();
+        if (queueStalenessMs < -CLOCK_SKEW_TOLERANCE_MS) {
+          // A3.2. The heartbeat's own §A4.4.4 branch, applied to this key and
+          // with the same tolerance: one process family, one clock, so a real
+          // negative reading means the clock moved — but a two-second NTP step
+          // must not flap the alarm an uptime monitor watches.
+          reasons.push(
+            `scheduled-notification queue freshness (${SCHEDULER_QUEUE_OK_KEY}) is dated ` +
+              `${Math.round(-queueStalenessMs / 1000)}s in the FUTURE — clock skew; queue ` +
+              `staleness cannot be judged and a STOPPED queue would read healthy`,
+          );
+        } else if (queueStalenessMs > SCHEDULER_STALE_AFTER_MS) {
+          // A2.1, ruled by Allison 2026-09-03: a queue that is not delivering
+          // turns the monitor red after about ten minutes. The SAME constant as
+          // heartbeat staleness on purpose — the system has one "too long", not
+          // two, and a second threshold is a second number for a human to
+          // remember under pressure.
+          //
+          // This is the state the heartbeat CANNOT see: the tick is running and
+          // stamping itself every minute, and it is phase 1 that stopped. Both
+          // ways it stops are covered, which is why the reason names both — the
+          // systemic branch (every claimed row failing, nothing parked, nothing
+          // recorded) and a throw at the phase boundary (which since 2026-09-03
+          // is a 200, deliberately, so the money phases behind it still run).
+          // Both of those DO leave a phase alarm, which is what makes the
+          // second clause true here and false on a stopped scheduler (A3.3).
+          reasons.push(
+            `scheduled-notification queue has not delivered for ` +
+              `${Math.round(queueStalenessMs / 1000)}s — every claimed row is failing, or phase 1 ` +
+              `is throwing (see the phase alarm)`,
+          );
+        }
+      } else if (queueOkReading.kind === 'absent') {
+        // A3.1. The tick is running and NOTHING has published a delivering
+        // phase 1 for as long as this key can remember. Its own sentence
+        // rather than the staleness one, because there is no instant to
+        // subtract: reporting a duration this system never measured is the
+        // §A4.5 L3 fault, one key over.
+        //
+        // Named cost, since it is fail-CLOSED: on a brand-new Redis the very
+        // first tick writes the heartbeat a beat before this key, so a monitor
+        // that polls inside that window sees one spurious 503 and clears on
+        // its next 5-minute pass. That direction is the correct one for a
+        // watchdog, and the fresh-DEPLOY case — the one this branch used to be
+        // excused by — is unaffected: before its first tick the heartbeat is
+        // absent too, and its own branch carries the 503 with the right words.
+        reasons.push(
+          `scheduled-notification queue has not delivered at all: ${SCHEDULER_QUEUE_OK_KEY} is ` +
+            `ABSENT while the scheduler is ticking — nothing has published a delivering phase 1 ` +
+            `within the key's ${SCHEDULER_QUEUE_OK_TTL_S / 3600}h TTL; every claimed row is ` +
+            `failing, or phase 1 is throwing (see the phase alarm)`,
+        );
+      } else if (queueOkReading.kind === 'unparseable') {
+        // A4 (iii), and it REVERSES the arm that stood here: `unparseable`
+        // used to add no reason, so this signal failed OPEN and a single
+        // corrupt key could silently delete a standing queue alarm while the
+        // heartbeat read fresh. That is A3.1's fault one state over — the same
+        // fact is true of a corrupt key as of a missing one: while the
+        // scheduler is ticking, NOTHING says phase 1 delivered.
+        //
+        // Its OWN sentence, not the ABSENT one and not a duration. "ABSENT" is
+        // false of a key that is present, and there is no instant to subtract,
+        // so stating a staleness would report a duration this system never
+        // measured — the §A4.5 L3 fault the heartbeat's own corruption branch
+        // exists to avoid.
+        //
+        // **The cost is BOUNDED, and that is what makes fail-CLOSED right
+        // here.** `recordQueueOk` is an unconditional `SETEX`
+        // (`schedulerHeartbeat.ts`), fired by `POST /workers/tick` on every
+        // tick whose phase 1 DELIVERED (`workersTick.ts`, inside
+        // `if (result.scheduledNotifications.queueOk)`). So over a HEALTHY
+        // queue a corrupt value is overwritten within one tick: the false 503
+        // costs at most one tick plus one monitor interval, and clears with no
+        // human in the loop. Over a BROKEN queue nothing rewrites it and the
+        // red stands — which is the point. Both halves are pinned in
+        // `test/contracts/healthWatchdog.test.ts`.
+        //
+        // `unreadable` is deliberately NOT changed: for this key it means
+        // Redis did not answer, and the heartbeat — read by the same client in
+        // the same `Promise.all` against the same deadline — is `unreadable`
+        // at the same moment, so `schedulerIsTicking` is false and the
+        // heartbeat's own reason already carries the 503. The mixed cell does
+        // not occur. The PARKED key's corrupt arm is unchanged too (A1.6 /
+        // A2.3): its reasoning is different — "there are parked rows" about
+        // rows it cannot see is a FALSE sentence, where "there is no valid
+        // delivery instant" about a corrupt instant is a true one.
+        reasons.push(
+          `scheduled-notification queue key is UNPARSEABLE (corrupt key ` +
+            `${SCHEDULER_QUEUE_OK_KEY}): ${JSON.stringify(queueOkReading.raw.slice(0, 64))} — ` +
+            `while the scheduler is ticking there is no valid delivery instant to judge; either ` +
+            `the queue is not delivering (every claimed row is failing, or phase 1 is throwing — ` +
+            `see the phase alarm) or the key was overwritten; a delivering tick rewrites it ` +
+            `within one tick`,
+        );
+      }
+      // `unreadable` still adds no reason, for the reason stated in the branch
+      // above: it cannot occur beside a `schedulerIsTicking` heartbeat, because
+      // one unreadable Redis makes both readings unreadable at once.
     }
 
     if (env.NODE_ENV === 'production' && !pager.installed) {
@@ -264,6 +508,8 @@ export function registerHealthWatchdogRoute(app: FastifyInstance): void {
       staleness_s: stalenessMs === null ? null : Math.round(stalenessMs / 1000),
       stale_after_s: SCHEDULER_STALE_AFTER_MS / 1000,
       pager,
+      parked_total: parkedReading.kind === 'recorded' ? parkedReading.n : null,
+      queue_ok_at: queueOkReading.kind === 'recorded' ? queueOkReading.at.toISOString() : null,
       reasons,
     };
     return reply.code(reasons.length === 0 ? 200 : 503).send(body);

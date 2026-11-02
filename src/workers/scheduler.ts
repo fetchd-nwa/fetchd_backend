@@ -1,3 +1,4 @@
+import { db } from '../db/client.js';
 import { deviceTokensRepository } from '../db/repositories/deviceTokensRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { ownersRepository } from '../db/repositories/ownersRepository.js';
@@ -68,6 +69,9 @@ interface WorkerLogger {
  *      entry, mark the schedule row `'sent'` + link via
  *      `emitted_notification_id`. Push attempts are queued in-memory
  *      and dispatched post-commit (best-effort; DB is source of truth).
+ *      Each row delivers inside its own SAVEPOINT (2026-09-03), so a
+ *      broken row fails alone and PARKS after `MAX_DELIVERY_ATTEMPTS`
+ *      instead of rolling back every batch-mate on every tick forever.
  *
  *   2. **§J.1 membership roll.** Open each due subscription's next month
  *      (advance period + card-backed invoice) or hard-stop at term end.
@@ -120,9 +124,11 @@ interface WorkerLogger {
  *      retry-safety window (24h default) per schema.sql lines ~918-920.
  *      One Postgres DELETE; runs on the pool runner outside any tx.
  *
- * Failures are logged-and-swallowed at each phase boundary so a flaky
- * Expo call can't block invoice dunning, and a stuck dunning attempt
- * can't block the TTL sweep. Returns a per-phase result summary.
+ * Failures are logged-and-swallowed at each phase boundary — ALL twelve since
+ * 2026-09-03 (phase 1 was the lone exception, and that hole was the
+ * 2026-09-02 production incident) — so a flaky Expo call can't block invoice
+ * dunning, and a stuck dunning attempt can't block the TTL sweep. Returns a
+ * per-phase result summary.
  *
  * The scheduler actor — `system:scheduler` — is distinct from the
  * Day-15 invoice worker's `system:stripe-webhook`. Different
@@ -136,6 +142,24 @@ const SCHEDULER_ACTOR = 'system:scheduler';
 /** Idempotency-key TTL window. 24h is comfortably longer than any
  *  client retry loop and short enough to keep the table small. */
 const IDEMPOTENCY_TTL_HOURS = 24;
+
+/**
+ * Failed delivery attempts a `scheduled_notifications` row gets before it
+ * PARKS — `failed_at` stamped, dropped from the claim, waiting on a human
+ * (2026-09-03, `designs/phase-1-poison-row-isolation.md`).
+ *
+ * **3, ruled by Allison 2026-09-03; was 5 as the design default** ("lets just
+ * have 3 retries and if after 3rd attempt…", that design's § Decisions,
+ * question 1). At the minutely tick it is about three minutes of retries —
+ * long enough to ride out a transient blip on ONE row, short enough that a
+ * genuinely broken row reaches a human while it still matters instead of
+ * raising a low-grade alarm forever. A DB-wide outage does not spend these
+ * attempts at all: a batch that fails ENTIRELY is systemic and records nothing
+ * (see the loop below). Exported because the retry budget is the contract the
+ * parking tests assert against, not an implementation detail — and changing it
+ * is a one-line change here.
+ */
+export const MAX_DELIVERY_ATTEMPTS = 3;
 
 export interface SchedulerTickOpts {
   expoPush?: ExpoPushClient;
@@ -162,6 +186,35 @@ export interface SchedulerTickOpts {
 export interface ScheduledNotificationsTickResult {
   scanned: number;
   sent: number;
+  /** Rows whose delivery threw this tick — rolled back alone. An attempt was
+   *  recorded for each UNLESS the whole batch failed (systemic; see the loop). */
+  failed: number;
+  /** Of those, the rows that hit `MAX_DELIVERY_ATTEMPTS` and PARKED this tick. */
+  parked: number;
+  /**
+   * Rows parked RIGHT NOW, across the whole table — the standing signal (A1.6),
+   * not a per-tick delta. `null` means this tick could not count them (phase 1
+   * threw at its boundary, or the count query itself failed): "I did not look"
+   * is not "there are none", and the difference decides whether
+   * `POST /workers/tick` overwrites what `GET /health/watchdog` reads.
+   */
+  parkedTotal: number | null;
+  /**
+   * **Did the queue DELIVER this tick?** (A2.1, ruled by Allison 2026-09-03.)
+   *
+   * `true` when the phase ran to the end and did NOT take the systemic branch —
+   * a delivering tick, a mixed or poison batch, and an EMPTY claim are all
+   * `true`, because an idle queue is healthy and a poison row already has its
+   * own parked signal. `false` for the systemic branch, and `false` in the
+   * boundary's DEFAULT result, so a phase that THREW is a not-delivering phase
+   * too. `POST /workers/tick` turns `true` into a Redis freshness stamp;
+   * `GET /health/watchdog` turns a stale stamp into a 503.
+   *
+   * It exists because this cycle's own fixes closed the two accidental paths to
+   * that 503: the phase-1 boundary replaced the 500 that starved the heartbeat,
+   * and the systemic branch stopped an outage from parking anything.
+   */
+  queueOk: boolean;
   pushTicketsOk: number;
   pushTicketsError: number;
 }
@@ -200,12 +253,49 @@ export async function runSchedulerTickOnce(
   const log = opts.log ?? NOOP_LOG;
   const now = opts.now ?? new Date();
 
-  const notificationsResult = await runScheduledNotificationsTick(
-    expoPush,
-    log,
-    opts.notificationsLimit,
-    now,
-  );
+  // Phase 1 — scheduled-notifications claim + deliver. Own log-and-swallow
+  // boundary, like every sibling phase below. It was the ONLY phase without one
+  // until 2026-09-03: on 2026-09-02 the first production tick hit a schema drift
+  // here (`column "deep_link_kind" does not exist`), the throw escaped, the
+  // route answered 500, and phases 2–12 — including the four money phases —
+  // never ran, 27 ticks in a row. The comment at phase 3b below records the
+  // previous time this exact class was found about a different phase.
+  let notificationsResult: ScheduledNotificationsTickResult = {
+    scanned: 0,
+    sent: 0,
+    failed: 0,
+    parked: 0,
+    // `null`, not 0 — a phase that threw did not count the parked rows, and
+    // publishing 0 from here would clear the watchdog's standing parked-row
+    // reason on exactly the tick that proved something is wrong.
+    parkedTotal: null,
+    // `false` for the same reason one line up, one question over (A2.1): a
+    // phase that THREW delivered nothing, so the tick must not refresh
+    // `scheduler:queue_ok_at`. Before the boundary above existed, this state
+    // was a 500 that never reached `recordSchedulerTick` and went red on
+    // heartbeat staleness by accident; the boundary is right and the red has
+    // to come back on purpose.
+    queueOk: false,
+    pushTicketsOk: 0,
+    pushTicketsError: 0,
+  };
+  try {
+    notificationsResult = await runScheduledNotificationsTick(
+      expoPush,
+      log,
+      opts.notificationsLimit,
+      now,
+    );
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'scheduled-notifications',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'scheduled-notifications phase threw at the worker boundary; will retry next tick',
+    );
+  }
 
   // Phase 2 — §J.1 membership roll. Runs BEFORE the invoice auto-charge so a
   // freshly-rolled month's invoice (due_at = period start ≤ now) is scooped
@@ -546,6 +636,22 @@ export async function runSchedulerTickOnce(
  * permanent BEFORE we attempt push, which is the right invariant: the
  * owner is going to see the bell in-app even if Expo is having a bad
  * day. Push failure is observability, not correctness.
+ *
+ * **Per-row isolation (2026-09-03, `designs/phase-1-poison-row-isolation.md`).**
+ * Each row is delivered inside its own SAVEPOINT, so one broken row rolls back
+ * ALONE and its eleven batch-mates still commit and still reach their owners.
+ * Before this, a single throw rolled back the whole claim — and since the claim
+ * re-selects the same rows a minute later, nobody in that batch was ever
+ * notified again.
+ *
+ * A SAVEPOINT and not a per-row transaction: the batch tx is what holds the
+ * `FOR UPDATE SKIP LOCKED` claim, and a per-row transaction would release that
+ * lock before delivery, letting a concurrent tick re-claim the row mid-flight.
+ *
+ * **Isolation is not blame.** A retry attempt is spent only on a row that failed
+ * while its batch-mates succeeded; a batch of ≥ 2 that fails ENTIRELY is
+ * systemic — a DB or deploy fault, not a poison row — and records nothing, so
+ * the queue comes back on its own the moment the cause is fixed (A1.1).
  */
 async function runScheduledNotificationsTick(
   expoPush: ExpoPushClient,
@@ -559,6 +665,14 @@ async function runScheduledNotificationsTick(
   const pendingPushes: ExpoPushMessage[] = [];
   let scanned = 0;
   let sent = 0;
+  let failed = 0;
+  let parked = 0;
+  // A2.1. Set by the systemic branch alone; everything else that reaches the
+  // end of `withActor` — a delivering batch, a mixed one, an empty claim — is a
+  // queue that is DELIVERING. A throw out of `withActor` never gets here at
+  // all: it propagates to the phase boundary, whose default result says
+  // `queueOk: false` for exactly that case.
+  let systemic = false;
 
   await withActor(SCHEDULER_ACTOR, async (tx) => {
     const batch = await scheduledNotificationsRepository.lockDueForSend(tx, {
@@ -570,30 +684,193 @@ async function runScheduledNotificationsTick(
       { workerTick: 'scheduler', phase: 'scheduled-notifications', batchSize: batch.length },
       'scheduler tick claimed scheduled_notifications batch',
     );
+    // Failures are COLLECTED here and adjudicated after the loop. Charging an
+    // attempt at the moment of the throw cannot tell "this row is broken" from
+    // "the database is broken", and the second one is a queue-wide outage: a
+    // column drift one table over (the 2026-09-02 class, on `notifications` or
+    // `owners` or `device_tokens` rather than on the claim projection) or a
+    // three-minute statement-timeout episode fails EVERY claimed row every
+    // tick, and three ticks later every due notification — reminders,
+    // `payment-failed`, `invoice-overdue`, `card-expiring` — is parked, the
+    // tick answers 200, and fixing the cause brings none of them back. Before
+    // this phase learned to park, that same outage self-healed (A1.1).
+    const failures: Array<{ row: ScheduledNotificationRow; message: string }> = [];
     for (const row of batch) {
-      const inserted = await deliverOne(tx, row);
-      const flipped = await scheduledNotificationsRepository.markSent(tx, {
-        id: row.id,
-        emittedNotificationId: inserted.notificationId,
-      });
-      if (flipped === 0) {
-        // Defense-in-depth: a row claimed under SKIP LOCKED shouldn't
-        // already be 'sent'. If it is, the INSERT above just created a
-        // duplicate notifications row — log it for follow-up.
-        log.warn(
-          { workerTick: 'scheduler', scheduledId: row.id },
-          'scheduler: scheduled row flipped out from under us (duplicate notification possible)',
+      try {
+        // Drizzle's node-postgres driver implements a nested `.transaction()`
+        // as a real SAVEPOINT / ROLLBACK TO SAVEPOINT pair
+        // (`drizzle-orm/node-postgres/session.js`) — the same mechanism
+        // `routes/enrollments.ts`'s per-dog isolation rests on. That is what
+        // makes "this row fails alone" true at the DB level rather than as a
+        // wish, and it leaves the outer tx usable afterwards, so the failure
+        // can be RECORDED rather than merely swallowed.
+        //
+        // Cost, measured rather than assumed: one cached subtransaction id per
+        // row, whether it succeeds or fails (an aborted subtransaction releases
+        // its xid). See the batch-limit comment in the repository.
+        const outcome = await tx.transaction(async (sp) => {
+          const inserted = await deliverOne(sp, row);
+          const flipped = await scheduledNotificationsRepository.markSent(sp, {
+            id: row.id,
+            emittedNotificationId: inserted.notificationId,
+          });
+          if (flipped === 0) {
+            // Defense-in-depth: a row claimed under SKIP LOCKED shouldn't
+            // already be 'sent'. If it is, the INSERT above just created a
+            // duplicate notifications row — log it for follow-up. Returned as
+            // a normal (non-throwing) outcome so the savepoint RELEASEs: this
+            // is not a delivery failure and must not spend a retry attempt.
+            log.warn(
+              { workerTick: 'scheduler', scheduledId: row.id },
+              'scheduler: scheduled row flipped out from under us (duplicate notification possible)',
+            );
+            return { delivered: false as const, pushMessages: [] as ExpoPushMessage[] };
+          }
+          return { delivered: true as const, pushMessages: inserted.pushMessages };
+        });
+        if (!outcome.delivered) continue;
+        sent += 1;
+        pendingPushes.push(...outcome.pushMessages);
+      } catch (err) {
+        // The savepoint has already rolled back this row's writes and the batch
+        // tx is usable again. Nothing is written yet — see the adjudication
+        // below.
+        failures.push({ row, message: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    failed = failures.length;
+    if (failures.length === 0) return;
+
+    // SYSTEMIC: every row in a batch of two or more failed. Nothing about this
+    // batch says which row is at fault, so no row pays for it — the rows stay
+    // pending and untouched, and the next tick retries all of them. One
+    // phase-level alarm, with a CONSTANT sentence: the counts and the first
+    // error text are templated INTO it, where the pager's digit-normalisation
+    // collapses them to `N`.
+    //
+    // The merge object below therefore carries NOTHING that varies — no row
+    // ids, and (since A2.2) not `batchSize` either. `identifyingExtra`
+    // (`src/lib/observability.js`) renders every scalar in it UN-normalised, so
+    // `batchSize` alone was enough to mint a fresh first-ever fingerprint on
+    // every tick of one outage as the queue backed up behind it: executed twice
+    // and independently, nine ticks with the batch growing 2 → 10 paged NINE
+    // times, against three (`IDENTICAL_ALLOWANCE`, then suppressed) once the
+    // count rides only the sentence. A continuing outage is one condition, and
+    // until A2.2 this comment asserted that of code that did not do it.
+    //
+    // A batch of ONE that fails takes the poison path below. It is genuinely
+    // ambiguous — one row and one failure look identical whether the row or the
+    // database is broken — and treating it as systemic would mean a single
+    // permanently-broken row could never park as long as it was alone in its
+    // batch, which is the every-minute-forever alarm this design rejected. The
+    // remedy if it WAS systemic is the bulk un-park verb in the migration file.
+    if (failures.length === batch.length && batch.length >= 2) {
+      systemic = true;
+      log.error(
+        {
+          workerTick: 'scheduler',
+          phase: 'scheduled-notifications',
+        },
+        `scheduled-notifications: every claimed row failed (${failures.length} of ${batch.length}) — ` +
+          `treating as systemic, no attempts spent; will retry next tick: ${failures[0]?.message ?? ''}`,
+      );
+      return;
+    }
+
+    // POISON: this row failed while its batch-mates succeeded, so the attempt
+    // is charged to it.
+    for (const failure of failures) {
+      // Its OWN savepoint (A1.5 as re-ruled). If this write throws — the
+      // savepoint statement itself failing, leaving the connection in an
+      // aborted transaction — the throw is allowed to ESCAPE to the phase
+      // boundary, which is loud. There is deliberately no catch-and-continue
+      // here: inside an already-aborted transaction every later statement is
+      // 25P02 and the COMMIT degrades to a silent ROLLBACK, so the tick would
+      // report "sent 11 / failed 1" and commit nothing at all, with no alarm.
+      const attempt = await tx.transaction(async (sp) =>
+        scheduledNotificationsRepository.recordAttemptFailure(sp, {
+          id: failure.row.id,
+          error: failure.message,
+          maxAttempts: MAX_DELIVERY_ATTEMPTS,
+        }),
+      );
+      if (attempt.outcome === 'gone') {
+        // The row is not there to record against. Its own sentence rather than
+        // a zeroth attempt, because nothing will retry a row that no longer
+        // exists and a human reading "attempt 0 of 3" would wait for one.
+        log.error(
+          {
+            workerTick: 'scheduler',
+            phase: 'scheduled-notifications',
+            scheduledId: failure.row.id,
+            dedupeKey: failure.row.dedupeKey,
+            err: failure.message,
+          },
+          'scheduled notification delivery failed and the row vanished under the claim lock — nothing was recorded',
         );
         continue;
       }
-      sent += 1;
-      pendingPushes.push(...inserted.pushMessages);
+      if (attempt.parked) parked += 1;
+      // The alarm. `scheduledId` + `dedupeKey` are the identifying scalars, so
+      // the pager's fingerprints are scoped to THIS row (deliberate
+      // over-uniqueness, D20-A4) rather than collapsing a broken row into the
+      // noise of every other. The attempt COUNT is templated into the sentence,
+      // never put in the merge object: every scalar in that object is
+      // identifying and un-normalised (`observability.ts` `identifyingExtra`),
+      // so `attempts: n` minted a fresh first-ever fingerprint on every retry,
+      // while digits in the SENTENCE normalise to `N`. Two fingerprints per
+      // row, then: the retry line, and the PARKED line — deliberately distinct
+      // text because it is a different event (nobody is retrying this row
+      // again) and must page on its own rather than dedupe into the line that
+      // preceded it.
+      log.error(
+        {
+          workerTick: 'scheduler',
+          phase: 'scheduled-notifications',
+          scheduledId: failure.row.id,
+          dedupeKey: failure.row.dedupeKey,
+          err: failure.message,
+        },
+        attempt.parked
+          ? `scheduled notification PARKED after ${attempt.attempts} attempts — needs a human`
+          : `scheduled notification delivery failed (attempt ${attempt.attempts} of ${MAX_DELIVERY_ATTEMPTS}); ` +
+            `row left pending for the next tick`,
+      );
     }
   });
 
+  // The standing signal (A1.6), read ONCE per tick on the pool AFTER the batch
+  // tx has committed — never inside it, where it would extend the window the
+  // claim's row locks are held. Its own try/catch: a count that cannot be taken
+  // must not discard the delivery results of a tick that already ran, and must
+  // not be reported as zero.
+  let parkedTotal: number | null = null;
+  try {
+    parkedTotal = await scheduledNotificationsRepository.countParked(db);
+  } catch (err) {
+    log.warn(
+      {
+        workerTick: 'scheduler',
+        phase: 'scheduled-notifications',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'could not count parked scheduled notifications; the standing parked-row signal is unchanged this tick',
+    );
+  }
+
   const { pushTicketsOk, pushTicketsError } = await dispatchPushes(expoPush, pendingPushes, log);
 
-  return { scanned, sent, pushTicketsOk, pushTicketsError };
+  return {
+    scanned,
+    sent,
+    failed,
+    parked,
+    parkedTotal,
+    queueOk: !systemic,
+    pushTicketsOk,
+    pushTicketsError,
+  };
 }
 
 /**

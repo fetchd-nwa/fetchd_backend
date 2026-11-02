@@ -1058,3 +1058,92 @@ test('fixture baseline: the owner holds no active school membership', SKIP_WHEN_
   });
   assert.equal(existing, undefined);
 });
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// 5. Parking vs the overdue safety net (2026-09-03, design
+//    phase-1-poison-row-isolation.md A1.3 as corrected by A1-R). A parked row
+//    was never delivered, so it has not "told the owner" anything — but the
+//    two suppression keys mean different things and get different rules.
+// ──────────────────────────────────────────────────────────────────────────
+
+async function parkScheduledRow(dedupeKey: string): Promise<void> {
+  const updated = await db
+    .update(scheduledNotifications)
+    .set({ failedAt: new Date().toISOString(), attempts: 3 })
+    .where(eq(scheduledNotifications.dedupeKey, dedupeKey))
+    .returning({ id: scheduledNotifications.id });
+  assert.equal(updated.length, 1, `expected to park exactly one row for ${dedupeKey}`);
+}
+
+async function enqueueSuppressor(invoiceId: string, dedupeKey: string): Promise<void> {
+  // Type is 'payment-failed' for BOTH keys so `cleanup()` (which deletes by
+  // type) reaches them; the suppression predicate reads only `dedupe_key`.
+  const row = await db.transaction(async (tx) =>
+    scheduledNotificationsRepository.enqueueIdempotent(tx, {
+      ownerId: FIXTURE_IDS.ownerId,
+      type: 'payment-failed',
+      trigger: 'test-suppressor',
+      dedupeKey,
+      scheduledFor: new Date('2026-01-02T00:00:00Z'),
+      title: 'suppressor',
+      body: 'suppressor',
+      deepLinkPath: `/account/invoices?invoiceId=${invoiceId}`,
+      deepLinkKind: null,
+      deepLinkId: null,
+      bookingId: null,
+      dogId: null,
+    }),
+  );
+  assert.ok(row !== undefined, 'the suppressor row must insert');
+}
+
+test(
+  'overdue safety net — a PARKED payment-failed row must not suppress it (the owner was never told)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedOpenInvoice({ dueAt: '2026-01-01T00:00:00Z' });
+    await enqueueSuppressor(invoiceId, `payment-failed:${invoiceId}`);
+
+    // Control: a LIVE (undelivered-but-pending) payment-failed row suppresses,
+    // exactly as before this change.
+    const suppressed = await withActor('test', async (tx) =>
+      enqueueInvoiceOverdueWarnings(tx, new Date('2026-02-01T12:00:00Z')),
+    );
+    assert.equal(suppressed.enqueued, 0, 'a pending payment-failed row still suppresses the nag');
+
+    // Park it: three failures, failed_at stamped, out of the claim forever.
+    await parkScheduledRow(`payment-failed:${invoiceId}`);
+    const unsuppressed = await withActor('test', async (tx) =>
+      enqueueInvoiceOverdueWarnings(tx, new Date('2026-02-01T12:00:00Z')),
+    );
+    assert.equal(
+      unsuppressed.enqueued,
+      1,
+      'a PARKED payment-failed row never reached the owner, so the overdue fallback must fire',
+    );
+    await cleanup();
+  },
+);
+
+test(
+  'overdue safety net — a PARKED payment-unconfirmed row STILL suppresses it (money may be in flight)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedOpenInvoice({ dueAt: '2026-01-01T00:00:00Z' });
+    await enqueueSuppressor(invoiceId, `payment-unconfirmed:${invoiceId}`);
+    await parkScheduledRow(`payment-unconfirmed:${invoiceId}`);
+
+    const result = await withActor('test', async (tx) =>
+      enqueueInvoiceOverdueWarnings(tx, new Date('2026-02-01T12:00:00Z')),
+    );
+    assert.equal(
+      result.enqueued,
+      0,
+      'payment-unconfirmed suppresses regardless of delivery: a "check your card" nag on top of an unknown outcome is the double-charge path',
+    );
+    await cleanup();
+  },
+);

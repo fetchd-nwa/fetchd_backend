@@ -44,6 +44,10 @@ const FAKE_RESULT: SchedulerTickResult = {
   scheduledNotifications: {
     scanned: 0,
     sent: 0,
+    failed: 0,
+    parked: 0,
+    parkedTotal: 0,
+    queueOk: true,
     pushTicketsOk: 0,
     pushTicketsError: 0,
   },

@@ -4,7 +4,11 @@ import { env } from '../env.js';
 import { ApiError } from '../lib/errors.js';
 import { defaultExpoPushClient, type ExpoPushClient } from '../lib/expoPush.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
-import { recordSchedulerTick } from '../lib/schedulerHeartbeat.js';
+import {
+  recordParkedTotal,
+  recordQueueOk,
+  recordSchedulerTick,
+} from '../lib/schedulerHeartbeat.js';
 import type { WorkerLogger } from '../workers/invoiceAutoCharge.js';
 import { runSchedulerTickOnce, type SchedulerTickResult } from '../workers/scheduler.js';
 
@@ -119,6 +123,23 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
         workerTick: 'scheduler',
         scheduledScanned: result.scheduledNotifications.scanned,
         scheduledSent: result.scheduledNotifications.sent,
+        // Poison-row isolation (2026-09-03). `scanned - sent` no longer implies
+        // "still due": a row can be scanned, fail alone under its SAVEPOINT and
+        // stay pending, or park out of the queue entirely. Both are leaves, so
+        // both are here.
+        scheduledFailed: result.scheduledNotifications.failed,
+        scheduledParked: result.scheduledNotifications.parked,
+        // The STANDING count, not this tick's delta (A1.6): `scheduledParked`
+        // reads 0 on every tick after the one that parked, so a human reading
+        // the log back an hour later cannot tell a healthy queue from one with
+        // rows waiting on them. `null` means this tick did not count them.
+        scheduledParkedTotal: result.scheduledNotifications.parkedTotal,
+        // Did phase 1 DELIVER (A2.1)? A leaf like every other, and the one a
+        // human reconstructing an outage needs: `scheduledSent: 0` is also what
+        // a quiet hour looks like, and `scheduledFailed: 12` with
+        // `scheduledParked: 0` is the systemic branch working as designed. This
+        // says which.
+        scheduledQueueOk: result.scheduledNotifications.queueOk,
         pushTicketsOk: result.scheduledNotifications.pushTicketsOk,
         pushTicketsError: result.scheduledNotifications.pushTicketsError,
         membershipRollScanned: result.membershipRoll.scanned,
@@ -175,6 +196,37 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
     // a 1s timeout inside `recordSchedulerTick`, because a Redis that is
     // reachable but silent used to hold this await open indefinitely.
     await recordSchedulerTick(request.log);
+    // …and the standing parked-row count the same endpoint turns into a 503
+    // (A1.6). Same position, same guarantees: after the log line, raced against
+    // its own 1s timeout, unable to fail or wedge the tick.
+    //
+    // Only when the tick actually COUNTED. `null` is "phase 1 threw at its
+    // boundary, or the count query did" — publishing 0 for that would clear a
+    // true standing alarm on exactly the tick that proved something is wrong,
+    // and the previous value stands under its 24h TTL instead.
+    const parkedTotal = result.scheduledNotifications.parkedTotal;
+    if (parkedTotal !== null) {
+      await recordParkedTotal(request.log, parkedTotal);
+    }
+    // …and the queue-freshness stamp (A2.1), same position, same guarantees.
+    //
+    // ONLY when phase 1 both completed and was not systemic. The write is what
+    // says "the queue delivered at this instant", so a tick that took the
+    // systemic branch — or whose phase 1 threw at its boundary, which is the
+    // `false` in that default result — deliberately writes NOTHING and lets the
+    // previous value age. `GET /health/watchdog` turns a value older than
+    // `SCHEDULER_STALE_AFTER_MS` into a 503; the ageing IS the signal, and
+    // refreshing the key here unconditionally would erase it.
+    //
+    // This restores the monitor coverage step 1's phase-1 boundary removed. A
+    // throw used to answer 500, never reach `recordSchedulerTick`, and go red
+    // on heartbeat staleness inside ten minutes; the boundary made it a 200 on
+    // purpose (the 500 also stopped phases 2-12, the four money phases
+    // included) and the systemic branch closed the parked-row path to a red as
+    // well. Without this key an all-day queue outage is pager-only.
+    if (result.scheduledNotifications.queueOk) {
+      await recordQueueOk(request.log);
+    }
     return reply.code(200).send(result);
   });
 }

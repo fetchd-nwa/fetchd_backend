@@ -563,6 +563,12 @@ export const invoicesRepository = {
    *    later message pays money that may already have moved. Suppression here
    *    is what keeps the unknown from being nagged into a double charge.
    *
+   *    Parking (2026-09-03): a `payment-failed` row that PARKED (`failed_at`
+   *    set after MAX_DELIVERY_ATTEMPTS) never reached the owner, so it does
+   *    NOT count as having told them — that arm is filtered on
+   *    `failed_at IS NULL`. The `payment-unconfirmed` arm deliberately is NOT:
+   *    its suppression is about the money state, not about delivery.
+   *
    * Ordered `due_at` ASC — longest overdue first, so a capped tick warns the
    * worst cases. Tx runner (the scan enqueues in the same transaction).
    */
@@ -578,9 +584,17 @@ export const invoicesRepository = {
         AND i.due_at < ${args.cutoff.toISOString()}
         AND NOT EXISTS (
           SELECT 1 FROM scheduled_notifications sn
-          WHERE sn.dedupe_key IN (
-            'payment-failed:' || i.id::text,
-            'payment-unconfirmed:' || i.id::text
+          WHERE (
+            -- A PARKED payment-failed row (failed_at set) was never delivered,
+            -- so it has not told the owner anything: it must NOT suppress the
+            -- safety net (2026-09-03, designs/phase-1-poison-row-isolation.md
+            -- A1.3 / A1-R).
+            sn.dedupe_key = 'payment-failed:' || i.id::text AND sn.failed_at IS NULL
+          ) OR (
+            -- payment-unconfirmed suppresses REGARDLESS of delivery or parking:
+            -- money may be in flight, and a "check the card on file" nag on top
+            -- of an unknown outcome is the double-charge path (see above).
+            sn.dedupe_key = 'payment-unconfirmed:' || i.id::text
           )
         )
       ORDER BY i.due_at ASC

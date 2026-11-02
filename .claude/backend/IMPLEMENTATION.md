@@ -1701,7 +1701,35 @@ observable behavior, not "looks right."
   composes with the Day-15 invoice tick + the idempotency TTL sweep.
 - **Production scheduler trigger (operational handoff to Day 20)**:
   pg_cron + pg_net is the locked primitive (matches Supabase-hosted
-  Postgres; one less moving part than a separate process). Day-16
+  Postgres; one less moving part than a separate process). **Re-affirmed
+  2026-09-03**: an in-process jobs-table + poller redesign was approved as a
+  shape (2026-09-02), attacked the same evening (two lanes, refutation pass)
+  and PARKED by Allison — umbrella `designs/scheduled-jobs-refactor.md` holds
+  the record and the revisit triggers. What the attack actually justified was
+  two hardenings of THIS tick: (1) phase 1 (`scheduled_notifications` claim +
+  deliver) was the ONLY phase without a log-and-swallow boundary — the
+  2026-09-02 production incident (`column "deep_link_kind" does not exist` →
+  27 × HTTP 500, phases 2–12 never ran) was exactly that hole — closed
+  2026-09-03, red-first at worker and route level; (2) per-row poison
+  isolation in phase 1 (`designs/phase-1-poison-row-isolation.md`) — **built
+  2026-09-03**: each claimed row now delivers inside its own SAVEPOINT and, after
+  `MAX_DELIVERY_ATTEMPTS` = 3 failures (ruled by Allison 2026-09-03; 5 was the
+  design default), PARKS on three additive
+  `scheduled_notifications` columns (`attempts` / `last_error` / `failed_at`,
+  which the claim and its partial index both filter on) instead of rolling back
+  every batch-mate on every tick forever. **Attacked the same day (two lanes +
+  a refutation pass) and repaired in fix round 1:** an attempt is spent only on
+  a row that failed while its batch-mates succeeded — a claimed batch of ≥ 2
+  that fails ENTIRELY is systemic, records nothing and heals itself when the
+  cause is fixed; a revive un-parks; the attempt count rides the alarm SENTENCE
+  rather than the pager fingerprint; and the standing parked-row count reaches
+  `GET /health/watchdog` through Redis `scheduler:parked_total`, so a parked row
+  survives its one fire-and-forget page. **Round 2 added the other half** (A2.1,
+  ruled by Allison): a queue that is not DELIVERING — every claimed row failing,
+  or phase 1 throwing at its boundary — reached no instrument at all, because
+  the systemic branch parks nothing and the boundary answers 200. The tick now
+  stamps `scheduler:queue_ok_at` only on a delivering phase 1, and the same
+  endpoint 503s when that stamp is older than the same 10 minutes. Day-16
   ships the worker function + the signed HTTP entrypoint; Day-20 wires
   the cron schedule. SQL to schedule the recurring tick (commented in
   the schema or applied via a separate ops migration — NOT in the

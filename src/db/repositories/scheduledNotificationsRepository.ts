@@ -1,4 +1,4 @@
-import { and, asc, eq, like, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, isNull, like, lte, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { scheduledNotifications } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -29,6 +29,16 @@ type Runner = Tx | typeof db;
  *     source of truth; a failed push doesn't roll back the notification
  *     row (the owner sees the in-app feed entry either way; Day-20 will
  *     wire push-retry observability).
+ *   - **Park** (2026-09-03) — a row whose delivery THROWS is rolled back to
+ *     its own SAVEPOINT while its batch-mates commit, and
+ *     `recordAttemptFailure` counts the attempt — but only when its batch-mates
+ *     SUCCEEDED. A batch of ≥ 2 rows that fails ENTIRELY is systemic, not
+ *     poison: no attempt is spent and nothing parks (`scheduler.ts`). On the
+ *     `MAX_DELIVERY_ATTEMPTS`-th failure the row is stamped `failed_at` and
+ *     drops out of `lockDueForSend` until a human clears it
+ *     (`unparkByDedupeKey`, or a revive — which un-parks). It stays
+ *     `status='pending'` throughout, so nothing else in the codebase has to
+ *     learn a fourth status.
  *
  * Append-only by nature — no `expired_at`; a cancelled enqueue uses
  * `status='cancelled'` (Day-19+ surface, not built today).
@@ -103,6 +113,11 @@ export interface ScheduledNotificationRow {
   dogId: string | null;
   emittedNotificationId: string | null;
   sentAt: string | null;
+  /** Delivery attempts spent on this row (poison-row isolation, 2026-09-03). */
+  attempts: number;
+  lastError: string | null;
+  /** NULL = live; set = PARKED after repeated failures, skipped by the claim. */
+  failedAt: string | null;
 }
 
 const SCHEDULED_NOTIFICATION_PROJECTION = {
@@ -123,7 +138,26 @@ const SCHEDULED_NOTIFICATION_PROJECTION = {
   dogId: scheduledNotifications.dogId,
   emittedNotificationId: scheduledNotifications.emittedNotificationId,
   sentAt: scheduledNotifications.sentAt,
+  attempts: scheduledNotifications.attempts,
+  lastError: scheduledNotifications.lastError,
+  failedAt: scheduledNotifications.failedAt,
 } as const;
+
+/**
+ * How much of a failure message `last_error` keeps. Hygiene, not correctness
+ * (A1.5 as re-ruled): the column is a breadcrumb for whoever runs the SQL, and
+ * a server message can carry an arbitrarily long statement echo.
+ */
+export const LAST_ERROR_MAX_CHARS = 2_000;
+
+/**
+ * What {@link scheduledNotificationsRepository.recordAttemptFailure} did.
+ * `gone` is its own arm so that a row which vanished under the claim lock
+ * cannot be reported as a first attempt on a row that will be retried.
+ */
+export type RecordAttemptFailureOutcome =
+  | { outcome: 'gone' }
+  | { outcome: 'recorded'; attempts: number; parked: boolean };
 
 export const scheduledNotificationsRepository = {
   /**
@@ -187,11 +221,26 @@ export const scheduledNotificationsRepository = {
    *
    * Ordered by `scheduled_for` ASC so the oldest-due is sent first
    * (mild fairness for delayed deliveries).
+   *
+   * PARKED rows are excluded (`failed_at IS NULL`, 2026-09-03): a row that has
+   * failed delivery `MAX_DELIVERY_ATTEMPTS` times stops being claimed so it
+   * cannot re-poison every later tick. It stays `status = 'pending'` — **cancel
+   * still reaches a parked row; revive UN-PARKS it** — and it comes back the
+   * moment a human clears `failed_at` (`unparkByDedupeKey`). The partial index
+   * carries the same predicate, so this filter is served by the index rather
+   * than fighting it.
    */
   async lockDueForSend(
     tx: Tx,
     args: { limit?: number; now?: Date } = {},
   ): Promise<ScheduledNotificationRow[]> {
+    // 50 is load-bearing for a reason beyond batch latency (2026-09-03).
+    // Per-row savepoints cost one cached subtransaction id per row, success or
+    // failure — measured against a throwaway Postgres, an ABORTED subtransaction
+    // releases its xid from the cache, so the crossover is 65 rows on both
+    // paths. A batch limit above 64 makes other backends' snapshots
+    // suboverflow (they fall back to `pg_subtrans` for visibility checks — a
+    // performance effect, not a correctness one); the 50 limit keeps under it.
     const limit = args.limit ?? 50;
     const cutoff = args.now
       ? sql`${scheduledNotifications.scheduledFor} <= ${args.now.toISOString()}::timestamptz`
@@ -199,7 +248,13 @@ export const scheduledNotificationsRepository = {
     return tx
       .select(SCHEDULED_NOTIFICATION_PROJECTION)
       .from(scheduledNotifications)
-      .where(and(eq(scheduledNotifications.status, 'pending'), cutoff))
+      .where(
+        and(
+          eq(scheduledNotifications.status, 'pending'),
+          isNull(scheduledNotifications.failedAt),
+          cutoff,
+        ),
+      )
       .orderBy(asc(scheduledNotifications.scheduledFor))
       .limit(limit)
       .for('update', { skipLocked: true });
@@ -224,6 +279,86 @@ export const scheduledNotificationsRepository = {
       })
       .where(
         and(eq(scheduledNotifications.id, args.id), eq(scheduledNotifications.status, 'pending')),
+      )
+      .returning({ id: scheduledNotifications.id });
+    return updated.length;
+  },
+
+  /**
+   * Record one FAILED delivery attempt (poison-row isolation, 2026-09-03).
+   * Called from the worker AFTER the batch loop, on the BATCH tx and inside a
+   * savepoint of its own — the row's own delivery SAVEPOINT has already rolled
+   * back, so this write is the only trace the attempt leaves, and it commits
+   * with the batch-mates that succeeded.
+   *
+   * Increments `attempts`, stores the failure message, and stamps `failed_at`
+   * on the attempt that reaches `maxAttempts` — the row PARKS: still 'pending'
+   * (cancel untouched; revive un-parks) but no longer claimed, waiting on a
+   * human. `attempts + 1 >= maxAttempts` rather than `=` so a row already past
+   * the threshold (a lowered `MAX_DELIVERY_ATTEMPTS`, a hand-edited row) parks
+   * on its next failure instead of retrying forever past the ceiling.
+   *
+   * `last_error` is truncated to {@link LAST_ERROR_MAX_CHARS} before the write:
+   * this column is a breadcrumb for a human running SQL, not a log sink, and an
+   * unbounded server message (a statement echo, a giant row dump) has no
+   * business being replayed into the row on every failure.
+   *
+   * Returns a DISCRIMINATED outcome, not a count. The 0-row case — the row
+   * vanished between the claim and this write — used to come back as
+   * `{ attempts: 0, parked: false }`, which is a first attempt's shape and a
+   * lie about a row that no longer exists (A1.5 / O12); the caller logs its own
+   * sentence for `gone` instead of posing as attempt 0.
+   */
+  async recordAttemptFailure(
+    tx: Tx,
+    args: { id: string; error: string; maxAttempts: number },
+  ): Promise<RecordAttemptFailureOutcome> {
+    const [row] = await tx
+      .update(scheduledNotifications)
+      .set({
+        attempts: sql`${scheduledNotifications.attempts} + 1`,
+        lastError: args.error.slice(0, LAST_ERROR_MAX_CHARS),
+        failedAt: sql`CASE WHEN ${scheduledNotifications.attempts} + 1 >= ${args.maxAttempts}::integer
+                          THEN now() ELSE ${scheduledNotifications.failedAt} END`,
+      })
+      .where(eq(scheduledNotifications.id, args.id))
+      .returning({
+        attempts: scheduledNotifications.attempts,
+        failedAt: scheduledNotifications.failedAt,
+      });
+    if (row === undefined) {
+      // Not reachable under the claim — the caller holds this row's
+      // `FOR UPDATE SKIP LOCKED` lock in this very tx, so it exists — but it is
+      // reported as its own outcome rather than as a zeroth attempt, so that if
+      // it ever DOES happen the log says what happened instead of describing a
+      // retry that nothing will retry.
+      return { outcome: 'gone' };
+    }
+    return { outcome: 'recorded', attempts: row.attempts, parked: row.failedAt !== null };
+  },
+
+  /**
+   * Un-park a row (ops verb): clears `failed_at` and resets `attempts`, so the
+   * next tick claims it again. Deliberately has no route — a parked row means a
+   * human read the PARKED alarm, fixed the cause, and is putting the row back;
+   * doing that by hand is the point. Mirrors the SQL in the umbrella's
+   * `scripts/db/2026-09-03-scheduled-notifications-parking.sql`.
+   *
+   * `failed_at IS NOT NULL` is part of the predicate (A1.9c) so the return is
+   * an ANSWER and not just an echo: without it, running this against a key whose
+   * row is 'sent', 'cancelled' or simply healthy resets that row's counters and
+   * returns 1, which the operator reads as "unparked". 0 now means "nothing was
+   * parked under that key".
+   */
+  async unparkByDedupeKey(tx: Tx, dedupeKey: string): Promise<number> {
+    const updated = await tx
+      .update(scheduledNotifications)
+      .set({ failedAt: null, attempts: 0 })
+      .where(
+        and(
+          eq(scheduledNotifications.dedupeKey, dedupeKey),
+          isNotNull(scheduledNotifications.failedAt),
+        ),
       )
       .returning({ id: scheduledNotifications.id });
     return updated.length;
@@ -257,6 +392,15 @@ export const scheduledNotificationsRepository = {
    * hits the unique dedupe_key and DO-NOTHINGs. Sent rows stay sent (a
    * reminder that already fired is history, not re-sendable). Returns the
    * number of rows revived (0 or 1).
+   *
+   * **A revive is a fresh intent, so it also UN-PARKS** (A1.2, 2026-09-03;
+   * Allison's decision 3-bis default: a re-armed reminder gets its three tries
+   * again). Without the reset, a row that had parked came back `pending`, due,
+   * and permanently invisible to the claim: `syncSpayNeuterReminder` reported
+   * cancelled 1 / revived 1, the owner's reminder looked scheduled everywhere,
+   * and it never fired and never alarmed again — the diff's own silent failure,
+   * executed by both attack lanes. If the row is still poison it re-parks
+   * loudly after `MAX_DELIVERY_ATTEMPTS`.
    */
   async revivePendingByDedupeKey(
     tx: Tx,
@@ -264,7 +408,12 @@ export const scheduledNotificationsRepository = {
   ): Promise<number> {
     const updated = await tx
       .update(scheduledNotifications)
-      .set({ status: 'pending', scheduledFor: args.scheduledFor.toISOString() })
+      .set({
+        status: 'pending',
+        scheduledFor: args.scheduledFor.toISOString(),
+        failedAt: null,
+        attempts: 0,
+      })
       .where(
         and(
           eq(scheduledNotifications.dedupeKey, args.dedupeKey),
@@ -296,6 +445,10 @@ export const scheduledNotificationsRepository = {
   /**
    * Test-only convenience for the worker contract tests — count pending
    * rows visible at `now`. Production workers always use `lockDueForSend`.
+   *
+   * `failed_at IS NULL` matches the claim (A1.9d): without it this counts
+   * PARKED rows as "due pending", which is the opposite of what the worker
+   * will do with them, and the narrower partial index no longer serves it.
    */
   async countDuePending(runner: Runner, now: Date): Promise<number> {
     const rows = await runner
@@ -304,9 +457,51 @@ export const scheduledNotificationsRepository = {
       .where(
         and(
           eq(scheduledNotifications.status, 'pending'),
+          isNull(scheduledNotifications.failedAt),
           lte(scheduledNotifications.scheduledFor, now.toISOString()),
         ),
       );
     return rows.length;
+  },
+
+  /**
+   * How many rows are PARKED right now — the standing signal (A1.6).
+   *
+   * The PARKED page is fire-and-forget and one-shot: the pager documents that a
+   * page can be shed at the in-flight ceiling or lost to a transport failure,
+   * and `scheduledParked` on the completion line is per-tick, so it reads 0 on
+   * every tick after the one that parked. Miss that single page and a
+   * permanently undeliverable notification is invisible until someone runs SQL.
+   * This count is what `POST /workers/tick` publishes and
+   * `GET /health/watchdog` turns into a standing 503.
+   *
+   * `status = 'pending'` is part of the predicate, not decoration: a parked row
+   * that is later CANCELLED is settled, and counting it would hold the watchdog
+   * red forever with nothing left for a human to do.
+   *
+   * Runs on the POOL after the batch tx commits — never inside it: it must not
+   * extend the window in which the claim's row locks are held.
+   *
+   * It is one **sequential scan** per tick, not an index lookup, and calling it
+   * "indexed-ish" here was wrong (A2.3): the only partial index on this table
+   * carries the exact COMPLEMENT of this predicate
+   * (`status = 'pending' AND failed_at IS NULL`), so `EXPLAIN` plans a Seq Scan
+   * even with `enable_seqscan = off` forcing the alternative to cost 1e10.
+   * Measured at 14.7 ms, once per 60 s, on the pool, after commit, holding no
+   * lock — which is why the ruling was to fix the WORD and not to add an index.
+   * The complementary partial index is filed as a follow-up, for the day this
+   * table is large enough for 14.7 ms to matter.
+   */
+  async countParked(runner: Runner): Promise<number> {
+    const [row] = await runner
+      .select({ count: sql<number>`count(*)::int` })
+      .from(scheduledNotifications)
+      .where(
+        and(
+          eq(scheduledNotifications.status, 'pending'),
+          isNotNull(scheduledNotifications.failedAt),
+        ),
+      );
+    return row?.count ?? 0;
   },
 };

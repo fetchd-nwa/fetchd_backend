@@ -593,21 +593,78 @@ lives inside a process nothing is calling. One level out, the pager has the
 same blind spot: after boot, a transport failure is a stderr line read by
 nobody, and the boot smoke proves the channel once, at setup, and never again.
 
-So `POST /workers/tick` writes a Redis heartbeat (`scheduler:last_tick_at`,
-24h TTL) immediately after its completion log line — a write that is logged and
-swallowed, because a watchdog must never be able to fail the thing it watches —
-and `GET /health/watchdog` `[public]` reports `last_tick_at`, `staleness_s`,
-pager health, and a `reasons` array. **503** when the last tick is older than
-10 minutes; when the heartbeat is ABSENT, UNPARSEABLE, UNREADABLE, or dated in
-the FUTURE (each its own reason — a corrupt key must not report "the scheduler
-never ran", "I cannot see the key" must not report either, and a forward clock
-jump must not buy a dead scheduler that much silence); when the pager has failed
-3 sends in a row; when it has LOST 3 sends to failed delivery in the last hour,
-consecutive or not; when it has dropped 200 alarms in the last hour; when its
-circuit breaker is tripped; or when production has no pager installed. 200
-otherwise. A free external uptime monitor watches it on a 5-minute interval —
-external to both this process and Sentry, which is what makes it the one
-instrument that survives either dying.
+So `POST /workers/tick` writes **three** Redis keys immediately after its
+completion log line — writes that are logged and swallowed, because a watchdog
+must never be able to fail the thing it watches, and each raced against a 1s
+deadline, because one that can WEDGE the thing it watches fails the same claim:
+
+| key | TTL | written | means |
+| --- | --- | --- | --- |
+| `scheduler:last_tick_at` | 24h | every tick that reached the completion line | *the tick happened at all* |
+| `scheduler:parked_total` | 24h | every tick that COUNTED (2026-09-03, A1.6) | *N scheduled notifications are parked right now* |
+| `scheduler:queue_ok_at` | 24h | only a tick whose phase 1 DELIVERED (2026-09-03, A2.1) | *the notification queue was moving at this instant* |
+
+`GET /health/watchdog` `[public]` reads all three in one `Promise.all` (one
+deadline, not three) and reports `last_tick_at`, `staleness_s`, `parked_total`,
+`queue_ok_at`, pager health, and a `reasons` array. **503**:
+
+- when the last tick is older than 10 minutes; or the heartbeat is ABSENT,
+  UNPARSEABLE, UNREADABLE, or dated in the FUTURE (each its own reason — a
+  corrupt key must not report "the scheduler never ran", "I cannot see the key"
+  must not report either, and a forward clock jump must not buy a dead
+  scheduler that much silence);
+- when `parked_total` > 0 — *"parked scheduled notifications: N — a human must
+  un-park or cancel them"*. A parked row is a notification that will NEVER be
+  delivered until someone acts, and its only other notice was one
+  fire-and-forget page. Allison's decision 4, ruled YES 2026-09-03;
+- when `queue_ok_at` is older than the SAME 10 minutes — *"scheduled-notification
+  queue has not delivered for Ns — every claimed row is failing, or phase 1 is
+  throwing"*. Ruled by Allison 2026-09-03: a queue that is not delivering turns
+  the monitor red after about ten minutes. This is the state the heartbeat
+  cannot see — the tick is running and stamping itself every minute, and it is
+  phase 1 that stopped. Two sibling conditions on the same key (round 3): when
+  it is **ABSENT** while the scheduler is ticking, in its own sentence, because
+  a key written ONLY by a delivering tick that fails open deletes its own
+  signal — the 24h TTL runs to zero under a continuing outage and the monitor
+  emails "UP / resolved" over it (A3.1); and when it is dated in the **FUTURE**
+  beyond the clock-skew tolerance, because the heartbeat's skew branch cannot
+  cover a key the failing path never rewrites (A3.2). **All three — and the
+  UNPARSEABLE arm A4 (iii) adds below — are gated on a heartbeat that is
+  `recorded` and fresh** (A3.3): when nothing is ticking at
+  all, "see the phase alarm" names a log line that cannot exist, and the
+  heartbeat's own reason is already carrying the 503;
+- when the pager has failed 3 sends in a row; when it has LOST 3 sends to failed
+  delivery in the last hour, consecutive or not; when it has dropped 200 alarms
+  in the last hour; when its circuit breaker is tripped; or when production has
+  no pager installed.
+
+200 otherwise. For `scheduler:parked_total` an ABSENT reading adds no reason — a
+deployment before its first tick has published none, and failing a fresh
+deploy's monitor is the trap this endpoint's separation from `/health` exists to
+avoid. **`scheduler:queue_ok_at` is the opposite and was wrongly given the same
+branch until A3.1**: `parked_total` is rewritten by every tick that can COUNT,
+so its absence means "nobody has published one", while `queue_ok_at` is written
+only by a DELIVERING tick, so its absence means "nothing healthy has happened
+since it last expired" — which is a 503 (and the fresh-deploy case is covered
+anyway by the heartbeat, absent at the same moment). **Since A4 (iii) an
+UNPARSEABLE `scheduler:queue_ok_at` fails CLOSED too**, in a sentence of its own
+that names the corruption rather than reusing the ABSENT one: the same fact is
+true of a corrupt key as of a missing one — while the scheduler ticks, nothing
+says phase 1 delivered. Its cost is bounded, which is what makes that direction
+right here: `recordQueueOk` is an unconditional `SETEX` on every DELIVERING
+tick, so over a healthy queue a corrupt value is overwritten within one tick and
+the false 503 lasts at most one tick plus one monitor interval; over a broken
+queue it stands. The PARKED key's UNPARSEABLE arm, and the UNREADABLE arm of
+both keys, still add no reason and still fail OPEN — for the parked key because
+"there are parked rows" about rows it cannot see would be a FALSE sentence, and
+for UNREADABLE because one unreadable Redis makes the HEARTBEAT unreadable at
+the same moment, so its own reason already carries the 503. That a corrupt
+parked key can silently lose a standing parked alarm is named here because it is
+a real cost, not a property anyone should have to rediscover.
+
+A free external uptime monitor watches it on a 5-minute interval — external to
+both this process and Sentry, which is what makes it the one instrument that
+survives either dying.
 
 Two of those conditions are D20-A5 and each was a way this endpoint reported
 health while pages were being lost. **UNREADABLE**: the heartbeat READER had no

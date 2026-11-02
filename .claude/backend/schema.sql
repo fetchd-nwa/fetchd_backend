@@ -1729,10 +1729,30 @@ CREATE TABLE scheduled_notifications (
   dog_id         uuid REFERENCES dogs(id) ON DELETE CASCADE,
   emitted_notification_id uuid REFERENCES notifications(id),
   created_at     timestamptz NOT NULL DEFAULT now(),
-  sent_at        timestamptz
+  sent_at        timestamptz,
+  -- Poison-row isolation (2026-09-03, designs/phase-1-poison-row-isolation.md).
+  -- One broken row used to take the whole batch down with it: the tick claimed
+  -- twelve rows in one transaction, row 7 threw, everything rolled back, and
+  -- the other eleven owners never got their reminder — every minute, forever.
+  -- The worker now delivers each row inside its own SAVEPOINT and records the
+  -- failure HERE instead of rolling back its batch-mates.
+  -- FAILED delivery attempts spent on this row: a row delivered on its first
+  -- try leaves this 0. An attempt is charged only when the row failed while its
+  -- batch-mates SUCCEEDED — a batch of >= 2 that fails entirely is systemic (a
+  -- DB or deploy fault) and spends nothing, so an outage cannot park the queue.
+  attempts       integer NOT NULL DEFAULT 0,
+  last_error     text,                        -- the last delivery failure's message (2000 chars)
+  -- NULL = live; set = PARKED after MAX_DELIVERY_ATTEMPTS (= 3, ruled by Allison
+  -- 2026-09-03; src/workers/scheduler.ts) failures, waiting on a human. A parked
+  -- row deliberately stays status = 'pending': every cancel/revive/suppression
+  -- predicate in the codebase branches on the three `scheduled_status` values and
+  -- stays correct as written — cancel still reaches a parked row, and revive
+  -- UN-PARKS it (a revive is a fresh intent). It simply drops out of the claim
+  -- scan below until someone clears failed_at.
+  failed_at      timestamptz
 );
 CREATE INDEX scheduled_notifications_due_idx
-  ON scheduled_notifications (scheduled_for) WHERE status = 'pending';
+  ON scheduled_notifications (scheduled_for) WHERE status = 'pending' AND failed_at IS NULL;
 
 CREATE TABLE notification_dogs (
   notification_id uuid NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,

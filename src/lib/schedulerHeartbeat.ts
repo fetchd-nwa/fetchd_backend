@@ -210,3 +210,305 @@ function interpret(raw: string | null): HeartbeatReading {
   }
   return { kind: 'recorded', at: parsed };
 }
+
+/**
+ * **How many scheduled notifications are PARKED right now** — the standing
+ * signal (2026-09-03, `designs/phase-1-poison-row-isolation.md` A1.6).
+ *
+ * A parked row is a notification that will NEVER be delivered until a human
+ * acts, and its only notice was one fire-and-forget page: the pager documents
+ * that a send can be shed at the in-flight ceiling or lost to the transport,
+ * and `scheduledParked` on the completion line is per-tick, so it reads 0 on
+ * every tick after the one that parked. Miss that page and the row is invisible
+ * until someone runs SQL — which is the same shape as the fault the heartbeat
+ * above exists to catch, one level in.
+ *
+ * So the tick publishes the count and `GET /health/watchdog` turns it into a
+ * standing 503. Redis and not a query, for the same reason as the heartbeat:
+ * the watchdog is deliberately DB-FREE, so it can still answer when the
+ * database is the thing that is broken.
+ */
+export const SCHEDULER_PARKED_TOTAL_KEY = 'scheduler:parked_total';
+
+/**
+ * 24h, matching {@link SCHEDULER_HEARTBEAT_TTL_S}. Long enough that a value
+ * outlives any plausible gap between ticks, so a missing key means "no tick has
+ * published one" rather than "the last one aged out" — and short enough that a
+ * count from a dead deployment does not hold the watchdog red forever.
+ */
+export const SCHEDULER_PARKED_TOTAL_TTL_S = 24 * 60 * 60;
+
+/**
+ * Publish the parked-row count. Called from `routes/workersTick.ts` straight
+ * after {@link recordSchedulerTick}, and — exactly like it — **never throws,
+ * never rejects, and never hangs**: this is a signal ABOUT the tick and must
+ * not become a way for the tick to fail or wedge. Same 1s race, both arms
+ * resolving, warn on failure or timeout.
+ *
+ * The caller must not invent a number. A tick that could not COUNT passes
+ * nothing here at all (the count is `null` in that case), leaving the previous
+ * value to stand under its TTL: publishing 0 from a tick that never looked
+ * would clear a true standing alarm.
+ */
+export async function recordParkedTotal(
+  log: { warn(obj: Record<string, unknown>, msg?: string): void },
+  parked: number,
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const write = redis
+      .setex(SCHEDULER_PARKED_TOTAL_KEY, SCHEDULER_PARKED_TOTAL_TTL_S, String(parked))
+      .then(
+        () => ({ kind: 'written' }) as const,
+        (err: unknown) => ({ kind: 'failed', err }) as const,
+      );
+    const deadline = new Promise<{ kind: 'timeout' }>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: 'timeout' }), HEARTBEAT_WRITE_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([write, deadline]);
+    if (outcome.kind === 'failed') {
+      log.warn(
+        { err: outcome.err instanceof Error ? outcome.err.message : String(outcome.err) },
+        'parked-notification count write failed — the tick is unaffected, but /health/watchdog will read stale',
+      );
+    } else if (outcome.kind === 'timeout') {
+      log.warn(
+        { timeoutMs: HEARTBEAT_WRITE_TIMEOUT_MS },
+        'parked-notification count write timed out — the tick is unaffected and completed, but /health/watchdog will read stale',
+      );
+    }
+  } catch (err) {
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'parked-notification count write failed — the tick is unaffected, but /health/watchdog will read stale',
+    );
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * What the parked-total key says — the same four states as
+ * {@link HeartbeatReading}, and for the same reasons: only `recorded` is a
+ * number anyone may act on, and each failure shape has to be distinguishable
+ * from "there are no parked rows", which is the reading that means everything
+ * is fine.
+ */
+export type ParkedTotalReading =
+  | { kind: 'absent' }
+  | { kind: 'unparseable'; raw: string }
+  | { kind: 'unreadable'; reason: string }
+  | { kind: 'recorded'; n: number };
+
+/**
+ * The published parked-row count, as one of {@link ParkedTotalReading}'s four
+ * states. **Never rejects and never hangs**, raced against
+ * {@link HEARTBEAT_READ_TIMEOUT_MS} with both arms resolving — the D20-A5.2
+ * shape, because a reachable-but-silent Redis left the watchdog running after
+ * 45 seconds and a watchdog that hangs is worse than one that says it is blind.
+ */
+export async function readParkedTotal(): Promise<ParkedTotalReading> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const read = redis.get(SCHEDULER_PARKED_TOTAL_KEY).then(
+      (raw: string | null) => ({ kind: 'read', raw }) as const,
+      (err: unknown) => ({ kind: 'failed', err }) as const,
+    );
+    const deadline = new Promise<{ kind: 'timeout' }>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: 'timeout' }), HEARTBEAT_READ_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([read, deadline]);
+    if (outcome.kind === 'timeout') {
+      return {
+        kind: 'unreadable',
+        reason: `redis did not answer within ${HEARTBEAT_READ_TIMEOUT_MS}ms (reachable but silent)`,
+      };
+    }
+    if (outcome.kind === 'failed') {
+      return {
+        kind: 'unreadable',
+        reason: outcome.err instanceof Error ? outcome.err.message : String(outcome.err),
+      };
+    }
+    return interpretParkedTotal(outcome.raw);
+  } catch (err) {
+    return { kind: 'unreadable', reason: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * The raw value, as a reading. The writer writes `String(n)` for a
+ * non-negative integer `n` and nothing else, so the reader accepts exactly that
+ * and treats everything else as corruption — the `interpret` lesson above, in
+ * its numeric form: `Number('')` is 0, `Number(' 7 ')` is 7 and `Number('1e3')`
+ * is 1000, so a coerced parse would report a count this system never wrote and
+ * (for `''`) would report the reassuring one.
+ */
+function interpretParkedTotal(raw: string | null): ParkedTotalReading {
+  if (raw === null) return { kind: 'absent' };
+  if (!/^\d+$/.test(raw)) return { kind: 'unparseable', raw };
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n)) return { kind: 'unparseable', raw };
+  return { kind: 'recorded', n };
+}
+
+/**
+ * **Is the scheduled-notification QUEUE delivering?** — the freshness key
+ * (2026-09-03, `designs/phase-1-poison-row-isolation.md` A2.1, ruled by Allison
+ * ~14:45 CDT: *a queue that is not delivering must turn the uptime monitor red
+ * after about ten minutes*).
+ *
+ * The heartbeat above answers "did the tick happen at all". It cannot answer
+ * "did phase 1 deliver anything", and this cycle's own two fixes are what made
+ * that gap load-bearing:
+ *
+ * - Before the phase-1 boundary, a throw inside phase 1 escaped to
+ *   `POST /workers/tick`, the route answered 500, {@link recordSchedulerTick}
+ *   was never reached, and the heartbeat went stale inside ten minutes. A
+ *   whole-queue notification outage went RED here — by accident.
+ * - The boundary removed that 500 deliberately: it also stopped phases 2-12,
+ *   the four money phases included (the 2026-09-02 incident, 27 ticks).
+ * - The systemic branch (A1.1) then removed the other path to a red: an
+ *   all-fail batch parks nothing, so `scheduler:parked_total` stays 0 too.
+ *
+ * Net, without this key: a schema drift on `notifications`, a statement-timeout
+ * episode or a bad deploy is PAGER-ONLY for as long as it lasts — on the one
+ * instrument whose whole purpose is to survive Sentry dying.
+ *
+ * **A freshness key and not a consecutive-tick counter**, which is what the
+ * attack lanes proposed: a counter needs a read-modify-write on Redis in the
+ * tick's hot path and races two overlapping ticks. An instant plus a staleness
+ * comparison is the shape the heartbeat above already proved in production
+ * (`8f25c8f`: real DOWN 02:26:38, real UP 02:31:44 UTC), it is idempotent, and
+ * two ticks writing it cannot corrupt each other.
+ */
+export const SCHEDULER_QUEUE_OK_KEY = 'scheduler:queue_ok_at';
+
+/**
+ * 24h, matching {@link SCHEDULER_HEARTBEAT_TTL_S} and
+ * {@link SCHEDULER_PARKED_TOTAL_TTL_S}, and for the heartbeat's reason: a key
+ * that expired at the staleness threshold would make "the queue stopped eleven
+ * minutes ago" and "the queue stopped last week" the same reading, and only the
+ * first of those can state a DURATION. Both are a 503 — since A3.1 an absent
+ * key raises the watchdog's own reason rather than reading as health — but the
+ * stale one names the number an operator acts on, so the TTL must stay far
+ * longer than `SCHEDULER_STALE_AFTER_MS` or every outage collapses into the
+ * vaguer sentence within one threshold. Pinned, with that ratio, in
+ * `test/contracts/healthWatchdog.test.ts`; before A3.1, collapsing this
+ * constant went further and made production GREEN one minute after it expired.
+ *
+ * What `absent` means here, stated because the code once assumed the opposite:
+ * NOT "nothing has ticked in this deployment" — that is what an absent
+ * {@link SCHEDULER_PARKED_TOTAL_KEY} means, because every tick that can count
+ * rewrites it. This key is written only by a DELIVERING tick, so its absence
+ * means "nothing healthy has happened since it last expired".
+ */
+export const SCHEDULER_QUEUE_OK_TTL_S = 24 * 60 * 60;
+
+/**
+ * Stamp "phase 1 delivered, at this instant". Called from
+ * `routes/workersTick.ts` beside {@link recordSchedulerTick}, and **only when
+ * `scheduledNotifications.queueOk` is true** — a tick that took the systemic
+ * branch, or whose phase 1 threw at its boundary, deliberately leaves the
+ * previous value to age out under its TTL. That ageing IS the signal, and
+ * since A3.1 it does not end when the key expires: the reader raises its own
+ * reason for an ABSENT key while the heartbeat says the scheduler is ticking,
+ * so a write-only-on-health key cannot delete its own alarm at the 24h mark.
+ *
+ * Never throws, never rejects, **and never hangs** — the same 1s race with both
+ * arms resolving as {@link recordSchedulerTick}, for the same reasons: a Redis
+ * blip must not fail a tick that already moved money, a WEDGED Redis must not
+ * stop it finishing (executed against a TCP blackhole, the tick route was still
+ * running after 45 seconds), and an abandoned write that rejects LATER would be
+ * an unhandled rejection, which with the Day-20 crash handlers installed takes
+ * the process down. Failure is logged at `warn`, not `error`: an unreachable
+ * Redis is already a `/health` 503 and must not also spend a page from the
+ * money alarms' budget.
+ */
+export async function recordQueueOk(
+  log: { warn(obj: Record<string, unknown>, msg?: string): void },
+  now: Date = new Date(),
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const write = redis
+      .setex(SCHEDULER_QUEUE_OK_KEY, SCHEDULER_QUEUE_OK_TTL_S, now.toISOString())
+      .then(
+        () => ({ kind: 'written' }) as const,
+        (err: unknown) => ({ kind: 'failed', err }) as const,
+      );
+    const deadline = new Promise<{ kind: 'timeout' }>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: 'timeout' }), HEARTBEAT_WRITE_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([write, deadline]);
+    if (outcome.kind === 'failed') {
+      log.warn(
+        { err: outcome.err instanceof Error ? outcome.err.message : String(outcome.err) },
+        'queue-delivering write failed — the tick is unaffected, but /health/watchdog will read stale',
+      );
+    } else if (outcome.kind === 'timeout') {
+      log.warn(
+        { timeoutMs: HEARTBEAT_WRITE_TIMEOUT_MS },
+        'queue-delivering write timed out — the tick is unaffected and completed, but /health/watchdog will read stale',
+      );
+    }
+  } catch (err) {
+    // Belt and braces, as in the writer above: `setex` throwing SYNCHRONOUSLY
+    // (a disconnected client can) would otherwise escape into the request path.
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'queue-delivering write failed — the tick is unaffected, but /health/watchdog will read stale',
+    );
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * The last instant phase 1 is known to have delivered, as one of
+ * {@link HeartbeatReading}'s four states.
+ *
+ * It IS a {@link HeartbeatReading}: the value is an ISO instant written by
+ * `Date.prototype.toISOString()` and nothing else, exactly like the heartbeat,
+ * so {@link interpret} is reused rather than reimplemented. That is not
+ * convenience — a second parser is a second place for `new Date('2026')` to
+ * come back as a valid `recorded` reading, which is the fault §A4.5 L3 exists
+ * to prevent and which this endpoint once reported as a 23-year-old tick.
+ *
+ * **Never rejects and never hangs**, raced against
+ * {@link HEARTBEAT_READ_TIMEOUT_MS} with both arms resolving — a
+ * reachable-but-silent Redis left the watchdog running after 45 seconds, and a
+ * watchdog that hangs is worse than one that says it is blind.
+ */
+export async function readQueueOk(): Promise<HeartbeatReading> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const read = redis.get(SCHEDULER_QUEUE_OK_KEY).then(
+      (raw: string | null) => ({ kind: 'read', raw }) as const,
+      (err: unknown) => ({ kind: 'failed', err }) as const,
+    );
+    const deadline = new Promise<{ kind: 'timeout' }>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: 'timeout' }), HEARTBEAT_READ_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([read, deadline]);
+    if (outcome.kind === 'timeout') {
+      return {
+        kind: 'unreadable',
+        reason: `redis did not answer within ${HEARTBEAT_READ_TIMEOUT_MS}ms (reachable but silent)`,
+      };
+    }
+    if (outcome.kind === 'failed') {
+      return {
+        kind: 'unreadable',
+        reason: outcome.err instanceof Error ? outcome.err.message : String(outcome.err),
+      };
+    }
+    return interpret(outcome.raw);
+  } catch (err) {
+    return { kind: 'unreadable', reason: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}

@@ -1723,6 +1723,165 @@ shape + repo extensions + a new signed HTTP entrypoint.
    ticks divide the queue without blocking. `dedupe_key UNIQUE`
    makes re-enqueue idempotent — an Idempotency-Key replay of a
    booking-creation tx ON CONFLICT DO NOTHING's the schedule rows.
+   **Amended 2026-09-03 (poison-row isolation,
+   `designs/phase-1-poison-row-isolation.md`):** the claim also filters
+   `failed_at IS NULL`, and the partial index
+   `scheduled_notifications_due_idx` carries the same predicate.
+
+3-bis. **Parking a poison row (2026-09-03).** Three additive columns on
+   `scheduled_notifications`: `attempts integer NOT NULL DEFAULT 0`,
+   `last_error text`, `failed_at timestamptz`. The worker now delivers each
+   claimed row inside its own SAVEPOINT (a nested drizzle `.transaction()`,
+   the `routes/enrollments.ts` per-dog precedent) rather than sharing one
+   all-or-nothing batch transaction, so **one broken row fails alone and its
+   batch-mates still commit**. On a row's failure the batch tx records the
+   attempt (`recordAttemptFailure`, itself inside a savepoint) and raises one
+   ERROR-level alarm naming `scheduledId` + `dedupeKey` — the attempt COUNT
+   rides the sentence, never the merge object, because every scalar there is an
+   un-normalised part of the pager fingerprint. On the
+   `MAX_DELIVERY_ATTEMPTS`-th failure (**3 — ruled by Allison 2026-09-03; was 5
+   as the design default** — `src/workers/scheduler.ts`) `failed_at` is stamped
+   and the row PARKS: it stops being claimed and a distinct "PARKED … needs a
+   human" sentence pages once.
+
+   **Isolation is not blame, stated once:** an attempt is spent only on a row
+   that failed while its batch-mates SUCCEEDED. A claimed batch of **two or more
+   that fails ENTIRELY is systemic** — a schema drift one table over, a
+   statement-timeout episode — so nothing is recorded, nothing parks, the rows
+   stay `pending` untouched, and one phase-level alarm names the count and the
+   first error in its SENTENCE — the merge object carries NOTHING that varies:
+   no row ids, and (A2.2) not `batchSize` either, because every scalar there is
+   rendered un-normalised and a batch growing 2 → 10 during one outage minted a
+   fresh first-ever page on every tick (executed: nine ticks, nine pages,
+   against three). So a continuing outage is one condition rather than a page
+   per row per tick. The
+   queue then heals itself the moment the cause is fixed. A batch of ONE that
+   fails takes the poison path: one row and one failure are genuinely ambiguous,
+   and the alternative is a row that can never park.
+
+   **The parking rule, stated once:** a parked row is still
+   `status = 'pending'`. That is deliberate — every cancel / revive /
+   suppression predicate branches on the three `scheduled_status` values and
+   stays correct as written: **`cancelPendingByDedupePrefix` still reaches a
+   parked row, and `revivePendingByDedupeKey` UN-PARKS it** (`failed_at = NULL,
+   attempts = 0` — a revive is a fresh intent, so a re-armed reminder gets its
+   three tries again; decision 3-bis). Parking is expressed only by `failed_at`,
+   which the claim filters on. A human un-parks with `unparkByDedupeKey`
+   (guarded on `failed_at IS NOT NULL`, so 0 means "nothing was parked under
+   that key") or with the SQL file's bulk verb — no route, no auto-unpark.
+
+   **What stays visible after the one page.**
+   `ScheduledNotificationsTickResult` gains `failed`, `parked` and
+   `parkedTotal`; `POST /workers/tick`'s completion line gains
+   `scheduledFailed`, `scheduledParked` and `scheduledParkedTotal` (EVERY leaf,
+   D20-A7.2). `parkedTotal` is the STANDING count
+   (`failed_at IS NOT NULL AND status = 'pending'`), read once per tick on the
+   pool after the batch commits, and `null` when the tick could not count it.
+   The tick publishes it to Redis `scheduler:parked_total` (SETEX 24h, the
+   heartbeat's 1s race-with-timeout shape) right after the heartbeat, and only
+   when it is a real number — a tick that never looked must not overwrite a true
+   alarm with 0. `GET /health/watchdog` reads it with the same guarantees and
+   adds the 503 reason `parked scheduled notifications: N — a human must un-park
+   or cancel them (see scripts/db in the umbrella)` when N > 0; its body gains
+   `parked_total: number | null`. Absent / unparseable / unreadable add NO
+   reason. Absent is normal before a deployment's first tick. For the other two
+   the honest justification is narrower than the one this document carried until
+   A2.3: it is **not** that "the heartbeat read already reports it" — these are
+   different keys read by different functions, so a fresh heartbeat beside a
+   corrupt parked key answers **200 with `reasons: []`**, which the tree's own
+   test pins. It is that this endpoint would otherwise have to say "there are
+   parked rows" about rows it cannot see. **Named cost:** this signal fails
+   OPEN, and a corrupt key can silently lose a standing parked alarm.
+
+   **What this did NOT cover, and A2.1 does (2026-09-03).** As built before
+   A2.1, a SYSTEMIC / all-fail outage never reached the uptime monitor at all:
+   nothing parks, so `parked_total` stays 0; the tick answers 200, so the
+   heartbeat stays fresh; and the phase-1 boundary — which is right, and which
+   replaced the 500 that used to starve the heartbeat and go red by accident —
+   also answers 200. A schema drift on `notifications`, a statement-timeout
+   episode or a bad deploy was therefore **pager-only for as long as it lasted**,
+   on the instrument whose whole purpose is to survive Sentry dying. Ruled by
+   Allison 2026-09-03: that state goes red after about ten minutes.
+
+   The shape is a FRESHNESS key, not a consecutive-tick counter (which would
+   need a read-modify-write in the tick's hot path and races two overlapping
+   ticks). `ScheduledNotificationsTickResult` gains `queueOk: boolean` — `true`
+   when phase 1 ran to the end and did not take the systemic branch, so a
+   delivering tick, a mixed or poison batch and an EMPTY claim are all `true`,
+   and the phase boundary's DEFAULT result is `false` so a phase that THREW is
+   not-delivering too. `POST /workers/tick`'s completion line gains the leaf
+   `scheduledQueueOk`, and the route writes Redis `scheduler:queue_ok_at` (an
+   ISO instant, SETEX 24h, the heartbeat's 1s race-with-timeout shape) **only
+   when `queueOk` is true** — the ageing of that key IS the signal.
+   `GET /health/watchdog` reads it in the same `Promise.all` as the other two
+   (one deadline, not three), publishes `queue_ok_at: string | null`, and turns
+   it into a 503 — but **only while the HEARTBEAT is `recorded` and itself
+   fresh**, and then in three shapes (round 3, A3.1–A3.3; the first version of
+   this paragraph described only the middle one and was wrong about the other
+   two):
+   - **stale** — older than `SCHEDULER_STALE_AFTER_MS`, the SAME 10-minute
+     constant as heartbeat staleness, so the system has one "too long" and not
+     two: *"scheduled-notification queue has not delivered for Ns — every
+     claimed row is failing, or phase 1 is throwing (see the phase alarm)"*.
+   - **absent** — its own sentence naming `scheduler:queue_ok_at`, because
+     there is no instant to subtract and reporting a duration this system never
+     measured is the §A4.5 L3 fault. **`absent` is NOT excused the way the
+     parked key's is**, and the analogy that excused it until A3.1 was false:
+     `scheduler:parked_total` is rewritten by every tick that can COUNT, so its
+     absence means "nobody has published one"; this key is written only on
+     HEALTH, so its absence means "nothing healthy has happened since it last
+     expired". Left failing open, the 24h TTL ran to zero under a continuing
+     outage and the monitor emailed "UP / resolved" over an outage still
+     running — worse than the coverage gap A2.1 was built to close. The
+     fresh-deploy carve-out it was excused by survives anyway: before its first
+     tick the heartbeat is absent too and carries the 503 itself.
+   - **future-dated** — the heartbeat's own §A4.4.4 skew branch, applied to
+     this key with the same `CLOCK_SKEW_TOLERANCE_MS`. Pointing at the
+     heartbeat's branch instead (as the code did until A3.2) cannot cover this
+     key: the heartbeat is rewritten on the FAILING path and this one is not,
+     so a clock stepped an hour forward and then corrected leaves this key
+     reading "fresh" for ~70 minutes over a dead queue.
+
+   - **unparseable** — a reason of its own since A4 (iii), naming the
+     corruption and quoting the first 64 characters of the raw value. It does
+     NOT reuse the ABSENT sentence ("ABSENT" is false of a key that is present)
+     and states no duration (there is no instant to subtract). This arm fails
+     **CLOSED**: the same fact is true of a corrupt key as of a missing one —
+     while the scheduler ticks, nothing says phase 1 delivered — and the
+     fail-OPEN arm that stood here until A4 let one corrupt key silently delete
+     a standing queue alarm. The cost is bounded: `recordQueueOk` is an
+     unconditional `SETEX` on every DELIVERING tick, so over a healthy queue the
+     corrupt value is overwritten within one tick and the false 503 lasts at
+     most one tick plus one monitor interval; over a broken queue it stands,
+     which is the point. `queue_ok_at` stays `null` in the body either way.
+
+   `unreadable` still adds no reason on this key — a Redis that cannot be read
+   is unreadable for the HEARTBEAT at the same moment (one client, one
+   `Promise.all`, one deadline), so the gate below is false and the heartbeat's
+   own reason already carries the 503. **The PARKED key's `unparseable` and
+   `unreadable` arms are unchanged and still fail OPEN**, with the named cost
+   recorded there: its reasoning is different — "there are parked rows" about
+   rows it cannot see would be a FALSE sentence, where "there is no valid
+   delivery instant" about a corrupt instant is a true one. And **every queue
+   reason is
+   gated on a ticking scheduler** (A3.3): with no tick running at all (the
+   2026-08-24 rotated-secret fault) both keys age out together, and the queue
+   sentence's second clause — "see the phase alarm" — names a log line that
+   cannot exist, on the endpoint whose purpose is to say what broke. The status
+   code never changes for that gate: whenever it suppresses the queue reason
+   the heartbeat's own reason is already carrying the 503, and a queue that is
+   still broken raises its own reason the moment the scheduler ticks again.
+   No row is parked by this and no attempt is charged: the systemic rule is
+   unchanged and stays the reason an outage self-heals.
+
+   Production DDL **is run by hand BEFORE the deploy** — the new claim filters
+   on `failed_at`, which must exist before the code that reads it boots — from
+   the UMBRELLA repo's
+   `<umbrella>/scripts/db/2026-09-03-scheduled-notifications-parking.sql`
+   (additive, never the drop-and-recreate rebuild). The proof it landed is that
+   file's own verify block (`pg_indexes` predicate +
+   `information_schema.columns` types), pasted; `diff-prod-schema.mjs` compares
+   column NAMES only and is the second check, not the first.
 
 4. **`Booking → schedule rows` trigger (`src/lib/enqueueBookingReminders.ts`).**
    Called from all 4 booking-creation paths (`routes/bookings.ts`
@@ -2604,7 +2763,7 @@ invisible to the repository layer.
 
 **Identity / session**
 
-- `GET /health` [public] · `GET /health/watchdog` [public] — Day-20 scheduler + pager watchdog for an external uptime monitor; 503 on a stale, absent, unparseable, UNREADABLE, or FUTURE-dated tick heartbeat / a failing pager / sustained LOST deliveries / sustained dropped alarms / a tripped pager circuit breaker / no pager in production, each with its own entry in the body's `reasons` array. Deliberately separate from `/health`, which `railway.json` uses as the deploy healthcheck. Not in `wire.ts` (no client generates it) · `POST /auth/webhook` [public, signed] — Supabase "user created" → upsert mirror row
+- `GET /health` [public] · `GET /health/watchdog` [public] — Day-20 scheduler + pager watchdog for an external uptime monitor; 503 on a stale, absent, unparseable, UNREADABLE, or FUTURE-dated tick heartbeat / a failing pager / sustained LOST deliveries / sustained dropped alarms / a tripped pager circuit breaker / no pager in production / PARKED scheduled notifications (2026-09-03, body leaf `parked_total`) / a scheduled-notification QUEUE that has not delivered — STALE for 10 minutes, ABSENT, UNPARSEABLE, or FUTURE-dated (2026-09-03 A2.1 as repaired by A3.1–A3.3 and A4 (iii), body leaf `queue_ok_at` — the systemic branch or a phase-1 throw, neither of which reaches any other condition; all four gated on a heartbeat that is recorded and fresh, because on a STOPPED scheduler the sentence would point at a phase alarm that cannot exist), each with its own entry in the body's `reasons` array. Deliberately separate from `/health`, which `railway.json` uses as the deploy healthcheck. Not in `wire.ts` (no client generates it) · `POST /auth/webhook` [public, signed] — Supabase "user created" → upsert mirror row
 - `GET /me` [auth] — owner|staff profile + mirror row · `PATCH /me` — profile / emergency contact / notification prefs
 
 **Dogs**

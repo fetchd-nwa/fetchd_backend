@@ -1403,9 +1403,12 @@ export const scheduledNotifications = pgTable("scheduled_notifications", {
 	emittedNotificationId: uuid("emitted_notification_id"),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	sentAt: timestamp("sent_at", { withTimezone: true, mode: 'string' }),
+	attempts: integer().default(0).notNull(),
+	lastError: text("last_error"),
+	failedAt: timestamp("failed_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
-		dueIdx: index("scheduled_notifications_due_idx").using("btree", table.scheduledFor.asc().nullsLast().op("timestamptz_ops")).where(sql`(status = 'pending'::scheduled_status)`),
+		dueIdx: index("scheduled_notifications_due_idx").using("btree", table.scheduledFor.asc().nullsLast().op("timestamptz_ops")).where(sql`((status = 'pending'::scheduled_status) AND (failed_at IS NULL))`),
 		scheduledNotificationsOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
