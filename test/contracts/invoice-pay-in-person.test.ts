@@ -6,6 +6,7 @@ import { db } from '../../src/db/client.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import { bookings, invoices, scheduledNotifications } from '../../src/db/schema/schema.js';
+import { bucketToChicagoDate } from '../../src/lib/chicagoDate.js';
 import { pgTimestampToDate } from '../../src/lib/pgTimestamp.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
@@ -337,6 +338,41 @@ test(
   },
 );
 
+const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * A drop-off that lands on TODAY's America/Chicago calendar day — "a couple of
+ * hours from now" whenever the day still has two hours left in it, and as late
+ * today as the time remaining allows when it does not.
+ *
+ * MECHANISM: `dropOffPhrase` (src/routes/invoices.ts:558-563) compares Chicago
+ * CALENDAR DAYS, not elapsed hours. From 22:00 America/Chicago to midnight,
+ * `now + 2h` is the NEXT Chicago day, so the reminder rightly says "tomorrow"
+ * and this test's stated precondition — "the drop-off is later today" — was
+ * simply false: the route was right and the fixture was wrong, so the gate went
+ * red every night for those two hours and green again at midnight. Found by a
+ * 2026-09-08 22:19 gate run (`# pass 10 / # fail 1`); the same bytes with the
+ * JS clock rolled back 6h ran `# pass 11 / # fail 0`.
+ *
+ * Everything stays relative to the real clock. A pinned date literal would buy
+ * the two-hour window back at the price of a permanent bomb — the rot pattern
+ * `fixture-rot.test.ts` exists to catch.
+ */
+function dropOffLaterToday(nowMs: number): Date {
+  const today = bucketToChicagoDate(new Date(nowMs));
+  // Halve the offset until it lands back on today: 2h, 1h, 30m, … Before 22:00
+  // Chicago the first candidate is taken and the shape is exactly the `+2h`
+  // this test has always used; inside the window the drop-off is pulled back to
+  // at worst half the time left in the day, which is still today.
+  for (let offsetMs = TWO_HOURS_MS; offsetMs >= 1; offsetMs = Math.floor(offsetMs / 2)) {
+    const candidate = new Date(nowMs + offsetMs);
+    if (bucketToChicagoDate(candidate) === today) return candidate;
+  }
+  // Only reachable within a millisecond of Chicago midnight; `now` itself is
+  // today by definition, and the assertions below stay true either way.
+  return new Date(nowMs);
+}
+
 test(
   'POST /invoices/:id/pay-in-person — a clamped reminder says "today", never "tomorrow"',
   SKIP_WHEN_NO_DB,
@@ -346,7 +382,7 @@ test(
     // is already past, so the reminder clamps to now and fires TODAY — the
     // common case at a 24h lead, and exactly where a hardcoded "tomorrow" would
     // lie to the owner about which day to bring cash.
-    const dropoffAt = new Date(REAL_NOW_MS + 2 * 60 * 60 * 1000);
+    const dropoffAt = dropOffLaterToday(REAL_NOW_MS);
     const bookingId = await seedBoardTrainBooking({ scheduledAt: dropoffAt, dropoffAt });
     const invoiceId = await seedOpenInvoice({ bookingId });
 
@@ -357,8 +393,35 @@ test(
       db,
       `payment-due:${invoiceId}`,
     );
-    assert.doesNotMatch(scheduled!.body, /tomorrow/, 'must not claim tomorrow for a same-day drop-off');
-    assert.match(scheduled!.body, /drop off today/);
+
+    // "tomorrow" is wrong at EVERY hour, unconditionally: the drop-off is on
+    // today's Chicago day by construction, and `scheduled_for` is the clamp to
+    // the route's own `now`, which is never earlier than ours — so the drop-off
+    // can never fall on a LATER Chicago day than the reminder fires. Catching a
+    // hardcoded "tomorrow" is this test's entire reason to exist; this guard
+    // never weakens with the hour.
+    assert.doesNotMatch(
+      scheduled!.body,
+      /tomorrow/,
+      'must not claim tomorrow — the drop-off is never on a later Chicago day than the reminder',
+    );
+
+    // Which day-word IS true is derived from the two Chicago days, never from
+    // the wall clock this file happens to run at.
+    const fireDay = bucketToChicagoDate(pgTimestampToDate(scheduled!.scheduledFor));
+    const dropDay = bucketToChicagoDate(dropoffAt);
+    if (dropDay === fireDay) {
+      // The case the construction above makes overwhelmingly common, and the
+      // one this test is for.
+      assert.match(scheduled!.body, /drop off today/);
+    } else {
+      // The seconds-wide race only: we built the drop-off just before Chicago
+      // midnight and the route clamped just after it, so the drop-off is now
+      // YESTERDAY and no day-word is true. The route's neutral fallback is the
+      // right answer, and asserting "today" here would be asserting a lie.
+      assert.match(scheduled!.body, /when you drop off\./);
+      assert.doesNotMatch(scheduled!.body, /drop off today/);
+    }
 
     await cleanup([bookingId]);
   },
