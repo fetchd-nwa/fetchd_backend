@@ -12,6 +12,7 @@ import {
   applyStep,
   clientConfig,
   findTransactionControl,
+  maskSql,
   parseStep,
   projectRefOf,
   checkProject,
@@ -113,6 +114,35 @@ describe('R6 — a step may not carry its own transaction control', () => {
     });
   }
 
+  // P02 item 0b (Opus r3 L1; DECISIONS 72): Postgres's dollar-quote tag takes
+  // any byte from \200-\377 (scan.l dolq_start/dolq_cont), so every non-ASCII
+  // character is a tag character. An ASCII-only tag rule read `$é$` as a
+  // parameter plus the identifier `é$`, and the `'` after it opened a "string"
+  // that swallowed the real COMMIT. The five probe variants of
+  // units/P02/evidence/probe-lexer.out, each refused:
+  for (const [label, sql] of [
+    ['a non-ASCII tag $é$ hiding $$', 'SELECT $é$ $$ $é$; COMMIT; SELECT 1;'],
+    ['a tag $aé$ (ASCII start, non-ASCII after)', 'SELECT $aé$ $$ $aé$; COMMIT; SELECT 1;'],
+    ['$é$ with a failing tail', 'SELECT $é$ $$ $é$; COMMIT; SELECT 1/0;'],
+    ["$é$ hiding a ' quote (the brief's probe)", "SELECT $é$ ' $é$; COMMIT; SELECT 'x';"],
+    ['a no-break-space tag $\u00a0$', 'SELECT $\u00a0$ $$ $\u00a0$; COMMIT; SELECT 1;'],
+  ] as const) {
+    test(`a non-ASCII dollar-quote tag is a tag: ${label}`, () => {
+      const parsed = parseStep('M9.01_probe.sql', Buffer.from(sql, 'utf8'));
+      assert.equal(parsed.ok, false, `${label} was accepted`);
+      assert.match(parsed.ok ? '' : parsed.reason, /COMMIT/);
+    });
+  }
+
+  test('a non-ASCII-tagged body still hides what it holds (the widened tag is not a false refusal)', () => {
+    assert.deepEqual(
+      findTransactionControl(
+        'DO $é$ BEGIN PERFORM 1; END $é$;\nCREATE FUNCTION g() RETURNS int AS $aé1$ SELECT 1 $aé1$ LANGUAGE sql;',
+      ),
+      [],
+    );
+  });
+
   test("a real E'…' escape string still hides what it holds, CRLF comments still end at the line", () => {
     assert.deepEqual(
       findTransactionControl("SELECT E'it\\'s; COMMIT;';\r\n-- COMMIT\r\nSELECT 1;"),
@@ -196,6 +226,39 @@ describe('the step file', () => {
     assert.match(parsed.ok ? '' : parsed.reason, /unknown directive/);
   });
 
+  // P02 (M1.19, design.md:2122-2128): the census gate is a header directive,
+  // so it is in the bytes the sha256 covers and production receives.
+  test('`-- migrate: census-empty <table>` names a table that must be empty before the step', () => {
+    const parsed = parseStep(
+      'M9.11_census.sql',
+      Buffer.from('-- migrate: census-empty staff\n-- why\nSELECT 1;\n'),
+    );
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+    assert.deepEqual(parsed.step.censusEmpty, ['staff']);
+    assert.equal(parsed.step.directives.size, 0);
+  });
+
+  test('a census gate needs the runner’s transaction: census-empty with no-transaction is refused', () => {
+    const parsed = parseStep(
+      'M9.12_census.sql',
+      Buffer.from('-- migrate: no-transaction\n-- migrate: census-empty staff\nSELECT 1;\n'),
+    );
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /a census gate needs the runner's transaction/);
+  });
+
+  test('a census gate on something that is not a plain table name is refused', () => {
+    for (const bad of [
+      'census-empty',
+      'census-empty staff; DROP TABLE x',
+      'census-empty "Staff"',
+    ]) {
+      const parsed = parseStep('M9.13_census.sql', Buffer.from(`-- migrate: ${bad}\nSELECT 1;\n`));
+      assert.equal(parsed.ok, false, bad);
+      assert.match(parsed.ok ? '' : parsed.reason, /census-empty takes one plain table name/, bad);
+    }
+  });
+
   test('a directive below the header is refused rather than ignored', () => {
     const parsed = parseStep(
       'M9.01_probe.sql',
@@ -203,6 +266,31 @@ describe('the step file', () => {
     );
     assert.equal(parsed.ok, false);
     assert.match(parsed.ok ? '' : parsed.reason, /header/);
+  });
+
+  // P02 fix round 1 (adversary nice N1): a near-miss of the directive form
+  // must not be read as a plain comment — a census gate that silently
+  // switches off is P01's "misspelt no-transaction" again. Fail closed.
+  test('a near-miss of `-- migrate: <directive>` is refused, never dropped as a comment', () => {
+    for (const header of [
+      '-- migrate: census-empy staff',
+      '-- Migrate: census-empty staff',
+      '-- migrate : census-empty staff',
+      '--MIGRATE: no-transaction',
+      '/* migrate: census-empty staff */',
+    ]) {
+      const parsed = parseStep('M9.14_probe.sql', Buffer.from(`${header}\nSELECT 1;\n`));
+      assert.equal(parsed.ok, false, header);
+    }
+  });
+
+  test('lone-CR line endings: the header is read line by line and the directive holds', () => {
+    const parsed = parseStep(
+      'M9.15_cr.sql',
+      Buffer.from('-- migrate: census-empty staff\r-- why\rSELECT 1;\r'),
+    );
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+    assert.deepEqual(parsed.step.censusEmpty, ['staff']);
   });
 
   test('every committed LG1 step file parses', () => {
@@ -429,6 +517,7 @@ describe('applying steps to a throwaway database', NO_DB, () => {
       sql,
       sha256: createHash('sha256').update(bytes).digest('hex'),
       directives: new Set(),
+      censusEmpty: [],
     };
     const result = await applyStep(client, smuggled, { appliedBy: 'test' });
     assert.equal(result.ok, false, 'a mid-step commit was logged as a whole step');
@@ -453,6 +542,7 @@ describe('applying steps to a throwaway database', NO_DB, () => {
       sql,
       sha256: createHash('sha256').update(bytes).digest('hex'),
       directives: new Set(),
+      censusEmpty: [],
     };
   }
 
@@ -595,6 +685,199 @@ describe('applying steps to a throwaway database', NO_DB, () => {
   });
 });
 
+// ── M1.19's census gate and its cast (STAFF-U02; design.md:2122-2128, :6150) ──
+
+describe('M1.19 — the census gate and the role cast, on a throwaway database', NO_DB, () => {
+  const dbName = `migrate_census_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+  let scratchUrl = '';
+  let client: pg.Client;
+  const M119 = path.join(LG1, 'M1.19_staff_role_rebuild.sql');
+
+  /** The pre-M1.19 shape of what M1.19 touches: the old enum and a staff table. */
+  const BEFORE = `
+    CREATE TABLE migrations_applied (step_id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now(), applied_by text NOT NULL, sql_sha256 text NOT NULL);
+    CREATE TYPE staff_role AS ENUM ('owner-shanthi', 'trainer', 'office');
+    CREATE TABLE staff (id serial PRIMARY KEY, name text NOT NULL, role staff_role NOT NULL);`;
+
+  async function reset(rows: Array<[string, string]>): Promise<void> {
+    await client.query(
+      'DROP TABLE IF EXISTS staff; DROP TABLE IF EXISTS migrations_applied; DROP TYPE IF EXISTS staff_role; DROP TYPE IF EXISTS staff_role_v2;',
+    );
+    await client.query(BEFORE);
+    for (const [name, role] of rows) {
+      await client.query('INSERT INTO staff (name, role) VALUES ($1, $2)', [name, role]);
+    }
+  }
+
+  async function enumLabels(): Promise<string[]> {
+    const { rows } = await client.query<{ label: string }>(
+      "SELECT e.enumlabel AS label FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'staff_role' ORDER BY e.enumsortorder",
+    );
+    return rows.map((r) => r.label);
+  }
+
+  function m119(): StepFile {
+    const parsed = parseStep(path.basename(M119), fs.readFileSync(M119));
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+    return parsed.step;
+  }
+
+  before(async () => {
+    const admin = new pg.Client({ connectionString: ADMIN_URL });
+    await admin.connect();
+    await admin.query(`CREATE DATABASE ${dbName}`);
+    await admin.end();
+    const url = new URL(ADMIN_URL as string);
+    url.pathname = `/${dbName}`;
+    scratchUrl = url.toString();
+    client = new pg.Client({ connectionString: scratchUrl });
+    await client.connect();
+  });
+
+  after(async () => {
+    await client?.end();
+    const admin = new pg.Client({ connectionString: ADMIN_URL });
+    await admin.connect();
+    await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
+    await admin.end();
+  });
+
+  test('the committed M1.19 declares the census gate on staff', () => {
+    assert.deepEqual(m119().censusEmpty, ['staff']);
+  });
+
+  test('a staff row present → the runner stops before the step: nothing cast, nothing logged', async () => {
+    await reset([['Shanthi', 'owner-shanthi']]);
+    const result = await applyStep(client, m119(), { appliedBy: 'test' });
+    assert.equal(result.ok, false, 'M1.19 ran over a staff row');
+    assert.equal(result.ok ? undefined : result.committed, false);
+    assert.match(result.ok ? '' : result.reason, /census/i);
+    assert.match(result.ok ? '' : result.reason, /staff holds 1 row/);
+    assert.deepEqual(await enumLabels(), ['owner-shanthi', 'trainer', 'office']);
+    const logged = await client.query('SELECT count(*)::int AS n FROM migrations_applied');
+    assert.equal(logged.rows[0].n, 0);
+  });
+
+  test('an empty staff table → the enum is rebuilt as owner, manager, trainer and the step is logged', async () => {
+    await reset([]);
+    const result = await applyStep(client, m119(), { appliedBy: 'test' });
+    assert.ok(result.ok, result.ok ? '' : result.reason);
+    assert.deepEqual(await enumLabels(), ['owner', 'manager', 'trainer']);
+    const types = await client.query(
+      "SELECT count(*)::int AS n FROM pg_type WHERE typname IN ('staff_role_v2', '_staff_role_v2')",
+    );
+    assert.equal(types.rows[0].n, 0, 'the v2 name (or its array type) survived the rename');
+  });
+
+  test('dev waives the census (skipCensus) and takes the CASE cast: owner-shanthi → owner, trainer → trainer', async () => {
+    await reset([
+      ['Shanthi', 'owner-shanthi'],
+      ['Fed', 'trainer'],
+    ]);
+    const result = await applyStep(client, m119(), { appliedBy: 'test', skipCensus: ['staff'] });
+    assert.ok(result.ok, result.ok ? '' : result.reason);
+    const { rows } = await client.query('SELECT name, role::text AS role FROM staff ORDER BY name');
+    assert.deepEqual(rows, [
+      { name: 'Fed', role: 'trainer' },
+      { name: 'Shanthi', role: 'owner' },
+    ]);
+  });
+
+  test("a live 'office' row aborts the cast, and the step rolls back whole (map it by hand first)", async () => {
+    await reset([
+      ['Shanthi', 'owner-shanthi'],
+      ['Desk', 'office'],
+    ]);
+    const result = await applyStep(client, m119(), { appliedBy: 'test', skipCensus: ['staff'] });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? undefined : result.committed, false);
+    assert.deepEqual(await enumLabels(), ['owner-shanthi', 'trainer', 'office']);
+    const v2 = await client.query("SELECT to_regtype('staff_role_v2') AS t");
+    assert.equal(v2.rows[0].t, null, 'the new type survived the rollback');
+  });
+
+  test('a census waiver that names no gate of the step is refused (a typo must not pass silently)', async () => {
+    await reset([['Shanthi', 'owner-shanthi']]);
+    const result = await applyStep(client, m119(), { appliedBy: 'test', skipCensus: ['staf'] });
+    assert.equal(result.ok, false);
+    assert.match(result.ok ? '' : result.reason, /staf/);
+    assert.deepEqual(await enumLabels(), ['owner-shanthi', 'trainer', 'office']);
+  });
+
+  // Adversary nice N4: every authenticated request reads `staff`; behind a long
+  // or idle transaction the census lock must not queue all of them for as
+  // long as it waits.
+  test('the census lock waits a few seconds at most (lock_timeout), then the step rolls back whole', async () => {
+    await reset([]);
+    const holder = new pg.Client({ connectionString: scratchUrl });
+    await holder.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT count(*) FROM staff'); // ACCESS SHARE, held until ROLLBACK
+      const release = setTimeout(
+        () => void holder.query('ROLLBACK').catch(() => undefined),
+        10_000,
+      );
+      const started = Date.now();
+      const result = await applyStep(client, m119(), { appliedBy: 'test' });
+      const waited = Date.now() - started;
+      clearTimeout(release);
+      assert.equal(result.ok, false, `the step waited ${waited} ms for the lock and ran`);
+      assert.equal(result.ok ? undefined : result.committed, false);
+      assert.match(result.ok ? '' : result.reason, /lock timeout/);
+      assert.ok(waited < 9_000, `waited ${waited} ms`);
+      assert.deepEqual(await enumLabels(), ['owner-shanthi', 'trainer', 'office']);
+    } finally {
+      await holder.query('ROLLBACK').catch(() => undefined);
+      await holder.end();
+    }
+  });
+
+  test('the CLI refuses --skip-census for any project but local, before connecting', () => {
+    const run = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/migrate-apply.ts',
+        M119,
+        '--url',
+        'postgresql://postgres:pw@db.abcdefghijklmnop.supabase.co:5432/postgres',
+        '--project',
+        'abcdefghijklmnop',
+        '--skip-census',
+        'staff',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8', env: { PATH: process.env.PATH ?? '' } },
+    );
+    assert.equal(run.status, 2, run.stdout + run.stderr);
+    assert.match(run.stderr, /--skip-census.*local/);
+  });
+
+  test('the CLI with --skip-census on local applies M1.19 over a seeded roster (the dev path)', async () => {
+    await reset([['Shanthi', 'owner-shanthi']]);
+    const run = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        'scripts/migrate-apply.ts',
+        M119,
+        '--url',
+        scratchUrl,
+        '--project',
+        'local',
+        '--skip-census',
+        'staff',
+      ],
+      { cwd: REPO_ROOT, encoding: 'utf-8', env: { PATH: process.env.PATH ?? '' } },
+    );
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, /census\s+SKIPPED: staff/);
+    assert.deepEqual(await enumLabels(), ['owner', 'manager', 'trainer']);
+  });
+});
+
 // ── the per-table REVOKE, every step file (DECISIONS 71; adversary r2 M3) ─────
 
 /**
@@ -605,36 +888,124 @@ describe('applying steps to a throwaway database', NO_DB, () => {
  * table closed — and the rehearsal, which replays per-schema defaults, cannot
  * see it go missing. So it is checked here, statically.
  *
+ * It reads SQL, not text (P02 item 0c; DECISIONS 72), through the runner's own
+ * lexer (`maskSql`), with two masks of each file that align offset for offset:
+ *
+ *   - the CREATEs are found with comments blanked and everything else kept —
+ *     a `CREATE TABLE` in a string or a `DO` body (`EXECUTE '…'`) still counts,
+ *     because over-reading a create costs a rewrite and under-reading one
+ *     leaves a table open;
+ *   - the REVOKEs are found with comments, strings, quoted identifiers and
+ *     dollar bodies blanked, so a REVOKE inside a comment, a string, a quoted
+ *     name or a function body does not count (a REVOKE written straight into a
+ *     `DO` body is real but is not credited either — write it at the top
+ *     level); each one found is then read, at the same offsets, from a mask
+ *     that keeps quoted identifiers, so a quoted table name still matches.
+ *
+ * A create is `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] [<schema>.]<name>`,
+ * quoted or bare; `public.x` is the table `x` (an unqualified name is
+ * public's), a bare name folds to lower case and a quoted one keeps its case.
+ * A revoke is `REVOKE ALL [PRIVILEGES] ON [TABLE] <list> FROM <grantees>` whose
+ * list names the table and whose grantees include both anon and authenticated.
+ *
+ * An EMPTY tree is refused, not passed: a check that finds no step file proves
+ * nothing, and `MIGRATIONS_DIR` pointing at the wrong place must go red.
+ *
  * `MIGRATIONS_DIR` points the check at another tree: that is how it is proven
  * red, on a scratch copy, so a mutant never sits in `migrations/`.
  */
+const NAME = String.raw`(?:"(?:[^"]|"")+"|[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*)`;
+const QUALIFIED = String.raw`${NAME}(?:\s*\.\s*${NAME})?`;
+const CREATE_TABLE = new RegExp(
+  String.raw`\bCREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(${QUALIFIED})`,
+  'gi',
+);
+const REVOKE_ALL =
+  /\bREVOKE\s+ALL(?:\s+PRIVILEGES)?\s+ON\s+(?:TABLE\s+)?([^;]*?)\s+FROM\s+([^;]*?)\s*;/gi;
+/** The same statement, read whole: its bounds come from the masked match, and
+ *  a quoted name inside it may hold a `;`. */
+const REVOKE_PARTS =
+  /^REVOKE\s+ALL(?:\s+PRIVILEGES)?\s+ON\s+(?:TABLE\s+)?([\s\S]*?)\s+FROM\s+([\s\S]*?)\s*;$/i;
+
+/** One identifier as Postgres reads it: a quoted one verbatim, a bare one folded. */
+function identifier(raw: string): string {
+  return raw.startsWith('"') ? raw.slice(1, -1).replaceAll('""', '"') : raw.toLowerCase();
+}
+
+/** `[schema.]name` → `schema.name`, with an unqualified name in public. */
+function qualifiedName(raw: string): string {
+  const parts = [...raw.matchAll(new RegExp(NAME, 'g'))].map((m) => identifier(m[0]));
+  return parts.length === 2 ? `${parts[0]}.${parts[1]}` : `public.${parts[0]}`;
+}
+
+/** The comma-separated names of a list, commas inside quotes kept. */
+function listNames(raw: string): string[] {
+  return [...raw.matchAll(new RegExp(QUALIFIED, 'g'))].map((m) => qualifiedName(m[0]));
+}
+
+function stepFiles(dir: string): string[] {
+  return fs
+    .readdirSync(dir, { withFileTypes: true })
+    .flatMap((d) =>
+      d.isDirectory()
+        ? stepFiles(path.join(dir, d.name))
+        : d.name.endsWith('.sql')
+          ? [path.join(dir, d.name)]
+          : [],
+    );
+}
+
 function tablesMissingTheirRevoke(root: string): string[] {
+  const files = stepFiles(root);
+  if (files.length === 0) {
+    throw new Error(`no step file under ${root}: an empty tree proves nothing (MIGRATIONS_DIR?)`);
+  }
   const missing: string[] = [];
-  const walk = (dir: string): string[] =>
-    fs
-      .readdirSync(dir, { withFileTypes: true })
-      .flatMap((d) =>
-        d.isDirectory()
-          ? walk(path.join(dir, d.name))
-          : d.name.endsWith('.sql')
-            ? [path.join(dir, d.name)]
-            : [],
+  for (const file of files) {
+    const sql = fs.readFileSync(file, 'utf8');
+    const creates = maskSql(sql, {
+      comments: true,
+      strings: false,
+      quotedIdentifiers: false,
+      dollarBodies: false,
+    });
+    const code = maskSql(sql, {
+      comments: true,
+      strings: true,
+      quotedIdentifiers: false,
+      dollarBodies: true,
+    });
+    const revokes = [...maskSql(sql).matchAll(REVOKE_ALL)].flatMap((m) => {
+      const at = m.index ?? 0;
+      const parts = REVOKE_PARTS.exec(code.slice(at, at + m[0].length));
+      if (parts === null) return [];
+      return [
+        {
+          at,
+          tables: new Set(listNames(parts[1] as string)),
+          grantees: new Set(
+            (parts[2] as string)
+              .replace(/\s+(CASCADE|RESTRICT)\s*$/i, '')
+              .split(',')
+              .map((g) => identifier(g.trim())),
+          ),
+        },
+      ];
+    });
+    for (const create of creates.matchAll(CREATE_TABLE)) {
+      const table = qualifiedName(create[1] as string);
+      const end = (create.index ?? 0) + create[0].length;
+      const revoked = revokes.some(
+        (r) =>
+          r.at >= end &&
+          r.tables.has(table) &&
+          r.grantees.has('anon') &&
+          r.grantees.has('authenticated'),
       );
-  for (const file of walk(root)) {
-    const sql = fs
-      .readFileSync(file, 'utf8')
-      .replace(/--[^\r\n]*/g, '') // comments may mention either statement
-      .replace(/\s+/g, ' ');
-    for (const create of sql.matchAll(
-      /CREATE TABLE (?:IF NOT EXISTS )?("?[A-Za-z_][A-Za-z0-9_]*"?)/gi,
-    )) {
-      const table = (create[1] as string).replaceAll('"', '');
-      const after = sql.slice((create.index ?? 0) + create[0].length);
-      const revoke = new RegExp(
-        `REVOKE ALL ON (?:TABLE )?"?${table}"? FROM anon, ?authenticated\\s*;`,
-        'i',
-      );
-      if (!revoke.test(after)) missing.push(`${path.relative(root, file)}: ${table}`);
+      if (!revoked) {
+        const shown = table.startsWith('public.') ? table.slice('public.'.length) : table;
+        missing.push(`${path.relative(root, file)}: ${shown}`);
+      }
     }
   }
   return missing;
@@ -643,9 +1014,100 @@ function tablesMissingTheirRevoke(root: string): string[] {
 describe('every CREATE TABLE in a step file is followed by its REVOKE (DECISIONS 71)', () => {
   test('the step files under test', () => {
     const root = process.env.MIGRATIONS_DIR ?? path.join(REPO_ROOT, 'migrations');
-    const files = fs.readdirSync(path.join(REPO_ROOT, 'migrations', 'lg1'));
-    assert.ok(files.length > 0);
     assert.deepEqual(tablesMissingTheirRevoke(root), []);
+  });
+
+  // P02 item 0c (Opus r3 L2, Fable r3 L3; DECISIONS 72): the check reads SQL,
+  // not text. Each case is a one-file scratch tree.
+  function scratchTree(files: Record<string, string>): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'revoke-case-'));
+    for (const [name, sql] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), sql);
+    return dir;
+  }
+  function missingIn(files: Record<string, string>): string[] {
+    const dir = scratchTree(files);
+    try {
+      return tablesMissingTheirRevoke(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('a REVOKE inside a block comment or a string does not count', () => {
+    assert.deepEqual(
+      missingIn({
+        'M9.01_a.sql':
+          'CREATE TABLE a (x int);\n/* REVOKE ALL ON a FROM anon, authenticated; */\nSELECT 1;\n',
+      }),
+      ['M9.01_a.sql: a'],
+    );
+    assert.deepEqual(
+      missingIn({
+        'M9.01_b.sql':
+          "CREATE TABLE b (x int);\nCOMMENT ON TABLE b IS 'REVOKE ALL ON b FROM anon, authenticated;';\n",
+      }),
+      ['M9.01_b.sql: b'],
+    );
+  });
+
+  test('CREATE UNLOGGED TABLE and CREATE TABLE IF NOT EXISTS are tables too', () => {
+    assert.deepEqual(missingIn({ 'M9.01_c.sql': 'CREATE UNLOGGED TABLE c (x int);\n' }), [
+      'M9.01_c.sql: c',
+    ]);
+    assert.deepEqual(
+      missingIn({ 'M9.01_d.sql': 'CREATE UNLOGGED TABLE IF NOT EXISTS d (x int);\n' }),
+      ['M9.01_d.sql: d'],
+    );
+  });
+
+  test('public.x is the table x, not a table named "public"; a quoted name keeps its case', () => {
+    assert.deepEqual(
+      missingIn({
+        'M9.01_e.sql':
+          'CREATE TABLE public.e (x int);\nREVOKE ALL ON public.e FROM anon, authenticated;\n',
+      }),
+      [],
+    );
+    assert.deepEqual(
+      missingIn({
+        'M9.01_f.sql':
+          'CREATE TABLE public.f (x int);\nREVOKE ALL ON f FROM anon, authenticated;\n',
+      }),
+      [],
+    );
+    assert.deepEqual(
+      missingIn({ 'M9.01_g.sql': 'CREATE TABLE IF NOT EXISTS public."Gee" (x int);\n' }),
+      ['M9.01_g.sql: Gee'],
+    );
+  });
+
+  // Adversary nice N2: a REVOKE spelled inside a quoted identifier is a name,
+  // not a statement.
+  test('a REVOKE inside a quoted identifier does not count', () => {
+    assert.deepEqual(
+      missingIn({
+        'M9.01_h.sql':
+          'CREATE TABLE h (x int, "x; REVOKE ALL ON h FROM anon, authenticated;" int);\n',
+      }),
+      ['M9.01_h.sql: h'],
+    );
+    // A quoted name in a real REVOKE is still read.
+    assert.deepEqual(
+      missingIn({
+        'M9.01_i.sql':
+          'CREATE TABLE "Eye" (x int);\nREVOKE ALL ON "Eye" FROM "anon", authenticated;\n',
+      }),
+      [],
+    );
+  });
+
+  test('an empty MIGRATIONS_DIR tree is refused, not passed vacuously', () => {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'revoke-empty-'));
+    try {
+      assert.throws(() => tablesMissingTheirRevoke(empty), /no step file/);
+    } finally {
+      fs.rmSync(empty, { recursive: true, force: true });
+    }
   });
 
   test('the check goes red on a scratch copy with one REVOKE deleted (the mutant never sits in migrations/)', () => {

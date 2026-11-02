@@ -9,6 +9,7 @@ import { registerStaffCancelWindowRoute } from '../../src/routes/staffCancelWind
 import { futureWeekday, FIXTURE_IDS, FIXTURE_NOW, topUpCredits } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
+  FIXTURE_MANAGER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
@@ -29,7 +30,9 @@ registerFixtureHooks();
 
 const ONE_HOUR_MS = 3_600_000;
 
-function staffApp(principal = FIXTURE_STAFF_PRINCIPAL): {
+// The manager by default (P02): the PATCH is owner and manager since STAFF-U07;
+// the trainer's 403 and its read are pinned at the end of the file.
+function staffApp(principal = FIXTURE_MANAGER_PRINCIPAL): {
   app: ReturnType<typeof makeContractApp>['app'];
 } {
   const { app, authenticate } = makeContractApp(principal);
@@ -113,7 +116,7 @@ test(
     };
     assert.equal(body.category, 'boarding');
     assert.equal(body.hours_before, 96);
-    assert.equal(body.updated_by_staff_id, FIXTURE_IDS.staffDonavanId);
+    assert.equal(body.updated_by_staff_id, FIXTURE_IDS.staffAmberId);
 
     // DB-side confirmation: other categories are unchanged.
     const allRows = await db.select().from(cancelWindowSettings);
@@ -248,3 +251,50 @@ test('PATCH /staff/cancel-window/:category — unknown category → 400', SKIP_W
   });
   assert.equal(res.statusCode, 400, res.body);
 });
+
+// STAFF-U07 (design §2.1:2080-2086): PATCH /staff/cancel-window/:category is
+// requireStaffRole('owner', 'manager') whole — the window is money policy.
+
+test(
+  'STAFF-U07: the trainer is refused PATCH /staff/cancel-window/:category — 403, nothing written',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await resetCancelWindowSettings();
+    const { app } = staffApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/staff/cancel-window/boarding',
+      headers: { 'idempotency-key': `pcw-trainer-${randomUUID()}` },
+      payload: { hours_before: 1 },
+    });
+    assert.equal(res.statusCode, 403, res.body);
+    assert.equal(res.json().error.code, 'forbidden');
+    const [row] = await db
+      .select()
+      .from(cancelWindowSettings)
+      .where(eq(cancelWindowSettings.category, 'boarding'));
+    assert.equal(row?.hoursBefore, 48, 'the refused PATCH wrote');
+  },
+);
+
+test(
+  'STAFF-U07: the trainer still reads GET /staff/cancel-window; the manager edits it',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await resetCancelWindowSettings();
+    const read = await staffApp(FIXTURE_STAFF_PRINCIPAL).app.inject({
+      method: 'GET',
+      url: '/staff/cancel-window',
+    });
+    assert.equal(read.statusCode, 200, read.body);
+    const edit = await staffApp(FIXTURE_MANAGER_PRINCIPAL).app.inject({
+      method: 'PATCH',
+      url: '/staff/cancel-window/boarding',
+      headers: { 'idempotency-key': `pcw-manager-${randomUUID()}` },
+      payload: { hours_before: 72 },
+    });
+    assert.equal(edit.statusCode, 200, edit.body);
+    assert.equal(edit.json().updated_by_staff_id, FIXTURE_IDS.staffAmberId);
+    await resetCancelWindowSettings();
+  },
+);

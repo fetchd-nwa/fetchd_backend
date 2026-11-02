@@ -33,7 +33,8 @@ export const serviceCategory = pgEnum("service_category", ['day-school', 'day-ca
 // Δ 2026-07-14: where a PRIVATE LESSON happens — owner-picked at request time,
 // copied onto the booking at approve. NULL on every other category.
 export const lessonSetting = pgEnum("lesson_setting", ['home', 'public'])
-export const staffRole = pgEnum("staff_role", ['owner-shanthi', 'trainer', 'office'])
+// M1.19 (STAFF-U02): rebuilt from ['owner-shanthi', 'trainer', 'office'].
+export const staffRole = pgEnum("staff_role", ['owner', 'manager', 'trainer'])
 export const threadCategory = pgEnum("thread_category", ['sessions', 'billing', 'enrollment', 'other'])
 
 
@@ -91,19 +92,15 @@ export const staff = pgTable("staff", {
 	supabaseUid: uuid("supabase_uid").notNull(),
 	name: text().notNull(),
 	role: staffRole().notNull(),
-	location: text().$type<LocationKey>(),
 	imagePath: text("image_path"),
-	active: boolean().default(true).notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	// M1.20 (STAFF-U03): a non-empty set of locations.slug (no FK on an array).
+	homeLocations: text("home_locations").array().$type<LocationKey[]>().notNull(),
 }, (table) => {
 	return {
-		staffLocationFkey: foreignKey({
-			columns: [table.location],
-			foreignColumns: [locations.slug],
-			name: "staff_location_fkey"
-		}),
 		staffSupabaseUidKey: unique("staff_supabase_uid_key").on(table.supabaseUid),
+		staffHomeLocationsCheck: check("staff_home_locations_check", sql`cardinality(home_locations) > 0`),
 	}
 });
 
@@ -1048,6 +1045,27 @@ export const vaccineSettings = pgTable("vaccine_settings", {
 			columns: [table.updatedByStaffId],
 			foreignColumns: [staff.id],
 			name: "vaccine_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+	}
+});
+
+// M1.21 (P02): the staff settings domain — five role lists and the idle minutes.
+export const staffSettings = pgTable("staff_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	refundRoles: staffRole("refund_roles").array().notNull(),
+	creditHandEditRoles: staffRole("credit_hand_edit_roles").array().notNull(),
+	deskSaleRoles: staffRole("desk_sale_roles").array().notNull(),
+	customInvoiceRoles: staffRole("custom_invoice_roles").array().notNull(),
+	cashDayTotalsRoles: staffRole("cash_day_totals_roles").array().notNull(),
+	portalIdleSignoutMinutes: integer("portal_idle_signout_minutes").default(30).notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		staffSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "staff_settings_updated_by_staff_id_fkey"
 		}).onDelete("set null"),
 	}
 });

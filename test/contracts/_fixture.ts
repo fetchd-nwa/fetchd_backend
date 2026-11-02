@@ -94,6 +94,12 @@ export const FIXTURE_IDS = {
   staffDonavanId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
   staffRachelSupabaseUid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2',
   staffRachelId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3',
+  // P02 (STAFF-U02, design §2.1:1961-1968): Amber, the manager, and Shanthi,
+  // the owner role, so a role-gated route is tested on a real row of each role.
+  staffAmberSupabaseUid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4',
+  staffAmberId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5',
+  staffShanthiSupabaseUid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6',
+  staffShanthiId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa7',
   paymentMethod1Id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1',
   // Day-14: Stripe customer mapping for the fixture owner. Required by the
   // POST /credit-packages/:key/purchase route's `loadPurchaseContext` step
@@ -483,23 +489,40 @@ export async function seedFixture(): Promise<void> {
   // Staff trainers — used by bookings' trainer_staff_id resolution. Two
   // staff so the contract tests exercise the inArray(staff.id, [...]) join
   // with >1 ids; one per real NWA role pattern (Donavan = day school,
-  // Rachel = private lessons).
+  // Rachel = private lessons). P02 (design §2.1:1950-1968): Amber is the
+  // manager and Shanthi the owner role, home to BOTH campuses (M1.20's
+  // backfill would give her one; `home_locations` is never empty).
   await db.insert(staff).values([
     {
       id: FIXTURE_IDS.staffDonavanId,
       supabaseUid: FIXTURE_IDS.staffDonavanSupabaseUid,
       name: 'Donavan',
       role: 'trainer',
-      location: 'fayetteville',
+      homeLocations: ['fayetteville'],
       imagePath: null,
-      active: true,
     },
     {
       id: FIXTURE_IDS.staffRachelId,
       supabaseUid: FIXTURE_IDS.staffRachelSupabaseUid,
       name: 'Rachel',
       role: 'trainer',
-      location: 'fayetteville',
+      homeLocations: ['fayetteville'],
+      imagePath: null,
+    },
+    {
+      id: FIXTURE_IDS.staffAmberId,
+      supabaseUid: FIXTURE_IDS.staffAmberSupabaseUid,
+      name: 'Amber',
+      role: 'manager',
+      homeLocations: ['bentonville'],
+      imagePath: null,
+    },
+    {
+      id: FIXTURE_IDS.staffShanthiId,
+      supabaseUid: FIXTURE_IDS.staffShanthiSupabaseUid,
+      name: 'Shanthi',
+      role: 'owner',
+      homeLocations: ['fayetteville', 'bentonville'],
       imagePath: null,
     },
   ]);
@@ -1861,6 +1884,8 @@ export async function teardownFixture(): Promise<void> {
   // robust to re-seeding mid-run.
   await db.delete(staff).where(eq(staff.id, FIXTURE_IDS.staffDonavanId));
   await db.delete(staff).where(eq(staff.id, FIXTURE_IDS.staffRachelId));
+  await db.delete(staff).where(eq(staff.id, FIXTURE_IDS.staffAmberId));
+  await db.delete(staff).where(eq(staff.id, FIXTURE_IDS.staffShanthiId));
 }
 
 /**

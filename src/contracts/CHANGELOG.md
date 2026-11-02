@@ -12,6 +12,94 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [2.0.0-lg1.2] — 2026-11-02
+
+BREAKING. LG1 step 2 of 3 toward 2.0.0 (plan unit P02, slice S02, ledger
+STAFF-U02, STAFF-U03, STAFF-U07, ACCT-U05; migrations M1.19–M1.21; design §1.1
+2.0.0, `designs/fetchd-v1-technical-design.md:598-605`, `:685-709`, `:720-721`).
+It types 2.0.0's whole breaking half: the rebuilt staff roles, the staff
+`/me` shape, and the `staff` settings domain that P01 left out (build
+DECISIONS 47). It also documents the trainer's 403 on the four legacy money
+editors and the expired staffer's 403. Contract-first: no route emits the new
+shapes until P02's backend lands M1.19–M1.21 and STAFF-U07. A 2.0.0-lg1.1
+client that reads `StaffMeWire.location` or `.active`, or matches on
+`'owner-shanthi'` / `'office'`, breaks. Resync both clients (`npm run
+sync:contracts` in mobile and portal). Both typecheck unchanged against the
+resynced copy (a scratch run, not their gates): the mobile role mapper takes
+`role: string`, and the portal imports nothing from `contracts.ts`.
+
+Breaking:
+
+- `StaffRole` `'owner-shanthi' | 'trainer' | 'office'` → `'owner' | 'manager' |
+  'trainer'`, in the rebuilt `staff_role` pgEnum's order (M1.19; STAFF-U02).
+  It types `StaffMeWire.role`, `ThreadParticipantWire.role` and the five lists
+  of `StaffSettingsWire`. `conformance.ts:83` stays red until the Drizzle
+  `pgEnum` is rebuilt in the same backend commit. No value tuple exists and
+  none is added.
+- `StaffMeWire.location: LocationDisplay | null` → `home_locations:
+  LocationDisplay[]`, display labels, never empty, held by M1.20's
+  `CHECK (cardinality(home_locations) > 0)` (STAFF-U03, E67). Descriptive
+  only: no route refuses a staffer outside her home campuses (STAFF-71).
+
+Added:
+
+- `StaffMeWire.capabilities: StaffCapabilitiesWire`, nine booleans computed
+  server-side on each `GET /me`: `edit_prices` (false for every role in v1,
+  q27 → (a)), `edit_money_policy`, `open_money_reports`,
+  `open_payment_history` (owner and manager), `refund_money`, `edit_credits`,
+  `custom_invoice`, `desk_sale`, `cash_day_totals` (owner, or a role on the
+  matching `staff_settings` list; `refund_money` also for every role while
+  `pay.refund_any_role_limit_cents` > 0). Each flag's rule is on its doc
+  comment. No `refund_over_limit` (never built, §1.1:729-731) (STAFF-U07).
+- `StaffSettingsWire` (M1.21): `refund_roles`, `credit_hand_edit_roles`,
+  `desk_sale_roles`, `custom_invoice_roles`, `cash_day_totals_roles:
+  StaffRole[]` and `portal_idle_signout_minutes: number` (1..60), plus the
+  audit pair. Seeds `{owner, manager}`, `{owner, manager}`, `{owner, manager,
+  trainer}`, `{owner, manager}`, `{owner, manager, trainer}`, 30. Served on
+  `GET/PATCH /staff/settings/staff`. Every key is `roles` class (owner only).
+  The PATCH body is `Partial<Omit<StaffSettingsWire, SettingsAuditKey>>`.
+  A role list that is empty is 422 `invalid_payload`; one holding an unknown
+  or a repeated role is 400 `bad_request` (build DECISIONS 59).
+- `'staff'` APPENDED to `SettingsDomain` and `SETTINGS_DOMAINS` (after `'vax'`,
+  never inserted) and to `SettingsWireByDomain` and `SettingsPatchByDomain`.
+  That makes fourteen domains, §1.1's count. The §16 key-set pins hold: a
+  mutant with `'staff'` in the tuple but missing from one map fails `tsc`
+  (TS2344 at the pin, both maps tried).
+
+Changed (doc only):
+
+- `ApiErrorCode`: 403 `not_provisioned` is documented for every staff route
+  when the bearer's `staff.expired_at` is set (existing behavior,
+  `auth/plugin.ts:115-121`, `auth/mirror.ts:33`; §1.1:720-721). The portal
+  signs out on it.
+- `POST /staff/rates` (`PostStaffRatesRequest`), `POST /staff/rates/:id/void`
+  (`StaffRateWire`), `PATCH /staff/cancel-window/:category`
+  (`PatchStaffCancelWindowRequest`, `CancelWindowSettingWire`) and `POST
+  /staff/credit-expiry-settings` (`PostStaffCreditExpiryRequest`) now
+  document 403 `forbidden` for the trainer. Each route is
+  `requireStaffRole('owner', 'manager')` whole (§1.1:706-709; §2.1:2080-2094).
+- `StaffMeWire`'s NOTE-35 freeze note and DRIFT-43 note are rewritten. The
+  "no per-`StaffRole` authorization gating" note is replaced by
+  `StaffCapabilitiesWire`'s doc.
+- Settings section header, the `SettingsDomain` doc and the §16 comment now
+  say fourteen domains.
+- `PaymentSettingValueByKey.refund_any_role_limit_cents`: editable by the owner
+  and the manager again (`money` class, design §3.7), reverting 2.0.0-lg1.1's
+  owner-only note. Allison's 11-02 answer, "Shanthi or Amber" (build
+  DECISIONS 73).
+- `WIRE_CONTRACT_VERSION` `'2.0.0-lg1.1'` → `'2.0.0-lg1.2'`.
+
+Removed:
+
+- `StaffMeWire.active` (with `staff.active`, M1.20; question 34). Sign-in reads
+  `expired_at` only, so an expired staffer gets 403 `not_provisioned` and
+  never this shape.
+- `StaffMeWire.location` (replaced by `home_locations`, above).
+- `StaffRole` members `'owner-shanthi'` and `'office'`.
+
+Not typed here: invoices, payments, payment-methods and `GET /staff/owners`
+(P03, LG1 step 3), and nothing from design 3.0.0 or later.
+
 ## [2.0.0-lg1.1] — 2026-11-02
 
 Additive. LG1 step 1 of 3 toward 2.0.0 (plan unit P01, slice S01, ledger

@@ -147,8 +147,9 @@ function groupDogIds(rows: { threadId: string; dogId: string }[]): Map<string, s
 /**
  * Look up the resolved participant for a thread row. Throws if the
  * participant_staff_id is null (schema allows NULL but business reality
- * always sets it) or the staff row is missing/expired — either would
- * silently emit a broken wire shape otherwise.
+ * always sets it) or the staff row is missing — either would silently emit a
+ * broken wire shape otherwise. An EXPIRED staffer resolves (a departed
+ * staffer stays a thread's participant; `staffRepository.findParticipantsByIds`).
  */
 function resolveParticipantOrThrow(
   row: ThreadRow,
@@ -162,7 +163,7 @@ function resolveParticipantOrThrow(
   const participant = participantsById.get(row.participantStaffId);
   if (participant === undefined) {
     throw new Error(
-      `thread ${row.id}: participant_staff_id ${row.participantStaffId} not found in live staff`,
+      `thread ${row.id}: participant_staff_id ${row.participantStaffId} not found in staff`,
     );
   }
   return participant;

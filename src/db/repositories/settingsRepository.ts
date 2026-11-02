@@ -16,6 +16,7 @@ import {
   paymentSettings,
   reportsSettings,
   staff,
+  staffSettings,
   vaccineSettings,
 } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -36,6 +37,7 @@ import type {
   OwnerClassSettingsWire,
   PaymentSettingWire,
   ReportsSettingsWire,
+  StaffSettingsWire,
   VaccineSettingsWire,
 } from '../../contracts/wire.js';
 import { ApiError } from '../../lib/errors.js';
@@ -348,6 +350,46 @@ export const settingsRepository = {
       typical_full_vaccination_age_months: r.typicalFullVaccinationAgeMonths,
       ...audit(r),
     };
+  },
+
+  /** The `staff` domain (M1.21): the five role lists and the idle minutes. */
+  async staff(runner: Runner = db): Promise<StaffSettingsWire> {
+    const [row] = await runner.select().from(staffSettings).limit(1);
+    const r = seeded(row, 'staff_settings', 'M1.21');
+    return {
+      refund_roles: r.refundRoles,
+      credit_hand_edit_roles: r.creditHandEditRoles,
+      desk_sale_roles: r.deskSaleRoles,
+      custom_invoice_roles: r.customInvoiceRoles,
+      cash_day_totals_roles: r.cashDayTotalsRoles,
+      portal_idle_signout_minutes: r.portalIdleSignoutMinutes,
+      ...audit(r),
+    };
+  },
+
+  /**
+   * `pay.refund_any_role_limit_cents` (M1.13; §3.7): what a role OFF
+   * `staff.refund_role_list` may refund; above 0 it opens `refund_money` to
+   * every role. A missing row or a non-integer value is a broken database,
+   * never a silent 0.
+   */
+  async refundAnyRoleLimitCents(runner: Runner = db): Promise<number> {
+    const [row] = await runner
+      .select({ value: paymentSettings.value })
+      .from(paymentSettings)
+      .where(
+        and(
+          eq(paymentSettings.key, 'refund_any_role_limit_cents'),
+          eq(paymentSettings.scope, 'global'),
+        ),
+      );
+    const r = seeded(row, 'payment_settings refund_any_role_limit_cents', 'M1.13');
+    if (typeof r.value !== 'number' || !Number.isInteger(r.value)) {
+      throw new Error(
+        `payment_settings refund_any_role_limit_cents holds ${JSON.stringify(r.value)}, not a whole number of cents`,
+      );
+    }
+    return r.value;
   },
 
   /**

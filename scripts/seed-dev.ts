@@ -6,7 +6,10 @@
  * `test/contracts/_fixture.ts` and seeds the :5433 test DB).
  *
  * Scope: exactly what the four staff-portal verbs need to demo —
- *   - staff (Shanthi + 3 trainers; Shanthi's id matches portal `.env.example`)
+ *   - staff: Shanthi (owner, both campuses), Amber (manager, Bentonville),
+ *     Rachel and Donavan (trainers, Fayetteville), Fed (trainer, Bentonville)
+ *     — the roster of design §2.1:1950-1955 (STAFF-U02, STAFF-U03), with fake
+ *     uids; Shanthi's id matches portal `.env.example`
  *   - two owners + dogs (the real cohort: Waffles, Lola, Brodie, Ollie)
  *   - upcoming bookings (confirm / cancel / attendance queue)
  *   - submitted requests (approve / deny queue)
@@ -237,38 +240,44 @@ async function restoreRealStripeRows({ customers, cards }: RealStripeRows): Prom
 }
 
 async function seed(): Promise<void> {
+  // M1.19/M1.20: owner | manager | trainer, and a non-empty set of home
+  // campuses. Shanthi is home to BOTH (M1.20's backfill alone gives one).
   await db.insert(staff).values([
     {
       id: SEED.staffShanthiId,
       supabaseUid: '00000000-0000-4000-8000-0000000000b1',
       name: 'Shanthi',
-      role: 'owner-shanthi',
-      location: 'fayetteville',
-      active: true,
+      role: 'owner',
+      // Sorted, as staff:provision writes a set: a roster run then compares equal.
+      homeLocations: ['bentonville', 'fayetteville'],
     },
     {
       id: SEED.staffRachelId,
       supabaseUid: '00000000-0000-4000-8000-0000000000b2',
       name: 'Rachel',
       role: 'trainer',
-      location: 'fayetteville',
-      active: true,
+      homeLocations: ['fayetteville'],
     },
     {
       id: SEED.staffDonavanId,
       supabaseUid: '00000000-0000-4000-8000-0000000000b3',
       name: 'Donavan',
       role: 'trainer',
-      location: 'fayetteville',
-      active: true,
+      homeLocations: ['fayetteville'],
     },
     {
       id: SEED.staffFedId,
       supabaseUid: '00000000-0000-4000-8000-0000000000b4',
       name: 'Fed Acosta',
       role: 'trainer',
-      location: 'bentonville',
-      active: true,
+      homeLocations: ['bentonville'],
+    },
+    {
+      id: SEED.staffAmberId,
+      supabaseUid: '00000000-0000-4000-8000-0000000000b5',
+      name: 'Amber',
+      role: 'manager',
+      homeLocations: ['bentonville'],
     },
   ]);
 
@@ -1104,7 +1113,7 @@ async function seed(): Promise<void> {
       category: 'team',
       title: 'Meet your Fayetteville trainers',
       body:
-        `Get to know the team behind your dog's progress. Rachel, Donavan, and Angie each ` +
+        `Get to know the team behind your dog's progress. Rachel and Donavan each ` +
         `bring a different specialty — from puppy foundations to reactivity and ` +
         `board-and-train — and they're who you'll see at drop-off and in your report cards.` +
         `\n\nTap through to read a little about each of them and what they focus on.`,
@@ -1188,10 +1197,10 @@ async function main(): Promise<void> {
   await seed();
   await restoreRealStripeRows(preserved);
   console.log(
-    `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 4 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
+    `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 5 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
       `2 threads, 4 group classes + 7 cohorts, billing ledger, 6 announcements, 1 event. ` +
       `Preserved real Stripe rows: ${preserved.customers.length} customer(s), ${preserved.cards.length} card(s). ` +
-      `Portal principal: staff:${SEED.staffShanthiId}:owner-shanthi`,
+      `Portal principal: staff:${SEED.staffShanthiId}:owner`,
   );
   process.exit(0);
 }

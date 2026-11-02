@@ -29,6 +29,7 @@
     "db:dev:check": "tsx scripts/check-dev-db.ts",
     "migrate:apply": "tsx scripts/migrate-apply.ts",
     "migrate:rehearse": "bash scripts/migrate-rehearse.sh",
+    "staff:provision": "tsx scripts/staff-provision.ts",
     "gate": "bash scripts/gate.sh",
     "probe:stripe": "tsx scripts/probe-stripe-thrown-confirm.ts"
   },

@@ -178,7 +178,10 @@ CREATE TYPE notification_type  AS ENUM (
   'waitlist-spot-open'
 );
 CREATE TYPE announcement_category AS ENUM ('urgent','team','class','event','promo','report');
-CREATE TYPE staff_role         AS ENUM ('owner-shanthi', 'trainer', 'office');
+-- M1.19 (STAFF-U02): rebuilt from ('owner-shanthi', 'trainer', 'office').
+-- Descriptive: what a staffer may DO is the settings registry's classes and
+-- staff_settings' role lists, computed into GET /me's capabilities.
+CREATE TYPE staff_role         AS ENUM ('owner', 'manager', 'trainer');
 -- Locations are a TABLE (`locations`, below), not an enum, since the robustness
 -- Δ 2026-06-08: a school is an attributed entity (display_name/address/coords/
 -- timezone) and adding one is a row INSERT, not an ALTER TYPE. The `slug` is the
@@ -303,11 +306,16 @@ CREATE TABLE staff (
                                                       -- Supabase project, role:'staff'
   name          text NOT NULL,                        -- seed = lib/staff.ts roster
   role          staff_role NOT NULL,
-  location      text REFERENCES locations(slug),
   image_path    text,
-  active        boolean NOT NULL DEFAULT true,
   created_at    timestamptz NOT NULL DEFAULT now(),
-  expired_at    timestamptz                           -- NULL = live (never hard-deleted)
+  expired_at    timestamptz,                          -- NULL = live (never hard-deleted);
+                                                      -- sign-in reads this alone
+  -- M1.20 (STAFF-U03, E67): the staffer's home campuses, a set of
+  -- locations.slug (no FK on an array; `npm run staff:provision`, the one
+  -- writer, refuses an empty set, an unknown slug and a repeat). Descriptive
+  -- only (STAFF-71): no route refuses a staffer outside them. Replaces
+  -- `location` (one campus or NULL); `active` was dropped with it (q34).
+  home_locations text[] NOT NULL CHECK (cardinality(home_locations) > 0)
 );
 
 -- ----------------------------------------------------------------------------
@@ -1035,7 +1043,8 @@ INSERT INTO credit_expiry_settings (location, expiry_window_months, warning_lead
 -- key and which keys are inert live in src/lib/settingsRegistry.ts. Each table
 -- is revoked from anon/authenticated as it is created (design §4 preamble).
 -- Not created in v1: boarding_settings, board_train_settings,
--- private_lesson_settings (M1.03, M1.04, M1.14). staff_settings is P02's (M1.21).
+-- private_lesson_settings (M1.03, M1.04, M1.14). staff_settings (M1.21, P02)
+-- needs M1.19's rebuilt staff_role.
 -- ----------------------------------------------------------------------------
 
 -- M1.01 (S01, SET-U01 ← ACCT-U02) — the `acct` settings domain.
@@ -1526,6 +1535,33 @@ REVOKE ALL ON vaccine_settings FROM anon, authenticated;
 
 INSERT INTO vaccine_settings (proof_file_types, typical_full_vaccination_age_months)
 VALUES ('{application/pdf,image/jpeg,image/png,image/heic,image/heif}', 4);
+
+-- M1.21 (S02, SET-U01 ← STAFF-U14; STAFF-U07, PAY-U25, CASH-U20) — the `staff`
+-- settings domain: who may use each money verb, and the portal's idle sign-out.
+-- design §4 LG1 (design.md:6153), §1.1:687-701, seeds §3.14. Every key is
+-- `roles` class (owner only); the owner role passes every list whatever it
+-- holds (STAFF-09). Each list is non-empty by its own CHECK; read as a set.
+CREATE TABLE staff_settings (
+  id                           boolean PRIMARY KEY DEFAULT true CHECK (id),
+  refund_roles                 staff_role[] NOT NULL CHECK (cardinality(refund_roles) > 0),
+  credit_hand_edit_roles       staff_role[] NOT NULL CHECK (cardinality(credit_hand_edit_roles) > 0),
+  desk_sale_roles              staff_role[] NOT NULL CHECK (cardinality(desk_sale_roles) > 0),
+  custom_invoice_roles         staff_role[] NOT NULL CHECK (cardinality(custom_invoice_roles) > 0),
+  cash_day_totals_roles        staff_role[] NOT NULL CHECK (cardinality(cash_day_totals_roles) > 0),
+  portal_idle_signout_minutes  integer NOT NULL DEFAULT 30
+                                 CHECK (portal_idle_signout_minutes BETWEEN 1 AND 60),
+  updated_at                   timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id          uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON staff_settings FROM anon, authenticated;
+
+INSERT INTO staff_settings (
+  refund_roles, credit_hand_edit_roles, desk_sale_roles, custom_invoice_roles,
+  cash_day_totals_roles, portal_idle_signout_minutes
+) VALUES (
+  '{owner,manager}', '{owner,manager}', '{owner,manager,trainer}', '{owner,manager}',
+  '{owner,manager,trainer}', 30
+);
 
 -- ----------------------------------------------------------------------------
 -- Credits — append-only ledger (replaces the mock mutable counter)
@@ -2449,7 +2485,9 @@ BEGIN
     'dog_descriptors','account_settings','alumni_settings','cash_settings',
     'credit_settings','day_program_settings','dog_gate_settings',
     'evaluation_settings','migration_settings','messaging_settings',
-    'notification_settings','payment_settings','reports_settings','vaccine_settings'
+    'notification_settings','payment_settings','reports_settings','vaccine_settings',
+    -- M1.21 (P02): the staff domain's role lists and idle minutes.
+    'staff_settings'
   ]) LOOP
     EXECUTE format(
       'CREATE TRIGGER %I_audit AFTER UPDATE OR DELETE ON %I
@@ -2788,6 +2826,7 @@ COMMENT ON TABLE notification_settings IS 'The notif settings domain (singleton,
 COMMENT ON TABLE payment_settings IS 'The pay settings domain: one row per (key, scope), value jsonb; scope ''global'' except charge_timing_mode, which is per service. Seeded whole at M1.13. Audited (STAFF-74); audit_log is the change history.';
 COMMENT ON TABLE reports_settings IS 'The rpt settings domain (singleton, id = true): events and gallery switches and limits, the media upload cap. Audited (STAFF-74).';
 COMMENT ON TABLE vaccine_settings IS 'The vax settings domain (singleton, id = true): accepted proof file types and the typical full-vaccination age. Audited (STAFF-74).';
+COMMENT ON TABLE staff_settings IS 'The staff settings domain (singleton, id = true): the five role lists that gate the money verbs (refund, hand credit edits, desk sale, custom invoice, end-of-day totals) and the portal idle sign-out minutes. Every key is roles class (owner only); the owner role passes every list. Audited (STAFF-74).';
 COMMENT ON TABLE  credit_packages                IS 'Effective-dated catalog of purchasable credit packages (mode, credit count, price) per location. Reprice/retire by closing effective_to + inserting a new row — never edit a priced row.';
 COMMENT ON TABLE  credit_ledger                  IS 'Append-only credit transactions (purchase grants, booking debits, refunds) modeled as expiring LOTS (Δ 2026-06-18): a source row (delta>0, lot_id NULL) carries expires_at; debits/refunds carry lot_id. Balance counts only live lots. Corrections are reversing entries.';
 COMMENT ON TABLE  stripe_customers               IS 'Maps an owner to their Stripe customer id (1:1).';

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { after, before, describe, test } from 'node:test';
-import { eq, sql } from 'drizzle-orm';
+import { describe, test } from 'node:test';
+import { sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import type { Principal } from '../../src/auth/principal.js';
 import type {
@@ -11,7 +11,6 @@ import type {
 } from '../../src/contracts/wire.js';
 import { db } from '../../src/db/client.js';
 import { pool } from '../../src/db/pool.js';
-import { staff } from '../../src/db/schema/schema.js';
 import { registerSettingsRoute } from '../../src/routes/settings.js';
 import {
   SETTINGS_TARGETS,
@@ -21,7 +20,9 @@ import {
 } from '../../src/routes/staffSettings.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
+  FIXTURE_MANAGER_PRINCIPAL,
   FIXTURE_OWNER_PRINCIPAL,
+  FIXTURE_OWNER_ROLE_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
@@ -33,23 +34,20 @@ import {
 /**
  * `GET /settings` (owner document) and `GET/PATCH /staff/settings/:domain
  * [/:location]` (SET-U01, STAFF-U07's class gate; design §1.1:628-649,
- * §2.1:1849-1887; wire 2.0.0-lg1.1 § settings).
+ * §2.1:1849-1887; wire 2.0.0-lg1.2 § settings).
  *
- * The principals are today's roles (DECISIONS 48): Shanthi as
- * `'owner-shanthi'` (every class but `price`), Donavan as `'trainer'` (`ops`
- * only). Every test that writes a setting puts it back in `finally`.
+ * The principals are the fixture's three roles (P02, STAFF-U07): Shanthi the
+ * owner (`ops`, `money`, `roles`), Amber the manager (`ops`, `money`), Donavan
+ * the trainer (`ops`). No role edits a `price` key in v1. Every test that
+ * writes a setting puts it back in `finally`.
  */
 
 registerFixtureHooks();
 
-const SHANTI_ID = randomUUID();
-const SHANTI: Principal = {
-  kind: 'staff',
-  staffId: SHANTI_ID,
-  role: 'owner-shanthi',
-  supabaseUid: randomUUID(),
-};
+const SHANTI = FIXTURE_OWNER_ROLE_PRINCIPAL;
+const SHANTI_ID = FIXTURE_IDS.staffShanthiId;
 const TRAINER = FIXTURE_STAFF_PRINCIPAL;
+const MANAGER = FIXTURE_MANAGER_PRINCIPAL;
 
 function appAs(principal: Principal, capture?: LogCapture): FastifyInstance {
   const { app, authenticate } = makeContractApp(principal, capture);
@@ -75,24 +73,6 @@ interface ErrorBody {
 async function setRaw(statement: ReturnType<typeof sql>): Promise<void> {
   await db.execute(statement);
 }
-
-before(async () => {
-  if (SKIP_WHEN_NO_DB.skip !== false) return;
-  await db.insert(staff).values({
-    id: SHANTI_ID,
-    supabaseUid: SHANTI.kind === 'staff' ? SHANTI.supabaseUid : randomUUID(),
-    name: 'Shanthi Test',
-    role: 'owner-shanthi',
-    location: 'fayetteville',
-    imagePath: null,
-  });
-});
-
-after(async () => {
-  if (SKIP_WHEN_NO_DB.skip !== false) return;
-  // ON DELETE SET NULL clears every updated_by_staff_id that names her.
-  await db.delete(staff).where(eq(staff.id, SHANTI_ID));
-});
 
 // ── R2 ───────────────────────────────────────────────────────────────────────
 
@@ -255,6 +235,8 @@ describe('GET /staff/settings/:domain[/:location]', SKIP_WHEN_NO_DB, () => {
       rpt: (b) => assert.equal((b as SettingsWireByDomain['rpt']).media_max_upload_megabytes, 25),
       vax: (b) =>
         assert.equal((b as SettingsWireByDomain['vax']).typical_full_vaccination_age_months, 4),
+      staff: (b) =>
+        assert.equal((b as SettingsWireByDomain['staff']).portal_idle_signout_minutes, 30),
     };
     for (const [domain, check] of Object.entries(expect)) {
       const res = await app.inject({ method: 'GET', url: `/staff/settings/${domain}` });
@@ -414,7 +396,7 @@ describe(
 
 // ── PATCH: who may edit what ─────────────────────────────────────────────────
 
-describe('PATCH — the class gate on today’s roles (DECISIONS 48)', SKIP_WHEN_NO_DB, () => {
+describe('PATCH — the class gate: owner, manager, trainer (STAFF-U07)', SKIP_WHEN_NO_DB, () => {
   test('the expiry switch (money): a trainer is refused; the owner edits it and is stamped', async () => {
     try {
       const refused = await patch(appAs(TRAINER), '/staff/settings/cred', {
@@ -453,8 +435,25 @@ describe('PATCH — the class gate on today’s roles (DECISIONS 48)', SKIP_WHEN
     }
   });
 
+  test('the expiry switch is money, not roles: the manager edits it too (Amber may; §3.14)', async () => {
+    try {
+      const ok = await patch(appAs(MANAGER), '/staff/settings/cred', {
+        expiry_enforced_enabled: false,
+      });
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal(
+        ok.json<SettingsWireByDomain['cred']>().updated_by_staff_id,
+        FIXTURE_IDS.staffAmberId,
+      );
+    } finally {
+      await setRaw(
+        sql`UPDATE credit_settings SET expiry_enforced_enabled = true, updated_by_staff_id = NULL`,
+      );
+    }
+  });
+
   test('a price key is refused to every role in v1, the owner included', async () => {
-    for (const principal of [SHANTI, TRAINER]) {
+    for (const principal of [SHANTI, MANAGER, TRAINER]) {
       const res = await patch(appAs(principal), '/staff/settings/day', {
         after_school_price_cents: 0,
       });
@@ -588,14 +587,135 @@ describe('PATCH — body shape, tiers and Idempotency-Key', SKIP_WHEN_NO_DB, () 
   });
 });
 
-// ── fix round 1 (DECISIONS 60–66) ────────────────────────────────────────────
+// ── the staff domain (M1.21; STAFF-U07; design §1.1:687-701, §3.14) ─────────
 
-const OFFICE: Principal = {
-  kind: 'staff',
-  staffId: randomUUID(), // refused before any write, so no row is needed
-  role: 'office',
-  supabaseUid: randomUUID(),
-};
+describe('the staff settings domain — every key roles class (owner only)', SKIP_WHEN_NO_DB, () => {
+  const restore = () =>
+    setRaw(sql`UPDATE staff_settings SET
+      refund_roles = '{owner,manager}', credit_hand_edit_roles = '{owner,manager}',
+      desk_sale_roles = '{owner,manager,trainer}', custom_invoice_roles = '{owner,manager}',
+      cash_day_totals_roles = '{owner,manager,trainer}', portal_idle_signout_minutes = 30,
+      updated_by_staff_id = NULL`);
+
+  test('any role reads it: the five lists and the minutes at their M1.21 seeds', async () => {
+    for (const principal of [TRAINER, MANAGER, SHANTI]) {
+      const res = await appAs(principal).inject({ method: 'GET', url: '/staff/settings/staff' });
+      assert.equal(res.statusCode, 200, res.body);
+      const body = res.json<SettingsWireByDomain['staff']>();
+      assert.deepEqual(
+        { ...body, updated_at: 'x' },
+        {
+          refund_roles: ['owner', 'manager'],
+          credit_hand_edit_roles: ['owner', 'manager'],
+          desk_sale_roles: ['owner', 'manager', 'trainer'],
+          custom_invoice_roles: ['owner', 'manager'],
+          cash_day_totals_roles: ['owner', 'manager', 'trainer'],
+          portal_idle_signout_minutes: 30,
+          updated_at: 'x',
+          updated_by_staff_id: null,
+        },
+      );
+    }
+  });
+
+  test("a trainer's and a manager's PATCH of portal_idle_signout_minutes is 403 refused_keys", async () => {
+    for (const principal of [TRAINER, MANAGER]) {
+      const res = await patch(appAs(principal), '/staff/settings/staff', {
+        portal_idle_signout_minutes: 45,
+      });
+      assert.equal(res.statusCode, 403, res.body);
+      assert.deepEqual(res.json<ErrorBody>().error.details, {
+        kind: 'refused_keys',
+        refused_keys: ['portal_idle_signout_minutes'],
+      });
+    }
+  });
+
+  test('the manager may not widen a money list: refund_roles is 403 refused_keys (only the owner widens who touches money)', async () => {
+    const res = await patch(appAs(MANAGER), '/staff/settings/staff', {
+      refund_roles: ['owner', 'manager', 'trainer'],
+    });
+    assert.equal(res.statusCode, 403, res.body);
+    assert.deepEqual(res.json<ErrorBody>().error.details, {
+      kind: 'refused_keys',
+      refused_keys: ['refund_roles'],
+    });
+  });
+
+  test("the owner's 45 is 200 and stamped; her 61 is 422 invalid_payload — never setting_inert", async () => {
+    try {
+      const ok = await patch(appAs(SHANTI), '/staff/settings/staff', {
+        portal_idle_signout_minutes: 45,
+      });
+      assert.equal(ok.statusCode, 200, ok.body);
+      const body = ok.json<SettingsWireByDomain['staff']>();
+      assert.equal(body.portal_idle_signout_minutes, 45);
+      assert.equal(body.updated_by_staff_id, SHANTI_ID);
+
+      const tooLong = await patch(appAs(SHANTI), '/staff/settings/staff', {
+        portal_idle_signout_minutes: 61,
+      });
+      assert.equal(tooLong.statusCode, 422, tooLong.body);
+      assert.equal(tooLong.json<ErrorBody>().error.code, 'invalid_payload');
+    } finally {
+      await restore();
+    }
+  });
+
+  test('the owner edits a list; the replaced list is kept in audit_log (STAFF-74)', async () => {
+    try {
+      const res = await patch(appAs(SHANTI), '/staff/settings/staff', {
+        refund_roles: ['owner', 'manager', 'trainer'],
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepEqual(res.json<SettingsWireByDomain['staff']>().refund_roles, [
+        'owner',
+        'manager',
+        'trainer',
+      ]);
+      const audit = await db.execute<{ actor: string; before: { refund_roles: string[] } }>(
+        sql`SELECT actor, before FROM audit_log WHERE table_name = 'staff_settings' ORDER BY id DESC LIMIT 1`,
+      );
+      assert.equal(audit.rows[0]?.actor, `staff:${SHANTI_ID}`);
+      assert.deepEqual(audit.rows[0]?.before.refund_roles, ['owner', 'manager']);
+    } finally {
+      await restore();
+    }
+  });
+
+  test('an empty list is 422 invalid_payload (the CHECK); an unknown or a repeated role is 400 bad_request (DECISIONS 59); nothing is written', async () => {
+    try {
+      const empty = await patch(appAs(SHANTI), '/staff/settings/staff', { desk_sale_roles: [] });
+      assert.equal(empty.statusCode, 422, empty.body);
+      assert.equal(empty.json<ErrorBody>().error.code, 'invalid_payload');
+      for (const list of [['owner', 'office'], ['manager', 'manager'], ['owner-shanthi']]) {
+        const res = await patch(appAs(SHANTI), '/staff/settings/staff', { desk_sale_roles: list });
+        assert.equal(res.statusCode, 400, `${JSON.stringify(list)}: ${res.body}`);
+        assert.equal(res.json<ErrorBody>().error.code, 'bad_request');
+      }
+      const read = await appAs(SHANTI).inject({ method: 'GET', url: '/staff/settings/staff' });
+      assert.deepEqual(read.json<SettingsWireByDomain['staff']>().desk_sale_roles, [
+        'owner',
+        'manager',
+        'trainer',
+      ]);
+      assert.equal(read.json<SettingsWireByDomain['staff']>().updated_by_staff_id, null);
+    } finally {
+      await restore();
+    }
+  });
+
+  test("the database itself refuses an empty list and a 61 (M1.21's CHECKs)", async () => {
+    for (const statement of [
+      sql`UPDATE staff_settings SET cash_day_totals_roles = '{}'`,
+      sql`UPDATE staff_settings SET portal_idle_signout_minutes = 61`,
+    ]) {
+      await assert.rejects(db.execute(statement), (err: unknown) => isValueRefusal(err));
+    }
+  });
+});
+
+// ── fix round 1 (DECISIONS 60–66) ────────────────────────────────────────────
 
 async function campusOfferings(
   location: 'fayetteville' | 'bentonville',
@@ -609,22 +729,26 @@ async function campusOfferings(
 }
 
 describe('fix round 1 — DECISIONS 60–66', SKIP_WHEN_NO_DB, () => {
-  test('D60: refund_any_role_limit_cents is roles class — the owner edits it; trainer and office are refused', async () => {
+  test('D73: refund_any_role_limit_cents is money class (DECISIONS 60 reversed) — owner 200, manager 200, trainer 403 refused_keys', async () => {
     try {
-      const ok = await patch(appAs(SHANTI), '/staff/settings/pay', {
-        refund_any_role_limit_cents: 0,
-      });
-      assert.equal(ok.statusCode, 200, ok.body);
-      for (const principal of [TRAINER, OFFICE]) {
-        const refused = await patch(appAs(principal), '/staff/settings/pay', {
-          refund_any_role_limit_cents: 25000,
+      for (const principal of [SHANTI, MANAGER]) {
+        const ok = await patch(appAs(principal), '/staff/settings/pay', {
+          refund_any_role_limit_cents: 0,
         });
-        assert.equal(refused.statusCode, 403, refused.body);
-        assert.deepEqual(refused.json<ErrorBody>().error.details, {
-          kind: 'refused_keys',
-          refused_keys: ['refund_any_role_limit_cents'],
-        });
+        assert.equal(
+          ok.statusCode,
+          200,
+          `${principal.kind === 'staff' && principal.role}: ${ok.body}`,
+        );
       }
+      const refused = await patch(appAs(TRAINER), '/staff/settings/pay', {
+        refund_any_role_limit_cents: 25000,
+      });
+      assert.equal(refused.statusCode, 403, refused.body);
+      assert.deepEqual(refused.json<ErrorBody>().error.details, {
+        kind: 'refused_keys',
+        refused_keys: ['refund_any_role_limit_cents'],
+      });
     } finally {
       await setRaw(
         sql`UPDATE payment_settings SET value = '0', updated_by_staff_id = NULL WHERE key = 'refund_any_role_limit_cents'`,
@@ -877,10 +1001,12 @@ describe('fix round 2 — DECISIONS 69 and 71', SKIP_WHEN_NO_DB, () => {
   });
 
   test('D71: a role the class map does not know is refused 403, never a 500', async () => {
+    // 'office' was a role until M1.19; a principal still carrying it (a stale
+    // token's mirror, a hand-edited row) edits nothing.
     const stranger = {
       kind: 'staff',
       staffId: randomUUID(),
-      role: 'manager',
+      role: 'office',
       supabaseUid: randomUUID(),
     } as unknown as Principal;
     const res = await patch(appAs(stranger), '/staff/settings/day/fayetteville', {

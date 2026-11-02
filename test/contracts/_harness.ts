@@ -35,6 +35,31 @@ export const FIXTURE_STAFF_PRINCIPAL: Principal = {
 };
 
 /**
+ * The fixture manager (Amber, P02; design §2.1:1961-1968) — owner and manager
+ * pass the role-gated routes (`requireStaffRole('owner', 'manager')`) and edit
+ * `money`-class settings; the trainer above does neither. A real row, so the
+ * guards and `GET /me` (which reads the row) agree.
+ */
+export const FIXTURE_MANAGER_PRINCIPAL: Principal = {
+  kind: 'staff',
+  staffId: FIXTURE_IDS.staffAmberId,
+  role: 'manager',
+  supabaseUid: FIXTURE_IDS.staffAmberSupabaseUid,
+};
+
+/**
+ * The fixture owner ROLE (Shanthi, P02) — a staff principal, not a family:
+ * the one role that edits `roles`-class settings (the five lists, the idle
+ * minutes) and passes every list whatever it holds (STAFF-09).
+ */
+export const FIXTURE_OWNER_ROLE_PRINCIPAL: Principal = {
+  kind: 'staff',
+  staffId: FIXTURE_IDS.staffShanthiId,
+  role: 'owner',
+  supabaseUid: FIXTURE_IDS.staffShanthiSupabaseUid,
+};
+
+/**
  * `true` when DATABASE_URL is set — every contract test that hits the DB
  * is gated on this. Reads `process.env` once at import time (the test
  * runner doesn't toggle env vars mid-run).

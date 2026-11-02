@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import { eq, sql } from 'drizzle-orm';
+import { db } from '../../src/db/client.js';
+import { staff } from '../../src/db/schema/schema.js';
 import { registerThreadsRoute } from '../../src/routes/threads.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -280,3 +283,36 @@ test('POST /threads/:id/messages as a staff principal returns 404', SKIP_WHEN_NO
   });
   assert.equal(res.statusCode, 404);
 });
+
+// P02 (design §2.1:2025-2029, r4-opus #4): `npm run staff:provision --expire`
+// sets a leaver's `expired_at`, and a departed staffer stays the participant
+// of the threads she was on. The thread read must still resolve her, or the
+// owner's GET /threads 500s the day someone is off-boarded.
+test(
+  'GET /threads still answers when a thread participant has been expired (--expire), naming her',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerThreadsRoute(app, { authenticate });
+    await db
+      .update(staff)
+      .set({ expiredAt: sql`now()` })
+      .where(eq(staff.id, FIXTURE_IDS.staffDonavanId));
+    try {
+      const res = await app.inject({ method: 'GET', url: '/threads' });
+      assert.equal(res.statusCode, 200, res.body);
+      const names = (res.json() as Array<{ participant: { name: string } }>).map(
+        (t) => t.participant.name,
+      );
+      assert.ok(
+        names.includes('Donavan'),
+        `the departed participant vanished: ${names.join(', ')}`,
+      );
+    } finally {
+      await db
+        .update(staff)
+        .set({ expiredAt: null })
+        .where(eq(staff.id, FIXTURE_IDS.staffDonavanId));
+    }
+  },
+);

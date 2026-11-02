@@ -10,6 +10,8 @@ import { futureWeekday, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
+  FIXTURE_MANAGER_PRINCIPAL,
+  FIXTURE_OWNER_ROLE_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
@@ -31,14 +33,15 @@ import {
  * FIXTURE_TODAY = 2026-05-19. Fixture seeds: day-school @fay $75 (open from
  * 2026-01-01), day-school @null $70, day-care @null $45 (→2026-06-01) then $50,
  * boarding @fay $85, day-care @bentonville $40 (expired 2026-04-01). The staff
- * principal is `staffDonavanId`.
+ * principal is the manager, `staffAmberId` (P02): the rate editor is owner and
+ * manager since STAFF-U07, and the trainer's 403 is pinned at the end.
  */
 
 registerFixtureHooks();
 
-const STAFF_ID = FIXTURE_IDS.staffDonavanId;
+const STAFF_ID = FIXTURE_IDS.staffAmberId;
 
-function staffApp(principal = FIXTURE_STAFF_PRINCIPAL): {
+function staffApp(principal = FIXTURE_MANAGER_PRINCIPAL): {
   app: ReturnType<typeof makeContractApp>['app'];
 } {
   const { app, authenticate } = makeContractApp(principal);
@@ -158,6 +161,10 @@ test(
   'POST /staff/rates — first rate for a fresh track inserts an open row, stamps created_by',
   SKIP_WHEN_NO_DB,
   async () => {
+    // A manager's private-lesson rate (design §2.1:2086-2091): kept green at
+    // 2.0.0 and deleted by DAY-U23 at design 4.0.0. The shared (category,
+    // campus) track is owner/manager — service_rates has no trainer axis; a
+    // trainer's own lesson price is STAFF-U23's per-trainer row, later.
     const { app } = staffApp();
     const res = await postRate({
       app,
@@ -679,3 +686,76 @@ test(
     assert.equal(booking.statusCode, 500, 'refuses to charge a non-per-day day-program rate');
   },
 );
+
+// ──────────────────────────────────────────────────────────────────────────
+// STAFF-U07 (design §2.1:2080-2091): the legacy rate editor is
+// requireStaffRole('owner', 'manager') whole. The shared (category, campus)
+// track on service_rates is owner/manager because the table has no trainer
+// axis; a trainer's own `pl.lesson_price_cents` (STAFF-30) is STAFF-U23's
+// per-trainer row, later. Until design 4.0.0 (DAY-U23) narrows the route, a
+// manager's rate post is accepted — harmless: no family exists before §2.11,
+// and the preflight catches any rate off its seed.
+// ──────────────────────────────────────────────────────────────────────────
+
+test(
+  'STAFF-U07: the trainer is refused POST /staff/rates — 403 forbidden, nothing written',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await postRate({
+      app,
+      idempotencyKey: `sr-trainer-${randomUUID()}`,
+      payload: {
+        category: 'boarding',
+        location: 'bentonville',
+        amount_cents: 1,
+        unit: 'per-night',
+      },
+    });
+    assert.equal(res.statusCode, 403, res.body);
+    assert.equal(res.json().error.code, 'forbidden');
+    const written = (await rowsForTrack('boarding', 'bentonville')).filter(
+      (r) => r.amountCents === 1,
+    );
+    assert.deepEqual(written, [], 'the refused post wrote a row');
+  },
+);
+
+test(
+  'STAFF-U07: the trainer is refused POST /staff/rates/:id/void — 403 before any lookup',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await voidRate(app, randomUUID());
+    assert.equal(res.statusCode, 403, res.body);
+    assert.equal(res.json().error.code, 'forbidden');
+  },
+);
+
+test(
+  'STAFF-U07: the trainer still reads GET /staff/rates (any role)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffApp(FIXTURE_STAFF_PRINCIPAL);
+    const res = await app.inject({ method: 'GET', url: '/staff/rates' });
+    assert.equal(res.statusCode, 200, res.body);
+  },
+);
+
+test('STAFF-U07: the manager and the owner role post a rate (200)', SKIP_WHEN_NO_DB, async () => {
+  for (const principal of [FIXTURE_MANAGER_PRINCIPAL, FIXTURE_OWNER_ROLE_PRINCIPAL]) {
+    const { app } = staffApp(principal);
+    const res = await postRate({
+      app,
+      idempotencyKey: `sr-role-${randomUUID()}`,
+      payload: {
+        category: 'boarding',
+        location: 'bentonville',
+        amount_cents: principal === FIXTURE_MANAGER_PRINCIPAL ? 9100 : 9200,
+        unit: 'per-night',
+        effective_from: principal === FIXTURE_MANAGER_PRINCIPAL ? '2026-06-01' : '2026-07-01',
+      },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+  }
+});

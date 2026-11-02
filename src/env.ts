@@ -11,9 +11,13 @@ import { z } from 'zod';
 // to fail noisily, and an unset NODE_ENV (treated as dev) loads `.env`.
 //
 // Day 5a addition: `.env.local` layers OVER `.env`. The intended workflow —
-// `.env` holds the canonical dev config (Supabase staging URL, etc.) and
-// `.env.local` holds the developer's per-machine overrides (e.g., a local
-// Postgres URL pointing at the docker-compose stack). `.env.local` is loaded
+// `.env` holds the shared config, which points at the ONE Supabase project:
+// production (there is no staging project — design §2.1:2042-2045; a separate
+// test environment is added when the app goes to Shanthi, SIGNOFF.md:180) —
+// and `.env.local` holds the developer's per-machine overrides (e.g., a local
+// Postgres URL pointing at the docker-compose stack). That is why the scripts
+// that write (`migrate:apply`, `staff:provision`) take their target explicitly
+// and check its project ref instead of trusting these files. `.env.local` is loaded
 // FIRST, then `.env` — because `dotenv` never overrides existing process.env
 // values, the first-loaded file wins per-key. Process.env (host/CLI) still
 // trumps both.
@@ -207,7 +211,13 @@ const envSchema = z
           'money alarm (SURPLUS REFUND, LOST HOLD, abandoned refunds) pages nobody',
       });
     }
-    const plainHttp = value.PORTAL_ORIGIN.filter((origin) => !origin.startsWith('https:'));
+    // zod runs this refinement on a DIRTY object too: when the PORTAL_ORIGIN
+    // transform refused an entry it returned z.NEVER, so the value here is not
+    // an array and its refusal ("not an exact origin") is already recorded.
+    // Unguarded, `.filter` threw a TypeError that swallowed that refusal and
+    // every other one in this parse (P02 item 0a; DECISIONS 72).
+    const origins = Array.isArray(value.PORTAL_ORIGIN) ? value.PORTAL_ORIGIN : undefined;
+    const plainHttp = origins?.filter((origin) => !origin.startsWith('https:')) ?? [];
     if (plainHttp.length > 0) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -217,7 +227,7 @@ const envSchema = z
           'staff bearer token with every call (DECISIONS 71)',
       });
     }
-    if (value.PORTAL_ORIGIN.length === 0) {
+    if (origins?.length === 0) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['PORTAL_ORIGIN'],

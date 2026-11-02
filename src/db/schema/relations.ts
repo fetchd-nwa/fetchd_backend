@@ -29,7 +29,6 @@ export const ownersRelations = relations(owners, ({one, many}) => ({
 
 export const locationsRelations = relations(locations, ({many}) => ({
 	owners: many(owners),
-	staff: many(staff),
 	cohorts: many(cohorts),
 	bookings: many(bookings),
 	creditExpirySettings: many(creditExpirySettings),
@@ -41,10 +40,6 @@ export const locationsRelations = relations(locations, ({many}) => ({
 }));
 
 export const staffRelations = relations(staff, ({one, many}) => ({
-	location: one(locations, {
-		fields: [staff.location],
-		references: [locations.slug]
-	}),
 	dogs: many(dogs),
 	reports: many(reports),
 	bookings: many(bookings),

@@ -16,8 +16,26 @@ function firstHeader(value: string | string[] | undefined): string | undefined {
 }
 
 /**
+ * What a record carried, by NAME only (ACCT-U05; design §2.1:2111-2113): its
+ * top-level keys and the keys of `raw_app_meta_data`, so the first real
+ * delivery shows which shape GoTrue sends — never a value (an email, a name, a
+ * uid or a role would put personal data or a privilege claim in the log).
+ */
+function recordKeyNames(body: unknown): { record_keys: string[]; app_metadata_keys: string[] } {
+  const record = isObject(body) && isObject(body.record) ? body.record : {};
+  const appMeta = isObject(record.raw_app_meta_data) ? record.raw_app_meta_data : {};
+  return { record_keys: Object.keys(record), app_metadata_keys: Object.keys(appMeta) };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
  * `POST /auth/webhook` `[public, signed]` — Supabase "user created" → upsert
- * the mirror row. Registered in its own encapsulated scope so the raw-body
+ * an OWNER mirror row, or skip; never a staff row (ACCT-U05, see
+ * `auth/provisioning.ts`). Answers `{ok: true, result: 'provisioned' |
+ * 'skipped'}`. Registered in its own encapsulated scope so the raw-body
  * content-type parser (the HMAC needs the exact received bytes, not a
  * re-serialized JSON) applies to *this route only* — `/me` and `/health`
  * keep Fastify's default JSON parsing.
@@ -55,9 +73,10 @@ export function registerAuthWebhook(app: FastifyInstance, verify: Verify = verif
         },
         request.rawBody ?? '',
       );
-      const result = await provisionFromWebhook(request.body);
-      request.log.info({ result }, 'auth webhook provisioned mirror row');
-      return reply.code(200).send({ ok: true });
+      request.log.info(recordKeyNames(request.body), 'auth webhook record received');
+      const outcome = await provisionFromWebhook(request.body);
+      request.log.info({ outcome }, `auth webhook ${outcome.result}`);
+      return reply.code(200).send({ ok: true, result: outcome.result });
     });
   });
 }

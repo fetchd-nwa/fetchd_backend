@@ -1,6 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import {
+  requirePrincipal,
+  requireStaffRole,
+  resolveAuthHook,
+  type AuthRouteOptions,
+} from '../auth/plugin.js';
 import type { CancelWindowSettingWire, PatchStaffCancelWindowRequest } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
@@ -106,9 +111,11 @@ export function registerStaffCancelWindowRoute(
   // their `cancel_deadline_at` using the new hours. Existing rows
   // keep their original stamped deadline — promise made at booking
   // time honors at cancel time even when the policy moves later.
+  // STAFF-U07 (design §2.1:2080-2086): owner and manager, whole — the window
+  // is money policy (STAFF-77); the trainer is 403 `forbidden`.
   app.patch(
     '/staff/cancel-window/:category',
-    { preHandler: [authHook] },
+    { preHandler: [authHook, requireStaffRole('owner', 'manager')] },
     async (request): Promise<CancelWindowSettingWire> => {
       const principal = requirePrincipal(request);
       requireStaff(principal, 'edit the cancel-window policy');

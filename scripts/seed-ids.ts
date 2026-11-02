@@ -12,6 +12,8 @@ export const SEED = {
   staffRachelId: '00000000-0000-4000-8000-0000000000a2',
   staffDonavanId: '00000000-0000-4000-8000-0000000000a3',
   staffFedId: '00000000-0000-4000-8000-0000000000a4',
+  // P02 (STAFF-U02): Amber, the manager (Bentonville).
+  staffAmberId: '00000000-0000-4000-8000-0000000000a5',
 
   // Owners (clients).
   ownerAllisonId: '0caa0000-0000-4000-8000-000000000001',

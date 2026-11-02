@@ -1,12 +1,19 @@
-import { NOTIFICATION_TYPES, SERVICE_CATEGORIES, type StaffRole } from '../contracts/wire.js';
+import {
+  NOTIFICATION_TYPES,
+  SERVICE_CATEGORIES,
+  SETTINGS_DOMAINS,
+  type SettingsDomain,
+  type StaffRole,
+} from '../contracts/wire.js';
 
 /**
  * **The settings registry** (SET-U01 / STAFF-U07; design §2.1 "The registry",
  * §3 every key and its seed; P01, wire 2.0.0-lg1.1).
  *
  * A typed map, written by hand and checked by tests, from every setting key of
- * the thirteen P01 domains (acct, alum, cash, cred, day, dog, eval, mig, msg,
- * notif, pay, rpt, vax — `staff` joins with P02, DECISIONS 47) to:
+ * the fourteen domains of `wire.ts`'s `SETTINGS_DOMAINS` (acct, alum, cash,
+ * cred, day, dog, eval, mig, msg, notif, pay, rpt, vax — and `staff`, P02's,
+ * DECISIONS 47) to:
  *
  *   - its **store**: a column of its domain's settings table; a
  *     `payment_settings` key and scope; a path inside a jsonb column (a
@@ -30,30 +37,19 @@ import { NOTIFICATION_TYPES, SERVICE_CATEGORIES, type StaffRole } from '../contr
  * (every settings column has exactly one editable key, no key names two
  * tables) and to the design's §3 (class and inert, key by key).
  *
- * This module owns its own types: it imports no name `wire.ts` does not
- * already export at 1.13.0. The per-domain wire shapes are Phase B's.
+ * The domain list is the wire's own tuple (P02; contract notes Part 4 item 3):
+ * a domain appended to `SETTINGS_DOMAINS` fails `tsc` here until
+ * `SETTINGS_TABLE_BY_DOMAIN` names its table, and that entry is what puts the
+ * table under the generated audit test.
  */
 
 export type SettingClass = 'ops' | 'money' | 'price' | 'roles';
 
-export const SETTINGS_DOMAINS = [
-  'acct',
-  'alum',
-  'cash',
-  'cred',
-  'day',
-  'dog',
-  'eval',
-  'mig',
-  'msg',
-  'notif',
-  'pay',
-  'rpt',
-  'vax',
-] as const;
-export type SettingsDomain = (typeof SETTINGS_DOMAINS)[number];
+export { SETTINGS_DOMAINS, type SettingsDomain };
 
-/** The settings tables P01 creates (M1.01–M1.16 less M1.03, M1.04, M1.14), by domain. */
+/** Every settings table, by domain: P01's (M1.01–M1.16 less M1.03, M1.04,
+ *  M1.14) and P02's `staff_settings` (M1.21). Keyed by the WIRE's domain union,
+ *  so a missing domain does not compile. */
 export const SETTINGS_TABLE_BY_DOMAIN = {
   acct: 'account_settings',
   alum: 'alumni_settings',
@@ -68,14 +64,16 @@ export const SETTINGS_TABLE_BY_DOMAIN = {
   pay: 'payment_settings',
   rpt: 'reports_settings',
   vax: 'vaccine_settings',
+  staff: 'staff_settings',
 } as const satisfies Record<SettingsDomain, string>;
 export type SettingsTable = (typeof SETTINGS_TABLE_BY_DOMAIN)[SettingsDomain];
 export const SETTINGS_TABLES: readonly SettingsTable[] = Object.values(SETTINGS_TABLE_BY_DOMAIN);
 
 /**
- * Every settings table under the audit trigger (M1.18, STAFF-U22): the four
- * that predate LG1 and every table P01 creates. P02's `staff_settings` joins by
- * adding its name; the audit test is generated from this list.
+ * Every settings table under the audit trigger (M1.18, STAFF-U22; M1.21): the
+ * four that predate LG1 and every settings table LG1 creates, `staff_settings`
+ * included (it joins through `SETTINGS_TABLE_BY_DOMAIN`). The audit test is
+ * generated from this list.
  */
 export const AUDITED_SETTINGS_TABLES: readonly string[] = [
   'cancel_window_settings',
@@ -141,6 +139,10 @@ export type SettingValue =
    *  any role, so turning one on is a deliberate act" (design.md:3719-3722;
    *  DECISIONS 69). */
   | { type: 'offerings'; services: readonly string[] }
+  /** A set of staff roles (`staff_role[]`, M1.21): a role outside the enum, or
+   *  one named twice, is a bad shape (400, DECISIONS 59); an empty list is out
+   *  of range (422 — the column's `cardinality > 0` CHECK). */
+  | { type: 'role-list' }
   /** A catalog fact: not a value the settings PATCH carries. */
   | { type: 'catalog' };
 
@@ -186,6 +188,7 @@ const UNTIL_P09: Inertness = {
 };
 
 const BOOLEAN: SettingValue = { type: 'boolean' };
+const ROLE_LIST: SettingValue = { type: 'role-list' };
 const TIME: SettingValue = { type: 'time' };
 const FRACTION: SettingValue = { type: 'fraction' };
 const atLeast = (min: number): SettingValue => ({ type: 'integer', min });
@@ -1086,10 +1089,10 @@ const ENTRIES: readonly Entry[] = [
   },
   {
     key: 'pay.refund_any_role_limit_cents',
-    // §3.7 says money; DECISIONS 60 rules roles (owner only): raising the limit
-    // above 0 lets every role refund, and only the owner widens who touches
-    // money (§2.1). The registry test lists this one override.
-    class: 'roles',
+    // §3.7: money (owner and manager). DECISIONS 60 had ruled it `roles`;
+    // Allison reverted that ruling (DECISIONS 73, "B is good"), so the §3
+    // check holds this key with no exception.
+    class: 'money',
     store: { kind: 'payment', key: 'refund_any_role_limit_cents', scope: 'global' },
     value: atLeast(0),
     inert: LIVE,
@@ -1199,6 +1202,55 @@ const ENTRIES: readonly Entry[] = [
     value: { type: 'catalog' },
     inert: UNTIL_P07,
   },
+
+  // staff — staff_settings (M1.21; §3.14). Every key is `roles` class: only
+  // the owner role edits who may use a money verb, or how long a money session
+  // outlives its staffer at the shared desk (§2.1:1791-1798). The owner role
+  // passes every list regardless (STAFF-09). None is inert: the lists' reader
+  // in this release is `GET /me`'s capabilities, the minutes' is the portal's
+  // idle sign-out (STAFF-U11).
+  {
+    key: 'staff.refund_role_list',
+    class: 'roles',
+    store: column('staff_settings', 'refund_roles'),
+    value: ROLE_LIST,
+    inert: LIVE,
+  },
+  {
+    key: 'staff.credit_hand_edit_role_list',
+    class: 'roles',
+    store: column('staff_settings', 'credit_hand_edit_roles'),
+    value: ROLE_LIST,
+    inert: LIVE,
+  },
+  {
+    key: 'staff.desk_sale_role_list',
+    class: 'roles',
+    store: column('staff_settings', 'desk_sale_roles'),
+    value: ROLE_LIST,
+    inert: LIVE,
+  },
+  {
+    key: 'staff.custom_invoice_role_list',
+    class: 'roles',
+    store: column('staff_settings', 'custom_invoice_roles'),
+    value: ROLE_LIST,
+    inert: LIVE,
+  },
+  {
+    key: 'staff.cash_day_totals_role_list',
+    class: 'roles',
+    store: column('staff_settings', 'cash_day_totals_roles'),
+    value: ROLE_LIST,
+    inert: LIVE,
+  },
+  {
+    key: 'staff.portal_idle_signout_minutes',
+    class: 'roles',
+    store: column('staff_settings', 'portal_idle_signout_minutes'),
+    value: between(1, 60),
+    inert: LIVE,
+  },
 ];
 
 function scopeOf(entry: Entry): SettingScope {
@@ -1215,7 +1267,7 @@ function scopeOf(entry: Entry): SettingScope {
 function domainOf(key: string): SettingsDomain {
   const prefix = key.slice(0, key.indexOf('.'));
   const domain = SETTINGS_DOMAINS.find((d) => d === prefix);
-  if (domain === undefined) throw new Error(`settings registry: '${key}' has no P01 domain`);
+  if (domain === undefined) throw new Error(`settings registry: '${key}' has no settings domain`);
   return domain;
 }
 
@@ -1244,24 +1296,22 @@ export function isPatchable(entry: SettingEntry): boolean {
 // ── Who may edit which class ─────────────────────────────────────────────────
 
 /**
- * The one place a role meets a class (design §2.1, §3.14; DECISIONS 48).
- *
- * INTERIM — today's roles, fail-closed, until P02 rebuilds `staff_role` as
- * owner/manager/trainer and rewrites this map (owner: ops, money, roles;
- * manager: ops, money; trainer: ops). `'owner-shanthi'` is the owner and passes
- * every class but `price`; `'trainer'` and `'office'` pass `ops` only. No role
- * passes `price` in v1, the owner included (question 27 → (a)). Never deployed:
- * this map lives only between two `v1/build` commits.
+ * The one place a role meets a class (design §2.1:1779-1798, §3.14; STAFF-U07,
+ * replacing DECISIONS 48's interim map): the owner edits `ops`, `money` and
+ * `roles`; the manager `ops` and `money` (STAFF-77, RULING §5 "money =
+ * owner/manager edit"); the trainer `ops` (STAFF-73). No role passes `price`
+ * in v1, the owner included (question 27 → (a)): every price is its seed.
+ * `GET /me`'s `edit_prices` and `edit_money_policy` read this same map.
  */
 const EDITABLE_CLASSES: Readonly<Record<StaffRole, ReadonlySet<SettingClass>>> = {
-  'owner-shanthi': new Set<SettingClass>(['ops', 'money', 'roles']),
+  owner: new Set<SettingClass>(['ops', 'money', 'roles']),
+  manager: new Set<SettingClass>(['ops', 'money']),
   trainer: new Set<SettingClass>(['ops']),
-  office: new Set<SettingClass>(['ops']),
 };
 
 export function mayEditClass(role: StaffRole, settingClass: SettingClass | null): boolean {
-  // A role the map does not hold (a P02 enum value landing before this map is
-  // rewritten, a hand-edited row) edits nothing: 403, never a TypeError's 500.
+  // A role the map does not hold (a hand-edited row, a value from a later enum)
+  // edits nothing: 403, never a TypeError's 500 (DECISIONS 71).
   const classes = Object.hasOwn(EDITABLE_CLASSES, role) ? EDITABLE_CLASSES[role] : undefined;
   return settingClass !== null && classes !== undefined && classes.has(settingClass);
 }

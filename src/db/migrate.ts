@@ -26,8 +26,8 @@ import type pg from 'pg';
  * pasted into the SQL editor sets no actor, and its audit rows would record
  * NULL, which STAFF-74 forbids: steps go through this runner, never the editor.)
  *
- * **The header.** A step's leading comment lines may carry directives, one per
- * line, exactly `-- migrate: <directive>`:
+ * **The header.** A step's leading comment lines (ended by LF, CRLF or a lone
+ * CR) may carry directives, one per line, exactly `-- migrate: <directive>`:
  *
  *   - `-- migrate: no-transaction` — for `ALTER TYPE … ADD VALUE` and anything
  *     else that must commit on its own. The bytes run bare (Postgres runs a
@@ -42,10 +42,23 @@ import type pg from 'pg';
  *     Redis key family the runner ever touches. For a seed step that changes a
  *     class price (question 27 (a): a price change is a seed step after
  *     Shanthi's notice). No LG1 step declares it.
+ *   - `-- migrate: census-empty <table>` — a gate, not a reading: inside the
+ *     step's transaction, before its bytes, the runner takes `<table>`'s
+ *     ACCESS EXCLUSIVE lock (so no row can land between the count and the
+ *     step) and stops, rolling back, unless `SELECT count(*)` is 0. M1.19
+ *     declares it on `staff` (design.md:2122-2128): the role cast must meet
+ *     no live staff row on production or on the rehearsal's production-shaped
+ *     copy. Only a caller with `skipCensus` naming the table passes a
+ *     non-empty one — the CLI's `--skip-census <table>`, which it refuses for
+ *     every project but `local` (dev takes the cast on its seeded roster). It
+ *     cannot combine with `no-transaction`.
  *
- * An unknown directive, or a `-- migrate:` line below the header, is refused:
- * a misspelt `no-transaction` must not silently run in a transaction, and a
- * misspelt cache clear must not silently leave stale class prices.
+ * An unknown directive, a `-- migrate:` line below the header, or a line that
+ * looks like one but is not its exact form (`-- Migrate:`, `-- migrate :`, a
+ * block comment opening `migrate:`) is refused: a misspelt `no-transaction`
+ * must not silently run in a transaction, a misspelt cache clear must not
+ * silently leave stale class prices, and a misspelt census gate must not
+ * switch off.
  *
  * **What is refused before anything runs.** A file name without a step id; a
  * file that is not UTF-8; a file containing transaction control (`BEGIN`,
@@ -75,6 +88,8 @@ export interface StepFile {
   sql: string;
   sha256: string;
   directives: ReadonlySet<StepDirective>;
+  /** Tables that must be empty before the step runs (`census-empty`). */
+  censusEmpty: readonly string[];
 }
 
 export type Refusal = { ok: false; reason: string };
@@ -108,6 +123,14 @@ export function parseStep(fileName: string, bytes: Buffer): Parsed<{ step: StepF
   }
   const header = parseHeader(sql);
   if (!header.ok) return { ok: false, reason: `${fileName}: ${header.reason}` };
+  if (header.directives.has('no-transaction') && header.censusEmpty.length > 0) {
+    return {
+      ok: false,
+      reason:
+        `${fileName}: a census gate needs the runner's transaction — the count and the step must ` +
+        'commit or roll back together — so census-empty cannot combine with no-transaction',
+    };
+  }
 
   if (!header.directives.has('no-transaction')) {
     const hits = findTransactionControl(sql);
@@ -132,21 +155,39 @@ export function parseStep(fileName: string, bytes: Buffer): Parsed<{ step: StepF
       sql,
       sha256: createHash('sha256').update(bytes).digest('hex'),
       directives: header.directives,
+      censusEmpty: header.censusEmpty,
     },
   };
 }
 
 const DIRECTIVE_LINE = /^--\s*migrate:\s*(.*?)\s*$/;
+/** A comment that opens like a directive in any other spelling. */
+const NEAR_DIRECTIVE = /^(?:--|\/\*)\s*migrate\s*:/i;
+const CENSUS_EMPTY = /^census-empty(?:\s+(.*))?$/;
+/** A plain, unquoted table name: the runner interpolates it into SQL. */
+const PLAIN_TABLE = /^[a-z_][a-z0-9_]*$/;
 
-function parseHeader(sql: string): Parsed<{ directives: ReadonlySet<StepDirective> }> | Refusal {
+function parseHeader(
+  sql: string,
+): Parsed<{ directives: ReadonlySet<StepDirective>; censusEmpty: readonly string[] }> | Refusal {
   const directives = new Set<StepDirective>();
-  const lines = sql.split(/\r?\n/);
+  const censusEmpty: string[] = [];
+  // Postgres ends a `--` comment at CR as well as LF: a lone CR ends a line too.
+  const lines = sql.split(/\r\n|\r|\n/);
   let inHeader = true;
   for (const [index, raw] of lines.entries()) {
     const line = raw.trim();
     if (inHeader && line !== '' && !line.startsWith('--')) inHeader = false;
     const directive = DIRECTIVE_LINE.exec(line);
-    if (directive === null) continue;
+    if (directive === null) {
+      if (NEAR_DIRECTIVE.test(line)) {
+        return {
+          ok: false,
+          reason: `line ${index + 1}: '${line}' is not a directive's exact form ('-- migrate: <directive>': a -- comment, lower case, no space before the colon)`,
+        };
+      }
+      continue;
+    }
     if (!inHeader) {
       return {
         ok: false,
@@ -154,15 +195,27 @@ function parseHeader(sql: string): Parsed<{ directives: ReadonlySet<StepDirectiv
       };
     }
     const value = directive[1] ?? '';
+    const census = CENSUS_EMPTY.exec(value);
+    if (census !== null) {
+      const table = census[1] ?? '';
+      if (!PLAIN_TABLE.test(table)) {
+        return {
+          ok: false,
+          reason: `line ${index + 1}: census-empty takes one plain table name (lower case, unquoted), got '${table}'`,
+        };
+      }
+      censusEmpty.push(table);
+      continue;
+    }
     if (!DIRECTIVES.has(value)) {
       return {
         ok: false,
-        reason: `line ${index + 1}: unknown directive '-- migrate: ${value}' (known: ${[...DIRECTIVES].join(', ')})`,
+        reason: `line ${index + 1}: unknown directive '-- migrate: ${value}' (known: ${[...DIRECTIVES].join(', ')}, census-empty <table>)`,
       };
     }
     directives.add(value as StepDirective);
   }
-  return { ok: true, directives };
+  return { ok: true, directives, censusEmpty };
 }
 
 export interface TransactionControl {
@@ -191,7 +244,7 @@ export interface TransactionControl {
  * costs a half-applied step logged as whole.
  */
 export function findTransactionControl(sql: string): TransactionControl[] {
-  const code = blankNonCode(sql);
+  const code = maskSql(sql);
   const hits: TransactionControl[] = [];
   const lineAt = (offset: number) => code.slice(0, offset).split('\n').length;
 
@@ -219,13 +272,36 @@ export function findTransactionControl(sql: string): TransactionControl[] {
 const IDENTIFIER_START = /[A-Za-z_\u0080-\uffff]/;
 const IDENTIFIER = /^[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/;
 
+/** Which kinds of non-code `maskSql` blanks. Every kind is still LEXED, so a
+ *  `--` inside a kept string is never read as a comment, and vice versa. */
+export interface SqlMask {
+  comments: boolean;
+  /** `'…'` and `E'…'` literals. */
+  strings: boolean;
+  /** `"…"` identifiers. */
+  quotedIdentifiers: boolean;
+  /** `$tag$…$tag$` bodies (function and `DO` bodies). */
+  dollarBodies: boolean;
+}
+
+const MASK_ALL: SqlMask = {
+  comments: true,
+  strings: true,
+  quotedIdentifiers: true,
+  dollarBodies: true,
+};
+
 /**
- * `sql` with every comment, string literal, quoted identifier and dollar-quoted
- * body replaced by spaces (newlines kept, so offsets and line numbers hold).
+ * `sql` with the chosen kinds of non-code replaced by spaces (newlines kept,
+ * so offsets and line numbers hold, and two masks of one file align). The
+ * default blanks every comment, string literal, quoted identifier and
+ * dollar-quoted body — what `findTransactionControl` reads. The static REVOKE
+ * check (`test/migrateRunner.test.ts`) reads narrower masks of the same lexer.
  */
-function blankNonCode(sql: string): string {
+export function maskSql(sql: string, mask: SqlMask = MASK_ALL): string {
   const out = sql.split('');
-  const blank = (from: number, to: number) => {
+  const blankIf = (on: boolean, from: number, to: number) => {
+    if (!on) return;
     for (let i = from; i < to; i += 1) if (out[i] !== '\n') out[i] = ' ';
   };
   let i = 0;
@@ -238,7 +314,7 @@ function blankNonCode(sql: string): string {
       // Postgres ends a `--` comment at CR as well as LF (scan.l: [^\n\r]).
       const end = /[\r\n]/.exec(sql.slice(i));
       const stop = end === null ? sql.length : i + end.index;
-      blank(i, stop);
+      blankIf(mask.comments, i, stop);
       i = stop;
     } else if (ch === '/' && next === '*') {
       let depth = 1;
@@ -254,7 +330,7 @@ function blankNonCode(sql: string): string {
           j += 1;
         }
       }
-      blank(i, j);
+      blankIf(mask.comments, i, j);
       i = j;
     } else if (ch === "'") {
       // E'…' strings take backslash escapes; every string takes '' as a quote.
@@ -274,7 +350,7 @@ function blankNonCode(sql: string): string {
           j += 1;
         }
       }
-      blank(i, j);
+      blankIf(mask.strings, i, j);
       i = j;
     } else if (ch === '"') {
       let j = i + 1;
@@ -285,7 +361,7 @@ function blankNonCode(sql: string): string {
           break;
         } else j += 1;
       }
-      blank(i, j);
+      blankIf(mask.quotedIdentifiers, i, j);
       i = j;
     } else if (IDENTIFIER_START.test(ch ?? '')) {
       // An identifier or keyword, read whole: a `$` inside one is part of it.
@@ -295,14 +371,17 @@ function blankNonCode(sql: string): string {
       lastWord = word;
       lastWordEnd = i;
     } else if (ch === '$') {
-      const tag = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
+      // A tag takes the identifier rule's characters, minus `$`: Postgres's
+      // dolq_start/dolq_cont include every byte \200-\377, so any non-ASCII
+      // character is a tag character (`$é$`, `$aé$`, `$\u00a0$`; P02 item 0b).
+      const tag = /^\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/.exec(sql.slice(i));
       if (tag === null) {
         i += 1; // `$1` — a parameter, not a quote
         continue;
       }
       const close = sql.indexOf(tag[0], i + tag[0].length);
       const stop = close === -1 ? sql.length : close + tag[0].length;
-      blank(i, stop);
+      blankIf(mask.dollarBodies, i, stop);
       i = stop;
     } else {
       i += 1;
@@ -453,6 +532,12 @@ export interface ApplyOptions {
   appliedBy: string;
   /** Clears one Redis key pattern; required for an `invalidate-class-catalog` step. */
   invalidateCache?: (pattern: string) => Promise<void>;
+  /**
+   * Census gates this caller waives (dev only: the CLI refuses it for any
+   * project but `local`). Each name must be one of the step's `census-empty`
+   * tables, or nothing runs — a typo must not leave a gate silently on or off.
+   */
+  skipCensus?: readonly string[];
 }
 
 export type ApplyResult =
@@ -474,6 +559,18 @@ export async function applyStep(
   options: ApplyOptions,
 ): Promise<ApplyResult> {
   const actor = `system:migrate-${step.stepId}`;
+  const waived = options.skipCensus ?? [];
+  const unknownWaiver = waived.filter((table) => !step.censusEmpty.includes(table));
+  if (unknownWaiver.length > 0) {
+    return {
+      ok: false,
+      committed: false,
+      reason:
+        `--skip-census ${unknownWaiver.join(', ')} names no census gate of ${step.stepId} ` +
+        `(its gates: ${step.censusEmpty.length === 0 ? 'none' : step.censusEmpty.join(', ')}). Nothing was run.`,
+    };
+  }
+  const censused = step.censusEmpty.filter((table) => !waived.includes(table));
   const clearsCache = step.directives.has('invalidate-class-catalog');
   if (clearsCache && options.invalidateCache === undefined) {
     return {
@@ -551,6 +648,35 @@ export async function applyStep(
       await client.query('BEGIN');
       await client.query("SELECT set_config('app.actor', $1, true)", [actor]);
       before = await currentTxid(client);
+      if (censused.length > 0) {
+        // Every authenticated request reads `staff` (the mirror): queued behind
+        // a long or idle transaction, the census lock would stall them all for
+        // as long as it waited. Wait a few seconds at most, then fail ("lock
+        // timeout") and roll back — for the rest of the step too, which holds
+        // that lock while it runs.
+        await client.query("SET LOCAL lock_timeout = '5s'");
+      }
+      for (const table of censused) {
+        // The step's own lock, taken first: no row lands between the count
+        // and the step (PLAIN_TABLE vetted the name at parse).
+        await client.query(`LOCK TABLE "${table}" IN ACCESS EXCLUSIVE MODE`);
+        const counted = await client.query<{ n: string }>(
+          `SELECT count(*)::text AS n FROM "${table}"`,
+        );
+        const rows = Number(counted.rows[0]?.n ?? 'NaN');
+        if (rows !== 0) {
+          await client.query('ROLLBACK');
+          return {
+            ok: false,
+            committed: false,
+            reason:
+              `${step.stepId} census gate: ${table} holds ${rows} row${rows === 1 ? '' : 's'}, and this ` +
+              `step runs only on an empty ${table} (a gate, not a reading). Rolled back; nothing was ` +
+              'applied or logged. On a dev database whose seeded rows the step maps, re-run with ' +
+              `--skip-census ${table} (--project local only).`,
+          };
+        }
+      }
       await client.query(step.sql);
       // The step must still be inside the transaction the runner opened. A
       // commit or rollback the parser missed (DECISIONS 64) shows up as a new

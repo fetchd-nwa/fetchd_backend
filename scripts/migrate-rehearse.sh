@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `scripts/migrate-rehearse.sh [--base <git-ref>] [--leave-out <step_id>]`
+# `scripts/migrate-rehearse.sh [--base <git-ref>] [--leave-out <step_id>] [--plant-staff-row]`
 # (`npm run migrate:rehearse -- …`) — rehearse a landing group's migration steps
 # on a throwaway database and prove they produce exactly the schema of record.
 # Design §4 preamble ("The rehearsal"), DECISIONS 51 and 52; S01.
@@ -33,6 +33,12 @@
 # `v1-lg0-close`); never `main`, which moves only at milestone ends.
 # --leave-out <step_id> skips one step: the instrument's own red proof (a
 # rehearsal missing a step must report differences and exit 1).
+# --plant-staff-row inserts ONE staff row into the production-shaped copy right
+# after the base load: the red proof of M1.19's census gate (P02; design.md:
+# 2122-2128). The run must then stop at M1.19 — the runner refuses the step
+# because `staff` is not empty — and exit 1, with M1.18 and everything before
+# it applied. The rehearsal never passes `--skip-census`: the gate binds here
+# exactly as it binds production.
 #
 # Not part of `npm run gate`: it runs per landing group between GATE GREEN and
 # merge. Needs Docker. What it cannot prove: seed rows (the fingerprint reads
@@ -50,10 +56,12 @@ cd "$(dirname "$0")/.." || exit 1
 
 BASE=""
 LEAVE_OUT=""
+PLANT_STAFF_ROW=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) BASE="${2:?--base needs a git ref}"; shift 2 ;;
     --leave-out) LEAVE_OUT="${2:?--leave-out needs a step id}"; shift 2 ;;
+    --plant-staff-row) PLANT_STAFF_ROW=1; shift ;;
     *) echo "migrate-rehearse: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -141,6 +149,15 @@ ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON FUNCTIO
 SQL
 
 psql_value() { docker exec -i "$CONTAINER" psql -X -q -At -v ON_ERROR_STOP=1 -U postgres -d "$1"; }
+
+if [ -n "$PLANT_STAFF_ROW" ]; then
+  # A production that already holds a staffer: one row in the BASE's shape
+  # ('trainer' is a value of both the old enum and the new one).
+  psql_in rehearsal <<'SQL'
+INSERT INTO staff (supabase_uid, name, role) VALUES (gen_random_uuid(), 'Census Probe', 'trainer');
+SQL
+  echo "migrate-rehearse: planted one staff row in the production-shaped copy — M1.19's census gate must stop the run"
+fi
 
 # The default grants to anon/authenticated that role postgres holds — in public,
 # or global. Empty after the steps; NOT empty before them (else the check below

@@ -56,11 +56,15 @@ export const staffRepository = {
    * Resolve a batch of staff ids to full participant rows (id + name + role
    * + image_path) for thread-participant emission. Day-7a addition for
    * Thread.participant per DATA-CONTRACT §B (the participant key needs
-   * role + image_path beyond the trainer-name shape). Soft-expired staff
-   * are excluded — a thread referencing a departed staffer returns
-   * `undefined` for that id, which the route maps to a Reception sentinel
-   * (TBD when that case first appears; today every fixture thread has a
-   * live participant).
+   * role + image_path beyond the trainer-name shape).
+   *
+   * EXPIRED staff resolve too (P02; design §2.1:2025-2029, r4-opus #4): a
+   * departed staffer stays the participant of the threads she was on, and
+   * `npm run staff:provision -- --expire` creates exactly that case — a
+   * live-only read would make `wireManyThreads` throw and 500 the owner's
+   * `GET /threads` and the staff queue the day someone is off-boarded. The
+   * design gives this read to MSG-U03 (P31); it is pulled forward because P02
+   * ships `--expire`.
    */
   async findParticipantsByIds(
     ids: string[],
@@ -74,6 +78,6 @@ export const staffRepository = {
         imagePath: staff.imagePath,
       })
       .from(staff)
-      .where(and(inArray(staff.id, ids), live(staff)));
+      .where(inArray(staff.id, ids));
   },
 };

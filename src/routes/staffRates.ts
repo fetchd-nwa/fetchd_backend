@@ -1,6 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import {
+  requirePrincipal,
+  requireStaffRole,
+  resolveAuthHook,
+  type AuthRouteOptions,
+} from '../auth/plugin.js';
 import type {
   PostStaffRatesRequest,
   StaffRateWire,
@@ -166,55 +171,63 @@ export function registerStaffRatesRoute(
   // --- POST /staff/rates ------------------------------------------------
   // Set the rate for one (category, location) track, effective-dated. Returns
   // the resulting current/scheduled row. Idempotency-Key required.
-  app.post('/staff/rates', { preHandler: [authHook] }, async (request): Promise<StaffRateWire> => {
-    const principal = requirePrincipal(request);
-    requireStaff(principal, 'set a service rate');
-    const body = parseOrThrow(postBodySchema, request.body, 'body');
-    const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+  // STAFF-U07 (design §2.1:2080-2091): owner and manager, whole. The shared
+  // (category, campus) track has no trainer axis; DAY-U23 narrows the route at
+  // design 4.0.0. `capabilities.edit_prices` is NOT this route's gate.
+  const ownerOrManager = requireStaffRole('owner', 'manager');
+  app.post(
+    '/staff/rates',
+    { preHandler: [authHook, ownerOrManager] },
+    async (request): Promise<StaffRateWire> => {
+      const principal = requirePrincipal(request);
+      requireStaff(principal, 'set a service rate');
+      const body = parseOrThrow(postBodySchema, request.body, 'body');
+      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
-    const today = bucketChicagoToday(nowFactory());
-    const effectiveFrom = body.effective_from ?? today;
-    if (effectiveFrom < today) {
-      throw new ApiError(
-        'invalid_payload',
-        `effective_from ${effectiveFrom} is in the past (today in America/Chicago is ${today}); rates can't be back-dated`,
-      );
-    }
-    if (PER_DAY_REQUIRED_CATEGORIES.has(body.category) && body.unit !== 'per-day') {
-      throw new ApiError(
-        'invalid_payload',
-        `${body.category} is billed per booking day; unit must be 'per-day' (got '${body.unit}')`,
-      );
-    }
-
-    const outcome = await withMutation<StaffRateWire>(
-      {
-        principal,
-        idempotencyKey,
-        endpoint: 'POST /staff/rates',
-        requestHash: hashRequestBody({ ...body, effective_from: effectiveFrom }),
-        // No cache wipe: service_rates is read direct from pg (no Redis read-
-        // through) by both GET /rates and the PAYG booking path.
-        keysToInvalidate: () => [],
-      },
-      async (tx) => {
-        const result = await withServiceRateLock(tx, body.category, body.location, () =>
-          serviceRatesRepository.supersedeRate(tx, {
-            category: body.category,
-            location: body.location,
-            amountCents: body.amount_cents,
-            unit: body.unit,
-            effectiveFrom,
-            note: body.note ?? null,
-            createdByStaffId: principal.staffId,
-          }),
+      const today = bucketChicagoToday(nowFactory());
+      const effectiveFrom = body.effective_from ?? today;
+      if (effectiveFrom < today) {
+        throw new ApiError(
+          'invalid_payload',
+          `effective_from ${effectiveFrom} is in the past (today in America/Chicago is ${today}); rates can't be back-dated`,
         );
-        return { status: 200, body: toStaffRateWire(result.row) };
-      },
-    );
+      }
+      if (PER_DAY_REQUIRED_CATEGORIES.has(body.category) && body.unit !== 'per-day') {
+        throw new ApiError(
+          'invalid_payload',
+          `${body.category} is billed per booking day; unit must be 'per-day' (got '${body.unit}')`,
+        );
+      }
 
-    return outcome.body;
-  });
+      const outcome = await withMutation<StaffRateWire>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /staff/rates',
+          requestHash: hashRequestBody({ ...body, effective_from: effectiveFrom }),
+          // No cache wipe: service_rates is read direct from pg (no Redis read-
+          // through) by both GET /rates and the PAYG booking path.
+          keysToInvalidate: () => [],
+        },
+        async (tx) => {
+          const result = await withServiceRateLock(tx, body.category, body.location, () =>
+            serviceRatesRepository.supersedeRate(tx, {
+              category: body.category,
+              location: body.location,
+              amountCents: body.amount_cents,
+              unit: body.unit,
+              effectiveFrom,
+              note: body.note ?? null,
+              createdByStaffId: principal.staffId,
+            }),
+          );
+          return { status: 200, body: toStaffRateWire(result.row) };
+        },
+      );
+
+      return outcome.body;
+    },
+  );
 
   // --- POST /staff/rates/:id/void ---------------------------------------
   // Cancel/remove one entry (a scheduled future change or the current rate).
@@ -222,7 +235,7 @@ export function registerStaffRatesRoute(
   // is no way to trap a track. Returns the voided row. Idempotency-Key required.
   app.post(
     '/staff/rates/:id/void',
-    { preHandler: [authHook] },
+    { preHandler: [authHook, ownerOrManager] },
     async (request): Promise<StaffRateWire> => {
       const principal = requirePrincipal(request);
       requireStaff(principal, 'void a service rate');

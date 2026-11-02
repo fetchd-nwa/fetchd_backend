@@ -4,14 +4,28 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { owners, staff } from '../db/schema/schema.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
-import type { MeWire, PatchMeRequest, StaffMeWire } from '../contracts/wire.js';
+import type {
+  MeWire,
+  PatchMeRequest,
+  StaffCapabilitiesWire,
+  StaffMeWire,
+} from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
-import { slugToDisplay, displayToSlug, LOCATION_DISPLAY_NAMES } from '../lib/locations.js';
+import {
+  slugToDisplay,
+  displayToSlug,
+  LOCATION_DISPLAY,
+  LOCATION_DISPLAY_NAMES,
+  type LocationDisplay,
+  type LocationKey,
+} from '../lib/locations.js';
 import { assertOwnedImagePath, buildProfileImageUrlResolver } from '../lib/profileImageUrls.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import { staffCapabilities } from '../lib/staffCapabilities.js';
 
 /**
  * Owner `/me` is a **frozen wire shape** — the exact keys the FE `toUser`
@@ -70,21 +84,37 @@ function ownerProfile(row: typeof owners.$inferSelect): MeWire {
 }
 
 /**
- * Staff `/me` — the mirror row the portal renders "who am I" from. RATIFIED AND
- * FROZEN at wire 1.13.0 as `StaffMeWire` (contracts/wire.ts, domain:auth-media),
- * discharging NOTE-35's "ratify before the portal consumes it". The shape was
- * frozen exactly as it was already emitted; nothing was added or renamed. Any
- * change from here is a contract change with a version bump.
+ * Staff `/me` — the mirror row the portal renders "who am I" from, and what
+ * the staffer may do. RATIFIED AND FROZEN at wire 1.13.0 as `StaffMeWire`
+ * (NOTE-35); changed at 2.0.0-lg1.2 (P02): `role` speaks owner | manager |
+ * trainer (M1.19), `location` became `home_locations` — display labels, never
+ * empty (M1.20's CHECK) — `active` went with `staff.active`, and
+ * `capabilities` arrived (STAFF-U07), computed from the SAME row's role.
  */
-function staffProfile(row: typeof staff.$inferSelect): StaffMeWire {
+function staffProfile(
+  row: typeof staff.$inferSelect,
+  capabilities: StaffCapabilitiesWire,
+): StaffMeWire {
   return {
     id: row.id,
     name: row.name,
     role: row.role,
-    location: row.location !== null ? slugToDisplay(row.location) : null,
+    home_locations: row.homeLocations.map(homeLabel),
     image_path: row.imagePath ?? '',
-    active: row.active,
+    capabilities,
   };
+}
+
+/**
+ * A home campus's display label. A slug the static map cannot render — a
+ * `locations` row added without a label, or a hand edit — is a loud 500,
+ * never a `null` in a list the wire promises is display labels (DECISIONS 79).
+ */
+function homeLabel(slug: LocationKey): LocationDisplay {
+  if (!Object.hasOwn(LOCATION_DISPLAY, slug)) {
+    throw new Error(`staff.home_locations holds '${slug}', which has no display label`);
+  }
+  return slugToDisplay(slug);
 }
 
 // Editable owner fields. `.strict()` rejects unknown keys (a typo doesn't
@@ -190,7 +220,12 @@ export function registerMeRoute(app: FastifyInstance, opts: MeRouteOpts = {}): v
     if (!row) {
       throw new ApiError('not_provisioned', 'staff record no longer available');
     }
-    return staffProfile(row);
+    // Read on every call (no cache): an owner's list edit shows at the next GET.
+    const [lists, refundAnyRoleLimitCents] = await Promise.all([
+      settingsRepository.staff(),
+      settingsRepository.refundAnyRoleLimitCents(),
+    ]);
+    return staffProfile(row, staffCapabilities(row.role, lists, refundAnyRoleLimitCents));
   });
 
   app.patch('/me', { preHandler: [authHook] }, async (request, reply) => {

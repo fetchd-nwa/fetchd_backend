@@ -148,6 +148,36 @@ export const requireStaff: preHandlerHookHandler = async function requireStaff(
 };
 
 /**
+ * `[staff: <roles>]` guard (STAFF-U07; design §2.1:2049-2050), beside
+ * `requireStaff`: a staff principal whose role is one of `roles`. An owner
+ * (family) principal, or a staff role off the list, is 403 `forbidden`.
+ * Composes after `authenticate` (`preHandler: [authHook,
+ * requireStaffRole('owner', 'manager')]`), so it runs before the handler parses
+ * a body: a refused caller learns nothing about the body's validity.
+ *
+ * The role is the principal's — the mirror row's, read at sign-in. Which
+ * routes take which roles is each route's declaration; what a role may do
+ * among the settings is the registry's (`settingsRegistry.mayEditClass`), and
+ * the verbs whose roles are data (the five `staff_settings` lists) read those
+ * lists at the verb, as `GET /me`'s capabilities do.
+ */
+export function requireStaffRole(...roles: [StaffRole, ...StaffRole[]]): preHandlerHookHandler {
+  const allowed: ReadonlySet<StaffRole> = new Set(roles);
+  const needs = roles.join(' or ');
+  return async function requireStaffRoleGuard(request: FastifyRequest): Promise<void> {
+    if (!request.principal) {
+      throw new ApiError('unauthenticated', 'requireStaffRole used without authenticate');
+    }
+    if (request.principal.kind !== 'staff') {
+      throw new ApiError('forbidden', 'staff role required');
+    }
+    if (!allowed.has(request.principal.role)) {
+      throw new ApiError('forbidden', `this action needs the ${needs} role`);
+    }
+  };
+}
+
+/**
  * Narrow `request.principal` to non-null inside an `[auth]` handler. It is a
  * programming error (not a user-reachable state) to call this on a route that
  * did not run `authenticate`; failing loud beats a null-deref three calls deep.

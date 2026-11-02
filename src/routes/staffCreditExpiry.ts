@@ -1,6 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import {
+  requirePrincipal,
+  requireStaffRole,
+  resolveAuthHook,
+  type AuthRouteOptions,
+} from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import {
   creditExpirySettingsRepository,
@@ -118,9 +123,12 @@ export function registerStaffCreditExpiryRoute(
   //
   // Non-retroactive: future purchases at this location stamp their lot expiry
   // from the new window; already-stamped lots keep their expires_at.
+  // STAFF-U07 (design §2.1:2080-2086; contract notes X2): owner and manager,
+  // WHOLE — no per-field case, so a body changing only `warning_lead_days` is
+  // refused to the trainer too. The route goes at design 5.0.0 (M4.07).
   app.post(
     '/staff/credit-expiry-settings',
-    { preHandler: [authHook] },
+    { preHandler: [authHook, requireStaffRole('owner', 'manager')] },
     async (request): Promise<CreditExpirySettingWire> => {
       const principal = requirePrincipal(request);
       requireStaff(principal, 'edit the credit-expiry settings');

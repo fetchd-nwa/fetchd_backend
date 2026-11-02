@@ -23,12 +23,15 @@ import {
   type SettingsAuditKey,
   type SettingsDomain,
   type SettingsPatchByDomain,
+  type StaffSettingsWire,
   type VaccineSettingsWire,
 } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
+import { staffRole } from '../db/schema/schema.js';
 import type { Tx } from '../db/tx.js';
 import { ApiError } from '../lib/errors.js';
+import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import {
   SETTINGS_REGISTRY,
@@ -42,11 +45,11 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
  * `GET` and `PATCH /staff/settings/:domain[/:location]` `[staff]` — every
- * staff-editable setting of the thirteen P01 domains (SET-U01, STAFF-U07's
- * per-key class gate; design §1.1:628-649, §2.1:1849-1869; wire 2.0.0-lg1.1
- * § settings). `day` and `eval` have two tiers: the bare path is the global
- * row, `/:location` that campus's row. Any staff role reads every key; an
- * owner (family) principal is 403.
+ * staff-editable setting of the fourteen domains (SET-U01, STAFF-U07's per-key
+ * class gate; design §1.1:628-649, §2.1:1849-1869; wire 2.0.0-lg1.2
+ * § settings; `staff` is P02's, M1.21). `day` and `eval` have two tiers: the
+ * bare path is the global row, `/:location` that campus's row. Any staff role
+ * reads every key; an owner (family) principal is 403.
  *
  * **The PATCH.** Partial: the editor sends its dirty set and every key in the
  * body is an edit (no stored-value compare). A jsonb key is one value, replaced
@@ -91,10 +94,21 @@ type Target =
   | { domain: Exclude<SettingsDomain, 'day' | 'eval'>; location: null }
   | { domain: 'day' | 'eval'; location: LocationKey | null };
 
-function targetName(target: { domain: SettingsDomain; location: LocationKey | null }): string {
-  if (!TIERED.has(target.domain)) return target.domain;
+/** What a body plan is keyed by: a domain, or a two-tier domain's tier. */
+type TargetName =
+  | Exclude<SettingsDomain, 'day' | 'eval'>
+  | 'day/global'
+  | 'day/campus'
+  | 'eval/global'
+  | 'eval/campus';
+
+function targetName(target: { domain: SettingsDomain; location: LocationKey | null }): TargetName {
+  if (target.domain !== 'day' && target.domain !== 'eval') return target.domain;
   return `${target.domain}/${target.location === null ? 'global' : 'campus'}`;
 }
+
+/** The staff roles, from the pgEnum: a role-list member outside it is 400. */
+const STAFF_ROLES = pgEnumTuple(staffRole);
 
 const pathSchema = z
   .object({ domain: z.enum(SETTINGS_DOMAINS), location: z.enum(LOCATIONS).optional() })
@@ -170,6 +184,12 @@ function shapeOf(value: SettingValue, perScope: boolean): z.ZodTypeAny {
       return z.array(z.string());
     case 'integer-list':
       return z.array(z.number());
+    case 'role-list':
+      // An unknown role and a repeated one are both a bad shape: 400
+      // bad_request (DECISIONS 59). An empty list is the 422 below.
+      return z
+        .array(z.enum(STAFF_ROLES))
+        .refine((list) => new Set(list).size === list.length, 'must not name a role twice');
     case 'record': {
       const member = value.value.nullable === true ? z.string().nullable() : z.string();
       return z.object(Object.fromEntries(value.keys.map((k) => [k, member]))).strict();
@@ -272,6 +292,9 @@ function boundsError(value: SettingValue, input: unknown, perScope: boolean): st
       const ok = list.every((n) => Number.isInteger(n) && n >= value.min && n <= max);
       return ok ? null : `every entry must be a whole number from ${value.min} to ${max}`;
     }
+    case 'role-list':
+      // The column's CHECK (cardinality > 0): a verb no role may use.
+      return (input as string[]).length === 0 ? 'must name at least one role' : null;
     case 'record': {
       const entries = Object.entries(input as Record<string, string | null>);
       const bad = entries.filter(([, v]) =>
@@ -319,7 +342,11 @@ function isPerScope(entry: SettingEntry): boolean {
 type Keys<T> = Record<keyof T, true>;
 type BodyOf<W> = Omit<W, SettingsAuditKey | 'location'>;
 
-const WIRE_BODY_KEYS: Record<string, Record<string, true>> = {
+// Keyed by EVERY target name, so a domain appended to the wire's
+// `SETTINGS_DOMAINS` does not compile until its body is pinned here — the
+// load-time agreement check below can never compare an absent plan with an
+// absent pin and pass (P02; contract notes Part 4 item 2).
+const WIRE_BODY_KEYS: Readonly<Record<TargetName, Record<string, true>>> = {
   acct: {
     email_verification_grace_days: true,
     close_blocked_by_pending_refund_enabled: true,
@@ -458,6 +485,14 @@ const WIRE_BODY_KEYS: Record<string, Record<string, true>> = {
     proof_file_types: true,
     typical_full_vaccination_age_months: true,
   } satisfies Keys<BodyOf<VaccineSettingsWire>>,
+  staff: {
+    refund_roles: true,
+    credit_hand_edit_roles: true,
+    desk_sale_roles: true,
+    custom_invoice_roles: true,
+    cash_day_totals_roles: true,
+    portal_idle_signout_minutes: true,
+  } satisfies Keys<BodyOf<StaffSettingsWire>>,
 };
 
 /** Every row a path can address. */
@@ -473,13 +508,13 @@ export const SETTINGS_TARGETS: ReadonlyArray<{
     : [{ domain, location: null }],
 );
 
-const PLANS = new Map<string, Plan>(SETTINGS_TARGETS.map((t) => [targetName(t), planFor(t)]));
+const PLANS = new Map<TargetName, Plan>(SETTINGS_TARGETS.map((t) => [targetName(t), planFor(t)]));
 
 // The registry and the wire must agree on every body's key set — checked once,
 // at load, so a server whose registry drifted from the contract never serves.
 for (const [name, plan] of PLANS) {
   const generated = [...plan.fields.keys()].sort();
-  const wire = Object.keys(WIRE_BODY_KEYS[name] ?? {}).sort();
+  const wire = Object.keys(WIRE_BODY_KEYS[name]).sort();
   if (generated.join(',') !== wire.join(',')) {
     throw new Error(
       `settings registry and wire.ts disagree on the ${name} body: registry [${generated.join(', ')}], wire [${wire.join(', ')}]`,
@@ -546,6 +581,8 @@ async function read(target: Target, runner?: Tx): Promise<GetStaffSettingsRespon
       return settingsRepository.reports(runner);
     case 'vax':
       return settingsRepository.vaccine(runner);
+    case 'staff':
+      return settingsRepository.staff(runner);
   }
 }
 

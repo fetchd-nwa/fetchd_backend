@@ -259,3 +259,74 @@ test('outside production an http origin is fine (the portal dev server)', () => 
   );
   assert.equal(result.status, 0, result.stderr);
 });
+
+/**
+ * **A malformed `PORTAL_ORIGIN` in production is refused by name, not by a
+ * TypeError** (P02 item 0a; Opus r3 M1, DECISIONS 72).
+ *
+ * The origin transform answers a bad entry with `z.NEVER`, and zod still runs
+ * the production `superRefine` on the dirty object — where `PORTAL_ORIGIN` is
+ * then not an array. Unguarded, `.filter` threw, and the boot died on
+ * `TypeError: value.PORTAL_ORIGIN.filter is not a function`: the designed
+ * "not an exact origin" refusal was swallowed, and so was every other refusal
+ * in the same parse (here, the missing `SENTRY_DSN`). Probe:
+ * `units/P02/evidence/probe-env-regression.out`.
+ */
+test('production with a malformed PORTAL_ORIGIN exits 1 naming it "not an exact origin", with no TypeError, and still reports the other refusals', () => {
+  for (const origin of [
+    'https://portal.fetchd.invalid/',
+    '*',
+    'HTTPS://PORTAL.FETCHD.INVALID',
+    'https://portal.fetchd.invalid:443',
+    'https://portal.fetchd.invalid/app',
+  ]) {
+    // No SENTRY_DSN on purpose: its refusal must survive beside the origin's.
+    const boot = bootEnv({ NODE_ENV: 'production', PORTAL_ORIGIN: origin });
+    assert.equal(boot.status, 1, `${origin}: expected exit 1; stdout: ${boot.stdout}`);
+    assert.equal(boot.stdout, '', `${origin}: the process reached past the env contract`);
+    assert.doesNotMatch(boot.stderr, /TypeError/, `${origin}: ${boot.stderr}`);
+    assert.match(boot.stderr, /Invalid environment — refusing to boot/, `${origin}`);
+    assert.match(boot.stderr, /PORTAL_ORIGIN: .*not an exact origin/, `${origin}: ${boot.stderr}`);
+    assert.match(boot.stderr, /SENTRY_DSN/, `${origin}: the other refusal was swallowed`);
+  }
+});
+
+/**
+ * **The dev bypass is off in production, whatever the env says** (STAFF-U02;
+ * design.md:1959-1961). `resolveBypassHeaderEnabled` is module-private and
+ * read at load, so it is pinned the way the other boot rules are: a real
+ * process, `NODE_ENV=production` with `BYPASS_HEADER_ENABLED=true`, printing
+ * the exported `bypassHeaderEnabled`. A bypass that honoured
+ * `X-Dev-Principal: staff:<id>:owner` in production would hand anyone the
+ * owner role.
+ */
+test('NODE_ENV=production forces the X-Dev-Principal bypass off even with BYPASS_HEADER_ENABLED=true', () => {
+  const run = (nodeEnv: string) =>
+    spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        '-e',
+        "const m = await import('./src/env.js'); process.stdout.write(String(m.bypassHeaderEnabled));",
+      ],
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...BASE_ENV,
+          NODE_ENV: nodeEnv,
+          SENTRY_DSN: PLACEHOLDER_DSN,
+          BYPASS_HEADER_ENABLED: 'true',
+        },
+        encoding: 'utf-8',
+      },
+    );
+  const production = run('production');
+  assert.equal(production.status, 0, production.stderr);
+  assert.equal(production.stdout, 'false');
+  // Control: the same variable in development turns it on, so 'false' above is
+  // the production override and not a misspelt variable.
+  const development = run('development');
+  assert.equal(development.status, 0, development.stderr);
+  assert.equal(development.stdout, 'true');
+});

@@ -12,7 +12,12 @@ import {
 import { env } from '../src/env.js';
 import { ApiError } from '../src/lib/errors.js';
 import { makeVerifyAccessToken } from '../src/auth/jwks.js';
-import { makeAuthenticate, registerAuth, requireStaff } from '../src/auth/plugin.js';
+import {
+  makeAuthenticate,
+  registerAuth,
+  requireStaff,
+  requireStaffRole,
+} from '../src/auth/plugin.js';
 import type { Principal } from '../src/auth/principal.js';
 import { withActor } from '../src/db/tx.js';
 import { sql } from 'drizzle-orm';
@@ -112,6 +117,51 @@ test('a [staff] route admits a staff principal', async () => {
   assert.deepEqual(res.json(), { ok: true });
 });
 
+// --- requireStaffRole (STAFF-U07): beside requireStaff, a role allow-list ---
+
+function roleGuardedApp(resolved: Principal) {
+  const app = Fastify();
+  registerAuth(app);
+  const authenticate = makeAuthenticate({
+    verify: async () => ({ sub: 'ignored' }),
+    resolve: async () => resolved,
+  });
+  app.post(
+    '/staff/money',
+    { preHandler: [authenticate, requireStaffRole('owner', 'manager')] },
+    async () => ({ ok: true }),
+  );
+  return app;
+}
+
+test("requireStaffRole('owner', 'manager') admits the owner and the manager, 403s the trainer and a family", async () => {
+  for (const [principal, status] of [
+    [{ ...STAFF, role: 'owner' }, 200],
+    [{ ...STAFF, role: 'manager' }, 200],
+    [STAFF, 403],
+    [OWNER, 403],
+  ] as const) {
+    const res = await roleGuardedApp(principal as Principal).inject({
+      method: 'POST',
+      url: '/staff/money',
+      headers: BEARER,
+      payload: { anything: 'the guard runs before any body parse' },
+    });
+    assert.equal(res.statusCode, status, `${JSON.stringify(principal)}: ${res.body}`);
+    if (status === 403) assert.equal(res.json().error.code, 'forbidden');
+  }
+});
+
+test('requireStaffRole refuses a role it does not list, even one the enum no longer has', async () => {
+  const stale = { ...STAFF, role: 'owner-shanthi' } as unknown as Principal;
+  const res = await roleGuardedApp(stale).inject({
+    method: 'POST',
+    url: '/staff/money',
+    headers: BEARER,
+  });
+  assert.equal(res.statusCode, 403);
+});
+
 test('a verified-but-unprovisioned token is 403 not_provisioned', async () => {
   const res = await staffGuardedApp(null).inject({
     method: 'GET',
@@ -200,6 +250,27 @@ test('X-Dev-Principal bypass rejects a malformed header value as 400', async () 
   });
   assert.equal(res.statusCode, 400);
   assert.equal(res.json().error.code, 'bad_request');
+});
+
+test('X-Dev-Principal follows the rebuilt staff_role enum: owner and manager construct, owner-shanthi and office are 400 (STAFF-U02)', async () => {
+  for (const role of ['owner', 'manager', 'trainer']) {
+    const res = await bypassApp({ bypassEnabled: true }).inject({
+      method: 'GET',
+      url: '/whoami',
+      headers: { 'x-dev-principal': `staff:${FIXTURE_STAFF_ID}:${role}` },
+    });
+    assert.equal(res.statusCode, 200, `${role}: ${res.body}`);
+    assert.equal(res.json().role, role);
+  }
+  for (const role of ['owner-shanthi', 'office']) {
+    const res = await bypassApp({ bypassEnabled: true }).inject({
+      method: 'GET',
+      url: '/whoami',
+      headers: { 'x-dev-principal': `staff:${FIXTURE_STAFF_ID}:${role}` },
+    });
+    assert.equal(res.statusCode, 400, `${role}: ${res.body}`);
+    assert.match(res.json().error.message, /allowed: owner\|manager\|trainer/);
+  }
 });
 
 test('X-Dev-Principal bypass rejects an unknown staff role as 400', async () => {

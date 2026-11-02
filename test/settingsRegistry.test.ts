@@ -4,7 +4,11 @@ import path from 'node:path';
 import { describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { getTableColumns, getTableName, type Table } from 'drizzle-orm';
-import { NOTIFICATION_TYPES, type StaffRole } from '../src/contracts/wire.js';
+import {
+  NOTIFICATION_TYPES,
+  SETTINGS_DOMAINS as WIRE_SETTINGS_DOMAINS,
+  type StaffRole,
+} from '../src/contracts/wire.js';
 import * as schema from '../src/db/schema/schema.js';
 import {
   SETTINGS_DOMAINS,
@@ -22,8 +26,9 @@ import { SETTINGS_TARGETS, patchableFields } from '../src/routes/staffSettings.j
  *
  *   1. the Drizzle schema — every settings column has exactly one editable
  *      key, and no key names a column or table that is not there;
- *   2. today's role map (DECISIONS 48) — the trainer and office are refused
- *      every `money`, `price` and `roles` key; the owner role every `price` key;
+ *   2. the role map (STAFF-U07, replacing DECISIONS 48's interim map) — the
+ *      trainer is refused every `money` key, every role (the owner included)
+ *      every `price` key in v1, and the manager every `roles` key;
  *   3. the design's §3 — key by key, its class, and its inertness (a §3
  *      *stored* key is inert; the only other inert keys are the 11-02 re-cut's).
  *
@@ -118,37 +123,61 @@ describe('the registry against the Drizzle schema', () => {
   });
 });
 
-describe("the class gate on today's roles (DECISIONS 48)", () => {
+describe('the class gate: owner, manager, trainer (STAFF-U07; design §2.1:1798-1801)', () => {
   const byClass = (cls: SettingClass) => SETTINGS_REGISTRY.filter((e) => e.class === cls);
+  const ROLES = ['owner', 'manager', 'trainer'] as const satisfies readonly StaffRole[];
 
-  test('the trainer and office are refused every money, price and roles key, and pass every ops key', () => {
-    for (const role of ['trainer', 'office'] as const satisfies readonly StaffRole[]) {
-      for (const cls of ['money', 'price', 'roles'] as const) {
-        for (const entry of byClass(cls))
-          assert.equal(mayEditClass(role, entry.class), false, `${role} ${entry.key}`);
-      }
-      for (const entry of byClass('ops'))
-        assert.equal(mayEditClass(role, entry.class), true, `${role} ${entry.key}`);
-    }
+  test('no class is empty, so none of the checks below is vacuous', () => {
+    for (const cls of ['ops', 'money', 'price', 'roles'] as const)
+      assert.ok(byClass(cls).length > 0, `no ${cls} key`);
+  });
+
+  test('the trainer is refused every money key (and every roles key), and passes every ops key', () => {
+    for (const entry of [...byClass('money'), ...byClass('roles')])
+      assert.equal(mayEditClass('trainer', entry.class), false, `trainer ${entry.key}`);
+    for (const entry of byClass('ops'))
+      assert.equal(mayEditClass('trainer', entry.class), true, `trainer ${entry.key}`);
   });
 
   test('every role, the owner included, is refused every price key (question 27 → (a))', () => {
-    assert.ok(byClass('price').length > 0, 'no price key to refuse — the check would be vacuous');
-    for (const role of [
-      'owner-shanthi',
-      'trainer',
-      'office',
-    ] as const satisfies readonly StaffRole[]) {
+    for (const role of ROLES) {
       for (const entry of byClass('price'))
         assert.equal(mayEditClass(role, entry.class), false, `${role} ${entry.key}`);
     }
   });
 
+  test('the manager is refused every roles key, and passes every ops and money key', () => {
+    for (const entry of byClass('roles'))
+      assert.equal(mayEditClass('manager', entry.class), false, `manager ${entry.key}`);
+    for (const entry of [...byClass('ops'), ...byClass('money')])
+      assert.equal(mayEditClass('manager', entry.class), true, `manager ${entry.key}`);
+  });
+
   test('the owner role passes ops, money and roles; no role edits a classless key', () => {
     for (const cls of ['ops', 'money', 'roles'] as const)
-      assert.equal(mayEditClass('owner-shanthi', cls), true);
-    for (const role of ['owner-shanthi', 'trainer', 'office'] as const)
-      assert.equal(mayEditClass(role, null), false);
+      assert.equal(mayEditClass('owner', cls), true);
+    for (const role of ROLES) assert.equal(mayEditClass(role, null), false);
+  });
+
+  test('the staff domain: six keys, every one roles class and live (a reader in this release)', () => {
+    const keys = SETTINGS_REGISTRY.filter((e) => e.domain === 'staff');
+    assert.deepEqual(keys.map((e) => e.key).sort(), [
+      'staff.cash_day_totals_role_list',
+      'staff.credit_hand_edit_role_list',
+      'staff.custom_invoice_role_list',
+      'staff.desk_sale_role_list',
+      'staff.portal_idle_signout_minutes',
+      'staff.refund_role_list',
+    ]);
+    for (const entry of keys) {
+      assert.equal(entry.class, 'roles', entry.key);
+      assert.equal(entry.inert, false, `${entry.key} must not be inert: 61 is 422 invalid_payload`);
+    }
+  });
+
+  test("the registry's domain list IS the wire's tuple (a domain appended there reaches here)", () => {
+    assert.equal(SETTINGS_DOMAINS, WIRE_SETTINGS_DOMAINS);
+    assert.ok(SETTINGS_TABLES.includes('staff_settings'));
   });
 
   test('the counts, per class and inert', (t) => {
@@ -191,23 +220,21 @@ const NOT_LANDED: Readonly<Record<string, string>> = {
   'pay.auto_renew_enabled': 'no LG1 store (per package; contract notes D11)',
 };
 
-/** Keys the registry carries that §3 names no row for. */
 /**
  * Keys whose registry class deliberately differs from §3's, each with the
  * ruling that overrides the design. The check below holds both ends: the
  * registry must carry the ruled class, and §3 must still say what the ruling
  * overrode (if §3 changes, the exception must be revisited, not kept).
+ *
+ * EMPTY since P02: DECISIONS 73 (Allison, "B is good") reverted DECISIONS 60,
+ * so `pay.refund_any_role_limit_cents` is §3.7's `money` again and the §3
+ * check holds every key with no exception.
  */
 const CLASS_OVERRIDES: Readonly<
   Record<string, { design: SettingClass; ruled: SettingClass; why: string }>
-> = {
-  'pay.refund_any_role_limit_cents': {
-    design: 'money',
-    ruled: 'roles',
-    why: 'DECISIONS 60: raising it widens who refunds money, and only the owner widens that (§2.1)',
-  },
-};
+> = {};
 
+/** Keys the registry carries that §3 names no row for. */
 const DESIGN_ADDED: Readonly<Record<string, string>> = {
   'day.offerings': "E03's per-campus service document (M1.07, §2.1)",
 };
@@ -261,7 +288,7 @@ function readSection3(): DesignRow[] {
 }
 
 describe("the registry against the design's §3", () => {
-  test('every §3 key of the thirteen domains is registered with §3’s class — or is dropped, or has no store yet', () => {
+  test('every §3 key of the fourteen domains is registered with §3’s class — or is dropped, or has no store yet', () => {
     const rows = readSection3();
     assert.ok(rows.length > 100, `parsed only ${rows.length} §3 rows`);
     const registry = new Map(SETTINGS_REGISTRY.map((e) => [e.key, e]));
@@ -325,18 +352,18 @@ describe("the registry against the design's §3", () => {
   });
 });
 
-describe('fix round 1 — the registry rulings (DECISIONS 60, 62; Fable L4)', () => {
+describe('fix round 1 — the registry rulings (DECISIONS 62, 73; Fable L4)', () => {
   const entry = (key: string) => {
     const found = SETTINGS_REGISTRY.find((e) => e.key === key);
     assert.ok(found !== undefined, key);
     return found;
   };
 
-  test('D60: pay.refund_any_role_limit_cents is roles class — no money-only role edits it', () => {
-    assert.equal(entry('pay.refund_any_role_limit_cents').class, 'roles');
-    assert.equal(mayEditClass('owner-shanthi', 'roles'), true);
-    assert.equal(mayEditClass('trainer', 'roles'), false);
-    assert.equal(mayEditClass('office', 'roles'), false);
+  test('D73 (reverses D60): pay.refund_any_role_limit_cents is money class — owner and manager edit it, the trainer does not', () => {
+    assert.equal(entry('pay.refund_any_role_limit_cents').class, 'money');
+    assert.equal(mayEditClass('owner', 'money'), true);
+    assert.equal(mayEditClass('manager', 'money'), true);
+    assert.equal(mayEditClass('trainer', 'money'), false);
   });
 
   test('D62: eval.reeval_after_months_unseen is nullable (null switches the clock off, EVAL-53) and stays inert', () => {
@@ -355,7 +382,7 @@ describe('fix round 1 — the registry rulings (DECISIONS 60, 62; Fable L4)', ()
 
 describe('fix round 2 — the role map fails closed (DECISIONS 71, adversary r2 L4)', () => {
   test('a role the map does not hold edits nothing, and asking never throws', () => {
-    for (const role of ['manager', 'owner', '', 'constructor', '__proto__']) {
+    for (const role of ['owner-shanthi', 'office', '', 'constructor', '__proto__']) {
       for (const cls of ['ops', 'money', 'price', 'roles', null] as const) {
         assert.equal(mayEditClass(role as StaffRole, cls), false, `${role} ${cls}`);
       }

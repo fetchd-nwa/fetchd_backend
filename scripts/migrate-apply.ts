@@ -21,6 +21,12 @@
  *                          always verified TLS: nothing in the URL can turn
  *                          it off, because the URL may carry no parameters.
  *   --applied-by <name>    recorded in migrations_applied (default: OS user).
+ *   --skip-census <table>  waive the step's `census-empty <table>` gate (M1.19's
+ *                          on `staff`). Refused unless `--project local`: dev
+ *                          takes M1.19's cast on its seeded roster, while
+ *                          production and the rehearsal's production-shaped
+ *                          copy must meet the gate (design.md:2122-2128).
+ *                          Comma-separate several tables.
  *
  * Note the `--` after the script name: without it npm keeps `--url` and
  * `--project` for itself and passes only their values, so the script refuses
@@ -49,13 +55,14 @@ interface Args {
   redisUrl?: string;
   ca: string;
   appliedBy: string;
+  skipCensus: string[];
 }
 
 function usage(message: string): never {
   process.stderr.write(
     `migrate:apply: ${message}\n` +
       'usage: npm run migrate:apply -- <step.sql> --url <DATABASE_URL> --project <ref> ' +
-      '[--redis-url <url>] [--ca <path>] [--applied-by <name>]\n',
+      '[--redis-url <url>] [--ca <path>] [--applied-by <name>] [--skip-census <table>]\n',
   );
   process.exit(2);
 }
@@ -81,7 +88,7 @@ function parseArgs(argv: readonly string[]): Args {
       positional.push(arg);
     }
   }
-  const known = new Set(['url', 'project', 'redis-url', 'ca', 'applied-by']);
+  const known = new Set(['url', 'project', 'redis-url', 'ca', 'applied-by', 'skip-census']);
   for (const name of flags.keys()) if (!known.has(name)) usage(`unknown flag --${name}`);
   if (positional.length !== 1) usage('exactly one step file is applied per run');
   const url = flags.get('url');
@@ -89,6 +96,16 @@ function parseArgs(argv: readonly string[]): Args {
   if (url === undefined) usage('--url is required');
   if (project === undefined) usage('--project is required');
   const redisUrl = flags.get('redis-url');
+  const skipCensus = (flags.get('skip-census') ?? '')
+    .split(',')
+    .map((table) => table.trim())
+    .filter((table) => table.length > 0);
+  if (skipCensus.length > 0 && project !== 'local') {
+    usage(
+      `--skip-census is refused for project '${project}': only --project local (dev) may waive a ` +
+        'census gate; production and the rehearsal meet it (design.md:2122-2128)',
+    );
+  }
   return {
     stepPath: positional[0] as string,
     url,
@@ -96,6 +113,7 @@ function parseArgs(argv: readonly string[]): Args {
     ...(redisUrl === undefined ? {} : { redisUrl }),
     ca: flags.get('ca') ?? fileURLToPath(new URL('../certs/supabase-ca.crt', import.meta.url)),
     appliedBy: flags.get('applied-by') ?? os.userInfo().username,
+    skipCensus,
   };
 }
 
@@ -133,13 +151,21 @@ async function main(): Promise<void> {
     `migrate:apply ${step.stepId} (${step.fileName})\n` +
       `  project  ${args.project}\n` +
       `  sha256   ${step.sha256}\n` +
-      `  header   ${step.directives.size === 0 ? '(none)' : [...step.directives].join(', ')}\n`,
+      `  header   ${step.directives.size === 0 ? '(none)' : [...step.directives].join(', ')}\n` +
+      step.censusEmpty
+        .map((table) =>
+          args.skipCensus.includes(table)
+            ? `  census   SKIPPED: ${table} (--skip-census, project local)\n`
+            : `  census   ${table} must be empty, or nothing runs\n`,
+        )
+        .join(''),
   );
 
   await client.connect();
   try {
     const result = await applyStep(client, step, {
       appliedBy: args.appliedBy,
+      skipCensus: args.skipCensus,
       ...(redis === undefined
         ? {}
         : { invalidateCache: (pattern: string) => unlinkMatching(redis, pattern) }),
