@@ -1019,3 +1019,87 @@ describe('fix round 2 — DECISIONS 69 and 71', SKIP_WHEN_NO_DB, () => {
     });
   });
 });
+
+// ── 2.0.0: the offerings copy caps (P03; build DECISIONS 89, J17 and J18) ────
+
+describe(
+  '2.0.0 — offerings name and description: capped in code points, never blank',
+  SKIP_WHEN_NO_DB,
+  () => {
+    /** PATCH bentonville's offerings with `day-school`'s `field` set to `value`. */
+    async function patchDaySchool(field: 'name' | 'description', value: string | null) {
+      const body = structuredClone(await campusOfferings('bentonville'));
+      (body['day-school'] as Record<string, unknown>)[field] = value;
+      return patch(appAs(TRAINER), '/staff/settings/day/bentonville', { offerings: body });
+    }
+
+    // An astral emoji is ONE code point and TWO UTF-16 units: a cap counted in
+    // UTF-16 units (`string.length`) refuses the 60-code-point name below.
+    const DOG = '\u{1F415}';
+
+    test('name: 61 code points is 422 naming day-school.name, nothing written; 60 with an emoji is 200', async () => {
+      const seeded = await campusOfferings('bentonville');
+      try {
+        const over = await patchDaySchool('name', `${'A'.repeat(60)}${DOG}`);
+        assert.equal(over.statusCode, 422, over.body);
+        assert.equal(over.json<ErrorBody>().error.code, 'invalid_payload');
+        assert.match(over.json<ErrorBody>().error.message, /day-school\.name/);
+        assert.deepEqual(
+          await campusOfferings('bentonville'),
+          seeded,
+          'a refused body wrote something',
+        );
+        const at = `${'A'.repeat(59)}${DOG}`;
+        assert.equal([...at].length, 60);
+        assert.equal(at.length, 61, 'precondition: more UTF-16 units than code points');
+        const ok = await patchDaySchool('name', at);
+        assert.equal(ok.statusCode, 200, ok.body);
+        assert.equal((await campusOfferings('bentonville'))['day-school']?.name, at);
+      } finally {
+        await db.execute(
+          sql`UPDATE day_program_settings SET offerings = ${JSON.stringify(seeded)}::jsonb WHERE location = 'bentonville'`,
+        );
+      }
+    });
+
+    test('description: 281 code points is 422 naming day-school.description; 280 is 200', async () => {
+      const seeded = await campusOfferings('bentonville');
+      try {
+        const over = await patchDaySchool('description', `${'d'.repeat(280)}${DOG}`);
+        assert.equal(over.statusCode, 422, over.body);
+        assert.match(over.json<ErrorBody>().error.message, /day-school\.description/);
+        const ok = await patchDaySchool('description', `${'d'.repeat(279)}${DOG}`);
+        assert.equal(ok.statusCode, 200, ok.body);
+      } finally {
+        await db.execute(
+          sql`UPDATE day_program_settings SET offerings = ${JSON.stringify(seeded)}::jsonb WHERE location = 'bentonville'`,
+        );
+      }
+    });
+
+    test('a blank name or description (empty or whitespace only) is 422; null clears it and is 200', async () => {
+      const seeded = await campusOfferings('bentonville');
+      try {
+        for (const field of ['name', 'description'] as const) {
+          for (const blank of ['', '   ']) {
+            const res = await patchDaySchool(field, blank);
+            assert.equal(res.statusCode, 422, `${field} ${JSON.stringify(blank)}: ${res.body}`);
+            assert.equal(res.json<ErrorBody>().error.code, 'invalid_payload');
+            assert.match(res.json<ErrorBody>().error.message, new RegExp(`day-school\\.${field}`));
+          }
+          const cleared = await patchDaySchool(field, null);
+          assert.equal(cleared.statusCode, 200, `${field} null: ${cleared.body}`);
+        }
+        assert.deepEqual(
+          await campusOfferings('bentonville'),
+          seeded,
+          'a refused body wrote something',
+        );
+      } finally {
+        await db.execute(
+          sql`UPDATE day_program_settings SET offerings = ${JSON.stringify(seeded)}::jsonb WHERE location = 'bentonville'`,
+        );
+      }
+    });
+  },
+);

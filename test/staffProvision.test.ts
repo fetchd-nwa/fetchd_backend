@@ -49,8 +49,10 @@ class FakeAdmin implements AdminClient {
    *  read until an empty page. */
   constructor(private readonly perPage = 2) {}
 
-  seed(user: Partial<AdminUser> & { email: string }): AdminUser {
-    const full: AdminUser = {
+  /** A user whose `email` keeps the type it was seeded with: a string for
+   *  every roster test, `null` for the phone-only one (AdminUser.email). */
+  seed<E extends string | null>(user: Partial<AdminUser> & { email: E }): AdminUser & { email: E } {
+    const full: AdminUser & { email: E } = {
       id: randomUUID(),
       created_at: '2026-10-01T12:00:00Z',
       email_confirmed_at: null,
@@ -466,7 +468,7 @@ describe('staff:provision — against a fake admin client and the test database'
       confirm: true,
     });
     assert.equal(applied, 0);
-    assert.equal(admin.byEmail(rachel)?.app_metadata.app_role, 'manager');
+    assert.equal(admin.byEmail(rachel)?.app_metadata?.app_role, 'manager');
     assert.equal((await staffRows([uid]))[0]?.role, 'manager');
     assert.equal(admin.links().length, 1, 'an adopted user got a new link (only --link mints one)');
   });
@@ -512,7 +514,7 @@ describe('staff:provision — against a fake admin client and the test database'
     const [row] = await staffRows([uid]);
     assert.notEqual(row?.expired_at, null);
     assert.equal(admin.canSignIn(amber), false, 'not banned');
-    assert.equal('app_role' in (admin.byEmail(amber) as AdminUser).app_metadata, false);
+    assert.equal('app_role' in ((admin.byEmail(amber) as AdminUser).app_metadata ?? {}), false);
     const after = await responders();
     assert.equal(after.def, null, 'the responder naming her was not reset');
     assert.notEqual(after.backup, null, 'an unrelated responder was reset');
@@ -584,7 +586,7 @@ describe('staff:provision — against a fake admin client and the test database'
       lines.join('\n'),
     );
     assert.equal((await staffRows([uid]))[0]?.expired_at, null);
-    assert.equal(admin.byEmail(back)?.app_metadata.app_role, 'trainer');
+    assert.equal(admin.byEmail(back)?.app_metadata?.app_role, 'trainer');
     assert.equal(admin.canSignIn(back), true);
   });
 
@@ -704,6 +706,37 @@ describe('staff:provision — against a fake admin client and the test database'
     }
   });
 
+  // ── P03 item 0d (DECISIONS 79, 82(d); Fable r2 L2, adversary r2 N5) ─────────
+
+  test('a home campus that is a locations row but has no display label → refused before any call (P03 0d)', async () => {
+    const slug = 'p03-third-campus';
+    await client.query(
+      "INSERT INTO locations (slug, display_name) VALUES ($1, 'Third, AR') ON CONFLICT DO NOTHING",
+      [slug],
+    );
+    try {
+      const admin = new FakeAdmin();
+      const { out, lines } = capture();
+      const code = await runRoster(
+        { admin, db: client, out },
+        [entry({ email: emailFor('third'), home_locations: [slug] })],
+        { portalOrigin: PORTAL, confirm: false },
+      );
+      track(admin);
+      assert.equal(code, 1, lines.join('\n'));
+      assert.deepEqual(admin.calls, [], 'an auth call was made');
+      assert.deepEqual(await staffRows([...admin.users.keys()]), []);
+      assert.ok(
+        lines.some(
+          (l) => l.startsWith('refused') && l.includes(`'${slug}'`) && /display label/.test(l),
+        ),
+        lines.join('\n'),
+      );
+    } finally {
+      await client.query('DELETE FROM locations WHERE slug = $1', [slug]);
+    }
+  });
+
   test('--expire of the default responder empties that slot; a roster re-run fills it from the roster and never overwrites the backup (DECISIONS 76)', async () => {
     const admin = new FakeAdmin();
     const amber = emailFor('amber-r');
@@ -808,6 +841,60 @@ describe('staff:provision — against a fake admin client and the test database'
     assert.doesNotMatch(said, /default/);
   });
 
+  // ── P03 item 0c (DECISIONS 76, 82(c); Fable r2 L1, adversary r2 L2) ─────────
+
+  test('a responder fill naming whoever holds the other slot is left empty: one staffer never fills both slots (P03 0c)', async () => {
+    const admin = new FakeAdmin();
+    const amber = emailFor('amber-swap');
+    const shanthi = emailFor('shanthi-swap');
+    const rachel = emailFor('rachel-swap');
+    const { out } = capture();
+    const first = [
+      entry({ email: amber, name: 'Amber', role: 'manager', responder: 'default' }),
+      entry({ email: shanthi, name: 'Shanthi', role: 'owner', responder: 'backup' }),
+    ];
+    assert.equal(
+      await runRoster({ admin, db: client, out }, first, { portalOrigin: PORTAL, confirm: false }),
+      0,
+    );
+    track(admin);
+    const held = await responders();
+    assert.equal(
+      await runExpire({ admin, db: client, out }, shanthi, { confirm: true, lastOwner: true }),
+      0,
+    );
+    assert.deepEqual(await responders(), { def: held.def, backup: null }, 'precondition');
+
+    // The swap: Rachel the default, Amber the backup. The default is held
+    // (Amber), so it is never touched (DECISIONS 76); filling the empty backup
+    // with Amber would put her in both slots.
+    const swap = capture();
+    const swapped = [
+      entry({ email: rachel, name: 'Rachel', role: 'manager', responder: 'default' }),
+      entry({ email: amber, name: 'Amber', role: 'manager', responder: 'backup' }),
+    ];
+    assert.equal(
+      await runRoster({ admin, db: client, out: swap.out }, swapped, {
+        portalOrigin: PORTAL,
+        confirm: false,
+      }),
+      0,
+      swap.lines.join('\n'),
+    );
+    track(admin);
+    assert.deepEqual(
+      await responders(),
+      { def: held.def, backup: null },
+      `one staffer fills both slots:\n${swap.lines.join('\n')}`,
+    );
+    assert.ok(
+      swap.lines.some(
+        (l) => /backup/.test(l) && /EMPTY/.test(l) && l.includes(amber) && /default/.test(l),
+      ),
+      swap.lines.join('\n'),
+    );
+  });
+
   test('--expire without --yes prints the plan, exits 1, writes nothing and makes no admin call (DECISIONS 77)', async () => {
     const admin = new FakeAdmin();
     const fed = emailFor('fed-plan');
@@ -881,6 +968,177 @@ describe('staff:provision — against a fake admin client and the test database'
     assert.notEqual((await staffRows([uid]))[0]?.expired_at, null);
   });
 
+  // ── P03 item 0b (DECISIONS 77, 82(b); adversary r2 L1) ──────────────────────
+
+  test('a roster that demotes the only live owner → exit 1, nothing written; --last-owner lets it through (P03 0b)', async () => {
+    const admin = new FakeAdmin();
+    const shanthi = emailFor('only-owner');
+    const fed = emailFor('fed-beside');
+    const { out } = capture();
+    const roster = [
+      entry({ email: shanthi, name: 'Shanthi', role: 'owner' }),
+      entry({ email: fed, name: 'Fed', role: 'trainer' }),
+    ];
+    assert.equal(
+      await runRoster({ admin, db: client, out }, roster, { portalOrigin: PORTAL, confirm: false }),
+      0,
+    );
+    track(admin);
+    const uid = (admin.byEmail(shanthi) as AdminUser).id;
+    const writes = admin.writes().length;
+    const auditBefore = await auditCount();
+    const demoted = [entry({ email: shanthi, name: 'Shanthi', role: 'manager' })];
+
+    const refused = capture();
+    const code = await runRoster({ admin, db: client, out: refused.out }, demoted, {
+      portalOrigin: PORTAL,
+      confirm: true,
+    });
+    assert.equal(code, 1, refused.lines.join('\n'));
+    assert.equal(admin.writes().length, writes, 'an auth write was made');
+    assert.equal(admin.byEmail(shanthi)?.app_metadata?.app_role, 'owner');
+    assert.equal((await staffRows([uid]))[0]?.role, 'owner', 'the last owner was demoted');
+    assert.equal(await auditCount(), auditBefore, 'a row was written');
+    assert.ok(
+      refused.lines.some(
+        (l) => l.includes(shanthi) && /last live owner/.test(l) && /--last-owner/.test(l),
+      ),
+      refused.lines.join('\n'),
+    );
+
+    const allowed = capture();
+    assert.equal(
+      await runRoster({ admin, db: client, out: allowed.out }, demoted, {
+        portalOrigin: PORTAL,
+        confirm: true,
+        lastOwner: true,
+      }),
+      0,
+      allowed.lines.join('\n'),
+    );
+    assert.equal((await staffRows([uid]))[0]?.role, 'manager');
+  });
+
+  test('a roster that demotes one of two owners, or promotes another while demoting the last, is not refused (P03 0b control)', async () => {
+    const admin = new FakeAdmin();
+    const a = emailFor('owner-a');
+    const b = emailFor('owner-b');
+    const { out, lines } = capture();
+    assert.equal(
+      await runRoster(
+        { admin, db: client, out },
+        [entry({ email: a, role: 'owner' }), entry({ email: b, role: 'owner' })],
+        { portalOrigin: PORTAL, confirm: false },
+      ),
+      0,
+    );
+    track(admin);
+    // Two owners: one may be demoted.
+    assert.equal(
+      await runRoster({ admin, db: client, out }, [entry({ email: a, role: 'manager' })], {
+        portalOrigin: PORTAL,
+        confirm: true,
+      }),
+      0,
+      lines.join('\n'),
+    );
+    // The last owner demoted while the same roster makes another owner: one is left.
+    assert.equal(
+      await runRoster(
+        { admin, db: client, out },
+        [entry({ email: b, role: 'trainer' }), entry({ email: a, role: 'owner' })],
+        { portalOrigin: PORTAL, confirm: true },
+      ),
+      0,
+      lines.join('\n'),
+    );
+    const { rows } = await client.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM staff WHERE role = 'owner' AND expired_at IS NULL",
+    );
+    assert.equal(rows[0]?.n, 1);
+  });
+
+  test('two concurrent rosters, each demoting a different one of two owners: at least one owner is left (P03 0b)', async () => {
+    const admin = new FakeAdmin();
+    const a = emailFor('race-a');
+    const b = emailFor('race-b');
+    const { out } = capture();
+    assert.equal(
+      await runRoster(
+        { admin, db: client, out },
+        [entry({ email: a, role: 'owner' }), entry({ email: b, role: 'owner' })],
+        { portalOrigin: PORTAL, confirm: false },
+      ),
+      0,
+    );
+    track(admin);
+
+    // Both runs read and pass everything before either opens its transaction:
+    // each one's BEGIN waits until the other has reached its own.
+    let arrived = 0;
+    let release: () => void = () => undefined;
+    const bothAtBegin = new Promise<void>((resolve) => (release = resolve));
+    const second = new pg.Client({ connectionString: DB_URL });
+    await second.connect();
+    const gated = (c: pg.Client) =>
+      ({
+        query: async (text: string, params?: unknown[]) => {
+          if (text === 'BEGIN') {
+            arrived += 1;
+            if (arrived === 2) release();
+            await bothAtBegin;
+          }
+          return c.query(text, params);
+        },
+      }) as unknown as pg.ClientBase;
+    try {
+      const [one, two] = [capture(), capture()];
+      const outcomes = await Promise.allSettled([
+        runRoster(
+          { admin, db: gated(client), out: one.out },
+          [entry({ email: a, role: 'manager' })],
+          {
+            portalOrigin: PORTAL,
+            confirm: true,
+          },
+        ),
+        runRoster(
+          { admin, db: gated(second), out: two.out },
+          [entry({ email: b, role: 'manager' })],
+          {
+            portalOrigin: PORTAL,
+            confirm: true,
+          },
+        ),
+      ]);
+      assert.equal(arrived, 2, 'precondition: both runs reached their transaction');
+      const { rows } = await client.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM staff WHERE role = 'owner' AND expired_at IS NULL",
+      );
+      const said = [...one.lines, ...two.lines].join('\n');
+      assert.equal(rows[0]?.n, 1, `two concurrent demotions left ${rows[0]?.n} owners:\n${said}`);
+      assert.equal(
+        outcomes.filter((o) => o.status === 'fulfilled' && o.value === 0).length,
+        1,
+        `exactly one run may pass:\n${said}`,
+      );
+      assert.ok(/last live owner/.test(said), said);
+      // The loser re-roled her in auth before its transaction refused: the
+      // advice must undo that, not send the operator back into the refusal.
+      const failure = [...one.lines, ...two.lines].find((l) => l.startsWith('FAILED'));
+      assert.ok(failure !== undefined, said);
+      assert.match(failure, /last live owner/);
+      assert.match(failure, /put app_role back/);
+      assert.doesNotMatch(
+        failure,
+        /bring each row to it/,
+        'the advice leads back into the refusal',
+      );
+    } finally {
+      await second.end();
+    }
+  });
+
   test('a name holding a NUL or another control character is refused in pass 1, before any createUser (adversary L3c)', async () => {
     for (const name of ['A\u0000B', 'A\u001b[31mB']) {
       const admin = new FakeAdmin();
@@ -924,7 +1182,7 @@ describe('staff:provision — against a fake admin client and the test database'
       }),
       /simulated staff INSERT failure/,
     );
-    assert.equal(admin.byEmail(fed)?.app_metadata.app_role, 'owner', 'precondition: re-roled');
+    assert.equal(admin.byEmail(fed)?.app_metadata?.app_role, 'owner', 'precondition: re-roled');
     assert.equal((await staffRows([uid]))[0]?.role, 'trainer', 'precondition: rolled back');
     const failure = report.lines.find((l) => l.startsWith('FAILED'));
     assert.ok(failure !== undefined, report.lines.join('\n'));
@@ -971,7 +1229,7 @@ describe('staff:provision — against a fake admin client and the test database'
 
   test('a phone-only auth user (email null) is skipped by the lookup, not a TypeError; with app_role it is a staff-clause violation (Fable N2)', async () => {
     const admin = new FakeAdmin();
-    admin.seed({ email: null as unknown as string, identities: [{ provider: 'phone' }] });
+    admin.seed({ email: null, identities: [{ provider: 'phone' }] });
     const staffer = emailFor('beside-phone');
     const roster = [entry({ email: staffer })];
     const { out, lines } = capture();
@@ -983,13 +1241,36 @@ describe('staff:provision — against a fake admin client and the test database'
     assert.equal(code, 0, `${String(code)}\n${lines.join('\n')}`);
     assert.deepEqual(await staffClauseViolations({ admin, db: client }, roster), []);
     const holder = admin.seed({
-      email: null as unknown as string,
+      email: null,
       app_metadata: { app_role: 'trainer' },
       identities: [{ provider: 'phone' }],
     });
     const violations = await staffClauseViolations({ admin, db: client }, roster);
     assert.equal(violations.length, 1, violations.join('\n'));
     assert.ok(violations[0]?.includes(holder.id), violations.join('\n'));
+  });
+
+  test('an auth user whose app_metadata is null is read as holding no app_role, not a TypeError (adversary r2 N3)', async () => {
+    const admin = new FakeAdmin();
+    const bare = admin.seed({ email: emailFor('null-meta'), app_metadata: null });
+    const roster = [entry({ email: emailFor('beside-null') })];
+    const { out, lines } = capture();
+    const code = await runRoster(
+      { admin, db: client, out },
+      [...roster, entry({ email: bare.email })],
+      { portalOrigin: PORTAL, confirm: false },
+    ).catch((err: unknown) => `threw: ${err instanceof Error ? err.message : String(err)}`);
+    track(admin);
+    assert.equal(code, 1, `${String(code)}\n${lines.join('\n')}`);
+    assert.ok(
+      lines.some((l) => l.includes(bare.email) && /no app_role/.test(l)),
+      lines.join('\n'),
+    );
+    // The preflight's clauses walk every auth user: one such user must not crash them.
+    const violations = await staffClauseViolations({ admin, db: client }, roster).catch(
+      (err: unknown) => [`threw: ${err instanceof Error ? err.message : String(err)}`],
+    );
+    assert.deepEqual(violations, []);
   });
 
   test('users are found across pages of the admin listing', async () => {
@@ -1012,6 +1293,20 @@ describe('staff:provision — against a fake admin client and the test database'
 });
 
 // ── the project-ref check and the env boundary ───────────────────────────────
+
+// Adversary r2 N4 (P03 nice-to-have): DEL, the C1 set (U+009B is CSI in some
+// terminals) and the bidi overrides and isolates reach the operator's terminal
+// and the wire as surely as the C0 set does.
+test('a name holding DEL, a C1 control or a bidi override is refused like NUL (pure: the parser)', () => {
+  for (const name of ['A\u007fB', 'A\u0085B', 'A\u009b31mB', 'A\u202eB', 'A\u2066B']) {
+    const parsed = parseRoster([entry({ email: emailFor('p'), name })]);
+    assert.equal(parsed.ok, false, `${JSON.stringify(name)} was accepted`);
+  }
+  // Ordinary names, accents and other scripts included, still pass.
+  for (const name of ['Amber', 'Zoë Núñez', 'Đặng Thị', "O'Brien-Smith"]) {
+    assert.ok(parseRoster([entry({ email: emailFor('p'), name })]).ok, name);
+  }
+});
 
 describe('staff:provision — the project-ref check and the env boundary', () => {
   test('the three refs must agree: SUPABASE_URL, DATABASE_URL and --project', () => {

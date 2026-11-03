@@ -13,6 +13,7 @@ import {
   type DogGateSettingsWire,
   type EvaluationCampusSettingsWire,
   type EvaluationGlobalSettingsWire,
+  type GetStaffSettingsManifestResponse,
   type GetStaffSettingsResponse,
   type LocationKey,
   type MigrationSettingsWire,
@@ -33,7 +34,9 @@ import type { Tx } from '../db/tx.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
+import { settingsManifest } from '../lib/settingsManifest.js';
 import {
+  INT4_MAX,
   SETTINGS_REGISTRY,
   SETTINGS_TABLE_BY_DOMAIN,
   isPatchable,
@@ -79,6 +82,13 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * key sent to a second campus is 422 `idempotency_mismatch`. The response is
  * the row(s) read back in the write's transaction; `updated_by_staff_id` is
  * the caller.
+ *
+ * **The manifest.** `GET /staff/settings/manifest` (2.0.0; build DECISIONS 85)
+ * serves every registry key with its class, store, editor, inertness, value
+ * spec and whether THIS caller may edit it (`lib/settingsManifest.ts`), so
+ * the portal never holds a copy of the registry. `manifest` is a static
+ * segment, matched before `:domain` (wire §16 pins that no domain takes the
+ * name); `PATCH /staff/settings/manifest` reaches `:domain` and is 400.
  *
  * The body schemas are GENERATED from the registry: a body key is a settings
  * column (or a `payment_settings` key) whose registry entry is patchable. The
@@ -212,10 +222,6 @@ function shapeOf(value: SettingValue, perScope: boolean): z.ZodTypeAny {
 
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
 
-/** Every integer setting is an `integer` column: a value past int4 is out of
- *  range here (422), not a Postgres 22003 (DECISIONS 65). */
-const INT4_MAX = 2147483647;
-
 /** The C0 control set (U+0000–U+001F). Refused in EVERY string a PATCH can
  *  write (DECISIONS 66, 71): CR and LF in a value that becomes a mail header,
  *  NUL anywhere (Postgres refuses it in text and jsonb — 22021, 22P05). */
@@ -237,16 +243,31 @@ function boundsError(value: SettingValue, input: unknown, perScope: boolean): st
     case 'staff-id':
       return null;
     case 'offerings': {
-      const strings = Object.entries(
+      // Each `name` and `description`: one line (no C0 control character), not
+      // blank (send null to clear it), at most the registry's cap in Unicode
+      // code points — what Postgres `char_length` counts, and never looser
+      // than a UTF-16 `maxLength` input (2.0.0; build DECISIONS 89, J17-J18).
+      const problems = Object.entries(
         input as Record<string, { name: string | null; description: string | null }>,
-      ).flatMap(([service, o]) => [
-        [`${service}.name`, o.name],
-        [`${service}.description`, o.description],
-      ]);
-      const bad = strings.filter(([, v]) => v !== null && CONTROL_CHARACTER.test(v as string));
-      return bad.length === 0
-        ? null
-        : `${bad.map(([where]) => where).join(', ')}: ${CONTROL_MESSAGE}`;
+      ).flatMap(([service, o]) =>
+        (
+          [
+            ['name', o.name, value.nameMaxLength],
+            ['description', o.description, value.descriptionMaxLength],
+          ] as const
+        ).flatMap(([field, text, max]) => {
+          if (text === null) return [];
+          const where = `${service}.${field}`;
+          if (text.trim().length === 0)
+            return [`${where}: must not be blank (send null to clear it)`];
+          if (CONTROL_CHARACTER.test(text)) return [`${where}: ${CONTROL_MESSAGE}`];
+          const codePoints = [...text].length;
+          return codePoints > max
+            ? [`${where}: must be at most ${max} characters (is ${codePoints})`]
+            : [];
+        }),
+      );
+      return problems.length === 0 ? null : problems.join('; ');
     }
     case 'integer': {
       const n = input as number;
@@ -679,6 +700,16 @@ export function registerStaffSettingsRoute(
   opts: AuthRouteOptions = {},
 ): void {
   const authHook = resolveAuthHook(opts);
+
+  app.get(
+    '/staff/settings/manifest',
+    { preHandler: [authHook] },
+    async (request): Promise<GetStaffSettingsManifestResponse> => {
+      const principal = requirePrincipal(request);
+      requireStaff(principal, 'read the settings manifest');
+      return settingsManifest(principal.role);
+    },
+  );
 
   for (const path of PATHS) {
     app.get(

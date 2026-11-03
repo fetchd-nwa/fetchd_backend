@@ -1888,10 +1888,9 @@ test(
     assert.equal(tick.abandonedByClass['stripe-failed'], 1, 'still owed');
     const alarm = logs.error('stripe-failed');
     assert.ok(alarm, 'and still loud');
-    const named = (alarm!.obj.refunds as {
-      remainingCents?: number;
-      actionableCents?: number;
-    })[0] as { remainingCents?: number; actionableCents?: number } | undefined;
+    const named = (
+      alarm!.obj.refunds as { remainingCents?: number; actionableCents?: number }[]
+    )[0];
     assert.equal(
       named?.remainingCents,
       6_000,

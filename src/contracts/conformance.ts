@@ -31,6 +31,7 @@ import {
   invoiceStatus,
   chargePurpose,
   announcementCategory,
+  recordSource,
   LOCATION_SLUGS,
 } from '../db/schema/schema.js';
 import type {
@@ -54,6 +55,7 @@ import type {
   ChargePurpose,
   AnnouncementCategory,
   LocationKey,
+  RecordSource,
 } from './wire.js';
 
 type Expect<T extends true> = T;
@@ -96,4 +98,6 @@ export type ContractEnumConformance = [
   Expect<Equal<InvoiceStatus, DrizzleEnum<typeof invoiceStatus>>>,
   Expect<Equal<ChargePurpose, DrizzleEnum<typeof chargePurpose>>>,
   Expect<Equal<AnnouncementCategory, DrizzleEnum<typeof announcementCategory>>>,
+  // 2.0.0 (P03): `StaffOwnerWire.source` puts `record_source` on the wire.
+  Expect<Equal<RecordSource, DrizzleEnum<typeof recordSource>>>,
 ];

@@ -194,6 +194,7 @@ test(
           bookingId: null,
           amountCents: maxRefund,
           reason: 'duplicate-invoice-settle',
+          stripeIdempotencyKey: null,
         });
       }
       const rows = await tx

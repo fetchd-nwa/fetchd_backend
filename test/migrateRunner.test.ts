@@ -284,6 +284,128 @@ describe('the step file', () => {
     }
   });
 
+  // P03 item 0e (adversary r2 L3; DECISIONS 82(e)): the wider family. Each of
+  // these is a plain Postgres comment, so before the fix it parsed `ok` with no
+  // directive — a census gate, a no-transaction header or a cache clear
+  // switched off in silence. Each is refused, naming its line.
+  test('the wider near-miss family is refused, naming the line: no colon, ---, migrates:, a bare directive', () => {
+    for (const header of [
+      '-- migrate census-empty staff',
+      '-- migrate no-transaction',
+      '--- migrate: census-empty staff',
+      '-- -- migrate: census-empty staff',
+      '-- migrates: no-transaction',
+      '-- migration: census-empty staff',
+      '-- migrate; census-empty staff',
+      '-- migrate= census-empty staff',
+      '-- migrate： census-empty staff',
+      '-- census-empty staff',
+      '-- no-transaction',
+      '-- invalidate-class-catalog',
+    ]) {
+      const parsed = parseStep(
+        'M9.16_probe.sql',
+        Buffer.from(`-- M9.16 — a probe.\n${header}\nSELECT 1;\n`),
+      );
+      assert.equal(parsed.ok, false, `${header} was accepted`);
+      const reason = parsed.ok ? '' : parsed.reason;
+      assert.match(reason, /line 2: /, header);
+      assert.ok(reason.includes(header), `the refusal does not name the line: ${reason}`);
+    }
+  });
+
+  test('prose that only mentions a directive word is not a near-miss (the family is a first word)', () => {
+    for (const prose of [
+      '-- The census gate is on M1.19 only; this step has none.',
+      '-- Run with `npm run migrate:apply -- <file>`, never the SQL editor.',
+      '-- migrated rows keep their ids',
+      '-- migration_settings is created in M1.10',
+    ]) {
+      const parsed = parseStep('M9.17_probe.sql', Buffer.from(`${prose}\nSELECT 1;\n`));
+      assert.ok(parsed.ok, `${prose}: ${parsed.ok ? '' : parsed.reason}`);
+    }
+  });
+
+  // P03 fix 1, item 13 (Opus N1): more distant spellings, each a header comment
+  // that today parses with no directive. (A homoglyph such as a Cyrillic і in
+  // "migrate" needs confusable folding, not one more character class: not done.)
+  test('the distant spellings are refused too: no transaction (space), @migrate, # migrate, a zero-width space', () => {
+    for (const header of [
+      '-- no transaction',
+      '-- @migrate: no-transaction',
+      '-- # migrate: no-transaction',
+      '-- * migrate: census-empty staff',
+      '-- \u200bmigrate: no-transaction',
+    ]) {
+      const parsed = parseStep('M9.20_probe.sql', Buffer.from(`${header}\nSELECT 1;\n`));
+      assert.equal(parsed.ok, false, `${JSON.stringify(header)} was accepted`);
+      assert.match(parsed.ok ? '' : parsed.reason, /line 1: /);
+    }
+  });
+
+  // P03 fix 2, item 6 (Opus r2 L2): a leading block comment is part of the
+  // leading comment lines however many lines it spans, so a misspelt
+  // directive after a multi-line banner is refused exactly as after a
+  // one-line one. (Cases from the adversary's r2 probe.)
+  test('a near-miss after a multi-line leading block comment is refused, the same as after a one-line one', () => {
+    for (const sql of [
+      '/* banner */\n-- Migrate: no-transaction\nSELECT 1;\n',
+      '/*\n * M2.05 banner\n */\n-- Migrate: no-transaction\nSELECT 1;\n',
+      '/*\n  M2.05 banner\n*/\n-- migrate : no-transaction\nSELECT 1;\n',
+      '\n\n/* x */\n-- Migrate: no-transaction\nSELECT 1;\n',
+      '/* outer\n  /* nested */\n  still outer\n*/\n-- migrate no-transaction\nSELECT 1;\n',
+    ]) {
+      const parsed = parseStep('M9.21_probe.sql', Buffer.from(sql));
+      assert.equal(parsed.ok, false, `accepted: ${JSON.stringify(sql)}`);
+      assert.match(
+        parsed.ok ? '' : parsed.reason,
+        /not a directive's exact form/,
+        JSON.stringify(sql),
+      );
+    }
+  });
+
+  test('a leading block comment that closes and is followed by SQL on its own last line ends the header', () => {
+    // `*/ SELECT 1;` is code: a comment below it is prose, as below any SQL.
+    const parsed = parseStep(
+      'M9.22_probe.sql',
+      Buffer.from('/*\n * banner\n */ SELECT 1;\n-- Migration of the old rows\nSELECT 2;\n'),
+    );
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+  });
+
+  // P03 fix 1, item 10 (Fable L3): directives are honoured only in the header
+  // (the leading comment lines), so a near-miss is refused only there. A body
+  // comment that opens with a directive word is prose.
+  test('below the header, a comment that opens with a directive word is prose, not a near-miss', () => {
+    for (const prose of [
+      '-- Migration of the old rows: each is mapped by hand above.',
+      '-- Census-empty is not needed here: the table is new.',
+      '-- no-transaction is not needed: this is one statement.',
+      '-- Migrate the remaining rows in the next step.',
+    ]) {
+      const parsed = parseStep(
+        'M9.18_probe.sql',
+        Buffer.from(`-- M9.18 — a probe.\nSELECT 1;\n${prose}\nSELECT 2;\n`),
+      );
+      assert.ok(parsed.ok, `${prose}: ${parsed.ok ? '' : parsed.reason}`);
+      assert.equal(parsed.step.directives.size, 0);
+    }
+  });
+
+  test('in the header the same spellings are still refused, before a body or after a blank line', () => {
+    for (const header of [
+      '-- migrate no-transaction',
+      '-- Migration: census-empty staff',
+      '-- census-empty staff',
+      '/* migrate: census-empty staff */',
+    ]) {
+      for (const sql of [`${header}\nSELECT 1;\n-- body\n`, `-- why\n\n${header}\nSELECT 1;\n`]) {
+        assert.equal(parseStep('M9.19_probe.sql', Buffer.from(sql)).ok, false, JSON.stringify(sql));
+      }
+    }
+  });
+
   test('lone-CR line endings: the header is read line by line and the directive holds', () => {
     const parsed = parseStep(
       'M9.15_cr.sql',
@@ -299,6 +421,21 @@ describe('the step file', () => {
     for (const file of files) {
       const parsed = parseStep(file, fs.readFileSync(path.join(LG1, file)));
       assert.ok(parsed.ok, `${file}: ${parsed.ok ? '' : parsed.reason}`);
+    }
+  });
+
+  // P03 fix 2: the set the rehearsal applies (`find migrations -type f -name
+  // 'M*.sql'`), every group, through the runner's own parse — so a widened
+  // near-miss rule that refused a committed step would go red here first.
+  test('every step file the rehearsal would apply parses, with M1.19 still carrying its census gate', () => {
+    const files = rehearsedStepFiles(path.join(REPO_ROOT, 'migrations'));
+    assert.ok(files.length >= 19, `only ${files.length} step files found`);
+    for (const file of files) {
+      const parsed = parseStep(path.basename(file), fs.readFileSync(file));
+      assert.ok(parsed.ok, `${file}: ${parsed.ok ? '' : parsed.reason}`);
+      if (path.basename(file).startsWith('M1.19_')) {
+        assert.deepEqual(parsed.step.censusEmpty, ['staff']);
+      }
     }
   });
 });
@@ -394,9 +531,13 @@ describe('the URL is parsed once, and the driver connects to what was checked (D
       ssl: { ca: 'THE-CA', rejectUnauthorized: true },
     });
     const client = new pg.Client(config); // constructed, never connected
-    assert.equal(client.connectionParameters.host, 'db.prodref123.supabase.co');
-    assert.equal(client.connectionParameters.user, 'postgres');
-    assert.deepEqual(client.connectionParameters.ssl, { ca: 'THE-CA', rejectUnauthorized: true });
+    // What `pg` resolved from the config — a runtime field @types/pg does not declare.
+    const { connectionParameters } = client as unknown as {
+      connectionParameters: { host: string; user: string; ssl: unknown };
+    };
+    assert.equal(connectionParameters.host, 'db.prodref123.supabase.co');
+    assert.equal(connectionParameters.user, 'postgres');
+    assert.deepEqual(connectionParameters.ssl, { ca: 'THE-CA', rejectUnauthorized: true });
   });
 
   test('a local target connects without TLS, and a project without a CA is refused', () => {
@@ -955,6 +1096,58 @@ function stepFiles(dir: string): string[] {
     );
 }
 
+/** What one step file creates and revokes, read as SQL (see above). */
+interface StepTables {
+  /** Each `CREATE TABLE`: the qualified name, and where the match ends. */
+  creates: { table: string; end: number }[];
+  /** Each top-level `REVOKE ALL … ON <list> FROM <grantees>`. */
+  revokes: { at: number; tables: Set<string>; grantees: Set<string> }[];
+}
+
+function readStepTables(sql: string): StepTables {
+  const creates = maskSql(sql, {
+    comments: true,
+    strings: false,
+    quotedIdentifiers: false,
+    dollarBodies: false,
+  });
+  const code = maskSql(sql, {
+    comments: true,
+    strings: true,
+    quotedIdentifiers: false,
+    dollarBodies: true,
+  });
+  const revokes = [...maskSql(sql).matchAll(REVOKE_ALL)].flatMap((m) => {
+    const at = m.index ?? 0;
+    const parts = REVOKE_PARTS.exec(code.slice(at, at + m[0].length));
+    if (parts === null) return [];
+    return [
+      {
+        at,
+        tables: new Set(listNames(parts[1] as string)),
+        grantees: new Set(
+          (parts[2] as string)
+            .replace(/\s+(CASCADE|RESTRICT)\s*$/i, '')
+            .split(',')
+            .map((g) => identifier(g.trim())),
+        ),
+      },
+    ];
+  });
+  return {
+    creates: [...creates.matchAll(CREATE_TABLE)].map((create) => ({
+      table: qualifiedName(create[1] as string),
+      end: (create.index ?? 0) + create[0].length,
+    })),
+    revokes,
+  };
+}
+
+/** `public.x` → `x`, for the messages. */
+function shownTable(table: string): string {
+  return table.startsWith('public.') ? table.slice('public.'.length) : table;
+}
+
 function tablesMissingTheirRevoke(root: string): string[] {
   const files = stepFiles(root);
   if (files.length === 0) {
@@ -962,39 +1155,8 @@ function tablesMissingTheirRevoke(root: string): string[] {
   }
   const missing: string[] = [];
   for (const file of files) {
-    const sql = fs.readFileSync(file, 'utf8');
-    const creates = maskSql(sql, {
-      comments: true,
-      strings: false,
-      quotedIdentifiers: false,
-      dollarBodies: false,
-    });
-    const code = maskSql(sql, {
-      comments: true,
-      strings: true,
-      quotedIdentifiers: false,
-      dollarBodies: true,
-    });
-    const revokes = [...maskSql(sql).matchAll(REVOKE_ALL)].flatMap((m) => {
-      const at = m.index ?? 0;
-      const parts = REVOKE_PARTS.exec(code.slice(at, at + m[0].length));
-      if (parts === null) return [];
-      return [
-        {
-          at,
-          tables: new Set(listNames(parts[1] as string)),
-          grantees: new Set(
-            (parts[2] as string)
-              .replace(/\s+(CASCADE|RESTRICT)\s*$/i, '')
-              .split(',')
-              .map((g) => identifier(g.trim())),
-          ),
-        },
-      ];
-    });
-    for (const create of creates.matchAll(CREATE_TABLE)) {
-      const table = qualifiedName(create[1] as string);
-      const end = (create.index ?? 0) + create[0].length;
+    const { creates, revokes } = readStepTables(fs.readFileSync(file, 'utf8'));
+    for (const { table, end } of creates) {
       const revoked = revokes.some(
         (r) =>
           r.at >= end &&
@@ -1002,10 +1164,7 @@ function tablesMissingTheirRevoke(root: string): string[] {
           r.grantees.has('anon') &&
           r.grantees.has('authenticated'),
       );
-      if (!revoked) {
-        const shown = table.startsWith('public.') ? table.slice('public.'.length) : table;
-        missing.push(`${path.relative(root, file)}: ${shown}`);
-      }
+      if (!revoked) missing.push(`${path.relative(root, file)}: ${shownTable(table)}`);
     }
   }
   return missing;
@@ -1122,6 +1281,247 @@ describe('every CREATE TABLE in a step file is followed by its REVOKE (DECISIONS
       assert.deepEqual(tablesMissingTheirRevoke(scratch), [
         path.join('lg1', 'M1.02_alumni_settings.sql') + ': alumni_settings',
       ]);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── the group's closing REVOKE (design.md:6106-6110; DECISIONS 86) ───────────
+
+/**
+ * The second check: "every landing group's migration file ends with a REVOKE
+ * ALL ON <each table the file created> FROM anon, authenticated" (design §4
+ * preamble). The runner applies one file per step, so "the file" is the
+ * group's LAST step file (DECISIONS 86; LG1's is M1.22): it revokes every
+ * table that any step file of its `migrations/lg<n>/` group creates. Read by
+ * the parser above, so a REVOKE in a comment, a string or a quoted name does
+ * not count here either. "Last" is by step id compared numerically (M1.100
+ * follows M1.99), the rehearsal's order. An empty tree, or a group directory
+ * with no step file, is refused rather than passed.
+ *
+ * The per-step check cannot see this line go missing (each step keeps its own
+ * REVOKE), and neither can the rehearsal (M1.00's default-privilege revoke
+ * already keeps the stock grants off new tables), so it is held here.
+ */
+const STEP_ORDER = /^M(\d+)\.(\d+)_/;
+
+function byStepId(a: string, b: string): number {
+  const [, aMajor, aMinor] = STEP_ORDER.exec(a) ?? [];
+  const [, bMajor, bMinor] = STEP_ORDER.exec(b) ?? [];
+  return Number(aMajor) - Number(bMajor) || Number(aMinor) - Number(bMinor);
+}
+
+/**
+ * The step files the rehearsal applies, by the rehearsal's own rule
+ * (`scripts/migrate-rehearse.sh`: `find migrations -type f -name 'M*.sql'`):
+ * every regular file whose name matches `M*.sql`, at any depth. The closing
+ * check must read exactly this set, or a step the rehearsal applies escapes
+ * the second check (P03 fix 1 item 9; Fable L2, Opus L4).
+ */
+function rehearsedStepFiles(dir: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
+    const full = path.join(dir, d.name);
+    if (d.isDirectory()) return rehearsedStepFiles(full);
+    return d.isFile() && /^M.*\.sql$/.test(d.name) ? [full] : [];
+  });
+}
+
+const GROUP_DIR = /^lg\d+[a-z]*$/;
+
+function groupsMissingTheirClosingRevoke(root: string): string[] {
+  // Every step the rehearsal applies must sit directly inside an lg<n> group
+  // directory; a step anywhere else is refused, loudly, naming it.
+  const byGroup = new Map<string, string[]>();
+  const outside: string[] = [];
+  for (const file of rehearsedStepFiles(root)) {
+    const parts = path.relative(root, file).split(path.sep);
+    const [group, name] = parts;
+    if (parts.length === 2 && group !== undefined && name !== undefined && GROUP_DIR.test(group)) {
+      byGroup.set(group, [...(byGroup.get(group) ?? []), name]);
+    } else {
+      outside.push(parts.join('/'));
+    }
+  }
+  if (outside.length > 0) {
+    throw new Error(
+      `step file(s) outside an lg<n> group directory: ${outside.join(', ')} — the rehearsal ` +
+        'applies every M*.sql under migrations/, so each must sit directly in migrations/lg<n>/',
+    );
+  }
+  if (byGroup.size === 0) {
+    throw new Error(`no lg<n> group under ${root}: an empty tree proves nothing (MIGRATIONS_DIR?)`);
+  }
+  const missing: string[] = [];
+  for (const [group, files] of byGroup) {
+    const dir = path.join(root, group);
+    for (const file of files) {
+      if (!STEP_ORDER.test(file)) throw new Error(`${group}/${file} has no step id to order it by`);
+    }
+    const last = [...files].sort(byStepId).at(-1);
+    if (last === undefined) throw new Error(`${group} holds no step file`);
+    const read = (file: string) => readStepTables(fs.readFileSync(path.join(dir, file), 'utf8'));
+    const created = new Set(files.flatMap((file) => read(file).creates.map((c) => c.table)));
+    const closing = read(last).revokes.filter(
+      (r) => r.grantees.has('anon') && r.grantees.has('authenticated'),
+    );
+    for (const table of created) {
+      if (!closing.some((r) => r.tables.has(table))) {
+        missing.push(`${group}/${last}: ${shownTable(table)}`);
+      }
+    }
+  }
+  return missing;
+}
+
+describe("each landing group's last step revokes every table the group creates (DECISIONS 86)", () => {
+  test('the step files under test', () => {
+    const root = process.env.MIGRATIONS_DIR ?? path.join(REPO_ROOT, 'migrations');
+    assert.deepEqual(groupsMissingTheirClosingRevoke(root), []);
+  });
+
+  function scratchGroups(files: Record<string, string>): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'closing-revoke-'));
+    for (const [name, sql] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+      fs.writeFileSync(path.join(dir, name), sql);
+    }
+    return dir;
+  }
+  function missingIn(files: Record<string, string>): string[] {
+    const dir = scratchGroups(files);
+    try {
+      return groupsMissingTheirClosingRevoke(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('"last" is by step id, numerically: M9.100 closes the group, not M9.99', () => {
+    const a = 'CREATE TABLE a (x int);\nREVOKE ALL ON a FROM anon, authenticated;\n';
+    assert.deepEqual(
+      missingIn({
+        'lg9/M9.99_a.sql': a,
+        'lg9/M9.100_close.sql': 'REVOKE ALL ON a FROM anon, authenticated;\n',
+      }),
+      [],
+    );
+    assert.deepEqual(missingIn({ 'lg9/M9.99_a.sql': a, 'lg9/M9.100_other.sql': 'SELECT 1;\n' }), [
+      'lg9/M9.100_other.sql: a',
+    ]);
+  });
+
+  test('a closing REVOKE in a comment, or one that leaves out authenticated, does not count', () => {
+    const a = 'CREATE TABLE a (x int);\nREVOKE ALL ON a FROM anon, authenticated;\n';
+    assert.deepEqual(
+      missingIn({
+        'lg9/M9.01_a.sql': a,
+        'lg9/M9.02_close.sql': '-- REVOKE ALL ON a FROM anon, authenticated;\nSELECT 1;\n',
+      }),
+      ['lg9/M9.02_close.sql: a'],
+    );
+    assert.deepEqual(
+      missingIn({
+        'lg9/M9.01_a.sql': a,
+        'lg9/M9.02_close.sql': 'REVOKE ALL ON a FROM anon;\n',
+      }),
+      ['lg9/M9.02_close.sql: a'],
+    );
+  });
+
+  // P03 fix 1, item 9 (Fable L2, Opus L4): the rehearsal applies every
+  // `M*.sql` under migrations/, at any depth; a step it applies that the
+  // closing check never reads is the second check lost. Each escape below sits
+  // beside a valid lg1, so an `lg*`-only walk passes it in silence.
+  test('a step the rehearsal would apply but no lg<n> group holds is refused, naming it', () => {
+    const lg1 = 'CREATE TABLE a (x int);\nREVOKE ALL ON a FROM anon, authenticated;\n';
+    const stray = 'CREATE TABLE s (x int);\nREVOKE ALL ON s FROM anon, authenticated;\n';
+    const escaped: string[] = [];
+    for (const escape of [
+      'LG3/M3.01_upper_case_group.sql',
+      'hotfix/M2.09_not_a_group.sql',
+      'lg2/fix/M2.30_nested_deeper.sql',
+      'M2.40_top_level.sql',
+    ]) {
+      const dir = scratchGroups({
+        'lg1/M1.01_a.sql': lg1,
+        'lg2/M2.01_b.sql': 'CREATE TABLE b (x int);\nREVOKE ALL ON b FROM anon, authenticated;\n',
+        [escape]: stray,
+      });
+      try {
+        const outcome = (() => {
+          try {
+            return `passed: ${JSON.stringify(groupsMissingTheirClosingRevoke(dir))}`;
+          } catch (err) {
+            return (err as Error).message;
+          }
+        })();
+        if (!(/outside an lg<n> group/.test(outcome) && outcome.includes(escape))) {
+          escaped.push(`${escape} → ${outcome}`);
+        }
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    assert.deepEqual(escaped, [], 'these steps escaped the closing check');
+  });
+
+  test("the walk reads exactly the rehearsal's set: the script's own find, on the real tree and on the escapes", () => {
+    const script = fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'migrate-rehearse.sh'), 'utf8');
+    assert.ok(
+      script.includes("find migrations -type f -name 'M*.sql'"),
+      "migrate-rehearse.sh no longer finds its steps with find -type f -name 'M*.sql': update rehearsedStepFiles to match",
+    );
+    const findSet = (root: string) =>
+      spawnSync('find', ['.', '-type', 'f', '-name', 'M*.sql'], { cwd: root, encoding: 'utf-8' })
+        .stdout.split('\n')
+        .filter((line) => line !== '')
+        .map((line) => line.replace(/^\.\//, ''))
+        .sort();
+    const walkSet = (root: string) =>
+      rehearsedStepFiles(root)
+        .map((f) => path.relative(root, f).split(path.sep).join('/'))
+        .sort();
+    const real = path.join(REPO_ROOT, 'migrations');
+    assert.ok(findSet(real).length > 0);
+    assert.deepEqual(walkSet(real), findSet(real));
+    const dir = scratchGroups({
+      'lg1/M1.01_a.sql': 'SELECT 1;\n',
+      'lg1/notes.sql': 'SELECT 1;\n',
+      'LG3/M3.01_x.sql': 'SELECT 1;\n',
+      'lg2/fix/M2.30_y.sql': 'SELECT 1;\n',
+      'M2.40_z.sql': 'SELECT 1;\n',
+    });
+    try {
+      assert.deepEqual(walkSet(dir), findSet(dir));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an empty tree is refused, not passed vacuously', () => {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'closing-revoke-empty-'));
+    try {
+      assert.throws(() => groupsMissingTheirClosingRevoke(empty), /no lg<n> group/);
+    } finally {
+      fs.rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  test('the check goes red on a scratch copy with one table left out of M1.22 (the mutant never sits in migrations/)', () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'closing-revoke-check-'));
+    try {
+      fs.cpSync(path.join(REPO_ROOT, 'migrations'), scratch, { recursive: true });
+      const target = path.join(scratch, 'lg1', 'M1.22_lg1_revoke_check.sql');
+      const before = fs.readFileSync(target, 'utf8');
+      const after = before.replace('REVOKE ALL ON staff_settings FROM anon, authenticated;\n', '');
+      assert.notEqual(after, before, 'the mutation did not land');
+      fs.writeFileSync(target, after);
+      assert.deepEqual(groupsMissingTheirClosingRevoke(scratch), [
+        'lg1/M1.22_lg1_revoke_check.sql: staff_settings',
+      ]);
+      // The per-step check is blind to it: M1.21 still revokes its own table.
+      assert.deepEqual(tablesMissingTheirRevoke(scratch), []);
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }

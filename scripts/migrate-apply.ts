@@ -28,6 +28,14 @@
  *                          copy must meet the gate (design.md:2122-2128).
  *                          Comma-separate several tables.
  *
+ * A step's leading comment lines (before its first line of SQL) are for its
+ * directives and its description. They are directive-only for one family of
+ * words: a line there that opens with `migrate`/`migration`, `census-empty`,
+ * `no-transaction` or `invalidate-class-catalog` in any spelling but the exact
+ * `-- migrate: <directive>` is refused, on purpose, as a possible misspelt
+ * directive ("-- Migration notes: …" included). Put that prose below the first
+ * line of SQL, or start it with another word (`src/db/migrate.ts`).
+ *
  * Note the `--` after the script name: without it npm keeps `--url` and
  * `--project` for itself and passes only their values, so the script refuses
  * a call whose flags npm swallowed rather than guess which value was which.

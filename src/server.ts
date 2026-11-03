@@ -34,6 +34,7 @@ import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffCreditExpiryRoute } from './routes/staffCreditExpiry.js';
 import { registerStaffInvoicesRoute } from './routes/staffInvoices.js';
+import { registerStaffOwnersRoute } from './routes/staffOwners.js';
 import { registerStaffMembershipsRoute } from './routes/staffMemberships.js';
 import { registerStaffDogsRoute } from './routes/staffDogs.js';
 import { registerStaffRatesRoute } from './routes/staffRates.js';
@@ -137,7 +138,8 @@ export function buildApp(): FastifyInstance {
   registerStaffSettingsRoute(app); // [staff] — GET/PATCH /staff/settings/:domain[/:location] (2.0.0)
   registerStaffAlumniRoute(app); // [staff] — §J.3 completed-programs record + alumni-flag clear
   registerStaffMembershipsRoute(app); // [staff] — §J.1 pause / resume (staff-mediated)
-  registerStaffInvoicesRoute(app); // [staff] — parked-invoice worklist (credit-expiry Phase 3)
+  registerStaffInvoicesRoute(app); // [staff] — parked-invoice worklist + GET /staff/invoices/:id (2.0.0)
+  registerStaffOwnersRoute(app); // [staff] — owner picker + STAFF-U13 billing reads (2.0.0)
   registerStaffRatesRoute(app); // [staff] — per-location service-rate editor (2026-06-20)
   registerStaffDogsRoute(app); // [staff] — Day-19b portal dog directory (name resolution)
   registerStaffBookingsRoute(app); // [staff] — Day-19 portal verb 4 (confirm / cancel / attendance)

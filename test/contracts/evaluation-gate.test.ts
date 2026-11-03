@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import type { LightMyRequestResponse } from 'fastify';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
@@ -129,7 +130,7 @@ async function postRequest(opts: {
   app: ReturnType<typeof requestsApp>['app'];
   payload: Record<string, unknown>;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof requestsApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({
@@ -145,7 +146,7 @@ async function approveRequest(opts: {
   id: string;
   payload: Record<string, unknown>;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof requestsApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({

@@ -1,7 +1,11 @@
+import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import {
   NOTIFICATION_TYPES,
   SERVICE_CATEGORIES,
   SETTINGS_DOMAINS,
+  type ServiceCategory,
+  type SettingCatalog,
+  type SettingClass,
   type SettingsDomain,
   type StaffRole,
 } from '../contracts/wire.js';
@@ -43,7 +47,9 @@ import {
  * table under the generated audit test.
  */
 
-export type SettingClass = 'ops' | 'money' | 'price' | 'roles';
+/** The four role classes are the wire's (2.0.0 serves them on the manifest),
+ *  re-exported so that one union exists (the `RefundStatus` precedent). */
+export type { SettingClass };
 
 export { SETTINGS_DOMAINS, type SettingsDomain };
 
@@ -93,6 +99,14 @@ export type CatalogTable =
   | 'dog_descriptors'
   | 'intake_field_settings'
   | 'day_capacity';
+/** The manifest serves a catalog key's table as the wire's `SettingCatalog`
+ *  (2.0.0), a transcription of this union: pinned, so neither drifts. */
+export type CatalogTableConformance = Expect<Equal<CatalogTable, SettingCatalog>>;
+
+/** Every integer setting is an `integer` column: int4 is the bound where an
+ *  entry sets no `max` — the PATCH's 422 (DECISIONS 65) and the manifest's
+ *  served `max` read this one constant. */
+export const INT4_MAX = 2147483647;
 
 export type SettingStore =
   /** A column of the domain's settings table — what the settings PATCH writes. */
@@ -137,8 +151,15 @@ export type SettingValue =
   /** `day.offerings`: service → {offered, client_visible, name, description}.
    *  Every switch is `ops`, the three request services' included: "Editable by
    *  any role, so turning one on is a deliberate act" (design.md:3719-3722;
-   *  DECISIONS 69). */
-  | { type: 'offerings'; services: readonly string[] }
+   *  DECISIONS 69). `name` and `description` hold at most these many Unicode
+   *  code points (2.0.0; build DECISIONS 89, J17): the PATCH's bound and the
+   *  manifest's served caps. */
+  | {
+      type: 'offerings';
+      services: readonly ServiceCategory[];
+      nameMaxLength: number;
+      descriptionMaxLength: number;
+    }
   /** A set of staff roles (`staff_role[]`, M1.21): a role outside the enum, or
    *  one named twice, is a bad shape (400, DECISIONS 59); an empty list is out
    *  of range (422 — the column's `cardinality > 0` CHECK). */
@@ -206,7 +227,11 @@ const DAY = 'day_program_settings' as const;
 const EVAL = 'evaluation_settings' as const;
 
 /** The services an `offerings` document names, and a day program's services. */
-const OFFERING_SERVICES: readonly string[] = SERVICE_CATEGORIES;
+const OFFERING_SERVICES: readonly ServiceCategory[] = SERVICE_CATEGORIES;
+/** The offerings copy caps, in Unicode code points (build DECISIONS 89, J17):
+ *  about 1.9× and 3.5× today's longest name (32) and tile description (81). */
+const OFFERING_NAME_MAX_LENGTH = 60;
+const OFFERING_DESCRIPTION_MAX_LENGTH = 280;
 const QUIET_HOURS_CLASSES: readonly string[] = [...NOTIFICATION_TYPES, 'closure', 'staff-reply'];
 const PROGRAMS_WITH_REMINDERS = ['day-school', 'day-care', 'group-class', 'evaluation'] as const;
 // No 'package' service and no 'purchase' event: §1.1 never builds that rule
@@ -630,7 +655,12 @@ const ENTRIES: readonly Entry[] = [
     key: 'day.offerings',
     class: 'ops',
     store: column(DAY, 'offerings', 'campus'),
-    value: { type: 'offerings', services: OFFERING_SERVICES },
+    value: {
+      type: 'offerings',
+      services: OFFERING_SERVICES,
+      nameMaxLength: OFFERING_NAME_MAX_LENGTH,
+      descriptionMaxLength: OFFERING_DESCRIPTION_MAX_LENGTH,
+    },
     inert: LIVE,
   },
   {
@@ -800,8 +830,12 @@ const ENTRIES: readonly Entry[] = [
     store: {
       kind: 'catalog',
       table: 'service_rates',
+      // DECISIONS 93: the note says what is true. `POST /staff/rates` accepts an
+      // evaluation rate from the owner or a manager until DAY-U23 narrows it at
+      // design 4.0.0 (design.md:2089-2090; DECISIONS 74 X6); the portal draws no
+      // rate editor in v1, and the preflight's price clause flags a rate off its seed.
       where:
-        "the campus's category = 'evaluation' row (amount_cents); no route accepts a non-zero price in v1",
+        "the campus's category = 'evaluation' row (amount_cents), edited only by POST /staff/rates (owner and manager); no portal screen in v1, and every price is kept at its seed (q27 (a))",
     },
     value: { type: 'catalog' },
     inert: LIVE,

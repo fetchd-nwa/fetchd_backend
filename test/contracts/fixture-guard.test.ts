@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -46,7 +46,7 @@ describe('assertTestDatabaseUrl', () => {
  * `_fixture.ts` opens no connection — the pg pool is lazy — so neither child
  * needs a database and neither can touch one.
  */
-function importFixture(databaseUrl: string): ReturnType<typeof spawnSync<string>> {
+function importFixture(databaseUrl: string): SpawnSyncReturns<string> {
   return spawnSync(
     process.execPath,
     [

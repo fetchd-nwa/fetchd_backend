@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import type { LightMyRequestResponse } from 'fastify';
 import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
@@ -75,7 +76,7 @@ async function postRequest(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   payload: Record<string, unknown>;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({
@@ -91,7 +92,7 @@ async function patchRequest(opts: {
   id: string;
   payload: Record<string, unknown>;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({
@@ -106,7 +107,7 @@ async function cancelRequest(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   id: string;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({
@@ -122,7 +123,7 @@ async function approveRequest(opts: {
   id: string;
   payload: Record<string, unknown>;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({
@@ -137,7 +138,7 @@ async function denyRequest(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   id: string;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({
@@ -168,7 +169,9 @@ async function seedSubmittedRequest(args: {
     status: 'submitted',
     lengthWeeks: args.lengthWeeks ?? null,
   });
-  const dogRows = [{ requestId: id, dogId: FIXTURE_IDS.dog1Id, isLead: true }];
+  const dogRows: { requestId: string; dogId: string; isLead: boolean }[] = [
+    { requestId: id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
+  ];
   for (const dogId of args.additionalDogIds ?? []) {
     dogRows.push({ requestId: id, dogId, isLead: false });
   }
@@ -922,7 +925,7 @@ test('POST /staff/requests/:id/deny — already-converted → 409', SKIP_WHEN_NO
 async function getStaffRequests(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   status?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const url =
     opts.status !== undefined ? `/staff/requests?status=${opts.status}` : '/staff/requests';
   return opts.app.inject({ method: 'GET', url });

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import type { LightMyRequestResponse } from 'fastify';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
@@ -51,7 +52,7 @@ function postReport(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   payload: Record<string, unknown>;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({ method: 'POST', url: '/staff/reports', headers, payload: opts.payload });
@@ -75,7 +76,7 @@ function deleteReport(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   id: string;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({ method: 'DELETE', url: `/staff/reports/${opts.id}`, headers });
@@ -86,7 +87,7 @@ function patchReport(opts: {
   id: string;
   payload: Record<string, unknown>;
   idempotencyKey?: string;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({
@@ -498,7 +499,7 @@ test('PATCH /staff/reports/:id — owner principal → 403', SKIP_WHEN_NO_DB, as
 // ──────────────────────────────────────────────────────────────────────────
 
 /** The dog-1 fixture reports, newest → oldest by `date`. */
-const DOG1_FIXTURE_REPORTS_DESC = [
+const DOG1_FIXTURE_REPORTS_DESC: readonly string[] = [
   FIXTURE_IDS.reportFoundationId, // 2026-05-08
   FIXTURE_IDS.reportPrivateLessonId, // 2026-04-25
   FIXTURE_IDS.reportBoardTrainId, // 2026-03-15
@@ -508,7 +509,7 @@ const DOG1_FIXTURE_REPORTS_DESC = [
 function listStaffReports(
   app: ReturnType<typeof makeContractApp>['app'],
   query: string,
-): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+): Promise<LightMyRequestResponse> {
   return app.inject({ method: 'GET', url: `/staff/reports${query}` });
 }
 

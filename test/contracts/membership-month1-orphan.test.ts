@@ -259,7 +259,7 @@ async function refundsForOwner(): Promise<
 
 async function orphanPushes(): Promise<
   {
-    dedupeKey: string;
+    dedupeKey: string | null;
     title: string;
     body: string;
     dogId: string | null;

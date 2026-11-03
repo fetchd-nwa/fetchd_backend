@@ -1,0 +1,12 @@
+// `npm run typecheck:tests`, a step of `npm run gate` (P03 item 0f): src/,
+// test/ and scripts/ under tsconfig.json's strict options. tsconfig.json covers
+// src/ only and the suite runs type-erased through tsx, so without this nothing
+// typechecks a test or a script. `.mjs` scripts stay out (no allowJs).
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*", "test/**/*", "scripts/**/*", "drizzle.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}

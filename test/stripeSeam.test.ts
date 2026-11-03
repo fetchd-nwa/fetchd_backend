@@ -51,7 +51,7 @@ import {
 function cardErrorWithIntent(
   intent: Record<string, unknown>,
   code = 'card_declined',
-): Stripe.errors.StripeCardError {
+): InstanceType<typeof Stripe.errors.StripeCardError> {
   return new Stripe.errors.StripeCardError({
     type: 'card_error',
     code,
@@ -500,7 +500,7 @@ test('chargeBlockerForConfirm: a code AGREEING with a processing status warns ab
   const { log, warns } = capturingLogger();
   assert.equal(
     chargeBlockerForConfirm(
-      { status: 'processing', blocker: 'processing', failureCode: 'processing_error' },
+      thrownForkResult('processing', { blocker: 'processing', failureCode: 'processing_error' }),
       log,
     ),
     'processing',
@@ -592,7 +592,7 @@ test('chargeBlockerForConfirm: a SUCCEEDED confirm has no blocker, on either for
   // an error path may never be allowed to describe a settlement.
   assert.equal(
     chargeBlockerForConfirm(
-      { status: 'succeeded', blocker: 'declined', failureCode: 'card_declined' },
+      thrownForkResult('succeeded', { blocker: 'declined', failureCode: 'card_declined' }),
       log,
     ),
     undefined,

@@ -26,8 +26,10 @@ export interface AdminUser {
   created_at: string;
   email_confirmed_at: string | null;
   last_sign_in_at: string | null;
-  /** Server-written: only the admin API sets it. `app_role` lives here. */
-  app_metadata: Record<string, unknown>;
+  /** Server-written: only the admin API sets it. `app_role` lives here.
+   *  `null` for a user whose `raw_app_meta_data` is NULL: GoTrue sends a nil
+   *  map as JSON `null` (adversary r2 N3). */
+  app_metadata: Record<string, unknown> | null;
   identities: Array<{ provider: string }>;
   banned_until?: string | null;
 }
@@ -66,6 +68,12 @@ export function makeAdminClient(
     const res = await fetchImpl(`${base}${path}`, {
       method,
       headers,
+      // Never follow a redirect (DECISIONS 82(a)): fetch drops `Authorization`
+      // on a cross-origin hop but keeps `apikey`, so following one would hand
+      // the service-role key to wherever the host points — in cleartext if
+      // that is http://. GoTrue's admin API does not redirect; a call that
+      // meets one fails instead.
+      redirect: 'error',
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await res.text();

@@ -433,6 +433,7 @@ test(
         bookingId: FIXTURE_IDS.booking1Id,
         amountCents: 4500,
         reason: 'cancel',
+        stripeIdempotencyKey: null,
       }),
     );
     await db.transaction(async (tx) =>
@@ -500,6 +501,7 @@ test(
         bookingId: FIXTURE_IDS.booking1Id,
         amountCents: 4500,
         reason: 'cancel',
+        stripeIdempotencyKey: null,
       }),
     );
 

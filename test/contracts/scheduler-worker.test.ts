@@ -878,8 +878,8 @@ test(
         1,
         `expected exactly one phase-1 boundary alarm; error lines were: ${JSON.stringify(errors)}`,
       );
-      assert.match(String(boundary[0].obj.err), /deep_link_kind/);
-      assert.match(boundary[0].msg ?? '', /worker boundary/);
+      assert.match(String(boundary[0]?.obj.err), /deep_link_kind/);
+      assert.match(boundary[0]?.msg ?? '', /worker boundary/);
       assert.equal(expoPush.calls.length, 0);
     } finally {
       scheduledNotificationsRepository.lockDueForSend = original;

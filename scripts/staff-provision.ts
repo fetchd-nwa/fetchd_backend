@@ -2,9 +2,11 @@
  * `npm run staff:provision -- --project <ref> …` — the only writer of person
  * `staff` rows (design §2.1:1969-2045; P02). Four modes:
  *
- *   --roster <file.json> --portal-origin <origin> [--yes]
+ *   --roster <file.json> --portal-origin <origin> [--yes] [--last-owner]
  *                          a roster run: create or adopt every staffer on
- *                          the roster; --yes confirms role changes
+ *                          the roster; --yes confirms role changes;
+ *                          --last-owner lets a role change demote the last
+ *                          live owner
  *   --link <email> --portal-origin <origin>
  *                          re-mint one set-password link
  *   --expire <email> --yes [--last-owner]
@@ -54,7 +56,7 @@ import { clientConfig, resolveTarget } from '../src/db/migrate.js';
 
 const USAGE =
   'usage: npm run staff:provision -- --project <ref> ' +
-  '(--roster <file> --portal-origin <origin> [--yes] | --link <email> --portal-origin <origin> | ' +
+  '(--roster <file> --portal-origin <origin> [--yes] [--last-owner] | --link <email> --portal-origin <origin> | ' +
   '--expire <email> --yes [--last-owner] | --rehire <email> --roster <file> --yes) [--ca <path>]';
 
 function usage(message: string): never {
@@ -184,7 +186,7 @@ async function main(): Promise<void> {
       code = await runExpire(deps, flags.get('expire') as string, { confirm: yes, lastOwner });
     } else if (mode === 'rehire') {
       code = await runRehire(deps, flags.get('rehire') as string, roster, { confirm: yes });
-    } else code = await runRoster(deps, roster, { portalOrigin, confirm: yes });
+    } else code = await runRoster(deps, roster, { portalOrigin, confirm: yes, lastOwner });
   } finally {
     await db.end();
   }

@@ -2170,7 +2170,10 @@ async function intoShadow(opts: {
   app: ReturnType<typeof makeContractApp>['app'];
   cohortId: string;
   key: string;
-}): Promise<{ id: string; bookings: { id: string; createdAt: string }[] }> {
+}): Promise<{
+  id: string;
+  bookings: { id: string; scheduledAt: string; createdAtUs: string }[];
+}> {
   const first = await enroll({
     app: opts.app,
     cohortId: opts.cohortId,

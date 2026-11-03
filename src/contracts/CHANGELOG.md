@@ -12,6 +12,107 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [2.0.0] — 2026-11-02
+
+Additive. LG1 step 3 of 3 and LG1's close: 2.0.0 itself, the group's target
+(plan unit P03, slice S03, ledger STAFF-U13 and the contract half of
+STAFF-U46; build DECISIONS 85; design §1.1 2.0.0,
+`designs/fetchd-v1-technical-design.md:710-719`, §2.10 `:4682-4697`,
+`:4943-4958`). It types the last of 2.0.0: the staff billing reads
+(STAFF-U13), the owner list, and the settings manifest that the portal's
+settings editor is drawn from (DECISIONS 85, J27, closing DECISIONS 58's gap).
+It also caps an offering's name and description. With 2.0.0-lg1.1 and
+2.0.0-lg1.2 before it, every line of §1.1 2.0.0 is now typed. No existing
+field, type or tuple changes shape, so every 2.0.0-lg1.2 client compiles
+unchanged. Contract-first: no route serves the new shapes until P03's backend
+phase B. Resync both clients (`npm run sync:contracts` in mobile and portal).
+Both typecheck unchanged against the resynced copy (a scratch run at their
+HEADs, not their gates).
+
+Added (§ auth-media):
+
+- `RecordSource` = `'app' | 'gingr' | 'seed'`, a mirror of the `record_source`
+  pgEnum (`schema.sql:194`). `conformance.ts` pins it in the same backend
+  commit. No value tuple.
+- `StaffOwnerWire` `{id, name, email, phone, location: LocationKey, source:
+  RecordSource}` and `GetStaffOwnersResponse` for `GET /staff/owners` (any
+  staff role; §1.1:718-719). It lists live owners, ordered by name, with no
+  money field. `location` is `owners.location` as the slug: the design's
+  "campus".
+
+Added (§ payments-invoices, STAFF-U13; §1.1:710-717, §2.10:4682-4697):
+
+- `StaffInvoiceWire` for `GET /staff/owners/:id/invoices`
+  (`GetStaffOwnersInvoicesResponse`) and `GET /staff/invoices/:id`, any staff
+  role: `id`, `owner_id`, `status`, `purpose`, `amount_cents`, `paid_cents`,
+  `dog_id?`, `issued_at`, `due_at`, `paid_at?`, `payments?`. It is today's
+  invoice shape (the severance from PAY-U20, design.md:4493-4494), so it has no
+  `number` and no `lines`: v1 invoices are one line (design.md:6944).
+  `payments` is a non-omit exception decided by the caller. It is present,
+  `[]` included, exactly for a caller holding `capabilities.refund_money`
+  (04- item 128), and absent for the seeded trainer.
+- `StaffInvoicePaymentWire` `{payment_id, paid_cents, refundable_cents}`.
+  `refundable_cents` uses the design's one cap definition. On today's schema
+  it is paid minus every refund not `failed`, floored at 0. No `withdrawn`
+  outcome exists until M5.10 (design 6.0.0), and the field's meaning holds
+  across that change.
+- `StaffPaymentWire` and `StaffPaymentRefundWire` for `GET
+  /staff/owners/:id/payments` (`GetStaffOwnersPaymentsResponse`), owner and
+  manager only. `StaffPaymentWire` extends `StaffInvoicePaymentWire` with
+  `status: 'succeeded' | 'refunded'`, `purpose`, `created_at`, `dog_id?`,
+  `invoice_id?` and `refunds: StaffPaymentRefundWire[]`. A refund row is
+  `{id, amount_cents, status: RefundStatus, reason?, created_at}`. There is
+  no brand or last4, and the trainer gets 403 `forbidden`.
+- `GetStaffOwnersPaymentMethodsResponse` = `PaymentMethodWire[]` for `GET
+  /staff/owners/:id/payment-methods`, owner and manager only. It reuses the
+  owner's own card row unchanged. The trainer gets 403 `forbidden`.
+
+Added (§ settings, DECISIONS 85):
+
+- (a) `SettingClass` (`'ops' | 'money' | 'price' | 'roles'`, the registry's
+  four) and `SettingCatalog` (the six catalog tables a *read-only here* key
+  lives in).
+- (b) `GET /staff/settings/manifest` → `GetStaffSettingsManifestResponse` =
+  `StaffSettingsManifestWire` `{entries: SettingsManifestEntryWire[]}`, any
+  staff role, one document. The registry serves one entry per key: `key`,
+  `domain`, `class` (`| null`), `read` (`SettingReadWire` `{tier, field,
+  path?}` `| null`), `editor` (`SettingEditorWire`: `here` | `via` |
+  `elsewhere`), `inert` (`SettingInertWire`: `false` | `{kind, note?}`),
+  `editable` and `value` (`SettingValueSpecWire`). `editable` is computed for
+  the caller's role, and is `false` for every price key and every inert key.
+  `value` has fourteen arms, the registry's value types, with bounds
+  resolved, enum values listed, the three staff roles on `role-list` and the
+  offerings caps. Un-inerting a key changes the manifest's data, never its
+  shape.
+- §16: `Expect<Equal<Extract<SettingsDomain, 'manifest'>, never>>`. The static
+  segment `manifest` wins over `:domain` in the router, so it may never be a
+  domain. A mutant that appends `'manifest'` as a full domain (tuple, union
+  and both maps) proved the pin red first: TS2344 at the pin, and nowhere else.
+
+Changed (doc, plus server validation; no shape change):
+
+- `ServiceOfferingWire.name` and `.description` hold at most 60 and 280
+  characters (Unicode code points). They are never blank (send `null` to
+  clear) and stay one line (DECISIONS 71). Anything else is 422
+  `invalid_payload`, enforced in the route; there is no DDL (P01 r3 Opus L3).
+
+Changed (doc only):
+
+- `WIRE_CONTRACT_VERSION` `'2.0.0-lg1.2'` → `'2.0.0'`. Its doc now states the
+  landing-group prerelease scheme.
+- `ParkedInvoiceWire` names the two new invoice routes. It notes that
+  `/staff/invoices/:id` does not collide with `/staff/invoices?parked`, and
+  that design 6.1.0's general invoice list is not built here.
+- `PaymentMethodWire` names the staff route. `RefundStatus` names its first
+  field.
+- Settings section header: it names 2.0.0's additions. Its class-and-inert
+  rule now says the manifest serves both as data, and its route list gains
+  the manifest and the static-segment note.
+
+Not typed here: a `STAFF_ROLES` tuple (nothing iterates the roles; the
+manifest serves them on each `role-list` entry); design 6.1.0's general
+`GET /staff/invoices` list; and nothing from design 3.0.0 or later.
+
 ## [2.0.0-lg1.2] — 2026-11-02
 
 BREAKING. LG1 step 2 of 3 toward 2.0.0 (plan unit P02, slice S02, ledger

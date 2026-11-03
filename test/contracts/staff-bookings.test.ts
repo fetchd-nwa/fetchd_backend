@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import type { LightMyRequestResponse } from 'fastify';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
@@ -95,7 +96,7 @@ function post(opts: {
   url: string;
   idempotencyKey?: string;
   payload?: Record<string, unknown>;
-}): ReturnType<ReturnType<typeof makeContractApp>['app']['inject']> {
+}): Promise<LightMyRequestResponse> {
   const headers: Record<string, string> = {};
   if (opts.idempotencyKey !== undefined) headers['idempotency-key'] = opts.idempotencyKey;
   return opts.app.inject({

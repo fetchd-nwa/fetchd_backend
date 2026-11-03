@@ -372,7 +372,9 @@ export function registerPaymentMethodsRoute(
   });
 }
 
-function toPaymentMethodWire(row: PaymentMethodRow): PaymentMethodWire {
+/** The one card mapping: the owner's `GET /payment-methods` and staff's
+ *  `GET /staff/owners/:id/payment-methods` (STAFF-U13) serve the same row. */
+export function toPaymentMethodWire(row: PaymentMethodRow): PaymentMethodWire {
   return {
     id: row.id,
     brand: row.brand,

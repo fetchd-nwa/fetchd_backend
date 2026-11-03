@@ -22,6 +22,7 @@ function row(overrides: Partial<BookingRowForWire> = {}): BookingRowForWire {
     notes: null,
     sessionReportId: null,
     location: 'fayetteville',
+    lessonSetting: null,
     cancelledAt: null,
     cancelForfeited: false,
     cancelDeadlineAt: null,

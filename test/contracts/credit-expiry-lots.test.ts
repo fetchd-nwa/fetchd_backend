@@ -206,6 +206,7 @@ test(
         lotId: lot,
         lotExpiresAt: isoIn(365),
         now: new Date(),
+        dogIsAlumni: false,
       });
     });
 
@@ -243,6 +244,7 @@ test(
         lotId: expiredLot,
         lotExpiresAt: isoIn(-1),
         now: new Date(),
+        dogIsAlumni: false,
       });
     });
 

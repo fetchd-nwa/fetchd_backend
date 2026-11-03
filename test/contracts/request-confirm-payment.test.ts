@@ -103,7 +103,7 @@ async function cleanup(): Promise<void> {
     await db.delete(pendingRequests).where(inArray(pendingRequests.id, testIds));
   }
   // Drop any test-created bookings (not the fixture's 10 booking ids).
-  const fixtureBookingIds = [
+  const fixtureBookingIds: readonly string[] = [
     FIXTURE_IDS.booking1Id,
     FIXTURE_IDS.booking2Id,
     FIXTURE_IDS.booking3Id,

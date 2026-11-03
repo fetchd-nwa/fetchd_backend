@@ -4,6 +4,7 @@ import type { StaffRole } from '../contracts/wire.js';
 import { withActorOn } from '../db/actorOn.js';
 import { resolveTarget } from '../db/migrate.js';
 import { staffRole } from '../db/schema/schema.js';
+import { LOCATION_DISPLAY } from '../lib/locations.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import type { AdminClient, AdminUser } from './adminClient.js';
 
@@ -19,7 +20,7 @@ export type { AdminClient, AdminUser } from './adminClient.js';
  * Nothing here loads `src/env.ts`: the script reads three variables
  * (`DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`), and its imports
  * — this module, `adminClient.ts`, `db/actorOn.ts`, `db/migrate.ts`, the Drizzle
- * enum — load no server configuration.
+ * enum, `lib/locations.ts` — load no server configuration.
  *
  * **A roster run** (`runRoster`):
  *   - *Pass 1, before any write.* The whole roster is validated — a known
@@ -37,6 +38,10 @@ export type { AdminClient, AdminUser } from './adminClient.js';
  *     email_confirmed_at, last_sign_in_at and identity providers. A roster
  *     role that differs from the adopted user's `app_role` (or from her staff
  *     row's role) is a role change: printed, and applied only with `--yes`.
+ *     A run whose role changes would leave no live `owner` row is refused
+ *     unless `--last-owner` is passed (DECISIONS 77, 82(b)); the count is
+ *     taken again inside the write transaction, the owner rows locked `FOR
+ *     UPDATE`, so two concurrent runs cannot each demote one of two owners.
  *   - *Pass 2.* Auth first — `createUser({email, email_confirm: true,
  *     app_metadata: {app_role}})` for each new staffer (`app_metadata` carries
  *     `app_role` only: name and campuses live on the row, read from `GET
@@ -45,8 +50,9 @@ export type { AdminClient, AdminUser } from './adminClient.js';
  *     `supabase_uid`, touching neither `expired_at` nor an unchanged row (so a
  *     re-run writes no audit row), and each EMPTY messaging-responder slot
  *     filled by staff id from the roster — one already set is never touched,
- *     and a slot whose named staffer was skipped is printed as left empty
- *     (DECISIONS 76). Last, a set-password link
+ *     and a slot whose named staffer was skipped, or already holds the other
+ *     slot, is printed as left empty (DECISIONS 76, 82(c)): one staffer never
+ *     fills both. Last, a set-password link
  *     (`generateLink` recovery → `<portal>/set-password`) only for users this
  *     run created, each printed once, to be handed over in person; an adopted
  *     user's link is `--link`'s alone, so a re-run never voids one already
@@ -58,7 +64,8 @@ export type { AdminClient, AdminUser } from './adminClient.js';
  * responder slot that names her (printed: a roster re-run fills it), bans the
  * auth user and removes `app_role` from her `app_metadata`, so the preflight's
  * roster clause never counts a leaver. It refuses the last live `owner` row
- * unless `--last-owner` is passed too. **`--rehire <email>`** is the one way
+ * unless `--last-owner` is passed too, decided under the roster's owner-row lock
+ * (DECISIONS 82(b)). **`--rehire <email>`** is the one way
  * back: `app_role` from the roster, the ban lifted and `expired_at` cleared
  * together, under one printed confirmation (`--yes`), her campuses checked
  * against `locations` as a roster run checks them (DECISIONS 79).
@@ -96,8 +103,10 @@ type Refused = { ok: false; reason: string };
 /** The C0 control set (U+0000–U+001F), as the settings PATCH refuses it
  *  (DECISIONS 66, 71): Postgres refuses NUL in text — at the INSERT, after
  *  every `createUser` has run — and ESC and the rest would reach the
- *  operator's terminal and the wire. */
-const CONTROL_CHARACTER = /[\u0000-\u001f]/;
+ *  operator's terminal and the wire. Also DEL, the C1 set (U+009B is CSI to
+ *  some terminals) and the bidi overrides and isolates (U+202A–E, U+2066–9),
+ *  which reorder what the operator reads (adversary r2 N4). */
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
 
 const entrySchema = z
   .object({
@@ -112,7 +121,7 @@ const entrySchema = z
       .min(1)
       .refine(
         (name) => !CONTROL_CHARACTER.test(name),
-        'must not hold a control character (NUL, ESC, CR, LF…)',
+        'must not hold a control or bidi character (NUL, ESC, CR, LF, DEL, C1, U+202E…)',
       ),
     role: z.enum(STAFF_ROLES),
     home_locations: z.array(z.string().trim().min(1)),
@@ -263,6 +272,56 @@ async function staffRowOf(db: pg.ClientBase, uid: string): Promise<StaffRow | un
   return rows[0];
 }
 
+/**
+ * The uids of the live `owner` staff rows. Inside a write transaction pass
+ * `lock`: the rows are taken `FOR UPDATE`, so a second run that would also
+ * take an owner away waits here until the first commits, then reads what it
+ * committed (DECISIONS 77, 82(b)) — two concurrent runs cannot both pass.
+ */
+async function liveOwnerUids(db: pg.ClientBase, lock: boolean): Promise<Set<string>> {
+  const { rows } = await db.query<{ uid: string }>(
+    `SELECT supabase_uid::text AS uid FROM staff WHERE role = 'owner' AND expired_at IS NULL` +
+      (lock ? ' FOR UPDATE' : ''),
+  );
+  return new Set(rows.map((r) => r.uid));
+}
+
+/**
+ * The emails of the live owners a roster run demotes, if the run leaves no
+ * live owner row; [] otherwise (DECISIONS 77, 82(b)). A run that demotes no
+ * one is never refused, and one that makes another owner while demoting the
+ * last leaves one. `uidOf` is the planned user's uid (none yet for a user the
+ * run will create).
+ */
+function lastOwnerDemotions(
+  owners: ReadonlySet<string>,
+  planned: readonly Planned[],
+  uidOf: (plan: Planned) => string | undefined,
+): string[] {
+  const after = new Set(owners);
+  const demoted: string[] = [];
+  for (const plan of planned) {
+    const uid = uidOf(plan);
+    if (plan.entry.role === 'owner') after.add(uid ?? `new:${plan.entry.email}`);
+    else if (uid !== undefined && owners.has(uid)) {
+      after.delete(uid);
+      demoted.push(plan.entry.email);
+    }
+  }
+  return demoted.length > 0 && after.size === 0 ? demoted : [];
+}
+
+/** The locked count's refusal, inside the transaction: a concurrent run took
+ *  an owner away after pass 1 passed. */
+class LastOwnerRaced extends Error {}
+
+function lastOwnerRefusal(emails: readonly string[]): string {
+  return (
+    `refused: ${emails.join(', ')} ${emails.length === 1 ? 'is the last live owner' : 'are the last live owners'} — ` +
+    'no one would be left to edit the role lists. If that is meant, pass --last-owner as well.'
+  );
+}
+
 async function holdsLiveOwnerRow(db: pg.ClientBase, uid: string): Promise<boolean> {
   const { rows } = await db.query(
     'SELECT 1 FROM owners WHERE supabase_uid = $1 AND expired_at IS NULL',
@@ -272,7 +331,7 @@ async function holdsLiveOwnerRow(db: pg.ClientBase, uid: string): Promise<boolea
 }
 
 function appRoleOf(user: AdminUser): string | undefined {
-  const role = user.app_metadata.app_role;
+  const role = user.app_metadata?.app_role;
   return typeof role === 'string' && role.length > 0 ? role : undefined;
 }
 
@@ -292,9 +351,11 @@ function canonical(homes: readonly string[]): string[] {
 }
 
 /**
- * Every home campus must be a `locations` row (design §2.1:1940-1943) — on
- * every write path, the roster run and `--rehire` alike (DECISIONS 79).
- * Returns the refusal, or `null`.
+ * Every home campus must be a `locations` row (design §2.1:1940-1943) and a
+ * key of `LOCATION_DISPLAY`, the static map `GET /me` renders labels from — on
+ * every write path, the roster run and `--rehire` alike (DECISIONS 79, 82(d)).
+ * A `locations` row added before its label would otherwise be written here and
+ * 500 that staffer's every `/me`. Returns the refusal, or `null`.
  */
 async function unknownHomes(
   db: pg.ClientBase,
@@ -302,12 +363,20 @@ async function unknownHomes(
 ): Promise<string | null> {
   const { rows } = await db.query<{ slug: string }>('SELECT slug FROM locations');
   const slugs = new Set(rows.map((r) => r.slug));
-  const unknown = entries.flatMap((e) =>
-    e.home_locations.filter((s) => !slugs.has(s)).map((s) => `${e.email}: '${s}'`),
-  );
-  return unknown.length === 0
-    ? null
-    : `home campus not in locations (${[...slugs].join(', ')}): ${unknown.join('; ')}`;
+  const named = (keep: (slug: string) => boolean) =>
+    entries.flatMap((e) => e.home_locations.filter(keep).map((s) => `${e.email}: '${s}'`));
+  const unknown = named((s) => !slugs.has(s));
+  const unlabelled = named((s) => slugs.has(s) && !Object.hasOwn(LOCATION_DISPLAY, s));
+  const problems = [
+    unknown.length === 0
+      ? null
+      : `home campus not in locations (${[...slugs].join(', ')}): ${unknown.join('; ')}`,
+    unlabelled.length === 0
+      ? null
+      : 'home campus is a locations row with no display label yet, so GET /me could not ' +
+        `render it (add it to LOCATION_DISPLAY in src/lib/locations.ts first): ${unlabelled.join('; ')}`,
+  ].filter((p) => p !== null);
+  return problems.length === 0 ? null : problems.join('; ');
 }
 
 // ── a roster run ─────────────────────────────────────────────────────────────
@@ -325,7 +394,7 @@ type Planned =
 export async function runRoster(
   deps: Deps,
   rosterInput: readonly RosterEntry[],
-  options: { portalOrigin: string; confirm: boolean },
+  options: { portalOrigin: string; confirm: boolean; lastOwner?: boolean },
 ): Promise<number> {
   const { admin, db, out } = deps;
   const parsed = parseRoster(rosterInput);
@@ -389,6 +458,17 @@ export async function runRoster(
     const { from, to } = change.roleChange as { from: string; to: StaffRole };
     out(`${change.entry.email}: role ${from} → ${to} (app_metadata and the staff row together)`);
   }
+  // A role change must not take away the one role that edits the role lists
+  // (DECISIONS 77, 82(b)). Read here so a refusal writes nothing; read again,
+  // locked, inside the transaction below, where it is decided.
+  const adoptedUid = (plan: Planned) => (plan.kind === 'adopt' ? plan.user.id : undefined);
+  if (options.lastOwner !== true) {
+    const taken = lastOwnerDemotions(await liveOwnerUids(db, false), planned, adoptedUid);
+    if (taken.length > 0) {
+      out(`${lastOwnerRefusal(taken)} Nothing was written.`);
+      return 1;
+    }
+  }
   if (roleChanges.length > 0 && !options.confirm) {
     out('Role changes need confirmation: re-run with --yes to apply them. Nothing was written.');
     return 1;
@@ -413,8 +493,12 @@ export async function runRoster(
             '(it adopts them and writes their rows), then mint each one a link with --link.') +
         (reroled.length === 0
           ? ''
-          : ` app_role already changed by this run, her staff row not yet: ${reroled.join(', ')}. ` +
-            'Re-run the roster with --yes to bring each row to it.'),
+          : err instanceof LastOwnerRaced
+            ? // Bringing the row to the new role is what was just refused.
+              ` app_role already changed by this run, her staff row not: ${reroled.join(', ')}. ` +
+              'To put app_role back, re-run the roster naming her old role, with --yes.'
+            : ` app_role already changed by this run, her staff row not yet: ${reroled.join(', ')}. ` +
+              'Re-run the roster with --yes to bring each row to it.'),
     );
     throw err;
   };
@@ -443,6 +527,16 @@ export async function runRoster(
   }
 
   const rows = withActorOn(db, ACTOR, async (tx) => {
+    // The owner rows are locked before anything is written: a concurrent run
+    // that also demotes an owner waits here, then counts what this one left.
+    if (options.lastOwner !== true) {
+      const taken = lastOwnerDemotions(await liveOwnerUids(tx, true), planned, (plan) =>
+        uidByEmail.get(plan.entry.email),
+      );
+      if (taken.length > 0) {
+        throw new LastOwnerRaced(`${lastOwnerRefusal(taken)} Another run took an owner away first`);
+      }
+    }
     for (const plan of planned) {
       const { entry } = plan;
       const written = await tx.query(
@@ -478,9 +572,26 @@ export async function runRoster(
         out('responders: already set, left as they are');
       } else {
         // A named staffer skipped in pass 1 (expired) has no uid here.
-        const fill = slots.map((s) =>
+        const named = slots.map((s) =>
           s.held === null ? (uidByEmail.get(s.entry.email) ?? null) : null,
         );
+        // One staffer never fills both slots (DECISIONS 82(c)): a fill naming
+        // whoever already holds the other slot — a roster that swaps default
+        // and backup — is left empty, since the held slot is never touched.
+        const holdsOther: boolean[] = [];
+        for (const [i, uid] of named.entries()) {
+          const other = slots[1 - i]?.held ?? null;
+          const found =
+            uid === null || other === null
+              ? undefined
+              : (
+                  await tx.query<{ id: string }>('SELECT id FROM staff WHERE supabase_uid = $1', [
+                    uid,
+                  ])
+                ).rows[0];
+          holdsOther.push(found !== undefined && found.id === other);
+        }
+        const fill = named.map((uid, i) => (holdsOther[i] === true ? null : uid));
         if (fill.some((uid) => uid !== null)) {
           await tx.query(
             `UPDATE messaging_settings
@@ -496,7 +607,13 @@ export async function runRoster(
         }
         slots.forEach((s, i) => {
           if (s.held !== null) out(`responders: ${s.slot} already set, left as it is`);
-          else if (fill[i] !== null) out(`responders: ${s.slot} ${s.entry.email}`);
+          else if (holdsOther[i] === true) {
+            out(
+              `responders: ${s.slot} left EMPTY — ${s.entry.email} already holds the ` +
+                `${slots[1 - i]?.slot} slot, and one staffer never fills both (moving a set ` +
+                "slot waits for MSG-U27's editor)",
+            );
+          } else if (fill[i] !== null) out(`responders: ${s.slot} ${s.entry.email}`);
           else {
             out(
               `responders: ${s.slot} left EMPTY — ${s.entry.email} was skipped above, so this ` +
@@ -581,26 +698,26 @@ export async function runExpire(
     `expire ${email} (${row.name}, ${row.role}, home ${row.home_locations.join(', ')}): ` +
       'expired_at set, a responder slot naming her emptied, the auth user banned and app_role removed',
   );
-  // A typo must not take away the one role that edits the role lists (DECISIONS 77).
-  if (row.expired_at === null && row.role === 'owner' && options.lastOwner !== true) {
-    const { rows: others } = await db.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM staff WHERE role = 'owner' AND expired_at IS NULL AND id <> $1",
-      [row.id],
-    );
-    if ((others[0]?.n ?? 0) === 0) {
-      out(
-        `refused: ${email} is the last live owner — no one would be left to edit the role lists. ` +
-          'If that is meant, pass --last-owner as well. Nothing was changed.',
-      );
-      return 1;
-    }
+  // A typo must not take away the one role that edits the role lists (DECISIONS
+  // 77): read here so the refusal comes before the confirmation, and decided
+  // again, locked, inside the transaction (DECISIONS 82(b)).
+  const guarded = row.expired_at === null && row.role === 'owner' && options.lastOwner !== true;
+  const leavesNoOwner = async (reader: pg.ClientBase, lock: boolean): Promise<boolean> => {
+    const owners = await liveOwnerUids(reader, lock);
+    owners.delete(user.id);
+    return owners.size === 0;
+  };
+  if (guarded && (await leavesNoOwner(db, false))) {
+    out(`${lastOwnerRefusal([email])} Nothing was changed.`);
+    return 1;
   }
   if (!options.confirm) {
     out('Expiring a staffer needs confirmation: re-run with --yes. Nothing was changed.');
     return 1;
   }
   // The row first: sign-in refuses the moment `expired_at` is set.
-  await withActorOn(db, ACTOR, async (tx) => {
+  const raced = await withActorOn(db, ACTOR, async (tx) => {
+    if (guarded && (await leavesNoOwner(tx, true))) return true;
     if (row.expired_at === null) {
       await tx.query('UPDATE staff SET expired_at = now() WHERE id = $1', [row.id]);
       out(`${email}: staff row expired (sign-in refuses from now)`);
@@ -633,7 +750,14 @@ export async function runExpire(
           're-run the roster to name a new one',
       );
     }
+    return false;
   });
+  if (raced) {
+    out(
+      `${lastOwnerRefusal([email])} (Another run took an owner away first.) Nothing was changed.`,
+    );
+    return 1;
+  }
   await admin.updateUserById(user.id, {
     ban_duration: BAN_UNTIL_REHIRED,
     app_metadata: { app_role: null },

@@ -114,7 +114,7 @@ export function recordedScenario(key: RecordedScenarioKey): RecordedScenario {
 export function rebuildRecordedCardError(
   key: RecordedScenarioKey,
   intentOverrides: Record<string, unknown> = {},
-): Stripe.errors.StripeCardError {
+): InstanceType<typeof Stripe.errors.StripeCardError> {
   const scenario = recordedScenario(key);
   const err = new Stripe.errors.StripeCardError({
     type: scenario.error.type,

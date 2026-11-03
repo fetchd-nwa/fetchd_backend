@@ -53,9 +53,19 @@ import type pg from 'pg';
  *     every project but `local` (dev takes the cast on its seeded roster). It
  *     cannot combine with `no-transaction`.
  *
- * An unknown directive, a `-- migrate:` line below the header, or a line that
- * looks like one but is not its exact form (`-- Migrate:`, `-- migrate :`, a
- * block comment opening `migrate:`) is refused: a misspelt `no-transaction`
+ * An unknown directive, a `-- migrate:` line below the header, or — in the
+ * leading comment lines, before the first line of SQL — a comment line whose
+ * first word is a directive's but which is not the exact form (`-- Migrate:`,
+ * `-- migrate :`, a block comment opening `migrate:`, `--- migrate:`,
+ * `-- migrates:`, no colon, a bare `-- no-transaction`; see `NEAR_DIRECTIVE`)
+ * is refused, naming the line. Below the first line of SQL such a comment is
+ * prose ("-- Migration of the old rows"), since no directive is honoured
+ * there. **The leading comment lines are directive-only, on purpose** (fix 2,
+ * item 7; Fable r2 N1): a prose line there that opens with a directive family
+ * word — "-- Migration notes: …", "-- No transaction is needed …" — is refused
+ * like a misspelt directive, because the parser cannot tell the two apart.
+ * Put such prose below the first line of SQL, or reword its first word
+ * ("-- This step migrates …"). The point: a misspelt `no-transaction`
  * must not silently run in a transaction, a misspelt cache clear must not
  * silently leave stale class prices, and a misspelt census gate must not
  * switch off.
@@ -161,8 +171,18 @@ export function parseStep(fileName: string, bytes: Buffer): Parsed<{ step: StepF
 }
 
 const DIRECTIVE_LINE = /^--\s*migrate:\s*(.*?)\s*$/;
-/** A comment that opens like a directive in any other spelling. */
-const NEAR_DIRECTIVE = /^(?:--|\/\*)\s*migrate\s*:/i;
+/**
+ * A comment whose first word is a directive's, in any spelling but the exact
+ * form: `-- Migrate:`, `-- migrate :`, `/* migrate:`, `--- migrate:`,
+ * `-- -- migrate:`, `-- migrates:`, `-- migration:`, `-- migrate census-empty`
+ * (no colon), `-- migrate;`, a full-width colon — or a directive's name with
+ * no `-- migrate:` before it (`-- no-transaction`, `-- no transaction`). P03
+ * item 0e (adversary r2 L3); fix 1 item 13 (Opus N1) lets `#`, `@`, `*` and a
+ * zero-width character sit between the comment opener and the word. Only the first word: prose that mentions one later is not refused; and
+ * only before the first line of SQL, where a directive would be read (fix 1).
+ */
+const NEAR_DIRECTIVE =
+  /^(?:--|\/\*)[\s\-#@*\u200b-\u200d\u2060\ufeff]*(?:migrat(?:e|es|ion)|census[-_ ]?empty|no[-\s]?transaction|invalidate[-_ ]?class[-_ ]?catalog)\b/i;
 const CENSUS_EMPTY = /^census-empty(?:\s+(.*))?$/;
 /** A plain, unquoted table name: the runner interpolates it into SQL. */
 const PLAIN_TABLE = /^[a-z_][a-z0-9_]*$/;
@@ -174,13 +194,25 @@ function parseHeader(
   const censusEmpty: string[] = [];
   // Postgres ends a `--` comment at CR as well as LF: a lone CR ends a line too.
   const lines = sql.split(/\r\n|\r|\n/);
+  // `inHeader`: the leading `--` lines, where a directive is honoured.
+  // `beforeCode`: every line before the first line of SQL — `--` lines, blank
+  // lines and a leading block comment however many lines it spans — where a
+  // near-miss is refused (P03 fix 1 item 10, Fable L3; fix 2 item 6, Opus r2
+  // L2). Below it, a comment that opens "-- Migration of …" is prose.
   let inHeader = true;
+  let beforeCode = true;
+  let blockDepth = 0;
   for (const [index, raw] of lines.entries()) {
     const line = raw.trim();
     if (inHeader && line !== '' && !line.startsWith('--')) inHeader = false;
+    if (beforeCode) {
+      const depth = leadingCommentDepth(line, blockDepth);
+      if (depth === null) beforeCode = false;
+      else blockDepth = depth;
+    }
     const directive = DIRECTIVE_LINE.exec(line);
     if (directive === null) {
-      if (NEAR_DIRECTIVE.test(line)) {
+      if (beforeCode && NEAR_DIRECTIVE.test(line)) {
         return {
           ok: false,
           reason: `line ${index + 1}: '${line}' is not a directive's exact form ('-- migrate: <directive>': a -- comment, lower case, no space before the colon)`,
@@ -216,6 +248,38 @@ function parseHeader(
     directives.add(value as StepDirective);
   }
   return { ok: true, directives, censusEmpty };
+}
+
+/**
+ * How deep inside a block comment the next line starts, if `line` holds no
+ * SQL — given that it starts `depth` deep. `null` once the line holds SQL: the
+ * end of the leading comment lines. A `--` comment ends the line; a block
+ * comment may span lines, and Postgres nests them: an inner opener needs its
+ * own closer before the outer one ends.
+ */
+function leadingCommentDepth(line: string, depth: number): number | null {
+  let d = depth;
+  let i = 0;
+  while (i < line.length) {
+    if (d > 0) {
+      if (line.startsWith('/*', i)) {
+        d += 1;
+        i += 2;
+      } else if (line.startsWith('*/', i)) {
+        d -= 1;
+        i += 2;
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+    const rest = line.slice(i).trimStart();
+    if (rest === '' || rest.startsWith('--')) return 0;
+    if (!rest.startsWith('/*')) return null;
+    d = 1;
+    i = line.length - rest.length + 2;
+  }
+  return d;
 }
 
 export interface TransactionControl {

@@ -24,13 +24,24 @@
 #   3. It prints one summary you can paste. If any step failed, the last line
 #      says FAILED and the exit code is non-zero — there is no arrangement of
 #      this output that lets a partial pass read as a pass.
+#   4. It typechecks the tests and scripts, not only `src/` (P03 item 0f).
+#      `typecheck` covers `src/` (tsconfig.json); `typecheck:tests` covers
+#      `src/`, `test/` and `scripts/` (tsconfig.tests.json). The suite runs
+#      type-erased through tsx, so before this step a test could call a
+#      function with the wrong shape and nothing said so. Both tsc steps are
+#      read from their own output as well as their exit code: any
+#      `error TS<n>` line fails the step, and the count is in the summary.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 
-STEPS=(typecheck lint build)
+STEPS=(typecheck typecheck:tests lint build)
 NAMES=()
 CODES=()
+# Per step: "" or why the step fails although it exited 0; and a note for the
+# summary line.
+OUTPUT_FAILS=()
+NOTES=()
 LOGDIR=$(mktemp -d)
 trap 'rm -rf "$LOGDIR"' EXIT
 
@@ -38,8 +49,21 @@ for step in "${STEPS[@]}"; do
   printf '\n════════ %s ════════\n' "$step"
   npm run --silent "$step" 2>&1 | tee "$LOGDIR/$step.log"
   code=${PIPESTATUS[0]}
+  note=""
+  output_fail=""
+  case "$step" in
+    typecheck | typecheck:tests)
+      # tsc prints nothing on success, so the output is read for what would
+      # make it a failure: a type error that the exit code alone could hide.
+      errors=$(grep -cE 'error TS[0-9]+:' "$LOGDIR/$step.log" || true)
+      note="$errors type error(s)"
+      [ "$errors" -ne 0 ] && output_fail="its output holds $errors type error(s)"
+      ;;
+  esac
   NAMES+=("$step")
   CODES+=("$code")
+  OUTPUT_FAILS+=("$output_fail")
+  NOTES+=("$note")
 done
 
 printf '\n════════ test ════════\n'
@@ -47,6 +71,8 @@ npm test 2>&1 | tee "$LOGDIR/test.log"
 test_code=${PIPESTATUS[0]}
 NAMES+=("test")
 CODES+=("$test_code")
+OUTPUT_FAILS+=("")
+NOTES+=("")
 
 # ── Reading the suite, not the exit code ──────────────────────────────────────
 #
@@ -93,10 +119,14 @@ EOF
 printf '\n════════════════════ GATE SUMMARY ════════════════════\n'
 failed=0
 for i in "${!NAMES[@]}"; do
-  if [ "${CODES[$i]}" -eq 0 ]; then
-    printf '  %-12s exit 0   PASS\n' "${NAMES[$i]}"
+  note="${NOTES[$i]:+  (${NOTES[$i]})}"
+  if [ "${CODES[$i]}" -eq 0 ] && [ -z "${OUTPUT_FAILS[$i]}" ]; then
+    printf '  %-16s exit 0   PASS%s\n' "${NAMES[$i]}" "$note"
   else
-    printf '  %-12s exit %-3s FAIL\n' "${NAMES[$i]}" "${CODES[$i]}"
+    printf '  %-16s exit %-3s FAIL%s\n' "${NAMES[$i]}" "${CODES[$i]}" "$note"
+    if [ "${CODES[$i]}" -eq 0 ]; then
+      printf '  ⚠ %s exited 0 but %s\n' "${NAMES[$i]}" "${OUTPUT_FAILS[$i]}"
+    fi
     failed=1
   fi
 done

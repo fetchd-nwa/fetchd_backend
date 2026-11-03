@@ -69,7 +69,7 @@ interface Missing {
 async function main(): Promise<void> {
   console.log(`db:dev:check — ${env.DATABASE_URL.replace(/:[^:@]*@/, ':***@')}`);
 
-  const entries = Object.entries(SEED).filter(
+  const entries = Object.entries<unknown>(SEED).filter(
     (entry): entry is [string, string] => typeof entry[1] === 'string',
   );
 
