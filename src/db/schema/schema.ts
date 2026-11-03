@@ -52,10 +52,10 @@ export const locations = pgTable("locations", {
 export const owners = pgTable("owners", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	supabaseUid: uuid("supabase_uid").notNull(),
-	name: text().notNull(),
+	name: text(),
 	email: text().notNull(),
-	phone: text().notNull(),
-	location: text().$type<LocationKey>().notNull(),
+	phone: text(),
+	location: text().$type<LocationKey>(),
 	avatarImagePath: text("avatar_image_path"),
 	emergencyName: text("emergency_name"),
 	emergencyRelationship: text("emergency_relationship"),

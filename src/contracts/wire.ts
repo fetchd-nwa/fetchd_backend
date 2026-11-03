@@ -59,8 +59,12 @@
  * `X.Y.Z` itself. A step may be breaking or additive; its CHANGELOG entry says
  * which, and the bump rules above apply step to step. LG1: 2.0.0-lg1.1 (P01,
  * additive), 2.0.0-lg1.2 (P02, breaking), 2.0.0 (P03, additive, LG1's close).
+ * LG2, M1's part (design 3.0.0's S05 and S17 only): 3.0.0-lg2.1 (P05,
+ * breaking), 3.0.0 (P12, breaking, its close). The rest of design 3.0.0
+ * ships after M1 as 7.0.0 (LG2b), so a design label above 3.0.0 reads one
+ * major up here (build DECISIONS 6).
  */
-export const WIRE_CONTRACT_VERSION = '2.0.0';
+export const WIRE_CONTRACT_VERSION = '3.0.0-lg2.1';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -145,7 +149,15 @@ export const WIRE_CONTRACT_VERSION = '2.0.0';
  * bearer that still verifies is refused 403 `not_provisioned`, no `details`,
  * on every `[auth]` route, staff routes included, until it expires. The
  * portal signs out on this code and on no other 403 (design §2.10:4636-4640);
- * every role refusal is `forbidden` or a named code instead.
+ * every role refusal is `forbidden` or a named code instead. The owner app
+ * answers it on `GET /me` with its one screen for a session whose token has
+ * no owner row — "No account yet: open the link we emailed you, or message
+ * the school" — and Log Out (design §2.2:2244; ACCT-U14).
+ *
+ * 3.0.0-lg2.1 appends a 25th thrown code, `'profile_incomplete'` (422),
+ * after `'setting_inert'` — appended, never inserted (design §1.1:758-763,
+ * :822-827; ACCT-U04). `PATCH /me` is its first route; the booking arms
+ * (ACCT-U11) and `POST /evaluations` join it when they land.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -172,7 +184,8 @@ export type ApiErrorCode =
   | 'event_full' // event RSVP blocked — live rsvp dogs + requested > events.capacity
   | 'payment_failed' // a charge was ATTEMPTED and did not complete — nothing was created or settled
   | 'internal' // serializer fallback for any non-ApiError throw — never thrown as ApiError
-  | 'setting_inert'; // settings PATCH blocked — a key in the body has no v1 reader (2.0.0-lg1.1)
+  | 'setting_inert' // settings PATCH blocked — a key in the body has no v1 reader (2.0.0-lg1.1)
+  | 'profile_incomplete'; // PATCH /me blocked — the body would blank a mandatory sign-up field (3.0.0-lg2.1)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -200,6 +213,7 @@ export const API_ERROR_CODES = [
   'payment_failed',
   'internal',
   'setting_inert',
+  'profile_incomplete',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -257,6 +271,10 @@ export const API_ERROR_STATUS = {
   // caller may edit the key's class, but the value could not bite, so the
   // whole body is refused (design §1.1:641-649; question 28).
   setting_inert: 422,
+  // 3.0.0-lg2.1 (new code, so its status is set in the same bump): the body
+  // would leave a field the sign-up map marks mandatory empty — well-formed,
+  // but refused by the account's own rules (design §1.1:758-763; ACCT-U04).
+  profile_incomplete: 422,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -525,13 +543,37 @@ export interface SettingInertDetails {
 }
 
 /**
+ * Rides code `profile_incomplete` (422) — `kind` equals `code`. New
+ * 3.0.0-lg2.1 (design §1.1:758-763, §2.2:2244; ACCT-U04). Emitted by
+ * `PATCH /me` when the body would leave EMPTY a field that
+ * `acct.signup_field_requirement_map` marks `mandatory`. Empty is each
+ * field's own test: `name` or `phone` `null` or with no visible character
+ * (spaces of any width, NBSP and zero-width characters do not count);
+ * `location` `null`; an `emergency_contact` without a name or a phone; an
+ * `address` without line 1, city, state or zip (design §2.2:2244's "filled").
+ *
+ * `field_keys` lists EVERY mandatory field the body would blank, never empty,
+ * in `SIGNUP_FIELDS` order. A field already empty on the account that the
+ * body does not name is neither listed nor a reason to refuse, so a family
+ * can fill her fields one save at a time; the account's empty fields are read
+ * from `MeWire.missing_mandatory_fields`. Atomic: a refused body writes
+ * nothing. The booking arms (`POST /bookings`, `POST /enrollments`;
+ * ACCT-U11) and `POST /evaluations` reuse this shape when they land.
+ */
+export interface ProfileIncompleteDetails {
+  kind: 'profile_incomplete';
+  field_keys: SignupField[];
+}
+
+/**
  * Every `details` payload the API can emit, closed. Provably complete at
  * 1.13.0 by full construction-site sweep, and kept complete by the fold-in:
  * `ApiError`'s constructor takes exactly this union, so a future route
  * inventing a details literal outside it is a `tsc` error at the construction
  * site. 2.0.0-lg1.1 appends the two settings-PATCH arms (`RefusedKeysDetails`,
  * `SettingInertDetails`), contract-first: no route emits them until P01's
- * phase B builds `routes/staffSettings.ts`.
+ * phase B builds `routes/staffSettings.ts`. 3.0.0-lg2.1 appends
+ * `ProfileIncompleteDetails` (`PATCH /me`).
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -548,7 +590,8 @@ export type ApiErrorDetailWire =
   | PaymentFailedDetails
   | MediaUploadMissingDetails
   | RefusedKeysDetails
-  | SettingInertDetails;
+  | SettingInertDetails
+  | ProfileIncompleteDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -953,15 +996,29 @@ export interface MeAddressWire {
  *
  *  This shape was frozen long before it was contracted: it is the exact key set
  *  the mobile `toUser` translator reads, and mobile hand-mirrors it as `RawUser`
- *  (`mobile/src/repositories/userRepository.ts:52`, deleted at 2.4 §10). */
+ *  (`mobile/src/repositories/userRepository.ts:52`, deleted at 2.4 §10).
+ *
+ *  3.0.0-lg2.1 is the first change since that freeze (design §1.1:738,
+ *  :760-762; ACCT-U04; migration M2.01). BREAKING: `name`, `phone` and
+ *  `location` become nullable — an imported family may arrive without any of
+ *  them (MIG-57), and a field the sign-up map marks `asked` may be cleared —
+ *  so a client that reads them as always-present strings breaks. ADDED:
+ *  `missing_mandatory_fields`. The `''`-never-`null` rule of the two nested
+ *  objects is unchanged. */
 export interface MeWire {
   id: string;
-  name: string;
+  /** NON-OMIT: `null` when the family has none, never `''` and never omitted
+   *  (3.0.0-lg2.1, M2.01). A reader that prints a name falls back to `email`
+   *  (design §2.2:2244). */
+  name: string | null;
   email: string;
-  phone: string;
+  /** NON-OMIT: `null` when the family has none, never `''` and never omitted
+   *  (3.0.0-lg2.1, M2.01). */
+  phone: string | null;
   /** DISPLAY label, not the slug — the one wire surface that translates
-   *  (`routes/me.ts:42`). `PatchMeRequest.location` speaks the same vocabulary. */
-  location: LocationDisplay;
+   *  (`routes/me.ts:42`). `PatchMeRequest.location` speaks the same vocabulary.
+   *  NON-OMIT: `null` when the family has no home campus (3.0.0-lg2.1, M2.01). */
+  location: LocationDisplay | null;
   /** Never `null` and never omitted (`?? ''`, `routes/me.ts:43`). A media-asset
    *  UUID is resolved to a 1h signed GET URL at read time; a bundled/seed path
    *  or `''` passes through unchanged (`lib/profileImageUrls.ts:26,40-59`), so
@@ -1003,6 +1060,17 @@ export interface MeWire {
   /** Opt-OUT gate on the pre-login public gallery (`GET /welcome-dogs`);
    *  persists via `PATCH /me`. BUSINESS-LOGIC/auth-accounts.md:49 (R24). */
   show_dogs_on_welcome: boolean;
+  /** The sign-up fields `acct.signup_field_requirement_map` marks `mandatory`
+   *  that are EMPTY on this account, in `SIGNUP_FIELDS` order; `[]` when none
+   *  (NON-OMIT, never `null`). Empty is the test `ProfileIncompleteDetails`
+   *  states. `email` is never listed: it is the login identity, never empty,
+   *  and fixed `mandatory` in the map. Read from Postgres on every `GET /me`
+   *  and `PATCH /me` (no cache), so a field staff flip to `mandatory` shows at
+   *  the family's next read. Only an imported family (MIG-57) or a field
+   *  flipped `mandatory` later (ACCT-08) can carry one (design §2.2:2237).
+   *  New 3.0.0-lg2.1 (design §1.1:762; ACCT-U04). The booking pre-check reads
+   *  the same test when it lands (ACCT-U11). */
+  missing_mandatory_fields: SignupField[];
 }
 
 /** `GET /me` (staff principal) response — the staff mirror row. Promoted 1.13.0
@@ -1185,23 +1253,31 @@ export interface UploadsSignResponse {
  * on `GET /staff/owners/:id/payments` and `/payment-methods` (§ payments-invoices).
  *
  * The list is every LIVE owner row (`owners.expired_at IS NULL`; a deleted
- * account is expired and its contact columns scrubbed), ordered by `name`
- * case-insensitively, then `id`. No query string and no paging: the whole
- * list (five families in the pilot; LG10's import brings the rest — a paging
- * parameter would be an additive change). Each field mirrors its `owners`
- * column, every one `NOT NULL`, so none is null or omitted.
+ * account is expired and its contact columns scrubbed), ordered by what a
+ * reader prints, `lower(coalesce(name, email))`, then `id`. No query string
+ * and no paging: the whole list (five families in the pilot; LG10's import
+ * brings the rest — a paging parameter would be an additive change). Each
+ * field mirrors its `owners` column, except that a stored `name` or `phone`
+ * with no visible character reads (and sorts) as `null`. BREAKING
+ * 3.0.0-lg2.1 (M2.01; ACCT-U04):
+ * `name`, `phone` and `location` may be `null` (NON-OMIT: never omitted);
+ * `id`, `email` and `source` never are. A reader that prints a name prints
+ * `email` when `name` is `null` (design §2.2:2244).
  */
 export interface StaffOwnerWire {
   id: string;
-  name: string;
+  /** `null` when the family has none (3.0.0-lg2.1); print `email` then. */
+  name: string | null;
   email: string;
-  phone: string;
+  /** `null` when the family has none (3.0.0-lg2.1). */
+  phone: string | null;
   /** The family's home campus — `owners.location` as the SLUG, as every
    *  location field on this contract but `/me`'s. `MeWire.location` is the
    *  same column as a display label; a client must not compare the two. The
    *  design calls it "campus". A third `locations` row emits a slug outside
-   *  `LocationKey` — the mirror hole `LocationDisplay` documents. */
-  location: LocationKey;
+   *  `LocationKey` — the mirror hole `LocationDisplay` documents. `null` when
+   *  the family has no home campus (3.0.0-lg2.1). */
+  location: LocationKey | null;
   /** `owners.source`, as stored; `'gingr'` marks a family LG10's import
    *  wrote. */
   source: RecordSource;
@@ -1229,13 +1305,32 @@ export type GetStaffOwnersResponse = StaffOwnerWire[];
  *      stored outcome) — `routes/me.ts:188,200-225`; auth-accounts.md:107.
  *    · Staff principals get 403 (`routes/me.ts:184-186`); a staff self-edit
  *      route does not exist.
+ *    · The sign-up map (`acct.signup_field_requirement_map`), read on every
+ *      call — 3.0.0-lg2.1 (design §2.2:2244; ACCT-U04). `name`, `phone` and
+ *      `location` take `null` to clear; a `name` or `phone` with no visible
+ *      character is the same as `null`; either is stored as NULL, so `MeWire`
+ *      reads `null`, never `''`. A body that would leave a `mandatory` field
+ *      empty (each field's test is on `ProfileIncompleteDetails`) is 422
+ *      `profile_incomplete`. A body that NAMES a field the map marks `off` is
+ *      400 `bad_request`, whatever its value — send only the fields that
+ *      changed. Refusal order: every 400 (the Idempotency-Key, the strict
+ *      parse, an empty patch, an `off` field) before the 422. The other keys
+ *      (avatar, notification prefs, `show_dogs_on_welcome`) are outside the
+ *      map and never refused by it.
+ *    · `POST /me/signup` is RESERVED: not built in v1 and not typed (design
+ *      §1.1:758-760; question 29: ACCT-U06's route half and ACCT-U07 are
+ *      dated before the full transfer). The invite and the Stage A seed are
+ *      the only doors to an owner row.
  *  Response is `MeWire`. */
 export interface PatchMeRequest {
-  name?: string;
-  phone?: string;
+  /** `null` clears (3.0.0-lg2.1); a string with no visible character is the
+   *  same as `null`. */
+  name?: string | null;
+  /** As `name`. */
+  phone?: string | null;
   /** The DISPLAY label, not the slug — translated to the slug server-side
-   *  (`routes/me.ts:115`). */
-  location?: LocationDisplay;
+   *  (`routes/me.ts:115`). `null` clears (3.0.0-lg2.1). */
+  location?: LocationDisplay | null;
   /** A media-asset UUID here MUST be the caller's own, live, and of purpose
    *  `owner-avatar`, or the write 4xxs (`assertOwnedImagePath`,
    *  `routes/me.ts:212-214`) — the guard that stops an owner pointing their
@@ -2478,7 +2573,11 @@ export interface WelcomeDogWire {
 }
 
 /** Dog directory for the cross-owner staff verbs (which reference dogs by UUID
- *  and carry no names). Resolves dog_id → name + owner for display. */
+ *  and carry no names). Resolves dog_id → name + owner for display.
+ *  `owner_name` is the family's name, or its `email` when the name is empty
+ *  (3.0.0-lg2.1: `owners.name` is nullable from M2.01; design §2.2:2244,
+ *  "readers that print a name fall back to the email"), so it is never
+ *  `null` and never `''`. */
 export interface StaffDogWire {
   id: string;
   name: string;
@@ -5442,8 +5541,23 @@ export const SETTINGS_DOMAINS = [
 export type AccountLockedViewMode = 'lock_screen' | 'actions_refused';
 
 /** The sign-up fields `acct.signup_field_requirement_map` covers — ACCT-U02's
- *  `field_key` set; `location` is §3.15:5974's "home campus". */
+ *  `field_key` set; `location` is §3.15:5974's "home campus". From
+ *  3.0.0-lg2.1 it also types `ProfileIncompleteDetails.field_keys` and
+ *  `MeWire.missing_mandatory_fields` (design §1.1:761-762 calls it
+ *  `SignupFieldKey`; the existing name is kept). */
 export type SignupField = 'name' | 'phone' | 'email' | 'location' | 'emergency_contact' | 'address';
+
+/** `SignupField` in its one order: the order `field_keys` and
+ *  `missing_mandatory_fields` list fields in (the map is jsonb, which keeps no
+ *  key order). New 3.0.0-lg2.1; pinned in §16. */
+export const SIGNUP_FIELDS = [
+  'name',
+  'phone',
+  'email',
+  'location',
+  'emergency_contact',
+  'address',
+] as const satisfies readonly [SignupField, ...SignupField[]];
 
 /** How one sign-up field is asked — ACCT-U02's `mode` set. */
 export type SignupFieldMode = 'off' | 'asked' | 'mandatory';
@@ -5570,7 +5684,12 @@ export interface AccountSettingsWire extends SettingsAuditWire {
   /** jsonb, the field → mode map (M1.01); registry key
    *  `acct.signup_field_requirement_map` (§3.15:5974). Seed: `mandatory` for
    *  name, phone, email, location, emergency_contact; `asked` for address. A
-   *  PATCH replaces the whole map. */
+   *  PATCH replaces the whole map. `email` is fixed at `mandatory` — it is the
+   *  login identity (design §2.2:2244: "email is fixed in the map, not
+   *  switchable") — so a PATCH that sets it to anything else is 422
+   *  `invalid_payload` (3.0.0-lg2.1). Read by `PATCH /me` and
+   *  `MeWire.missing_mandatory_fields` from 3.0.0-lg2.1, and by the booking
+   *  pre-check when it lands (ACCT-U11). */
   signup_fields: Record<SignupField, SignupFieldMode>;
 }
 
@@ -6629,4 +6748,6 @@ export type WireTupleConformance = [
   Expect<Equal<keyof PatchStaffSettingsPayRequest, PaymentSettingKey>>,
   // 2.0.0 (§ settings): `manifest` is never a settings domain.
   Expect<Equal<Extract<SettingsDomain, 'manifest'>, never>>,
+  // 3.0.0-lg2.1 (§ settings): the sign-up field order.
+  Expect<Equal<(typeof SIGNUP_FIELDS)[number], SignupField>>,
 ];

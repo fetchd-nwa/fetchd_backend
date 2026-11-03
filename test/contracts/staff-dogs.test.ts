@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import { eq } from 'drizzle-orm';
+import { db } from '../../src/db/client.js';
+import { dogs, owners } from '../../src/db/schema/schema.js';
 import { registerStaffDogsRoute } from '../../src/routes/staffDogs.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -67,6 +71,48 @@ test(
       lola.profile_image_path,
       undefined,
       'profile_image_path omitted when the dog has none',
+    );
+  },
+);
+
+// P05 B5 (X7; design §2.2:2244, "readers that print a name fall back to the
+// email"): `owners.name` is nullable from M2.01, and `owner_name` is a display
+// field with no email beside it — so an unnamed family's dog reads her email.
+// The wire promises never null and never '': a name with no non-space
+// character (a pre-3.0.0 PATCH /me stored '  ') is no name either.
+test(
+  "GET /staff/dogs — an unnamed family (name NULL, '' or blank) reads owner_name = her email, never null or ''",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const seen: Array<{ name: string | null; ownerName: string | undefined; email: string }> = [];
+    for (const name of [null, '', '  ']) {
+      const ownerId = randomUUID();
+      const dogId = randomUUID();
+      const email = `unnamed-${ownerId}@example.invalid`;
+      await db.insert(owners).values({
+        id: ownerId,
+        supabaseUid: randomUUID(),
+        name,
+        email,
+        phone: null,
+        location: null,
+      });
+      try {
+        await db
+          .insert(dogs)
+          .values({ id: dogId, ownerId, name: 'Mabel', breed: 'Beagle', birthdate: '2026-03-10' });
+        const res = await staffDogsApp().inject({ method: 'GET', url: '/staff/dogs' });
+        assert.equal(res.statusCode, 200, res.body);
+        const mabel = (res.json() as StaffDogWire[]).find((r) => r.id === dogId);
+        seen.push({ name, ownerName: mabel?.owner_name, email });
+      } finally {
+        await db.delete(dogs).where(eq(dogs.id, dogId));
+        await db.delete(owners).where(eq(owners.id, ownerId));
+      }
+    }
+    assert.deepEqual(
+      seen.map((s) => ({ name: s.name, ownerName: s.ownerName })),
+      seen.map((s) => ({ name: s.name, ownerName: s.email })),
     );
   },
 );

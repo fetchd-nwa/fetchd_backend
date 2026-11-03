@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
-import { paymentMethods, stripeCustomers } from '../../src/db/schema/schema.js';
+import { owners, paymentMethods, stripeCustomers } from '../../src/db/schema/schema.js';
 import { registerPaymentMethodsRoute } from '../../src/routes/paymentMethods.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -130,6 +130,51 @@ test(
     assert.equal(replay.statusCode, 201);
     assert.deepEqual(replay.json(), first.json());
     assert.equal(stripe.calls.length, calledOnce, 'replay path skipped the Stripe round-trip');
+  },
+);
+
+// P05 B5 (M2.01): an unnamed family's first card creates her Stripe customer
+// with no `name` at all — never `name: null`, which the SDK would send as the
+// literal field, and never the string "null".
+test(
+  'POST /payment-methods/setup-intent — an unnamed family (name NULL): the Stripe customer is created with no name',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const ownerId = randomUUID();
+    const supabaseUid = randomUUID();
+    await db.insert(owners).values({
+      id: ownerId,
+      supabaseUid,
+      name: null,
+      email: `unnamed-${ownerId}@example.invalid`,
+      phone: null,
+      location: null,
+    });
+    try {
+      const { app, stripe } = buildApp({ kind: 'owner', ownerId, supabaseUid });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/payment-methods/setup-intent',
+        headers: { 'idempotency-key': `si-unnamed-${randomUUID()}` },
+        payload: {},
+      });
+      assert.equal(res.statusCode, 201, res.body);
+      const create = stripe.calls.find((c) => c.method === 'createCustomer');
+      assert.ok(create, 'the first card creates the Stripe customer');
+      assert.equal(Object.hasOwn(create.args, 'name'), false, JSON.stringify(create.args));
+      assert.equal(
+        JSON.stringify(create.args).includes('null'),
+        false,
+        JSON.stringify(create.args),
+      );
+      assert.deepEqual(create.args, {
+        email: `unnamed-${ownerId}@example.invalid`,
+        ownerId,
+      });
+    } finally {
+      await db.delete(stripeCustomers).where(eq(stripeCustomers.ownerId, ownerId));
+      await db.delete(owners).where(eq(owners.id, ownerId));
+    }
   },
 );
 

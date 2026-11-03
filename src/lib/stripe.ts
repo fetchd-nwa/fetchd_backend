@@ -432,10 +432,12 @@ export interface StripeClient {
    * Create a Stripe customer for an owner — once per owner. Idempotency key
    * is required so a retried POST /payment-methods/setup-intent doesn't
    * create duplicate customers in Stripe. Returns the new customer id; the
-   * caller is responsible for persisting it in `stripe_customers`.
+   * caller is responsible for persisting it in `stripe_customers`. `name` is
+   * absent for a family with none (`owners.name` is nullable from M2.01): the
+   * customer is created without one.
    */
   createCustomer(
-    args: { email: string; name: string; ownerId: string },
+    args: { email: string; name?: string; ownerId: string },
     idempotencyKey: string,
   ): Promise<{ id: StripeCustomerId }>;
 
@@ -1019,7 +1021,7 @@ export const defaultStripeClient: StripeClient = {
     const customer = await stripeSingleton.customers.create(
       {
         email: args.email,
-        name: args.name,
+        ...(args.name !== undefined ? { name: args.name } : {}),
         metadata: { owner_id: args.ownerId },
       },
       { idempotencyKey },

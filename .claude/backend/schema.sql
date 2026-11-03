@@ -260,10 +260,15 @@ INSERT INTO locations (slug, display_name) VALUES
 CREATE TABLE owners (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   supabase_uid      uuid UNIQUE NOT NULL,            -- the Supabase Auth user id
-  name              text NOT NULL,
+  -- name, phone and location (the home campus) may be NULL (M2.01, ACCT-U04):
+  -- an imported owner may arrive with any of them empty, and the signup-field
+  -- map (account_settings.signup_fields) decides which an owner must fill.
+  -- PATCH /me stores an emptied one as NULL, never ''. email stays NOT NULL:
+  -- it is the login identity, fixed mandatory in the map.
+  name              text,
   email             text NOT NULL,
-  phone             text NOT NULL,
-  location          text NOT NULL REFERENCES locations(slug),
+  phone             text,
+  location          text REFERENCES locations(slug),
   avatar_image_path text,
   emergency_name    text,
   emergency_relationship text,

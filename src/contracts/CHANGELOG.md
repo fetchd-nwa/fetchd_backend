@@ -12,6 +12,85 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [3.0.0-lg2.1] — 2026-11-03
+
+BREAKING. LG2 step 1 of 2 toward 3.0.0, M1's part of design 3.0.0 (plan unit
+P05, slice S05, ledger ACCT-U04; migration M2.01; design §1.1 3.0.0,
+`designs/fetchd-v1-technical-design.md:738`, `:758-763`, `:822-827`; §2.2
+`:2244`). It types the two design 3.0.0 items M1 carries for S05 (plan.json
+`wire_3_0_0_split`: B-me-nullable, A-profile-incomplete-me): the owner's
+`name`, `phone` and home campus become nullable, and `PATCH /me` follows the
+sign-up map. P12 sets 3.0.0 itself (the divert lane's removal and
+`DogWire.last_seen_on`). Every other design 3.0.0 item ships after M1 as
+7.0.0 (LG2b; build DECISIONS 6, 32) and is not typed here. Contract-first: no
+route emits the new shapes until P05's backend lands M2.01 and the route
+changes. Resync both clients (`npm run sync:contracts` in mobile and portal).
+Against the resynced copy (a scratch run at their HEADs, not their gates) the
+portal typechecks unchanged; the mobile app fails at
+`userRepository.ts:71` and `:73` until P05's mobile builder adapts `toUser`.
+
+Breaking:
+
+- `MeWire.name` and `.phone` `string` → `string | null`; `MeWire.location`
+  `LocationDisplay` → `LocationDisplay | null` (ACCT-U04; M2.01). Each is
+  `null` when the family has none, never `''` and never omitted. A reader that
+  prints a name falls back to `email` (design §2.2:2244). The nested
+  `emergency_contact` and `address` keep their `''`-never-`null` rule.
+- `StaffOwnerWire.name` and `.phone` → `string | null`; `.location`
+  `LocationKey` → `LocationKey | null`. They mirror their `owners` columns,
+  which M2.01 makes nullable. `id`, `email` and `source` never are. The list
+  is now ordered by `lower(coalesce(name, email))`, then `id`: what a reader
+  prints.
+
+Added:
+
+- `MeWire.missing_mandatory_fields: SignupField[]`: the fields the sign-up map
+  (`acct.signup_field_requirement_map`) marks `mandatory` that are empty on the
+  account, in `SIGNUP_FIELDS` order, `[]` when none. It is read from Postgres
+  on every `GET /me` and `PATCH /me`, with no cache, and never lists `email`.
+- `'profile_incomplete'` appended to `ApiErrorCode` and `API_ERROR_CODES`
+  (after `'setting_inert'`, never inserted), with status 422 in
+  `API_ERROR_STATUS`.
+- `ProfileIncompleteDetails {kind: 'profile_incomplete'; field_keys:
+  SignupField[]}`, appended to `ApiErrorDetailWire`. `PATCH /me` emits it when
+  the body would leave a `mandatory` field empty. It lists every such field the
+  body blanks, never empty, in `SIGNUP_FIELDS` order. A field already empty
+  that the body does not name is not a reason to refuse.
+- `SIGNUP_FIELDS`, the `SignupField` value tuple in its one order (the map is
+  jsonb, which keeps no key order). §16 pins it to `SignupField`. A mutant that
+  drops `'address'` proved the pin red first: TS2344 at the pin, and nowhere
+  else.
+- `PatchMeRequest.name` and `.phone` → `string | null`, and `.location` →
+  `LocationDisplay | null`. `null` clears; a `name` or `phone` with no
+  visible character (spaces, NBSP and zero-width characters do not count) is
+  the same as `null`. A request type that only widens,
+  so every 2.0.0 client's body is still accepted.
+
+Changed (doc, plus server behaviour; no shape change):
+
+- `PatchMeRequest`: the map is read on every call. A blanked `mandatory` field
+  is 422 `profile_incomplete`; a body that names an `off` field is 400
+  `bad_request` whatever its value; every 400 comes before the 422.
+  `POST /me/signup` is documented as reserved: not built in v1 and not typed
+  (question 29).
+- `AccountSettingsWire.signup_fields`: `email` is fixed at `mandatory` (design
+  §2.2:2244). A staff PATCH that sets it to anything else is 422
+  `invalid_payload`.
+- `StaffDogWire.owner_name` is the family's name, or its `email` when the name
+  is empty. It is never `null` and never `''`.
+- `ApiErrorCode`'s `not_provisioned` note: the owner app answers it on
+  `GET /me` with its one "No account yet" screen and Log Out (ACCT-U14).
+- `SignupField`'s doc names its two new uses. The design calls the type
+  `SignupFieldKey` (§1.1:761-762); the existing name is kept.
+- `WIRE_CONTRACT_VERSION` `'2.0.0'` → `'3.0.0-lg2.1'`. Its doc gains LG2's
+  line, the M1 part and the LG2b offset.
+
+Not typed here: `POST /me/signup` and its `invite_pending` kind (never built in
+3.0.0); `profile_incomplete` on `POST /bookings`, `POST /enrollments` and
+`POST /evaluations` (ACCT-U11 and the evaluation route, LG2b); mobile's
+`parseBookingGate` codes; and every other design 3.0.0 item (LG2b's 7.0.0, or
+P12's 3.0.0).
+
 ## [2.0.0] — 2026-11-02
 
 Additive. LG1 step 3 of 3 and LG1's close: 2.0.0 itself, the group's target

@@ -1103,3 +1103,48 @@ describe(
     });
   },
 );
+
+// ── P05 B4: email is fixed in the sign-up map (X5; design §2.2:2244) ─────────
+
+test(
+  'acct: a signup_fields.email other than mandatory is 422 invalid_payload, and nothing is written (X5)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const seed = {
+      name: 'mandatory',
+      phone: 'mandatory',
+      email: 'mandatory',
+      location: 'mandatory',
+      emergency_contact: 'mandatory',
+      address: 'asked',
+    };
+    const read = async () =>
+      (await appAs(SHANTI).inject({ method: 'GET', url: '/staff/settings/acct' })).json<
+        SettingsWireByDomain['acct']
+      >();
+    try {
+      const before = await read();
+      assert.deepEqual(before.signup_fields, seed);
+      for (const email of ['asked', 'off']) {
+        const res = await patch(appAs(TRAINER), '/staff/settings/acct', {
+          signup_fields: { ...seed, email },
+        });
+        assert.equal(res.statusCode, 422, `${email}: ${res.body}`);
+        const { error } = res.json<ErrorBody>();
+        assert.equal(error.code, 'invalid_payload');
+        assert.match(error.message, /\bemail\b/);
+      }
+      assert.deepEqual(await read(), before, 'a refused body wrote something');
+      // Control: the map's other keys stay switchable (ops: any role).
+      const ok = await patch(appAs(TRAINER), '/staff/settings/acct', {
+        signup_fields: { ...seed, address: 'mandatory' },
+      });
+      assert.equal(ok.statusCode, 200, ok.body);
+      assert.equal(ok.json<SettingsWireByDomain['acct']>().signup_fields.address, 'mandatory');
+    } finally {
+      await setRaw(
+        sql`UPDATE account_settings SET signup_fields = ${JSON.stringify(seed)}::jsonb, updated_by_staff_id = NULL`,
+      );
+    }
+  },
+);

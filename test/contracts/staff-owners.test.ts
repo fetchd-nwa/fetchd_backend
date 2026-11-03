@@ -121,3 +121,48 @@ test(
     assert.equal(res.json<{ error: { code: string } }>().error.code, 'forbidden');
   },
 );
+
+// P05 B5 (X6; design §2.2:2244): from M2.01 a family may have no name, phone or
+// home campus. `StaffOwnerWire` carries the nulls (never omitted), and the list
+// orders by what a reader prints, `lower(coalesce(name, email))`, then id —
+// `lower(name)` alone would sort every unnamed family last.
+test(
+  'an unnamed family serializes name, phone and location null, and sorts by her email',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const unnamed = randomUUID();
+    await db.insert(owners).values({
+      id: unnamed,
+      supabaseUid: randomUUID(),
+      name: null,
+      email: 'aardvark-unnamed@example.invalid',
+      phone: null,
+      location: null,
+    });
+    try {
+      const res = await appAs(FIXTURE_STAFF_PRINCIPAL).inject({
+        method: 'GET',
+        url: '/staff/owners',
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      const rows = res.json<GetStaffOwnersResponse>();
+      const row = rows.find((r) => r.id === unnamed);
+      assert.deepEqual(row, {
+        id: unnamed,
+        name: null,
+        email: 'aardvark-unnamed@example.invalid',
+        phone: null,
+        location: null,
+        source: 'app',
+      } satisfies StaffOwnerWire);
+      const ids = rows.map((r) => r.id);
+      // "aardvark-unnamed@…" < "allison fixture": by email, not last.
+      assert.ok(
+        ids.indexOf(unnamed) < ids.indexOf(FIXTURE_IDS.ownerId),
+        `an unnamed family is not ordered by her email: ${ids.join(', ')}`,
+      );
+    } finally {
+      await db.delete(owners).where(inArray(owners.id, [unnamed]));
+    }
+  },
+);

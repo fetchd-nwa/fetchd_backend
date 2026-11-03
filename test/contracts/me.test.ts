@@ -48,6 +48,8 @@ const ME_WIRE_KEYS = [
   'email_notifications_enabled',
   'email_notification_categories',
   'show_dogs_on_welcome',
+  // 3.0.0-lg2.1 (ACCT-U04): the map's mandatory fields empty on this account.
+  'missing_mandatory_fields',
 ];
 const ME_EMERGENCY_CONTACT_KEYS = ['name', 'relationship', 'phone'];
 const ME_ADDRESS_KEYS = ['line1', 'line2', 'city', 'state', 'zip'];

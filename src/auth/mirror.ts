@@ -8,12 +8,11 @@ import { ApiError } from '../lib/errors.js';
  * Resolve a verified Supabase uid to its live mirror row.
  *
  * Day-2 provisioning model (locked with Allison): the middleware **only
- * resolves** — it never mints a row from a bare token. `owners` requires
- * `name/email/phone/location` NOT NULL and `supabase_uid` UNIQUE NOT NULL; a
- * JWT cannot satisfy that, and the account model is invite/pre-provisioned
- * (BACKEND-ARCHITECTURE §2.6, no public signup). Creation is the webhook's job
- * (Day 2b). A verified token with no row → `not_provisioned` (caller's
- * concern), modeled here as `null`.
+ * resolves** — it never mints a row from a bare token: the account model is
+ * invite/pre-provisioned (BACKEND-ARCHITECTURE §2.6, no public signup).
+ * Creation is the seed's and the import's — from 3.0.0-lg2.1 the auth webhook
+ * writes no row either (ACCT-U04, `auth/provisioning.ts`). A verified token
+ * with no row → `not_provisioned` (caller's concern), modeled here as `null`.
  *
  * Expired mirror rows are excluded: a soft-expired account is deactivated and
  * must not authenticate (cross-cutting soft-expire invariant). `kind` is

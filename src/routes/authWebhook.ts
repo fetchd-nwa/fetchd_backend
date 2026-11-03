@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { provisionFromWebhook } from '../auth/provisioning.js';
+import { parseInvite } from '../auth/provisioning.js';
 import { verifyWebhook } from '../auth/webhookSignature.js';
 
 declare module 'fastify' {
@@ -32,10 +32,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * `POST /auth/webhook` `[public, signed]` — Supabase "user created" → upsert
- * an OWNER mirror row, or skip; never a staff row (ACCT-U05, see
- * `auth/provisioning.ts`). Answers `{ok: true, result: 'provisioned' |
- * 'skipped'}`. Registered in its own encapsulated scope so the raw-body
+ * `POST /auth/webhook` `[public, signed]` — Supabase "user created" → write
+ * nothing: never a staff row (ACCT-U05) and, from 3.0.0-lg2.1, never an owner
+ * row (ACCT-U04; the seed and the import write those). See
+ * `auth/provisioning.ts`. A signed Supabase auth record answers `{ok: true,
+ * result: 'skipped'}`, its reason logged; anything else signed is 422
+ * `invalid_payload`. Registered in its own encapsulated scope so the raw-body
  * content-type parser (the HMAC needs the exact received bytes, not a
  * re-serialized JSON) applies to *this route only* — `/me` and `/health`
  * keep Fastify's default JSON parsing.
@@ -74,7 +76,7 @@ export function registerAuthWebhook(app: FastifyInstance, verify: Verify = verif
         request.rawBody ?? '',
       );
       request.log.info(recordKeyNames(request.body), 'auth webhook record received');
-      const outcome = await provisionFromWebhook(request.body);
+      const outcome = { result: 'skipped', reason: parseInvite(request.body).reason } as const;
       request.log.info({ outcome }, `auth webhook ${outcome.result}`);
       return reply.code(200).send({ ok: true, result: outcome.result });
     });

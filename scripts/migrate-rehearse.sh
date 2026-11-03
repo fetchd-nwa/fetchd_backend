@@ -7,12 +7,18 @@
 # What it does, in order, in a throwaway `postgres:17` container:
 #   1. loads `.claude/backend/00-supabase-roles.sql` (the API roles plain
 #      Postgres lacks);
-#   2. database `rehearsal`: loads the BASE ref's schema.sql
-#      (`git show <base>:.claude/backend/schema.sql`) — the schema before the
-#      group — then replays production's default privileges. Until the
-#      production pg_default_acl reading exists (DECISIONS 51) that is
+#   2. database `rehearsal`: replays production's default privileges, then
+#      loads the BASE ref's schema.sql (`git show <base>:.claude/backend/
+#      schema.sql`) — the schema before the group — over them. Until the
+#      production pg_default_acl reading exists (DECISIONS 51) the replay is
 #      Supabase's stock grants: ALL on TABLES, SEQUENCES and FUNCTIONS in
-#      `public`, for role postgres, to anon, authenticated and service_role;
+#      `public`, for role postgres, to anon, authenticated and service_role.
+#      The replay comes FIRST so the base's own ALTER DEFAULT PRIVILEGES lines
+#      (M1.00's revokes, in every base from v1-lg1-close on) run over it, as
+#      they ran over production when that group landed. Replayed after the
+#      base, the stock grants would undo a revoke production already holds,
+#      and every group after LG1 would fail the check in 5 for a grant it
+#      never made (P05, X21's neighbour);
 #   3. applies every step file that is new since the base — `migrations/**/
 #      <step_id>_*.sql` in the working tree, absent at the base — in step order,
 #      each through `npm run migrate:apply` (`--project local`), so the bytes the
@@ -23,16 +29,24 @@
 #      created, neither API role can execute a function the group created, and
 #      `pg_default_acl` for role postgres (in `public`, or global) grants them
 #      nothing. Not vacuous: the stock grants replayed in step 2 must be visible
-#      in pg_default_acl BEFORE the steps, or the rehearsal stops;
+#      in pg_default_acl right after the replay, before the base loads, or the
+#      rehearsal stops. A base without M1.00 (v1-lg0-close) still holds them
+#      when the steps start, so the group must revoke them; a base with it
+#      holds none, so the group must not grant them back;
 #   6. runs `scripts/db/fingerprint.sql` (a copy of
 #      product/rebuild/phase-2/db/fingerprint.sql) against both and requires
 #      0 differences. Any difference, failed assertion or failed step exits
 #      non-zero.
 #
 # --base defaults to the newest `v1-lg*-close` tag (DECISIONS 52: today
-# `v1-lg0-close`); never `main`, which moves only at milestone ends.
+# `v1-lg1-close`); never `main`, which moves only at milestone ends.
 # --leave-out <step_id> skips one step: the instrument's own red proof (a
-# rehearsal missing a step must report differences and exit 1).
+# rehearsal missing a step must report differences and exit 1). On a group of
+# one step that leaves zero steps: the base is compared with the reference as
+# it stands. Every expansion of a possibly-empty array is spelled
+# ${A[@]+"${A[@]}"}, because this runs under `#!/usr/bin/env bash`, which is
+# bash 3.2 on macOS, where "${A[@]}" of an empty array is an unbound-variable
+# error under `set -u` (X21).
 # --plant-staff-row inserts ONE staff row into the production-shaped copy right
 # after the base load: the red proof of M1.19's census gate (P02; design.md:
 # 2122-2128). The run must then stop at M1.19 — the runner refuses the step
@@ -108,7 +122,7 @@ if [ -n "$LEAVE_OUT" ]; then
     echo "migrate-rehearse: --leave-out $LEAVE_OUT names no step of this group" >&2
     exit 2
   fi
-  STEPS=("${KEPT[@]}")
+  STEPS=(${KEPT[@]+"${KEPT[@]}"})
 fi
 
 CONTAINER="fetchd-rehearse-$$"
@@ -121,7 +135,11 @@ trap cleanup EXIT
 
 echo "migrate-rehearse: base $BASE ($BASE_SHA)"
 echo "migrate-rehearse: ${#STEPS[@]} step(s)${LEAVE_OUT:+ (leaving out $LEAVE_OUT)}:"
-printf '    %s\n' "${STEPS[@]}"
+if [ ${#STEPS[@]} -eq 0 ]; then
+  echo "    (none: the base alone is compared with the reference)"
+else
+  printf '    %s\n' ${STEPS[@]+"${STEPS[@]}"}
+fi
 
 docker run -d --rm --name "$CONTAINER" -e POSTGRES_PASSWORD=postgres -p 127.0.0.1::5432 postgres:17 >/dev/null
 for _ in $(seq 1 120); do
@@ -140,15 +158,34 @@ psql_in() { docker exec -i "$CONTAINER" psql -X -q -v ON_ERROR_STOP=1 -U postgre
 psql_in postgres < .claude/backend/00-supabase-roles.sql
 psql_in postgres <<< 'CREATE DATABASE rehearsal; CREATE DATABASE reference;'
 
-echo "migrate-rehearse: rehearsal ← $BASE's schema.sql + Supabase's stock default grants"
-git show "$BASE_SHA:.claude/backend/schema.sql" | psql_in rehearsal
+psql_value() { docker exec -i "$CONTAINER" psql -X -q -At -v ON_ERROR_STOP=1 -U postgres -d "$1"; }
+
+# The default grants to anon/authenticated that role postgres holds — in public,
+# or global. NOT empty right after the replay (else the check below proves
+# nothing); empty after the steps.
+DEFAULT_GRANTS_SQL="SELECT coalesce(string_agg(DISTINCT d.defaclobjtype::text || ' to ' || a.grantee::regrole::text, ', '), '')
+  FROM pg_default_acl d, aclexplode(d.defaclacl) a
+ WHERE d.defaclrole = 'postgres'::regrole
+   AND d.defaclnamespace IN (0, 'public'::regnamespace)
+   AND a.grantee IN ('anon'::regrole, 'authenticated'::regrole)"
+RELATIONS_SQL="SELECT relname FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind IN ('r', 'p', 'v', 'm', 'S') ORDER BY 1"
+# Functions by oid (signatures hold commas); the oids are stable within the database.
+FUNCTIONS_SQL="SELECT oid FROM pg_proc WHERE pronamespace = 'public'::regnamespace ORDER BY 1"
+
+echo "migrate-rehearse: rehearsal ← Supabase's stock default grants, then $BASE's schema.sql over them"
 psql_in rehearsal <<'SQL'
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;
 SQL
-
-psql_value() { docker exec -i "$CONTAINER" psql -X -q -At -v ON_ERROR_STOP=1 -U postgres -d "$1"; }
+REPLAYED=$(psql_value rehearsal <<< "$DEFAULT_GRANTS_SQL")
+if [ -z "$REPLAYED" ]; then
+  echo "migrate-rehearse: the stock default grants did not land — the privilege check would be vacuous" >&2
+  exit 1
+fi
+git show "$BASE_SHA:.claude/backend/schema.sql" | psql_in rehearsal
+AT_BASE=$(psql_value rehearsal <<< "$DEFAULT_GRANTS_SQL")
+echo "migrate-rehearse: default grants to anon/authenticated as of $BASE: ${AT_BASE:-none (its schema.sql revokes the stock ones)}"
 
 if [ -n "$PLANT_STAFF_ROW" ]; then
   # A production that already holds a staffer: one row in the BASE's shape
@@ -159,27 +196,10 @@ SQL
   echo "migrate-rehearse: planted one staff row in the production-shaped copy — M1.19's census gate must stop the run"
 fi
 
-# The default grants to anon/authenticated that role postgres holds — in public,
-# or global. Empty after the steps; NOT empty before them (else the check below
-# proves nothing).
-DEFAULT_GRANTS_SQL="SELECT coalesce(string_agg(DISTINCT d.defaclobjtype::text || ' to ' || a.grantee::regrole::text, ', '), '')
-  FROM pg_default_acl d, aclexplode(d.defaclacl) a
- WHERE d.defaclrole = 'postgres'::regrole
-   AND d.defaclnamespace IN (0, 'public'::regnamespace)
-   AND a.grantee IN ('anon'::regrole, 'authenticated'::regrole)"
-RELATIONS_SQL="SELECT relname FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind IN ('r', 'p', 'v', 'm', 'S') ORDER BY 1"
-# Functions by oid (signatures hold commas); the oids are stable within the database.
-FUNCTIONS_SQL="SELECT oid FROM pg_proc WHERE pronamespace = 'public'::regnamespace ORDER BY 1"
-
-REPLAYED=$(psql_value rehearsal <<< "$DEFAULT_GRANTS_SQL")
-if [ -z "$REPLAYED" ]; then
-  echo "migrate-rehearse: the stock default grants did not land — the privilege check would be vacuous" >&2
-  exit 1
-fi
 psql_value rehearsal <<< "$RELATIONS_SQL" > "$WORK/relations-before.txt"
 psql_value rehearsal <<< "$FUNCTIONS_SQL" | sort > "$WORK/functions-before.txt"
 
-for file in "${STEPS[@]}"; do
+for file in ${STEPS[@]+"${STEPS[@]}"}; do
   npm run --silent migrate:apply -- "$file" \
     --url "postgres://postgres:postgres@127.0.0.1:$PORT/rehearsal" --project local \
     --applied-by "migrate-rehearse" || {
@@ -221,7 +241,7 @@ if [ -n "$OPEN" ] || [ -n "$CALLABLE" ] || [ -n "$LEFT" ]; then
   exit 1
 fi
 count() { printf '%s' "$1" | tr ',' '\n' | grep -c . || true; }
-echo "migrate-rehearse: privileges — the stock grants ($REPLAYED) were replayed; after the steps no default grant to anon/authenticated remains, none of the $(count "$CREATED") relations the group created is open to anon, authenticated or PUBLIC, and none of the $(count "$NEW_FUNCTIONS") functions it created is executable by them"
+echo "migrate-rehearse: privileges — the stock grants ($REPLAYED) were replayed before the base (which left: ${AT_BASE:-none}); after the steps no default grant to anon/authenticated remains, none of the $(count "$CREATED") relations the group created is open to anon, authenticated or PUBLIC, and none of the $(count "$NEW_FUNCTIONS") functions it created is executable by them"
 
 echo "migrate-rehearse: reference ← the working tree's schema.sql"
 psql_in reference < .claude/backend/schema.sql

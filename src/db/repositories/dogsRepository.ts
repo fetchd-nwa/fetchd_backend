@@ -13,6 +13,7 @@ import {
 } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { Tx } from '../tx.js';
+import { visibleOrNull } from '../visibleText.js';
 
 /**
  * Data-access seam for `dogs`. Returns the internal `AssembledDog` domain
@@ -508,6 +509,13 @@ export interface StaffDogRow {
  * only — the inner join on live `owners` excludes staff-owned school cats
  * (those carry `staff_owner_id`, never an `owner_id`). Ordered by name.
  * Unbounded: a Day-20 pagination item like the other `GET /staff/*` reads.
+ *
+ * `ownerName` is the family's name, or her email when she has none (M2.01;
+ * design §2.2:2244, "readers that print a name fall back to the email"; X7):
+ * a display field with no email beside it, so never null and never ''. "None"
+ * is the sign-up map's test: NULL, or no visible character (`visibleOrNull`,
+ * the SQL twin of `signupFields.isNonBlank`; P05 fix round 1, BF1) — a
+ * pre-3.0.0 `PATCH /me` could store '  '.
  */
 async function findAllLiveForStaff(): Promise<StaffDogRow[]> {
   return db
@@ -516,7 +524,7 @@ async function findAllLiveForStaff(): Promise<StaffDogRow[]> {
       name: dogs.name,
       breed: dogs.breed,
       ownerId: owners.id,
-      ownerName: owners.name,
+      ownerName: sql<string>`coalesce(${visibleOrNull(owners.name)}, ${owners.email})`,
       profileImagePath: dogs.profileImagePath,
     })
     .from(dogs)

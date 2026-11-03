@@ -11,6 +11,7 @@ import { owners } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { requireOwner } from '../lib/principalNarrows.js';
+import { isNonBlank } from '../lib/signupFields.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
@@ -151,10 +152,13 @@ export function registerPaymentMethodsRoute(
             if (owner === undefined) {
               throw new ApiError('not_found', `owner ${principal.ownerId} not found`);
             }
+            // `name` only when the family has one (M2.01) — the sign-up map's
+            // test, so a stored blank is none too (P05 fix round 1, BF1): an
+            // absent name is no field at all, never `null`, never "null".
             const created = await stripe.createCustomer(
               {
                 email: owner.email,
-                name: owner.name,
+                ...(isNonBlank(owner.name) ? { name: owner.name } : {}),
                 ownerId: principal.ownerId,
               },
               `${idempotencyKey}:customer`,

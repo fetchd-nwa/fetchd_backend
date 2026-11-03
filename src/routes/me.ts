@@ -4,11 +4,13 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { owners, staff } from '../db/schema/schema.js';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
-import type {
-  MeWire,
-  PatchMeRequest,
-  StaffCapabilitiesWire,
-  StaffMeWire,
+import {
+  SIGNUP_FIELDS,
+  type MeWire,
+  type PatchMeRequest,
+  type SignupField,
+  type StaffCapabilitiesWire,
+  type StaffMeWire,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
@@ -25,15 +27,24 @@ import {
 } from '../lib/locations.js';
 import { assertOwnedImagePath, buildProfileImageUrlResolver } from '../lib/profileImageUrls.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import {
+  isFilled,
+  isNonBlank,
+  missingMandatoryFields,
+  type SignupFieldMap,
+  type SignupFieldValues,
+} from '../lib/signupFields.js';
 import { staffCapabilities } from '../lib/staffCapabilities.js';
 
 /**
  * Owner `/me` is a **frozen wire shape** — the exact keys the FE `toUser`
  * translator reads (`src/repositories/userRepository.ts`). The DB stores
  * `emergency_*` as flat columns; the API nests them into `emergency_contact`
- * (same denormalize-on-read pattern as Booking). Nullable text columns emit
- * `''` rather than `null` so the FE translator's unconditional property reads
- * never hit `undefined` — the mock always carried strings.
+ * (same denormalize-on-read pattern as Booking). The nested objects' and the
+ * avatar's nullable columns emit `''` rather than `null` so the FE
+ * translator's unconditional property reads never hit `undefined` — the mock
+ * always carried strings. From 3.0.0-lg2.1 (M2.01; ACCT-U04) `name`, `phone`
+ * and `location` are the exception: an empty one emits `null`, never `''`.
  */
 /**
  * Resolve the owner profile's `avatar_image_path` to a signed URL when it's a
@@ -54,14 +65,14 @@ async function withResolvedAvatar(
 // `Record<string, unknown>` for the jsonb columns; a wire type that claims LESS
 // is caught by conformance.ts's bidirectional enum pins). Type-only — zero
 // runtime bytes change.
-function ownerProfile(row: typeof owners.$inferSelect): MeWire {
+function ownerProfile(row: typeof owners.$inferSelect, signupFields: SignupFieldMap): MeWire {
   return {
     id: row.id,
-    name: row.name,
+    name: isNonBlank(row.name) ? row.name : null,
     email: row.email,
-    phone: row.phone,
+    phone: isNonBlank(row.phone) ? row.phone : null,
     // DB stores the slug; the FE `toUser` wire expects the display label.
-    location: slugToDisplay(row.location),
+    location: row.location === null ? null : slugToDisplay(row.location),
     avatar_image_path: row.avatarImagePath ?? '',
     emergency_contact: {
       name: row.emergencyName ?? '',
@@ -80,6 +91,7 @@ function ownerProfile(row: typeof owners.$inferSelect): MeWire {
     email_notifications_enabled: row.emailNotificationsEnabled,
     email_notification_categories: row.emailNotificationCategories,
     show_dogs_on_welcome: row.showDogsOnWelcome,
+    missing_mandatory_fields: missingMandatoryFields(row, signupFields),
   };
 }
 
@@ -121,11 +133,13 @@ function homeLabel(slug: LocationKey): LocationDisplay {
 // silently no-op); `.partial()` makes every field optional (PATCH semantics);
 // `email` is intentionally absent — identity is not self-editable here.
 // `emergency_contact` is whole-object replace (matches the FE's submit shape).
+// `name`, `phone` and `location` take `null` to clear (3.0.0-lg2.1); whether a
+// clear is allowed is the sign-up map's call, made in the handler (X2).
 const patchMeSchema = z
   .object({
-    name: z.string().min(1),
-    phone: z.string().min(1),
-    location: z.enum(LOCATION_DISPLAY_NAMES),
+    name: z.string().nullable(),
+    phone: z.string().nullable(),
+    location: z.enum(LOCATION_DISPLAY_NAMES).nullable(),
     avatar_image_path: z.string(),
     emergency_contact: z.object({
       name: z.string(),
@@ -152,11 +166,16 @@ const patchMeSchema = z
 // below keeps `z.infer` deliberately: it consumes the POST-PARSE value.
 export type PatchMeBodyConformance = Expect<Equal<z.input<typeof patchMeSchema>, PatchMeRequest>>;
 
-function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof owners.$inferInsert> {
+type PatchMe = z.infer<typeof patchMeSchema>;
+
+// A blank `name` or `phone` (no non-space character) is stored as NULL, the
+// one stored form of "empty", so `MeWire` reads `null`, never `''` (X2).
+function toOwnerUpdate(patch: PatchMe): Partial<typeof owners.$inferInsert> {
   const set: Partial<typeof owners.$inferInsert> = {};
-  if (patch.name !== undefined) set.name = patch.name;
-  if (patch.phone !== undefined) set.phone = patch.phone;
-  if (patch.location !== undefined) set.location = displayToSlug(patch.location);
+  if (patch.name !== undefined) set.name = isNonBlank(patch.name) ? patch.name : null;
+  if (patch.phone !== undefined) set.phone = isNonBlank(patch.phone) ? patch.phone : null;
+  if (patch.location !== undefined)
+    set.location = patch.location === null ? null : displayToSlug(patch.location);
   if (patch.avatar_image_path !== undefined) set.avatarImagePath = patch.avatar_image_path;
   if (patch.emergency_contact !== undefined) {
     set.emergencyName = patch.emergency_contact.name;
@@ -182,6 +201,36 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
   return set;
 }
 
+/** The sign-up fields a parsed body names, in `SIGNUP_FIELDS` order. `email`
+ *  is never one: the strict parse refuses it. */
+function signupFieldsNamed(patch: PatchMe): SignupField[] {
+  const named: Record<SignupField, boolean> = {
+    name: patch.name !== undefined,
+    phone: patch.phone !== undefined,
+    email: false,
+    location: patch.location !== undefined,
+    emergency_contact: patch.emergency_contact !== undefined,
+    address: patch.address !== undefined,
+  };
+  return SIGNUP_FIELDS.filter((field) => named[field]);
+}
+
+/** The values a sign-up field would hold after `set` is written. Read only for
+ *  the fields the body names, each of which `set` carries whole. */
+function valuesAfter(set: Partial<typeof owners.$inferInsert>): SignupFieldValues {
+  return {
+    name: set.name ?? null,
+    phone: set.phone ?? null,
+    location: set.location ?? null,
+    emergencyName: set.emergencyName ?? null,
+    emergencyPhone: set.emergencyPhone ?? null,
+    addressLine1: set.addressLine1 ?? null,
+    addressCity: set.addressCity ?? null,
+    addressState: set.addressState ?? null,
+    addressZip: set.addressZip ?? null,
+  };
+}
+
 /**
  * `GET /me` `[auth]` — the authenticated principal's own profile + mirror row.
  * `PATCH /me` `[auth]` — owner self-edit (profile / emergency contact /
@@ -189,6 +238,22 @@ function toOwnerUpdate(patch: z.infer<typeof patchMeSchema>): Partial<typeof own
  * `audit_capture` trigger records actor `owner:<id>` and the Idempotency-Key
  * dedupes retries through the Day-3 wrapper. Staff self-edit is the Day-19
  * portal's concern, not modeled here.
+ *
+ * Both follow the sign-up map (`acct.signup_field_requirement_map`; ACCT-U04,
+ * design §2.2:2244), read from Postgres on every call — `PATCH /me` reads it
+ * inside its transaction. `MeWire.missing_mandatory_fields` lists the
+ * `mandatory` fields empty on the account. `PATCH /me` refuses, in this order,
+ * atomically (a refused body writes nothing):
+ *   1. 400 — no Idempotency-Key;
+ *   2. 400 — the strict parse;
+ *   3. 400 — an empty patch;
+ *   4. 400 `bad_request` — a body that NAMES a field the map switches `off`,
+ *      whatever its value (X4: a client sends only the fields that changed);
+ *   5. 422 `profile_incomplete` `{kind, field_keys}` — a body that would leave
+ *      a `mandatory` field empty: every such field it names, in
+ *      `SIGNUP_FIELDS` order. A field already empty that the body does not
+ *      name refuses nothing (X3), so a family fills hers one save at a time.
+ * The avatar's ownership check (`invalid_payload`) runs after these.
  *
  * The auth preHandler is injectable via `AuthRouteOptions` so an integration
  * test can pin the principal without standing up the full Supabase JWKS
@@ -207,13 +272,18 @@ export function registerMeRoute(app: FastifyInstance, opts: MeRouteOpts = {}): v
     const principal = requirePrincipal(request);
 
     if (principal.kind === 'owner') {
-      const [row] = await db.select().from(owners).where(eq(owners.id, principal.ownerId)).limit(1);
+      // Read on every call (no cache): a field staff flip to mandatory shows
+      // at the family's next GET.
+      const [[row], account] = await Promise.all([
+        db.select().from(owners).where(eq(owners.id, principal.ownerId)).limit(1),
+        settingsRepository.account(),
+      ]);
       if (!row) {
         // Resolved a live row, then it vanished before the read — account
         // expired mid-request. Treat as the account being gone.
         throw new ApiError('not_provisioned', 'owner record no longer available');
       }
-      return withResolvedAvatar(ownerProfile(row), r2);
+      return withResolvedAvatar(ownerProfile(row, account.signup_fields), r2);
     }
 
     const [row] = await db.select().from(staff).where(eq(staff.id, principal.staffId)).limit(1);
@@ -258,6 +328,31 @@ export function registerMeRoute(app: FastifyInstance, opts: MeRouteOpts = {}): v
         keysToInvalidate: () => [],
       },
       async (tx) => {
+        const map = (await settingsRepository.account(tx)).signup_fields;
+        const named = signupFieldsNamed(parsed.data);
+
+        // 4. 400 — a body that names an `off` field, whatever its value.
+        const off = named.filter((field) => map[field] === 'off');
+        if (off.length > 0) {
+          throw new ApiError(
+            'bad_request',
+            `the sign-up map switches off ${off.join(', ')}: send only the fields that changed`,
+          );
+        }
+
+        // 5. 422 — a body that would leave a mandatory field empty.
+        const after = valuesAfter(set);
+        const blanked = named.filter(
+          (field) => map[field] === 'mandatory' && !isFilled(field, after),
+        );
+        if (blanked.length > 0) {
+          throw new ApiError(
+            'profile_incomplete',
+            `the sign-up map requires ${blanked.join(', ')}: it cannot be left empty`,
+            { kind: 'profile_incomplete', field_keys: blanked },
+          );
+        }
+
         if (typeof set.avatarImagePath === 'string') {
           await assertOwnedImagePath(tx, principal.ownerId, set.avatarImagePath, 'owner-avatar');
         }
@@ -269,7 +364,7 @@ export function registerMeRoute(app: FastifyInstance, opts: MeRouteOpts = {}): v
         if (!row) {
           throw new ApiError('not_provisioned', 'owner record no longer available');
         }
-        return { status: 200, body: await withResolvedAvatar(ownerProfile(row), r2) };
+        return { status: 200, body: await withResolvedAvatar(ownerProfile(row, map), r2) };
       },
     );
 

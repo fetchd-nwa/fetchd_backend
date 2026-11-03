@@ -3,6 +3,7 @@ import {
   NOTIFICATION_TYPES,
   SERVICE_CATEGORIES,
   SETTINGS_DOMAINS,
+  SIGNUP_FIELDS,
   type ServiceCategory,
   type SettingCatalog,
   type SettingClass,
@@ -146,8 +147,15 @@ export type SettingValue =
   | { type: 'text'; nullable?: true }
   | { type: 'text-list' }
   | { type: 'staff-id'; nullable: true }
-  /** A jsonb object with exactly these keys, each value an enum. */
-  | { type: 'record'; keys: readonly string[]; value: EnumValue }
+  /** A jsonb object with exactly these keys, each value an enum. A key in
+   *  `fixed` may hold only its one value: a PATCH naming another is 422
+   *  `invalid_payload` (the manifest still serves the enum's value set). */
+  | {
+      type: 'record';
+      keys: readonly string[];
+      value: EnumValue;
+      fixed?: Readonly<Record<string, string>>;
+    }
   /** `day.offerings`: service → {offered, client_visible, name, description}.
    *  Every switch is `ops`, the three request services' included: "Editable by
    *  any role, so turning one on is a deliberate act" (design.md:3719-3722;
@@ -311,8 +319,11 @@ const ENTRIES: readonly Entry[] = [
     store: column('account_settings', 'signup_fields'),
     value: {
       type: 'record',
-      keys: ['name', 'phone', 'email', 'location', 'emergency_contact', 'address'],
+      keys: SIGNUP_FIELDS,
       value: { type: 'enum', values: ['off', 'asked', 'mandatory'] },
+      // "email is fixed in the map, not switchable" (design §2.2:2244; X5):
+      // the login identity, never empty, so never anything but mandatory.
+      fixed: { email: 'mandatory' },
     },
     inert: LIVE,
   },

@@ -54,39 +54,44 @@ test('rejects missing signature headers', () => {
   );
 });
 
-// --- parseInvite (pure: payload → mirror target, or precise 422) ---
+// --- parseInvite (pure: payload → the skip and its reason, or a precise 422) ---
 
 function envelope(meta: Record<string, unknown>, email = 'jane@example.com') {
   return { record: { id: randomUUID(), email, raw_user_meta_data: meta } };
 }
 
-test('parses a valid owner invite', () => {
-  const t = parseInvite(envelope({ name: 'Jane', phone: '555', location: 'Fayetteville, AR' }));
-  assert.equal(t.kind, 'owner');
-  assert.equal(t.kind === 'owner' && t.email, 'jane@example.com');
+// ACCT-U04 (design §2.2:2244; X9): the webhook stops minting owners. The seed
+// and the import write owner rows; an INSERT without `app_role` in the
+// server-written app metadata is skipped, owner fields or not.
+test('a complete owner set in user metadata, no app_role → skipped: the webhook mints no owner', () => {
+  assert.deepEqual(
+    parseInvite(envelope({ name: 'Jane', phone: '555', location: 'Fayetteville, AR' })),
+    { kind: 'skip', reason: 'no_app_role' },
+  );
 });
 
-test('owner invite missing phone → 422 naming the field', () => {
-  assert.throws(
-    () => parseInvite(envelope({ name: 'Jane', location: 'Fayetteville, AR' })),
-    (e) => e instanceof ApiError && e.status === 422 && /phone/.test((e as Error).message),
-  );
+test('a partial owner set → skipped, never 422: the partial-metadata refusal went with the owner branch', () => {
+  assert.deepEqual(parseInvite(envelope({ name: 'Jane', location: 'Fayetteville, AR' })), {
+    kind: 'skip',
+    reason: 'no_app_role',
+  });
 });
 
 // ACCT-U05 (design §2.1:2099-2115, :1713; DECISIONS 42/L5): the webhook never
 // creates a staff row. `raw_user_meta_data` is what a client's signUp writes, so
-// an `app_role` there is just another sign-up field: the owner path, never staff.
-test('app_role in user metadata → the owner path (422 here: no phone or campus), never staff', () => {
-  assert.throws(
-    () => parseInvite(envelope({ name: 'Fed', app_role: 'trainer' })),
-    (e) => e instanceof ApiError && e.status === 422 && /owner invite/.test((e as Error).message),
-  );
+// an `app_role` there is just another field: skipped like any app-role-less
+// INSERT, never staff.
+test('app_role in user metadata → skipped like any app-role-less INSERT, never staff', () => {
+  assert.deepEqual(parseInvite(envelope({ name: 'Fed', app_role: 'trainer' })), {
+    kind: 'skip',
+    reason: 'no_app_role',
+  });
 });
 
 test('app_role alone in user metadata, no owner field → skipped, never staff', () => {
   assert.deepEqual(parseInvite(envelope({ app_role: 'owner' })), {
     kind: 'skip',
-    reason: 'no_owner_fields',
+    reason: 'no_app_role',
   });
 });
 
@@ -189,11 +194,15 @@ test(
   { skip: dbGate },
   async () => {
     // Today's hole: signUp({options: {data: {app_role: 'owner-shanthi', …}}}).
-    for (const meta of [
-      { app_role: 'owner-shanthi', name: 'Mallory' }, // owner path, incomplete → 422
-      { app_role: 'trainer' }, // no owner field → skipped
+    // From ACCT-U04 (3.0.0-lg2.1) each is 200 skipped with nothing written:
+    // no staff row, and no owner row either — the webhook mints neither.
+    const metas = [
+      { app_role: 'owner-shanthi', name: 'Mallory' },
+      { app_role: 'trainer' },
       { app_role: 'owner-shanthi', name: 'Mallory', phone: '555', location: 'Fayetteville, AR' },
-    ]) {
+    ];
+    const seen: Array<{ status: number; result: unknown; staff: number; owners: number }> = [];
+    for (const meta of metas) {
       const uid = randomUUID();
       try {
         const res = await postRecord({
@@ -201,16 +210,16 @@ test(
           email: 'mallory@example.com',
           raw_user_meta_data: meta,
         });
-        assert.ok(
-          res.statusCode === 200 || res.statusCode === 422,
-          `${JSON.stringify(meta)}: ${res.statusCode} ${res.body}`,
-        );
         const rows = await rowsFor(uid);
-        assert.equal(rows.staff, 0, `${JSON.stringify(meta)} minted a staff row`);
+        seen.push({ status: res.statusCode, result: res.json().result, ...rows });
       } finally {
         await cleanup(uid);
       }
     }
+    assert.deepEqual(
+      seen,
+      metas.map(() => ({ status: 200, result: 'skipped', staff: 0, owners: 0 })),
+    );
   },
 );
 
@@ -236,7 +245,7 @@ test(
 );
 
 test(
-  'ACCT-U05: a complete owner sign-up is still the owner branch (provisioned)',
+  'ACCT-U04: a complete owner sign-up → 200 skipped, and 0 owner rows: the webhook mints no owner',
   { skip: dbGate },
   async () => {
     const uid = randomUUID();
@@ -247,8 +256,8 @@ test(
         raw_user_meta_data: { name: 'Jane', phone: '555', location: 'Fayetteville, AR' },
       });
       assert.equal(res.statusCode, 200, res.body);
-      assert.equal(res.json().result, 'provisioned');
-      assert.deepEqual(await rowsFor(uid), { staff: 0, owners: 1 });
+      assert.equal(res.json().result, 'skipped');
+      assert.deepEqual(await rowsFor(uid), { staff: 0, owners: 0 });
     } finally {
       await cleanup(uid);
     }
@@ -304,30 +313,42 @@ test('a payload type other than INSERT → skipped, owner fields or not', () => 
   }
 });
 
+/** The skip reason the route logged with its outcome (names, never values). */
+function loggedReason(logs: string[]): unknown {
+  const line = logs
+    .map((l) => JSON.parse(l) as { outcome?: { reason?: unknown } })
+    .find((l) => l.outcome !== undefined);
+  return line?.outcome?.reason;
+}
+
 test(
-  'DECISIONS 78: an UPDATE carrying complete owner fields → 200 skipped, zero rows; the INSERT twin provisions',
+  'DECISIONS 78: an UPDATE carrying complete owner fields → 200 skipped not_insert, zero rows; the INSERT twin is skipped too (ACCT-U04)',
   { skip: dbGate },
   async () => {
     const meta = { name: 'Jane', phone: '555', location: 'Fayetteville, AR' };
     const uid = randomUUID();
     try {
+      const updateLogs: string[] = [];
       const res = await postRecord(
         { id: uid, email: 'jane@example.com', raw_user_meta_data: meta },
-        undefined,
+        updateLogs,
         'UPDATE',
       );
       assert.equal(res.statusCode, 200, res.body);
       assert.equal(res.json().result, 'skipped');
+      assert.equal(loggedReason(updateLogs), 'not_insert');
       assert.deepEqual(await rowsFor(uid), { staff: 0, owners: 0 });
 
+      const insertLogs: string[] = [];
       const insert = await postRecord(
         { id: uid, email: 'jane@example.com', raw_user_meta_data: meta },
-        undefined,
+        insertLogs,
         'INSERT',
       );
       assert.equal(insert.statusCode, 200, insert.body);
-      assert.equal(insert.json().result, 'provisioned');
-      assert.deepEqual(await rowsFor(uid), { staff: 0, owners: 1 });
+      assert.equal(insert.json().result, 'skipped');
+      assert.equal(loggedReason(insertLogs), 'no_app_role');
+      assert.deepEqual(await rowsFor(uid), { staff: 0, owners: 0 });
     } finally {
       await cleanup(uid);
     }

@@ -24,6 +24,9 @@ export function live<T extends { expiredAt: AnyColumn }>(table: T): SQL<unknown>
  *
  * Canonical uses:
  *   1. Day-2 provisioning webhook — owner/staff upsert by `supabase_uid`.
+ *      Retired: the webhook writes no row from 3.0.0-lg2.1 (ACCT-U04); the
+ *      seed and the import write owner rows, and a uid with a row is never
+ *      re-inserted (`owners.supabase_uid UNIQUE`, ACCT-37).
  *   2. Day-9d `PUT /dogs/:id/feeding` — 1:1 upsert by `dog_feeding.dog_id`
  *      (the PK). A previously soft-expired feeding row resurrects in the
  *      same statement, preserving the row's `created_at` + audit chain.

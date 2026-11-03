@@ -66,7 +66,9 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *      may not edit (`settingsRegistry.mayEditClass`; no role edits a price);
  *   3. 422 `setting_inert` + `inert_keys` — a key with no v1 reader;
  *   4. 422 `invalid_payload` — a value outside its bounds (the registry's,
- *      which mirror the table's CHECKs; every integer is also held to int4,
+ *      which mirror the table's CHECKs; a record key the registry fixes —
+ *      the sign-up map's `email`, always `mandatory` (3.0.0-lg2.1, X5) —
+ *      holding any other value; every integer is also held to int4,
  *      DECISIONS 65; no string the body can carry holds a C0 control
  *      character, DECISIONS 71), or a Postgres `23514`, `22003`, `22P02`,
  *      `22P05` or `22021` from anything the bounds do not catch — logged at
@@ -321,9 +323,16 @@ function boundsError(value: SettingValue, input: unknown, perScope: boolean): st
       const bad = entries.filter(([, v]) =>
         v === null ? value.value.nullable !== true : !value.value.values.includes(v),
       );
-      return bad.length === 0
+      if (bad.length > 0) {
+        return `${bad.map(([k]) => k).join(', ')}: not one of ${value.value.values.join(', ')}`;
+      }
+      const unfixed = entries.filter(
+        ([k, v]) =>
+          value.fixed !== undefined && Object.hasOwn(value.fixed, k) && value.fixed[k] !== v,
+      );
+      return unfixed.length === 0
         ? null
-        : `${bad.map(([k]) => k).join(', ')}: not one of ${value.value.values.join(', ')}`;
+        : unfixed.map(([k]) => `${k}: fixed at ${value.fixed?.[k]}`).join('; ');
     }
     case 'catalog':
       return 'not editable here';
