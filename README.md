@@ -33,11 +33,14 @@ fixture teardown never touches dev data. `npm run db:test:nuke` resets it.
 
 ## Database
 
-- `schema.sql` is canonical — Drizzle is query-only (`npm run db:introspect`
-  mirrors the live DB into the typed surface at `src/db/schema/`).
+- `schema.sql` is canonical — Drizzle is query-only. The typed surface at
+  `src/db/schema/` is hand-edited to match. Do not run `npm run db:introspect`:
+  it fails on this tree after overwriting `src/db/schema/`, and it reads `.env`,
+  not `.env.local`.
 - Schema loads once per empty volume via docker-entrypoint-initdb.d. After
-  editing `schema.sql`: `docker compose down -v && docker compose up -d`
-  (or `docker volume rm fetchd-pg-test-data` for just the test DB).
+  editing `schema.sql`, re-init the test volume:
+  `npm run db:test:nuke && npm run db:test:up`. Never `docker compose down -v`:
+  it also deletes the dev database volume.
 - `npm run db:dev:seed` seeds dev data (preserves real Stripe rows).
 
 ## Deploy

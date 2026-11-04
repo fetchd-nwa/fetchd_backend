@@ -25,16 +25,18 @@ client repo — a candidate for extraction to the umbrella alongside
 3. `.claude/backend/DATA-CONTRACT.md` — the wire contract, kept in lockstep
    with `src/contracts/wire.ts`.
 4. `.claude/backend/schema.sql` — the canonical DDL. Drizzle never owns
-   migrations; `src/db/schema/` is an introspected mirror (machine-authored,
-   lint-ignored, committed).
+   migrations; `src/db/schema/` is a hand-edited mirror of it (lint-ignored,
+   committed).
 
 ## Locked invariants
 
 - `schema.sql` is the source of truth for DDL. Edit it, then re-init the
   test volume (`npm run db:test:nuke && npm run db:test:up`, with
   `COMPOSE_PROJECT_NAME=fetchd_backend`) or apply by hand. Never
-  `docker compose down -v`: it also deletes the dev database volume. `npm run
-  db:introspect` refreshes the typed query surface afterward.
+  `docker compose down -v`: it also deletes the dev database volume. Then
+  hand-edit `src/db/schema/schema.ts` to match. Do not run
+  `npm run db:introspect`: it fails on this tree after overwriting
+  `src/db/schema/`, and it reads `.env`, which is production.
 - The DEV-RESET `DROP SCHEMA` preamble in `schema.sql` stays **commented** in
   git — CI asserts this before every schema load.
 - `src/contracts/wire.ts` is dependency-free by construction (it is copied

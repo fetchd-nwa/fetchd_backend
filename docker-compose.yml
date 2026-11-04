@@ -20,9 +20,9 @@
 # Schema bootstrap: `.claude/backend/schema.sql` is mounted into each pg
 # image's docker-entrypoint-initdb.d, which runs each .sql file exactly
 # ONCE — on the FIRST start against an empty data volume. To force a
-# re-init after editing schema.sql, drop the relevant volume:
-#   docker compose down -v && docker compose up -d           # everything
-#   docker volume rm fetchd-pg-test-data                     # just test
+# re-init after editing schema.sql, drop the test volume:
+#   npm run db:test:nuke && npm run db:test:up
+# Never `docker compose down -v`: it also deletes the dev database volume.
 #
 # Volumes are named (not anonymous) so `docker compose down` preserves
 # data across normal restarts; only `down -v` nukes them.
