@@ -31,7 +31,9 @@ client repo — a candidate for extraction to the umbrella alongside
 ## Locked invariants
 
 - `schema.sql` is the source of truth for DDL. Edit it, then re-init the
-  docker volume (`docker compose down -v`) or apply by hand. `npm run
+  test volume (`npm run db:test:nuke && npm run db:test:up`, with
+  `COMPOSE_PROJECT_NAME=fetchd_backend`) or apply by hand. Never
+  `docker compose down -v`: it also deletes the dev database volume. `npm run
   db:introspect` refreshes the typed query surface afterward.
 - The DEV-RESET `DROP SCHEMA` preamble in `schema.sql` stays **commented** in
   git — CI asserts this before every schema load.
