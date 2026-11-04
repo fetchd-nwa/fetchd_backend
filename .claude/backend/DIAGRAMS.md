@@ -219,8 +219,7 @@ erDiagram
   day_capacity {
     location_key location PK
     date date PK
-    integer school_openings
-    integer daycare_openings
+    integer capacity_dogs
   }
 
   %% ---- credits + payments ----

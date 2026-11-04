@@ -30,14 +30,34 @@ const EVALUATION_ROWS = `
          note, created_by_staff_id, voided_at, voided_by_staff_id
     FROM service_rates WHERE category = 'evaluation' ORDER BY location`;
 
+/** Every `service_rates` INSERT in a SQL text. */
+function seedStatementsIn(sqlText: string): string[] {
+  return sqlText.match(/^\s*insert\s+into\s+(?:public\.)?service_rates\b[\s\S]*?;\s*$/gim) ?? [];
+}
+
 /** Every `service_rates` seed statement in schema.sql, which a fresh volume ran at init. */
 function schemaSeedStatements(): string[] {
-  const statements = fs
-    .readFileSync(SCHEMA_PATH, 'utf8')
-    .match(/^INSERT INTO service_rates[\s\S]*?;$/gm);
-  assert.ok(statements, 'schema.sql carries an INSERT INTO service_rates');
+  const statements = seedStatementsIn(fs.readFileSync(SCHEMA_PATH, 'utf8'));
+  assert.ok(statements.length > 0, 'schema.sql carries an INSERT INTO service_rates');
   return statements;
 }
+
+test('the seed reader finds the INSERT however schema.sql spells it', () => {
+  for (const spelling of [
+    `INSERT INTO service_rates (id) VALUES ('a');`,
+    `insert into service_rates (id) values ('a');`,
+    `Insert Into  service_rates (id) VALUES ('a');`,
+    `  INSERT INTO service_rates (id) VALUES ('a');`,
+    `INSERT\n  INTO service_rates (id) VALUES ('a');`,
+    `INSERT INTO public.service_rates (id) VALUES ('a');`,
+    `INSERT INTO service_rates (id) VALUES ('a') ;  `,
+  ]) {
+    const found = seedStatementsIn(`SELECT 1;\n${spelling}\nSELECT 2;\n`);
+    assert.equal(found.length, 1, `missed: ${JSON.stringify(spelling)}`);
+    assert.ok(found[0]?.includes(`('a')`), `cut short: ${JSON.stringify(spelling)}`);
+  }
+  assert.deepEqual(seedStatementsIn('INSERT INTO service_rates_archive (id) VALUES (1);\n'), []);
+});
 
 test(
   "M3.05: its bytes run twice in a rolled-back transaction find exactly two rows, equal to schema.sql's and the volume's",

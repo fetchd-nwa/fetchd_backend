@@ -40,19 +40,22 @@ import {
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { refundsRepository, type CappedRefundMint } from '../db/repositories/refundsRepository.js';
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { withActor } from '../db/tx.js';
 import {
   agreementUnsignedError,
   alreadyEnrolledError,
+  beyondBookingHorizonError,
   cohortFullError,
   dogChargeFailedResult,
   dogEnrolledResult,
   dogSeatShortfallResult,
+  type EligibilityGap,
   eligibilityMissingError,
   paymentRequiredError,
-  type EligibilityGap,
 } from '../lib/bookingErrors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
+import { lastBookableDate } from '../lib/bookingHorizon.js';
 import { enrollmentIdentityOf } from '../lib/enrollmentIdentity.js';
 import {
   amendStoredEnvelopeAfterCapture,
@@ -73,6 +76,7 @@ import { computeCohortSessionDates } from '../lib/cohortSchedule.js';
 import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
+import { bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import {
@@ -182,7 +186,9 @@ const GROUP_CLASS_AUTOCHARGE_LEAD_MS = 24 * 60 * 60 * 1000;
 const postEnrollmentBodySchema = z
   .object({
     cohort_id: z.string().uuid(),
-    dog_ids: z.array(z.string().uuid()).min(1).max(MAX_DOGS_PER_REQUEST),
+    // Lowercased at the parse: Postgres reads a uuid in either case, and the distinct
+    // check below compares strings (`bookings.ts`, `dogIdField`).
+    dog_ids: z.array(z.string().uuid().toLowerCase()).min(1).max(MAX_DOGS_PER_REQUEST),
     payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
     // pay-now (the default) authorizes each dog's card immediately; pay-later
     // defers to the auto-charge worker 24h before the first session.
@@ -311,7 +317,7 @@ export function registerEnrollmentsRoute(
         return peeked.body;
       }
 
-      const cohort = await resolveCohortForEnrollment(parsed.cohortId);
+      const cohort = await resolveCohortForEnrollment(parsed.cohortId, nowFactory());
       const shared: EnrollmentRunContext = {
         stripe,
         principal,
@@ -1223,12 +1229,25 @@ interface EnrollmentCohortContext {
  * gone/soft-expired — the enroll tx re-locks and re-checks authoritatively;
  * this read only needs the amount and a seat count good enough to refuse a
  * hopeless request before it touches Stripe.
+ *
+ * The horizon is decided here too, on the cohort's first session (DECISIONS
+ * 128(d)): a class that starts within the horizon stays bookable whatever its last
+ * session's date. The cohort is refused, not a dog, so it answers 422 on both
+ * `allow_partial` paths, before any Stripe call, and after the route's peek, so a
+ * replay outlives it.
  */
-async function resolveCohortForEnrollment(cohortId: string): Promise<EnrollmentCohortContext> {
+async function resolveCohortForEnrollment(
+  cohortId: string,
+  now: Date,
+): Promise<EnrollmentCohortContext> {
   const cohort = await cohortsRepository.findById(cohortId);
   if (cohort === undefined) {
     throw new ApiError('not_found', `cohort ${cohortId} not found`);
   }
+  const { booking_horizon_months: months } = await settingsRepository.dayGlobal();
+  const firstSession = bucketToChicagoDate(pgTimestampToDate(cohort.startDate));
+  const last = lastBookableDate(now, months);
+  if (firstSession > last) throw beyondBookingHorizonError(firstSession, last);
   const groupClass = await groupClassesRepository.findByKey(cohort.classKey);
   if (groupClass === undefined) {
     throw new ApiError('invalid_payload', `cohort ${cohortId} references an unknown class`);

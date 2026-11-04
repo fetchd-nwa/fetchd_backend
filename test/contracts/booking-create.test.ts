@@ -52,7 +52,7 @@ import {
  *     post-commit on the non-replay path.
  *   - Authorization: staff principal → 403; ownership gate → 404.
  *   - Body validation: dates empty / too many / duplicates / past /
- *     beyond-lookahead / dropoff_time out-of-window / lead+additional
+ *     beyond-horizon / a stale dropoff_time / lead+additional
  *     id collision / missing Idempotency-Key.
  *
  * Cross-test state isolation: each test uses unique future dates derived
@@ -68,9 +68,9 @@ const ONE_DAY_MS = 86_400_000;
 
 /** YYYY-MM-DD `daysAhead` from FIXTURE_TODAY (in UTC — dates are
  * timezone-independent labels). NOTE: weekday-only via `futureWeekday`
- * is what most tests want — default `day_capacity` for weekends is
- * `{school:0, daycare:0}` (closed), so booking on a Saturday/Sunday
- * without an explicit override 422s on insufficient_capacity. */
+ * is what most tests want — a weekend is unticked in `open_weekdays_list`
+ * as seeded, so its cap is 0 and booking on a Saturday/Sunday without an
+ * explicit override 422s on insufficient_capacity. */
 function futureDate(daysAhead: number): string {
   const ms = FIXTURE_TODAY_MS + daysAhead * ONE_DAY_MS;
   const d = new Date(ms);
@@ -364,7 +364,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
-    await topUpCredits(FIXTURE_IDS.dog1Id, 'daycare', 5);
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'daycare', 5, 'bentonville');
     const { app } = bookingApp();
     const date = futureDate(44); // 2026-07-02 (Thu), clear of fixtures + other tests
     const school = await postBooking({
@@ -380,7 +380,8 @@ test(
     assert.equal(school.statusCode, 201, school.body);
 
     // Day care the same day — both day programs occupy 07:00–17:00, so the dog
-    // can't be in both (day-school ↔ day-care conflict).
+    // can't be in both (day-school ↔ day-care conflict). Day care runs at
+    // Bentonville only, as seeded, so this crosses campuses too.
     const care = await postBooking({
       app,
       idempotencyKey: `bk-sc-2-${randomUUID()}`,
@@ -388,7 +389,7 @@ test(
         category: 'day-care',
         lead_dog_id: FIXTURE_IDS.dog1Id,
         dates: [date],
-        location: 'fayetteville',
+        location: 'bentonville',
       },
     });
     assert.equal(care.statusCode, 422, care.body);
@@ -446,8 +447,8 @@ test(
   'POST /bookings — multi-dog day-care → additional_dog_ids + 2 debits per booking',
   SKIP_WHEN_NO_DB,
   async () => {
-    await topUpCredits(FIXTURE_IDS.dog1Id, 'daycare', 3);
-    await topUpCredits(FIXTURE_IDS.dog2Id, 'daycare', 3);
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'daycare', 3, 'bentonville');
+    await topUpCredits(FIXTURE_IDS.dog2Id, 'daycare', 3, 'bentonville');
     const { app } = bookingApp();
     const date = futureDate(8);
     const res = await postBooking({
@@ -458,7 +459,7 @@ test(
         lead_dog_id: FIXTURE_IDS.dog1Id,
         additional_dog_ids: [FIXTURE_IDS.dog2Id],
         dates: [date],
-        location: 'fayetteville',
+        location: 'bentonville',
       },
     });
     assert.equal(res.statusCode, 201, res.body);
@@ -481,7 +482,7 @@ test(
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 5);
     const { app } = bookingApp();
-    // Three weekdays (Mon–Wed, 3/3 capacity) well clear of every fixture
+    // Three weekdays (Mon–Wed, open at the campus cap) well clear of every fixture
     // session + other tests' dog1 bookings — the time-overlap guard rejects a
     // day program that shares a day with any existing session for the dog.
     const dates = [futureDate(48), futureDate(49), futureDate(50)];
@@ -537,7 +538,6 @@ test(
         category: 'day-school',
         lead_dog_id: FIXTURE_IDS.dog1Id,
         dates: [date],
-        dropoff_time: '08:00',
         location: 'fayetteville',
       },
     });
@@ -642,7 +642,7 @@ test('POST /bookings — past date → 422 invalid_payload', SKIP_WHEN_NO_DB, as
 });
 
 test(
-  'POST /bookings — date beyond 92-day lookahead → 422 invalid_payload',
+  'POST /bookings — date beyond the horizon → 422 beyond_booking_horizon',
   SKIP_WHEN_NO_DB,
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
@@ -658,7 +658,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 422);
-    assert.match((res.json() as { error: { message: string } }).error.message, /lookahead/);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'beyond_booking_horizon');
   },
 );
 
@@ -685,27 +685,29 @@ test(
 );
 
 test(
-  'POST /bookings — dropoff_time outside window (06:30) → 400 bad_request',
+  'POST /bookings — a dropoff_time, in or out of the old window → 400 bad_request',
   SKIP_WHEN_NO_DB,
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     const { app } = bookingApp();
-    const res = await postBooking({
-      app,
-      idempotencyKey: `bk-dropoff-${randomUUID()}`,
-      payload: {
-        category: 'day-school',
-        lead_dog_id: FIXTURE_IDS.dog1Id,
-        dates: [futureDate(17)],
-        dropoff_time: '06:30',
-        location: 'fayetteville',
-      },
-    });
-    assert.equal(res.statusCode, 400);
-    assert.match(
-      (res.json() as { error: { message: string } }).error.message,
-      /dropoff_time must be within/,
-    );
+    for (const dropoffTime of ['06:30', '08:00']) {
+      const res = await postBooking({
+        app,
+        idempotencyKey: `bk-dropoff-${randomUUID()}`,
+        payload: {
+          category: 'day-school',
+          lead_dog_id: FIXTURE_IDS.dog1Id,
+          dates: [futureDate(17)],
+          dropoff_time: dropoffTime,
+          location: 'fayetteville',
+        },
+      });
+      assert.equal(res.statusCode, 400);
+      assert.match(
+        (res.json() as { error: { message: string } }).error.message,
+        /Unrecognized key.*dropoff_time/,
+      );
+    }
   },
 );
 
@@ -931,12 +933,11 @@ test(
   async () => {
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     const date = futureDate(25);
-    // Override day_capacity to 0 for school at fayetteville on this date.
+    // Override day_capacity to 0 at fayetteville on this date.
     await db.insert(dayCapacity).values({
       location: 'fayetteville',
       date,
-      schoolOpenings: 0,
-      daycareOpenings: 3,
+      capacityDogs: 0,
     });
     try {
       const { app } = bookingApp();
@@ -954,14 +955,14 @@ test(
       const body = res.json() as {
         error: {
           code: string;
-          details: { kind: string; location: string; date: string; mode: string };
+          details: { kind: string; location: string; date: string };
         };
       };
       assert.equal(body.error.code, 'insufficient_capacity');
       assert.equal(body.error.details.kind, 'insufficient_capacity');
       assert.equal(body.error.details.location, 'fayetteville');
       assert.equal(body.error.details.date, date);
-      assert.equal(body.error.details.mode, 'school');
+      assert.equal(Object.hasOwn(body.error.details, 'mode'), false, 'one cap has no mode');
     } finally {
       await db
         .delete(dayCapacity)
@@ -1103,8 +1104,7 @@ test(
     await db.insert(dayCapacity).values({
       location: 'fayetteville',
       date,
-      schoolOpenings: 1,
-      daycareOpenings: 3,
+      capacityDogs: 1,
     });
     try {
       const app1 = bookingApp().app;
@@ -1152,10 +1152,7 @@ test(
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     // Pre-warm a key matching avail:fayetteville:*
     const warmKey = `avail:fayetteville:cache-test-${randomUUID()}`;
-    await redis.set(
-      warmKey,
-      JSON.stringify([{ date: '2026-06-15', school_openings: 3, daycare_openings: 3 }]),
-    );
+    await redis.set(warmKey, JSON.stringify([{ date: '2026-06-15', capacity_dogs: 15 }]));
     const existsBefore = await redis.exists(warmKey);
     assert.equal(existsBefore, 1, 'pre-warm key should exist before POST');
 

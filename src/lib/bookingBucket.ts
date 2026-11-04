@@ -1,30 +1,6 @@
-import { bucketToChicagoDate, chicagoWallTimeToUtc } from './chicagoDate.js';
+import { bucketToChicagoDate, chicagoTimeOnDate } from './chicagoDate.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
 import type { serviceCategory } from '../db/schema/schema.js';
-
-/**
- * Day-program operating windows in America/Chicago (locked 2026-05-20).
- *
- * Drop-off and pick-up are RANGES — owners arrive any time within these.
- * Same at both locations until per-location windows are modeled (deferred).
- *
- *   Drop-off:  07:30 → 09:00  (owner may show up any time in this window)
- *   Pick-up:   16:30 → 17:30  (owner may show up any time in this window)
- *
- * Bucketing uses the CLOSE of the pick-up window: a parent picking up at
- * 17:25 should still see the booking in Upcoming — anything earlier is a
- * lie. The FE's pre-Day-5 constant `DAY_PROGRAM_PICKUP_HOUR = 17` is off by
- * 30 min vs. the actual rule; Day 18 swap inherits this corrected boundary.
- */
-export const DAY_PROGRAM_DROPOFF_WINDOW = {
-  open: { hour: 7, minute: 30 },
-  close: { hour: 9, minute: 0 },
-} as const;
-
-export const DAY_PROGRAM_PICKUP_WINDOW = {
-  open: { hour: 16, minute: 30 },
-  close: { hour: 17, minute: 30 },
-} as const;
 
 /**
  * Fallback session length for sessional categories whose `duration_minutes`
@@ -51,6 +27,31 @@ export interface BookingForBucket {
   scheduledAt: string;
   durationMinutes: number | null;
   pickupAt: string | null;
+  /** The campus whose `day.pickup_close_time` ends a day-program row. */
+  location: string | null;
+}
+
+/**
+ * `day.pickup_close_time` per campus, `HH:MM`. Each list route reads it once per
+ * request (`settingsRepository.dayCampuses`) and passes it down, so a list of
+ * fifty bookings costs one settings read and every row sees the same value.
+ */
+export type PickupCloseByCampus = ReadonlyMap<string, string>;
+
+/**
+ * The close for one day-program row. A row with no campus, which only a legacy
+ * import can be, has no close of its own, so it takes the latest of the campuses':
+ * a day that stays Upcoming a little long is honest, and one that flips early hides
+ * a dog still on site.
+ */
+function pickupCloseFor(location: string | null, byCampus: PickupCloseByCampus): string {
+  const own = location === null ? undefined : byCampus.get(location);
+  if (own !== undefined) return own;
+  const latest = [...byCampus.values()].sort().at(-1);
+  if (latest === undefined) {
+    throw new Error('sessionEndTime: no campus has a pickup_close_time — apply M1.07');
+  }
+  return latest;
 }
 
 /**
@@ -62,27 +63,24 @@ export interface BookingForBucket {
  * stay with no scheduled end can't be made past by clock alone.
  *
  * Rules, by category:
- *   • day-school / day-care → end of pick-up window in Chicago on the
- *     scheduled calendar day (`DAY_PROGRAM_PICKUP_WINDOW.close = 17:30`).
- *     `duration_minutes` is ignored — day programs have a fixed window,
- *     not a per-booking duration.
+ *   • day-school / day-care → the campus's `day.pickup_close_time` in Chicago
+ *     on the scheduled calendar day, computed at read time (DAY-60). `duration_
+ *     minutes` is ignored — day programs have a fixed close, not a per-booking
+ *     duration. Using the close, not the open, is what keeps a parent picking
+ *     up at 17:25 looking at an Upcoming booking.
  *   • boarding / board-and-train → `pickup_at` (the scheduled stay end),
  *     or `null` if unset.
  *   • group-class / private-lesson / evaluation → `scheduled_at +
  *     duration_minutes`, with per-category fallback when `duration_minutes`
  *     is NULL (private-lesson 60 / group-class 50 / evaluation 30).
  */
-export function sessionEndTime(b: BookingForBucket): Date | null {
+export function sessionEndTime(b: BookingForBucket, pickupClose: PickupCloseByCampus): Date | null {
   if (b.category === 'boarding' || b.category === 'board-and-train') {
     return b.pickupAt === null ? null : pgTimestampToDate(b.pickupAt);
   }
   if (b.category === 'day-school' || b.category === 'day-care') {
     const chicagoDay = bucketToChicagoDate(pgTimestampToDate(b.scheduledAt));
-    return chicagoWallTimeToUtc(
-      chicagoDay,
-      DAY_PROGRAM_PICKUP_WINDOW.close.hour,
-      DAY_PROGRAM_PICKUP_WINDOW.close.minute,
-    );
+    return chicagoTimeOnDate(chicagoDay, pickupCloseFor(b.location, pickupClose));
   }
   const start = pgTimestampToDate(b.scheduledAt);
   const minutes =
@@ -106,8 +104,13 @@ export type BookingView = 'upcoming' | 'past';
  * but end ≤ now correctly buckets to Past. The Day-16 worker transitions
  * the column to 'past' eventually, but the read never has to wait for it.
  */
-export function isInView(b: BookingForBucket, view: BookingView, now: Date): boolean {
-  const end = sessionEndTime(b);
+export function isInView(
+  b: BookingForBucket,
+  view: BookingView,
+  now: Date,
+  pickupClose: PickupCloseByCampus,
+): boolean {
+  const end = sessionEndTime(b, pickupClose);
   if (view === 'upcoming') {
     return end === null || end.getTime() > now.getTime();
   }

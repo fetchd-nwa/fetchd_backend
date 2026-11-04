@@ -31,11 +31,11 @@ test(
 
     // 7-day window: Fri/Sat/Sun/Mon/Tue/Wed/Thu starting 2026-05-15. Hits
     // both override rows (Sun OPEN @ 2026-05-17, Tue CLOSED @ 2026-05-19)
-    // plus the weekend-closed default (Sat 2026-05-16) and four weekday
-    // defaults (Fri/Mon/Wed/Thu = 3/3).
+    // plus an unticked weekend day (Sat 2026-05-16 = 0) and four open
+    // weekdays (Fri/Mon/Wed/Thu = 15, the campus's seed).
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-05-15&to=2026-05-21&mode=school&location=fayetteville',
+      url: '/availability?from=2026-05-15&to=2026-05-21&location=fayetteville',
     });
     if (res.statusCode !== 200) {
       throw new Error(`/availability returned ${res.statusCode}: ${res.body}`);
@@ -53,7 +53,7 @@ test(
 
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-05-15&to=2026-05-17&mode=daycare&location=bentonville',
+      url: '/availability?from=2026-05-15&to=2026-05-17&location=bentonville',
     });
     if (res.statusCode !== 200) {
       throw new Error(`/availability returned ${res.statusCode}: ${res.body}`);
@@ -71,7 +71,7 @@ test(
 
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-05-15&to=2026-05-21&mode=school&location=fayetteville',
+      url: '/availability?from=2026-05-15&to=2026-05-21&location=fayetteville',
     });
     assert.equal(res.statusCode, 200);
     assert.deepStrictEqual(res.json(), loadSnapshot('availability-fayetteville'));
@@ -97,7 +97,7 @@ test(
 
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=05/15/2026&to=2026-05-21&mode=school&location=fayetteville',
+      url: '/availability?from=05/15/2026&to=2026-05-21&location=fayetteville',
     });
     assert.equal(res.statusCode, 400);
     const body = res.json() as { error?: { code?: string } };
@@ -114,7 +114,7 @@ test(
 
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-05-15&to=2026-05-21&mode=school&location=nowhere',
+      url: '/availability?from=2026-05-15&to=2026-05-21&location=nowhere',
     });
     assert.equal(res.statusCode, 400);
     const body = res.json() as { error?: { code?: string } };
@@ -128,7 +128,7 @@ test('GET /availability with from > to returns 422 invalid_payload', SKIP_WHEN_N
 
   const res = await app.inject({
     method: 'GET',
-    url: '/availability?from=2026-05-21&to=2026-05-15&mode=school&location=fayetteville',
+    url: '/availability?from=2026-05-21&to=2026-05-15&location=fayetteville',
   });
   assert.equal(res.statusCode, 422);
   const body = res.json() as { error?: { code?: string } };
@@ -136,52 +136,51 @@ test('GET /availability with from > to returns 422 invalid_payload', SKIP_WHEN_N
 });
 
 test(
-  'GET /availability over the 92-date cap returns 422 invalid_payload',
+  'GET /availability over the date cap returns 422 invalid_payload, naming the live number',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     registerAvailabilityRoute(app, { authenticate });
 
-    // 93-day window — one day past the cap.
+    // 95 dates — one past the cap at the seeded 3-month horizon, 3 * 31 + 1.
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-05-01&to=2026-08-01&mode=school&location=fayetteville',
+      url: '/availability?from=2026-05-01&to=2026-08-03&location=fayetteville',
     });
     assert.equal(res.statusCode, 422);
-    const body = res.json() as { error?: { code?: string } };
+    const body = res.json() as { error?: { code?: string; message?: string } };
     assert.equal(body.error?.code, 'invalid_payload');
+    assert.match(body.error?.message ?? '', /94-date cap/);
   },
 );
 
 test(
-  'GET /availability skips a soft-expired override (live() filter), falling back to the default rule',
+  'GET /availability skips a soft-expired override (live() filter), falling back to the campus rule',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     registerAvailabilityRoute(app, { authenticate });
 
-    // 2026-05-22 (Fri) has an EXPIRED override (0/0). The route should
-    // emit weekday defaults 3/3 because `live(dayCapacity)` drops the
+    // 2026-05-22 (Fri) has an EXPIRED override (0). The route should
+    // emit the open-weekday cap, 15, because `live(dayCapacity)` drops the
     // expired row before the override map is built.
     //
-    // The `*_remaining` half of this row is load-bearing too: fixture
+    // The `remaining_dogs` half of this row is load-bearing too: fixture
     // booking9 is a fayetteville day-school on exactly this date whose
-    // status is `cancelled`. `school_remaining: 3` is the pin that the
+    // status is `cancelled`. `remaining_dogs: 15` is the pin that the
     // booked count carries `ne(bookings.status, 'cancelled')` — a cancelled
-    // booking must not hold a seat. Drop that predicate and this reads 2.
+    // booking must not hold a seat. Drop that predicate and this reads 14.
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-05-22&to=2026-05-22&mode=school&location=fayetteville',
+      url: '/availability?from=2026-05-22&to=2026-05-22&location=fayetteville',
     });
     assert.equal(res.statusCode, 200);
     assert.deepStrictEqual(res.json(), [
       {
         location: 'fayetteville',
         date: '2026-05-22',
-        school_openings: 3,
-        daycare_openings: 3,
-        school_remaining: 3,
-        daycare_remaining: 3,
+        capacity_dogs: 15,
+        remaining_dogs: 15,
       },
     ]);
   },
@@ -196,7 +195,7 @@ test(
 
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-13-40&to=2026-05-21&mode=school&location=fayetteville',
+      url: '/availability?from=2026-13-40&to=2026-05-21&location=fayetteville',
     });
     assert.equal(res.statusCode, 400);
     const body = res.json() as { error?: { code?: string } };
@@ -204,30 +203,26 @@ test(
   },
 );
 
-// Wire 1.13.0 §5.4 guard: `mode` is validated against the contract tuple
-// BOOKING_MODES instead of a re-derivation of the booking_mode pgEnum. The
-// suite pinned a bad `location` but never a bad `mode`, so nothing would have
-// caught the swap widening or narrowing the accepted set. Both members are
-// exercised as accepted above (mode=school, mode=daycare).
-test(
-  'GET /availability with a non-member mode returns 400 bad_request',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-    registerAvailabilityRoute(app, { authenticate });
+// 4.0.0-lg3.1: one cap per (location, date) has no mode to ask about. The query is
+// not `.strict()`, so a stale client still sending `mode=` is not refused and the
+// key is dropped. That is what makes the landing order backend first: new backend
+// with old mobile works. This test used to pin the opposite (400 on a non-member).
+test('GET /availability drops a stale mode, whatever its value', SKIP_WHEN_NO_DB, async () => {
+  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  registerAvailabilityRoute(app, { authenticate });
 
+  for (const mode of ['school', 'daycare', 'boarding']) {
     const res = await app.inject({
       method: 'GET',
-      url: '/availability?from=2026-05-15&to=2026-05-21&mode=boarding&location=fayetteville',
+      url: `/availability?from=2026-05-15&to=2026-05-21&mode=${mode}&location=fayetteville`,
     });
-    assert.equal(res.statusCode, 400);
-    const body = res.json() as { error?: { code?: string } };
-    assert.equal(body.error?.code, 'bad_request');
-  },
-);
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepStrictEqual(res.json(), loadSnapshot('availability-fayetteville'));
+  }
+});
 
 // ──────────────────────────────────────────────────────────────────────────
-// `*_remaining` — the §6-batch #3 option-C fields (wire 1.13.0 fix round).
+// `remaining_dogs` — the §6-batch #3 option-C field, combined at 4.0.0-lg3.1.
 //
 // These two tests RETIRE the phase-3 debt item "the runtime test that would
 // stop 'configured, not remaining' from silently becoming false" (digest
@@ -235,8 +230,7 @@ test(
 // configured-only, and what it emits instead is pinned here against seeded
 // bookings rather than against prose.
 //
-// `*_openings` stays the CONFIGURED cap in both — the additive field is the
-// only thing that moves, which is what makes the 1.13.0 bump minor.
+// `capacity_dogs` stays the CONFIGURED cap in both.
 // ──────────────────────────────────────────────────────────────────────────
 
 /**
@@ -277,13 +271,12 @@ async function seedBookedDay(opts: {
   date: string;
   category: 'day-school' | 'day-care';
   dogIds: string[];
-  openings: { school: number; daycare: number };
+  capacity: number;
 }): Promise<() => Promise<void>> {
   await db.insert(dayCapacityTable).values({
     location: 'fayetteville',
     date: opts.date,
-    schoolOpenings: opts.openings.school,
-    daycareOpenings: opts.openings.daycare,
+    capacityDogs: opts.capacity,
   });
   const bookingId = await insertBookingAt({
     scheduledAtIso: `${opts.date}T13:00:00Z`,
@@ -308,42 +301,36 @@ async function seedBookedDay(opts: {
 }
 
 test(
-  'GET /availability — a FULL day emits remaining 0 while openings stays the configured cap',
+  'GET /availability — a FULL day emits remaining 0 while capacity stays the configured cap',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     registerAvailabilityRoute(app, { authenticate });
 
-    // 2026-06-03 (Wed) configured at 2/2, then filled with a two-dog
+    // 2026-06-03 (Wed) configured at 2, then filled with a two-dog
     // day-school booking. Two seats configured, two dogs booked.
     const cleanup = await seedBookedDay({
       date: '2026-06-03',
       category: 'day-school',
       dogIds: [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id],
-      openings: { school: 2, daycare: 2 },
+      capacity: 2,
     });
     try {
       const res = await app.inject({
         method: 'GET',
-        url: '/availability?from=2026-06-03&to=2026-06-03&mode=school&location=fayetteville',
+        url: '/availability?from=2026-06-03&to=2026-06-03&location=fayetteville',
       });
       assert.equal(res.statusCode, 200, res.body);
       assert.deepStrictEqual(res.json(), [
         {
           location: 'fayetteville',
           date: '2026-06-03',
-          // The cap the staff configured — unchanged by the bookings. This
-          // is the field three repos already share; it does NOT become
-          // "remaining" (that was option B, rejected).
-          school_openings: 2,
-          daycare_openings: 2,
+          // The cap the staff configured — unchanged by the bookings. It does
+          // NOT become "remaining" (that was option B, rejected).
+          capacity_dogs: 2,
           // 2 configured − 2 booked = 0. The owner's calendar can finally
           // render this day full instead of walking her to the 422.
-          school_remaining: 0,
-          // …and the daycare axis is untouched: a day-school booking eats a
-          // school seat only. Counting by `mode` is the half a naive
-          // "count bookings on this date" would get wrong.
-          daycare_remaining: 2,
+          remaining_dogs: 0,
         },
       ]);
     } finally {
@@ -359,9 +346,10 @@ test(
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     registerAvailabilityRoute(app, { authenticate });
 
-    // The override-shrink case, which is reachable in production: two dogs
-    // book a day-care day at the 3/3 default, then staff shrink the day to
-    // ONE daycare seat. openings(1) − booked(2) = −1.
+    // Staff can no longer shrink a date below its count inside the horizon
+    // (`capacity_below_booked`, 4.0.0-lg3.1), so this is now the narrow case: a
+    // date past the horizon, which the check leaves alone, or one imported over
+    // its cap. Two dogs booked against one seat: capacity(1) − booked(2) = −1.
     //
     // The wire promises a floor at 0 and mobile's `classifyStatus` compares
     // remaining against the selected dog count — a negative would still be
@@ -369,29 +357,27 @@ test(
     // and invert the moment anyone writes `remaining > 0 ? … : …` on a
     // signed value. `Math.max(0, …)` is also exactly what the 422's
     // `openings_remaining` detail already does — applied in
-    // `dayCapacityRepository.assertCapacityWithinLock` (:313), which feeds
-    // `insufficientCapacityError` (`lib/bookingErrors.ts:119`) — so the
-    // advisory read and the authoritative error agree on "full".
+    // `dayCapacityRepository.assertCapacityWithinLock`, which feeds
+    // `insufficientCapacityError` — so the advisory read and the authoritative
+    // error agree on "full".
     const cleanup = await seedBookedDay({
       date: '2026-06-04',
       category: 'day-care',
       dogIds: [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id],
-      openings: { school: 3, daycare: 1 },
+      capacity: 1,
     });
     try {
       const res = await app.inject({
         method: 'GET',
-        url: '/availability?from=2026-06-04&to=2026-06-04&mode=daycare&location=fayetteville',
+        url: '/availability?from=2026-06-04&to=2026-06-04&location=fayetteville',
       });
       assert.equal(res.statusCode, 200, res.body);
       assert.deepStrictEqual(res.json(), [
         {
           location: 'fayetteville',
           date: '2026-06-04',
-          school_openings: 3,
-          daycare_openings: 1,
-          school_remaining: 3,
-          daycare_remaining: 0,
+          capacity_dogs: 1,
+          remaining_dogs: 0,
         },
       ]);
     } finally {
@@ -419,15 +405,14 @@ test(
     // Only the second may consume a seat. The proven failure mode (executed,
     // r2-item2-mutation-fixedoffset.log): swap the zone for permanent-CST
     // America/Regina and the lower bound lands at 06:00Z instead of 05:00Z —
-    // the 00:30 CDT booking falls OUT of the window and school_remaining
+    // the 00:30 CDT booking falls OUT of the window and remaining_dogs
     // reads 3, failing exactly this test. (An earlier draft of this comment
     // mis-stated the direction; 2.6 final pass corrected it.)
     const overrideDate = '2026-11-01';
     await db.insert(dayCapacityTable).values({
       location: 'fayetteville',
       date: overrideDate,
-      schoolOpenings: 3,
-      daycareOpenings: 3,
+      capacityDogs: 3,
     });
     const beforeMidnight = await insertBookingAt({
       scheduledAtIso: '2026-11-01T04:30:00Z',
@@ -443,18 +428,16 @@ test(
     try {
       const res = await app.inject({
         method: 'GET',
-        url: '/availability?from=2026-11-01&to=2026-11-01&mode=school&location=fayetteville',
+        url: '/availability?from=2026-11-01&to=2026-11-01&location=fayetteville',
       });
       assert.equal(res.statusCode, 200, res.body);
       assert.deepStrictEqual(res.json(), [
         {
           location: 'fayetteville',
           date: '2026-11-01',
-          school_openings: 3,
-          daycare_openings: 3,
+          capacity_dogs: 3,
           // 3 configured − exactly ONE booked (the 00:30 CDT one).
-          school_remaining: 2,
-          daycare_remaining: 3,
+          remaining_dogs: 2,
         },
       ]);
     } finally {

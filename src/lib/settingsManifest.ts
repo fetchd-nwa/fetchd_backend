@@ -126,6 +126,9 @@ function valueSpecOf(value: SettingValue): SettingValueSpecWire {
         type: 'record',
         keys: [...value.keys],
         value: { values: [...value.value.values], nullable: value.value.nullable === true },
+        // The file's omit rule: a record with no fixed key has no `fixed`. Without
+        // this the editor offers `email` three modes the PATCH refuses (P05 N4).
+        ...(value.fixed === undefined ? {} : { fixed: { ...value.fixed } }),
       };
     case 'offerings':
       return {

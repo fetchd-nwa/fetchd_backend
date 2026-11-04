@@ -120,6 +120,42 @@ describe('the settings manifest, built from the registry', () => {
     assert.equal(offerings.type === 'offerings' ? offerings.description_max_length : 0, 280);
   });
 
+  test('the two day ceilings are served, so the editor refuses what the PATCH refuses (P13 F1)', () => {
+    assert.deepEqual(
+      (({ type, min, max }) => ({ type, min, max }))(
+        entryFor('day.booking_horizon_months', 'trainer').value as {
+          type: string;
+          min: number;
+          max: number;
+        },
+      ),
+      { type: 'integer', min: 1, max: 12 },
+    );
+    assert.deepEqual(
+      (({ type, min, max }) => ({ type, min, max }))(
+        entryFor('day.max_dogs_per_booking_count', 'trainer').value as {
+          type: string;
+          min: number;
+          max: number;
+        },
+      ),
+      { type: 'integer', min: 1, max: 99 },
+    );
+  });
+
+  test('a record serves `fixed` when the registry fixes a key, and omits it when it does not (P05 N4)', () => {
+    const fixed = entryFor('acct.signup_field_requirement_map', 'owner').value;
+    assert.equal(fixed.type, 'record');
+    assert.deepEqual(fixed.type === 'record' ? fixed.fixed : undefined, { email: 'mandatory' });
+
+    const unfixed = SETTINGS_REGISTRY.find(
+      (e) => e.value.type === 'record' && e.value.fixed === undefined,
+    ) as SettingEntry;
+    const spec = entryFor(unfixed.key, 'owner').value;
+    assert.equal(spec.type, 'record');
+    assert.equal(Object.hasOwn(spec, 'fixed'), false, 'the wire omits it, never `undefined`');
+  });
+
   test('un-inerting a key changes data, never shape: only `inert` and `editable` differ', () => {
     const key = 'dog.gate_card_on_file_enabled';
     const inert = settingEntry(key) as SettingEntry;

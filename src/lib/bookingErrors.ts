@@ -119,8 +119,29 @@ export function insufficientCreditsError(gaps: readonly CreditGap[]): ApiError {
 export function insufficientCapacityError(gap: CapacityGap): ApiError {
   return new ApiError(
     'insufficient_capacity',
-    `${gap.mode === 'school' ? 'Day School' : 'Day Care'} is full on ${gap.date} at ${gap.location} (${gap.openings_remaining} seat(s) remaining, ${gap.requested} requested).`,
+    `${gap.date} at ${gap.location} is full (${gap.openings_remaining} seat(s) remaining, ${gap.requested} requested).`,
     { kind: 'insufficient_capacity', ...gap },
+  );
+}
+
+/** A date past the horizon (`lib/bookingHorizon.ts`). No `details`: the app reads
+ *  the horizon from `GET /settings`. */
+export function beyondBookingHorizonError(date: string, lastBookable: string): ApiError {
+  return new ApiError(
+    'beyond_booking_horizon',
+    `${date} is past the last bookable date, ${lastBookable}.`,
+  );
+}
+
+/** A cap edit would leave these booked dates below their count: every one, ascending. */
+export function capacityBelowBookedError(dates: readonly string[]): ApiError {
+  if (dates.length === 0) {
+    throw new Error('capacityBelowBookedError: dates must be non-empty');
+  }
+  return new ApiError(
+    'capacity_below_booked',
+    `That would leave fewer seats than dogs booked on ${dates.join(', ')}.`,
+    { kind: 'capacity_below_booked', dates: [...dates] },
   );
 }
 

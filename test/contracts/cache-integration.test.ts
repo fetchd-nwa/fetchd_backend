@@ -152,31 +152,31 @@ test(
     const to = '2026-05-19';
     const rangeKey = dayCapacityCacheKey(location, from, to);
 
-    // The two live fixture overrides in this range: 2026-05-17 (school 2,
-    // daycare 1) and 2026-05-19 (both zero). The 2026-05-22 row is
-    // soft-expired so it is NOT in the result regardless of caching.
+    // The two live fixture overrides in this range: 2026-05-17 (3 seats) and
+    // 2026-05-19 (0). The 2026-05-22 row is soft-expired so it is NOT in the
+    // result regardless of caching.
 
     // 1. Cold call seeds `avail:fayetteville:2026-05-17:2026-05-19`.
     const cold = await dayCapacityRepository.findOverridesInRange(location, from, to);
     assert.equal(cold.length, 2, 'two live overrides in this range');
     const cold17 = cold.find((r) => r.date === '2026-05-17');
-    assert.equal(cold17?.school_openings, 2, 'fixture sanity check');
+    assert.equal(cold17?.capacity_dogs, 3, 'fixture sanity check');
     assert.equal(await redis.exists(rangeKey), 1, 'cold call must seed cache');
 
     // 2. Mutate the underlying row UNDER the warm cache.
-    const corruptedOpenings = 99;
+    const corruptedCapacity = 99;
     try {
       await db
         .update(dayCapacity)
-        .set({ schoolOpenings: corruptedOpenings })
+        .set({ capacityDogs: corruptedCapacity })
         .where(eq(dayCapacity.location, location));
 
       // 3. Warm call — cached pre-mutation values must serve.
       const warm = await dayCapacityRepository.findOverridesInRange(location, from, to);
       const warm17 = warm.find((r) => r.date === '2026-05-17');
       assert.equal(
-        warm17?.school_openings,
-        2,
+        warm17?.capacity_dogs,
+        3,
         'warm read must serve the cached value, not the freshly-mutated DB row',
       );
 
@@ -203,8 +203,8 @@ test(
       const fresh = await dayCapacityRepository.findOverridesInRange(location, from, to);
       const fresh17 = fresh.find((r) => r.date === '2026-05-17');
       assert.equal(
-        fresh17?.school_openings,
-        corruptedOpenings,
+        fresh17?.capacity_dogs,
+        corruptedCapacity,
         'after pattern wipe, the next read must re-query the DB and see the new value',
       );
     } finally {
@@ -214,18 +214,49 @@ test(
       // `seedFixture` re-seeds the next file anyway.
       await db
         .update(dayCapacity)
-        .set({ schoolOpenings: 2 })
+        .set({ capacityDogs: 3 })
         .where(and(eq(dayCapacity.location, location), eq(dayCapacity.date, '2026-05-17')));
       await db
         .update(dayCapacity)
-        .set({ schoolOpenings: 0 })
+        .set({ capacityDogs: 0 })
         .where(and(eq(dayCapacity.location, location), eq(dayCapacity.date, '2026-05-19')));
       await db
         .update(dayCapacity)
-        .set({ schoolOpenings: 0 })
+        .set({ capacityDogs: 0 })
         .where(and(eq(dayCapacity.location, location), eq(dayCapacity.date, '2026-05-22')));
       await invalidatePattern(`avail:${location}:*`);
     }
+  },
+);
+
+test(
+  'day-capacity read-through: a value cached in the old two-column shape is dropped and refilled',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // A deploy of 4.0.0-lg3.1 meets `avail:*` keys written up to 5 minutes earlier
+    // by the old build. The row schema now requires `capacity_dogs`, so `lookup`
+    // discards such a value as a stale shape and the read goes to Postgres. It never
+    // reaches a caller, and nothing has to clear the cache at deploy.
+    const location = 'fayetteville';
+    const from = '2026-05-17';
+    const to = '2026-05-19';
+    const rangeKey = dayCapacityCacheKey(location, from, to);
+    await redis.set(
+      rangeKey,
+      JSON.stringify([{ date: '2026-05-17', school_openings: 2, daycare_openings: 1 }]),
+      'EX',
+      300,
+    );
+
+    const rows = await dayCapacityRepository.findOverridesInRange(location, from, to);
+    assert.deepEqual(rows.find((r) => r.date === '2026-05-17')?.capacity_dogs, 3);
+    assert.equal(rows.length, 2);
+
+    const stored = JSON.parse((await redis.get(rangeKey)) as string) as Array<{
+      capacity_dogs?: number;
+    }>;
+    assert.equal(stored[0]?.capacity_dogs !== undefined, true, 'refilled in the new shape');
+    await invalidatePattern(`avail:${location}:*`);
   },
 );
 

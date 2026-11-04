@@ -32,6 +32,7 @@ import {
   SKIP_WHEN_NO_DB,
   makeContractApp,
   registerFixtureHooks,
+  registerRequestServicesOn,
 } from './_harness.js';
 
 /**
@@ -59,6 +60,7 @@ import {
  */
 
 registerFixtureHooks();
+registerRequestServicesOn();
 
 const FIXTURE_TODAY_MS = FIXTURE_TODAY.getTime();
 const ONE_DAY_MS = 86_400_000;
@@ -66,7 +68,7 @@ const ONE_DAY_MS = 86_400_000;
 // The requests route now takes the injected FIXTURE_NOW clock (Δ 2026-07-15
 // — the old Date.now() validation made these hardcoded "far future" dates a
 // time bomb that went off when the real calendar caught up). Relative to
-// FIXTURE_TODAY (2026-05-19) these sit ~57-71 days out, inside the 92-day cap.
+// FIXTURE_TODAY (2026-05-19) these sit ~57-71 days out, inside the 3-month horizon.
 const PREFERRED_1 = '2026-07-15T15:00:00Z';
 const PREFERRED_2 = '2026-07-22T15:00:00Z';
 const APPROVE_SCHEDULED_AT = '2026-07-20T15:00:00Z';
@@ -260,8 +262,8 @@ test(
   'POST /bookings — multi-dog day-care surfaces only the un-passed dogs in missing[]',
   SKIP_WHEN_NO_DB,
   async () => {
-    await topUpCredits(FIXTURE_IDS.dog1Id, 'daycare', 1);
-    await topUpCredits(FIXTURE_IDS.dog2Id, 'daycare', 1);
+    await topUpCredits(FIXTURE_IDS.dog1Id, 'daycare', 1, 'bentonville');
+    await topUpCredits(FIXTURE_IDS.dog2Id, 'daycare', 1, 'bentonville');
     // Waffles stays 'passed'; flip Lola to 'failed' to also exercise the
     // 'failed' arm of the evaluation_status union.
     await withDogEvalStatus(FIXTURE_IDS.dog2Id, 'failed', async () => {
@@ -275,7 +277,7 @@ test(
           lead_dog_id: FIXTURE_IDS.dog1Id,
           additional_dog_ids: [FIXTURE_IDS.dog2Id],
           dates: [futureWeekday(6)],
-          location: 'fayetteville',
+          location: 'bentonville',
         },
       });
       assert.equal(res.statusCode, 422, res.body);

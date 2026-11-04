@@ -5,27 +5,19 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import type { PostBookingsRequest } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
-import { isInView } from '../lib/bookingBucket.js';
-import { bucketChicagoToday, isValidCalendarDate } from '../lib/chicagoDate.js';
-import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
-import {
-  DEFAULT_DROPOFF_TIME,
-  DROPOFF_TIME_REGEX,
-  assertDropoffWithinWindow,
-  computeDayProgramScheduledAt,
-  parseDropoffTime,
-  type DayProgramCategory,
-} from '../lib/bookingSchedule.js';
+import { isInView, type PickupCloseByCampus } from '../lib/bookingBucket.js';
+import { isValidCalendarDate } from '../lib/chicagoDate.js';
+import type { DayProgramCategory } from '../lib/bookingSchedule.js';
 import type { BookingWire } from '../lib/bookingWire.js';
 import { cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import {
   createDayProgramBookings,
   type DayProgramPaymentPlan,
-  type DayProgramSession,
 } from '../lib/createDayProgramBookings.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
 import { ApiError } from '../lib/errors.js';
@@ -72,34 +64,33 @@ const uuidParamSchema = z.object({
 });
 
 /**
- * Day-10 POST /bookings limits — both bound the cost of one request AND
- * shape the user-facing booking flow:
+ * `MAX_DATES_PER_REQUEST` — a request-size guard, a semester at a time. 30 days ×
+ * 3 dogs × 1 INSERT booking + 1 INSERT booking_dog row + 3 INSERT credit_ledger
+ * debits = 30 × (1 + 3 + 3) = 210 INSERTs in one tx upper bound, well within a
+ * single tx's budget. Larger windows are split into multiple requests, each with
+ * its own Idempotency-Key.
  *
- *   `MAX_DATES_PER_REQUEST` — a semester at a time. 30 days × 3 dogs ×
- *     1 INSERT booking + 1 INSERT booking_dog row + 3 INSERT credit_ledger
- *     debits = 30 × (1 + 3 + 3) = 210 INSERTs in one tx upper bound, well
- *     within a single tx's budget. Larger windows are split into multiple
- *     requests, each with its own Idempotency-Key.
+ * `ADDITIONAL_DOGS_PARSE_CEILING` — this is a hostile-body ceiling and nothing
+ * else. How many dogs a booking takes is `day.max_dogs_per_booking_count`, read at
+ * runtime and answered 422 `invalid_payload`, so raising that setting past 5 needs
+ * no release. This bound sits far above any setting a campus would hold, only so a
+ * thousand-entry array is refused before anything is read.
  *
- *   `MAX_DOGS_PER_REQUEST` — five is the customer cohort ceiling (NWA's
- *     three-dog households are the realistic top end). A blanket cap
- *     stops a hostile body from materializing a thousand booking_dog rows
- *     per date.
- *
- *   `MAX_LOOKAHEAD_DAYS` — three months mirrors the booking flow's
- *     advance-window decision (locked Day 5b, 2026-05-20) — same number
- *     that `AVAILABILITY_MAX_DATES = 92` enforces on the read side.
- *
- * Updating these is a deliberate scope change — the numbers travel with
- * the body validator, the test suite, and the FE's UX expectations.
+ * The horizon is `day.booking_horizon_months` (`lib/bookingHorizon.ts`).
  */
 const MAX_DATES_PER_REQUEST = 30;
-const MAX_DOGS_PER_REQUEST = 5;
-const MAX_LOOKAHEAD_DAYS = 92;
-const ONE_DAY_MS = 86_400_000;
+const ADDITIONAL_DOGS_PARSE_CEILING = 99;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const LOCATION_KEYS = LOCATION_SLUGS;
+
+/**
+ * A dog id as the booking core may hold it: lowercased here, at the parse
+ * boundary. `withDogLocks` keys a string, and Postgres reads a uuid in either
+ * case, so a capitalised spelling would otherwise be a second lock for one dog,
+ * a second entry past the distinct check, and a second seat at the other campus.
+ */
+const dogIdField = z.string().uuid().toLowerCase();
 
 /**
  * POST /bookings body — day-program creation (day-school / day-care).
@@ -107,9 +98,9 @@ const LOCATION_KEYS = LOCATION_SLUGS;
  * evaluation) hit different endpoints (POST /enrollments, request
  * flows, staff-picked slots); narrowing `category` here keeps the
  * route's static type honest about what it accepts. The route's
- * `parseAndValidatePostBody` adds the cross-field invariants Zod
- * doesn't express cleanly (dates distinct, lead not in additionals,
- * dropoff within window).
+ * `validateBookingBody` adds the cross-field invariants Zod doesn't
+ * express cleanly (dates distinct, lead not in additionals). No arrival
+ * time is taken (DAY-U11): `dropoff_time` is an unknown key to `.strict()`.
  *
  * `payment` (Δ 2026-06-19): a day-program group pays from the credit balance
  * (default, omitted) or pay-as-you-go (`'payg'` — skip the credit debit, charge
@@ -120,11 +111,8 @@ const LOCATION_KEYS = LOCATION_SLUGS;
 const postBookingBodySchema = z
   .object({
     category: z.enum(['day-school', 'day-care']),
-    lead_dog_id: z.string().uuid(),
-    additional_dog_ids: z
-      .array(z.string().uuid())
-      .max(MAX_DOGS_PER_REQUEST - 1)
-      .optional(),
+    lead_dog_id: dogIdField,
+    additional_dog_ids: z.array(dogIdField).max(ADDITIONAL_DOGS_PARSE_CEILING).optional(),
     dates: z
       .array(
         z
@@ -134,7 +122,6 @@ const postBookingBodySchema = z
       )
       .min(1)
       .max(MAX_DATES_PER_REQUEST),
-    dropoff_time: z.string().regex(DROPOFF_TIME_REGEX, 'must be HH:MM').optional(),
     location: z.enum(LOCATION_KEYS),
     notes: z.string().max(2000).optional(),
     payment: z.enum(['credits', 'payg']).optional(),
@@ -176,8 +163,11 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
     const view = parseView(request.query);
     if (principal.kind !== 'owner') return [];
 
-    const rows = await bookingsRepository.findLiveActiveByOwner(principal.ownerId);
-    const bucketed = rows.filter((row) => isInView(row, view, nowFactory()));
+    const [rows, pickupClose] = await Promise.all([
+      bookingsRepository.findLiveActiveByOwner(principal.ownerId),
+      pickupCloseByCampus(),
+    ]);
+    const bucketed = rows.filter((row) => isInView(row, view, nowFactory(), pickupClose));
     const sorted = sortBookingsByScheduledAt(bucketed, view === 'past' ? 'desc' : 'asc');
     return wireManyBookings(sorted);
   });
@@ -185,7 +175,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   // --- GET /bookings/up-next ---------------------------------------------
   // Most-imminent upcoming booking (ascending scheduledAt, first row).
   // `null` when none. "Upcoming" here is the runtime bucket — an in-
-  // progress day-school session at 11am still counts (end = 17:30).
+  // progress day-school session at 11am still counts (end = the campus's
+  // `day.pickup_close_time`).
   app.get(
     '/bookings/up-next',
     { preHandler: [authHook] },
@@ -193,8 +184,11 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       const principal = requirePrincipal(request);
       if (principal.kind !== 'owner') return null;
 
-      const rows = await bookingsRepository.findLiveActiveByOwner(principal.ownerId);
-      const upcoming = rows.filter((row) => isInView(row, 'upcoming', nowFactory()));
+      const [rows, pickupClose] = await Promise.all([
+        bookingsRepository.findLiveActiveByOwner(principal.ownerId),
+        pickupCloseByCampus(),
+      ]);
+      const upcoming = rows.filter((row) => isInView(row, 'upcoming', nowFactory(), pickupClose));
       const sorted = sortBookingsByScheduledAt(upcoming, 'asc');
       const first = sorted[0];
       if (first === undefined) return null;
@@ -238,8 +232,11 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       const view = parseView(request.query);
       if (principal.kind !== 'owner') return [];
 
-      const rows = await bookingsRepository.findLiveActiveForDog(dogId, principal.ownerId);
-      const bucketed = rows.filter((row) => isInView(row, view, nowFactory()));
+      const [rows, pickupClose] = await Promise.all([
+        bookingsRepository.findLiveActiveForDog(dogId, principal.ownerId),
+        pickupCloseByCampus(),
+      ]);
+      const bucketed = rows.filter((row) => isInView(row, view, nowFactory(), pickupClose));
       const sorted = sortBookingsByScheduledAt(bucketed, view === 'past' ? 'desc' : 'asc');
       return wireManyBookings(sorted);
     },
@@ -251,47 +248,36 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   // bookSession transaction-contract notes).
   //
   // One request → N bookings, one per requested date, atomic. Body:
-  //   { category, lead_dog_id, additional_dog_ids?, dates[],
-  //     dropoff_time?, location, notes? }
+  //   { category, lead_dog_id, additional_dog_ids?, dates[], location, notes?,
+  //     payment?, payment_method_id? }
   // → 201 BookingWire[] (length = dates.length, ordered ASC by scheduled_at).
   //
   // Owner-only (staff portal lives at Day 19). Idempotency-Key required;
   // the same key + body returns the stored response. The same key + a
   // different body produces 422 `idempotency_mismatch`.
   //
+  // Everything that reads a clock or a setting runs INSIDE `withMutation`, after
+  // the idempotency claim, so a booking made at 07:29 and replayed at 07:31 gets
+  // its stored 201 rather than `same_day_cutoff_passed` (DECISIONS 128(a)).
+  // `validateBookingBody` keeps only what needs neither.
+  //
   // The transaction protocol — DEADLOCK ORDER MATTERS, do not reorder:
   //
-  //   1. Ownership gate per dog (`dogsRepository.findOwnedExists`). Any
+  //   1. The roster ceiling (`day.max_dogs_per_booking_count`): over it is 422
+  //      `invalid_payload`. It comes before ownership so a hostile body costs one
+  //      read, not a thousand.
+  //   2. Ownership gate per dog (`dogsRepository.findOwnedExists`). Any
   //      miss → 404 (same response as "dog doesn't exist"; ids don't
   //      enumerate across owners).
-  //   2. Advisory locks in canonical order:
-  //        (a) `withDogLocks(tx, dogs ASC, ...)` serializes credit_ledger
-  //            contention and the overlap guard per dog, across modes and
-  //            campuses.
-  //        (b) `withCapacityLocks(tx, location, dates ASC, ...)`
-  //            serializes `day_capacity` contention per (location, date).
-  //      Both batch helpers acquire in sorted order so two concurrent
-  //      N-key requests on overlapping sets observe the same total
-  //      acquisition order — no deadlock.
-  //   3. Gate pre-check in priority order (payment → vaccine →
-  //      agreement). Each gate produces a complete error for the failing
-  //      category (every missing vaccine across every dog, every
-  //      unsigned agreement). The first failing gate aborts; the user
-  //      fixes that category, retries, and the next gate (if any)
-  //      surfaces. Multi-gate consolidation is a future refinement
-  //      (`lib/bookingErrors.ts` design note).
-  //   4. Credit pre-check across all (dog, mode) pairs — every dog must
-  //      have >= `dates.length` credits in `mode`. Insufficient → 422
-  //      `insufficient_credits` with the per-dog gap list.
-  //   5. Per-date (sorted ASC) loop:
-  //        - assert capacity inside the held lock
-  //        - INSERT bookings + booking_dogs (gate triggers fire here;
-  //          the catch maps trigger violations to typed `ApiError` via
-  //          `gateTriggerErrorToApiError` for the rare race window)
-  //        - INSERT credit_ledger debits per dog (delta=-1, reason='booking-debit')
-  //   6. Post-commit (handled by withMutation):
-  //        - `patternsToInvalidate` wipes `avail:{location}:*` — every
-  //          range cache spanning this location's dates is stale now.
+  //   3. The core (`lib/createDayProgramBookings`), whose header holds the rest:
+  //      advisory locks in canonical order, dogs then `(location, date)` capacity,
+  //      both sorted so two concurrent N-key requests on overlapping sets observe
+  //      the same total acquisition order; the settings read once under the locks;
+  //      `program_not_offered` → the past-date check and `beyond_booking_horizon` →
+  //      `same_day_cutoff_passed`; the gates; credits; the overlap guard; then, per
+  //      session, capacity → INSERT → money → reminders.
+  //   4. Post-commit (handled by withMutation): `patternsToInvalidate` wipes
+  //      `avail:{location}:*` and each debited dog's balance cache.
   //
   // The DB-side BEFORE-INSERT gate triggers (schema.sql lines 1184/1231/1272)
   // remain the unbypassable floor — the route pre-check produces friendly
@@ -306,7 +292,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       requireOwner(principal, 'create a booking');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postBookingBodySchema, request.body, 'body');
-      const parsed = validateBookingBody(body, nowFactory());
+      const parsed = validateBookingBody(body);
 
       // Closure-captured (same pattern as the cancel route's
       // `pendingStripeRefund`): the credits branch debits every dog, PAYG
@@ -326,7 +312,16 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           ],
         },
         async (tx) => {
-          // 1. Ownership gate — every dog must belong to the principal.
+          // 1. The roster ceiling, read at runtime (the protocol above).
+          const { max_dogs_per_booking_count: maxDogs } = await settingsRepository.dayGlobal(tx);
+          if (parsed.allDogIds.length > maxDogs) {
+            throw new ApiError(
+              'invalid_payload',
+              `at most ${maxDogs} dogs per booking (got ${parsed.allDogIds.length})`,
+            );
+          }
+
+          // 2. Ownership gate — every dog must belong to the principal.
           for (const dogId of parsed.allDogIds) {
             const exists = await dogsRepository.findOwnedExists(dogId, principal.ownerId, tx);
             if (!exists) {
@@ -334,21 +329,14 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             }
           }
 
-          // 2. The exact session instants, then the shared core
-          //    (`lib/createDayProgramBookings`): locks → gates → payment plan →
-          //    overlap guard → per-session capacity/INSERT/money/reminders. It
-          //    books every dog or refuses; nothing is parked (wire 3.0.0).
-          const sessions: DayProgramSession[] = parsed.sortedDates.map((date) => ({
-            date,
-            scheduledAt: computeDayProgramScheduledAt(parsed.category, date, parsed.dropoff),
-          }));
-
+          // 3. The shared core. It books every dog or refuses; nothing is parked
+          //    (wire 3.0.0).
           const result = await createDayProgramBookings(tx, {
             ownerId: principal.ownerId,
             category: parsed.category,
             leadDogId: parsed.leadDogId,
             additionalDogIds: parsed.additionalDogIds,
-            sessions,
+            dates: parsed.sortedDates,
             location: parsed.location,
             notes: parsed.notes,
             payment: parsed.payment,
@@ -506,15 +494,25 @@ function parseUuidParam(params: unknown): { id: string } {
   return parsed.data;
 }
 
+/**
+ * Each campus's `day.pickup_close_time`, once per list request (DAY-60): a day goes
+ * Past at its campus's close, and fifty rows cost one read.
+ */
+async function pickupCloseByCampus(): Promise<PickupCloseByCampus> {
+  const campuses = await settingsRepository.dayCampuses();
+  return new Map(campuses.map((campus) => [campus.location, campus.pickup_close_time]));
+}
+
 // =========================================================================
 // Day 10 POST /bookings helpers
 // =========================================================================
 
 /**
  * Validated, derived form of the request body. `parseOrThrow` handles
- * the Zod-shape errors; this helper layers on cross-field invariants
- * Zod doesn't express cleanly (dates distinct, lead not in additionals,
- * dropoff within window, no past dates, lookahead cap).
+ * the Zod-shape errors; this helper layers on the cross-field invariants
+ * Zod doesn't express cleanly and that need NO CLOCK AND NO SETTING: dates
+ * distinct, lead not in additionals, the card named on a PAYG group. A rule
+ * that reads either belongs inside `withMutation`, or a replay meets it.
  *
  * Returns the route-internal `ValidatedBookingBody` — every downstream
  * call (gate pre-check, capacity assertion, INSERT) takes this typed
@@ -527,26 +525,17 @@ interface ValidatedBookingBody {
   additionalDogIds: string[];
   allDogIds: string[];
   sortedDates: string[];
-  dropoff: { hour: number; minute: number };
   location: (typeof LOCATION_KEYS)[number];
   notes: string | null;
-  mode: ReturnType<typeof dayProgramCategoryToMode>;
   // Tagged union (Δ 2026-06-19) — `paymentMethodId` exists only on the PAYG
   // arm; the cross-field requirement is enforced in `resolvePaymentPlan`.
   payment: DayProgramPaymentPlan;
 }
 
-function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBookingBody {
-  // Combined dog list — lead first, then additionals. Distinctness +
-  // count cap enforced before we touch the DB.
+function validateBookingBody(body: PostBookingBody): ValidatedBookingBody {
+  // Combined dog list — lead first, then additionals.
   const additionalDogIds = body.additional_dog_ids ?? [];
   const allDogIds = [body.lead_dog_id, ...additionalDogIds];
-  if (allDogIds.length > MAX_DOGS_PER_REQUEST) {
-    throw new ApiError(
-      'invalid_payload',
-      `at most ${MAX_DOGS_PER_REQUEST} dogs per booking (got ${allDogIds.length})`,
-    );
-  }
   const dogIdSet = new Set(allDogIds);
   if (dogIdSet.size !== allDogIds.length) {
     // lead_dog_id appearing in additional_dog_ids OR an additional id
@@ -554,40 +543,14 @@ function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBooking
     throw new ApiError('invalid_payload', 'lead_dog_id and additional_dog_ids must be distinct');
   }
 
-  // Dates: distinct, real, today-or-future, within MAX_LOOKAHEAD_DAYS.
-  // Today is "today in America/Chicago" so a 11pm Mar 7 (Chicago)
-  // request to book "Mar 8" doesn't fail as "in the past" because UTC
-  // rolled over already — Chicago is the booking-day truth axis.
-  const today = bucketChicagoToday(now);
-  const todayMs = parseDateUtcMs(today);
-  const lookAheadCapMs = todayMs + MAX_LOOKAHEAD_DAYS * ONE_DAY_MS;
   const dateSet = new Set<string>();
   for (const date of body.dates) {
     if (dateSet.has(date)) {
       throw new ApiError('invalid_payload', `dates contains duplicate ${date}`);
     }
     dateSet.add(date);
-    const dateMs = parseDateUtcMs(date);
-    if (dateMs < todayMs) {
-      throw new ApiError(
-        'invalid_payload',
-        `date ${date} is in the past (today in America/Chicago is ${today})`,
-      );
-    }
-    if (dateMs > lookAheadCapMs) {
-      throw new ApiError(
-        'invalid_payload',
-        `date ${date} exceeds the ${MAX_LOOKAHEAD_DAYS}-day lookahead window`,
-      );
-    }
   }
   const sortedDates = [...body.dates].sort();
-
-  // Drop-off time: parse + window check. Default opens of the window
-  // when the body omits `dropoff_time`.
-  const dropoff =
-    body.dropoff_time !== undefined ? parseDropoffTime(body.dropoff_time) : DEFAULT_DROPOFF_TIME;
-  assertDropoffWithinWindow(dropoff);
 
   return {
     category: body.category,
@@ -595,10 +558,8 @@ function validateBookingBody(body: PostBookingBody, now: Date): ValidatedBooking
     additionalDogIds,
     allDogIds,
     sortedDates,
-    dropoff,
     location: body.location,
     notes: body.notes ?? null,
-    mode: dayProgramCategoryToMode(body.category),
     payment: resolvePaymentPlan(body),
   };
 }
@@ -616,14 +577,4 @@ function resolvePaymentPlan(body: PostBookingBody): DayProgramPaymentPlan {
     throw new ApiError('invalid_payload', 'payment_method_id is required when payment is payg');
   }
   return { kind: 'payg', paymentMethodId: body.payment_method_id };
-}
-
-/**
- * Parse YYYY-MM-DD to a UTC-midnight ms count. Pure timezone-independent
- * arithmetic — same shape `lib/availability.ts` uses. No DST drift; same
- * value across both Chicago and UTC for the SAME calendar label.
- */
-function parseDateUtcMs(dateStr: string): number {
-  const [y, m, d] = dateStr.split('-').map(Number);
-  return Date.UTC(y!, m! - 1, d!);
 }

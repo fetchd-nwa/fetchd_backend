@@ -3,15 +3,21 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
+import { ownersRepository } from '../db/repositories/ownersRepository.js';
 import { requestsRepository } from '../db/repositories/requestsRepository.js';
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { requestStatus } from '../db/schema/schema.js';
+import type { Tx } from '../db/tx.js';
 import type { PatchRequestsRequest, PostRequestsRequest } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import {
   alreadyRequestedError,
+  beyondBookingHorizonError,
   evaluationRequiredError,
   type UnpassedEvaluationStatus,
 } from '../lib/bookingErrors.js';
+import { lastBookableDate } from '../lib/bookingHorizon.js';
+import { bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -61,7 +67,8 @@ const uuidParamSchema = z.object({
 /**
  * Day-12 limits on the POST /requests + PATCH /requests bodies. All three
  * categories share the same caps — owner request submissions are
- * lightweight (1-3 preferred slots, 1-5 dogs, ≤92-day lookahead).
+ * lightweight (1-3 preferred slots, 1-5 dogs). A preferred date is also held to
+ * `day.booking_horizon_months`, read at runtime (`lib/bookingHorizon.ts`).
  *
  *   `MAX_PREFERRED_DATES` — 3 matches §C.1 Model 3 prose ("3 ranked
  *      preferred_dates" for PL/B&T; "2 preferred-date slots" for
@@ -69,12 +76,9 @@ const uuidParamSchema = z.object({
  *      it surfaces per category; the backend accepts up to 3.
  *
  *   `MAX_DOGS_PER_REQUEST` — five, matching the day-program POST
- *      /bookings cap (Day 10). Hostile bodies are bounded BEFORE we
- *      touch the DB.
- *
- *   `MAX_LOOKAHEAD_DAYS` — 92 matches the day-program lookahead +
- *      availability range cap. Submitting a request 6 months out is a
- *      different UX problem than booking a session; deferred.
+ *      /bookings ceiling as it stood; that one is a setting now, this one
+ *      stays a constant (DECISIONS 128(e)). Hostile bodies are bounded BEFORE
+ *      we touch the DB.
  *
  *   `MAX_LENGTH_WEEKS` — 12 weeks is a generous cap. NWA's standard
  *      B&T is 2 weeks; 12 covers an extended residential without
@@ -84,7 +88,6 @@ const uuidParamSchema = z.object({
  */
 const MAX_PREFERRED_DATES = 3;
 const MAX_DOGS_PER_REQUEST = 5;
-const MAX_LOOKAHEAD_DAYS = 92;
 const MAX_LENGTH_WEEKS = 12;
 const MAX_NOTE_LENGTH = 2000;
 const MAX_STAFF_PREF_LENGTH = 100;
@@ -94,7 +97,6 @@ const MAX_STAFF_PREF_LENGTH = 100;
 // shape: a generous count cap and per-key length cap against a hostile body.
 const MAX_DESCRIPTOR_KEYS = 20;
 const MAX_DESCRIPTOR_KEY_LENGTH = 64;
-const ONE_DAY_MS = 86_400_000;
 
 /**
  * Categories that go through the request → approval flow (§C.1 Model 3).
@@ -127,9 +129,12 @@ const isoDateTimeSchema = z.string().datetime({ offset: true });
 const postRequestBodySchema = z
   .object({
     category: z.enum(REQUEST_CATEGORIES),
-    lead_dog_id: z.string().uuid(),
+    // Lowercased at the parse: Postgres reads a uuid in either case, and the distinct
+    // check compares strings, so a second spelling reached the primary key as a 500
+    // (`bookings.ts`, `dogIdField`).
+    lead_dog_id: z.string().uuid().toLowerCase(),
     additional_dog_ids: z
-      .array(z.string().uuid())
+      .array(z.string().uuid().toLowerCase())
       .max(MAX_DOGS_PER_REQUEST - 1)
       .optional(),
     preferred_dates: z.array(isoDateTimeSchema).min(1).max(MAX_PREFERRED_DATES),
@@ -178,7 +183,7 @@ export type PatchRequestsBodyConformance = Expect<
 export interface RequestsRouteOptions extends AuthRouteOptions {
   /**
    * Injectable clock for the preferred-date window validation (in-the-future
-   * + 92-day lookahead). Contract tests inject the frozen fixture clock so
+   * + the booking horizon). Contract tests inject the frozen fixture clock so
    * date fixtures never expire as the real calendar advances — this seam's
    * absence was a literal time bomb: hardcoded "far future" test dates
    * (2026-07-15) started failing the day the calendar caught up. Default =
@@ -234,10 +239,14 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
   // --- POST /requests -----------------------------------------------------
   //
   // Day 12 owner-side request submission (DATA-CONTRACT §C.1 Model 3).
-  // Single transaction:
+  // Everything that reads a clock or a setting runs after the idempotency claim,
+  // so a replay outlives them (DECISIONS 128(a)). Single transaction:
   //   1. Per-category invariant check (B&T = single dog + length_weeks
-  //      required; PL/boarding = no length_weeks).
+  //      required; PL/boarding = no length_weeks). Before the claim: it reads
+  //      neither.
   //   2. Ownership gate per dog (lead + every additional).
+  //   2b. `service_not_offered` — the service is off at the family's home campus.
+  //   2c. The preferred dates: future, and within the horizon.
   //   3. Evaluation gate at the request boundary for B&T + boarding
   //      (Day 12b, §A Amendment 2026-05-23). Lead-only — additional
   //      dogs are caught at the staff approve verb's checkBookingGates.
@@ -259,7 +268,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
       requireOwner(principal, 'submit a request');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postRequestBodySchema, request.body, 'body');
-      const parsed = validatePostRequestBody(body, nowFactory());
+      const parsed = validatePostRequestBody(body);
 
       const outcome = await withMutation<PendingRequestWire>(
         {
@@ -284,6 +293,13 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
               throw new ApiError('not_found', `dog ${dogId} not found`);
             }
           }
+
+          // 1b. The service is on (P13 ruling (f)). After the claim, as every
+          //     refusal that reads a setting is, so a stored 201 replays.
+          await assertServiceOffered(tx, principal.ownerId, parsed.category);
+
+          // 1c. The preferred dates, on the clock and the horizon.
+          await assertPreferredDatesWithinWindow(tx, parsed.preferredDates, nowFactory());
 
           // 2. Evaluation gate at the request boundary (Day 12b,
           //    §A Amendment 2026-05-23 step 5). Board-and-train +
@@ -386,7 +402,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(patchRequestBodySchema, request.body, 'body');
-      const parsed = validatePatchRequestBody(body, nowFactory());
+      const parsed = validatePatchRequestBody(body);
 
       const outcome = await withMutation<PendingRequestWire>(
         {
@@ -412,6 +428,11 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
               'conflict',
               `pending request ${id} is ${row.status} and cannot be edited`,
             );
+          }
+
+          // 2b. The preferred dates, as on POST (one validator).
+          if (parsed.preferredDates !== undefined) {
+            await assertPreferredDatesWithinWindow(tx, parsed.preferredDates, nowFactory());
           }
 
           // 3. Apply the partial update + (optionally) replace preferred
@@ -528,31 +549,64 @@ function parseUuidParam(params: unknown): { id: string } {
   return parsed.data;
 }
 
-// ---- body validation -------------------------------------------------
+// ---- the service switch ----------------------------------------------
 
 /**
- * Preferred-date invariants shared by POST + PATCH: distinct, in the future,
- * and within MAX_LOOKAHEAD_DAYS. Throws invalid_payload on the first offender.
+ * 422 `service_not_offered` unless the service runs (design §2.6:3727, DECISIONS
+ * 128(f)). The body names no campus and a request stores none, so the campus is
+ * the family's home campus. A family with none is refused only when NO campus
+ * offers the service: she asks, and staff name the campus at approve, before any
+ * money moves. It reads `offered`, the service's one store; `client_visible` only
+ * hides a tile.
  */
-function assertPreferredDatesWithinWindow(dates: readonly string[], now: Date): void {
-  const nowMs = now.getTime();
-  const lookAheadMs = nowMs + MAX_LOOKAHEAD_DAYS * ONE_DAY_MS;
+async function assertServiceOffered(
+  tx: Tx,
+  ownerId: string,
+  category: RequestCategory,
+): Promise<void> {
+  const home = await ownersRepository.homeCampus(ownerId, tx);
+  const campuses = await settingsRepository.dayCampuses(tx);
+  const judged = home === null ? campuses : campuses.filter((c) => c.location === home);
+  if (judged.some((campus) => campus.offerings[category].offered)) return;
+  throw new ApiError(
+    'service_not_offered',
+    home === null ? `${category} is not offered` : `${category} is not offered at ${home}`,
+  );
+}
+
+// ---- body validation -------------------------------------------------
+
+/** Preferred dates are distinct, shared by POST + PATCH. Reads no clock and no
+ *  setting, so it stays ahead of the claim. */
+function assertPreferredDatesDistinct(dates: readonly string[]): void {
   const seen = new Set<string>();
   for (const iso of dates) {
     if (seen.has(iso)) {
       throw new ApiError('invalid_payload', `preferred_dates contains duplicate ${iso}`);
     }
     seen.add(iso);
-    const ms = Date.parse(iso);
-    if (ms <= nowMs) {
+  }
+}
+
+/**
+ * Every preferred date is in the future (`invalid_payload`) and no later than the
+ * horizon (`beyond_booking_horizon`), reckoned on the Chicago day the instant falls
+ * on, as `POST /bookings` reckons it. Shared by POST + PATCH. It reads the clock and
+ * a setting, so it runs inside `withMutation`, after the claim (DECISIONS 128(a)).
+ */
+async function assertPreferredDatesWithinWindow(
+  tx: Tx,
+  dates: readonly string[],
+  now: Date,
+): Promise<void> {
+  const { booking_horizon_months: months } = await settingsRepository.dayGlobal(tx);
+  const last = lastBookableDate(now, months);
+  for (const iso of dates) {
+    if (Date.parse(iso) <= now.getTime()) {
       throw new ApiError('invalid_payload', `preferred_dates entry ${iso} is in the past`);
     }
-    if (ms > lookAheadMs) {
-      throw new ApiError(
-        'invalid_payload',
-        `preferred_dates entry ${iso} exceeds the ${MAX_LOOKAHEAD_DAYS}-day lookahead window`,
-      );
-    }
+    const date = bucketToChicagoDate(iso);
+    if (date > last) throw beyondBookingHorizonError(date, last);
   }
 }
 
@@ -578,10 +632,11 @@ interface ValidatedPostRequestBody {
  *     `length_weeks` REQUIRED.
  *   - Private-lesson + boarding: any of {1..5} dogs; `length_weeks`
  *     MUST be omitted.
- *   - Dog ids distinct; lead not in additionals; all preferred dates
- *     in the future + within MAX_LOOKAHEAD_DAYS.
+ *   - Dog ids distinct; lead not in additionals; preferred dates distinct.
+ *
+ * What needs a clock or a setting runs in the transaction instead.
  */
-function validatePostRequestBody(body: PostRequestBody, now: Date): ValidatedPostRequestBody {
+function validatePostRequestBody(body: PostRequestBody): ValidatedPostRequestBody {
   const additionalDogIds = body.additional_dog_ids ?? [];
   const allDogIds = [body.lead_dog_id, ...additionalDogIds];
 
@@ -624,7 +679,7 @@ function validatePostRequestBody(body: PostRequestBody, now: Date): ValidatedPos
     );
   }
 
-  assertPreferredDatesWithinWindow(body.preferred_dates, now);
+  assertPreferredDatesDistinct(body.preferred_dates);
 
   return {
     category: body.category,
@@ -652,7 +707,7 @@ interface ValidatedPatchRequestBody {
   preferredDates: string[] | undefined;
 }
 
-function validatePatchRequestBody(body: PatchRequestBody, now: Date): ValidatedPatchRequestBody {
+function validatePatchRequestBody(body: PatchRequestBody): ValidatedPatchRequestBody {
   // Identity fields are locked — reject before the repo. Cross-owner
   // re-target via PATCH would be a privilege-escalation if it landed.
   if (body.category !== undefined) {
@@ -665,9 +720,8 @@ function validatePatchRequestBody(body: PatchRequestBody, now: Date): ValidatedP
     throw new ApiError('invalid_payload', 'additional_dog_ids cannot be changed after submission');
   }
 
-  // Preferred dates — same future-window check as POST.
   if (body.preferred_dates !== undefined) {
-    assertPreferredDatesWithinWindow(body.preferred_dates, now);
+    assertPreferredDatesDistinct(body.preferred_dates);
   }
 
   // Notes / focus / length_weeks — undefined = leave unchanged; null =

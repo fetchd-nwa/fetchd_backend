@@ -1,12 +1,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  DAY_PROGRAM_PICKUP_WINDOW,
-  isInView,
-  sessionEndTime,
+  isInView as isInViewAtCloses,
+  sessionEndTime as sessionEndTimeAtCloses,
   type BookingForBucket,
+  type PickupCloseByCampus,
   type ServiceCategory,
 } from '../src/lib/bookingBucket.js';
+
+// §3.4's seed, at both campuses. The tests below stress the category rules, so they
+// run over it; the per-campus close has its own tests at the end of this file.
+const SEEDED_CLOSES: PickupCloseByCampus = new Map([
+  ['fayetteville', '17:30'],
+  ['bentonville', '17:30'],
+]);
+const sessionEndTime = (b: BookingForBucket): Date | null =>
+  sessionEndTimeAtCloses(b, SEEDED_CLOSES);
+const isInView = (b: BookingForBucket, view: 'upcoming' | 'past', now: Date): boolean =>
+  isInViewAtCloses(b, view, now, SEEDED_CLOSES);
 
 // Helper: a minimal booking shape for unit tests. Defaults exercise the
 // "happy path" for each category; tests override only the field they're
@@ -18,6 +29,7 @@ function makeBooking(
     scheduledAt: '2026-06-15 08:00:00+00',
     durationMinutes: null,
     pickupAt: null,
+    location: 'fayetteville',
     ...overrides,
   };
 }
@@ -57,13 +69,6 @@ test('sessionEndTime: day-program uses Chicago calendar day, not UTC day', () =>
     makeBooking({ category: 'day-school', scheduledAt: '2026-06-15 03:00:00+00' }),
   );
   assert.equal(end?.toISOString(), '2026-06-14T22:30:00.000Z');
-});
-
-test('sessionEndTime: day-program window-close constants match the named window', () => {
-  // The window-close constant is `17:30` — guard against a future edit that
-  // changes the helper without updating the bucket.
-  assert.equal(DAY_PROGRAM_PICKUP_WINDOW.close.hour, 17);
-  assert.equal(DAY_PROGRAM_PICKUP_WINDOW.close.minute, 30);
 });
 
 // sessionEndTime: boarding + board-and-train — pickup_at when set, null when not.
@@ -310,4 +315,56 @@ test('sessionEndTime: every ServiceCategory produces a determinate end (or expli
       assert.ok(end instanceof Date, `${category} should return a Date`);
     }
   }
+});
+
+// The close is the campus's setting (DAY-60), and a row names its campus.
+
+const MOVED_CLOSES: PickupCloseByCampus = new Map([
+  ['fayetteville', '17:30'],
+  ['bentonville', '18:00'],
+]);
+
+test('sessionEndTime: a day ends at its own campus close', () => {
+  const at = (location: string): string | undefined =>
+    sessionEndTimeAtCloses(
+      makeBooking({ category: 'day-care', scheduledAt: '2026-06-15 12:30:00+00', location }),
+      MOVED_CLOSES,
+    )?.toISOString();
+  assert.equal(at('fayetteville'), '2026-06-15T22:30:00.000Z');
+  assert.equal(at('bentonville'), '2026-06-15T23:00:00.000Z');
+});
+
+test('isInView: Upcoming until the close, Past at it, not at 17:30', () => {
+  const b = makeBooking({
+    category: 'day-school',
+    scheduledAt: '2026-06-15 12:30:00+00',
+    location: 'bentonville',
+  });
+  const at1745 = new Date('2026-06-15T22:45:00Z');
+  const at1800 = new Date('2026-06-15T23:00:00Z');
+  assert.equal(isInViewAtCloses(b, 'upcoming', at1745, MOVED_CLOSES), true);
+  assert.equal(isInViewAtCloses(b, 'past', at1745, MOVED_CLOSES), false);
+  assert.equal(isInViewAtCloses(b, 'upcoming', at1800, MOVED_CLOSES), false);
+  assert.equal(isInViewAtCloses(b, 'past', at1800, MOVED_CLOSES), true);
+});
+
+test('sessionEndTime: a legacy day-program row with no campus takes the latest close', () => {
+  const end = sessionEndTimeAtCloses(
+    makeBooking({ category: 'day-school', scheduledAt: '2026-06-15 12:30:00+00', location: null }),
+    MOVED_CLOSES,
+  );
+  assert.equal(end?.toISOString(), '2026-06-15T23:00:00.000Z');
+});
+
+test('sessionEndTime: only a day program reads the close', () => {
+  const end = sessionEndTimeAtCloses(
+    makeBooking({
+      category: 'private-lesson',
+      scheduledAt: '2026-06-15 12:30:00+00',
+      durationMinutes: 45,
+      location: null,
+    }),
+    new Map(),
+  );
+  assert.equal(end?.toISOString(), '2026-06-15T13:15:00.000Z');
 });

@@ -18,9 +18,9 @@ import { chicagoWallPartsAt, chicagoWallTimeToUtc } from './chicagoDate.js';
  * `chicagoWallTimeToUtc` (Day-10's fixed-point iteration). Week 0 is
  * the start instant exactly; week k (k ≥ 1) is the recomputed UTC.
  *
- * Distinct from `computeDayProgramScheduledAt` (day-school/day-care)
- * which takes a `dropoff_time` and bucketed date — cohort scheduling
- * doesn't ask for a drop-off time, the cohort row owns it.
+ * Distinct from `computeDayProgramScheduledAt` (day-school/day-care), which
+ * starts a date at the campus's `day.dropoff_open_time` — cohort scheduling
+ * has no such setting, the cohort row owns its time.
  *
  * Throws if `weeks < 1` (the schema guarantees `weeks > 0`; this is a
  * defense-in-depth assertion against a corrupted cohort row).

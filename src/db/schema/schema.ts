@@ -1935,9 +1935,10 @@ export const pendingRequestPreferredDates = pgTable("pending_request_preferred_d
 export const dayCapacity = pgTable("day_capacity", {
 	location: text().$type<LocationKey>().notNull(),
 	date: date().notNull(),
-	schoolOpenings: integer("school_openings").notNull(),
-	daycareOpenings: integer("daycare_openings").notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	capacityDogs: integer("capacity_dogs").notNull(),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
 }, (table) => {
 	return {
 		dayCapacityLocationFkey: foreignKey({
@@ -1945,9 +1946,13 @@ export const dayCapacity = pgTable("day_capacity", {
 			foreignColumns: [locations.slug],
 			name: "day_capacity_location_fkey"
 		}),
+		dayCapacityUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "day_capacity_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
 		dayCapacityPkey: primaryKey({ columns: [table.location, table.date], name: "day_capacity_pkey"}),
-		dayCapacitySchoolOpeningsCheck: check("day_capacity_school_openings_check", sql`school_openings >= 0`),
-		dayCapacityDaycareOpeningsCheck: check("day_capacity_daycare_openings_check", sql`daycare_openings >= 0`),
+		dayCapacityCapacityDogsCheck: check("day_capacity_capacity_dogs_check", sql`capacity_dogs >= 0`),
 	}
 });
 

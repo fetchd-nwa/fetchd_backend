@@ -53,8 +53,8 @@
 -- Conventions: snake_case; timestamptz (UTC) for instants; date for calendar
 -- days; *_cents integers for money (never float); created_at on all tables.
 -- BUSINESS TIMEZONE = America/Chicago (locked 2026-05-19). Instants stored
--- UTC, but ALL business-day math — day_capacity dates, the 8am/5pm day-program
--- window, today/tomorrow bucketing, the 24h-before-dropoff reminder — is
+-- UTC, but ALL business-day math — day_capacity dates, the campus day's open
+-- and close, today/tomorrow bucketing, the 24h-before-dropoff reminder — is
 -- computed in America/Chicago. Never derive a calendar day straight from a UTC
 -- timestamp (that was the mock's off-by-one bug class).
 -- The Node API verifies the Supabase JWT, resolves it to an owners/staff row
@@ -883,18 +883,23 @@ CREATE TABLE pending_request_preferred_dates (
 
 -- ----------------------------------------------------------------------------
 -- Day capacity (R5: a capacity day is a calendar DATE; sparse = override-only)
--- Per-LOCATION (locked 2026-05-19): each school runs its own openings, so the
--- key is (location, date). Only rows that DIFFER from the default rule are
--- stored. The Node API applies the business rule (weekend = closed; otherwise
--- DEFAULT_OPENINGS = 3) per location over the top of any override here. That
--- rule is API logic, not schema.
+-- Per-LOCATION (locked 2026-05-19): each school runs its own seats, so the key
+-- is (location, date). One count per date: day school and daycare share it
+-- (M3.01, DAY-U05). A row is the store of day.capacity_override_dogs, edited by
+-- PUT and DELETE /staff/day-capacity/:location/:date. Where no live row exists
+-- the Node API applies the campus's day.open_weekdays_list and
+-- day.daily_capacity_dogs (lib/availability.dayCapacityFor): an open weekday gets
+-- the daily cap, any other date 0. That rule is API logic, not schema.
+-- updated_at and updated_by_staff_id are the settings audit pair (STAFF-74), stamped
+-- by the writers: a date's first PUT is an INSERT, which audit_capture does not see.
 -- ----------------------------------------------------------------------------
 CREATE TABLE day_capacity (
-  location          text NOT NULL REFERENCES locations(slug),
-  date              date NOT NULL,
-  school_openings   integer NOT NULL CHECK (school_openings   >= 0),
-  daycare_openings  integer NOT NULL CHECK (daycare_openings  >= 0),
-  expired_at        timestamptz,                       -- NULL = live (override withdrawn = expire)
+  location             text NOT NULL REFERENCES locations(slug),
+  date                 date NOT NULL,
+  expired_at           timestamptz,                    -- NULL = live (override withdrawn = expire)
+  capacity_dogs        integer NOT NULL CHECK (capacity_dogs >= 0),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id  uuid REFERENCES staff(id) ON DELETE SET NULL,
   PRIMARY KEY (location, date)
 );
 
@@ -2449,8 +2454,9 @@ END $$;
 -- agreement_signatures,
 -- scheduled_notifications, notifications, media_derivative_jobs, audit_log) as
 -- is idempotency_keys (transport dedupe, TTL-pruned). day_capacity is
--- included — it carries expired_at. service_rates is included so closing an
--- effective_to is audited.
+-- included — it carries expired_at; its first write is an INSERT, which this
+-- trigger does not see, so the row's own updated_by_staff_id names that author.
+-- service_rates is included so closing an effective_to is audited.
 --
 -- Δ 2026-08-24 (MR-A1.1), one honest clause about `refunds` in that list: it is
 -- NOT immutable — the webhook flips its status, `markUnroutable` flips it,
@@ -2728,12 +2734,15 @@ CREATE TRIGGER bookings_eval_gate_check
 --         every required agreement_documents applicable to the category.
 --
 --  bookSession (Day School/Care with credits): ONE transaction —
---    SELECT ... FROM day_capacity WHERE location=$loc AND date=$d FOR UPDATE
---      (materialize the default-rule row first if absent); assert remaining
---      openings for (location,date,mode) > count of non-staff dogs — the
---      day-capacity analogue of the cohort row lock;
---    lock per dog: pg_advisory_xact_lock(hashtext('dog:'||dog_id)) OR
---      run SERIALIZABLE;                                       -- no double-spend
+--    lock per dog, ascending: pg_advisory_xact_lock(hashtext('dog:'||dog_id)),
+--      the id lowercased at the parse boundary;                -- no double-spend
+--    lock per (location, date), ascending:
+--      pg_advisory_xact_lock(hashtext('capacity:'||location||':'||date)), the
+--      day-capacity analogue of the cohort row lock, which a staff cap edit
+--      takes too, so the two serialise;
+--    read the campus's settings under those locks; assert the cap (a live
+--      day_capacity row, else the campus's rule) covers every live non-staff
+--      dog on the date, day school and daycare together, plus the request's;
 --    INSERT booking (+ booking_dogs);
 --    INSERT credit_ledger (delta = -1, reason='booking-debit', booking_id)
 --      per dog per mode; assert post-balance >= 0 OR a charge/membership
@@ -2804,7 +2813,7 @@ COMMENT ON TABLE  after_school_optins            IS 'Per-dog After School Coachi
 COMMENT ON TABLE  pending_requests               IS 'Owner-submitted requests awaiting staff approval (private lesson, boarding, board-and-train) before they convert to bookings.';
 COMMENT ON TABLE  pending_request_dogs           IS 'Dogs attached to a pending request (lead + additional), mirroring booking_dogs.';
 COMMENT ON TABLE  pending_request_preferred_dates IS 'The owner ranked preferred date/time slots for a pending request.';
-COMMENT ON TABLE  day_capacity                   IS 'Sparse per-(location, calendar-day) capacity overrides for Day School/Care; the per-location default rule is applied in the API when no row exists.';
+COMMENT ON TABLE  day_capacity                   IS 'Sparse per-(location, calendar-day) seat overrides for Day School and Day Care combined; a live row wins over the campus''s day.daily_capacity_dogs and day.open_weekdays_list, which the API applies when no row exists.';
 COMMENT ON TABLE  cancel_window_settings         IS 'Owner-tunable per-category free-cancel hours (Day 13). One row per service_category; seeded 48h flat. API reads at booking creation to stamp bookings.cancel_deadline_at; the resolved deadline travels with the booking.';
 COMMENT ON TABLE  credit_expiry_settings         IS 'Staff-tunable credit-expiry window + warning lead (2026-06-20). One org-default row (location IS NULL) + optional per-location override rows; partial unique indexes enforce exactly-one-default and one-per-location. API resolves per-location → org-default → code default (12mo) to stamp credit_ledger lot expiry at purchase (non-retroactive). warning_lead_days has no P2 consumer (its reader is the Phase-3 expiry-warning notification).';
 COMMENT ON TABLE migrations_applied IS 'One row per migration step applied through npm run migrate:apply: the step id, who ran it, and the sha256 of the exact bytes sent. Written as the step''s last statement, in its transaction.';

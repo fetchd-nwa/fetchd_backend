@@ -1,5 +1,5 @@
 import { asc, eq, isNull, sql } from 'drizzle-orm';
-import type { StaffOwnerWire } from '../../contracts/wire.js';
+import type { LocationKey, StaffOwnerWire } from '../../contracts/wire.js';
 import { db } from '../client.js';
 import { owners } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -64,6 +64,20 @@ export const ownersRepository = {
         sql`lower(coalesce(${visibleOrNull(owners.name)}, ${owners.email}))`,
         asc(owners.id),
       );
+  },
+
+  /**
+   * The family's home campus, `null` when she has none (M2.01). The campus a
+   * `POST /requests` is judged at (P13 ruling (f)): neither `dogs` nor
+   * `pending_requests` has one.
+   */
+  async homeCampus(ownerId: string, runner: Runner = db): Promise<LocationKey | null> {
+    const [row] = await runner
+      .select({ location: owners.location })
+      .from(owners)
+      .where(eq(owners.id, ownerId))
+      .limit(1);
+    return row?.location ?? null;
   },
 
   /** Whether any `owners` row has this id, an expired one included: a

@@ -297,3 +297,118 @@ test(
     assert.deepEqual(rounds, { '201 + 201; bookings 2; debits 2': ROUNDS });
   },
 );
+
+/**
+ * P13 item 0a (Opus r2 L1): the lock's key is a string, and Postgres reads a uuid
+ * in either case. So a capitalised spelling of one dog's id used to reach
+ * `withDogLocks` as a second key, and two campuses took two seats and two credits.
+ * The id is lowercased at the parse boundary, so every reader past `parseOrThrow`
+ * holds one spelling. R14, R14b, R15 and R16 are the review's probes, kept as pins.
+ */
+test(
+  'R14: one request spells the dog in capitals: still one dog, one booking, one credit',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = ownerApp();
+    const rounds = await tally(async (i) => {
+      const dogId = await createFundedDog();
+      const date = futureWeekday(40 + i);
+      const [ra, rb] = await Promise.all([
+        postBooking(app, {
+          category: 'day-school',
+          location: 'fayetteville',
+          lead_dog_id: dogId,
+          dates: [date],
+        }),
+        postBooking(app, {
+          category: 'day-school',
+          location: 'bentonville',
+          lead_dog_id: dogId.toUpperCase(),
+          dates: [date],
+        }),
+      ]);
+      const booked = (await upcomingBookingIds([dogId])).length;
+      return `${statusesOf(ra, rb)}; bookings ${booked}; debits ${await debitsOf(dogId)}`;
+    });
+    assert.deepEqual(rounds, { [`${ONE_WINNER}; bookings 1; debits 1`]: ROUNDS });
+  },
+);
+
+test('R14b: the same on PAYG: one booking and one open invoice', SKIP_WHEN_NO_DB, async () => {
+  const app = ownerApp();
+  const rounds = await tally(async (i) => {
+    const dogId = await createTestDog();
+    const base = {
+      category: 'day-school',
+      dates: [futureWeekday(10 + i)],
+      payment: 'payg',
+      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+    };
+    const [ra, rb] = await Promise.all([
+      postBooking(app, { ...base, location: 'fayetteville', lead_dog_id: dogId }),
+      postBooking(app, {
+        ...base,
+        location: 'bentonville',
+        lead_dog_id: dogId.toUpperCase(),
+      }),
+    ]);
+    const ids = await upcomingBookingIds([dogId]);
+    const open = await openInvoicesOf(ids);
+    return `${statusesOf(ra, rb)}; bookings ${ids.length}; open invoices ${open}`;
+  });
+  assert.deepEqual(rounds, { [`${ONE_WINNER}; bookings 1; open invoices 1`]: ROUNDS });
+});
+
+test(
+  'R15: one dog twice on a roster, once in each case, is the same dog: 422, not a 500',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = ownerApp();
+    const dogId = await createFundedDog();
+    const res = await postBooking(app, {
+      category: 'day-school',
+      location: 'fayetteville',
+      lead_dog_id: dogId,
+      additional_dog_ids: [dogId.toUpperCase()],
+      dates: [futureWeekday(12)],
+    });
+    assert.equal(res.statusCode, 422, res.body);
+    const { error } = JSON.parse(res.body) as { error: { code: string } };
+    assert.equal(error.code, 'invalid_payload');
+    assert.equal((await upcomingBookingIds([dogId])).length, 0);
+    assert.equal(await debitsOf(dogId), 0);
+  },
+);
+
+test(
+  'R16: a two-dog roster in capitals, against the same two in lowercase: one winner, no double',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = ownerApp();
+    const rounds = await tally(async (i) => {
+      // Capitals sort before lowercase and digits before both, so the capital
+      // spelling can flip the order the roster's strings sort in.
+      const [x, y] = [await createFundedDog(), await createFundedDog()].sort() as [string, string];
+      const date = futureWeekday(5 + i);
+      const [ra, rb] = await Promise.all([
+        postBooking(app, {
+          category: 'day-school',
+          location: 'fayetteville',
+          lead_dog_id: x,
+          additional_dog_ids: [y],
+          dates: [date],
+        }),
+        postBooking(app, {
+          category: 'day-care',
+          location: 'bentonville',
+          lead_dog_id: x.toUpperCase(),
+          additional_dog_ids: [y.toUpperCase()],
+          dates: [date],
+        }),
+      ]);
+      const booked = (await upcomingBookingIds([x, y])).length;
+      return `${statusesOf(ra, rb)}; bookings ${booked}; debits ${await debitsOf(x)}/${await debitsOf(y)}`;
+    });
+    assert.deepEqual(rounds, { [`${ONE_WINNER}; bookings 1; debits 1/1`]: ROUNDS });
+  },
+);

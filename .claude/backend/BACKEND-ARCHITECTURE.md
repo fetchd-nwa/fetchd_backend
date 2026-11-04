@@ -108,7 +108,7 @@ read-mostly things; invalidate on the write that changes them:
 
 | Cached | Key | Invalidated by |
 |---|---|---|
-| Day capacity / availability for a date | `avail:{date}:{mode}` | capacity override write; nightly TTL |
+| Day capacity overrides for a date range | `avail:{location}:{from}:{to}` | capacity override write (`PUT`/`DELETE /staff/day-capacity`), 5-min TTL. The booked count is not cached |
 | Group classes + cohort fill | `cohorts:{classKey}` | enroll txn; `bumpFilled` |
 | Per-dog credit balance | `credits:{dogId}:{mode}` | any `credit_ledger` insert for that dog |
 | Announcements feed | `ann:{location}` | announcement publish |

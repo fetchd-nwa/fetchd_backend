@@ -249,8 +249,10 @@ export const bookingsRepository = {
    *     the earliest target (unbounded stays — no pick-up yet — always kept);
    *     the JS coverage check narrows to exact days.
    *
-   * Run inside the booking txn under the (location, date) capacity lock so a
-   * concurrent create on the same bucket can't slip an overlap past the check.
+   * Run inside the booking txn under `withDogLocks`, keyed on the dog alone, so
+   * a concurrent create for this dog, in any mode at either campus, can't slip
+   * an overlap past the check. The capacity lock alone would not: it is per
+   * (location, date), and a dog is in one place on a day at either campus.
    */
   async findConflictCandidatesForDog(
     tx: Tx,

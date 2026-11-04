@@ -165,7 +165,10 @@ const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
 
 const createBodySchema = z
   .object({
-    dog_id: z.string().uuid('dog_id must be a UUID'),
+    // Lowercased at the parse: `withMembershipCreateLock` builds its key from this
+    // string, so a second spelling took a second lock, missed the re-check under it
+    // and answered 500 with the charge taken and no refund (P13 fix round 1, F4).
+    dog_id: z.string().uuid('dog_id must be a UUID').toLowerCase(),
     package_key: z
       .string()
       .min(1)

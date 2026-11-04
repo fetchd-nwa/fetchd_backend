@@ -26,6 +26,7 @@ import {
   SKIP_WHEN_NO_DB,
   makeContractApp,
   registerFixtureHooks,
+  registerRequestServicesOn,
 } from './_harness.js';
 
 /**
@@ -50,11 +51,12 @@ import {
  */
 
 registerFixtureHooks();
+registerRequestServicesOn();
 
 // The requests route takes the injected FIXTURE_NOW clock (Δ 2026-07-15 —
 // the old Date.now() validation made these hardcoded dates a time bomb).
 // Relative to FIXTURE_TODAY (2026-05-19) these sit ~57-71 days out, inside
-// the 92-day lookahead cap.
+// the 3-month horizon.
 const PREFERRED_1 = '2026-07-15T15:00:00Z';
 const PREFERRED_2 = '2026-07-22T15:00:00Z';
 const PREFERRED_3 = '2026-07-29T15:00:00Z';

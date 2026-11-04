@@ -1,56 +1,51 @@
 import { and, between, eq, inArray, ne, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { readThrough } from '../../lib/cache.js';
-import { defaultDayCapacity } from '../../lib/availability.js';
+import { dayCapacityFor, type DayCapacityRule } from '../../lib/availability.js';
 import { insufficientCapacityError } from '../../lib/bookingErrors.js';
-import type { BookingMode } from '../../lib/bookingMode.js';
 import type { DayProgramCategory } from '../../lib/bookingSchedule.js';
 import { db } from '../client.js';
 import { bookingDogs, bookings, dayCapacity, dogs, type LocationKey } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { Tx } from '../tx.js';
 
+/** Polymorphic runner: the pool for the advisory read, the Tx under a lock. */
+type Runner = Tx | typeof db;
+
 /**
- * Sparse override rows for day-program capacity (schema.sql:589-594). Only
- * rows that DIFFER from the default rule are stored — most calls return
- * 0-few rows for a multi-week window. The default ({3,3} weekday / {0,0}
- * weekend) is applied in the route via `lib/availability.defaultDayCapacity`
- * over the top of whatever this repo returns.
+ * Sparse override rows for day-program capacity (`schema.sql`, `day_capacity`).
+ * Only rows that DIFFER from the campus's rule are stored — most calls return
+ * 0-few rows for a multi-week window. `lib/availability.dayCapacityFor` applies the
+ * rule over the top of whatever this repo returns.
  *
  * Date column comes back as a `YYYY-MM-DD` string (Drizzle `date()` default
  * mode); the route uses it as a Map key against `datesInRange` output.
  */
 export interface DayCapacityOverrideRow {
   date: string;
-  school_openings: number;
-  daycare_openings: number;
+  capacity_dogs: number;
 }
 
 /**
- * Booked seats per calendar date for one location, split by booking mode —
- * the subtrahend behind `DayCapacityWire.*_remaining` (wire 1.13.0, §6-batch
- * decision #3 option C). Deliberately shaped like `DayCapacityOverrideRow` so
- * the route folds both maps the same way.
+ * Booked seats per calendar date for one location, day school and daycare
+ * together — the subtrahend behind `DayCapacityWire.remaining_dogs`.
  *
  * A date with no day-program bookings is ABSENT from the result, not present
- * as a pair of zeroes — the caller defaults a miss to 0.
+ * as a zero — the caller defaults a miss to 0.
  */
 export interface DayBookedCountRow {
   date: string;
-  school_booked: number;
-  daycare_booked: number;
+  booked: number;
 }
 
 /**
  * The two day-program categories, typed as `DayProgramCategory` so renaming a
  * `service_category` member is a compile error here rather than a count that
- * silently returns zero. `dayProgramCategoryToMode` is the mapping of record;
- * these constants are the same mapping read the other way (category → the
- * column its seats come out of), and they are spelled exactly as
- * `assertCapacityWithinLock` spells it below.
+ * silently returns zero. Both queries below filter on this list: the seat count is
+ * one number across the two programs (DAY-U05). Evaluations join it with P10 and
+ * P11; payment-pending and turn-away arrive with their units.
  */
-const SCHOOL_CATEGORY: DayProgramCategory = 'day-school';
-const DAYCARE_CATEGORY: DayProgramCategory = 'day-care';
+const DAY_PROGRAM_CATEGORIES: DayProgramCategory[] = ['day-school', 'day-care'];
 
 /**
  * Day-8 cache: availability is the hottest read in the system — every
@@ -68,8 +63,7 @@ const DAY_CAPACITY_TTL_SEC = 300;
 
 const DAY_CAPACITY_ROW_SCHEMA: z.ZodType<DayCapacityOverrideRow> = z.object({
   date: z.string(),
-  school_openings: z.number(),
-  daycare_openings: z.number(),
+  capacity_dogs: z.number(),
 });
 const DAY_CAPACITY_ROWS_SCHEMA = DAY_CAPACITY_ROW_SCHEMA.array();
 
@@ -87,8 +81,8 @@ export const dayCapacityRepository = {
   /**
    * Live overrides for one location between `from` and `to` inclusive.
    * Both bounds are YYYY-MM-DD; Postgres `BETWEEN` on a `date` column is
-   * inclusive on both ends. Caller is responsible for the 60-day-ish range
-   * cap (see `lib/availability.AVAILABILITY_MAX_DATES`).
+   * inclusive on both ends. Caller is responsible for the range cap (see
+   * `lib/availability.availabilityMaxDates`).
    *
    * Day-8 read-through cached under `avail:{location}:{from}:{to}` for
    * 5 min. Invalidated by `day_capacity` writes via
@@ -105,11 +99,7 @@ export const dayCapacityRepository = {
       DAY_CAPACITY_ROWS_SCHEMA,
       () =>
         db
-          .select({
-            date: dayCapacity.date,
-            school_openings: dayCapacity.schoolOpenings,
-            daycare_openings: dayCapacity.daycareOpenings,
-          })
+          .select({ date: dayCapacity.date, capacity_dogs: dayCapacity.capacityDogs })
           .from(dayCapacity)
           .where(
             and(
@@ -122,20 +112,97 @@ export const dayCapacityRepository = {
   },
 
   /**
-   * Live booked seats per (date, mode) for one location across `[from, to]`
-   * inclusive — the read-side half of the capacity arithmetic, feeding
-   * `DayCapacityWire.school_remaining` / `daycare_remaining`.
+   * The same rows, read in the caller's transaction and never from the cache.
+   * What a cap edit or a booking reads under its `(location, date)` locks: the
+   * cached read above is 5 minutes old by design, and a decision to refuse a dog
+   * cannot be.
+   */
+  async findLiveOverridesInTx(
+    tx: Tx,
+    location: LocationKey,
+    from: string,
+    to: string,
+  ): Promise<DayCapacityOverrideRow[]> {
+    return tx
+      .select({ date: dayCapacity.date, capacity_dogs: dayCapacity.capacityDogs })
+      .from(dayCapacity)
+      .where(
+        and(
+          eq(dayCapacity.location, location),
+          between(dayCapacity.date, from, to),
+          live(dayCapacity),
+        ),
+      );
+  },
+
+  /**
+   * Set one date's seats (`PUT /staff/day-capacity/:location/:date`). An upsert
+   * that also clears `expired_at`, so a withdrawn date can be re-opened: a row
+   * survives its withdrawal and the primary key would refuse a plain INSERT.
    *
-   * **The population is `assertCapacityWithinLock`'s, exactly**, just outside
-   * the lock and grouped instead of filtered to one date: live, non-cancelled
-   * `booking_dogs` on live day-program bookings at this location whose
-   * `scheduled_at` bucket-to-Chicago-date falls in the range, excluding
-   * staff-owned (capacity-exempt) dogs. If those two predicates ever diverge,
-   * the calendar starts lying in a NEW direction — keep them edited together.
-   * They are now spelled DIFFERENTLY on the date axis — that one asserts a
-   * single Chicago day by casting the column, this one an equivalent
-   * half-open instant range (below) — so a reader diffing them should compare
-   * the row SETS, which are proven identical, not the SQL text.
+   * Stamps who and when (STAFF-74). A date's first write is an INSERT, which the
+   * audit trigger does not see, so this row is the only record of who opened it.
+   */
+  async upsertOverride(
+    tx: Tx,
+    args: { location: LocationKey; date: string; capacityDogs: number; staffId: string },
+  ): Promise<void> {
+    await tx
+      .insert(dayCapacity)
+      .values({
+        location: args.location,
+        date: args.date,
+        capacityDogs: args.capacityDogs,
+        updatedByStaffId: args.staffId,
+      })
+      .onConflictDoUpdate({
+        target: [dayCapacity.location, dayCapacity.date],
+        set: {
+          capacityDogs: args.capacityDogs,
+          expiredAt: null,
+          updatedAt: sql`now()`,
+          updatedByStaffId: args.staffId,
+        },
+      });
+  },
+
+  /**
+   * Withdraw one date's override: a soft expire, so the date falls back to the
+   * campus's rule and the row keeps its history. Stamps who and when, as the upsert
+   * does. Touches nothing when no live row exists, so a repeat stamps nothing.
+   */
+  async withdrawOverride(
+    tx: Tx,
+    args: { location: LocationKey; date: string; staffId: string },
+  ): Promise<void> {
+    await tx
+      .update(dayCapacity)
+      .set({ expiredAt: sql`now()`, updatedAt: sql`now()`, updatedByStaffId: args.staffId })
+      .where(
+        and(
+          eq(dayCapacity.location, args.location),
+          eq(dayCapacity.date, args.date),
+          live(dayCapacity),
+        ),
+      );
+  },
+
+  /**
+   * Live booked seats per date for one location across `[from, to]` inclusive,
+   * day school and daycare together — the read-side half of the capacity
+   * arithmetic, feeding `DayCapacityWire.remaining_dogs`, and the count the
+   * cap-lowering check reads under its locks (pass the `tx`).
+   *
+   * **The population is `assertCapacityWithinLock`'s, exactly**, just grouped
+   * instead of filtered to one date: live, non-cancelled `booking_dogs` on live
+   * day-program bookings at this location whose `scheduled_at`
+   * bucket-to-Chicago-date falls in the range, excluding staff-owned
+   * (capacity-exempt) dogs. If those two predicates ever diverge, the calendar
+   * starts lying in a NEW direction — keep them edited together. They are
+   * spelled DIFFERENTLY on the date axis — that one asserts a single Chicago day
+   * by casting the column, this one an equivalent half-open instant range
+   * (below) — so a reader diffing them should compare the row SETS, which are
+   * proven identical, not the SQL text.
    *
    * `to_char(...)` rather than a bare `::date` cast so the grouping key comes
    * back as the same `YYYY-MM-DD` string the route's date list is made of;
@@ -185,32 +252,31 @@ export const dayCapacityRepository = {
    * **NOT cached, on purpose** (§6-batch #3's load note): the `avail:*` range
    * cache is invalidated by `day_capacity` writes only, so a cached booked
    * count would resurrect the very lie this field exists to kill — as
-   * staleness, which is harder to see. One aggregate over ≤92 dates per
+   * staleness, which is harder to see. One aggregate over one window per
    * request, now genuinely served by `bookings_location_time_idx`.
    *
-   * Advisory by construction: no lock is held, so a booking committing
-   * between this read and the client's POST makes it stale. The authority is
-   * still `assertCapacityWithinLock` inside the booking transaction.
+   * Advisory by construction when read through the pool: no lock is held, so a
+   * booking committing between this read and the client's POST makes it stale.
+   * The authority is still `assertCapacityWithinLock` inside the booking
+   * transaction. Read through a `tx` that holds the dates' capacity locks, it is
+   * authoritative: no booking can land on those dates until that tx ends.
    */
   async findBookedCountsInRange(
     location: LocationKey,
     from: string,
     to: string,
+    runner: Runner = db,
   ): Promise<DayBookedCountRow[]> {
     const chicagoDate = sql<string>`to_char((${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date, 'YYYY-MM-DD')`;
-    return db
-      .select({
-        date: chicagoDate,
-        school_booked: sql<number>`count(*) FILTER (WHERE ${bookings.category} = ${SCHOOL_CATEGORY})::int`,
-        daycare_booked: sql<number>`count(*) FILTER (WHERE ${bookings.category} = ${DAYCARE_CATEGORY})::int`,
-      })
+    return runner
+      .select({ date: chicagoDate, booked: sql<number>`count(*)::int` })
       .from(bookingDogs)
       .innerJoin(bookings, eq(bookings.id, bookingDogs.bookingId))
       .innerJoin(dogs, eq(dogs.id, bookingDogs.dogId))
       .where(
         and(
           eq(bookings.location, location),
-          inArray(bookings.category, [SCHOOL_CATEGORY, DAYCARE_CATEGORY]),
+          inArray(bookings.category, DAY_PROGRAM_CATEGORIES),
           // Half-open [midnight(from), midnight(to+1)) in Chicago wall time.
           // Bare column on the left = index bound; see the doc block above for
           // the EXPLAIN before/after and the equivalence proof.
@@ -229,18 +295,21 @@ export const dayCapacityRepository = {
 
   /**
    * Day 10 — Tx-only capacity assertion for the day-program booking path.
-   * MUST be called inside a `withCapacityLock(tx, location, date, ...)`
-   * scope; the advisory lock serializes concurrent bookings on the same
+   * MUST be called inside a `withCapacityLocks(tx, location, dates, ...)`
+   * scope; the advisory lock serializes concurrent writers on the same
    * calendar bucket so the count below is a consistent snapshot.
    *
    * The capacity rule:
-   *   openings = (live day_capacity row at (location, date)) ?? defaultDayCapacity(date)
-   *   used     = count of live, non-cancelled booking_dogs for non-staff
-   *              dogs on bookings whose category matches `mode` and
-   *              scheduled_at bucket-to-Chicago-date equals `date` at
-   *              the same location
-   *   remaining = openings[mode] − used
+   *   capacity  = dayCapacityFor(date, rule, live day_capacity row at
+   *               (location, date))
+   *   used      = count of live, non-cancelled booking_dogs for non-staff
+   *               dogs on day-school and day-care bookings whose scheduled_at
+   *               bucket-to-Chicago-date equals `date` at the same location
+   *   remaining = capacity − used
    *   if remaining < requestedCount → insufficient_capacity 422
+   *
+   * `rule` is the campus row the caller read under its locks, once for the whole
+   * request, so a cap edit and a booking serialise on the same keys.
    *
    * Staff-owned dogs (`dogs.staff_owner_id IS NOT NULL`) are excluded
    * from the count — `dogs.capacity_exempt` is the generated boolean
@@ -271,16 +340,13 @@ export const dayCapacityRepository = {
     args: {
       location: LocationKey;
       date: string;
-      mode: BookingMode;
+      rule: DayCapacityRule;
       requestedCount: number;
     },
   ): Promise<void> {
     if (args.requestedCount <= 0) return;
     const [override] = await tx
-      .select({
-        schoolOpenings: dayCapacity.schoolOpenings,
-        daycareOpenings: dayCapacity.daycareOpenings,
-      })
+      .select({ capacity_dogs: dayCapacity.capacityDogs })
       .from(dayCapacity)
       .where(
         and(
@@ -290,9 +356,8 @@ export const dayCapacityRepository = {
         ),
       )
       .limit(1);
-    const openings = openingsForMode(args.mode, args.date, override);
+    const capacity = dayCapacityFor(args.date, args.rule, override);
 
-    const category = args.mode === 'school' ? 'day-school' : 'day-care';
     const [usage] = await tx
       .select({ used: sql<number>`count(*)::int`.as('used') })
       .from(bookingDogs)
@@ -301,7 +366,7 @@ export const dayCapacityRepository = {
       .where(
         and(
           eq(bookings.location, args.location),
-          eq(bookings.category, category),
+          inArray(bookings.category, DAY_PROGRAM_CATEGORIES),
           sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date = ${args.date}::date`,
           ne(bookings.status, 'cancelled'),
           live(bookings),
@@ -313,30 +378,14 @@ export const dayCapacityRepository = {
         ),
       );
     const used = usage?.used ?? 0;
-    const remaining = openings - used;
+    const remaining = capacity - used;
     if (remaining < args.requestedCount) {
       throw insufficientCapacityError({
         location: args.location,
         date: args.date,
-        mode: args.mode,
         openings_remaining: Math.max(0, remaining),
         requested: args.requestedCount,
       });
     }
   },
 };
-
-function openingsForMode(
-  mode: BookingMode,
-  date: string,
-  override: { schoolOpenings: number; daycareOpenings: number } | undefined,
-): number {
-  if (override !== undefined) {
-    return mode === 'school' ? override.schoolOpenings : override.daycareOpenings;
-  }
-  // No override — read the API-side default rule. Mirrors the read-side
-  // fallback in `routes/availability.ts:83`. Weekend = closed (0/0);
-  // weekday = 3/3.
-  const d = defaultDayCapacity(date);
-  return mode === 'school' ? d.school_openings : d.daycare_openings;
-}

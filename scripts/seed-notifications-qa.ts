@@ -27,7 +27,8 @@ import { eq, inArray, or } from 'drizzle-orm';
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
 import { deepLinkToPath, type NotificationType } from '../src/contracts/wire.js';
-import { chicagoShortDate } from '../src/lib/chicagoDate.js';
+import { computeDayProgramScheduledAt } from '../src/lib/bookingSchedule.js';
+import { bucketChicagoToday, chicagoShortDate } from '../src/lib/chicagoDate.js';
 import { formatDollars } from '../src/lib/invoiceReceiptCopy.js';
 import {
   bookingDogs,
@@ -462,7 +463,11 @@ async function seedNotificationSubjects(): Promise<void> {
       leadDogId: BASE.dogWafflesId,
       category: 'day-school',
       status: 'upcoming',
-      scheduledAt: daysFromNow(1, 9),
+      // The day starts when the campus opens: §3.4's `day.dropoff_open_time`.
+      scheduledAt: computeDayProgramScheduledAt(
+        bucketChicagoToday(new Date(Date.now() + 24 * 60 * 60 * 1000)),
+        '07:30',
+      ).toISOString(),
       durationMinutes: 540,
       location: 'fayetteville',
     },

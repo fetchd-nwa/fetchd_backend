@@ -9,9 +9,10 @@ import type { ServiceCategory } from './bookingBucket.js';
  * `mobile/src/lib/bookingConflicts.ts` (Δ 2026-07-09, locked): the FE prevents
  * conflicts pre-submit, this guarantees the invariant against a racing client,
  * a second device, or a direct API call: `createDayProgramBookings` runs it under
- * `withDogLocks`, keyed on the dog alone, so two racing day-program bookings for
- * one dog see each other in any mode at either campus. The two implementations
- * MUST agree, so the rules here mirror that file exactly:
+ * `withDogLocks`, whose key is the dog's lowercased id alone (the route normalises
+ * the id at its parse boundary), so two racing day-program bookings for one dog see
+ * each other in any mode at either campus, however the client spelled the id. The
+ * two implementations MUST agree, so the rules here mirror that file exactly:
  *
  *   • Occupied window, day-school / day-care → the FIXED block [07:00, 17:00)
  *     America/Chicago on the calendar day — the "dog is unavailable" span,
@@ -23,10 +24,13 @@ import type { ServiceCategory } from './bookingBucket.js';
  *     the stay (drop-off day through pick-up day) — the dog lives on-site, so
  *     anything else that day collides.
  *
- * Carve-outs (both directions): GROUP CLASSES never conflict (they meet
- * weekends / after 5pm, outside every window) and TWO PRIVATE LESSONS stack.
- * The proposal here is always a day program, so only the group-class carve-out
- * is reachable — a day program never pairs private↔private.
+ * Carve-outs (both directions): GROUP CLASSES never conflict, by rule and not by
+ * their timing (CLS-08, Allison: "A dog can hold a day-school or daycare booking
+ * and a class meeting on the same day without a booking conflict"), and TWO PRIVATE
+ * LESSONS stack. The rule holds on a Saturday a campus opens for day school, even
+ * though a class can meet inside that day's window. The proposal here is always a
+ * day program, so only the group-class carve-out is reachable — a day program never
+ * pairs private↔private.
  *
  * Everything else that overlaps conflicts symmetrically: day-program ↔
  * day-program (school + care included), day-program ↔ private/eval (by time),
@@ -93,7 +97,7 @@ function residentialCoversDate(stay: ConflictCandidate, chicagoDate: string): bo
  * Mirrors `findBookingConflicts` in the FE engine for the day-program proposal.
  */
 export function dayProgramConflictsWith(chicagoDate: string, existing: ConflictCandidate): boolean {
-  // Group classes are outside every window — never a conflict.
+  // Group classes never conflict with a day program (CLS-08).
   if (existing.category === 'group-class') return false;
 
   if (isResidential(existing.category)) {

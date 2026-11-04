@@ -25,11 +25,12 @@ import type { ServiceCategory } from '../../lib/bookingBucket.js';
  * `findByIdForOwner`, child-row resolvers). Day 12 extends with the
  * mutation primitives composing inside `withMutation`:
  *
- *   - `findFullByIdInTx` — full row read with `ownerId` / `expiredAt` /
- *     `paymentMethodId` (the wire helper doesn't need these, the route's
- *     owner-scope assertion and state-machine guard do). `approvedByStaffId`
- *     moved DOWN into the base projection at wire 1.13.0 — it is on the wire
- *     now (`PendingRequestWire.approved_by_staff_id`).
+ *   - `findFullByIdInTx` — full row read with `ownerId` / `expiredAt` (the
+ *     wire helper doesn't need these, the route's owner-scope assertion and
+ *     state-machine guard do). `approvedByStaffId` moved DOWN into the base
+ *     projection at wire 1.13.0 — it is on the wire now
+ *     (`PendingRequestWire.approved_by_staff_id`). `paymentMethodId` left with
+ *     its column at M2.17, along with the row's other day-program fields.
  *   - `lockById(tx, id)` — `SELECT ... FOR UPDATE` on the request row.
  *     Concurrent approve attempts on the same request serialize here.
  *   - `create(tx, values)` — INSERT a new pending_requests row at

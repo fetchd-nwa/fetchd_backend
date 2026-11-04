@@ -31,6 +31,8 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { staffRole } from '../db/schema/schema.js';
 import type { Tx } from '../db/tx.js';
+import type { DayCapacityRule } from '../lib/availability.js';
+import { assertCapEditKeepsBooked } from '../lib/capLowering.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
@@ -72,7 +74,10 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *      DECISIONS 65; no string the body can carry holds a C0 control
  *      character, DECISIONS 71), or a Postgres `23514`, `22003`, `22P02`,
  *      `22P05` or `22021` from anything the bounds do not catch — logged at
- *      warn with its code, never paged.
+ *      warn with its code, never paged;
+ *   5. 422 `capacity_below_booked` + its `dates` — `/day/:location` only: the body
+ *      lowers `daily_capacity_dogs` or unticks a weekday and a booked date within
+ *      the horizon would fall below its count (`lib/capLowering.ts`, 4.0.0-lg3.1).
  *
  * The three request services' `offerings` switches (boarding, board-and-train,
  * private-lesson) are `ops` like the rest: "Editable by any role, so turning
@@ -704,11 +709,44 @@ function postgresErrorOf(err: unknown): { code: string; message: string } | unde
 
 const PATHS = ['/staff/settings/:domain', '/staff/settings/:domain/:location'] as const;
 
+export interface StaffSettingsRouteOptions extends AuthRouteOptions {
+  /** Injectable clock: the cap-lowering check reckons "within the horizon" from it. */
+  now?: () => Date;
+}
+
+/**
+ * The cap-lowering check for a `/day/:location` body naming either key of the rule.
+ * The row lock comes first so two PATCHes queue, and the check sits before `write`,
+ * inside the same transaction, so a refusal writes nothing and an accepted edit
+ * commits with the dates' locks still held.
+ */
+async function checkCapLowering(
+  tx: Tx,
+  target: Target,
+  body: Record<string, unknown>,
+  now: Date,
+): Promise<void> {
+  if (target.domain !== 'day' || target.location === null) return;
+  const { daily_capacity_dogs: dailyCap, open_weekdays_list: weekdays } = body;
+  if (dailyCap === undefined && weekdays === undefined) return;
+  const before = await settingsRepository.lockDayCampus(target.location, tx);
+  const after: DayCapacityRule = {
+    daily_capacity_dogs: (dailyCap as number | undefined) ?? before.daily_capacity_dogs,
+    open_weekdays_list: (weekdays as number[] | undefined) ?? before.open_weekdays_list,
+  };
+  await assertCapEditKeepsBooked(tx, {
+    location: target.location,
+    now,
+    edit: { kind: 'rule', before, after },
+  });
+}
+
 export function registerStaffSettingsRoute(
   app: FastifyInstance,
-  opts: AuthRouteOptions = {},
+  opts: StaffSettingsRouteOptions = {},
 ): void {
   const authHook = resolveAuthHook(opts);
+  const nowFactory = opts.now ?? ((): Date => new Date());
 
   app.get(
     '/staff/settings/manifest',
@@ -815,6 +853,7 @@ export function registerStaffSettingsRoute(
             keysToInvalidate: () => [],
           },
           async (tx) => {
+            await checkCapLowering(tx, target, body, nowFactory());
             try {
               await write(tx, target, plan, body, principal.staffId);
             } catch (err) {

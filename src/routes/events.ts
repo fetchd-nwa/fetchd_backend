@@ -44,8 +44,10 @@ const uuidParamSchema = z.object({
 // Body cap on dogs per RSVP — mirrors POST /enrollments + /bookings. Bounds a
 // hostile body BEFORE the DB; 5 covers every plausible household.
 const MAX_RSVP_DOGS = 5;
+// Lowercased at the parse: Postgres reads a uuid in either case, and the distinct check
+// compares strings, so a second spelling reached the primary key as a 500.
 const rsvpBodySchema = z.object({
-  dog_ids: z.array(z.string().uuid()).min(1).max(MAX_RSVP_DOGS),
+  dog_ids: z.array(z.string().uuid().toLowerCase()).min(1).max(MAX_RSVP_DOGS),
 });
 
 /**

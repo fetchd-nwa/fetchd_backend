@@ -166,8 +166,8 @@ function chicagoOffsetMinutesAt(instant: Date): number {
 /**
  * Convert a Chicago wall clock (date + hour + minute) to the UTC instant
  * it represents. The inverse of `bucketToChicagoDate` for the small set of
- * named "wall clock moments" the API cares about (day-program window
- * open/close, the 8am/5pm legacy boundary).
+ * named "wall clock moments" the API cares about (a campus day's open,
+ * cutoff and close, the occupied block).
  *
  *   chicagoWallTimeToUtc('2026-06-15', 17, 30)
  *     → 2026-06-15T22:30:00.000Z  (CDT, UTC-5)
@@ -201,14 +201,13 @@ function chicagoOffsetMinutesAt(instant: Date): number {
  *     first-occurrence convention. A future caller that needs the second
  *     occurrence would need an explicit fold parameter — out of scope.
  *
- * Day-10 sensitivity (locked Day 10, 2026-05-22): the day-program
- * drop-off window (07:30-09:00) is HOURS clear of the 02:00 wall
- * transition but NOT clear of the 07:00-08:00 UTC transition window —
- * a fixed two-probe heuristic returns the wrong UTC for the 07:30-07:59
- * slice of the window on spring-forward day. The iterative form
- * converges to the correct UTC for every wall time the API constructs;
- * unit tests exercise every drop-off window endpoint on spring-forward,
- * fall-back, and stable days.
+ * Day-10 sensitivity (locked Day 10, 2026-05-22): a day-program start
+ * (07:30 as seeded) is HOURS clear of the 02:00 wall transition but NOT
+ * clear of the 07:00-08:00 UTC transition window — a fixed two-probe
+ * heuristic returns the wrong UTC for the 07:30-07:59 slice on
+ * spring-forward day. The iterative form converges to the correct UTC for
+ * every wall time the API constructs; unit tests exercise it on
+ * spring-forward, fall-back, and stable days.
  */
 const CHICAGO_MAX_OFFSET_ITERS = 3;
 
@@ -249,6 +248,20 @@ export function chicagoWallTimeToUtc(dateStr: string, hour: number, minute: numb
   // transition; pick the LATER UTC per IANA fold=0 (skip the gap
   // forward into the post-transition wall).
   return new Date(Math.max(guessUtcMs, lastGuessUtcMs));
+}
+
+/**
+ * A settings time on a date: `chicagoTimeOnDate('2026-06-15', '17:30')` is 17:30 in
+ * Chicago on that day, as an instant. Every `day.*` time is `HH:MM` wall clock
+ * (`settingsRepository`), and this is where that string becomes a moment, so the
+ * start of a day, its cutoff and its close all cross DST the same way.
+ */
+export function chicagoTimeOnDate(dateStr: string, hhmm: string): Date {
+  const [hour, minute] = hhmm.split(':').map(Number);
+  if (hour === undefined || minute === undefined) {
+    throw new Error(`chicagoTimeOnDate: invalid HH:MM ${hhmm}`);
+  }
+  return chicagoWallTimeToUtc(dateStr, hour, minute);
 }
 
 /**

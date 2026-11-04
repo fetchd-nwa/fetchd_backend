@@ -145,21 +145,22 @@ export const settingsRepository = {
       .from(dayProgramSettings)
       .where(isNull(dayProgramSettings.location))
       .limit(1);
-    const r = seeded(row, 'day_program_settings (global row)', 'M1.07');
-    // The tier CHECK makes every global column non-null on this row.
-    return {
-      location: null,
-      booking_horizon_months: r.bookingHorizonMonths as number,
-      max_dogs_per_booking_count: r.maxDogsPerBookingCount as number,
-      day_school_one_on_one_minutes: r.daySchoolOneOnOneMinutes as number,
-      after_school_price_cents: r.afterSchoolPriceCents as number,
-      occupied_block_end_time: hhmm(r.occupiedBlockEndTime as string),
-      midstay_day_charge_fraction: Number(r.midstayDayChargeFraction),
-      sent_home_before_training_return_fraction: Number(r.sentHomeBeforeTrainingReturnFraction),
-      sent_home_after_training_return_fraction: Number(r.sentHomeAfterTrainingReturnFraction),
-      closure_return_fraction: Number(r.closureReturnFraction),
-      ...audit(r),
-    };
+    return dayGlobalWire(seeded(row, 'day_program_settings (global row)', 'M1.07'));
+  },
+
+  /**
+   * The global row `FOR SHARE`, the cap-lowering check's first step: a horizon edit
+   * holds this row until it commits, so an edit and a horizon raise queue, and the
+   * check's window stays the horizon in force until the check's own COMMIT. A booking
+   * reads this row with a plain SELECT, which neither lock blocks.
+   */
+  async shareDayGlobal(tx: Tx): Promise<DayProgramGlobalSettingsWire> {
+    const [row] = await tx
+      .select()
+      .from(dayProgramSettings)
+      .where(isNull(dayProgramSettings.location))
+      .for('share');
+    return dayGlobalWire(seeded(row, 'day_program_settings (global row)', 'M1.07'));
   },
 
   async dayCampus(
@@ -171,6 +172,20 @@ export const settingsRepository = {
       .from(dayProgramSettings)
       .where(eq(dayProgramSettings.location, location))
       .limit(1);
+    return dayCampusWire(location, seeded(row, `day_program_settings (${location})`, 'M1.07'));
+  },
+
+  /**
+   * The campus row `FOR UPDATE`, for the cap-lowering PATCH (DECISIONS 128(i)): two
+   * PATCHes queue here, so each compares its edit with the row the other left. A
+   * booking reads this row with a plain SELECT, which a row lock does not block.
+   */
+  async lockDayCampus(location: LocationKey, tx: Tx): Promise<DayProgramCampusSettingsWire> {
+    const [row] = await tx
+      .select()
+      .from(dayProgramSettings)
+      .where(eq(dayProgramSettings.location, location))
+      .for('update');
     return dayCampusWire(location, seeded(row, `day_program_settings (${location})`, 'M1.07'));
   },
 
@@ -477,6 +492,23 @@ export const settingsRepository = {
     return rows.length;
   },
 };
+
+/** The tier CHECK makes every global column non-null on this row. */
+function dayGlobalWire(r: typeof dayProgramSettings.$inferSelect): DayProgramGlobalSettingsWire {
+  return {
+    location: null,
+    booking_horizon_months: r.bookingHorizonMonths as number,
+    max_dogs_per_booking_count: r.maxDogsPerBookingCount as number,
+    day_school_one_on_one_minutes: r.daySchoolOneOnOneMinutes as number,
+    after_school_price_cents: r.afterSchoolPriceCents as number,
+    occupied_block_end_time: hhmm(r.occupiedBlockEndTime as string),
+    midstay_day_charge_fraction: Number(r.midstayDayChargeFraction),
+    sent_home_before_training_return_fraction: Number(r.sentHomeBeforeTrainingReturnFraction),
+    sent_home_after_training_return_fraction: Number(r.sentHomeAfterTrainingReturnFraction),
+    closure_return_fraction: Number(r.closureReturnFraction),
+    ...audit(r),
+  };
+}
 
 function dayCampusWire(
   location: LocationKey,

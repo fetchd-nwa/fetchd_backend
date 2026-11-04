@@ -61,10 +61,12 @@
  * additive), 2.0.0-lg1.2 (P02, breaking), 2.0.0 (P03, additive, LG1's close).
  * LG2, M1's part (design 3.0.0's S05 and S17 only): 3.0.0-lg2.1 (P05,
  * breaking), 3.0.0 (P12, breaking, its close). The rest of design 3.0.0
- * ships after M1 as 7.0.0 (LG2b), so a design label above 3.0.0 reads one
- * major up here (build DECISIONS 6).
+ * ships after M1 as 7.0.0 (LG2b), so a design label from 6.1.0 up reads one
+ * major up here; 4.0.0, 5.0.0 and 6.0.0 keep theirs (build DECISIONS 6;
+ * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
+ * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close).
  */
-export const WIRE_CONTRACT_VERSION = '3.0.0';
+export const WIRE_CONTRACT_VERSION = '4.0.0-lg3.1';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -158,6 +160,14 @@ export const WIRE_CONTRACT_VERSION = '3.0.0';
  * after `'setting_inert'` — appended, never inserted (design §1.1:758-763,
  * :822-827; ACCT-U04). `PATCH /me` is its first route; the booking arms
  * (ACCT-U11) and `POST /evaluations` join it when they land.
+ *
+ * 4.0.0-lg3.1 appends five thrown codes, the 26th to the 30th, after
+ * `'profile_incomplete'` — appended, never inserted (design §1.1:914-916,
+ * :936): `'program_not_offered'`, `'same_day_cutoff_passed'`,
+ * `'beyond_booking_horizon'`, `'capacity_below_booked'` and
+ * `'service_not_offered'`, each 422. Only `'capacity_below_booked'` carries
+ * `details` (`CapacityBelowBookedDetails`); on the other four the code is the
+ * whole signal. Each route's doc says which of them it can answer.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -174,7 +184,7 @@ export type ApiErrorCode =
   | 'vaccine_missing' // booking blocked — required vaccines missing/expired (per dog)
   | 'agreement_unsigned' // booking blocked — required agreements unsigned at current version
   | 'insufficient_credits' // booking blocked — per-dog credit balance would go negative
-  | 'insufficient_capacity' // booking blocked — day_capacity for (location,date,mode) exhausted
+  | 'insufficient_capacity' // booking blocked — the (location,date) seat cap is exhausted
   | 'cohort_full' // enrollment blocked — cohort.filled + requested > cohort.capacity
   | 'eligibility_missing' // enrollment blocked — dog(s) missing OR-prereq for cohort's class
   | 'evaluation_required' // booking blocked — dog(s) missing passed evaluation for gated category
@@ -185,7 +195,12 @@ export type ApiErrorCode =
   | 'payment_failed' // a charge was ATTEMPTED and did not complete — nothing was created or settled
   | 'internal' // serializer fallback for any non-ApiError throw — never thrown as ApiError
   | 'setting_inert' // settings PATCH blocked — a key in the body has no v1 reader (2.0.0-lg1.1)
-  | 'profile_incomplete'; // PATCH /me blocked — the body would blank a mandatory sign-up field (3.0.0-lg2.1)
+  | 'profile_incomplete' // PATCH /me blocked — the body would blank a mandatory sign-up field (3.0.0-lg2.1)
+  | 'program_not_offered' // booking blocked — the campus does not offer this day program (4.0.0-lg3.1)
+  | 'same_day_cutoff_passed' // booking blocked — today's same-day cutoff has passed at this campus (4.0.0-lg3.1)
+  | 'beyond_booking_horizon' // create blocked — a date is past day.booking_horizon_months (4.0.0-lg3.1)
+  | 'capacity_below_booked' // cap edit blocked — a booked date would fall below its count (4.0.0-lg3.1)
+  | 'service_not_offered'; // request blocked — the service is off at the campus (4.0.0-lg3.1)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -214,11 +229,16 @@ export const API_ERROR_CODES = [
   'internal',
   'setting_inert',
   'profile_incomplete',
+  'program_not_offered',
+  'same_day_cutoff_passed',
+  'beyond_booking_horizon',
+  'capacity_below_booked',
+  'service_not_offered',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
- * The HTTP status each THROWN code rides. CONTRACTUAL for the 23 ApiError
- * codes: changing one is a wire change (major unless the code is new in the
+ * The HTTP status each THROWN code rides. CONTRACTUAL for every thrown
+ * code: changing one is a wire change (major unless the code is new in the
  * same bump). Promoted verbatim from `lib/errors.ts` STATUS_BY_CODE (which
  * now imports THIS table). The 4xx family notes, preserved: the gate
  * failures + capacity/credit/duplicate assertions are all 422 — the request
@@ -275,6 +295,15 @@ export const API_ERROR_STATUS = {
   // would leave a field the sign-up map marks mandatory empty — well-formed,
   // but refused by the account's own rules (design §1.1:758-763; ACCT-U04).
   profile_incomplete: 422,
+  // 4.0.0-lg3.1 (new codes, so their statuses are set in the same bump): each
+  // request is well-formed, and refused by a campus setting or by seats already
+  // booked (design §1.1:914-916, :936). `capacity_below_booked` is a plain 422
+  // under the date's lock (question 79 dissolved).
+  program_not_offered: 422,
+  same_day_cutoff_passed: 422,
+  beyond_booking_horizon: 422,
+  capacity_below_booked: 422,
+  service_not_offered: 422,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -335,22 +364,23 @@ export interface CreditGap {
 }
 
 /**
- * Day-program capacity exhaustion for one date. `openings_remaining` is the
- * number of seats still free at the moment the check fired (≥ 0 — if zero,
- * the request asked for at least one over the cap). Useful for "1 seat left,
- * you asked for 2" messaging. Promoted from lib/bookingErrors.ts:69.
+ * Day-program capacity exhaustion for one (location, date): one cap, combined
+ * across day school and daycare, so no mode (4.0.0-lg3.1; `DayCapacityWire`).
+ * `openings_remaining` is the number of seats still free at the moment the
+ * check fired (≥ 0 — if zero, the request asked for at least one over the
+ * cap). Useful for "1 seat left, you asked for 2" messaging. Promoted from
+ * lib/bookingErrors.ts:69.
  */
 export interface CapacityGap {
   location: LocationKey;
   date: string;
-  mode: BookingMode;
   openings_remaining: number;
   requested: number;
 }
 
 /**
  * Cohort capacity gap — the M:N enrollment counterpart to `CapacityGap`,
- * scoped to one cohort row, not a (location, date, mode) bucket. Promoted
+ * scoped to one cohort row, not a (location, date) bucket. Promoted
  * from lib/bookingErrors.ts:86. NOTE: this is the ITEM shape (grandfathered
  * name); the union arm carrying `kind: 'cohort_full'` is `CohortFullDetails_`.
  */
@@ -409,7 +439,8 @@ export interface AlreadyBookedConflict {
 // change (designs/wire-contract-completion.md §3.2):
 //   1. Two grammars coexist: most arms nest their payload under
 //      `missing`/`gaps`/`conflicts`; `insufficient_capacity` and `cohort_full`
-//      spread their fields FLAT into `details` (bookingErrors.ts:214, :223).
+//      spread their fields FLAT into `details` (`insufficientCapacityError`,
+//      `cohortFullError`).
 //      Documented, not unified.
 //   2. `media-upload-missing` is kebab-case (routes/media.ts:507) while every
 //      other kind is snake_case. Documented, not renamed.
@@ -566,6 +597,23 @@ export interface ProfileIncompleteDetails {
 }
 
 /**
+ * Rides code `capacity_below_booked` (422) — `kind` equals `code`. New
+ * 4.0.0-lg3.1 (design §1.1:915-916, §2.3:2334-2340; DAY-U07, DAY-67). Emitted
+ * by a cap edit that would leave a booked date within the horizon below its
+ * count: `PUT` or `DELETE /staff/day-capacity/:location/:date`, or a
+ * `PATCH /staff/settings/day/:location` that lowers `daily_capacity_dogs` or
+ * unticks a weekday from `open_weekdays_list`.
+ *
+ * `dates` lists EVERY date the edit would undercut, `YYYY-MM-DD`, ascending,
+ * never empty; on the per-date routes that is the one date. Atomic: a refused
+ * edit writes nothing.
+ */
+export interface CapacityBelowBookedDetails {
+  kind: 'capacity_below_booked';
+  dates: string[];
+}
+
+/**
  * Every `details` payload the API can emit, closed. Provably complete at
  * 1.13.0 by full construction-site sweep, and kept complete by the fold-in:
  * `ApiError`'s constructor takes exactly this union, so a future route
@@ -573,7 +621,9 @@ export interface ProfileIncompleteDetails {
  * site. 2.0.0-lg1.1 appends the two settings-PATCH arms (`RefusedKeysDetails`,
  * `SettingInertDetails`), contract-first: no route emits them until P01's
  * phase B builds `routes/staffSettings.ts`. 3.0.0-lg2.1 appends
- * `ProfileIncompleteDetails` (`PATCH /me`).
+ * `ProfileIncompleteDetails` (`PATCH /me`). 4.0.0-lg3.1 appends
+ * `CapacityBelowBookedDetails`, contract-first: no route emits it until P13's
+ * backend lands.
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -591,7 +641,8 @@ export type ApiErrorDetailWire =
   | MediaUploadMissingDetails
   | RefusedKeysDetails
   | SettingInertDetails
-  | ProfileIncompleteDetails;
+  | ProfileIncompleteDetails
+  | CapacityBelowBookedDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -771,10 +822,9 @@ export type NotificationDeepLinkKind =
  * The credit-axis booking mode for day programs (`schema.sql`:
  * `booking_mode AS ENUM ('school', 'daycare')`). Promoted 1.13.0 from
  * `lib/bookingMode.ts:28` (which now re-exports this type; the domain mapping
- * `dayProgramCategoryToMode` stays server-side). Crosses the credits,
- * payments, and rates-availability surfaces (`CreditGap.mode`,
- * `CapacityGap.mode`, ledger `mode`); pinned to the pgEnum in
- * `conformance.ts`.
+ * `dayProgramCategoryToMode` stays server-side). Crosses the credits and
+ * payments surfaces (`CreditGap.mode`, ledger `mode`); a day's capacity has
+ * no mode since 4.0.0-lg3.1. Pinned to the pgEnum in `conformance.ts`.
  */
 export type BookingMode = 'school' | 'daycare';
 
@@ -1529,10 +1579,10 @@ export interface PendingRequestWire {
   // BUSINESS-LOGIC/DISCREPANCIES.md:291). The staff actor on a STAFF-driven
   // resolution — stamped by approve (`markApprovedAwaitingPayment`,
   // `markConverted`) and by deny (`markCancelled`), all in `staffRequests.ts`,
-  // and left NULL by an owner self-cancel (`requests.ts:480`).
+  // and left NULL by an owner self-cancel (`POST /requests/:id/cancel`).
   // It is the discriminator the client branches on to render "Denied by the
   // school" vs "You cancelled this", because `request_status` has no 'denied'
-  // member (DATA-CONTRACT.md:1217-1222; column @ schema.sql:822). Omit-on-null
+  // member (DATA-CONTRACT.md:1217-1222; the column is on `pending_requests`). Omit-on-null
   // like its neighbours: present ⇒ staff acted, absent ⇒ they did not.
   approved_by_staff_id?: string;
   converted_booking_id?: string;
@@ -1578,7 +1628,7 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
 
 /**
  * `POST /bookings` body — day-program creation only (day-school / day-care).
- * Promoted 1.13.0 from `routes/bookings.ts:134` `postBookingBodySchema`
+ * Promoted 1.13.0 from `postBookingBodySchema` in `routes/bookings.ts`
  * (digest bookings/M "contract every request body"); pinned to that schema by
  * `PostBookingsBodyConformance` in the route file (§5.1.3, `z.input`).
  *
@@ -1587,24 +1637,48 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  * approve, evaluation via a staff-picked slot — so `category` is genuinely two
  * values here, not a narrowed `ServiceCategory`.
  *
- * Zod-enforced bounds, transcribed (NOT tightenable by a client rereading
- * this): `dates` 1..30 entries, each `YYYY-MM-DD` and a real calendar date;
- * `additional_dog_ids` ≤ 4 (5 dogs total with the lead); `notes` ≤ 2000 chars;
- * `dropoff_time` `HH:MM`. The body is `.strict()` — an unknown key is a 422.
+ * A day-program booking carries no arrival time (4.0.0-lg3.1; DAY-U11): each
+ * session's `scheduled_at` is the campus's `day.dropoff_open_time` on its date,
+ * America/Chicago, and the cancel deadline and the reminders follow from it.
  *
- * Cross-field rules Zod does not express, enforced in
- * `routes/bookings.ts:694 validateBookingBody` (§4.6 — doc comments, not type
- * gymnastics):
+ * Zod-enforced bounds, transcribed (NOT tightenable by a client rereading
+ * this): `dates` 1..30 entries (`MAX_DATES_PER_REQUEST`, a constant: a
+ * request-size guard), each `YYYY-MM-DD` and a real calendar date;
+ * `additional_dog_ids` ≤ 99 (a hostile-body ceiling, not the roster rule, which
+ * is the setting below); `notes` ≤ 2000 chars. The body is `.strict()`: an
+ * unknown key is 400 `bad_request`,
+ * like every Zod failure on this route (`parseOrThrow`), and since 4.0.0-lg3.1
+ * that includes `dropoff_time`.
+ *
+ * Cross-field rules Zod does not express (§4.6 — doc comments, not type
+ * gymnastics). Each limit is a setting read at runtime, never a constant, and
+ * a client reads it from `GET /settings`:
  *   - `lead_dog_id` must not repeat inside `additional_dog_ids`, and the ids
  *     must be distinct (`invalid_payload`).
- *   - every date is distinct, today-or-later in America/Chicago, and within
- *     the 92-day lookahead (`invalid_payload`).
- *   - `dropoff_time` must fall inside the drop-off window; omitted ⇒ the
- *     window's open (`lib/bookingSchedule.ts DEFAULT_DROPOFF_TIME`).
+ *   - at most `day.max_dogs_per_booking_count` dogs, the lead included
+ *     (`invalid_payload`).
+ *   - every date is distinct and today-or-later in America/Chicago
+ *     (`invalid_payload`).
  *   - `payment_method_id` is REQUIRED when `payment: 'payg'`
- *     (`routes/bookings.ts:768 resolvePaymentPlan`); sending one on a
+ *     (`resolvePaymentPlan`, `routes/bookings.ts`); sending one on a
  *     `'credits'` group is accepted and ignored — deliberately backward-
  *     compatible, do not "fix" it (§14.1).
+ *
+ * Three refusals have a code of their own (4.0.0-lg3.1; design §2.3:2325-2328),
+ * each 422 with no `details`, and each refuses the whole request:
+ *   - `program_not_offered` — `offerings[category].offered` is false at
+ *     `location` (DAY-U04): as seeded, day-care at Fayetteville.
+ *   - `beyond_booking_horizon` — a date is later than
+ *     `day.booking_horizon_months` calendar months after today in
+ *     America/Chicago, a day the target month lacks falling on its last day
+ *     (DAY-U10, DAY-09).
+ *   - `same_day_cutoff_passed` — a date is today in America/Chicago and the
+ *     clock has reached the campus's `day.same_day_cutoff_time` (DAY-U10,
+ *     DAY-07). This route is owner-only; the cutoff binds owners only (DAY-08).
+ * A closed date has no refusal of its own: its cap is 0, so the request meets
+ * `insufficient_capacity`. `PostBookingsErrorDetails` lists the arms that do
+ * carry `details`.
+ *
  * `Idempotency-Key` is required on this endpoint (§0 conventions). The
  * response is 201 `BookingWire[]`.
  * BUSINESS-LOGIC/bookings-scheduling.md R20 @ :90.
@@ -1615,8 +1689,6 @@ export interface PostBookingsRequest {
   additional_dog_ids?: string[];
   /** `YYYY-MM-DD` Chicago calendar days, 1..30, distinct. */
   dates: string[];
-  /** `HH:MM`; omitted ⇒ the drop-off window's open. */
-  dropoff_time?: string;
   location: LocationKey;
   notes?: string;
   /** Omitted ⇒ `'credits'`. `'payg'` skips the credit debit and rides an open
@@ -1629,12 +1701,12 @@ export interface PostBookingsRequest {
 /**
  * `POST /requests` body — the owner-side request submission for the three
  * approval-flow categories (DATA-CONTRACT §C.1 Model 3). Promoted 1.13.0 from
- * `routes/requests.ts:125` `postRequestBodySchema` (digest bookings/M); pinned
+ * `postRequestBodySchema` in `routes/requests.ts` (digest bookings/M); pinned
  * by `PostRequestsBodyConformance`.
  *
  * `notes` / `focus` reuse the response sub-shapes (`PendingRequestNotesWire`,
- * `PendingRequestFocusWire`): the request Zod objects at
- * `routes/requests.ts:106,116` are structurally identical to them today, and
+ * `PendingRequestFocusWire`): the request Zod objects `notesBodySchema` and
+ * `focusBodySchema` are structurally identical to them today, and
  * the §5.1.3 pin is what keeps that true — if either side moves, the pin
  * fails and the wire type is corrected to the schema (§14.1).
  *
@@ -1644,13 +1716,25 @@ export interface PostBookingsRequest {
  * ≤ 20 keys × ≤ 64 chars (trimmed, each non-empty); each note ≤ 2000 chars.
  * `.strict()` at both levels.
  *
- * Cross-field rules (`routes/requests.ts:569 validatePostRequestBody`):
+ * Cross-field rules (`validatePostRequestBody`, `routes/requests.ts`):
  *   - board-and-train is SINGLE-DOG (`additional_dog_ids` rejected) and
  *     REQUIRES `length_weeks`; private-lesson + boarding must OMIT it.
  *   - `lesson_setting` is private-lesson only (Δ 2026-07-14).
- *   - dog ids distinct; every preferred date strictly in the future and
- *     within the 92-day lookahead.
- * All of the above are `invalid_payload` (422). `Idempotency-Key` required.
+ *   - dog ids distinct; every preferred date strictly in the future.
+ * All of the above are `invalid_payload` (422).
+ *
+ * Two refusals have a code of their own (4.0.0-lg3.1), each 422 with no
+ * `details`:
+ *   - `service_not_offered` — the service is off (design §1.1:936, §2.6:3727;
+ *     question 2). The body names no campus and a request stores none, so the
+ *     campus is the family's home campus (`owners.location`, read on
+ *     `MeWire.location`), and `offerings[category].offered` false there
+ *     refuses. A family with no home campus is refused only when no campus
+ *     offers the service. As seeded, all three services are off everywhere.
+ *   - `beyond_booking_horizon` — a preferred date is later than the horizon,
+ *     reckoned as on `PostBookingsRequest` (DAY-U10; PL-39, BRD-06, BT-09).
+ *
+ * `Idempotency-Key` required.
  */
 export interface PostRequestsRequest {
   category: 'private-lesson' | 'board-and-train' | 'boarding';
@@ -1668,29 +1752,32 @@ export interface PostRequestsRequest {
 
 /**
  * `PATCH /requests/:id` body — the owner's edit surface while a request is
- * still `'submitted'`. Promoted 1.13.0 from `routes/requests.ts:144`
- * `patchRequestBodySchema` (digest bookings/M); pinned by
+ * still `'submitted'`. Promoted 1.13.0 from `patchRequestBodySchema` in
+ * `routes/requests.ts` (digest bookings/M); pinned by
  * `PatchRequestsBodyConformance`.
  *
  * Tri-state per key, and the type says so honestly: **omitted** = leave
  * unchanged, **`null`** = clear, **value** = set. `focus: null` clears BOTH
  * inner fields (`descriptor_keys` clears to `[]` — the column is NOT NULL);
  * `focus: { descriptor_keys: [] }` clears only that one
- * (`routes/requests.ts:684,707`). Empty/whitespace strings normalize to
+ * (`validatePatchRequestBody`). Empty/whitespace strings normalize to
  * cleared, so the response's omit-on-null round-trips.
  *
  * The three identity keys are typed `unknown` because that is exactly what
  * the schema accepts: they are listed in the `.strict()` object ONLY so an
  * attempt to change them meets a route-specific 422 ("category cannot be
- * changed after submission", `routes/requests.ts:643`) instead of Zod's
+ * changed after submission", `validatePatchRequestBody`) instead of Zod's
  * generic unrecognized-key error. Sending ANY value for one — `null`
  * included — is a 422. Typing them as `never` would be a tightening (§14.1):
  * the schema accepts the key and the route rejects it, which is not the same
  * thing as the client being unable to express it.
  *
  * Editing a request that is not `'submitted'` is 409 `conflict`;
- * `lesson_setting` on a non-private-lesson request is 422. `Idempotency-Key`
- * required (the body rides the request hash, so a same-key replay with a
+ * `lesson_setting` on a non-private-lesson request is 422. A preferred date
+ * later than the horizon is 422 `beyond_booking_horizon`, no `details`, as on
+ * `POST /requests` (4.0.0-lg3.1; the two share
+ * `assertPreferredDatesWithinWindow`). `Idempotency-Key` required (the body
+ * rides the request hash, so a same-key replay with a
  * different body is 422 `idempotency_mismatch`).
  */
 export interface PatchRequestsRequest {
@@ -1709,9 +1796,9 @@ export interface PatchRequestsRequest {
 
 /**
  * `POST /requests/:id/confirm-payment` body — the board-and-train conversion
- * verb (Day 15, `[auth, $]`). Promoted 1.13.0 from
- * `routes/requestConfirmPayment.ts:78` `confirmBodySchema` (digest
- * bookings/M); pinned by `PostRequestsConfirmPaymentBodyConformance`.
+ * verb (Day 15, `[auth, $]`). Promoted 1.13.0 from `confirmBodySchema` in
+ * `routes/requestConfirmPayment.ts` (digest bookings/M); pinned by
+ * `PostRequestsConfirmPaymentBodyConformance`.
  *
  * **`pay_later` is optional-with-a-default, and this type documents the
  * SEND side**: the schema is `z.boolean().optional().default(false)`, so a
@@ -1720,21 +1807,19 @@ export interface PatchRequestsRequest {
  *
  * Cross-field rules — these two live in the schema itself, as `.refine`s
  * (§4.6 renders them as prose, not as types):
- *   - `due_at` is REQUIRED when `pay_later: true`
- *     (`requestConfirmPayment.ts:90`).
- *   - `pickup_at` must be strictly after `dropoff_at`
- *     (`requestConfirmPayment.ts:94`).
+ *   - `due_at` is REQUIRED when `pay_later: true`.
+ *   - `pickup_at` must be strictly after `dropoff_at`.
  * Both surface as 400 `bad_request` (this route's `parseBody` uses
  * `bad_request`, unlike the `invalid_payload` used by the routes above —
  * transcribed as-is; unifying it would be a behavior change).
  *
  * Money semantics the client must not re-derive: the amount is SERVER
- * authority (`boardTrainPriceCentsForLengthWeeks(request.length_weeks)`,
- * `requestConfirmPayment.ts:148`) — the body never carries a price.
+ * authority (`boardTrainPriceCentsForLengthWeeks(request.length_weeks)`) —
+ * the body never carries a price.
  * `scheduled_at` and `dropoff_at` are the same instant for B&T (two columns
  * for the schema CHECK). Pay-now is all-or-nothing: a confirm that does not
  * reach `succeeded` cancels its PaymentIntent and throws 402 `payment_failed`
- * with a `PaymentFailedDetails` (`requestConfirmPayment.ts:217`) — that arm
+ * with a `PaymentFailedDetails` — that arm
  * has no per-endpoint alias this bump (see the §3.5 debt note in the
  * bookings patch). `Idempotency-Key` required.
  */
@@ -1787,26 +1872,26 @@ export interface PostStaffRequestsApproveRequest {
 
 /**
  * `POST /staff/requests/:id/deny` body `[staff]`. Promoted 1.13.0 from
- * `routes/staffRequests.ts:103` `denyBodySchema` (digest bookings/S); pinned
+ * `denyBodySchema` in `routes/staffRequests.ts` (digest bookings/S); pinned
  * by `PostStaffRequestsDenyBodyConformance`.
  *
  * **`reason` is accepted and DISCARDED.** No column stores it — the schema
  * calls it "reserved for future use" and `markCancelled` never receives it
- * (`staffRequests.ts:385`), so a denial reason typed by a staffer is lost.
+ * (the deny handler), so a denial reason typed by a staffer is lost.
  * This is documented, not fixed: persisting it needs DDL (`deny_reason` does
- * not exist on `pending_requests`, schema.sql:795-830) and is deferred to
+ * not exist on `pending_requests`) and is deferred to
  * phase 3. (An earlier draft cited "§6-batch #7" — the delivered batch's
  * item 7 contains no requests-policy discussion; corrected in the 1.13.0
  * fix round, 2.6 adversary.) Already on the ledger —
  * BUSINESS-LOGIC/DISCREPANCIES.md:671; do not re-file it as new.
  *
  * The one thing `reason` DOES affect: it rides the idempotency request hash
- * (`hashRequestBody({ id, ...body })`, `staffRequests.ts:370`), so replaying
+ * (`hashRequestBody({ id, ...body })`, the deny handler), so replaying
  * the same `Idempotency-Key` with a different reason is 422
  * `idempotency_mismatch` rather than a silent no-op.
  *
  * Denial writes `status: 'cancelled'` + `approved_by_staff_id` — the
- * `request_status` enum has no `'denied'` member (schema.sql:90). Clients
+ * `request_status` enum has no `'denied'` member. Clients
  * branch on `PendingRequestWire.approved_by_staff_id` being present to render
  * "Denied by the school" vs "You cancelled this" (DATA-CONTRACT.md:1221).
  * An absent body is accepted. `Idempotency-Key` required.
@@ -1818,7 +1903,7 @@ export interface PostStaffRequestsDenyRequest {
 
 /**
  * `POST /staff/bookings/:id/attendance` body `[staff]` — per-dog check-in.
- * Promoted 1.13.0 from `routes/staffBookings.ts:44` `attendanceBodySchema`
+ * Promoted 1.13.0 from `attendanceBodySchema` in `routes/staffBookings.ts`
  * (digest bookings/M); pinned by
  * `PostStaffBookingsAttendanceBodyConformance`. Response is `AttendanceWire`.
  *
@@ -1836,15 +1921,15 @@ export interface PostStaffBookingsAttendanceRequest {
 
 /**
  * `POST /staff/bookings/:id/cancel` body `[staff]` (R5, Allison sim-QA
- * 2026-07-27). Promoted 1.13.0 from `routes/staffBookings.ts:57`
- * `cancelBodySchema` (digest bookings/M); pinned by
+ * 2026-07-27). Promoted 1.13.0 from `cancelBodySchema` in
+ * `routes/staffBookings.ts` (digest bookings/M); pinned by
  * `PostStaffBookingsCancelBodyConformance`.
  *
  * Unlike the deny body's `reason`, THIS one is persisted and emitted — it
  * comes back as `BookingWire.cancel_reason` under "The school cancelled this
  * on …". Trimmed, 1..500 chars; an empty string is a 422, an omitted key is
  * "cancelled without a note". The whole body may be absent
- * (`request.body ?? {}`, `staffBookings.ts:308`). It rides the idempotency
+ * (`parseCancelReason`, `staffBookings.ts`). It rides the idempotency
  * request hash, so a same-key replay with a different reason is 422
  * `idempotency_mismatch`. The owner-side `POST /bookings/:id/cancel` takes NO
  * body at all — deliberately asymmetric. `Idempotency-Key` required.
@@ -1872,7 +1957,7 @@ export interface PostStaffBookingsCancelRequest {
  * (PORTAL-ENDPOINT-MAP.md:458 open question).
  *
  * `from` / `to` are the pair the route's own Day-20 hardening note flagged
- * (`staffBookings.ts:89-91`); `category` + `location` come from the portal
+ * (over `GET /staff/bookings`); `category` + `location` come from the portal
  * demand line (PORTAL-ENDPOINT-MAP.md:453). Semantics for 2.3b, fixed here so
  * the build has no room to guess:
  *   - `from`/`to` are `YYYY-MM-DD` **America/Chicago calendar days**,
@@ -1880,9 +1965,9 @@ export interface PostStaffBookingsCancelRequest {
  *     `BookingWire.date` carries. Either may be sent alone (open-ended).
  *   - `category` and `location` are exact-match single values.
  *   - a malformed value is 400 `bad_request` — the query-parse convention
- *     already used by `routes/bookings.ts:651`, `requests.ts:503` and
- *     `staffRequests.ts:572` (route BODIES use `invalid_payload`; queries use
- *     `bad_request`).
+ *     already used by `parseView` (`routes/bookings.ts`) and each
+ *     `parseStatusQuery` (`requests.ts`, `staffRequests.ts`) (a route body's
+ *     cross-field rules use `invalid_payload`; queries use `bad_request`).
  * The proposed `search=<str>` free-text filter (PORTAL-ENDPOINT-MAP.md:453)
  * is NOT here — see the bookings patch's STOP item.
  */
@@ -1902,20 +1987,24 @@ export interface GetStaffBookingsQuery {
  * `ApiErrorEnvelope['error']['details']` once for this endpoint instead of
  * switching over every arm (digest bookings/L). Emit sites, in the order
  * the request hits them:
- *   1. `payment_required`      — `lib/bookingGatePreCheck.ts:101`
- *   2. `evaluation_required`   — `lib/bookingGatePreCheck.ts:119`
- *   3. `vaccine_missing`       — `lib/bookingGatePreCheck.ts:141`
- *   4. `agreement_unsigned`    — `lib/bookingGatePreCheck.ts:151`
- *   5. `insufficient_credits`  — `lib/createDayProgramBookings.ts:195`
- *   6. `already_booked`        — `lib/createDayProgramBookings.ts:217`
- *   7. `insufficient_capacity` — `db/repositories/dayCapacityRepository.ts:179`
+ *   1. `payment_required`      — `checkBookingGates` (`lib/bookingGatePreCheck.ts`)
+ *   2. `evaluation_required`   — `checkBookingGates`
+ *   3. `vaccine_missing`       — `checkBookingGates`
+ *   4. `agreement_unsigned`    — `checkBookingGates`
+ *   5. `insufficient_credits`  — `createDayProgramBookings` (`lib/createDayProgramBookings.ts`)
+ *   6. `already_booked`        — `createDayProgramBookings`
+ *   7. `insufficient_capacity` — `dayCapacityRepository.assertCapacityWithinLock`
  * Arms 1-4 can also arrive from the DB trigger floor with EMPTY arrays
- * (`gateTriggerErrorToApiError`, `lib/bookingErrors.ts:409-455`) in the race
+ * (`gateTriggerErrorToApiError`, `lib/bookingErrors.ts`) in the race
  * window — `missing: []` is a legal emission, see §1.
+ *
+ * The route's other 422s carry no `details`, so they are not arms here:
+ * `invalid_payload`, and 4.0.0-lg3.1's `program_not_offered`,
+ * `beyond_booking_horizon` and `same_day_cutoff_passed` (`PostBookingsRequest`).
  *
  * NOT reachable here, despite looking like it should be: `payment_failed`.
  * A PAYG day-program books against an OPEN INVOICE auto-charged ~1h before
- * drop-off (`createDayProgramBookings.ts:247-260`); no card is charged inside
+ * drop-off (`createDayProgramBookings`); no card is charged inside
  * `POST /bookings`, so no charge can fail inside it.
  */
 export type PostBookingsErrorDetails =
@@ -1931,16 +2020,19 @@ export type PostBookingsErrorDetails =
  * Every `details` arm `POST /requests` can 422 with (digest bookings/L).
  * Much smaller than the booking set by design: submission runs no payment,
  * vaccine, agreement, credit or capacity gate — those fire later, at the
- * staff approve verb's booking INSERT (`routes/requests.ts:234-238`). Two
- * arms only:
- *   1. `evaluation_required` — `routes/requests.ts:290`, the LEAD dog only,
- *      and only for board-and-train + boarding. Private-lesson is
- *      staff-curated and does not gate here.
- *   2. `already_requested`   — `routes/requests.ts:314`, the residential
- *      duplicate guard (board-and-train + boarding, roster-matched).
- *      Private-lesson is EXEMPT: an owner may keep several pending at once.
- * The other 422 this endpoint emits, `invalid_payload`, carries NO `details`
- * — every cross-field rule in `validatePostRequestBody` throws message-only.
+ * staff approve verb's booking INSERT (the comment over the `POST /requests`
+ * handler). Two arms only:
+ *   1. `evaluation_required` — `evaluationRequiredError` in the handler, the
+ *      LEAD dog only, and only for board-and-train + boarding. Private-lesson
+ *      is staff-curated and does not gate here.
+ *   2. `already_requested`   — `alreadyRequestedError` in the handler, the
+ *      residential duplicate guard (board-and-train + boarding,
+ *      roster-matched). Private-lesson is EXEMPT: an owner may keep several
+ *      pending at once.
+ * The endpoint's other 422s carry NO `details`: `invalid_payload`, because
+ * every cross-field rule in `validatePostRequestBody` throws message-only, and
+ * 4.0.0-lg3.1's `service_not_offered` and `beyond_booking_horizon`
+ * (`PostRequestsRequest`).
  */
 export type PostRequestsErrorDetails = EvaluationRequiredDetails | AlreadyRequestedDetails;
 
@@ -3032,7 +3124,7 @@ export interface EnrollmentWire {
 /** `POST /enrollments` request body — group-class cohort enrollment.
  *  Owner-only (staff get 403); `Idempotency-Key` header REQUIRED (R8 @
  *  BUSINESS-LOGIC/group-classes-enrollments.md:40). Promoted 1.13.0 from
- *  `routes/enrollments.ts:186-246` — the first time `allow_partial` and
+ *  `routes/enrollments.ts` — the first time `allow_partial` and
  *  `retry_of` are TYPED anywhere: both shipped as CHANGELOG prose only
  *  (`[1.11.0]`, `[1.12.0]`). Digest enrollments/L; DRIFT-26.
  *
@@ -3040,7 +3132,7 @@ export interface EnrollmentWire {
  *
  *  Cross-field rules the type cannot state (§4.6):
  *  - `dog_ids` must contain DISTINCT values — enforced after Zod, in
- *    `validateEnrollmentBody` (`routes/enrollments.ts:1181-1185`), and it is
+ *    `validateEnrollmentBody` (`routes/enrollments.ts`), and it is
  *    the one body rule answering **422 `invalid_payload`**. Everything Zod
  *    rejects — an unknown key (the schema is `.strict()`), a bad uuid, wrong
  *    arity — answers **400 `bad_request`** via `parseOrThrow`
@@ -3048,13 +3140,18 @@ export interface EnrollmentWire {
  *    pre-1.13.0 behavior and neither changes here.
  *  - Price is never sent: the per-dog amount is the class's
  *    `price_per_dog_cents`, resolved server-side from the cohort (R24 @ …:62).
+ *  - The cohort's first session (`cohorts.start_date`) must not be later than
+ *    the horizon, reckoned as on `PostBookingsRequest`, else **422
+ *    `beyond_booking_horizon`**, no `details` (4.0.0-lg3.1; DAY-U10, DAY-09).
+ *    The cohort is refused, not a dog, so this answers 422 with or without
+ *    `allow_partial`, before any Stripe call.
  *
  *  The RESPONSE shape depends on `allow_partial`, not on the version — see
  *  that field. */
 export interface PostEnrollmentsRequest {
   cohort_id: string;
   /** 1..5 distinct dog uuids. The cap is `MAX_DOGS_PER_REQUEST`
-   *  (`routes/enrollments.ts:176`) — a hostile body bounded BEFORE the DB is
+   *  (`MAX_DOGS_PER_REQUEST`, `routes/enrollments.ts`) — a hostile body bounded BEFORE the DB is
    *  touched; five covers every plausible household. */
   dog_ids: string[];
   payment_method_id: string;
@@ -4732,50 +4829,46 @@ export interface StaffRateHistoryWire extends StaffRateWire {
 
 /**
  * One element of `GET /availability` — day-program capacity for one
- * (location, date). Promoted 1.13.0 from the route-local declaration at
- * `routes/availability.ts:61` (digest rates-availability/M), which is what
+ * (location, date) — and the 200 body of `PUT` and
+ * `DELETE /staff/day-capacity/:location/:date`. Promoted 1.13.0 from the
+ * route-local declaration at `routes/availability.ts:61` (digest
+ * rates-availability/M), which is what
  * DISCREPANCIES NOTE-1 (@ :645) flagged: the shape lived in a route file and
  * was hand-mirrored in mobile (`availabilityRepository.ts:20 RawCapacity`),
  * so a change bypassed the version bump entirely.
  *
- * **The `*_openings` pair is CONFIGURED capacity; the `*_remaining` pair is
- * seats left.** Each `*_openings` number is the live `day_capacity` override
- * row for (location, date) or, where no override exists, the API default
- * rule — weekend (Sat/Sun) = 0/0 closed, weekday = 3/3
- * (`lib/availability.ts:16-49`; `schema.sql:860`; R4 @
- * BUSINESS-LOGIC/bookings-scheduling.md:52, R22 @ :94). Nothing is
- * subtracted from `*_openings` for dogs already booked — a fully-booked day
- * still reports its full configured openings THERE, and D9 @
- * bookings-scheduling.md:237 / NOTE-2 @ DISCREPANCIES.md:651 describe that
- * pre-1.13.0-fix-round state, when these two were the only fields.
+ * **One cap per (location, date), combined across day school and daycare**
+ * (4.0.0-lg3.1; DAY-U05, DAY-10). `capacity_dogs` is the date's CONFIGURED
+ * cap: `day.daily_capacity_dogs` when the date's weekday is in
+ * `day.open_weekdays_list`, otherwise 0, and a live `day_capacity` row for
+ * (location, date) overrides either (DAY-11). Both settings are per campus
+ * (`DayProgramCampusSettingsWire`). Nothing is subtracted from it for dogs
+ * already booked. It says how many seats a date has, never which programs run
+ * there: whether a campus offers daycare is `offerings` (§ settings).
  *
- * Since the 1.13.0 fix round the response ALSO carries `*_remaining` —
- * Allison's §6-batch decision #3, option C, APPROVED 2026-08-24
- * (designs/decision-batch-2026-08.md item 3; adversary round 2.6 caught the
- * lanes carrying the pre-approval DEFER label — wire-contract-completion.md
- * WC-A7). `*_remaining` = configured openings − live booked count for
- * (location, date, mode), floored at 0. ADVISORY, not authoritative: it is
- * computed outside any booking lock, so a concurrent booking can stale it
- * between read and POST — the authoritative arithmetic still runs inside the
- * booking transaction (`dayCapacityRepository.assertCapacityWithinLock`) and
- * the 422 `insufficient_capacity` remains the source of truth at write time.
- * Mobile's calendar `classifyStatus` points at `*_remaining` (option C's
- * second half), so a fully-booked day finally renders as full instead of the
+ * `remaining_dogs` is that cap minus every live client booking dog on that
+ * date at that campus, day school and daycare together, floored at 0. A live
+ * dog is one whose session is not cancelled and whose own `booking_dogs` row
+ * is live; a staff-owned dog is not counted. An evaluation does not count yet
+ * (P10 and P11 carry that arm). The field began as the 1.13.0 fix round's
+ * `*_remaining` pair: Allison's §6-batch decision #3, option C, APPROVED
+ * 2026-08-24 (designs/decision-batch-2026-08.md item 3).
+ *
+ * ADVISORY, not authoritative: it is computed outside any booking lock, so a
+ * concurrent booking can stale it between read and POST — the authoritative
+ * arithmetic still runs inside the booking transaction
+ * (`dayCapacityRepository.assertCapacityWithinLock`) and the 422
+ * `insufficient_capacity` remains the source of truth at write time. Mobile's
+ * calendar reads it, so a fully-booked day renders as full instead of the
  * owner learning at the 422.
- *
- * All four columns always emit: the `mode` query param validates but does
- * not filter (`availability.ts` destructures `from`/`to`/`location` only),
- * so the client picks which numbers to display.
  */
 export interface DayCapacityWire {
   location: LocationKey;
   date: string;
-  school_openings: number;
-  daycare_openings: number;
-  /** Configured openings minus live booked, floored at 0 — advisory (see doc). */
-  school_remaining: number;
-  /** Configured openings minus live booked, floored at 0 — advisory (see doc). */
-  daycare_remaining: number;
+  /** The date's combined seat cap. Nothing booked is subtracted (see doc). */
+  capacity_dogs: number;
+  /** `capacity_dogs` minus live client booking dogs, floored at 0 — advisory (see doc). */
+  remaining_dogs: number;
 }
 
 /**
@@ -4897,28 +4990,69 @@ export interface GetRatesQuery {
 }
 
 /**
- * `GET /availability` query string — all four params REQUIRED
- * (`routes/availability.ts:52-57`). Promoted 1.13.0 (digest
- * rates-availability/M).
+ * `GET /availability` query string — all three params REQUIRED
+ * (`querySchema`, `routes/availability.ts`). Promoted 1.13.0 (digest
+ * rates-availability/M). `mode` left at 4.0.0-lg3.1: one cap per (location,
+ * date) has no mode to ask about. The schema is not `.strict()`, so a stale
+ * client still sending `mode=` is not refused and the key is dropped.
  *
  *   • `from` / `to` — `YYYY-MM-DD`, inclusive range. The regex alone accepts
- *     `2026-02-31`; the `.refine(isValidCalendarDate)` is what rejects it
- *     (`availability.ts:47-50`), and field-level failures are 400
- *     `bad_request`.
+ *     `2026-02-31`; the `.refine(isValidCalendarDate)` is what rejects it,
+ *     and field-level failures are 400 `bad_request`.
  *   • Range errors are 422 `invalid_payload`, NOT 400 — `to` before `from`,
- *     or a window over the 92-date cap (`AVAILABILITY_MAX_DATES`,
- *     `lib/availability.ts`) — because both are user-fixable mistakes that
- *     already passed field validation (`availability.ts:105-118`).
- *   • `mode` is validated but never used: it does not filter the response
- *     and the handler discards it (`availability.ts:76`). It stays on the
- *     wire as required because dropping a required param is a breaking
- *     change, not because it does anything.
+ *     or a window over the date cap — because both are user-fixable mistakes
+ *     that already passed field validation (`resolveRange`).
+ *   • The date cap (`availabilityMaxDates`, `lib/availability.ts`) follows
+ *     `day.booking_horizon_months` (design §2.3:2353): at least as many dates
+ *     as that many calendar months can hold, so a window from today through
+ *     the horizon's last date always fits. The refusal's message names the
+ *     live number; read it rather than hard-coding one.
  */
 export interface GetAvailabilityQuery {
   from: string;
   to: string;
-  mode: BookingMode;
   location: LocationKey;
+}
+
+/**
+ * `PUT /staff/day-capacity/:location/:date` body `[staff]` — one campus's cap
+ * on one date (the store of `day.capacity_override_dogs`). New 4.0.0-lg3.1
+ * (DAY-U07, DAY-11, DAY-67; design §1.1:921-924, §2.3:2334-2352).
+ *
+ *   PUT    /staff/day-capacity/:location/:date  → 200 `DayCapacityWire`
+ *   DELETE /staff/day-capacity/:location/:date  → 200 `DayCapacityWire`, no body
+ *
+ * `PUT` is an upsert: it sets the date's cap, opens a date the default rule
+ * closes (a weekend included) and re-opens a withdrawn date. `DELETE` withdraws
+ * the override, so the date falls back to the default rule (`DayCapacityWire`):
+ * 0 on a closed weekday. A `DELETE` that finds no live override changes nothing
+ * and is still 200, so PUT, DELETE, PUT on one date is 200 three times. Both
+ * answer the date's resulting `DayCapacityWire`, read in the write's
+ * transaction; a replay of a completed `Idempotency-Key` returns the original
+ * body.
+ *
+ * Any staff role, at either campus: a staffer's `home_locations` is descriptive
+ * and refuses nothing (STAFF-71, STAFF-73). An owner principal is 403
+ * `forbidden`.
+ *
+ * `Idempotency-Key` REQUIRED on both (§0 conventions), a fresh key per edit.
+ * The `requestHash` covers `{location, date, ...body}`, so one key sent to a
+ * second date is 422 `idempotency_mismatch`.
+ *
+ * Refused, in this order; a refused edit writes nothing:
+ *   1. 400 `bad_request` — a `:location` outside `LOCATIONS`, a `:date` that is
+ *      not a real `YYYY-MM-DD` calendar date, or a `PUT` body the strict parse
+ *      refuses: an unknown key, or `capacity_dogs` not a whole number in
+ *      0..2147483647 (`parseOrThrow`, the `/staff/cancel-window/:category`
+ *      precedent).
+ *   2. 422 `capacity_below_booked` + `CapacityBelowBookedDetails` — a booked
+ *      date within the horizon would fall below its count, checked under the
+ *      date's `(location, date)` lock. A `DELETE` can answer this too, when
+ *      the default rule gives the date fewer seats than are booked on it.
+ */
+export interface PutStaffDayCapacityRequest {
+  /** Dogs, day school and daycare together; 0 closes the date. */
+  capacity_dogs: number;
 }
 
 /**
@@ -5795,7 +5929,12 @@ export interface DayProgramGlobalSettingsWire extends SettingsAuditWire {
  * `day_program_settings` (M1.07, design.md:6141; the `c`-scoped keys of
  * §3.4:5751-5781, plus E03's `offerings`). No day-school price column (R1)
  * and no `capacity_override_dogs` column: that key's store is the per-date
- * `day_capacity` row (§2.3:2305-2308; P01-contract notes item D3).
+ * `day_capacity` row (§2.3:2305-2308; P01-contract notes item D3), edited by
+ * `PUT` and `DELETE /staff/day-capacity/:location/:date`.
+ *
+ * A PATCH that lowers `daily_capacity_dogs` or unticks a weekday from
+ * `open_weekdays_list` can answer 422 `capacity_below_booked` (4.0.0-lg3.1;
+ * refusal step 5, `PatchStaffSettingsRequest`).
  */
 export interface DayProgramCampusSettingsWire extends SettingsAuditWire {
   /** NON-OMIT: the campus this row belongs to. */
@@ -6446,7 +6585,12 @@ export type SettingInertWire = false | { kind: 'stored' | 'deferred'; note?: str
  *   · `text-list` — a list of such strings.
  *   · `staff-id` — a `staff.id`; `nullable` allows `null`.
  *   · `record` — an object with exactly `keys`, each value one of
- *     `value.values`, or `null` where `value.nullable`.
+ *     `value.values`, or `null` where `value.nullable`. `fixed` (4.0.0-lg3.1;
+ *     omitted when the record has none) names the keys that may hold only
+ *     the value given: `{ email: 'mandatory' }` on the sign-up map
+ *     (design §2.2:2244). An editor shows such a key read-only at that value,
+ *     and a PATCH naming another is 422 `invalid_payload` (refusal step 4).
+ *     `value.values` still lists the whole set.
  *   · `offerings` — `Record<ServiceCategory, ServiceOfferingWire>` over
  *     `services`; each `name` and `description` holds at most
  *     `name_max_length` and `description_max_length` characters (60 and 280;
@@ -6467,7 +6611,12 @@ export type SettingValueSpecWire =
   | { type: 'text'; nullable: boolean }
   | { type: 'text-list' }
   | { type: 'staff-id'; nullable: boolean }
-  | { type: 'record'; keys: string[]; value: { values: string[]; nullable: boolean } }
+  | {
+      type: 'record';
+      keys: string[];
+      value: { values: string[]; nullable: boolean };
+      fixed?: Record<string, string>;
+    }
   | {
       type: 'offerings';
       services: ServiceCategory[];
@@ -6623,6 +6772,11 @@ export interface SettingsPatchByDomain {
  *   3. 422 `setting_inert` + `SettingInertDetails` — a key with no v1 reader.
  *   4. 422 `invalid_payload` (no details) — a value out of range, Postgres
  *      `23514` included.
+ *   5. 422 `capacity_below_booked` + `CapacityBelowBookedDetails` —
+ *      `/day/:location` only: the body lowers `daily_capacity_dogs` or unticks
+ *      a weekday from `open_weekdays_list`, and a booked date within the
+ *      horizon would fall below its count (4.0.0-lg3.1; DAY-67; design
+ *      §2.3:2334-2340), every affected date's lock held in one transaction.
  * A refused body writes nothing.
  */
 export type PatchStaffSettingsRequest<D extends SettingsDomain = SettingsDomain> =
@@ -6634,11 +6788,16 @@ export type PatchStaffSettingsRequest<D extends SettingsDomain = SettingsDomain>
  * Every `details` arm `PATCH /staff/settings/:domain[/:location]` can carry:
  *   1. `refused_keys`  — rides 403 `forbidden` (refusal step 2).
  *   2. `setting_inert` — rides 422 `setting_inert` (refusal step 3).
+ *   3. `capacity_below_booked` — rides 422 `capacity_below_booked` (refusal
+ *      step 5), `/day/:location` only.
  * The endpoint's other refusals — 400 `bad_request`, 422 `invalid_payload`,
  * 422 `idempotency_mismatch`, 409 `idempotency_inflight`, an owner
  * principal's 403 `forbidden` — carry no `details`. `GET` carries none.
  */
-export type PatchStaffSettingsErrorDetails = RefusedKeysDetails | SettingInertDetails;
+export type PatchStaffSettingsErrorDetails =
+  | RefusedKeysDetails
+  | SettingInertDetails
+  | CapacityBelowBookedDetails;
 
 // (e) domain-owned pure helpers — NONE. Every settings value ships resolved
 //     (the responder first names included); no client recomputes one.

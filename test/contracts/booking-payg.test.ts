@@ -48,8 +48,8 @@ const DAY_SCHOOL_FAY_RATE_CENTS = 7500;
 const DAY_CARE_RATE_CENTS = 4500;
 
 /**
- * YYYY-MM-DD for the `nth` weekday after FIXTURE_TODAY. Weekday-only so
- * day_capacity defaults to 3/3 (weekends seed 0/0 = closed).
+ * YYYY-MM-DD for the `nth` weekday after FIXTURE_TODAY. Weekday-only so the
+ * date is open at the campus cap (a weekend is unticked, so 0, as seeded).
  *
  * Δ 2026-08-12: this file used to carry a second, REAL-clock helper for the
  * cancel + pay-in-person cases, because those routes read a clock no test could
@@ -295,7 +295,7 @@ test(
           category: 'day-care',
           lead_dog_id: FIXTURE_IDS.dog1Id,
           dates: [futureWeekday(47)],
-          location: 'fayetteville',
+          location: 'bentonville',
           payment: 'payg',
           payment_method_id: FIXTURE_IDS.paymentMethod1Id,
         },
@@ -441,7 +441,7 @@ test(
         lead_dog_id: FIXTURE_IDS.dog1Id,
         additional_dog_ids: [FIXTURE_IDS.dog2Id],
         dates: [futureWeekday(49)],
-        location: 'fayetteville',
+        location: 'bentonville',
         payment: 'payg',
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
       },
@@ -479,7 +479,7 @@ test(
     // Both routes run on FIXTURE_NOW (Δ 2026-08-12 — `pay-in-person` takes a
     // `now` override now). The date has to sit more than 24h past that instant
     // or the reminder clamps to now and the 24h arithmetic this exists to pin
-    // disappears; `futureWeekday(52)` is ~73 days out, inside the 92-day cap.
+    // disappears; `futureWeekday(52)` is ~73 days out, inside the 3-month horizon.
     const { app } = bookingApp();
     const res = await postBooking({
       app,

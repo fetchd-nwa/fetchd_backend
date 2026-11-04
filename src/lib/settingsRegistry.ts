@@ -515,7 +515,9 @@ const ENTRIES: readonly Entry[] = [
     key: 'day.booking_horizon_months',
     class: 'ops',
     store: column(DAY, 'booking_horizon_months', 'global'),
-    value: atLeast(1),
+    // A year ahead. A lowering edit takes one lock per date it lowers across the
+    // whole horizon, in one transaction, so an unbounded value takes bookings down.
+    value: between(1, 12),
     inert: LIVE,
   },
   {
@@ -536,7 +538,9 @@ const ENTRIES: readonly Entry[] = [
     key: 'day.max_dogs_per_booking_count',
     class: 'ops',
     store: column(DAY, 'max_dogs_per_booking_count', 'global'),
-    value: atLeast(1),
+    // `POST /bookings` parses at most this many before it reads the setting, so a
+    // higher value would promise what the route refuses.
+    value: between(1, 99),
     inert: LIVE,
   },
   {
@@ -708,7 +712,8 @@ const ENTRIES: readonly Entry[] = [
     store: {
       kind: 'catalog',
       table: 'day_capacity',
-      where: "per (location, date) row; its per-date verb is DAY-U07's (4.0.0)",
+      where:
+        'per (location, date) row; set with PUT and DELETE /staff/day-capacity/:location/:date',
     },
     value: { type: 'catalog' },
     inert: LIVE,

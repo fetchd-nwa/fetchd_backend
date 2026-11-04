@@ -151,14 +151,16 @@ observable behavior, not "looks right."
 - **Goal:** Encode the concurrency + calendar half of the invariants so every
   Day-10+ txn day has them on tap.
 - **Work:** `withDogLocks(tx, dogIds, fn)` (P12; was `withDogModeLock`) over
-  `pg_advisory_xact_lock(hashtext(dog||mode))` (the booking serializability
-  primitive — no double-spend under concurrent retries); `lockCohort(id, tx)`
-  + `lockDayCapacity(location, date, tx)` `SELECT ... FOR UPDATE` helpers;
+  `pg_advisory_xact_lock(hashtext('dog:' || dogId))`, keyed on the dog's lowercased
+  id alone (P13) (the booking serializability primitive — no double-spend under
+  concurrent retries, in any mode at either campus); `lockCohort(id, tx)`,
+  a `SELECT ... FOR UPDATE` helper (its `lockDayCapacity` sibling never had a
+  production caller: `withCapacityLocks` took the job, and P13 deleted it);
   `bucketToChicagoDate(ts)` + day-window utilities (every calendar/day calc
   routes through this — never raw UTC).
-- **Exit:** tests prove (3) two concurrent transactions on the same
-  `(dog,mode)` serialize (the second blocks on the advisory lock until the
-  first commits), and (4) Chicago bucketing across a DST boundary
+- **Exit:** tests prove (3) two concurrent transactions on the same dog
+  serialize (the second blocks on the advisory lock until the first commits),
+  and (4) Chicago bucketing across a DST boundary
   (spring-forward / fall-back) returns the right calendar day.
 - **Handoff note:** the locks + bucket are the only Day-10/11/12/13
   prerequisites left. Day 4 (the read days) doesn't depend on 3b — it could
@@ -242,8 +244,9 @@ observable behavior, not "looks right."
   runtime bucketing + multi-dog denormalization, on top of a freshly
   extracted repository layer the rest of Day 5–8 builds on.
 - **Work:** `lib/bookingBucket.ts` (sessionEndTime per category, isInView
-  combining DB status with runtime bucket, day-program windows 07:30-09:00
-  drop + 16:30-17:30 pickup); `lib/bookingWire.ts` (multi-dog denorm +
+  combining DB status with runtime bucket; P13 replaced the fixed day-program
+  windows with each campus's `day.pickup_close_time` and `day.dropoff_open_time`);
+  `lib/bookingWire.ts` (multi-dog denorm +
   §B emit, cancelled_at/cancel_forfeited only when status=cancelled);
   `lib/chicagoDate.ts` extended with `chicagoWallTimeToUtc` (DST-correct
   per IANA fold=0); `lib/pgTimestamp.ts` extracted `pgTimestampToDate`;
@@ -291,10 +294,10 @@ observable behavior, not "looks right."
   availability with the default rule applied server-side, per-dog
   credit balance via `dog_credit_balance` view + zero-sentinel,
   catalog reads for credit-packages and effective-dated rates.
-- **Work:** `GET /availability?from=&to=&mode=&location=` (DayCapacity
-  rows over the date range, weekend=closed + default 3, sparse overrides
-  via `day_capacity` table; 60-day range cap; mode does NOT filter
-  output, both school + daycare openings always emit); `GET /dogs/:id/credits`
+- **Work:** `GET /availability?from=&to=&location=` (DayCapacity rows over
+  the date range, the campus's rule over sparse overrides via the `day_capacity`
+  table; the range cap follows the horizon; one combined cap per (location, date)
+  since P13, which also dropped `mode`); `GET /dogs/:id/credits`
   (LEFT JOIN view for zero-sentinel); `GET /credit-packages` (live
   catalog, active=true filter, ORDER BY mode, credits); `GET /rates?category=&location=`
   (effective-dated lookup: `effective_from <= today_chicago AND
@@ -308,10 +311,9 @@ observable behavior, not "looks right."
   **closed-window fallback** / **empty-note omit** / 404; zero-sentinel
   credits exercises a dog with zero ledger rows; `lib/availability.test.ts`
   (11 unit tests) pins day-of-week branches, leap year (2028 Feb), year
-  boundary, **exact 92-cap boundary** (92 ok / 93 over), reversed range,
-  100-year pathological short-circuit. **Cap raised 60 → 92 dates** —
-  DATA-CONTRACT §B DayCapacity Δ updated per Allison's "book up to 3
-  months in advance" requirement.
+  boundary, the exact cap boundary, reversed range, 100-year pathological
+  short-circuit. The cap became `availabilityMaxDates(months)` at P13, per
+  Allison's "book up to 3 months in advance" requirement.
 - **Handoff note:** booking-data read surface is now complete (Days 4 + 5
   = identity, dogs, vets, agreements, bookings, availability, credits,
   packages, rates). Day-5b additions Day 6+ should reuse: `lib/pgEnumTuple`
@@ -760,7 +762,7 @@ observable behavior, not "looks right."
 - **Handoff note:** the dog-write surface is now complete (top-level
   CRUD + GET-by-id from Day-9c + 7 nested endpoints from Day-9d).
   Day-10 (`bookSession` txn) is the next surface — composes
-  `withMutation` with `withDogLocks` + `lockDayCapacity` +
+  `withMutation` with `withDogLocks` + `withCapacityLocks` +
   `credit_ledger` debit + the 3 booking gates (vaccine / agreement /
   payment). The Day-9d patterns Day-10 inherits: `parseOrThrow`
   (every parse in the new booking routes), `findOwnedExists` (the
@@ -800,8 +802,8 @@ observable behavior, not "looks right."
 - **Depends on:** Day 9
 - **Governing contract:** schema.sql txn-notes `bookSession` + BOOKING GATES
 - **Goal:** Credit-debited booking with double-spend safety and the 3 gates.
-- **Work:** per-`(dog,mode)` lock + `day_capacity FOR UPDATE` + `credit_ledger`
-  debit; map gate `check_violation` → typed 422 (card/vaccine/agreement) with
+- **Work:** the per-dog lock (`withDogLocks`) + the `(location, date)` capacity
+  lock (`withCapacityLocks`) + `credit_ledger` debit; map gate `check_violation` → typed 422 (card/vaccine/agreement) with
   friendly copy; API pre-checks above the DB floor.
 - **Exit:** tests: no double-spend under concurrency; each gate rejects; happy path books.
 - **Handoff note:** the gate→HTTP error mapping table.
@@ -903,7 +905,7 @@ observable behavior, not "looks right."
   (cohortId? + sessionReportId? — same primitive serves both
   day-program and group-class); new pure `lib/cohortSchedule.ts`
   for DST-preserving weekly cadence (distinct from Day-10's
-  `bookingSchedule.ts` for day-program drop-off windows); single
+  `bookingSchedule.ts`, which composes a day program's `scheduled_at`); single
   lock surface (cohort row lock); two new typed codes extend the
   §A discriminated union without changing existing arms; Boy-Scout
   teardown fix in `_fixture.ts` with explicit FK-chain comment so
@@ -934,8 +936,8 @@ observable behavior, not "looks right."
   - **`POST /requests` `[auth]`** — owner-side submission with per-category
     body validation (PL = multi-dog OK; B&T = single dog + length_weeks REQUIRED;
     boarding = multi-dog OK + no length_weeks). Flat Zod schema + in-code
-    cross-field validator (`validatePostRequestBody`). 92-day lookahead on
-    preferred_dates (matches Day-5b availability cap). Ownership gate per dog.
+    cross-field validator (`validatePostRequestBody`). The booking horizon on
+    preferred_dates, read at runtime since P13. Ownership gate per dog.
   - **`PATCH /requests/:id` `[auth]`** — owner edits (preferred_dates / notes /
     focus / length_weeks). Identity fields (category / lead_dog_id /
     additional_dog_ids) locked → 422. State-machine guard: only `status='submitted'`
@@ -1040,7 +1042,7 @@ observable behavior, not "looks right."
 - Clean Code: 94 — honest names throughout; literal-union asserts predicates;
   step-numbered txn-contract comments; JSDoc on every new public method
   explains WHY. Magic constants extracted at module scope (`MAX_PREFERRED_
-  DATES`, `MAX_LOOKAHEAD_DAYS`, `MAX_LENGTH_WEEKS`, etc.). TypeScript strict,
+  DATES`, `MAX_LENGTH_WEEKS`, etc.; the lookahead became a setting at P13). TypeScript strict,
   no `any`. Deliberate scope hygiene (no Stripe in approve; no eval-gate pre-
   check; no `/staff/requests` GET queue). What'd push higher: (a)
   `routes/requests.ts` at ~680 LOC is upper-end of "keep monolithic" —
@@ -2225,7 +2227,7 @@ real-sized chunks:
      immediately via `bookSession` → `POST /bookings` (the Day-10 txn), gated by
      the **full §H/§G set: payment + evaluation + vaccine + agreement +
      capacity** (all already enforced by the booking BEFORE-INSERT triggers +
-     `lockDayCapacity`; a blocked insert is a typed 422 the FE already renders).
+     `withCapacityLocks`; a blocked insert is a typed 422 the FE already renders).
      Extract typed `bookSessions` → `POST /bookings`; the FE surfaces any gate
      422 via the existing error abstraction. (The request→approve flow stays for
      the categories that need staff pricing/scheduling — B&T, boarding,
@@ -2326,8 +2328,9 @@ owner's *set* location (Account → location). **Backend (§B Δ — deliberate 
 change, documented in DATA-CONTRACT):** `credit_ledger` += `location` (location_key
 NOT NULL); `dog_credit_balance` view groups by `(dog_id, mode, location)`; every ledger
 writer carries location (purchase → chosen location, booking-debit →
-`bookings.location`, cancel-refund → the original debit's location); the booking balance
-advisory lock is per-(dog, mode, location); `credit_packages` PK is composite
+`bookings.location`, cancel-refund → the original debit's location); the booking
+advisory lock was per-(dog, mode, location) here and is per dog alone since P12, because
+one dog is in one place on a day; `credit_packages` PK is composite
 `(key, location)` with per-location `price_cents`, ledger `package_key` FK composite
 `(package_key, location)`. `GET /dogs/:id/credits?location=` + `GET /credit-packages
 ?location=` take a required `location`; the purchase body gains `location`; the Stripe

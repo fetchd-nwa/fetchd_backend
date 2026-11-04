@@ -6,7 +6,9 @@ import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { paymentMethodsRepository } from '../db/repositories/paymentMethodsRepository.js';
 import { serviceRatesRepository } from '../db/repositories/serviceRatesRepository.js';
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import type { Tx } from '../db/tx.js';
+import type { DayProgramCampusSettingsWire } from '../contracts/wire.js';
 import { dayProgramConflictsWith } from './bookingConflicts.js';
 import {
   alreadyBookedError,
@@ -15,10 +17,11 @@ import {
   type CreditGap,
 } from './bookingErrors.js';
 import { checkBookingGates } from './bookingGatePreCheck.js';
+import { assertDatesBookable } from './bookingHorizon.js';
 import { dayProgramCategoryToMode } from './bookingMode.js';
-import type { DayProgramCategory } from './bookingSchedule.js';
+import { computeDayProgramScheduledAt, type DayProgramCategory } from './bookingSchedule.js';
 import { toBookingWire, type BookingWire, type LocationKey } from './bookingWire.js';
-import { bucketChicagoToday } from './chicagoDate.js';
+import { bucketChicagoToday, chicagoTimeOnDate } from './chicagoDate.js';
 import { computeCancelDeadlineFromHours } from './cancelWindow.js';
 import { enqueueBookingReminders } from './enqueueBookingReminders.js';
 import { ApiError } from './errors.js';
@@ -37,11 +40,20 @@ import { insertBookingWithGateMapping } from './insertBookingWithGateMapping.js'
  * The transaction protocol — DEADLOCK ORDER MATTERS, do not reorder:
  *   1. `withDogLocks(dogs ASC)` then `withCapacityLocks(location, dates ASC)`
  *      — both acquire in canonical sorted order.
- *   2. Gate pre-check (payment → evaluation → vaccine → agreement).
- *   3. Payment plan: PAYG validates card + per-day rate and skips the credit
+ *   2. The settings, read ONCE for the whole request, UNDER the locks: an edit
+ *      and a booking must serialise on the same keys (design §2.3:2344), so a
+ *      read before the locks could act on a cap a concurrent edit just lowered.
+ *      A campus row held `FOR UPDATE` by a PATCH does not block this plain read.
+ *   3. What the campus says before what the clock says (DECISIONS 128(b)):
+ *      `program_not_offered` → the past-date check and `beyond_booking_horizon` →
+ *      `same_day_cutoff_passed`. Each runs after the idempotency claim, because
+ *      the caller's `withMutation` holds it: a replay outlives every clock.
+ *   4. Each session's `scheduled_at`, from the campus row just read.
+ *   5. Gate pre-check (payment → evaluation → vaccine → agreement).
+ *   6. Payment plan: PAYG validates card + per-day rate and skips the credit
  *      pre-check; credits runs the per-dog balance check.
- *   4. Time-overlap guard against live sessions (`lib/bookingConflicts`).
- *   5. Per-session (date ASC): capacity assert → INSERT booking +
+ *   7. Time-overlap guard against live sessions (`lib/bookingConflicts`).
+ *   8. Per-session (date ASC): capacity assert → INSERT booking +
  *      booking_dogs → money write (PAYG open invoice / credit debits) →
  *      scheduled reminders.
  */
@@ -53,12 +65,8 @@ import { insertBookingWithGateMapping } from './insertBookingWithGateMapping.js'
  */
 export type DayProgramPaymentPlan = { kind: 'credits' } | { kind: 'payg'; paymentMethodId: string };
 
-/**
- * One session to create: the Chicago calendar day (capacity bucket) + the
- * exact UTC instant (drop-off applied). POST /bookings derives these from
- * `dates[]` + `dropoff_time`.
- */
-export interface DayProgramSession {
+/** One session to create: the Chicago calendar day (capacity bucket) + its start. */
+interface DayProgramSession {
   date: string; // YYYY-MM-DD, America/Chicago
   scheduledAt: Date;
 }
@@ -74,8 +82,12 @@ export interface CreateDayProgramBookingsArgs {
   category: DayProgramCategory;
   leadDogId: string;
   additionalDogIds: string[];
-  /** MUST be date-ASC (the caller sorts at parse time). */
-  sessions: DayProgramSession[];
+  /**
+   * YYYY-MM-DD Chicago days, distinct. MUST be date-ASC (the caller sorts at parse
+   * time). Dates, not sessions: each start is computed here, from the campus row
+   * read under the locks.
+   */
+  dates: string[];
   location: LocationKey;
   notes: string | null;
   payment: DayProgramPaymentPlan;
@@ -142,17 +154,52 @@ async function resolvePaygPlan(
   return { paymentMethodId: args.payment.paymentMethodId, amountCents: rate.amount_cents };
 }
 
+/** DAY-U04: `offerings[category].offered`, the service's one store, at this campus. */
+function assertProgramOffered(
+  campus: DayProgramCampusSettingsWire,
+  category: DayProgramCategory,
+): void {
+  if (campus.offerings[category].offered) return;
+  throw new ApiError('program_not_offered', `${category} is not offered at ${campus.location}`);
+}
+
+/**
+ * DAY-U10, DAY-07: refused when a date is today in Chicago and `now` is at or past
+ * the cutoff's wall-clock instant, so 07:29:59 books and 07:30:00 does not. Owners
+ * only (DAY-08), and this path is owner-only: `POST /bookings` is the one
+ * day-program create, and P26's walk-in does not call this.
+ */
+function assertBeforeSameDayCutoff(dates: readonly string[], now: Date, cutoffTime: string): void {
+  const today = bucketChicagoToday(now);
+  if (!dates.includes(today)) return;
+  if (now.getTime() < chicagoTimeOnDate(today, cutoffTime).getTime()) return;
+  throw new ApiError('same_day_cutoff_passed', `same-day booking closed at ${cutoffTime} today`);
+}
+
 export async function createDayProgramBookings(
   tx: Tx,
   args: CreateDayProgramBookingsArgs,
 ): Promise<CreateDayProgramBookingsResult> {
   const allDogIds = [args.leadDogId, ...args.additionalDogIds];
   const mode = dayProgramCategoryToMode(args.category);
-  const sortedDates = args.sessions.map((s) => s.date);
+  const sortedDates = args.dates;
   const creditDebitedDogIds = new Set<string>();
 
   const wires = await withDogLocks(tx, allDogIds, () =>
     withCapacityLocks(tx, args.location, sortedDates, async () => {
+      // Once, for the whole request, under the locks (see the protocol above).
+      const global = await settingsRepository.dayGlobal(tx);
+      const campus = await settingsRepository.dayCampus(args.location, tx);
+
+      assertProgramOffered(campus, args.category);
+      assertDatesBookable(sortedDates, args.now, global.booking_horizon_months);
+      assertBeforeSameDayCutoff(sortedDates, args.now, campus.same_day_cutoff_time);
+
+      const sessions: DayProgramSession[] = sortedDates.map((date) => ({
+        date,
+        scheduledAt: computeDayProgramScheduledAt(date, campus.dropoff_open_time),
+      }));
+
       // Gates (payment → evaluation → vaccine → agreement) above the DB
       // trigger floor. See `lib/bookingGatePreCheck.ts` for the sequence
       // rationale; first failure aborts with full structured details.
@@ -177,13 +224,8 @@ export async function createDayProgramBookings(
         for (const dogId of allDogIds) {
           const balance =
             (await creditLedgerRepository.balanceForDogInTx(tx, dogId, mode, args.location)) ?? 0;
-          if (balance < args.sessions.length) {
-            creditGaps.push({
-              dog_id: dogId,
-              mode,
-              balance,
-              required: args.sessions.length,
-            });
+          if (balance < sessions.length) {
+            creditGaps.push({ dog_id: dogId, mode, balance, required: sessions.length });
           }
         }
         if (creditGaps.length > 0) throw insufficientCreditsError(creditGaps);
@@ -191,9 +233,9 @@ export async function createDayProgramBookings(
 
       // Time-overlap guard — the authoritative backstop for the FE conflict
       // engine (exact rules in `lib/bookingConflicts`, Δ 2026-07-09). Runs
-      // under the dog locks, which key on the dog alone, so a concurrent
-      // create for the same dog, in any mode at either campus, can't slip an
-      // overlap past this.
+      // under the dog locks, which key on the lowercased id alone (normalised
+      // at the route's parse boundary), so a concurrent create for the same
+      // dog, in any mode at either campus, can't slip an overlap past this.
       const conflicts: AlreadyBookedConflict[] = [];
       for (const dogId of allDogIds) {
         const candidates = await bookingsRepository.findConflictCandidatesForDog(
@@ -214,11 +256,11 @@ export async function createDayProgramBookings(
       // Per-session: capacity → INSERT booking + booking_dogs → money write
       // (PAYG invoice schedule, or credit-ledger debits) → reminders.
       const created: BookingWire[] = [];
-      for (const session of args.sessions) {
+      for (const session of sessions) {
         await dayCapacityRepository.assertCapacityWithinLock(tx, {
           location: args.location,
           date: session.date,
-          mode,
+          rule: campus,
           requestedCount: allDogIds.length,
         });
 

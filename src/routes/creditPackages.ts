@@ -103,7 +103,10 @@ const PURCHASE_QUANTITY_MAX = 100;
 
 const purchaseBodySchema = z
   .object({
-    dog_id: z.string().uuid('dog_id must be a UUID'),
+    // Lowercased at the parse: the `credits:{dogId}:*` wipe below builds its pattern
+    // from this string, and the cache is keyed by the lowercase id, so a second
+    // spelling left the balance stale (P13 fix round 1, F4).
+    dog_id: z.string().uuid('dog_id must be a UUID').toLowerCase(),
     payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
     location: z.enum(LOCATION_KEYS),
     // Buy N units of the package in ONE charge: quantity × price_cents,

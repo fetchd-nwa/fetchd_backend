@@ -101,10 +101,7 @@ test('full Day-10 flow: 7:30 Chicago drop-off the day after spring-forward → 2
   // wall-clock drift. The user-facing render is "X hours until
   // deadline," which is exactly 24h.
   const { computeDayProgramScheduledAt } = await import('../src/lib/bookingSchedule.js');
-  const scheduledAt = computeDayProgramScheduledAt('day-school', '2026-03-09', {
-    hour: 7,
-    minute: 30,
-  });
+  const scheduledAt = computeDayProgramScheduledAt('2026-03-09', '07:30');
   assert.equal(scheduledAt.toISOString(), '2026-03-09T12:30:00.000Z');
   const deadline = computeCancelDeadline('day-school', scheduledAt);
   assert.equal(scheduledAt.getTime() - deadline.getTime(), 24 * HOUR_MS);
@@ -119,10 +116,7 @@ test('full Day-10 flow: 7:30 Chicago drop-off the day before fall-back → 24h-p
   // them), so the wall-clock equivalent is identical. The math doesn't
   // care; the test confirms the pure-UTC contract holds.
   const { computeDayProgramScheduledAt } = await import('../src/lib/bookingSchedule.js');
-  const scheduledAt = computeDayProgramScheduledAt('day-school', '2026-10-31', {
-    hour: 7,
-    minute: 30,
-  });
+  const scheduledAt = computeDayProgramScheduledAt('2026-10-31', '07:30');
   assert.equal(scheduledAt.toISOString(), '2026-10-31T12:30:00.000Z');
   const deadline = computeCancelDeadline('day-school', scheduledAt);
   assert.equal(scheduledAt.getTime() - deadline.getTime(), 24 * HOUR_MS);
@@ -135,10 +129,7 @@ test('full Day-10 flow: 7:30 Chicago drop-off the day OF spring-forward exercise
   // chicagoWallTimeToUtc (the bug fixed Day-10). The deadline must
   // land at 2026-03-07T12:30Z exactly (24h prior, pure UTC).
   const { computeDayProgramScheduledAt } = await import('../src/lib/bookingSchedule.js');
-  const scheduledAt = computeDayProgramScheduledAt('day-school', '2026-03-08', {
-    hour: 7,
-    minute: 30,
-  });
+  const scheduledAt = computeDayProgramScheduledAt('2026-03-08', '07:30');
   assert.equal(scheduledAt.toISOString(), '2026-03-08T12:30:00.000Z');
   const deadline = computeCancelDeadline('day-school', scheduledAt);
   assert.equal(deadline.toISOString(), '2026-03-07T12:30:00.000Z');

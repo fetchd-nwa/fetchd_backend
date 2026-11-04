@@ -67,6 +67,7 @@ import {
   threads,
 } from '../src/db/schema/schema.js';
 import { CURRICULUM_PROGRAMS } from '../src/lib/alumni.js';
+import { computeDayProgramScheduledAt } from '../src/lib/bookingSchedule.js';
 
 function assertLocalDb(): void {
   const url = env.DATABASE_URL;
@@ -95,17 +96,19 @@ function daysFromNow(days: number, hour = 14): string {
   return d.toISOString();
 }
 
-// Day school and day care run Mon–Fri only, so their seeded rows must never
+// §3.4's `day.dropoff_open_time` at both campuses, which is where a seeded day
+// starts: the day starts when the campus opens and no arrival time is asked.
+const SEEDED_DROPOFF_OPEN = '07:30';
+
+// Day school and day care run Mon–Fri as seeded, so their seeded rows must never
 // land on a weekend. Takes the raw offset then nudges forward off any Sat/Sun.
-// (`hour` is a morning-UTC drop-off — 13–15 UTC is 8–10am Chicago, same
-// calendar day, so the UTC weekday equals the Chicago weekday here.)
-function weekdayFromNow(days: number, hour = 14): string {
+function dayProgramStartFromNow(days: number): string {
   const d = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
   while (d.getUTCDay() === 0 || d.getUTCDay() === 6) {
     d.setUTCDate(d.getUTCDate() + 1);
   }
-  d.setUTCHours(hour, 0, 0, 0);
-  return d.toISOString();
+  const date = d.toISOString().slice(0, 10);
+  return computeDayProgramScheduledAt(date, SEEDED_DROPOFF_OPEN).toISOString();
 }
 
 // Human Chicago weekday+date label (e.g. "Friday, June 6") computed off the
@@ -741,7 +744,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogWafflesId,
       category: 'day-school',
       status: 'upcoming',
-      scheduledAt: weekdayFromNow(2, 13),
+      scheduledAt: dayProgramStartFromNow(2),
       durationMinutes: 540,
       trainerStaffId: SEED.staffDonavanId,
       location: 'fayetteville',
@@ -784,7 +787,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogBrodieId,
       category: 'day-care',
       status: 'upcoming',
-      scheduledAt: weekdayFromNow(1, 14),
+      scheduledAt: dayProgramStartFromNow(1),
       durationMinutes: 480,
       trainerStaffId: null,
       location: 'bentonville',
@@ -797,7 +800,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogWafflesId,
       category: 'day-school',
       status: 'past',
-      scheduledAt: weekdayFromNow(-14, 13),
+      scheduledAt: dayProgramStartFromNow(-14),
       durationMinutes: 540,
       trainerStaffId: SEED.staffDonavanId,
       confirmedAt: daysFromNow(-15, 15),
@@ -809,7 +812,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogLolaId,
       category: 'day-school',
       status: 'past',
-      scheduledAt: weekdayFromNow(-10, 13),
+      scheduledAt: dayProgramStartFromNow(-10),
       durationMinutes: 540,
       trainerStaffId: SEED.staffRachelId,
       confirmedAt: daysFromNow(-11, 15),
@@ -821,7 +824,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogBrodieId,
       category: 'day-care',
       status: 'past',
-      scheduledAt: weekdayFromNow(-12, 14),
+      scheduledAt: dayProgramStartFromNow(-12),
       durationMinutes: 480,
       trainerStaffId: null,
       confirmedAt: daysFromNow(-13, 15),
@@ -833,7 +836,7 @@ async function seed(): Promise<void> {
       leadDogId: SEED.dogOllieId,
       category: 'day-care',
       status: 'past',
-      scheduledAt: weekdayFromNow(-8, 14),
+      scheduledAt: dayProgramStartFromNow(-8),
       durationMinutes: 480,
       trainerStaffId: null,
       confirmedAt: daysFromNow(-9, 15),
@@ -853,7 +856,7 @@ async function seed(): Promise<void> {
       dogId: SEED.dogWafflesId,
       isLead: true,
       attendance: 'attended',
-      checkedInAt: weekdayFromNow(-14, 13),
+      checkedInAt: dayProgramStartFromNow(-14),
       checkedInByStaffId: SEED.staffDonavanId,
     },
     {
@@ -861,7 +864,7 @@ async function seed(): Promise<void> {
       dogId: SEED.dogLolaId,
       isLead: true,
       attendance: 'attended',
-      checkedInAt: weekdayFromNow(-10, 13),
+      checkedInAt: dayProgramStartFromNow(-10),
       checkedInByStaffId: SEED.staffRachelId,
     },
     {
@@ -869,7 +872,7 @@ async function seed(): Promise<void> {
       dogId: SEED.dogBrodieId,
       isLead: true,
       attendance: 'attended',
-      checkedInAt: weekdayFromNow(-12, 14),
+      checkedInAt: dayProgramStartFromNow(-12),
       checkedInByStaffId: SEED.staffShanthiId,
     },
     {
@@ -877,7 +880,7 @@ async function seed(): Promise<void> {
       dogId: SEED.dogOllieId,
       isLead: true,
       attendance: 'attended',
-      checkedInAt: weekdayFromNow(-8, 14),
+      checkedInAt: dayProgramStartFromNow(-8),
       checkedInByStaffId: SEED.staffShanthiId,
     },
   ]);

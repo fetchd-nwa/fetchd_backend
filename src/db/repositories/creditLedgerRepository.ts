@@ -45,9 +45,9 @@ export interface LiveExpiringLot {
  * (`creditsRepository.findExpiringLots`) and the expiry-warning scan; debit
  * selection has its own priority order — see `findNextDebitLot`.
  *
- * Polymorphic runner: pass the booking Tx to see in-tx debits under the
- * (dog,mode,location) advisory lock (so a multi-debit loop walks the lots
- * correctly); pass the pool `db` for the public read.
+ * Polymorphic runner: pass the booking Tx to see in-tx debits under the dog
+ * lock (`withDogLocks`, keyed on the dog alone, so a multi-debit loop walks the
+ * lots correctly); pass the pool `db` for the public read.
  */
 export async function findLiveExpiringLots(
   runner: Tx | typeof db,

@@ -12,6 +12,7 @@ import {
   creditLedger,
   creditPackages,
   dayCapacity,
+  dayProgramSettings,
   dogCompletedClasses,
   dogFeeding,
   dogMedications,
@@ -827,33 +828,30 @@ export async function seedFixture(): Promise<void> {
     },
   ]);
 
-  // Day-5b: per-location day_capacity overrides. Default rule (weekend
-  // closed, weekday 3/3) lives in `lib/availability.ts` — these two rows
-  // exercise the two override branches:
-  //   - 2026-05-17 (Sun) OPEN as a special-event day (school 2 + daycare 1)
-  //   - 2026-05-19 (Tue) CLOSED for a staff offsite (0/0)
+  // Day-5b: per-location day_capacity overrides. The rule they sit over (an
+  // open weekday gets the campus's daily cap, anything else 0) lives in
+  // `lib/availability.ts` — these two rows exercise the two override branches:
+  //   - 2026-05-17 (Sun) OPEN as a special-event day (3 seats)
+  //   - 2026-05-19 (Tue) CLOSED for a staff offsite (0 seats)
   // Bentonville has no overrides so its snapshot exercises pure defaults.
   await db.insert(dayCapacity).values([
     {
       location: 'fayetteville',
       date: '2026-05-17',
-      schoolOpenings: 2,
-      daycareOpenings: 1,
+      capacityDogs: 3,
     },
     {
       location: 'fayetteville',
       date: '2026-05-19',
-      schoolOpenings: 0,
-      daycareOpenings: 0,
+      capacityDogs: 0,
     },
     // Soft-expired override: a "closed-Fri" override that was withdrawn.
     // `live(dayCapacity)` filters it out → /availability for 2026-05-22
-    // emits the default (3/3 weekday) instead of the expired override (0/0).
+    // emits the rule (an open Friday) instead of the expired override (0).
     {
       location: 'fayetteville',
       date: '2026-05-22',
-      schoolOpenings: 0,
-      daycareOpenings: 0,
+      capacityDogs: 0,
       expiredAt: '2026-05-01T12:00:00Z',
     },
   ]);
@@ -1725,6 +1723,46 @@ export async function clearInvoiceChargeAttempts(): Promise<void> {
   await db.delete(invoiceChargeAttempts);
 }
 
+/** The three services `POST /requests` takes, each seeded off at both campuses. */
+const REQUEST_SERVICES = ['boarding', 'board-and-train', 'private-lesson'] as const;
+
+/**
+ * The one way a test switches the request services (P13 ruling (f)). The schema
+ * seeds them off, so `POST /requests` answers `service_not_offered` until one is
+ * on, and every test that posts a request calls this with `true` first and `false`
+ * after. Pass `only` to move one campus or one service.
+ *
+ * `false` writes the seed, not a saved copy of the document: a run that dies
+ * between the two calls leaves them on, and a snapshot taken by the next run would
+ * then restore "on" for good.
+ */
+export async function setRequestServicesOffered(
+  offered: boolean,
+  only: {
+    location?: 'fayetteville' | 'bentonville';
+    services?: readonly (typeof REQUEST_SERVICES)[number][];
+  } = {},
+): Promise<void> {
+  const rows = await db
+    .select({ location: dayProgramSettings.location, offerings: dayProgramSettings.offerings })
+    .from(dayProgramSettings)
+    .where(
+      only.location === undefined
+        ? isNotNull(dayProgramSettings.location)
+        : eq(dayProgramSettings.location, only.location),
+    );
+  for (const row of rows) {
+    const offerings = structuredClone(row.offerings) as Record<string, { offered: boolean }>;
+    for (const service of only.services ?? REQUEST_SERVICES) {
+      (offerings[service] as { offered: boolean }).offered = offered;
+    }
+    await db
+      .update(dayProgramSettings)
+      .set({ offerings })
+      .where(eq(dayProgramSettings.location, row.location as 'fayetteville' | 'bentonville'));
+  }
+}
+
 export async function teardownFixture(): Promise<void> {
   // Day-16: scheduled_notifications must drop BEFORE notifications —
   // the FK `emitted_notification_id → notifications.id` has no ON DELETE
@@ -1905,8 +1943,8 @@ export async function teardownFixture(): Promise<void> {
 
 /**
  * YYYY-MM-DD for the `nth` weekday strictly after FIXTURE_TODAY (n=0 is the
- * next weekday). Booking-surface tests want weekdays because the default
- * `day_capacity` for weekends is {school:0, daycare:0} (closed) — a weekend
+ * next weekday). Booking-surface tests want weekdays because a weekend is
+ * unticked in `open_weekdays_list` as seeded, so its cap is 0 — a weekend
  * date 422s on insufficient_capacity before the behavior under test runs.
  * Extracted 2026-07-15 (the 6th per-file copy tripped the duplication bar);
  * booking-payg keeps its local dual-anchor variant (it also derives weekdays

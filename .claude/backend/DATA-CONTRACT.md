@@ -741,15 +741,16 @@ Six pieces ship together; all are additive or doc-only (no R1-R8 change).
 
 1. **POST /bookings body — pinned from §C's `dates[]` placeholder.**
    `{ category: 'day-school'|'day-care', lead_dog_id, additional_dog_ids?,
-dates: 'YYYY-MM-DD'[], dropoff_time?: 'HH:MM', location:
-'fayetteville'|'bentonville', notes? }`. Returns 201 + `BookingWire[]`
-   (one per date, ASC). `dates[]` is `string[]` for now — per-date
-   `{date, dropoff_time}` objects added when a real use case demands;
-   today the top-level `dropoff_time` applies to every date in the
-   request. Limits: `dates.length ∈ [1, 30]`, all distinct, all
-   today-or-future in America/Chicago, all within 92-day lookahead
-   (matches GET /availability cap). Up to 5 dogs per request. Idempotency-
-   Key required (per the GLOBAL IDEMPOTENCY rule). Other service
+dates: 'YYYY-MM-DD'[], location: 'fayetteville'|'bentonville', notes? }`.
+   Returns 201 + `BookingWire[]` (one per date, ASC). No arrival time is
+   asked (wire 4.0.0-lg3.1): each session starts at the campus's
+   `day.dropoff_open_time`. Limits: `dates.length ∈ [1, 30]`, all distinct,
+   all today-or-future in America/Chicago, none past the booking horizon
+   (`day.booking_horizon_months` calendar months, 422
+   `beyond_booking_horizon`). At most `day.max_dogs_per_booking_count` dogs
+   per booking. Idempotency-Key required (per the GLOBAL IDEMPOTENCY rule). A
+   refusal that reads a clock or a setting runs after the idempotency claim, so
+   a replay gets its stored 201. Other service
    categories use different endpoints — group-class via POST /enrollments
    (Day 11), B&T/boarding/private-lesson/evaluation via the
    pending-request flow (Day 12).
@@ -778,9 +779,10 @@ missing: { document_key, label }[] }`.
    - `insufficient_credits` — at least one (dog, mode) would go
      negative. `details: { kind, gaps: { dog_id, mode, balance,
 required }[] }`.
-   - `insufficient_capacity` — `(location, date, mode)` day-program
-     capacity is exhausted for the requested count. `details: { kind,
-  location, date, mode, openings_remaining, requested }`.
+   - `insufficient_capacity` — `(location, date)` day-program capacity,
+     one cap across day school and daycare, is exhausted for the
+     requested count. `details: { kind, location, date,
+  openings_remaining, requested }`.
      Gates fire in priority order (payment → vaccine → agreement); first
      failure aborts with full WITHIN-gate detail. Multi-gate consolidation
      (one error carrying multiple `kind` arms) is a deferred refinement;
@@ -801,18 +803,17 @@ required }[] }`.
      the default rule).
 
 6. **`scheduled_at` composition for day programs lives in
-   `src/lib/bookingSchedule.ts`** — combines the body's `dropoff_time`
-   (default 07:30, must be within `DAY_PROGRAM_DROPOFF_WINDOW` 07:30-09:00
-   inclusive) with `chicagoWallTimeToUtc` so the create-side date math
+   `src/lib/bookingSchedule.ts`** — the campus's `day.dropoff_open_time` on
+   the date, through `chicagoWallTimeToUtc`, so the create-side date math
    matches the read-side bucket math (`lib/bookingBucket.sessionEndTime`)
-   exactly. Per the §B Booking Δ 2026-05-20 — `scheduled_at` for
-   day-school / day-care IS the user-authored drop-off time.
+   exactly. `scheduled_at` for day-school / day-care is when the campus opens,
+   never an owner's arrival time (§B Booking Δ 2026-11-04).
 
 **DST fix in `chicagoWallTimeToUtc` (latent Day-3b bug, surfaced by
 Day-10's drop-off window).** The prior two-probe Math.max heuristic
 returned the WRONG UTC for spring-forward day wall times in the
 post-jump-but-pre-naive-UTC-catch-up window (~03:00-07:59 wall), which
-overlaps the day-program drop-off window (07:30-08:00 specifically).
+holds the seeded day start, 07:30.
 Replaced with fixed-point iteration on the offset Chicago has at the
 candidate UTC; converges in 1-2 iterations on every normal day,
 oscillates on the spring-forward gap (resolved by Math.max as a
@@ -1168,8 +1169,9 @@ focus?:{staff_preference?,descriptor_keys?}, length_weeks? }`. Returns 201 +
    - **private-lesson + boarding:** `length_weeks` MUST be omitted (B&T-only
      field per §B).
    - All categories: dogs distinct (lead not in additionals); preferred_dates
-     1-3 distinct ISO timestamps, future, within 92-day lookahead (matches
-     POST /bookings + GET /availability caps).
+     1-3 distinct ISO timestamps, future, none past the booking horizon (422
+     `beyond_booking_horizon`, the POST /bookings rule). The service must be
+     offered at the family's home campus (422 `service_not_offered`).
      Idempotency-Key required. Empty-string scalars normalize to null at the
      trust boundary (omit-on-null wire round-trip).
 
@@ -2535,8 +2537,8 @@ primaryVet?, otherVaccines? }`, each bool; omit when empty). Staff-set,
   `cancel_forfeited` (true = cancelled past the free-cancel window → no
   refund). All optional; existing FE `toBooking` ignores unknown keys.
 - Δ 2026-05-20 (Day 5): runtime bucketing **server-side**, by category:
-  day-school / day-care → end-of-day-program window in America/Chicago
-  (`DAY_PROGRAM_PICKUP_WINDOW.close = 17:30`); boarding / board-and-train →
+  day-school / day-care → the campus's `day.pickup_close_time` in
+  America/Chicago, computed at read time; boarding / board-and-train →
   `pickup_at` (NULL = stay not yet approved → indefinite-upcoming until
   Day-12 sets it); group-class / private-lesson / evaluation →
   `scheduled_at + duration_minutes` with per-category fallback (50 / 60 /
@@ -2546,15 +2548,12 @@ primaryVet?, otherVaccines? }`, each bool; omit when empty). Staff-set,
   `cancelled_at`, `cancel_forfeited` are OMITTED when null/false (Day-4a
   optional convention); `cancel_forfeited` is always-emitted-as-boolean only
   when the booking is cancelled.
-- Δ 2026-05-20 (Day 5): `scheduled_at` for **day-school / day-care** is the
-  user-authored drop-off time anywhere within the drop-off window (`DAY_PROGRAM_DROPOFF_WINDOW = 07:30 → 09:00` America/Chicago); pick-up
-  is anywhere within the pick-up window (`16:30 → 17:30`). The booking has
-  no `pickup_at` for day programs — parents arrive when they arrive, and
-  the booking is considered active until the pick-up window closes. Windows
-  assumed identical across both locations until per-location windows are
-  modeled (deferred). Existing FE constants
-  (`bookingService.DAY_PROGRAM_PICKUP_HOUR = 17`) are off by 30 min vs. the
-  actual rule — corrected on Day 18 FE swap.
+- Δ 2026-11-04 (wire 4.0.0-lg3.1): `scheduled_at` for **day-school / day-care**
+  is the campus's `day.dropoff_open_time` on the date; no arrival time is
+  asked, and `dropoff_time` left `POST /bookings`. The booking has no
+  `pickup_at` for day programs — parents arrive when they arrive, and the
+  booking is active until the campus's `day.pickup_close_time`. Both times
+  are per campus, in `GET /settings`.
 
 **PendingRequest** — `{ id, dog_id, additional_dog_ids?, category, submitted_at, preferred_dates:[iso], notes?:{per_dog?,joint?}, focus:{staff_preference?,descriptor_keys?}, length_weeks?, status, approved_at?, converted_booking_id? }`
 
@@ -2626,33 +2625,25 @@ mode, remaining, expires_at }]` — the dog's LIVE expiring lots (count + lapse
   on the same window as the server's `credits-expiring` push. Additive; the
   FE falls back to its client-side 60-day default when absent (mock mode).
 
-**DayCapacity** — `{ location, date:'YYYY-MM-DD', school_openings, daycare_openings,
-school_remaining, daycare_remaining }`.
-API applies the **per-location** business rule (weekend=closed, default 3)
-over sparse `day_capacity` overrides now keyed `(location, date)`. Δ
-2026-05-19: `location` added; availability queries take `&location=`. The
-FE/`availabilityService` rule moves server-side or stays in the ported
-service; the wire shape is otherwise unchanged.
+**DayCapacity** — `{ location, date:'YYYY-MM-DD', capacity_dogs, remaining_dogs }`.
+One cap per `(location, date)`, shared by day school and daycare (wire
+4.0.0-lg3.1). The API applies the campus's rule: an open weekday in
+`day.open_weekdays_list` gets `day.daily_capacity_dogs`, any other date 0, and a
+live `day_capacity` row overrides either. Staff set a date with
+`PUT /staff/day-capacity/:location/:date` and withdraw it with `DELETE`.
 
-- Δ 2026-05-20 (Day 5): rule moved server-side. `GET /availability?from=&to=&mode=&location=`
-  emits one `DayCapacity` row per calendar date in `[from, to]` for the
-  given `location`. `mode` (school/daycare) does **not** filter — both
-  `school_openings` and `daycare_openings` are always emitted; the FE
-  selects which to display. Default rule fires when no override row exists.
-  Range cap: **92 dates (≈3 months)** — locked Day 5b per the FE's "book
-  up to 3 months in advance" requirement; larger windows return 422
-  `invalid_payload`. Reversed bounds (`to < from`) also 422
-  `invalid_payload`. The 60-day prior estimate was superseded.
+- `GET /availability?from=&to=&location=` emits one `DayCapacity` row per
+  calendar date in `[from, to]` for the given `location`. The range cap follows
+  `day.booking_horizon_months` (`availabilityMaxDates`, months × 31 + 1), so a
+  window from today through the horizon's last date always fits; larger windows
+  return 422 `invalid_payload`. Reversed bounds (`to < from`) also 422
+  `invalid_payload`. A stale client's `mode=` is dropped, not refused.
 
-- Δ 2026-08-25 (wire 1.13.0 fix round): **additive** `school_remaining` /
-  `daycare_remaining` (both required ints) — Allison's §6-batch decision #3,
-  option C, approved 2026-08-24. `*_remaining` = the day's configured
-  openings minus the live booked seats for `(location, date, mode)`, floored
-  at 0. `*_openings` keeps its existing meaning (the CONFIGURED cap), which
-  is what makes this minor rather than major; option B — redefining
-  `*_openings` as remaining — was rejected for exactly that reason. All four
-  columns always emit; `mode` still does not filter.
-  **`*_remaining` is ADVISORY**: it is read outside any booking lock, so a
+- `remaining_dogs` = `capacity_dogs` minus every live client booking dog on that
+  date at that campus, day school and daycare together, floored at 0.
+  Allison's §6-batch decision #3, option C, approved 2026-08-24, as combined by
+  4.0.0-lg3.1. Evaluations are not in the count yet (P10, P11).
+  **`remaining_dogs` is ADVISORY**: it is read outside any booking lock, so a
   concurrent booking stales it. `dayCapacityRepository.assertCapacityWithinLock`
   inside the booking transaction stays authoritative and its 422
   `insufficient_capacity` is still the truth at write time — the field exists
@@ -2660,9 +2651,8 @@ service; the wire shape is otherwise unchanged.
   count is deliberately **uncached** (the `avail:{location}:*` range cache is
   invalidated by `day_capacity` writes only, so caching the count would
   reintroduce the same falsehood as staleness). Pinned by
-  `test/contracts/availability.test.ts` (snapshots + full-day + floor cases),
-  which retires the phase-3 "configured, not remaining" test debt item by
-  superseding it.
+  `test/contracts/availability.test.ts` and
+  `test/contracts/day-capacity-combined.test.ts`.
 
 **CreditPackage** (Δ 2026-05-20, Day 5) — `{ key, mode, credits, price_cents, label, is_popular }`.
 `GET /credit-packages` filters to `active = true` server-side (retired packs
@@ -2818,7 +2808,8 @@ invisible to the repository layer.
 
 **Availability & credits**
 
-- `GET /availability?from=&to=&mode=&location=` — per-location capacity (weekend/default rule server-side)
+- `GET /availability?from=&to=&location=` — per-campus capacity (the campus's rule, server-side)
+- `PUT` / `DELETE /staff/day-capacity/:location/:date` [staff] — one date's cap (4.0.0-lg3.1)
 - `GET /dogs/:id/credits` — ledger balance per mode · `GET /credit-packages`
 - `POST /credit-purchases` [$] — Stripe charge → credit_ledger
 - `GET /rates?category=&location=` — current effective `service_rates` (effective-dated; the API resolves the active window)
@@ -3112,8 +3103,8 @@ LOCKED`; `dedupe_key` makes enqueue idempotent (#8).
   `events.series_id` NULL = one-off. RSVPs attach to the occurrence so per-week
   and past attendance are real data, not derived from one mutated row.
 - **Business timezone (#6) = America/Chicago.** Instants stored UTC; ALL
-  business-day math (day_capacity, 8am/5pm window, today/tomorrow, 24h
-  reminder) computed in America/Chicago. Contract invariant — never bucket a
+  business-day math (day_capacity, the campus day's open and close, today/tomorrow,
+  24h reminder) computed in America/Chicago. Contract invariant — never bucket a
   calendar day off a raw UTC timestamp.
 - **FE impact:** none. The API filters `expired_at`; repository `toX()` shapes
   are unchanged. `Dog.owner_id` is null only for staff dogs, which the owner

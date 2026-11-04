@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   agreementUnsignedError,
+  beyondBookingHorizonError,
+  capacityBelowBookedError,
   gateTriggerErrorToApiError,
   insufficientCapacityError,
   insufficientCreditsError,
@@ -103,11 +105,10 @@ test('insufficientCreditsError throws on empty gaps[]', () => {
   assert.throws(() => insufficientCreditsError([]), /gaps array must be non-empty/);
 });
 
-test('insufficientCapacityError carries location/date/mode/remaining/requested', () => {
+test('insufficientCapacityError carries location/date/remaining/requested, and no mode', () => {
   const err = insufficientCapacityError({
     location: 'fayetteville',
     date: '2026-06-15',
-    mode: 'school',
     openings_remaining: 1,
     requested: 3,
   });
@@ -117,22 +118,33 @@ test('insufficientCapacityError carries location/date/mode/remaining/requested',
     kind: 'insufficient_capacity',
     location: 'fayetteville',
     date: '2026-06-15',
-    mode: 'school',
     openings_remaining: 1,
     requested: 3,
   });
-  assert.match(err.message, /Day School is full on 2026-06-15 at fayetteville/);
+  assert.match(err.message, /2026-06-15 at fayetteville is full/);
+  assert.doesNotMatch(err.message, /Day School|Day Care/);
 });
 
-test('insufficientCapacityError uses Day Care label when mode=daycare', () => {
-  const err = insufficientCapacityError({
-    location: 'bentonville',
-    date: '2026-06-16',
-    mode: 'daycare',
-    openings_remaining: 0,
-    requested: 1,
+test('beyondBookingHorizonError: 422, no details, names the date and the last one', () => {
+  const err = beyondBookingHorizonError('2026-08-20', '2026-08-19');
+  assert.equal(err.code, 'beyond_booking_horizon');
+  assert.equal(err.status, 422);
+  assert.equal(err.details, undefined);
+  assert.match(err.message, /2026-08-20.*2026-08-19/);
+});
+
+test('capacityBelowBookedError: 422 with every date, as given', () => {
+  const err = capacityBelowBookedError(['2026-10-23', '2026-10-30']);
+  assert.equal(err.code, 'capacity_below_booked');
+  assert.equal(err.status, 422);
+  assert.deepEqual(err.details, {
+    kind: 'capacity_below_booked',
+    dates: ['2026-10-23', '2026-10-30'],
   });
-  assert.match(err.message, /Day Care is full on 2026-06-16 at bentonville/);
+});
+
+test('capacityBelowBookedError throws on no dates: the wire says never empty', () => {
+  assert.throws(() => capacityBelowBookedError([]), /dates must be non-empty/);
 });
 
 // ──────────────────────────────────────────────────────────────────────────

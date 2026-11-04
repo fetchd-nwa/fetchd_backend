@@ -12,6 +12,104 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [4.0.0-lg3.1] — 2026-11-04
+
+BREAKING. LG3's first step, step 1 of 3 toward 4.0.0 (plan unit P13, slice S18,
+ledger DAY-U05, DAY-U04, DAY-U10, DAY-U11, DAY-U07; migration M3.01; design §1.1
+4.0.0, `designs/fetchd-v1-technical-design.md:849-960`; §2.3 `:2305-2353`; §2.6
+`:3714-3731`). Contract-first: the routes keep today's behaviour until P13's
+backend lands them and M3.01. Resync both clients (`npm run sync:contracts` in
+mobile and portal). Against the resynced copy (a scratch run at their HEADs, not
+their gates) the portal typechecks unchanged. The mobile app fails in
+`availabilityRepository.ts` (`:46`, `:47`, `:51`, `:52`) and
+`bookingRepository.ts:693` until P13's mobile builder lands.
+
+Breaking:
+
+- `DayCapacityWire`: `school_openings`, `daycare_openings`, `school_remaining`
+  and `daycare_remaining` become `capacity_dogs` and `remaining_dogs`: one cap
+  per (location, date), combined across day school and daycare (DAY-U05). The
+  rule replaces the 3/3 weekday and closed-weekend default: open weekday in
+  `day.open_weekdays_list` → `day.daily_capacity_dogs`; else 0; a `day_capacity`
+  row overrides either. Remaining is the cap minus every live client booking dog
+  on that date at that campus. Evaluations are not in the count yet (P10, P11).
+- `CapacityGap`, and so `InsufficientCapacityDetails`, lose `mode`: keyed
+  (location, date). `openings_remaining` keeps its name.
+- `GetAvailabilityQuery.mode` is removed. The route's query schema is not
+  `.strict()`, so a stale client still sending `mode=` is not refused.
+- `PostBookingsRequest.dropoff_time` is removed, and with it the drop-off window
+  refusal (DAY-U11). Each session's `scheduled_at` is the campus's
+  `day.dropoff_open_time` on its date, so the cancel deadline and the reminders
+  move with it (DAY-71). The body is `.strict()`, so a client still sending the
+  key gets 400 `bad_request`.
+
+Added:
+
+- `'program_not_offered'` (DAY-U04), `'same_day_cutoff_passed'`,
+  `'beyond_booking_horizon'` (DAY-U10), `'capacity_below_booked'` (DAY-U07) and
+  `'service_not_offered'` (design-added, design §1.1:936, §2.6:3727; question 2)
+  appended to `ApiErrorCode` and `API_ERROR_CODES`, each 422 in
+  `API_ERROR_STATUS`. Only `capacity_below_booked` carries `details`.
+- `CapacityBelowBookedDetails {kind: 'capacity_below_booked'; dates: string[]}`,
+  in `ApiErrorDetailWire` and `PatchStaffSettingsErrorDetails`.
+- `PUT /staff/day-capacity/:location/:date` (`PutStaffDayCapacityRequest
+  {capacity_dogs}`, an upsert that re-opens a withdrawn date) and `DELETE` to
+  withdraw (DAY-U07). Both answer 200 with the date's resulting
+  `DayCapacityWire`, take an `Idempotency-Key`, are open to any staff role at
+  either campus, and can answer 422 `capacity_below_booked`. A `DELETE` that
+  finds no live override changes nothing and is still 200.
+- `SettingValueSpecWire`'s `record` arm gains `fixed?: Record<string, string>`,
+  so the manifest serves what the PATCH already enforces. A key named there is
+  shown read-only at that value, and a PATCH naming another is 422
+  `invalid_payload`. It closes the editor drawing `asked` for the sign-up map's
+  `email` (P05 review, Fable N4).
+
+Changed (a route answers something new, no shape change):
+
+- `POST /bookings` answers `program_not_offered`, `same_day_cutoff_passed` and
+  `beyond_booking_horizon`, none with `details`. A date past the horizon was
+  `invalid_payload`.
+- `POST /requests` answers `service_not_offered` and `beyond_booking_horizon`,
+  and `PATCH /requests/:id` `beyond_booking_horizon`, none with `details`. A
+  request names no campus, so `service_not_offered` reads the family's home
+  campus; a family with none is refused only when no campus offers the service.
+- `POST /enrollments` answers `beyond_booking_horizon`, no `details`, on the
+  cohort's first session, with or without `allow_partial`.
+- `PATCH /staff/settings/day/:location` answers `capacity_below_booked` when it
+  lowers `daily_capacity_dogs` or unticks a weekday from `open_weekdays_list`
+  under a booked date (refusal step 5).
+
+Changed (doc only; no shape change):
+
+- `PostBookingsRequest`: the 92-day lookahead and the 5-dog bound leave the doc;
+  both are read at runtime from `day.booking_horizon_months` and
+  `day.max_dogs_per_booking_count` (DAY-U10). The 1..30 dates bound stays
+  `MAX_DATES_PER_REQUEST`, a constant. The horizon is calendar months, not 92
+  days, and the doc defines the reckoning once.
+- `PostBookingsRequest`: a Zod failure, an unknown key included, is 400
+  `bad_request`. The doc said 422.
+- `GetAvailabilityQuery`: the date cap follows `day.booking_horizon_months`, so
+  a window from today through the horizon's last date always fits. No fixed
+  number is stated.
+- `PostRequestsRequest`: the 92-day lookahead leaves the doc.
+- `BookingMode`, `CohortFullDetails`, `PostBookingsErrorDetails`,
+  `PostRequestsErrorDetails` and the `insufficient_capacity` comment no longer
+  name a mode on capacity or leave out the new refusals.
+- Every `.ts:NNN` cite in § bookings (36 lines) and its three `schema.sql:NNN`
+  cites now name symbols. The build keeps moving those files (build DECISIONS
+  120, 121(f)).
+- `API_ERROR_STATUS` no longer counts its codes; `GetStaffBookingsQuery` says a
+  route body's cross-field rules use `invalid_payload`, since a Zod failure there
+  is 400; two `bookingErrors.ts` and three `routes/enrollments.ts` cites stop
+  naming lines that moved.
+- `WIRE_CONTRACT_VERSION` `'3.0.0'` → `'4.0.0-lg3.1'`. Its doc gains LG3's steps,
+  and no longer says every design label above 3.0.0 reads one major up: that
+  starts at 6.1.0 (build DECISIONS 6, plan.json `wire_label_map`).
+
+Not typed here: `OrderWire`, `PostBookingsResponse`, `order_id`, the `payment`
+object and every other design 4.0.0 item of S19–S22 (P15, P16). Evaluations in
+the seat count (P10, P11).
+
 ## [3.0.0] — 2026-11-03
 
 BREAKING. LG2's close, and the end of M1's part of design 3.0.0 (plan unit P12,

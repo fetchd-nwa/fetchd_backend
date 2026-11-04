@@ -1,5 +1,5 @@
-import { and, eq, sql } from 'drizzle-orm';
-import { bookingMode, cohorts, dayCapacity, events, type LocationKey } from './schema/schema.js';
+import { eq, sql } from 'drizzle-orm';
+import { bookingMode, cohorts, events, type LocationKey } from './schema/schema.js';
 import type { Tx } from './tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
@@ -47,7 +47,8 @@ export async function withServiceRateLock<T>(
  * Key: `hashtext('membership:<dogId>:<mode>')`. The prefix keeps this
  * namespace disjoint from the booking (`dog:<dogId>`) and
  * `service-rate:` locks; int4 hash collisions only cause spurious
- * serialization, never incorrect behavior.
+ * serialization, never incorrect behavior. The key is a string, so `dogId` must
+ * be the lowercased id: `POST /memberships` normalises it at its parse boundary.
  */
 export async function withMembershipCreateLock<T>(
   tx: Tx,
@@ -103,39 +104,6 @@ export async function lockEvent(
 }
 
 /**
- * Row-lock the `(location, date)` day-capacity row for the duration of the
- * transaction — the `bookSession` Day-School/Care openings primitive
- * (`schema.sql` Transaction contract notes, `bookSession` ~line 1306).
- * Returns the locked row so the caller can read `school_openings` /
- * `daycare_openings` against the booking mode and assert remaining capacity
- * before INSERTing the booking + decrementing the column.
- *
- * `undefined` if no override row exists for `(location, date)` — the
- * schema's design is that day_capacity is SPARSE (rows are overrides),
- * with a per-location default rule the API applies when no row is present.
- *
- * Day 10 superseded primitive: the day-program booking path uses
- * `withCapacityLock` + `dayCapacityRepository.assertCapacityWithinLock`
- * instead (advisory lock + count-against-default), which serializes
- * cleanly without materializing default-rule rows in the sparse table.
- * `lockDayCapacity` stays available for callers that genuinely want the
- * row-lock semantic (e.g., Day-19 staff-portal override edits where the
- * row's *existence* IS the lock target).
- */
-export async function lockDayCapacity(
-  tx: Tx,
-  location: LocationKey,
-  date: string,
-): Promise<typeof dayCapacity.$inferSelect | undefined> {
-  const [row] = await tx
-    .select()
-    .from(dayCapacity)
-    .where(and(eq(dayCapacity.location, location), eq(dayCapacity.date, date)))
-    .for('update');
-  return row;
-}
-
-/**
  * Day 10 capacity serializer — advisory lock on `(location, date)` for the
  * day-program booking path. Held for the lifetime of the transaction;
  * concurrent `bookSession` calls touching the same calendar bucket serialize
@@ -149,13 +117,10 @@ export async function lockDayCapacity(
  *   relies on (a `day_capacity` row stops being an unambiguous override
  *   signal once we start writing default-value rows alongside).
  * - The advisory lock doesn't care whether a row exists. The capacity
- *   computation reads the override row OR falls back to the default rule
- *   under the same lock — symmetric with the read-side
- *   `defaultDayCapacity` fallback.
- * - The Day-19 staff portal will write `day_capacity` overrides; it
- *   should ALSO acquire this advisory lock so a concurrent booking
- *   assertion sees the staff write atomically. Documented at the call
- *   site when Day-19 lands.
+ *   computation reads the override row OR falls back to the campus's rule
+ *   under the same lock, through the one `dayCapacityFor` the read side uses.
+ * - The cap edits (`lib/capLowering.ts`) take this same lock, so a booking
+ *   and a staff write serialise on it: `withCapacityLocks`, below.
  *
  * Lock key: `hashtext('capacity:<location>:<date>')`. The colon separator
  * makes "no two different (location, date) pairs collide" structurally
@@ -165,11 +130,12 @@ export async function lockDayCapacity(
  * serialization (never incorrect behavior).
  *
  * Day-10 lock ordering protocol (deadlock avoidance): when a single
- * transaction acquires multiple capacity locks (multi-date booking),
- * caller MUST acquire them in ASC date order. Combined with
- * `withDogLocks`'s ASC dogId ordering, two concurrent
- * multi-key bookings can never deadlock — both observe the same
- * total acquisition order.
+ * transaction acquires multiple capacity locks (a multi-date booking, a cap
+ * edit that lowers many dates), it MUST acquire them in ASC date order.
+ * Combined with `withDogLocks`'s ASC dogId ordering, two concurrent
+ * multi-key writers can never deadlock — both observe the same total
+ * acquisition order. An advisory transaction lock cannot be released before
+ * COMMIT, so a multi-date holder holds every date it has taken.
  */
 export async function withCapacityLock<T>(
   tx: Tx,
@@ -182,12 +148,12 @@ export async function withCapacityLock<T>(
 }
 
 /**
- * Day 10 batch helper for the multi-date `bookSession` path. Acquires
- * `withCapacityLock` for every `(location, date)` pair in canonical ASC
- * date order so two concurrent N-date bookings on overlapping date sets
- * can never deadlock against each other — both observe the same total
- * acquisition order. Single-date is a no-overhead degenerate of this
- * helper (one lock acquired).
+ * Batch helper for every multi-date holder: the `bookSession` path and the
+ * cap-lowering check. Acquires `withCapacityLock` for every `(location, date)`
+ * pair in canonical ASC date order so two concurrent N-date writers on
+ * overlapping date sets can never deadlock against each other — both observe
+ * the same total acquisition order. Single-date is a no-overhead degenerate of
+ * this helper (one lock acquired).
  */
 export async function withCapacityLocks<T>(
   tx: Tx,
@@ -212,8 +178,11 @@ export async function withCapacityLocks<T>(
  * choice and the overlap guard, so the `credit_ledger` debit can't race any of
  * them. Held until the outer transaction commits OR rolls back.
  *
- * The key is the dog alone, `hashtext('dog:<dogId>')`; the prefix keeps it
- * disjoint from the file's other namespaces. A dog is in one place on a day, so
+ * The key is the dog alone, `hashtext('dog:<dogId>')`, and `<dogId>` is the
+ * lowercased id. The key is a string and Postgres reads a uuid in either case, so
+ * this function trusts its caller to have normalised: `POST /bookings` does it at
+ * the parse boundary (`postBookingBodySchema`). The prefix keeps the key disjoint
+ * from the file's other namespaces. A dog is in one place on a day, so
  * the overlap guard reads her bookings across every mode and campus, and any two
  * bookings for her must be able to see each other. A key carrying the campus or
  * the mode lets two concurrent requests both pass the guard, and each spends a

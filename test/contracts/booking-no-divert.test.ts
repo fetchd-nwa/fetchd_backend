@@ -31,6 +31,7 @@ import {
   SKIP_WHEN_NO_DB,
   makeContractApp,
   registerFixtureHooks,
+  registerRequestServicesOn,
 } from './_harness.js';
 
 /**
@@ -77,6 +78,7 @@ after(async () => {
 });
 
 registerFixtureHooks();
+registerRequestServicesOn();
 
 function ownerApp(): ReturnType<typeof makeContractApp>['app'] {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
@@ -325,13 +327,13 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const dogId = await createTestDog();
-    await topUpCredits(dogId, 'daycare', 5);
+    await topUpCredits(dogId, 'daycare', 5, 'bentonville');
 
     const res = await postBooking(ownerApp(), {
       category: 'day-care',
       lead_dog_id: dogId,
       dates: [futureWeekday(23)],
-      location: 'fayetteville',
+      location: 'bentonville',
     });
     await assertBookedAtOnce(res, dogId);
   },

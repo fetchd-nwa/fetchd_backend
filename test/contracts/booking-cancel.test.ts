@@ -738,12 +738,12 @@ test(
     const { app } = cancelApp();
     const date = futureWeekday(9);
     // Drive day_capacity to a 1-seat ceiling at this date so the cancel
-    // → re-book sequence is observable. The default rule is 3/3; the
-    // override below shrinks it to 1/1 just for this calendar day.
+    // → re-book sequence is observable. The override below shrinks the
+    // campus's cap to 1 just for this calendar day.
     await db.execute(sql`
-      INSERT INTO day_capacity (location, date, school_openings, daycare_openings)
-      VALUES ('fayetteville', ${date}::date, 1, 1)
-      ON CONFLICT (location, date) DO UPDATE SET school_openings = 1, daycare_openings = 1
+      INSERT INTO day_capacity (location, date, capacity_dogs)
+      VALUES ('fayetteville', ${date}::date, 1)
+      ON CONFLICT (location, date) DO UPDATE SET capacity_dogs = 1
     `);
 
     // Step 1: book the only seat.

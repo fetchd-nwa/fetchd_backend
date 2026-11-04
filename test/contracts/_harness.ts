@@ -6,7 +6,12 @@ import Fastify, { type FastifyInstance, type preHandlerHookHandler } from 'fasti
 import { registerAuth } from '../../src/auth/plugin.js';
 import type { Principal } from '../../src/auth/principal.js';
 import { closeRedis, redis } from '../../src/redis.js';
-import { FIXTURE_IDS, seedFixture, teardownFixture } from './_fixture.js';
+import {
+  FIXTURE_IDS,
+  seedFixture,
+  setRequestServicesOffered,
+  teardownFixture,
+} from './_fixture.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -113,6 +118,22 @@ export function registerFixtureHooks(): void {
       // cleanly. Closing here is local to this subprocess.
       await closeRedis();
     }
+  });
+}
+
+/**
+ * A test file that posts a request calls this once at module load (P13 ruling
+ * (f)): the schema seeds boarding, board-and-train and private lessons off, so
+ * `POST /requests` answers `service_not_offered` until they are on. The one door
+ * is `setRequestServicesOffered`, and `after` puts the seed back.
+ */
+export function registerRequestServicesOn(): void {
+  if (!DB_CONFIGURED) return;
+  before(async () => {
+    await setRequestServicesOffered(true);
+  });
+  after(async () => {
+    await setRequestServicesOffered(false);
   });
 }
 

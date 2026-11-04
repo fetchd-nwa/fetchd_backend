@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { PoolClient } from 'pg';
 import { db } from '../src/db/client.js';
-import { lockCohort, lockDayCapacity, withDogLocks } from '../src/db/locks.js';
+import { lockCohort, withDogLocks } from '../src/db/locks.js';
 import { pool } from '../src/db/pool.js';
 
 const dbConfigured = typeof process.env.DATABASE_URL === 'string';
@@ -104,10 +104,10 @@ test(
   },
 );
 
-// lockCohort / lockDayCapacity are typed wrappers around SELECT ... FOR
-// UPDATE — Postgres provides the locking semantic; these tests prove the
-// wrappers return the right shape (smoke), not that Postgres locks
-// correctly (that's Postgres's job, tested by Postgres).
+// lockCohort is a typed wrapper around SELECT ... FOR UPDATE — Postgres
+// provides the locking semantic; this test proves the wrapper returns the
+// right shape (smoke), not that Postgres locks correctly (that's Postgres's
+// job, tested by Postgres).
 
 test(
   'lockCohort returns undefined for a non-existent cohort id',
@@ -117,23 +117,6 @@ test(
     await assert.rejects(
       db.transaction(async (tx) => {
         const row = await lockCohort(tx, randomUUID());
-        assert.equal(row, undefined);
-        throw new Rollback();
-      }),
-      Rollback,
-    );
-  },
-);
-
-test(
-  'lockDayCapacity returns undefined when no override row exists for (location, date)',
-  { skip: dbConfigured ? false : 'DATABASE_URL not set' },
-  async () => {
-    class Rollback extends Error {}
-    await assert.rejects(
-      db.transaction(async (tx) => {
-        // A date deliberately far in the future — guaranteed no override row.
-        const row = await lockDayCapacity(tx, 'fayetteville', '2099-12-31');
         assert.equal(row, undefined);
         throw new Rollback();
       }),
