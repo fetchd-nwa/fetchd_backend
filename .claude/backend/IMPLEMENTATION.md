@@ -150,7 +150,7 @@ observable behavior, not "looks right."
   2026-05-19, schema.sql lines ~55-59)
 - **Goal:** Encode the concurrency + calendar half of the invariants so every
   Day-10+ txn day has them on tap.
-- **Work:** `withDogModeLock(dogId, mode, tx)` over
+- **Work:** `withDogLocks(tx, dogIds, fn)` (P12; was `withDogModeLock`) over
   `pg_advisory_xact_lock(hashtext(dog||mode))` (the booking serializability
   primitive — no double-spend under concurrent retries); `lockCohort(id, tx)`
   + `lockDayCapacity(location, date, tx)` `SELECT ... FOR UPDATE` helpers;
@@ -760,7 +760,7 @@ observable behavior, not "looks right."
 - **Handoff note:** the dog-write surface is now complete (top-level
   CRUD + GET-by-id from Day-9c + 7 nested endpoints from Day-9d).
   Day-10 (`bookSession` txn) is the next surface — composes
-  `withMutation` with `withDogModeLock` + `lockDayCapacity` +
+  `withMutation` with `withDogLocks` + `lockDayCapacity` +
   `credit_ledger` debit + the 3 booking gates (vaccine / agreement /
   payment). The Day-9d patterns Day-10 inherits: `parseOrThrow`
   (every parse in the new booking routes), `findOwnedExists` (the

@@ -49,7 +49,7 @@ export interface CreditLot {
  * Read-through cache for the `GET /dogs/:id/credits` display reads. This cache
  * is DISPLAY-ONLY: the authoritative balance check at booking time is
  * `creditLedgerRepository.balanceForDogInTx` (read inside the booking txn under
- * the dog-mode advisory lock), NOT this cache. So a missed invalidation can
+ * the dog advisory lock), NOT this cache. So a missed invalidation can
  * only ever show a briefly-stale number (TTL-bounded) — it can never permit an
  * overspend. Invalidated by every `credit_ledger` mutation via
  * `invalidatePattern(creditsInvalidationPattern(dogId))`: purchase (sync +

@@ -43,3 +43,46 @@ test(
     assert.ok(blank > 500 && blank < chars.length, `${blank} of ${chars.length} blank`);
   },
 );
+
+/**
+ * P12 item 0 (P05 Opus r2 nice 2). The test above walks whatever the class
+ * lists, so a range the class leaves out passes it. This one names the three
+ * Default_Ignorable ranges the class missed, and the visible code point on
+ * each side of them, so dropping a range goes red in both engines.
+ */
+test(
+  'P12 item 0: U+FFF0-FFF8, U+1BCA0-1BCA3 and U+E0080-E0FFF are blank in JavaScript and Postgres, and their outer neighbours are not',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const blank = [0xfff0, 0xfff8, 0x1bca0, 0x1bca3, 0xe0080, 0xe00ff, 0xe01f0, 0xe0fff];
+    const visible = [0xffef, 0x1bc9f, 0x1bca4, 0xe1000];
+    const chars = [...blank, ...visible].map((cp) => String.fromCodePoint(cp));
+    const rows = await db.execute<{ i: string; visible: boolean }>(
+      sql`SELECT i, ${visibleOrNull(sql`c`)} IS NOT NULL AS visible
+            FROM jsonb_array_elements_text(${JSON.stringify(chars)}::jsonb) WITH ORDINALITY AS t(c, i)`,
+    );
+    assert.equal(rows.rows.length, chars.length, 'Postgres saw every character');
+    const show = (cp: number): string => `U+${cp.toString(16).toUpperCase()}`;
+    const inSql = new Map(rows.rows.map((r) => [Number(r.i) - 1, r.visible]));
+    assert.deepEqual(
+      blank.filter((cp) => isNonBlank(String.fromCodePoint(cp))).map(show),
+      [],
+      'JavaScript reads these blanks as text',
+    );
+    assert.deepEqual(
+      blank.filter((_, i) => inSql.get(i) === true).map(show),
+      [],
+      'Postgres reads these blanks as text',
+    );
+    assert.deepEqual(
+      visible.filter((cp) => !isNonBlank(String.fromCodePoint(cp))).map(show),
+      [],
+      'JavaScript reads these visible characters as blank',
+    );
+    assert.deepEqual(
+      visible.filter((_, i) => inSql.get(blank.length + i) === false).map(show),
+      [],
+      'Postgres reads these visible characters as blank',
+    );
+  },
+);

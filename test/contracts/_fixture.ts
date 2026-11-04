@@ -1,4 +1,4 @@
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, notInArray, or } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   agreementDocuments,
@@ -119,10 +119,10 @@ export const FIXTURE_IDS = {
   booking8Id: '77777777-7777-4777-8777-777777777778',
   booking9Id: '77777777-7777-4777-8777-777777777779',
   bookingDstId: '77777777-7777-4777-8777-77777777777a',
-  // Δ 2026-07-14 staleness anchors: booking6 (dog1 past day-school) is marked
-  // ATTENDED on its roster row, and this past day-care gives dog2 the same —
-  // without a recent attended day program every POST /bookings in this suite
-  // would divert into the approval queue (Shanthi's 3-month re-eval rule).
+  // Ordinary past bookings: booking6 (dog1 past day-school) is marked ATTENDED
+  // on its roster row, and this past day-care gives dog2 the same. No booking
+  // path reads attendance since wire 3.0.0; the rows stay because the read
+  // suites count them (DECISIONS 118(d)).
   bookingDog2PastCareId: '77777777-7777-4777-8777-77777777777b',
   // Day-5b: credit_packages catalog keys + credit_ledger ids + service_rates
   // ids. Packages use `test-*` text prefixes for the same reason as the
@@ -258,6 +258,13 @@ export const FIXTURE_IDS = {
  * so `age_months` is deterministic. Pick a date well inside DST so the
  * Chicago bucket is unambiguous (CDT in May = UTC-5).
  */
+/** M3.05's two rows (fayetteville, bentonville), the only rows schema.sql seeds
+ *  into `service_rates`. Fixed in the step file and in schema.sql. */
+export const EVALUATION_RATE_SEED_IDS = [
+  'e7a10000-0000-4000-8000-000000000001',
+  'e7a10000-0000-4000-8000-000000000002',
+];
+
 export const FIXTURE_TODAY = new Date('2026-05-19T17:00:00Z');
 export const FIXTURE_NOW = (): Date => FIXTURE_TODAY;
 
@@ -702,10 +709,8 @@ export async function seedFixture(): Promise<void> {
       location: 'fayetteville',
     },
     {
-      // Δ 2026-07-14: dog2's staleness anchor — a recently-ATTENDED day-care
-      // (roster row below carries attendance='attended'). Keeps dog2 "fresh"
-      // under the 3-month re-eval divert so pre-existing POST /bookings tests
-      // book instantly; the divert suite builds its own stale dogs.
+      // dog2's past ATTENDED day-care (the roster row below carries
+      // attendance='attended'), an ordinary past booking (DECISIONS 118(d)).
       id: FIXTURE_IDS.bookingDog2PastCareId,
       ownerId: FIXTURE_IDS.ownerId,
       leadDogId: FIXTURE_IDS.dog2Id,
@@ -940,9 +945,8 @@ export async function seedFixture(): Promise<void> {
     { bookingId: FIXTURE_IDS.booking3Id, dogId: FIXTURE_IDS.dog2Id, isLead: false },
     { bookingId: FIXTURE_IDS.booking4Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking5Id, dogId: FIXTURE_IDS.dog2Id, isLead: true },
-    // Δ 2026-07-14: the two staleness anchors — dog1's past day-school and
-    // dog2's past day-care are ATTENDED so the fixture dogs book instantly
-    // under the 3-month re-eval divert rule.
+    // dog1's past day-school and dog2's past day-care are ATTENDED, ordinary
+    // past bookings (DECISIONS 118(d)).
     {
       bookingId: FIXTURE_IDS.booking6Id,
       dogId: FIXTURE_IDS.dog1Id,
@@ -1847,12 +1851,23 @@ export async function teardownFixture(): Promise<void> {
         FIXTURE_IDS.creditPackageRetiredKey,
       ]),
     );
-  // Clear the WHOLE table, not just the seeded fixture ids: the staff
-  // rate-editor write path (`POST /staff/rates`) inserts rows with random
-  // UUIDs, so an id-scoped delete would leak them across files and pollute
-  // every later rate lookup. `service_rates` is fixture-owned in tests (schema
-  // .sql seeds none), so a full delete is safe + keeps the table reset per file.
-  await db.delete(serviceRates);
+  // Clear the whole table but M3.05's two evaluation rows, not just the fixture
+  // ids: the staff rate-editor write path (`POST /staff/rates`) inserts rows with
+  // random UUIDs, so an id-scoped delete would leak them across files and pollute
+  // every later rate lookup. schema.sql seeds those two rows and nothing else, so
+  // they stay, and `GET /rates` for an evaluation reads the volume's own row. A
+  // test that closes or voids one gets it back open here; a missing one stays
+  // missing, so the suite says so.
+  await db.delete(serviceRates).where(notInArray(serviceRates.id, EVALUATION_RATE_SEED_IDS));
+  await db
+    .update(serviceRates)
+    .set({ effectiveTo: null, voidedAt: null, voidedByStaffId: null })
+    .where(
+      and(
+        inArray(serviceRates.id, EVALUATION_RATE_SEED_IDS),
+        or(isNotNull(serviceRates.effectiveTo), isNotNull(serviceRates.voidedAt)),
+      ),
+    );
   await db.delete(dayCapacity).where(eq(dayCapacity.location, 'fayetteville'));
   await db.delete(paymentMethods).where(eq(paymentMethods.ownerId, FIXTURE_IDS.ownerId));
   // Day-14: stripe_customers FK→owners is ON DELETE RESTRICT, so it must

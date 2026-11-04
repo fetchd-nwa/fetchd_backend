@@ -109,30 +109,6 @@ async function clearDogBookings(dogId: string): Promise<void> {
     await tx.delete(creditLedger).where(inArray(creditLedger.bookingId, ids));
     await tx.delete(bookingDogsTable).where(inArray(bookingDogsTable.bookingId, ids));
     await tx.delete(bookingsTable).where(inArray(bookingsTable.id, ids));
-
-    // Δ 2026-07-14: the wipe just deleted the dog's ATTENDED staleness anchor
-    // (fixture booking6 / bookingDog2PastCareId), which would flip the next
-    // POST /bookings into the approval divert (202) instead of booking (201).
-    // Re-plant a fresh anchor so this helper keeps meaning "isolate bookings",
-    // not "make the dog stale" — the divert suite builds stale dogs its own way.
-    const anchorId = randomUUID();
-    await tx.insert(bookingsTable).values({
-      id: anchorId,
-      ownerId: FIXTURE_IDS.ownerId,
-      leadDogId: dogId,
-      category: 'day-school',
-      status: 'past',
-      scheduledAt: '2026-05-12T13:00:00Z',
-      durationMinutes: 540,
-      location: 'fayetteville',
-    });
-    await tx.insert(bookingDogsTable).values({
-      bookingId: anchorId,
-      dogId,
-      isLead: true,
-      attendance: 'attended',
-      checkedInAt: '2026-05-12T13:05:00Z',
-    });
   });
 }
 

@@ -328,28 +328,6 @@ async function findEvaluationStatusInTx(
   return rows;
 }
 
-/**
- * Batched lookup for the day-program approval-divert rules (Shanthi
- * 2026-07-14, `lib/bookingApprovalDivert.ts`): staff-owned dogs are exempt
- * from the divert entirely; `spayedNeutered === false` (explicitly answered
- * "no", any age) is one of the two divert reasons. Same trust model as
- * `findEvaluationStatusInTx` — ownership is gated upstream.
- */
-async function findApprovalDivertFieldsInTx(
-  tx: Tx,
-  dogIds: readonly string[],
-): Promise<{ dogId: string; staffOwnerId: string | null; spayedNeutered: boolean | null }[]> {
-  if (dogIds.length === 0) return [];
-  return tx
-    .select({
-      dogId: dogs.id,
-      staffOwnerId: dogs.staffOwnerId,
-      spayedNeutered: dogs.spayedNeutered,
-    })
-    .from(dogs)
-    .where(and(inArray(dogs.id, [...dogIds]), live(dogs)));
-}
-
 async function softExpire(tx: Tx, id: string): Promise<Dog | undefined> {
   const [row] = await tx
     .update(dogs)
@@ -549,7 +527,6 @@ export const dogsRepository = {
   findById,
   findOwnedExists,
   findEvaluationStatusInTx,
-  findApprovalDivertFieldsInTx,
   findOwnerIdInTx,
   findOwnerIdAnyInTx,
   findNameInTx,

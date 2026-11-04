@@ -23,9 +23,9 @@ import type { Tx } from '../tx.js';
  *     canonical formula; `balanceForDogInTx` reads it inside the booking tx so
  *     the freshly-inserted debit is visible (Redis caches the public read).
  *
- * Concurrency: every debit/balance read for a (dog, mode, location) runs under
- * the `withDogModeLock(dogId, mode, location)` advisory lock acquired by the
- * route, so FIFO lot selection + the post-pre-check balance are race-free.
+ * Concurrency: every debit/balance read runs under the `withDogLocks` advisory
+ * lock on the dog, acquired by the booking core, so FIFO lot selection + the
+ * post-pre-check balance are race-free.
  */
 
 /** A live, non-exhausted EXPIRING lot + its remaining capacity. */
@@ -93,7 +93,7 @@ export async function findLiveExpiringLots(
  *   3. no row → the never-expiring pool (caller tags the debit lot_id NULL).
  *
  * `created_at ASC` breaks expiry ties deterministically. Caller must hold
- * `withDogModeLock` (same contract as `debitForBooking`).
+ * `withDogLocks` (same contract as `debitForBooking`).
  */
 async function findNextDebitLot(
   tx: Tx,
@@ -201,7 +201,7 @@ export const creditLedgerRepository = {
   /**
    * INSERT one booking-debit row (delta = -1) inside the open tx, tagged with
    * the priority source lot (or NULL for the never-expiring pool). Caller must
-   * hold `withDogModeLock(tx, dogId, mode, location)` first — without it, two
+   * hold `withDogLocks` on this dog first — without it, two
    * concurrent bookSession txns could each pass the pre-check against a
    * snapshot that hadn't seen the other's debit, or pick the same lot twice.
    *

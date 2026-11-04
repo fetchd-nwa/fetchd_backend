@@ -53,7 +53,7 @@ export type PendingRequestRow = PendingRequestRowForWire;
 /**
  * Full row projection — the columns the ROUTES need and the wire helper does
  * not: `ownerId` for the cross-owner defense (404, the same response as
- * not-found), `leadDogId`, `expiredAt` for the live check, and the PAYG card.
+ * not-found), `leadDogId`, and `expiredAt` for the live check.
  * `approvedByStaffId` used to live here; wire 1.13.0 promoted it into the base
  * projection because it is emitted now, so it arrives through
  * `PendingRequestRow` and is deliberately NOT re-declared.
@@ -62,8 +62,6 @@ export interface PendingRequestFullRow extends PendingRequestRow {
   ownerId: string;
   leadDogId: string;
   expiredAt: string | null;
-  /** PAYG divert requests carry the card to auto-charge; never on the wire. */
-  paymentMethodId: string | null;
 }
 
 const PENDING_REQUEST_PROJECTION = {
@@ -81,10 +79,6 @@ const PENDING_REQUEST_PROJECTION = {
   // Wire 1.13.0: on the wire now — the deny-vs-owner-cancel discriminator.
   approvedByStaffId: pendingRequests.approvedByStaffId,
   convertedBookingId: pendingRequests.convertedBookingId,
-  // Day-program divert columns (Shanthi 2026-07-14).
-  location: pendingRequests.location,
-  payment: pendingRequests.payment,
-  divertReasons: pendingRequests.divertReasons,
 } as const;
 
 const PENDING_REQUEST_FULL_PROJECTION = {
@@ -92,7 +86,6 @@ const PENDING_REQUEST_FULL_PROJECTION = {
   ownerId: pendingRequests.ownerId,
   leadDogId: pendingRequests.leadDogId,
   expiredAt: pendingRequests.expiredAt,
-  paymentMethodId: pendingRequests.paymentMethodId,
 } as const;
 
 // A request is "open" (still in flight) in these states — the Day-19d
@@ -303,12 +296,6 @@ export const requestsRepository = {
       lengthWeeks: number | null;
       // Δ 2026-07-14: private-lesson only — where the lesson happens.
       lessonSetting?: 'home' | 'public' | null;
-      // Day-program divert fields (Shanthi 2026-07-14) — omitted by the
-      // classic POST /requests categories.
-      location?: 'fayetteville' | 'bentonville';
-      payment?: 'credits' | 'payg';
-      paymentMethodId?: string;
-      divertReasons?: string[];
     },
   ): Promise<{ id: string }> {
     const [row] = await tx
@@ -323,10 +310,6 @@ export const requestsRepository = {
         descriptorKeys: values.descriptorKeys,
         lengthWeeks: values.lengthWeeks,
         lessonSetting: values.lessonSetting ?? null,
-        location: values.location ?? null,
-        payment: values.payment ?? null,
-        paymentMethodId: values.paymentMethodId ?? null,
-        divertReasons: values.divertReasons ?? [],
         // status defaults to 'submitted' (schema); submittedAt /
         // createdAt / updatedAt default to now(); source defaults to
         // 'app'; expiredAt remains NULL (live).

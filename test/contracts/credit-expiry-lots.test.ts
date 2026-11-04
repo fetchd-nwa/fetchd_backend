@@ -5,7 +5,7 @@ import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';
 import { creditsInvalidationPattern } from '../../src/db/repositories/creditsRepository.js';
-import { withDogModeLock } from '../../src/db/locks.js';
+import { withDogLocks } from '../../src/db/locks.js';
 import { invalidatePattern } from '../../src/lib/cache.js';
 import { creditLedger } from '../../src/db/schema/schema.js';
 import { resolvePurchaseExpiry, resolveRefundExpiry } from '../../src/lib/creditExpiry.js';
@@ -382,7 +382,7 @@ test(
     // serializes them, so FIFO can't hand the one expiring credit to both.
     const debitOnce = (bookingId: string): Promise<void> =>
       db.transaction((tx) =>
-        withDogModeLock(tx, DOG, SCHOOL, FAY, () =>
+        withDogLocks(tx, [DOG], () =>
           creditLedgerRepository.debitForBooking(tx, {
             dogId: DOG,
             mode: SCHOOL,

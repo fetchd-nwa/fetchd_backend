@@ -464,3 +464,33 @@ test(
     }
   },
 );
+
+// ── P12 item 0 (P05 Opus r2 nice 2): the three Default_Ignorable ranges ─────
+
+test(
+  'P12 item 0: PATCH a mandatory name of U+FFF0, U+1BCA0 or U+E0080 is 422 [name]; an asked phone of U+1BCA0 is stored NULL',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const family = await seedFamily();
+    try {
+      const before = await rowOf(family);
+      const statuses: Record<string, number> = {};
+      for (const value of ['\ufff0', '\u{1bca0}', '\u{e0080}']) {
+        const label = `U+${(value.codePointAt(0) as number).toString(16).toUpperCase()}`;
+        const res = await patchMe(family.principal, { name: value });
+        statuses[label] = res.statusCode;
+        if (res.statusCode === 422) assertProfileIncomplete(res, ['name']);
+      }
+      assert.deepEqual(statuses, { 'U+FFF0': 422, 'U+1BCA0': 422, 'U+E0080': 422 });
+      assert.deepEqual(await rowOf(family), before, 'a refused body wrote something');
+
+      await setMap({ phone: 'asked' });
+      const asked = await patchMe(family.principal, { phone: '\u{1bca0}' });
+      assert.equal(asked.statusCode, 200, asked.body);
+      assert.equal((await rowOf(family)).phone, null, 'an invisible phone is stored NULL');
+    } finally {
+      await restoreMap();
+      await dropFamily(family);
+    }
+  },
+);

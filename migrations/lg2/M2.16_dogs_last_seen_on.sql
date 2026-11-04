@@ -1,0 +1,11 @@
+-- M2.16 (S17, EVAL-U12 dated, EVAL-U04) — the day a dog was last seen.
+-- design §4 LG2 (design.md:6177), the 3.0.0 wire list (design.md:806-809).
+-- Rev.: yes. Empty prod: 0 rows.
+--
+-- `last_seen_on` lands now so wire 3.0.0 can carry it, omitted while NULL. Nothing
+-- stamps it yet: the check-in does from P20, and the verdict and the import after
+-- that. No gate, clock or client acts on it; S14's re-evaluation clock is dated.
+--
+-- No table is created, so the step needs no per-table REVOKE, and the group's
+-- closing REVOKE (DECISIONS 86, 118(g)) has nothing of this step's to repeat.
+ALTER TABLE dogs ADD COLUMN last_seen_on date;

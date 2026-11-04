@@ -12,6 +12,78 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [3.0.0] — 2026-11-03
+
+BREAKING. LG2's close, and the end of M1's part of design 3.0.0 (plan unit P12,
+slice S17, ledger DOG-U08, PAY-U19; migrations M2.16, M2.17, M3.05; design §1.1 3.0.0,
+`designs/fetchd-v1-technical-design.md:749-755`, `:806-809`; §2.2 `:2132-2137`;
+§2.6 `:3714-3730`). It types the two design 3.0.0 items M1 carries for S17
+(plan.json `wire_3_0_0_split`: B-divert-lane-removed, A-last-seen-on). With
+3.0.0-lg2.1's two items, that is all of design 3.0.0 in M1. Every other design
+3.0.0 item ships after M1 as 7.0.0 (LG2b; build DECISIONS 6, 32) and is not
+typed here. Contract-first: the routes keep today's behaviour until P12's
+backend lands the deletion, M2.16 and M2.17. Resync both clients (`npm run
+sync:contracts` in mobile and portal). Against the resynced copy (a scratch run
+at their HEADs, not their gates) the portal typechecks unchanged. The mobile
+app fails in `bookingRepository.ts` (`:28`, `:30`, `:34`, `:164`, then `:266`
+and `:777` behind them) until P12's mobile builder deletes the divert flow.
+
+Breaking (B-divert-lane-removed; DOG-U08, PAY-U19):
+
+- `POST /bookings` loses its 202 arm: `DivertedBookingWire` is removed. 201
+  `BookingWire[]` is its one success. Nothing replaces the lane in M1: the
+  spay/neuter refusal lands in S11 (LG2b; plan.json `m1_known_gaps`), and the
+  re-evaluation clock in S14, dated (design.md:806-809).
+- `POST /bookings/preview` is removed, with `PostBookingsPreviewRequest`,
+  `BookingDivertPreviewWire` and `BookingDivertPreviewDogWire`.
+- `PendingRequestWire.location`, `.payment` and `.divert_reasons` are removed.
+  M2.17 drops their columns and `payment_method_id`, which was never on the
+  wire.
+- `'already_requested'` leaves `POST_BOOKINGS_ERROR_DETAIL_KINDS`, and
+  `AlreadyRequestedDetails` leaves `PostBookingsErrorDetails`: the divert branch
+  was `POST /bookings`' only emit site. Both stay on `POST /requests`, and the
+  code and its details arm stay in `ApiErrorCode` and `ApiErrorDetailWire`.
+  Arms 1-7 of the `POST /bookings` list keep their numbers.
+
+Added (A-last-seen-on; EVAL-U12, EVAL-U04):
+
+- `DogWire.last_seen_on?: string` (`YYYY-MM-DD`), sent from `dogs.last_seen_on`
+  (M2.16) and omitted while the column is null. Nothing stamps the column until
+  the check-in unit lands (P20), and no gate, clock or client acts on it in v1
+  yet: its reader is S14's, dated.
+
+Changed (doc only; no shape change):
+
+- `PostStaffRequestsApproveRequest`: the day-school / day-care bullet is gone.
+  Such a request cannot be created any more; approving one that survives is 409
+  `conflict`, books and charges nothing, and leaves the row `submitted`; deny
+  still works. The private-lesson, boarding and
+  board-and-train bullets are unchanged (design §2.6). The doc now cites
+  `staffRequests.ts` by symbol, because this unit moves its lines.
+- `OwnerEvaluationCampusSettingsWire.price_cents`: M3.05 seeds both campuses,
+  so `null` now takes a closed or voided row.
+- `DogWire.spayed_neutered`: the owner's answer is stored, and no booking path
+  reads it until the spay/neuter refusal lands (S11, LG2b).
+- `PostBookingsRequest`: states the 201 `BookingWire[]` response, which only the
+  deleted 202 doc stated before.
+- `PendingRequestWire.approved_by_staff_id`: its stamp sites are cited by symbol;
+  one of the old line cites was the arm this unit deletes.
+- `MeWire.name` and `.phone`: a stored value with no visible character reads as
+  `null`, now said on the field itself (P05 review, Fable r2 N1).
+- `PatchMeRequest`: `emergency_contact` and `address` require every sub-key;
+  omitting one is a 400, not a blank, as the old doc said. `MeWire.location` no
+  longer claims to be the one wire surface that translates.
+- Every `routes/me.ts:NNN` cite (19 lines, 18 distinct cites) now names a symbol.
+  P05 rewrote that file and all of them had gone stale.
+- `WIRE_CONTRACT_VERSION` `'3.0.0-lg2.1'` → `'3.0.0'`. Its doc already named
+  this step.
+- This changelog: the 3.0.0-lg2.1 `StaffOwnerWire` bullet no longer says the
+  fields "mirror" their columns (build DECISIONS 115(b), 116).
+
+Not typed here: every other design 3.0.0 item (plan.json P12
+`wire_items_not_in_m1`, LG2b's 7.0.0); `reeval_due` and `reevaluation_due`
+(S14, dated); 4.0.0's `PostBookingsResponse`.
+
 ## [3.0.0-lg2.1] — 2026-11-03
 
 BREAKING. LG2 step 1 of 2 toward 3.0.0, M1's part of design 3.0.0 (plan unit
@@ -37,10 +109,12 @@ Breaking:
   prints a name falls back to `email` (design §2.2:2244). The nested
   `emergency_contact` and `address` keep their `''`-never-`null` rule.
 - `StaffOwnerWire.name` and `.phone` → `string | null`; `.location`
-  `LocationKey` → `LocationKey | null`. They mirror their `owners` columns,
-  which M2.01 makes nullable. `id`, `email` and `source` never are. The list
-  is now ordered by `lower(coalesce(name, email))`, then `id`: what a reader
-  prints.
+  `LocationKey` → `LocationKey | null`. M2.01 makes the three `owners` columns
+  nullable, and each field is `null` when the family has none. A stored `name`
+  or `phone` with no visible character reads, and sorts, as `null`: "filled"
+  means a visible character. `id`, `email` and `source` are never `null`. The
+  list is now ordered by `lower(coalesce(name, email))`, then `id`: what a
+  reader prints.
 
 Added:
 

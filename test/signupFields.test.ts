@@ -28,6 +28,14 @@ const BLANK: Record<string, string> = {
   'braille blank': '⠀',
   'a variation selector': '️',
   'a tag character': '\u{e0020}',
+  // P12 item 0 (P05 Opus r2 nice 2): the three Default_Ignorable ranges the
+  // class missed, each by its first and last code point.
+  'U+FFF0, an unassigned special': '\ufff0',
+  'U+FFF8, the last of them': '\ufff8',
+  'U+1BCA0, a shorthand format control': '\u{1bca0}',
+  'U+1BCA3, the last of them': '\u{1bca3}',
+  'U+E0080, past the tags': '\u{e0080}',
+  'U+E0FFF, the last of the plane 14 block': '\u{e0fff}',
   'mixed blanks': '  ​　⁠\t',
 };
 

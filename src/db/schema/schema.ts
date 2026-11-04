@@ -120,8 +120,8 @@ export const dogs = pgTable("dogs", {
 	// §J.3: set by the monthly alumni attendance scan (<2 qualifying sessions
 	// in the closed Chicago month); cleared by staff after the re-check.
 	alumniAttendanceFlaggedAt: timestamp("alumni_attendance_flagged_at", { withTimezone: true, mode: 'string' }),
-	// Shanthi 2026-07-14: profile question, never a hard block. NULL =
-	// unanswered; FALSE diverts day-program bookings to the approval lane.
+	// Shanthi 2026-07-14: profile question. NULL = unanswered. No booking path
+	// reads it until the refusal lands (S11, LG2b).
 	spayedNeutered: boolean("spayed_neutered"),
 	spayNeuterPlannedOn: date("spay_neuter_planned_on"),
 	fieldOverrides: jsonb("field_overrides").default({}).notNull(),
@@ -132,6 +132,8 @@ export const dogs = pgTable("dogs", {
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	// M2.16: nothing stamps it until P20's check-in; omitted on DogWire while NULL.
+	lastSeenOn: date("last_seen_on"),
 }, (table) => {
 	return {
 		ownerIdx: index("dogs_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
@@ -612,13 +614,6 @@ export const pendingRequests = pgTable("pending_requests", {
 	lessonSetting: lessonSetting("lesson_setting"),
 	descriptorKeys: text("descriptor_keys").array().default([]).notNull(),
 	lengthWeeks: integer("length_weeks"),
-	// Day-program divert (Shanthi 2026-07-14): what the approve conversion
-	// needs to create the day-school/day-care bookings. NULL/empty on the
-	// classic request categories.
-	location: text().$type<LocationKey>(),
-	payment: text().$type<'credits' | 'payg'>(),
-	paymentMethodId: uuid("payment_method_id"),
-	divertReasons: text("divert_reasons").array().default([]).notNull(),
 	approvedAt: timestamp("approved_at", { withTimezone: true, mode: 'string' }),
 	approvedByStaffId: uuid("approved_by_staff_id"),
 	convertedBookingId: uuid("converted_booking_id"),

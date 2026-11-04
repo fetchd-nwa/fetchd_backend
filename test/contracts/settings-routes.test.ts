@@ -181,8 +181,7 @@ describe('GET /settings — the owner document', SKIP_WHEN_NO_DB, () => {
     });
     assert.equal(doc.eval.reeval_after_months_unseen, 3);
     for (const location of ['fayetteville', 'bentonville'] as const) {
-      const price = doc.eval.by_location[location].price_cents;
-      assert.ok(price === null || Number.isInteger(price));
+      assert.equal(doc.eval.by_location[location].price_cents, 0, 'the M3.05 seed');
     }
     assert.equal(doc.pay.charge_timing_mode['day-school'], 'at_confirm');
     assert.equal(doc.pay.charge_timing_mode['private-lesson'], 'at_close_out');

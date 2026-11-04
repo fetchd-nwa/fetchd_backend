@@ -150,3 +150,33 @@ test(
     assert.equal('note' in body, false);
   },
 );
+
+// M3.05 (P12 B3): schema.sql seeds these two rows and the fixture keeps them,
+// so an answer here is the volume's own row, not one a test planted.
+for (const [location, display] of [
+  ['fayetteville', 'Fayetteville'],
+  ['bentonville', 'Bentonville'],
+] as const) {
+  test(
+    `GET /rates?category=evaluation at ${location} answers amount_cents 0 from the volume's own row`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+      registerRatesRoute(app, { authenticate, now: FIXTURE_NOW });
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/rates?category=evaluation&location=${location}`,
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepStrictEqual(res.json(), {
+        category: 'evaluation',
+        location,
+        amount_cents: 0,
+        unit: 'per-session',
+        effective_from: '2025-01-01',
+        note: `Evaluation rate, ${display}: free (M3.05 seed)`,
+      });
+    },
+  );
+}

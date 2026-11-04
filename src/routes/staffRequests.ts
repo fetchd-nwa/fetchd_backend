@@ -14,18 +14,11 @@ import {
   type PendingRequestFullRow,
 } from '../db/repositories/requestsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
-import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { LOCATION_SLUGS, requestStatus } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
-import { bucketToChicagoDate } from '../lib/chicagoDate.js';
-import {
-  createDayProgramBookings,
-  type DayProgramPaymentPlan,
-  type DayProgramSession,
-} from '../lib/createDayProgramBookings.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
@@ -61,6 +54,10 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  *          private-lesson / boarding: gate pre-check → INSERT booking
  *            (+ booking_dogs) → markConverted (with converted_booking_id) →
  *            enqueue 'booking-confirmed' notification.
+ *          any other category: 409 `conflict`, nothing written. Only a
+ *            day-school or day-care row from before M2.17 could reach this
+ *            (wire 3.0.0; DECISIONS 118(a)); it stays `submitted`, and deny
+ *            still works on it.
  *     5. re-read + emit the updated PendingRequestWire.
  *
  * Gate pre-check uses the shared `lib/bookingGatePreCheck.ts` (rule-of-
@@ -85,7 +82,7 @@ const isoDateTimeSchema = z.string().datetime({ offset: true });
 
 /**
  * Approve body — per-category required fields:
- *   - private-lesson: scheduled_at REQUIRED; location OPTIONAL
+ *   - private-lesson: scheduled_at + location REQUIRED
  *   - boarding: scheduled_at + pickup_at + location ALL REQUIRED
  *   - board-and-train: body MAY be empty (no booking created)
  *
@@ -166,24 +163,15 @@ export function registerStaffRequestsRoute(
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(approveBodySchema, request.body ?? {}, 'body');
 
-      // Closure-captured by the day-program conversion arm: which dogs'
-      // credit balances moved + where, for the post-commit cache wipes
-      // (mirrors POST /bookings).
-      let creditDebitedDogIds = new Set<string>();
-      let bookedLocation: LocationKey | null = null;
-
       const outcome = await withMutation<PendingRequestWire>(
         {
           principal,
           idempotencyKey,
           endpoint: 'POST /staff/requests/:id/approve',
           requestHash: hashRequestBody({ id, ...body }),
-          // Request reads aren't cached; the day-program conversion arm
-          // invalidates availability + moved credit balances.
-          patternsToInvalidate: () => [
-            ...(bookedLocation !== null ? [`avail:${bookedLocation}:*`] : []),
-            ...[...creditDebitedDogIds].map(creditsInvalidationPattern),
-          ],
+          // Request reads aren't cached, and no arm here moves credits or
+          // day-program capacity.
+          keysToInvalidate: () => [],
         },
         async (tx) => {
           // 1. Row-lock the pending_request — serializes concurrent
@@ -209,80 +197,7 @@ export function registerStaffRequestsRoute(
             await requestsRepository.markApprovedAwaitingPayment(tx, id, {
               approvedByStaffId: principal.staffId,
             });
-          } else if (row.category === 'day-school' || row.category === 'day-care') {
-            // Day-program divert conversion (Shanthi 2026-07-14). The request
-            // row carries everything POST /bookings validated at submit —
-            // location, payment plan, exact session instants (preferred_dates)
-            // — so approval takes NO body fields and runs the SAME creation
-            // core the direct booking path uses: gates, credit debits / PAYG
-            // invoice, capacity, overlap guard, reminders. A bounce here
-            // (credits spent meanwhile, capacity filled, new conflict) is a
-            // typed 422 back to the portal; the request stays 'submitted'.
-            const { leadDogId, additionalDogIds } = await readRequestDogIds(tx, id);
-            if (row.location === null) {
-              throw new Error(`day-program request ${id} has no location — divert-create bug`);
-            }
-            const preferred = await requestsRepository.findPreferredDatesByRequestIds([id], tx);
-            if (preferred.length === 0) {
-              throw new Error(`day-program request ${id} has no preferred dates`);
-            }
-            const sessions: DayProgramSession[] = preferred
-              .map((p) => {
-                const scheduledAt = new Date(p.preferredAt);
-                return { date: bucketToChicagoDate(scheduledAt), scheduledAt };
-              })
-              .sort((a, b) => a.date.localeCompare(b.date));
-            const firstSession = sessions[0];
-            if (firstSession === undefined) {
-              throw new Error(`day-program request ${id} has no sessions after mapping`);
-            }
-            let payment: DayProgramPaymentPlan;
-            if (row.payment === 'payg') {
-              if (row.paymentMethodId === null) {
-                throw new Error(`payg request ${id} has no payment_method_id — divert-create bug`);
-              }
-              payment = { kind: 'payg', paymentMethodId: row.paymentMethodId };
-            } else {
-              payment = { kind: 'credits' };
-            }
-
-            const result = await createDayProgramBookings(tx, {
-              ownerId: row.ownerId,
-              category: row.category,
-              leadDogId,
-              additionalDogIds,
-              sessions,
-              location: row.location,
-              notes: row.notesJoint,
-              payment,
-              now: new Date(),
-            });
-            creditDebitedDogIds = result.creditDebitedDogIds;
-            bookedLocation = row.location;
-
-            const firstBooking = result.wires[0];
-            if (firstBooking === undefined) {
-              throw new Error(`day-program conversion ${id} created no bookings`);
-            }
-            // Multi-session conversions create N bookings; the single FK
-            // records the first (earliest date) as the anchor the owner's
-            // request card links to. All N appear in their bookings list.
-            await requestsRepository.markConverted(tx, id, {
-              approvedByStaffId: principal.staffId,
-              convertedBookingId: firstBooking.id,
-            });
-
-            await notificationsRepository.enqueue(tx, {
-              ownerId: row.ownerId,
-              type: 'booking-confirmed',
-              title: 'Booking confirmed!',
-              body: notificationBodyFor(row.category, firstSession.scheduledAt),
-              deepLinkPath: deepLinkToPath({ kind: 'booking', id: firstBooking.id }),
-              deepLinkKind: 'booking',
-              deepLinkId: firstBooking.id,
-              dogIds: [leadDogId, ...additionalDogIds],
-            });
-          } else {
+          } else if (row.category === 'private-lesson' || row.category === 'boarding') {
             // PL / boarding: validate body, gate pre-check, INSERT
             // booking, mark converted, enqueue notification.
             const parsed = validateApproveBody(body, row);
@@ -351,6 +266,15 @@ export function registerStaffRequestsRoute(
               deepLinkId: inserted.id,
               dogIds: [row.leadDogId, ...allDogIds.additionalDogIds],
             });
+          } else {
+            // A day program books and pays at POST /bookings, and staff
+            // approval moves no money (R1, PAY-16), so a surviving row has
+            // nothing to convert into. Falling through to the arm above would
+            // book it with no credit and no charge.
+            throw new ApiError(
+              'conflict',
+              `pending request ${id} is ${row.category} and cannot be approved`,
+            );
           }
 
           // 4. Re-read + emit the updated PendingRequest wire shape.
@@ -552,10 +476,7 @@ async function setBoardingStayWindow(
  * Build the notification body copy. Brief, category-aware. The deep
  * link goes to `/bookings/:id`; the body just orients the reader.
  */
-function notificationBodyFor(
-  category: PendingRequestFullRow['category'],
-  scheduledAt: Date,
-): string {
+function notificationBodyFor(category: 'private-lesson' | 'boarding', scheduledAt: Date): string {
   const when = scheduledAt.toLocaleDateString('en-US', {
     timeZone: 'America/Chicago',
     month: 'short',
@@ -564,19 +485,7 @@ function notificationBodyFor(
   if (category === 'boarding') {
     return `Your boarding stay starting ${when} is confirmed.`;
   }
-  if (category === 'private-lesson') {
-    return `Your private lesson on ${when} is confirmed.`;
-  }
-  if (category === 'day-school') {
-    return `Your Day School booking starting ${when} is approved and confirmed.`;
-  }
-  if (category === 'day-care') {
-    return `Your Day Care booking starting ${when} is approved and confirmed.`;
-  }
-  // Remaining categories don't reach this helper (B&T parks at
-  // awaiting-payment; group-class uses POST /enrollments); the default
-  // keeps the fallback honest.
-  return `Your session on ${when} is confirmed.`;
+  return `Your private lesson on ${when} is confirmed.`;
 }
 
 function parseUuidParam(params: unknown): { id: string } {

@@ -457,6 +457,9 @@ async function seed(): Promise<void> {
   // base + a flat Bentonville premium. Without a row a real-mode PAYG booking
   // (and `GET /rates`) 404s. School base matches the single-day pack ($60); day
   // care is a small premium over the 10-pack's per-day rate ($35 → $40).
+  // The evaluation's two rows are schema.sql's own seed (M3.05): this script
+  // leaves them alone. It deletes no `service_rates` row, and the four below
+  // have no fixed ids, so each run appends four more.
   const BENTONVILLE_PAYG_PREMIUM_CENTS = 500;
   const dayProgramRateBases = [
     { category: 'day-school' as const, amountCents: 6000 },
@@ -500,8 +503,8 @@ async function seed(): Promise<void> {
       // show; the other seed dogs' don't).
       boardingEnabled: true,
       profileImagePath: 'dogs/waffles/waffles-pfp.jpg',
-      // Shanthi 2026-07-14: all seed dogs are fixed so the intact-dog
-      // approval divert never fires in demos (flip via PATCH to demo it).
+      // Shanthi 2026-07-14: all seed dogs are fixed, so the spay/neuter refusal
+      // (S11) will not refuse a demo family when it lands.
       spayedNeutered: true,
     },
     {
@@ -786,9 +789,8 @@ async function seed(): Promise<void> {
       trainerStaffId: null,
       location: 'bentonville',
     },
-    // Past ATTENDED day programs (Shanthi 2026-07-14 staleness rule): each
-    // dog's most recent "NWA saw them" anchor, ~2 weeks back, so demo
-    // bookings stay instant instead of diverting to the approval queue.
+    // Past ATTENDED day programs: each dog's most recent day, ~2 weeks back,
+    // so a demo dog has a history to show. No booking path reads attendance.
     {
       id: SEED.bookingWafflesPastSchoolId,
       ownerId: SEED.ownerAllisonId,
@@ -845,7 +847,7 @@ async function seed(): Promise<void> {
     { bookingId: SEED.bookingBrodieBoardingId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogOllieId, isLead: false },
-    // The staleness anchors — per-dog attendance actually marked 'attended'.
+    // The past days above, with per-dog attendance actually marked 'attended'.
     {
       bookingId: SEED.bookingWafflesPastSchoolId,
       dogId: SEED.dogWafflesId,

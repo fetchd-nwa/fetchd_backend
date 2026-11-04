@@ -8,8 +8,10 @@ import type { ServiceCategory } from './bookingBucket.js';
  * the authoritative backstop for the FE engine in
  * `mobile/src/lib/bookingConflicts.ts` (Δ 2026-07-09, locked): the FE prevents
  * conflicts pre-submit, this guarantees the invariant against a racing client,
- * a second device, or a direct API call. The two implementations MUST agree, so
- * the rules here mirror that file exactly:
+ * a second device, or a direct API call: `createDayProgramBookings` runs it under
+ * `withDogLocks`, keyed on the dog alone, so two racing day-program bookings for
+ * one dog see each other in any mode at either campus. The two implementations
+ * MUST agree, so the rules here mirror that file exactly:
  *
  *   • Occupied window, day-school / day-care → the FIXED block [07:00, 17:00)
  *     America/Chicago on the calendar day — the "dog is unavailable" span,

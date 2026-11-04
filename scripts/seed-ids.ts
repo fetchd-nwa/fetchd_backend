@@ -30,10 +30,8 @@ export const SEED = {
   bookingLolaLessonId: 'b0070000-0000-4000-8000-000000000002',
   bookingBrodieBoardingId: 'b0070000-0000-4000-8000-000000000003',
   bookingGroupWalkId: 'b0070000-0000-4000-8000-000000000004',
-  // Past ATTENDED day programs — one per dog, ~2 weeks back. These are what
-  // keep the seeded dogs "fresh" under the 3-month re-evaluation staleness
-  // rule (Shanthi 2026-07-14): without a recent attended day-school/day-care
-  // session, every demo booking would divert into the staff-approval queue.
+  // Past ATTENDED day programs — one per dog, ~2 weeks back, ordinary past
+  // bookings. No booking path reads attendance.
   bookingWafflesPastSchoolId: 'b0070000-0000-4000-8000-000000000005',
   bookingLolaPastSchoolId: 'b0070000-0000-4000-8000-000000000006',
   bookingBrodiePastCareId: 'b0070000-0000-4000-8000-000000000007',

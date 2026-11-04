@@ -2,25 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
-import { withDivertRequestLocks, withDogModeLocks } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
-import { db } from '../db/client.js';
-import type {
-  BookingDivertPreviewDogWire,
-  BookingDivertPreviewWire,
-  DivertedBookingWire,
-  PostBookingsPreviewRequest,
-  PostBookingsRequest,
-} from '../contracts/wire.js';
+import type { PostBookingsRequest } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { isInView } from '../lib/bookingBucket.js';
-import { resolveApprovalDivert } from '../lib/bookingApprovalDivert.js';
-import { alreadyRequestedError } from '../lib/bookingErrors.js';
-import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
 import { bucketChicagoToday, isValidCalendarDate } from '../lib/chicagoDate.js';
 import { dayProgramCategoryToMode } from '../lib/bookingMode.js';
 import {
@@ -36,12 +24,10 @@ import { cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import {
   createDayProgramBookings,
-  resolvePaygPlan,
   type DayProgramPaymentPlan,
   type DayProgramSession,
 } from '../lib/createDayProgramBookings.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
-import { wireOneRequest } from '../lib/wireOneRequest.js';
 import { ApiError } from '../lib/errors.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
@@ -168,19 +154,6 @@ export type PostBookingsBodyConformance = Expect<
   Equal<z.input<typeof postBookingBodySchema>, PostBookingsRequest>
 >;
 
-// POST /bookings/preview body — just the roster; the divert check is
-// category/date-agnostic (see the route comment).
-const previewBodySchema = z
-  .object({
-    dog_ids: z.array(z.string().uuid()).min(1).max(MAX_DOGS_PER_REQUEST),
-  })
-  .strict();
-
-/** §5.1.3 pin — see `PostBookingsBodyConformance`. */
-export type PostBookingsPreviewBodyConformance = Expect<
-  Equal<z.input<typeof previewBodySchema>, PostBookingsPreviewRequest>
->;
-
 export interface BookingsRouteOptions extends AuthRouteOptions {
   now?: () => Date;
   /**
@@ -272,50 +245,6 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
     },
   );
 
-  // --- POST /bookings/preview --------------------------------------------
-  //
-  // Read-only pre-check of the approval-divert rules (Δ 2026-07-17). The owner
-  // app calls this before submitting a day-program booking so it can ask the
-  // owner up front — "some dogs need staff approval; book the rest, request
-  // them too, or cancel?" — instead of discovering the divert only after the
-  // 202 (by which point the instant dogs are already booked and the held dogs
-  // already have requests). Advisory only: POST /bookings re-runs the
-  // authoritative check. No idempotency key, no locks, no writes.
-  //
-  // The divert decision is category-agnostic (staleness = last ATTENDED day
-  // program of either kind; spay is dog-level), so the body carries only the
-  // roster. Per-dog reasons come from calling `resolveApprovalDivert` one dog
-  // at a time — the same call the POST route makes per group.
-  app.post(
-    '/bookings/preview',
-    { preHandler: [authHook] },
-    async (request): Promise<BookingDivertPreviewWire> => {
-      const principal = requirePrincipal(request);
-      requireOwner(principal, 'preview a booking');
-      const { dog_ids } = parseOrThrow(previewBodySchema, request.body, 'body');
-      // De-dupe, first-seen order. A real roster never repeats a dog, but a
-      // confused body shouldn't double the work or the response rows.
-      const dogIds = [...new Set(dog_ids)];
-
-      return db.transaction(async (tx) => {
-        const dogs: BookingDivertPreviewDogWire[] = [];
-        for (const dogId of dogIds) {
-          // Same ownership gate as POST — a miss 404s (no cross-owner id leak).
-          const exists = await dogsRepository.findOwnedExists(dogId, principal.ownerId, tx);
-          if (!exists) {
-            throw new ApiError('not_found', `dog ${dogId} not found`);
-          }
-          const divertReasons = await resolveApprovalDivert(tx, {
-            dogIds: [dogId],
-            now: nowFactory(),
-          });
-          dogs.push({ dog_id: dogId, divert_reasons: divertReasons });
-        }
-        return { dogs };
-      });
-    },
-  );
-
   // --- POST /bookings -----------------------------------------------------
   //
   // Day 10 day-program creation (DATA-CONTRACT §C, schema.sql ~line 1328
@@ -336,8 +265,9 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   //      miss → 404 (same response as "dog doesn't exist"; ids don't
   //      enumerate across owners).
   //   2. Advisory locks in canonical order:
-  //        (a) `withDogModeLocks(tx, dogs ASC, mode, ...)`  serializes
-  //            credit_ledger contention per (dog, mode).
+  //        (a) `withDogLocks(tx, dogs ASC, ...)` serializes credit_ledger
+  //            contention and the overlap guard per dog, across modes and
+  //            campuses.
   //        (b) `withCapacityLocks(tx, location, dates ASC, ...)`
   //            serializes `day_capacity` contention per (location, date).
   //      Both batch helpers acquire in sorted order so two concurrent
@@ -371,7 +301,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   app.post(
     '/bookings',
     { preHandler: [authHook] },
-    async (request, reply): Promise<BookingWire[] | DivertedBookingWire> => {
+    async (request, reply): Promise<BookingWire[]> => {
       const principal = requirePrincipal(request);
       requireOwner(principal, 'create a booking');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
@@ -380,11 +310,11 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
 
       // Closure-captured (same pattern as the cancel route's
       // `pendingStripeRefund`): the credits branch debits every dog, PAYG
-      // and the divert branch debit none. `patternsToInvalidate` reads this
-      // post-commit to wipe only the dogs whose balance actually moved.
+      // debits none. `patternsToInvalidate` reads this post-commit to wipe only
+      // the dogs whose balance actually moved.
       let creditDebitedDogIds = new Set<string>();
 
-      const outcome = await withMutation<BookingWire[] | DivertedBookingWire>(
+      const outcome = await withMutation<BookingWire[]>(
         {
           principal,
           idempotencyKey,
@@ -404,115 +334,15 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             }
           }
 
-          // The exact session instants — shared by both branches below.
+          // 2. The exact session instants, then the shared core
+          //    (`lib/createDayProgramBookings`): locks → gates → payment plan →
+          //    overlap guard → per-session capacity/INSERT/money/reminders. It
+          //    books every dog or refuses; nothing is parked (wire 3.0.0).
           const sessions: DayProgramSession[] = parsed.sortedDates.map((date) => ({
             date,
             scheduledAt: computeDayProgramScheduledAt(parsed.category, date, parsed.dropoff),
           }));
 
-          // 2. Approval divert (Shanthi 2026-07-14, `lib/bookingApprovalDivert`):
-          //    a stale (>3 months since last attended day program, non-alumni)
-          //    or intact dog parks the WHOLE submission as a pending request
-          //    for staff approval instead of booking instantly. Money never
-          //    moves here — credits debit / PAYG invoicing happen at the
-          //    approve conversion, which runs this same creation core.
-          const divertReasons = await resolveApprovalDivert(tx, {
-            dogIds: parsed.allDogIds,
-            now: nowFactory(),
-          });
-          if (divertReasons.length > 0) {
-            // Two lock layers (Δ 2026-07-16): the outer location-AGNOSTIC
-            // divert lock serializes the duplicate guard — the (dog, mode,
-            // location) locks alone don't cover the same dog diverting at two
-            // schools concurrently (the owner app POSTs each location
-            // separately), and "one open request per (dog, category)" is
-            // location-agnostic. The inner (dog, mode, location) locks keep
-            // the same canonical order as `createDayProgramBookings`, so a
-            // concurrent instant-book on the same dog serializes too.
-            const requestWire = await withDivertRequestLocks(
-              tx,
-              parsed.allDogIds,
-              parsed.category,
-              () =>
-                withDogModeLocks(tx, parsed.allDogIds, parsed.mode, parsed.location, async () => {
-                  // Everything ELSE about the submission must be valid before we
-                  // park it in the staff queue — gates + (for PAYG) the card/rate —
-                  // so staff never approve into a guaranteed bounce and the owner
-                  // fixes real blockers NOW, not after a wasted approval round-trip.
-                  await checkBookingGates(tx, {
-                    ownerId: principal.ownerId,
-                    dogIds: parsed.allDogIds,
-                    category: parsed.category,
-                  });
-                  await resolvePaygPlan(tx, {
-                    payment: parsed.payment,
-                    category: parsed.category,
-                    location: parsed.location,
-                    ownerId: principal.ownerId,
-                    now: nowFactory(),
-                  });
-
-                  // Duplicate guard — same rule as POST /requests (Day-19d): one
-                  // OPEN request per (dog, category) at a time; re-submit once the
-                  // pending one resolves.
-                  const alreadyRequested = await requestsRepository.findOpenByDogsAndCategory(
-                    tx,
-                    parsed.allDogIds,
-                    parsed.category,
-                  );
-                  if (alreadyRequested.length > 0) {
-                    throw alreadyRequestedError({
-                      category: parsed.category,
-                      dog_ids: alreadyRequested,
-                    });
-                  }
-
-                  const { id: requestId } = await requestsRepository.create(tx, {
-                    ownerId: principal.ownerId,
-                    leadDogId: parsed.leadDogId,
-                    category: parsed.category,
-                    notesPerDog: null,
-                    notesJoint: parsed.notes,
-                    staffPreference: null,
-                    descriptorKeys: [],
-                    lengthWeeks: null,
-                    location: parsed.location,
-                    payment: parsed.payment.kind,
-                    ...(parsed.payment.kind === 'payg'
-                      ? { paymentMethodId: parsed.payment.paymentMethodId }
-                      : {}),
-                    divertReasons,
-                  });
-                  await requestsRepository.addDogs(tx, requestId, {
-                    lead: parsed.leadDogId,
-                    additional: parsed.additionalDogIds,
-                  });
-                  // The exact session instants ride in preferred_dates — the
-                  // approve conversion books them verbatim (no recompute).
-                  await requestsRepository.addPreferredDates(
-                    tx,
-                    requestId,
-                    sessions.map((s) => s.scheduledAt.toISOString()),
-                  );
-
-                  const full = await requestsRepository.findFullByIdInTx(tx, requestId);
-                  if (full === undefined) {
-                    throw new Error(`divert ${requestId}: row vanished before re-fetch`);
-                  }
-                  return wireOneRequest(tx, full);
-                }),
-            );
-            return {
-              status: 202,
-              body: { diverted: true, divert_reasons: divertReasons, request: requestWire },
-            };
-          }
-
-          // 3. Fresh dog(s) — book instantly, exactly as before the ruling.
-          //    Locks → gates → payment plan → overlap guard → per-session
-          //    capacity/INSERT/money/reminders all live in the shared core
-          //    (`lib/createDayProgramBookings`, also run by the staff
-          //    approve conversion).
           const result = await createDayProgramBookings(tx, {
             ownerId: principal.ownerId,
             category: parsed.category,

@@ -356,12 +356,10 @@ CREATE TABLE dogs (
   -- Staff clear it (set NULL) after the re-check. Soft surface — not a
   -- booking-gate trigger like evaluation.
   alumni_attendance_flagged_at timestamptz,
-  -- Spay/neuter (Shanthi ruling 2026-07-14): a PROFILE question, never a hard
-  -- block. NULL = unanswered (pre-existing dogs; nothing diverts). FALSE
-  -- diverts day-program bookings into the pending-request approval lane
-  -- (staff eyes, not a wall — even a too-young intact dog diverts, per
-  -- Allison 2026-07-14). planned_on: the owner's stated spay/neuter date —
-  -- a scheduled reminder fires that day prompting a profile update. Only
+  -- Spay/neuter (Shanthi ruling 2026-07-14): a PROFILE question. NULL =
+  -- unanswered. No booking path reads it from wire 3.0.0 until the refusal
+  -- lands (S11, LG2b). planned_on: the owner's stated spay/neuter date — a
+  -- scheduled reminder fires that day prompting a profile update. Only
   -- meaningful while not yet fixed (CHECK below).
   spayed_neutered    boolean,
   spay_neuter_planned_on date,
@@ -386,6 +384,9 @@ CREATE TABLE dogs (
   created_at         timestamptz NOT NULL DEFAULT now(),
   updated_at         timestamptz NOT NULL DEFAULT now(),
   expired_at         timestamptz,                     -- NULL = live; soft-delete only
+  -- M2.16: the day the dog was last seen. Sent on DogWire, omitted while NULL.
+  -- Nothing stamps it until P20's check-in; no gate, clock or client acts on it.
+  last_seen_on       date,
   CHECK (birthdate IS NOT NULL OR age_months_override IS NOT NULL),
   -- A dog belongs to exactly one of: a client owner, or a staff member.
   CHECK ((owner_id IS NOT NULL) <> (staff_owner_id IS NOT NULL)),
@@ -848,18 +849,6 @@ CREATE TABLE pending_requests (
   -- (same loose coupling as staff_preference → staff slug).
   descriptor_keys     text[] NOT NULL DEFAULT '{}',
   length_weeks        integer,                         -- board-and-train only
-  -- Day-program divert (Shanthi ruling 2026-07-14): day-school / day-care
-  -- submissions that trip the approval rules (3-month re-eval staleness /
-  -- intact dog) land HERE instead of bookings. These columns carry what the
-  -- staff-approve conversion needs to create the bookings verbatim; the
-  -- session timestamps ride in pending_request_preferred_dates. All NULL /
-  -- empty on the classic request categories (PL / B&T / boarding).
-  location            text REFERENCES locations(slug),
-  payment             text CHECK (payment IN ('credits','payg')),
-  -- FK added AFTER payment_methods is created (below) — an inline REFERENCES
-  -- here forward-references a table defined later and breaks fresh initdb.
-  payment_method_id   uuid,
-  divert_reasons      text[] NOT NULL DEFAULT '{}',    -- 'reevaluation-stale' | 'not-spayed-neutered'
   -- Approval lifecycle (real, produced by the minimal staff portal — not auto)
   approved_at         timestamptz,
   approved_by_staff_id uuid REFERENCES staff(id),
@@ -1646,7 +1635,7 @@ CREATE INDEX credit_ledger_lot_id_idx ON credit_ledger (lot_id) WHERE lot_id IS 
 -- Dropping an expired lot whole forfeits only its UNUSED remainder — its
 -- already-applied debits drop with it, netting to exactly the unspent credits.
 -- `now()` = transaction start; the booking txn reads this under the
--- (dog_id,mode,location) advisory lock. Redis caches the per-dog result.
+-- per-dog advisory lock. Redis caches the per-dog result.
 CREATE VIEW dog_credit_balance AS
   SELECT cl.dog_id, cl.mode, cl.location, COALESCE(SUM(cl.delta), 0) AS balance
   FROM credit_ledger cl
@@ -1689,13 +1678,6 @@ CREATE INDEX payment_methods_owner_idx ON payment_methods (owner_id);
 -- At most one default *live* card per owner.
 CREATE UNIQUE INDEX payment_methods_one_default
   ON payment_methods (owner_id) WHERE is_default AND expired_at IS NULL;
-
--- pending_requests.payment_method_id FK, deferred to here: pending_requests
--- (the 2026-07-14 approval-divert amendment) is created before this table
--- exists, so the constraint can't ride inline there.
-ALTER TABLE pending_requests
-  ADD CONSTRAINT pending_requests_payment_method_id_fkey
-  FOREIGN KEY (payment_method_id) REFERENCES payment_methods(id);
 
 CREATE TABLE charges (
   id                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2097,6 +2079,14 @@ CREATE TABLE service_rates (
 );
 CREATE INDEX service_rates_lookup_idx
   ON service_rates (category, location, effective_from DESC);
+-- M3.05: the evaluation's one price store, 0 at each campus (eval.price_cents).
+-- Fixed ids, the same as the step file, because the table has no other unique
+-- key. Reference data, so the test volume carries it too; the fingerprint reads
+-- no rows, so test/contracts/lg2-p12-steps.test.ts is what proves the two agree.
+INSERT INTO service_rates (id, category, location, amount_cents, unit, effective_from, effective_to, note) VALUES
+  ('e7a10000-0000-4000-8000-000000000001', 'evaluation', 'fayetteville', 0, 'per-session', '2025-01-01', NULL, 'Evaluation rate, Fayetteville: free (M3.05 seed)'),
+  ('e7a10000-0000-4000-8000-000000000002', 'evaluation', 'bentonville', 0, 'per-session', '2025-01-01', NULL, 'Evaluation rate, Bentonville: free (M3.05 seed)')
+ON CONFLICT (id) DO NOTHING;
 
 -- ----------------------------------------------------------------------------
 -- Client-mutation idempotency (locked 2026-05-19). Mutating endpoints (book,
@@ -2742,7 +2732,7 @@ CREATE TRIGGER bookings_eval_gate_check
 --      (materialize the default-rule row first if absent); assert remaining
 --      openings for (location,date,mode) > count of non-staff dogs — the
 --      day-capacity analogue of the cohort row lock;
---    lock per (dog_id,mode): pg_advisory_xact_lock(hashtext(dog||mode)) OR
+--    lock per dog: pg_advisory_xact_lock(hashtext('dog:'||dog_id)) OR
 --      run SERIALIZABLE;                                       -- no double-spend
 --    INSERT booking (+ booking_dogs);
 --    INSERT credit_ledger (delta = -1, reason='booking-debit', booking_id)

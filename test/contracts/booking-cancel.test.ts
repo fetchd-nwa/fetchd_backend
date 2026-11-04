@@ -62,8 +62,9 @@ const ONE_HOUR_MS = 3_600_000;
  * then the CREATION route, on FIXTURE_NOW, validated real-clock dates against a
  * frozen 92-day lookahead cap and the file went red on 2026-08-20 by one day
  * (fixed in 1bb207f by moving both sides to the real clock, which re-armed it:
- * on the real clock the fixture's last-attended dates aged past 3 months and
- * every credit-back seed started diverting to a 202). The fix is the seam, not
+ * on the real clock the fixture's last-attended dates aged past 3 months, and
+ * the booking rule of the day, deleted at wire 3.0.0, stopped every credit-back
+ * seed from booking). The fix is the seam, not
  * the anchor: `cancelBookingInTx` now takes the caller's `now`, so BOTH sides
  * can be frozen and there is no second clock left to disagree with.
  */

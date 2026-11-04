@@ -64,7 +64,7 @@
  * ships after M1 as 7.0.0 (LG2b), so a design label above 3.0.0 reads one
  * major up here (build DECISIONS 6).
  */
-export const WIRE_CONTRACT_VERSION = '3.0.0-lg2.1';
+export const WIRE_CONTRACT_VERSION = '3.0.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -964,11 +964,12 @@ export interface MediaWire {
 
 /** The owner's emergency contact, nested on `MeWire`. The DB stores these as
  *  flat `emergency_*` columns and the API denormalizes them on read (the same
- *  pattern as Booking). Promoted 1.13.0 from `routes/me.ts:44-48` — digest
- *  auth-media/M. NON-OMIT EXCEPTION to the file-wide omit-on-null rule: each
- *  nullable column emits `''`, never `null` and never an omitted key, so the
- *  mobile `toUser` translator's unconditional property reads can't hit
- *  `undefined` (`routes/me.ts:14-21`; BUSINESS-LOGIC/auth-accounts.md:38 R13). */
+ *  pattern as Booking). Promoted 1.13.0 from `ownerProfile` (`routes/me.ts`)
+ *  — digest auth-media/M. NON-OMIT EXCEPTION to the file-wide omit-on-null
+ *  rule: each nullable column emits `''`, never `null` and never an omitted
+ *  key, so the mobile `toUser` translator's unconditional property reads can't
+ *  hit `undefined` (the "frozen wire shape" comment in `routes/me.ts`;
+ *  BUSINESS-LOGIC/auth-accounts.md:38 R13). */
 export interface MeEmergencyContactWire {
   name: string;
   relationship: string;
@@ -977,7 +978,7 @@ export interface MeEmergencyContactWire {
 
 /** The owner's mailing address, nested on `MeWire`. Same denormalize-on-read +
  *  `''`-never-`null` contract as `MeEmergencyContactWire`. Promoted 1.13.0 from
- *  `routes/me.ts:49-55` — digest auth-media/M. */
+ *  `ownerProfile` (`routes/me.ts`) — digest auth-media/M. */
 export interface MeAddressWire {
   line1: string;
   line2: string;
@@ -987,12 +988,13 @@ export interface MeAddressWire {
 }
 
 /** `GET /me` (owner principal) and `PATCH /me` response — the SAME projection
- *  (`ownerProfile`, both call sites). Promoted 1.13.0 from `routes/me.ts:35-62`
- *  — digest auth-media/M. Rules: BUSINESS-LOGIC/auth-accounts.md:38 (R13, the
- *  frozen owner shape) and :39 (R14, the PATCH contract).
+ *  (`ownerProfile`, both call sites, `routes/me.ts`). Promoted 1.13.0 from that
+ *  function — digest auth-media/M. Rules: BUSINESS-LOGIC/auth-accounts.md:38
+ *  (R13, the frozen owner shape) and :39 (R14, the PATCH contract).
  *
  *  A staff principal on `GET /me` gets `StaffMeWire` instead — see
- *  `GetMeResponse`. `PATCH /me` hard-403s staff (`routes/me.ts:184-186`).
+ *  `GetMeResponse`. `PATCH /me` hard-403s staff (the handler's `principal.kind`
+ *  check, `routes/me.ts`).
  *
  *  This shape was frozen long before it was contracted: it is the exact key set
  *  the mobile `toUser` translator reads, and mobile hand-mirrors it as `RawUser`
@@ -1008,18 +1010,20 @@ export interface MeAddressWire {
 export interface MeWire {
   id: string;
   /** NON-OMIT: `null` when the family has none, never `''` and never omitted
-   *  (3.0.0-lg2.1, M2.01). A reader that prints a name falls back to `email`
-   *  (design §2.2:2244). */
+   *  (3.0.0-lg2.1, M2.01). A stored value with no visible character reads as
+   *  `null` too (the test is on `ProfileIncompleteDetails`). A reader that
+   *  prints a name falls back to `email` (design §2.2:2244). */
   name: string | null;
   email: string;
   /** NON-OMIT: `null` when the family has none, never `''` and never omitted
-   *  (3.0.0-lg2.1, M2.01). */
+   *  (3.0.0-lg2.1, M2.01). A stored value with no visible character reads as
+   *  `null` too, as on `name`. */
   phone: string | null;
-  /** DISPLAY label, not the slug — the one wire surface that translates
-   *  (`routes/me.ts:42`). `PatchMeRequest.location` speaks the same vocabulary.
-   *  NON-OMIT: `null` when the family has no home campus (3.0.0-lg2.1, M2.01). */
+  /** DISPLAY label, not the slug (`slugToDisplay` in `ownerProfile`).
+   *  `PatchMeRequest.location` speaks the same vocabulary. NON-OMIT: `null` when the family has no home campus
+   *  (3.0.0-lg2.1, M2.01). */
   location: LocationDisplay | null;
-  /** Never `null` and never omitted (`?? ''`, `routes/me.ts:43`). A media-asset
+  /** Never `null` and never omitted (`?? ''`, `ownerProfile`). A media-asset
    *  UUID is resolved to a 1h signed GET URL at read time; a bundled/seed path
    *  or `''` passes through unchanged (`lib/profileImageUrls.ts:26,40-59`), so
    *  the value is EITHER an opaque stored path OR an expiring URL — clients must
@@ -1074,12 +1078,12 @@ export interface MeWire {
 }
 
 /** `GET /me` (staff principal) response — the staff mirror row. Promoted 1.13.0
- *  from `routes/me.ts:69-78` — digest auth-media/S.
+ *  from `staffProfile` (`routes/me.ts`) — digest auth-media/S.
  *
  *  RATIFIED + FROZEN at 1.13.0. The source comment called this "a Day-2 design
  *  choice, not a frozen contract … Ratify when the portal lands"
- *  (`routes/me.ts:64-68`), logged as NOTE-35 (`BUSINESS-LOGIC/DISCREPANCIES.md:849`)
- *  and as the freeze-before-consume caveat in
+ *  (over `staffProfile`, replaced by this ratification), logged as NOTE-35
+ *  (`BUSINESS-LOGIC/DISCREPANCIES.md:849`) and as the freeze-before-consume caveat in
  *  `.claude/backend/PORTAL-ENDPOINT-MAP.md` § auth/me. This declaration IS that
  *  ratification: the shape is frozen exactly as emitted today, nothing added,
  *  nothing renamed.
@@ -1121,7 +1125,7 @@ export interface StaffMeWire {
    *  (§2.1:1943-1945). Replaces 1.13.0's `location: LocationDisplay | null`
    *  (BREAKING, 2.0.0-lg1.2; STAFF-U03, E67), so the null case is gone. */
   home_locations: LocationDisplay[];
-  /** `''`, never `null` (`?? ''`, `routes/me.ts:75`). Unlike `MeWire`'s avatar
+  /** `''`, never `null` (`?? ''`, `staffProfile`). Unlike `MeWire`'s avatar
    *  this is NOT resolved to a signed URL — the staff read path has no
    *  equivalent of `withResolvedAvatar`, so a media-asset UUID stored here
    *  would reach the client unresolved. Transcribed as-is (§14.1); the
@@ -1214,8 +1218,8 @@ export interface StaffCapabilitiesWire {
 }
 
 /** `GET /me` returns ONE OF TWO SHAPES, chosen by the caller's principal kind
- *  (`routes/me.ts:162-180`): owner → `MeWire`, staff → `StaffMeWire`. Promoted
- *  1.13.0 — digest auth-media/S + /M.
+ *  (the `GET /me` handler in `routes/me.ts`): owner → `MeWire`, staff →
+ *  `StaffMeWire`. Promoted 1.13.0 — digest auth-media/S + /M.
  *
  *  The union carries NO discriminant field — there is no `kind` on either arm,
  *  and adding one would be a behavior change, not a doc change, so it is
@@ -1288,23 +1292,25 @@ export type GetStaffOwnersResponse = StaffOwnerWire[];
 
 // --- (c) request bodies + query shapes --------------------------------------
 
-/** `PATCH /me` body — owner self-edit. Promoted 1.13.0 from `routes/me.ts:84-109`
+/** `PATCH /me` body — owner self-edit. Promoted 1.13.0 from `patchMeSchema`
  *  — digest auth-media/M. Pinned to the Zod schema by `PatchMeBodyConformance`
  *  (`routes/me.ts`, §5.1.3). Rule: BUSINESS-LOGIC/auth-accounts.md:39 (R14).
  *
  *  Semantics the type cannot state (§4.6 — doc comments, not type gymnastics):
  *    · Every key is optional (`.partial()`), but an EMPTY effective patch is a
- *      400, not a no-op (`routes/me.ts:196-198`).
+ *      400, not a no-op (the handler's `Object.keys(set)` check, `routes/me.ts`).
  *    · Unknown keys are REJECTED (`.strict()`) — a typo 400s rather than
  *      silently no-opping.
  *    · `email` is deliberately absent: identity is not self-editable here.
- *    · `emergency_contact` and `address` are WHOLE-OBJECT REPLACE, not merge —
- *      omitting a sub-key blanks that column (`routes/me.ts:117-128`).
+ *    · `emergency_contact` and `address` are WHOLE-OBJECT REPLACE, not merge:
+ *      every sub-key is required (omitting one is a 400), and `''` blanks that
+ *      column (`patchMeSchema`, `toOwnerUpdate`).
  *    · An `Idempotency-Key` header is REQUIRED; the write runs through the
  *      audited `withMutation` wrapper (actor `owner:<id>`, retries replay the
- *      stored outcome) — `routes/me.ts:188,200-225`; auth-accounts.md:107.
- *    · Staff principals get 403 (`routes/me.ts:184-186`); a staff self-edit
- *      route does not exist.
+ *      stored outcome) — `requireIdempotencyKey` and `withMutation` in the
+ *      `PATCH /me` handler; auth-accounts.md:107.
+ *    · Staff principals get 403 (the handler's `principal.kind` check); a
+ *      staff self-edit route does not exist.
  *    · The sign-up map (`acct.signup_field_requirement_map`), read on every
  *      call — 3.0.0-lg2.1 (design §2.2:2244; ACCT-U04). `name`, `phone` and
  *      `location` take `null` to clear; a `name` or `phone` with no visible
@@ -1329,17 +1335,17 @@ export interface PatchMeRequest {
   /** As `name`. */
   phone?: string | null;
   /** The DISPLAY label, not the slug — translated to the slug server-side
-   *  (`routes/me.ts:115`). `null` clears (3.0.0-lg2.1). */
+   *  (`displayToSlug` in `toOwnerUpdate`). `null` clears (3.0.0-lg2.1). */
   location?: LocationDisplay | null;
   /** A media-asset UUID here MUST be the caller's own, live, and of purpose
-   *  `owner-avatar`, or the write 4xxs (`assertOwnedImagePath`,
-   *  `routes/me.ts:212-214`) — the guard that stops an owner pointing their
+   *  `owner-avatar`, or the write 4xxs (`assertOwnedImagePath` in the
+   *  `PATCH /me` handler) — the guard that stops an owner pointing their
    *  avatar at another tenant's media id. A non-UUID path is left permissive. */
   avatar_image_path?: string;
   emergency_contact?: MeEmergencyContactWire;
   address?: MeAddressWire;
   push_notifications_enabled?: boolean;
-  /** An ARBITRARY record — `z.record(z.unknown())` (`routes/me.ts:103`): any
+  /** An ARBITRARY record — `z.record(z.unknown())` (`patchMeSchema`): any
    *  string key, any JSON value, no vocabulary enforced, written straight to
    *  the jsonb column. This is the truthful transcription of what the endpoint
    *  ACCEPTS, and it is deliberately NOT tightened to the six live toggles
@@ -1521,52 +1527,17 @@ export interface PendingRequestWire {
   approved_at?: string;
   // Δ 1.13.0 (digest bookings/S; closes DRIFT-8 @
   // BUSINESS-LOGIC/DISCREPANCIES.md:291). The staff actor on a STAFF-driven
-  // resolution — stamped by approve (`staffRequests.ts:189,250,315`) and by
-  // deny (`:386`), and left NULL by an owner self-cancel (`requests.ts:480`).
+  // resolution — stamped by approve (`markApprovedAwaitingPayment`,
+  // `markConverted`) and by deny (`markCancelled`), all in `staffRequests.ts`,
+  // and left NULL by an owner self-cancel (`requests.ts:480`).
   // It is the discriminator the client branches on to render "Denied by the
   // school" vs "You cancelled this", because `request_status` has no 'denied'
   // member (DATA-CONTRACT.md:1217-1222; column @ schema.sql:822). Omit-on-null
   // like its neighbours: present ⇒ staff acted, absent ⇒ they did not.
   approved_by_staff_id?: string;
   converted_booking_id?: string;
-  // Day-program divert (Shanthi 2026-07-14): present only on diverted
-  // day-school / day-care submissions. `divert_reasons` tells the staff
-  // queue WHY this needs eyes ('reevaluation-stale' | 'not-spayed-neutered');
-  // `location` + `payment` ride so the approve conversion books verbatim.
-  location?: LocationKey;
-  payment?: 'credits' | 'payg';
-  divert_reasons?: string[];
   // Private-lesson only (Δ 2026-07-14): where the lesson should happen.
   lesson_setting?: LessonSetting;
-}
-
-/**
- * `POST /bookings` 202 response (Shanthi 2026-07-14): the submission tripped
- * an approval rule (3-month re-eval staleness / intact dog) and was parked as
- * a pending request instead of booking instantly. The 201 arm remains
- * `BookingWire[]` — clients branch on the status code.
- */
-export interface DivertedBookingWire {
-  diverted: true;
-  divert_reasons: string[];
-  request: PendingRequestWire;
-}
-
-/**
- * `POST /bookings/preview` response (Δ 2026-07-17): a read-only pre-check of
- * the approval-divert rules for a roster, so the owner app can ask up front —
- * "some dogs need staff approval; book the rest, request them too, or cancel?"
- * — BEFORE anything commits. Advisory only: POST /bookings re-runs the
- * authoritative check. One entry per requested dog; empty `divert_reasons`
- * means the dog books instantly.
- */
-export interface BookingDivertPreviewDogWire {
-  dog_id: string;
-  divert_reasons: string[];
-}
-
-export interface BookingDivertPreviewWire {
-  dogs: BookingDivertPreviewDogWire[];
 }
 // ---- (a) domain-local value tuples -----------------------------------------
 // Runtime arm lists for the two per-endpoint 422 aliases below (§2.1(d)). They
@@ -1588,7 +1559,6 @@ export const POST_BOOKINGS_ERROR_DETAIL_KINDS = [
   'insufficient_credits',
   'already_booked',
   'insufficient_capacity',
-  'already_requested',
 ] as const satisfies readonly [
   PostBookingsErrorDetails['kind'],
   ...PostBookingsErrorDetails['kind'][],
@@ -1635,7 +1605,8 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  *     (`routes/bookings.ts:768 resolvePaymentPlan`); sending one on a
  *     `'credits'` group is accepted and ignored — deliberately backward-
  *     compatible, do not "fix" it (§14.1).
- * `Idempotency-Key` is required on this endpoint (§0 conventions).
+ * `Idempotency-Key` is required on this endpoint (§0 conventions). The
+ * response is 201 `BookingWire[]`.
  * BUSINESS-LOGIC/bookings-scheduling.md R20 @ :90.
  */
 export interface PostBookingsRequest {
@@ -1653,21 +1624,6 @@ export interface PostBookingsRequest {
   payment?: 'credits' | 'payg';
   /** REQUIRED when `payment: 'payg'`; ignored otherwise. */
   payment_method_id?: string;
-}
-
-/**
- * `POST /bookings/preview` body (Δ 2026-07-17). Promoted 1.13.0 from
- * `routes/bookings.ts:163` `previewBodySchema` (digest bookings/M); pinned by
- * `PostBookingsPreviewBodyConformance`.
- *
- * Roster only — the divert check is category- and date-agnostic (staleness is
- * the last ATTENDED day program of either kind; spay/neuter is dog-level), so
- * nothing else belongs in this body. 1..5 ids, `.strict()`. Duplicates are
- * accepted and de-duped first-seen (`routes/bookings.ts:283`) — transcribed,
- * not tightened. No `Idempotency-Key` (read-only, no writes, no locks).
- */
-export interface PostBookingsPreviewRequest {
-  dog_ids: string[];
 }
 
 /**
@@ -1799,24 +1755,24 @@ export interface PostRequestsConfirmPaymentRequest {
 
 /**
  * `POST /staff/requests/:id/approve` body `[staff]`. Promoted 1.13.0 from
- * `routes/staffRequests.ts:92` `approveBodySchema` (digest bookings/M);
+ * `approveBodySchema` in `routes/staffRequests.ts` (digest bookings/M);
  * pinned by `PostStaffRequestsApproveBodyConformance`.
  *
  * Flat and fully optional ON PURPOSE: which keys are required depends on the
  * LOCKED request row's category, which is not known until the row is read, so
- * a discriminated union on the body alone could not help
- * (`routes/staffRequests.ts:81-91`). The per-category requirements, enforced
- * in `validateApproveBody` (`staffRequests.ts:425`) as 422 `invalid_payload`:
+ * a discriminated union on the body alone could not help (the comment over
+ * `approveBodySchema`). The per-category requirements, enforced in
+ * `validateApproveBody` as 422 `invalid_payload`:
  *   - private-lesson: `scheduled_at` AND `location` required; `pickup_at`
  *     rejected.
  *   - boarding: `scheduled_at`, `location` AND `pickup_at` required, with
  *     `pickup_at` strictly after `scheduled_at`.
  *   - board-and-train: the body is IGNORED entirely — approval parks the
  *     request at `'approved-awaiting-payment'` and creates no booking.
- *   - day-school / day-care (divert conversions): the body is IGNORED — the
- *     request row already carries location, payment plan and the exact
- *     session instants from submit time (`staffRequests.ts:191-263`).
- * An absent body is accepted (`request.body ?? {}`, `staffRequests.ts:146`).
+ * A `day-school` or `day-care` request cannot be created any more (3.0.0);
+ * approving one that survives answers 409 `conflict` and books and charges
+ * nothing; the row stays `submitted`, and deny still works.
+ * An absent body is accepted (`request.body ?? {}`, the approve handler).
  * `Idempotency-Key` required.
  */
 export interface PostStaffRequestsApproveRequest {
@@ -1944,7 +1900,7 @@ export interface GetStaffBookingsQuery {
 /**
  * Every `details` arm `POST /bookings` can 422 with, so a client can narrow
  * `ApiErrorEnvelope['error']['details']` once for this endpoint instead of
- * switching over all thirteen (digest bookings/L). Emit sites, in the order
+ * switching over every arm (digest bookings/L). Emit sites, in the order
  * the request hits them:
  *   1. `payment_required`      — `lib/bookingGatePreCheck.ts:101`
  *   2. `evaluation_required`   — `lib/bookingGatePreCheck.ts:119`
@@ -1953,8 +1909,6 @@ export interface GetStaffBookingsQuery {
  *   5. `insufficient_credits`  — `lib/createDayProgramBookings.ts:195`
  *   6. `already_booked`        — `lib/createDayProgramBookings.ts:217`
  *   7. `insufficient_capacity` — `db/repositories/dayCapacityRepository.ts:179`
- *   8. `already_requested`     — `routes/bookings.ts:449` (the 202-divert
- *      branch's one-open-request-per-(dog,category) guard)
  * Arms 1-4 can also arrive from the DB trigger floor with EMPTY arrays
  * (`gateTriggerErrorToApiError`, `lib/bookingErrors.ts:409-455`) in the race
  * window — `missing: []` is a legal emission, see §1.
@@ -1971,8 +1925,7 @@ export type PostBookingsErrorDetails =
   | AgreementUnsignedDetails
   | InsufficientCreditsDetails
   | AlreadyBookedDetails
-  | InsufficientCapacityDetails
-  | AlreadyRequestedDetails;
+  | InsufficientCapacityDetails;
 
 /**
  * Every `details` arm `POST /requests` can 422 with (digest bookings/L).
@@ -2433,9 +2386,9 @@ export interface FeedingWire {
  *   - There is NO `field_overrides` key: DATA-CONTRACT §B promises one and
  *     mobile reads one, but no server code has ever emitted it (DRIFT-27).
  *     Deciding it is a named out-of-scope design item (§17).
- *   - Date conventions: `spay_neuter_planned_on` is `YYYY-MM-DD`;
- *     `evaluation_date` and `alumni_attendance_flagged_at` are ISO timestamptz
- *     (dogs-evaluations.md :135).
+ *   - Date conventions: `spay_neuter_planned_on` and `last_seen_on` are
+ *     `YYYY-MM-DD`; `evaluation_date` and `alumni_attendance_flagged_at` are
+ *     ISO timestamptz (dogs-evaluations.md :135).
  */
 export interface DogWire {
   id: string;
@@ -2461,13 +2414,19 @@ export interface DogWire {
    *  the dog stays alumni, credits keep no-expiry, and no booking 422 fires
    *  (BUSINESS-LOGIC/dogs-evaluations.md R23-R24 @ :78-79). */
   alumni_attendance_flagged_at?: string;
-  /** Shanthi 2026-07-14 (omit-on-null = unanswered): a PROFILE question, never
-   *  a hard block. An explicit `false` diverts day-program bookings into the
-   *  staff-approval lane (R18 @ :70); `null`/absent never diverts. */
+  /** Shanthi 2026-07-14 (omit-on-null = unanswered): a PROFILE question. The
+   *  owner's answer is stored, and no booking path reads it until the
+   *  spay/neuter refusal lands in a later group (S11, LG2b). */
   spayed_neutered?: boolean;
   /** `YYYY-MM-DD` (omit-on-null): the owner's stated spay/neuter date — a
    *  reminder to update the profile fires that morning. */
   spay_neuter_planned_on?: string;
+  /** `YYYY-MM-DD` (omit-on-null): `dogs.last_seen_on` (M2.16), the last day the
+   *  school saw this dog. New 3.0.0. Nothing stamps the column until the
+   *  check-in unit lands (P20), so the key is absent until then. No gate, clock
+   *  or client acts on it in v1 yet: its reader is S14's, dated (design §1.1:806,
+   *  M2.16). */
+  last_seen_on?: string;
 }
 
 /**
@@ -6290,9 +6249,9 @@ export interface OwnerGateSettingsWire {
 export interface OwnerEvaluationCampusSettingsWire {
   /** Cents, read from the row `GET /rates` (category `evaluation`, this
    *  location) selects — the price's one store (C8); `evaluation_settings`
-   *  holds no price. NON-OMIT: `null` where that read would 404, i.e. until
-   *  M3.05 seeds the campus rows — a store that has not landed emits `null`,
-   *  never a default. */
+   *  holds no price. NON-OMIT: `null` where that read would 404. M3.05 seeds
+   *  both campuses, so that takes a closed or voided row — a campus with no
+   *  row emits `null`, never a default. */
   price_cents: number | null;
 }
 

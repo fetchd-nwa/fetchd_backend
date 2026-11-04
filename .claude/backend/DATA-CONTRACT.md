@@ -1325,6 +1325,20 @@ BUILT same day — see the "AS BUILT" block at the end of this amendment for
 the resolved decisions + wire deltas; owner-authoritative (validation model:
 Shanthi's domain corrections are the source of truth).**
 
+> **Superseded in part at wire 3.0.0 (P12; DOG-U08, PAY-U19).** Ruling 1's
+> day-program lane and every line below about it are history, kept for the
+> record. `POST /bookings` has one outcome: 201 `BookingWire[]` or a refusal.
+> `POST /bookings/preview` and `DivertedBookingWire` are gone. `POST
+> /staff/requests/:id/approve` has no day-program arm: a surviving `day-school`
+> or `day-care` row answers 409 `conflict`, moves nothing, stays `submitted`,
+> and can still be denied. `pending_requests` lost `location`, `payment`,
+> `payment_method_id` and `divert_reasons` (M2.17), and `PendingRequestWire`
+> lost the wire three. `dogs.last_seen_on` (M2.16) is on `DogWire`, omitted
+> while null; P20's check-in stamps it, and no gate, clock or client acts on it.
+> The re-evaluation clock is S14's and dated; the spay/neuter refusal is S11's.
+> Rulings 2 and 3's vaccine exemption and spay/neuter profile fields stand, and
+> the fields' reminder lifecycle with them.
+
 Context: Allison asked whether every enrollment request should be staff-
 approved, or only privates / B&T / boarding (today's request-approve set).
 Shanthi's first answer was "each reservation type," but her stated REASON
@@ -1375,9 +1389,10 @@ that's perfect." Three rulings fall out:
    no gate arm, ever — re-confirm with Shanthi before anyone promotes it.
 
 **AS BUILT (same day; Allison rulings resolved the open decisions —
-api 825/825, mobile jest 260/260):**
+api 825/825, mobile jest 260/260). Each bullet tagged DELETED below left the
+code at wire 3.0.0:**
 
-- **Mechanism = server-side divert into the pending-request lane** (Allison:
+- **DELETED. Mechanism = server-side divert into the pending-request lane** (Allison:
   "we want them to approve the pending request"). `POST /bookings` runs
   `lib/bookingApprovalDivert.resolveApprovalDivert` after the ownership gate;
   any reason ⇒ gates + PAYG card/rate are still validated (staff never
@@ -1389,7 +1404,7 @@ api 825/825, mobile jest 260/260):**
   same (dog, mode) advisory locks as the booking core, so two concurrent
   submissions for the same dog can't race the duplicate guard into two
   open requests (Δ same day, test-verified).
-- **"Seen" = last ATTENDED day-school / day-care session ONLY** (Allison
+- **DELETED. "Seen" = last ATTENDED day-school / day-care session ONLY** (Allison
   narrowed it: group classes and private lessons do NOT reset the 3-month
   clock; `booking_dogs.attendance = 'attended'` is the signal). A dog with
   no attended day program EVER is stale — its first booking gets staff eyes.
@@ -1398,12 +1413,12 @@ api 825/825, mobile jest 260/260):**
   (§J.3 derived); staff-owned dogs exempt (uniform gate exemption). This is
   a WORKFLOW rule, deliberately NOT a trigger floor — staff paths (approve
   conversion, staff on-behalf booking) are the legitimate override.
-- **Intact divert (Allison extension):** `dogs.spayed_neutered = FALSE`
+- **DELETED. Intact divert (Allison extension):** `dogs.spayed_neutered = FALSE`
   diverts too — even a too-young intact dog ("that is ok but should still
   go automatically into pending request"). NULL (unanswered — every
   pre-existing dog) never diverts. Reasons: `'reevaluation-stale'` |
   `'not-spayed-neutered'`, both possible on one request.
-- **Approve conversion:** `POST /staff/requests/:id/approve` gained a
+- **DELETED. Approve conversion:** `POST /staff/requests/:id/approve` gained a
   day-program arm — no body fields; the request carries location / payment
   ('credits' | 'payg' + payment_method_id) / exact session instants
   (`pending_request_preferred_dates`), and the conversion runs the SAME
@@ -1415,13 +1430,12 @@ api 825/825, mobile jest 260/260):**
   the request stays `submitted`.
 - **Schema:** `dogs.spayed_neutered boolean` + `dogs.spay_neuter_planned_on
   date` (+ CHECK planned⇒not-true); `pending_requests.location / payment /
-  payment_method_id / divert_reasons`; `required_vaccines.exempt_class_keys
+  payment_method_id / divert_reasons` (DELETED, M2.17); `required_vaccines.exempt_class_keys
   group_class_key[]` + the vaccine trigger's group-class exemption clause;
   `notification_type` += `'spay-neuter-reminder'`. Applied to both local DBs.
 - **Wire:** `PendingRequestWire` += optional `location` / `payment` /
-  `divert_reasons` (omit-on-null — classic requests byte-identical);
-  `DogWire` += optional `spayed_neutered` / `spay_neuter_planned_on`;
-  new `DivertedBookingWire`.
+  `divert_reasons` (DELETED, 3.0.0); `DogWire` += optional `spayed_neutered` /
+  `spay_neuter_planned_on`; new `DivertedBookingWire` (DELETED, 3.0.0).
 - **Spay/neuter surface:** POST/PATCH `/dogs` accept the pair (planned date
   requires an explicit `spayed_neutered: false` in the same body — 422
   otherwise; answering "fixed" auto-clears the date). A planned date
@@ -1433,11 +1447,12 @@ api 825/825, mobile jest 260/260):**
   through `checkBookingGates.groupClassKey`). Rabies-for-puppy is DATA, not
   code — staff seed it when `required_vaccines` gets populated for real.
 - **Seed / fixture:** dev seed + contract fixture now plant recently-ATTENDED
-  day programs per dog (staleness anchors) and `spayed_neutered: true` on
-  seed dogs — without them every demo/test booking would divert. Seed also
+  day programs per dog and `spayed_neutered: true` on seed dogs. Since wire
+  3.0.0 those are ordinary past bookings; no booking path reads them. Seed also
   STOPPED planting fake `cus_seed_*` stripe_customers (they 500'd the
   add-card flow; the route lazily provisions real test-mode customers).
-- **FE:** ~~minimal this round: the 202 rides the gate lane into a
+- **FE (DELETED at wire 3.0.0, the owner app's whole pending-approval phase):**
+  ~~minimal this round: the 202 rides the gate lane into a
   `<BookingGateModal>` "Sent to the school for approval" arm~~ **(SUPERSEDED
   — full pending-approval phase BUILT 2026-07-16 later round.** The flow now
   catches `BookingDivertedToApprovalError` BEFORE gate parsing and enters a
@@ -1460,7 +1475,10 @@ api 825/825, mobile jest 260/260):**
   nothing — that's go-live blocker #5, POST /dogs unwired, and the form
   values are ready for it), and the portal queue's divert-reason badge
   (other repo).
-- **Tests:** `booking-approval-divert.test.ts` (17) — divert/instant/alumni/
+- **Tests (that suite is DELETED at wire 3.0.0; its survivors moved to
+  `requiredVaccines.test.ts` and `dogs-spay-neuter.test.ts`, and
+  `booking-no-divert.test.ts` pins the one outcome):**
+  `booking-approval-divert.test.ts` (17) — divert/instant/alumni/
   intact/both-reasons/dup-guard, approve conversion incl. PAYG + the full
   divert→approve→attend→instant loop, bounce-stays-submitted (credits spent /
   capacity filled / same-day overlap created between divert and approval —
@@ -2540,6 +2558,9 @@ primaryVet?, otherVaccines? }`, each bool; omit when empty). Staff-set,
 
 **PendingRequest** — `{ id, dog_id, additional_dog_ids?, category, submitted_at, preferred_dates:[iso], notes?:{per_dog?,joint?}, focus:{staff_preference?,descriptor_keys?}, length_weeks?, status, approved_at?, converted_booking_id? }`
 
+- Δ 3.0.0: `location`, `payment` and `divert_reasons` are gone, with the
+  day-program lane that wrote them (`src/contracts/wire.ts` is the full shape).
+
 - Δ R1: gains `additional_dog_ids`. Δ R8: `focus` object replaces
   `focus_areas:string[]`. Δ: `notes` is the structured object (the mock's
   `toPendingNotes` lossy `{perDog:raw}` collapse is gone). Δ: real `status`.
@@ -2583,7 +2604,8 @@ FE `toCredits` unchanged (`school_credits`→`school` etc. — API emits the
   `bad_request`). `dog_credit_balance` groups by `(dog_id, mode, location)`;
   every `credit_ledger` row carries `location` (purchase → the chosen location,
   booking-debit → the booking's location, cancel-refund → the original debit's
-  location); the booking balance advisory lock is per-(dog, mode, location). The
+  location); the booking balance advisory lock is per-(dog, mode, location)
+  (from wire 3.0.0 it is per dog: `withDogLocks`, P12's two-campus race). The
   zero sentinel carries the queried `location`.
 - **Δ 2026-06-18 (credit-expiry lot model):** credits now **expire** (supersedes
   the 2026-05-19 "never expire" decision). The wire gains `expiring_lots: [{

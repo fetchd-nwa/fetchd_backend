@@ -62,10 +62,11 @@ export const INVISIBLE_CODE_POINTS: ReadonlyArray<readonly [number, number]> = [
   [0xfe00, 0xfe0f], // variation selectors
   [0xfeff, 0xfeff], // zero-width no-break space (BOM)
   [0xffa0, 0xffa0], // halfwidth Hangul filler
+  [0xfff0, 0xfff8], // unassigned specials (Default_Ignorable)
   [0xfff9, 0xfffb], // interlinear annotation marks
+  [0x1bca0, 0x1bca3], // shorthand format controls
   [0x1d173, 0x1d17a], // musical format characters
-  [0xe0000, 0xe007f], // tag characters
-  [0xe0100, 0xe01ef], // variation selectors supplement
+  [0xe0000, 0xe0fff], // tag characters, variation selectors supplement, the rest of the block
 ];
 
 /** One character outside the invisible class — a regex both engines read the

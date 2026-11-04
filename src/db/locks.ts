@@ -1,50 +1,8 @@
 import { and, eq, sql } from 'drizzle-orm';
-import {
-  bookingMode,
-  cohorts,
-  dayCapacity,
-  events,
-  serviceCategory,
-  type LocationKey,
-} from './schema/schema.js';
+import { bookingMode, cohorts, dayCapacity, events, type LocationKey } from './schema/schema.js';
 import type { Tx } from './tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
-type ServiceCategory = (typeof serviceCategory.enumValues)[number];
-
-/**
- * Per-(dog, mode) transaction-scoped advisory lock — the booking
- * serializability primitive (`schema.sql` Transaction contract notes,
- * `bookSession` ~line 1310). Two concurrent retries of `bookSession` for the
- * same `(dog_id, mode)` must serialize so the `credit_ledger` debit can't
- * race the balance check (no double-spend). The lock is held until the
- * outer transaction commits OR rolls back — that's what `_xact_` means,
- * and it's why Day-0 lock #3 mandates the direct/session connection (5432).
- *
- * The key is `hashtext('<dogId>:<mode>')` — a single int4 hash that Postgres
- * widens to the int8 advisory-lock space. The colon separator is defensive:
- * dog IDs are UUIDs (fixed 36 chars) so concatenation alone would be
- * unambiguous, but the separator makes "no two different (dog, mode) pairs
- * collide" structurally obvious to a reader. Hash collisions across distinct
- * keys are birthday-paradox-bounded by int4 space; a spurious collide only
- * causes extra serialization, never incorrect behavior.
- *
- * `fn` runs AFTER the lock is acquired; subsequent statements inside `fn`
- * see the dog-mode pair as "owned" by this transaction. The lock auto-
- * releases on commit/rollback — there's no explicit `pg_advisory_unlock`
- * needed (and using one would be a footgun, since rolled-back transactions
- * still need their locks released).
- */
-export async function withDogModeLock<T>(
-  tx: Tx,
-  dogId: string,
-  mode: BookingMode,
-  location: LocationKey,
-  fn: () => Promise<T>,
-): Promise<T> {
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}:${location}`}))`);
-  return fn();
-}
 
 /**
  * Per-(category, location) transaction-scoped advisory lock — the
@@ -87,7 +45,7 @@ export async function withServiceRateLock<T>(
  * both.
  *
  * Key: `hashtext('membership:<dogId>:<mode>')`. The prefix keeps this
- * namespace disjoint from the booking (`<dogId>:<mode>:<location>`) and
+ * namespace disjoint from the booking (`dog:<dogId>`) and
  * `service-rate:` locks; int4 hash collisions only cause spurious
  * serialization, never incorrect behavior.
  */
@@ -202,14 +160,14 @@ export async function lockDayCapacity(
  * Lock key: `hashtext('capacity:<location>:<date>')`. The colon separator
  * makes "no two different (location, date) pairs collide" structurally
  * obvious; the prefix keeps this key namespace disjoint from the
- * `<dogId>:<mode>` advisory locks elsewhere in the file. int4 hash
+ * `dog:<dogId>` advisory locks elsewhere in the file. int4 hash
  * collisions are birthday-paradox-bounded and only cause spurious
  * serialization (never incorrect behavior).
  *
  * Day-10 lock ordering protocol (deadlock avoidance): when a single
  * transaction acquires multiple capacity locks (multi-date booking),
  * caller MUST acquire them in ASC date order. Combined with
- * `withDogModeLocks`'s ASC dogId-ascending ordering, two concurrent
+ * `withDogLocks`'s ASC dogId ordering, two concurrent
  * multi-key bookings can never deadlock — both observe the same
  * total acquisition order.
  */
@@ -247,58 +205,34 @@ export async function withCapacityLocks<T>(
 }
 
 /**
- * Day 10 batch helper for the multi-dog `bookSession` path. Acquires
- * `withDogModeLock` for every `(dogId, mode)` pair in canonical ASC dogId
- * order so two concurrent N-dog bookings on overlapping dog sets can
- * never deadlock — both observe the same total acquisition order.
+ * The booking core's dog lock: one transaction-scoped advisory lock per dog,
+ * acquired in canonical ASC dogId order so two concurrent N-dog bookings on
+ * overlapping dog sets can never deadlock — both observe the same total
+ * acquisition order. It serializes the credit balance check, the FIFO lot
+ * choice and the overlap guard, so the `credit_ledger` debit can't race any of
+ * them. Held until the outer transaction commits OR rolls back.
  *
- * Single-mode (every booking_dog shares the same mode in a given booking
- * — day-school is 'school' for all dogs, day-care is 'daycare' for all):
- * the per-pair locks all share `mode`, but the key still uses
- * `<dogId>:<mode>` so a future mixed-mode booking shape (none planned)
- * wouldn't deadlock against a current single-mode one.
+ * The key is the dog alone, `hashtext('dog:<dogId>')`; the prefix keeps it
+ * disjoint from the file's other namespaces. A dog is in one place on a day, so
+ * the overlap guard reads her bookings across every mode and campus, and any two
+ * bookings for her must be able to see each other. A key carrying the campus or
+ * the mode lets two concurrent requests both pass the guard, and each spends a
+ * credit or opens an invoice for one day. Credits stay per-(dog, mode, location);
+ * only the queue is per dog.
  *
  * Acquisition is sequential — postgres holds advisory locks until the
  * transaction commits, and the lock-acquire round-trips are cheap
  * (one statement each). Parallelizing would risk deadlock against a
  * concurrent transaction acquiring the same dogs in a different order.
  */
-export async function withDogModeLocks<T>(
+export async function withDogLocks<T>(
   tx: Tx,
   dogIds: readonly string[],
-  mode: BookingMode,
-  location: LocationKey,
   fn: () => Promise<T>,
 ): Promise<T> {
   const sortedIds = [...dogIds].sort();
   for (const dogId of sortedIds) {
-    await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:${mode}:${location}`}))`,
-    );
-  }
-  return fn();
-}
-
-/**
- * Location-agnostic serialization for the approval-divert duplicate guard
- * (Δ 2026-07-16). The (dog, mode, location) booking locks do NOT serialize
- * the same dog diverting at two schools concurrently — the owner app submits
- * each location as its own POST — but "one OPEN request per (dog, category)"
- * is location-agnostic, so its guard needs a location-agnostic key or both
- * transactions pass it and commit duplicate open requests.
- *
- * Deadlock-safe by canonical order: every divert transaction acquires this
- * BEFORE `withDogModeLocks`, and instant-book transactions never take it.
- */
-export async function withDivertRequestLocks<T>(
-  tx: Tx,
-  dogIds: readonly string[],
-  category: ServiceCategory,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const sortedIds = [...dogIds].sort();
-  for (const dogId of sortedIds) {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${dogId}:divert:${category}`}))`);
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`dog:${dogId}`}))`);
   }
   return fn();
 }

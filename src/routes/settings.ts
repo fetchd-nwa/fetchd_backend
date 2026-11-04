@@ -31,7 +31,7 @@ import { ApiError } from '../lib/errors.js';
  *
  * A store that has not landed emits `null`, never a default: the evaluation's
  * per-campus price is the row `GET /rates` would select (category
- * `evaluation`), `null` until M3.05 seeds those rows.
+ * `evaluation`), which M3.05 seeds at 0; `null` if a campus has no active row.
  */
 
 export interface SettingsRouteOptions extends AuthRouteOptions {

@@ -155,10 +155,10 @@ const postDogBodySchema = z
     special_notes: optionalText.optional(),
     evaluation_status: z.enum(EVALUATION_STATUSES).optional(),
     evaluation_date: optionalEvaluationDate.optional(),
-    // Shanthi 2026-07-14: profile question (never a hard gate). Omitted =
-    // unanswered. An explicit false diverts day-program bookings to the
-    // staff-approval lane; `spay_neuter_planned_on` schedules the "is it
-    // done yet?" reminder for that date.
+    // Shanthi 2026-07-14: profile question. Omitted = unanswered. No booking
+    // path reads it until the refusal lands (S11, LG2b).
+    // `spay_neuter_planned_on` schedules the "is it done yet?" reminder for
+    // that date.
     spayed_neutered: z.boolean().nullable().optional(),
     spay_neuter_planned_on: isoDate.nullable().optional(),
   })

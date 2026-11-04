@@ -61,6 +61,7 @@ export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
   }
   if (dog.spayedNeutered !== null) wire.spayed_neutered = dog.spayedNeutered;
   if (dog.spayNeuterPlannedOn !== null) wire.spay_neuter_planned_on = dog.spayNeuterPlannedOn;
+  if (dog.lastSeenOn !== null) wire.last_seen_on = dog.lastSeenOn;
 
   const completedKeys = completedClasses.map((c) => c.classKey);
   if (completedKeys.length > 0) wire.completed_class_keys = completedKeys;

@@ -1,4 +1,4 @@
-import { withCapacityLocks, withDogModeLocks } from '../db/locks.js';
+import { withCapacityLocks, withDogLocks } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
@@ -27,20 +27,16 @@ import { insertBookingWithGateMapping } from './insertBookingWithGateMapping.js'
 /**
  * The day-program (day-school / day-care) booking-creation core — locks →
  * gates → payment plan → overlap guard → per-session capacity/INSERT/money/
- * reminders. Extracted from `POST /bookings` (Day-10..Δ 2026-06-19) when the
- * Shanthi-2026-07-14 approval divert gave it a second caller: the staff
- * portal's `POST /staff/requests/:id/approve` converts a diverted day-program
- * request by running EXACTLY this — same gates, same credit debits / PAYG
- * invoice, same reminders — so an approved request can never book on looser
- * rules than a direct booking.
+ * reminders. `POST /bookings` is its one caller (wire 3.0.0 deleted the staff
+ * approve conversion that was its second).
  *
- * Callers own: body parsing/validation, ownership gates, idempotency
+ * The caller owns: body parsing/validation, ownership gates, idempotency
  * (`withMutation`), and post-commit cache invalidation (the returned
  * `creditDebitedDogIds` + the location feed `patternsToInvalidate`).
  *
  * The transaction protocol — DEADLOCK ORDER MATTERS, do not reorder:
- *   1. `withDogModeLocks(dogs ASC, mode)` then `withCapacityLocks(location,
- *      dates ASC)` — both acquire in canonical sorted order.
+ *   1. `withDogLocks(dogs ASC)` then `withCapacityLocks(location, dates ASC)`
+ *      — both acquire in canonical sorted order.
  *   2. Gate pre-check (payment → evaluation → vaccine → agreement).
  *   3. Payment plan: PAYG validates card + per-day rate and skips the credit
  *      pre-check; credits runs the per-dog balance check.
@@ -60,8 +56,7 @@ export type DayProgramPaymentPlan = { kind: 'credits' } | { kind: 'payg'; paymen
 /**
  * One session to create: the Chicago calendar day (capacity bucket) + the
  * exact UTC instant (drop-off applied). POST /bookings derives these from
- * `dates[]` + `dropoff_time`; the approve conversion reads them back from
- * `pending_request_preferred_dates`.
+ * `dates[]` + `dropoff_time`.
  */
 export interface DayProgramSession {
   date: string; // YYYY-MM-DD, America/Chicago
@@ -79,7 +74,7 @@ export interface CreateDayProgramBookingsArgs {
   category: DayProgramCategory;
   leadDogId: string;
   additionalDogIds: string[];
-  /** MUST be date-ASC (both callers sort at parse/read time). */
+  /** MUST be date-ASC (the caller sorts at parse time). */
   sessions: DayProgramSession[];
   location: LocationKey;
   notes: string | null;
@@ -102,10 +97,9 @@ interface PaygPlan {
 /**
  * In-tx PAYG validation. Returns `null` for a `'credits'` group. For PAYG,
  * verifies the card is owned + live and resolves the active per-day rate —
- * both 404 on miss. Also called STANDALONE by the POST /bookings divert path
- * so a dead card fails at submit time, not at staff-approval time.
+ * both 404 on miss.
  */
-export async function resolvePaygPlan(
+async function resolvePaygPlan(
   tx: Tx,
   args: {
     payment: DayProgramPaymentPlan;
@@ -157,7 +151,7 @@ export async function createDayProgramBookings(
   const sortedDates = args.sessions.map((s) => s.date);
   const creditDebitedDogIds = new Set<string>();
 
-  const wires = await withDogModeLocks(tx, allDogIds, mode, args.location, () =>
+  const wires = await withDogLocks(tx, allDogIds, () =>
     withCapacityLocks(tx, args.location, sortedDates, async () => {
       // Gates (payment → evaluation → vaccine → agreement) above the DB
       // trigger floor. See `lib/bookingGatePreCheck.ts` for the sequence
@@ -197,8 +191,9 @@ export async function createDayProgramBookings(
 
       // Time-overlap guard — the authoritative backstop for the FE conflict
       // engine (exact rules in `lib/bookingConflicts`, Δ 2026-07-09). Runs
-      // under the (location, date) capacity lock, so a concurrent create on
-      // the same bucket can't slip an overlap past this.
+      // under the dog locks, which key on the dog alone, so a concurrent
+      // create for the same dog, in any mode at either campus, can't slip an
+      // overlap past this.
       const conflicts: AlreadyBookedConflict[] = [];
       for (const dogId of allDogIds) {
         const candidates = await bookingsRepository.findConflictCandidatesForDog(

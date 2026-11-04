@@ -222,9 +222,8 @@ Supabase Bearer JWT + `X-Dev-Principal` dev bypass, the `Idempotency-Key`
 requirement on all mutations, and the `{ error: { code, message, details? } }`
 envelope. Mobile hand-maintains camelCase mirrors of the wire shapes in
 `mobile/src/types/*` with no drift guard — **every `wire.ts` change must be
-hand-ported.** Known drift today: mobile has _not_ yet consumed the newest
-`POST /bookings/preview` → `BookingDivertPreviewWire`. (This repo's `CLAUDE.md`
-already mandates flagging mobile in the handoff on any `wire.ts` change.)
+hand-ported.** (This repo's `CLAUDE.md` already mandates flagging mobile in the
+handoff on any `wire.ts` change.)
 
 Also, the **seed** (`scripts/seed-dev.ts`) hardcodes the Shanthi staff id
 `00000000-…-a1` to match the portal's default principal, and preserves the
