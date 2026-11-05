@@ -12,6 +12,7 @@ import {
   type EventRsvpWire,
   type EventWire,
 } from '../lib/eventWire.js';
+import { uuidId } from '../lib/uuidId.js';
 import type { DeleteEventsRsvpResponse, PostEventsRsvpRequest } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { eventsRepository } from '../db/repositories/eventsRepository.js';
@@ -38,7 +39,7 @@ import { dogsRepository } from '../db/repositories/dogsRepository.js';
  */
 
 const uuidParamSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 // Body cap on dogs per RSVP — mirrors POST /enrollments + /bookings. Bounds a
@@ -47,7 +48,7 @@ const MAX_RSVP_DOGS = 5;
 // Lowercased at the parse: Postgres reads a uuid in either case, and the distinct check
 // compares strings, so a second spelling reached the primary key as a 500.
 const rsvpBodySchema = z.object({
-  dog_ids: z.array(z.string().uuid().toLowerCase()).min(1).max(MAX_RSVP_DOGS),
+  dog_ids: z.array(uuidId()).min(1).max(MAX_RSVP_DOGS),
 });
 
 /**

@@ -13,6 +13,7 @@ import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { toReportWire, type ReportProgram, type ReportWire } from '../lib/reportWire.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import type {
@@ -65,7 +66,7 @@ const MAX_EXCERPT_LEN = 2000;
 const MAX_FULL_TEXT_LEN = 20000;
 const MAX_VERDICT_LEN = 500;
 
-const uuidParamSchema = z.object({ id: z.string().uuid() });
+const uuidParamSchema = z.object({ id: uuidId() });
 
 /**
  * `GET /staff/reports` query. `dog_id` is REQUIRED — Allison's 2026-08-25
@@ -79,7 +80,7 @@ const uuidParamSchema = z.object({ id: z.string().uuid() });
  * is dropped, not rejected. `staffInvoices` is the lone strict outlier.
  */
 const getReportsQuerySchema = z.object({
-  dog_id: z.string().uuid(),
+  dog_id: uuidId(),
   program: z.enum(REPORT_PROGRAM_VALUES).optional(),
   category: z.enum(SERVICE_CATEGORY_VALUES).optional(),
 });
@@ -106,18 +107,18 @@ const contentSchema = z.record(z.unknown());
 
 const postReportBodySchema = z
   .object({
-    dog_id: z.string().uuid(),
+    dog_id: uuidId(),
     date: z.string().datetime({ offset: true }),
     category: z.enum(SERVICE_CATEGORY_VALUES),
     program: z.enum(REPORT_PROGRAM_VALUES),
     excerpt: z.string().trim().min(1).max(MAX_EXCERPT_LEN),
     full_text: z.string().trim().min(1).max(MAX_FULL_TEXT_LEN),
-    trainer_staff_id: z.string().uuid().optional(),
+    trainer_staff_id: uuidId().optional(),
     visit_count: z.number().int().min(0).optional(),
     verdict_headline: z.string().trim().max(MAX_VERDICT_LEN).optional(),
     results: resultsEnvelopeSchema.optional(),
     content: contentSchema.optional(),
-    link_booking_id: z.string().uuid().optional(),
+    link_booking_id: uuidId().optional(),
   })
   .strict();
 

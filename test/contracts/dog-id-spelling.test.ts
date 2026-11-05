@@ -10,6 +10,7 @@ import {
   charges,
   cohorts,
   creditLedger,
+  dogCompletedPrograms,
   eventRsvpDogs,
   invoices,
   memberships,
@@ -23,10 +24,13 @@ import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerEventsRoute } from '../../src/routes/events.js';
 import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
+import { registerStaffAlumniRoute } from '../../src/routes/staffAlumni.js';
+import { CURRICULUM_PROGRAMS } from '../../src/lib/alumni.js';
 import { createBookableDog, removeDogs } from './_dayFixture.js';
 import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
+  FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
   registerFixtureHooks,
@@ -408,6 +412,98 @@ test(
     } finally {
       await db.delete(creditLedger).where(eq(creditLedger.dogId, lower));
       await db.delete(charges).where(eq(charges.dogId, lower));
+    }
+  },
+);
+
+// ── Path params that reach a cache key (Fable probe F4; P14) ─────────────────
+
+test(
+  'GET /dogs/:id/credits: a capitalised read is fresh after a purchase',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { lower, upper } = await dogWithLetters();
+    const app = appWith((a, authenticate) => {
+      registerCreditsRoute(a, { authenticate });
+      registerCreditPackagesRoute(a, { authenticate, stripe: makeStripeStub(), now: FIXTURE_NOW });
+    });
+    const read = async (id: string): Promise<{ dog_id: string; school: number }> => {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/dogs/${id}/credits?location=fayetteville`,
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      return res.json() as { dog_id: string; school: number };
+    };
+
+    try {
+      assert.equal((await read(upper)).school, 0, 'read in capitals, so the balance is cached');
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+        headers: { 'idempotency-key': randomUUID() },
+        payload: {
+          dog_id: lower,
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          location: 'fayetteville',
+        },
+      });
+      assert.equal(res.statusCode, 201, res.body);
+
+      assert.equal((await read(lower)).school, 5, 'the lowercase read is fresh');
+      const capitalised = await read(upper);
+      assert.equal(capitalised.school, 5, 'and the capitalised read is the same read');
+      assert.equal(capitalised.dog_id, lower, 'the wire holds one spelling');
+    } finally {
+      await db.delete(creditLedger).where(eq(creditLedger.dogId, lower));
+      await db.delete(charges).where(eq(charges.dogId, lower));
+    }
+  },
+);
+
+test(
+  'POST /staff/dogs/:dogId/completed-programs: a capitalised path wipes the lowercase credits cache',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { lower, upper } = await dogWithLetters();
+    const reader = appWith((a, authenticate) => registerCreditsRoute(a, { authenticate }));
+    const expiringLots = async (): Promise<number> => {
+      const res = await reader.inject({
+        method: 'GET',
+        url: `/dogs/${lower}/credits?location=fayetteville`,
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      return (res.json() as { expiring_lots: unknown[] }).expiring_lots.length;
+    };
+    const { app: staff, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+    registerStaffAlumniRoute(staff, { authenticate, now: FIXTURE_NOW });
+    await db.insert(creditLedger).values({
+      dogId: lower,
+      mode: 'school',
+      location: 'fayetteville',
+      delta: 3,
+      reason: 'purchase',
+      expiresAt: new Date(Date.now() + 60 * 86_400_000).toISOString(),
+    });
+
+    try {
+      assert.equal(await expiringLots(), 1, 'read once, so the expiring lot is cached');
+
+      // The fifth program makes her an alumna, which clears every live expiry.
+      for (const program of CURRICULUM_PROGRAMS) {
+        const res = await staff.inject({
+          method: 'POST',
+          url: `/staff/dogs/${upper}/completed-programs`,
+          headers: { 'idempotency-key': randomUUID() },
+          payload: { program },
+        });
+        assert.equal(res.statusCode, 201, res.body);
+      }
+
+      assert.equal(await expiringLots(), 0, 'the cleared expiry shows on the next read');
+    } finally {
+      await db.delete(dogCompletedPrograms).where(eq(dogCompletedPrograms.dogId, lower));
     }
   },
 );

@@ -40,6 +40,7 @@ import {
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
@@ -82,7 +83,7 @@ export interface InvoicesRouteOptions extends AuthRouteOptions {
   now?: () => Date;
 }
 
-const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
+const idParamSchema = z.object({ id: uuidId('id must be a UUID') });
 
 /**
  * `POST /invoices/:id/pay` body (wire 1.7.0). Every field optional and the whole
@@ -94,7 +95,7 @@ const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
  * away, and failing loudly is what stops the next version of that.
  */
 const paySchema = z
-  .object({ payment_method_id: z.string().uuid('payment_method_id must be a UUID').optional() })
+  .object({ payment_method_id: uuidId('payment_method_id must be a UUID').optional() })
   .strict();
 
 /**

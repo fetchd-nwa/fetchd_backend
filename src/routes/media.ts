@@ -32,6 +32,7 @@ import {
   type StaffPrincipal,
 } from '../lib/principalNarrows.js';
 import { defaultR2Client, type HeadObjectResult, type R2Client } from '../lib/r2.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
@@ -76,7 +77,7 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 const GET_URL_TTL_SECONDS = 60 * 5; // 5 min — short enough to be useless if leaked
 
 const paramsSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 // §5.4 swap (1.13.0) — see uploadsSign.ts for the identical collapse. Member
@@ -87,8 +88,8 @@ const postBodySchema = z
   .object({
     key: z.string().min(1),
     purpose: mediaPurposeSchema,
-    dog_id: z.string().uuid().nullable().optional(),
-    report_id: z.string().uuid().nullable().optional(),
+    dog_id: uuidId().nullable().optional(),
+    report_id: uuidId().nullable().optional(),
   })
   .strict();
 
@@ -110,7 +111,7 @@ export type PostMediaBodyConformance = Expect<
 const uploadQuerySchema = z
   .object({
     purpose: z.enum(['report-photo', 'report-video']),
-    report_id: z.string().uuid(),
+    report_id: uuidId(),
   })
   .strict();
 

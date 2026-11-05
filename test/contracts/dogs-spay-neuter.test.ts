@@ -76,6 +76,47 @@ test(
 );
 
 test(
+  'PATCH /dogs/:id — a capitalised id moves the reminder rather than leaving two',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { ownerApp } = buildApps();
+    const create = await ownerApp.inject({
+      method: 'POST',
+      url: '/dogs',
+      headers: { 'idempotency-key': `dog-spay-case-${randomUUID()}` },
+      payload: {
+        name: 'Spay Case',
+        breed: 'Test Breed',
+        birthdate: '2026-01-01',
+        spayed_neutered: false,
+        spay_neuter_planned_on: '2026-08-01',
+      },
+    });
+    const dogId = (create.json() as { id: string }).id;
+    createdDogIds.push(dogId);
+    const capitalised = dogId.toUpperCase();
+    assert.notEqual(capitalised, dogId, 'this id has no letter to capitalise');
+
+    const move = await ownerApp.inject({
+      method: 'PATCH',
+      url: `/dogs/${capitalised}`,
+      headers: { 'idempotency-key': `dog-spay-case2-${randomUUID()}` },
+      payload: { spayed_neutered: false, spay_neuter_planned_on: '2026-10-01' },
+    });
+    assert.equal(move.statusCode, 200, move.body);
+
+    const rows = await db
+      .select()
+      .from(scheduledNotifications)
+      .where(eq(scheduledNotifications.dogId, dogId));
+    assert.deepEqual(rows.map((row) => [row.dedupeKey, row.status]).sort(), [
+      [`spay-neuter:${dogId}:2026-08-01`, 'cancelled'],
+      [`spay-neuter:${dogId}:2026-10-01`, 'pending'],
+    ]);
+  },
+);
+
+test(
   'PATCH /dogs/:id — moving the planned date cancels the old reminder and enqueues the new; answering "fixed" cancels + clears the date',
   SKIP_WHEN_NO_DB,
   async () => {

@@ -106,6 +106,36 @@ async function payInPerson(opts: {
 }
 
 test(
+  'POST /invoices/:id/pay-in-person — a capitalised id files the reminder where the settle finds it',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedOpenInvoice({});
+    const capitalised = invoiceId.toUpperCase();
+    assert.notEqual(capitalised, invoiceId, 'this id has no letter to capitalise');
+
+    const { app } = buildApp();
+    const res = await payInPerson({ app, invoiceId: capitalised });
+    assert.equal(res.statusCode, 204, res.body);
+
+    // A settle and a booking cancel both cancel this reminder by the row's own id.
+    await db.transaction((tx) =>
+      scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `payment-due:${invoiceId}`),
+    );
+    const reminders = await db
+      .select({ status: scheduledNotifications.status })
+      .from(scheduledNotifications)
+      .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
+    assert.deepEqual(
+      reminders.map((row) => row.status),
+      ['cancelled'],
+      'a paid invoice never asks for the money again',
+    );
+    await cleanup();
+  },
+);
+
+test(
   'POST /invoices/:id/pay-in-person — booking anchor: flags in-person + enqueues payment-due at drop-off − 24h',
   SKIP_WHEN_NO_DB,
   async () => {

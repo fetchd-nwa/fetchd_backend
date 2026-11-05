@@ -29,6 +29,7 @@ import {
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
@@ -106,8 +107,8 @@ const purchaseBodySchema = z
     // Lowercased at the parse: the `credits:{dogId}:*` wipe below builds its pattern
     // from this string, and the cache is keyed by the lowercase id, so a second
     // spelling left the balance stale (P13 fix round 1, F4).
-    dog_id: z.string().uuid('dog_id must be a UUID').toLowerCase(),
-    payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
+    dog_id: uuidId('dog_id must be a UUID'),
+    payment_method_id: uuidId('payment_method_id must be a UUID'),
     location: z.enum(LOCATION_KEYS),
     // Buy N units of the package in ONE charge: quantity × price_cents,
     // quantity × credits granted. Powers the app's custom-amount option

@@ -5,6 +5,7 @@ import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { toReportWire, type ReportWire } from '../lib/reportWire.js';
+import { uuidId } from '../lib/uuidId.js';
 import { reportsRepository, type ReportRow } from '../db/repositories/reportsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
 import { reportProgram } from '../db/schema/schema.js';
@@ -33,15 +34,15 @@ import { reportProgram } from '../db/schema/schema.js';
 const REPORT_PROGRAM_VALUES = pgEnumTuple(reportProgram);
 
 const dogIdParamSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 const reportIdParamSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 const resolveQuerySchema = z.object({
-  reportId: z.string().uuid().optional(),
+  reportId: uuidId().optional(),
   program: z.enum(REPORT_PROGRAM_VALUES).optional(),
 });
 

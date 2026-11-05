@@ -14,6 +14,7 @@ import { requireOwner } from '../lib/principalNarrows.js';
 import { isNonBlank } from '../lib/signupFields.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import type { Expect, Equal } from '../contracts/typeAsserts.js';
 import type {
@@ -61,7 +62,7 @@ export interface PaymentMethodsRouteOptions extends AuthRouteOptions {
   stripe?: StripeClient;
 }
 
-const uuidParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
+const uuidParamSchema = z.object({ id: uuidId('id must be a UUID') });
 
 const patchBodySchema = z.object({ is_default: z.literal(true) }).strict();
 

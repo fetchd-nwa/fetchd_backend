@@ -6,6 +6,7 @@ import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { toNotificationWire } from '../lib/notificationWire.js';
+import { uuidId } from '../lib/uuidId.js';
 import type {
   NotificationWire,
   NotificationListResponse,
@@ -214,7 +215,7 @@ function parseListQuery(query: unknown): { cursor?: string; limit: number } {
   return parsed.data;
 }
 
-const uuidParamSchema = z.object({ id: z.string().uuid() });
+const uuidParamSchema = z.object({ id: uuidId() });
 
 function parseUuidParam(params: unknown): { id: string } {
   const parsed = uuidParamSchema.safeParse(params);
@@ -228,7 +229,7 @@ function parseUuidParam(params: unknown): { id: string } {
 
 const cursorPayloadSchema = z.object({
   r: z.string().datetime(),
-  i: z.string().uuid(),
+  i: uuidId(),
 });
 
 function encodeCursor(cursor: NotificationCursor): string {

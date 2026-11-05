@@ -23,6 +23,7 @@ import { groupRequestDogs } from '../lib/requestWire.js';
 import { wireOneRequest } from '../lib/wireOneRequest.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import type { PendingRequestWire } from '../lib/requestWire.js';
+import { uuidId } from '../lib/uuidId.js';
 
 /**
  * `POST /requests/:id/confirm-payment` `[auth, $]` — Day 15. Owner-only.
@@ -65,7 +66,7 @@ export interface RequestConfirmPaymentRouteOptions extends AuthRouteOptions {
   stripe?: StripeClient;
 }
 
-const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
+const idParamSchema = z.object({ id: uuidId('id must be a UUID') });
 
 const isoDateTime = z
   .string()
@@ -74,7 +75,7 @@ const isoDateTime = z
 
 const confirmBodySchema = z
   .object({
-    payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
+    payment_method_id: uuidId('payment_method_id must be a UUID'),
     scheduled_at: isoDateTime,
     dropoff_at: isoDateTime,
     pickup_at: isoDateTime,

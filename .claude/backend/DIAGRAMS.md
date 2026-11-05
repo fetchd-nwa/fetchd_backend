@@ -219,7 +219,10 @@ erDiagram
   day_capacity {
     location_key location PK
     date date PK
+    timestamptz expired_at
     integer capacity_dogs
+    timestamptz updated_at
+    uuid updated_by_staff_id FK
   }
 
   %% ---- credits + payments ----

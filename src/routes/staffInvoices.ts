@@ -8,6 +8,7 @@ import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { ApiError } from '../lib/errors.js';
 import { callerMayRefund, toStaffInvoiceWires } from '../lib/staffBilling.js';
+import { uuidId } from '../lib/uuidId.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 import { MAX_AUTO_CHARGE_ATTEMPTS } from '../workers/invoiceAutoCharge.js';
 
@@ -38,7 +39,7 @@ import { MAX_AUTO_CHARGE_ATTEMPTS } from '../workers/invoiceAutoCharge.js';
  * `/staff/invoices/:id` are distinct routes: the parked list is untouched.
  */
 
-const invoiceParamSchema = z.object({ id: z.string().uuid('id must be a UUID') }).strict();
+const invoiceParamSchema = z.object({ id: uuidId('id must be a UUID') }).strict();
 
 const querySchema = z
   .object({

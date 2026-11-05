@@ -15,6 +15,7 @@ import {
 } from '../db/repositories/mediaAssetsRepository.js';
 import { threadsRepository } from '../db/repositories/threadsRepository.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import { uuidId } from '../lib/uuidId.js';
 import type { Tx } from '../db/tx.js';
 
 /**
@@ -40,7 +41,7 @@ import type { Tx } from '../db/tx.js';
  */
 
 const uuidParamSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 const MAX_MESSAGE_LEN = 4000;
@@ -50,7 +51,7 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 const messageBodySchema = z
   .object({
     text: z.string().trim().max(MAX_MESSAGE_LEN).optional(),
-    attachment_media_ids: z.array(z.string().uuid()).max(MAX_ATTACHMENTS_PER_MESSAGE).optional(),
+    attachment_media_ids: z.array(uuidId()).max(MAX_ATTACHMENTS_PER_MESSAGE).optional(),
   })
   .strict()
   .refine(

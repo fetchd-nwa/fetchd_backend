@@ -538,8 +538,9 @@ const ENTRIES: readonly Entry[] = [
     key: 'day.max_dogs_per_booking_count',
     class: 'ops',
     store: column(DAY, 'max_dogs_per_booking_count', 'global'),
-    // `POST /bookings` parses at most this many before it reads the setting, so a
-    // higher value would promise what the route refuses.
+    // `POST /bookings` parses a lead and at most 99 more before it reads the setting,
+    // so 100 dogs reach this refusal and 101 is the parse's. A value past 100 would
+    // promise what the route refuses; 99 stays one under that.
     value: between(1, 99),
     inert: LIVE,
   },

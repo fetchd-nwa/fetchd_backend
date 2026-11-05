@@ -4,6 +4,7 @@ import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../aut
 import type { CreditLotWire, CreditsWire, GetCreditsQuery } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { ApiError } from '../lib/errors.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
 import { creditsRepository } from '../db/repositories/creditsRepository.js';
@@ -27,7 +28,7 @@ import { LOCATION_SLUGS } from '../db/schema/schema.js';
 const LOCATION_KEYS = LOCATION_SLUGS;
 type LocationKey = (typeof LOCATION_KEYS)[number];
 
-const uuidParamSchema = z.object({ id: z.string().uuid() });
+const uuidParamSchema = z.object({ id: uuidId() });
 const creditsQuerySchema = z.object({ location: z.enum(LOCATION_KEYS) });
 
 // `CreditLotWire` + `CreditsWire` used to be declared right here — the credits

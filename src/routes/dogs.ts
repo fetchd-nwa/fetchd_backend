@@ -45,6 +45,7 @@ import { ApiError } from '../lib/errors.js';
 import { normalizeOptional } from '../lib/normalize.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
+import { uuidId } from '../lib/uuidId.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -118,21 +119,21 @@ import { parseOrThrow } from '../lib/zodIssues.js';
 const EVALUATION_STATUSES = pgEnumTuple(evaluationStatus);
 
 const paramsSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 const vaccineParamsSchema = z.object({
-  id: z.string().uuid(),
-  vid: z.string().uuid(),
+  id: uuidId(),
+  vid: uuidId(),
 });
 
 const medicationParamsSchema = z.object({
-  id: z.string().uuid(),
-  mid: z.string().uuid(),
+  id: uuidId(),
+  mid: uuidId(),
 });
 
 const optionalText = z.string().nullable();
-const optionalUuid = z.string().uuid().nullable();
+const optionalUuid = uuidId().nullable();
 /** ISO date 'YYYY-MM-DD' (Postgres `date`). Trailing time disallowed. */
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD');
 /** ISO datetime with timezone offset (Postgres `timestamptz`). */

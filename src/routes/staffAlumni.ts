@@ -16,6 +16,7 @@ import { CURRICULUM_PROGRAMS } from '../lib/alumni.js';
 import { ApiError } from '../lib/errors.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireStaff } from '../lib/principalNarrows.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -41,10 +42,10 @@ import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
  * because `isAlumni` is re-derived at every grant site.
  */
 
-const dogIdParamSchema = z.object({ dogId: z.string().uuid('dogId must be a UUID') });
+const dogIdParamSchema = z.object({ dogId: uuidId('dogId must be a UUID') });
 
 const programParamSchema = z.object({
-  dogId: z.string().uuid('dogId must be a UUID'),
+  dogId: uuidId('dogId must be a UUID'),
   program: z.enum(CURRICULUM_PROGRAMS),
 });
 

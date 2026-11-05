@@ -18,6 +18,7 @@ import { staffBillingRepository } from '../db/repositories/staffBillingRepositor
 import { ApiError } from '../lib/errors.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { callerMayRefund, staffPaymentHistory, toStaffInvoiceWires } from '../lib/staffBilling.js';
+import { uuidId } from '../lib/uuidId.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 import { toPaymentMethodWire } from './paymentMethods.js';
 
@@ -41,7 +42,7 @@ import { toPaymentMethodWire } from './paymentMethods.js';
  * trainer may not see (04- item 128).
  */
 
-const ownerParamSchema = z.object({ id: z.string().uuid('id must be a UUID') }).strict();
+const ownerParamSchema = z.object({ id: uuidId('id must be a UUID') }).strict();
 
 async function ownerIdOf(params: unknown): Promise<string> {
   const { id } = parseOrThrow(ownerParamSchema, params, 'path');

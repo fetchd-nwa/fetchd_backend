@@ -24,6 +24,7 @@ import { bucketChicagoToday, isValidCalendarDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -93,7 +94,7 @@ const historyQuerySchema = z.object({
   location: z.enum(LOCATION_VALUES),
 });
 
-const uuidParamSchema = z.object({ id: z.string().uuid() });
+const uuidParamSchema = z.object({ id: uuidId() });
 
 /** Wire 1.13.0 §5.1.3 — the body type and `postBodySchema` are the same shape
  *  or `tsc` fails here. `z.input`, not `z.infer`: `effective_from` and `note`

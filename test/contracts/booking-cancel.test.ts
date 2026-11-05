@@ -732,6 +732,30 @@ test(
 );
 
 test(
+  'POST /bookings/:id/cancel — a capitalised id still cancels the reminder, whose key is lowercase',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = cancelApp();
+    const bookingId = await createCreditPaidBooking({ app, date: futureWeekday(12) });
+    const capitalised = bookingId.toUpperCase();
+    assert.notEqual(capitalised, bookingId, 'this id has no letter to capitalise');
+
+    const res = await postCancel({
+      app,
+      bookingId: capitalised,
+      idempotencyKey: `cn-case-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+
+    const [reminder] = await db
+      .select({ status: scheduledNotifications.status })
+      .from(scheduledNotifications)
+      .where(eq(scheduledNotifications.dedupeKey, `booking-reminder:${bookingId}`));
+    assert.equal(reminder?.status, 'cancelled', 'a cancelled booking never reminds');
+  },
+);
+
+test(
   'POST /bookings/:id/cancel — releases capacity (seat available for a new booking on the same date)',
   SKIP_WHEN_NO_DB,
   async () => {

@@ -26,6 +26,7 @@ import { groupRequestDogs, type PendingRequestWire } from '../lib/requestWire.js
 import { wireOneRequest } from '../lib/wireOneRequest.js';
 import { sortRequestsBySubmittedAt, wireManyRequests } from '../lib/wireManyRequests.js';
 import type { LocationKey } from '../lib/bookingWire.js';
+import { uuidId } from '../lib/uuidId.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -75,7 +76,7 @@ import { parseOrThrow } from '../lib/zodIssues.js';
 
 const LOCATION_KEYS = LOCATION_SLUGS;
 const REQUEST_STATUS_VALUES = pgEnumTuple(requestStatus);
-const uuidParamSchema = z.object({ id: z.string().uuid() });
+const uuidParamSchema = z.object({ id: uuidId() });
 const statusQuerySchema = z.object({ status: z.enum(REQUEST_STATUS_VALUES).optional() });
 
 const isoDateTimeSchema = z.string().datetime({ offset: true });

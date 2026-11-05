@@ -13,6 +13,7 @@ import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { type MessageWire, type ThreadWire } from '../lib/threadWire.js';
 import { wireManyMessages, wireManyThreads } from '../lib/wireManyThreads.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
+import { uuidId } from '../lib/uuidId.js';
 
 /**
  * Day-19 staff portal verb 3 — messaging reply.
@@ -31,7 +32,7 @@ import { defaultR2Client, type R2Client } from '../lib/r2.js';
 
 const MAX_MESSAGE_LEN = 4000;
 
-const uuidParamSchema = z.object({ id: z.string().uuid() });
+const uuidParamSchema = z.object({ id: uuidId() });
 const messageBodySchema = z
   .object({ text: z.string().trim().min(1).max(MAX_MESSAGE_LEN) })
   .strict();

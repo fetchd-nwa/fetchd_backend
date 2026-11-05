@@ -91,6 +91,7 @@ import {
   stripeIntentStatusToChargeStatus,
   type StripeClient,
 } from '../lib/stripe.js';
+import { uuidId } from '../lib/uuidId.js';
 import { settleCapturePendingHold, type WithdrawSettleVerdict } from '../lib/withdrawSettlement.js';
 import { parseOrThrow } from '../lib/zodIssues.js';
 
@@ -185,11 +186,11 @@ const GROUP_CLASS_AUTOCHARGE_LEAD_MS = 24 * 60 * 60 * 1000;
 
 const postEnrollmentBodySchema = z
   .object({
-    cohort_id: z.string().uuid(),
+    cohort_id: uuidId(),
     // Lowercased at the parse: Postgres reads a uuid in either case, and the distinct
     // check below compares strings (`bookings.ts`, `dogIdField`).
-    dog_ids: z.array(z.string().uuid().toLowerCase()).min(1).max(MAX_DOGS_PER_REQUEST),
-    payment_method_id: z.string().uuid('payment_method_id must be a UUID'),
+    dog_ids: z.array(uuidId()).min(1).max(MAX_DOGS_PER_REQUEST),
+    payment_method_id: uuidId('payment_method_id must be a UUID'),
     // pay-now (the default) authorizes each dog's card immediately; pay-later
     // defers to the auto-charge worker 24h before the first session.
     pay_later: z.boolean().optional(),
@@ -267,8 +268,8 @@ export interface EnrollmentsRouteOptions extends AuthRouteOptions {
   now?: () => Date;
 }
 
-const cohortIdParamSchema = z.object({ cohortId: z.string().uuid('cohortId must be a UUID') });
-const withdrawBodySchema = z.object({ dog_id: z.string().uuid('dog_id must be a UUID') }).strict();
+const cohortIdParamSchema = z.object({ cohortId: uuidId('cohortId must be a UUID') });
+const withdrawBodySchema = z.object({ dog_id: uuidId('dog_id must be a UUID') }).strict();
 
 /** Zod ↔ wire pin (§5.1.3). */
 export type PostEnrollmentsWithdrawBodyConformance = Expect<

@@ -79,6 +79,37 @@ test(
 );
 
 test(
+  'PATCH /dogs — a capitalised media id resolves too: this path is a z.string(), not a uuidId()',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    const r2 = makeR2Stub();
+    registerMediaRoute(app, { authenticate, r2 });
+    registerDogsRoute(app, { authenticate, r2 });
+
+    const mediaId = await createOwnerMedia(app, r2, {
+      purpose: 'dog-profile',
+      dog_id: FIXTURE_IDS.dog1Id,
+    });
+    const capitalised = mediaId.toUpperCase();
+    assert.notEqual(capitalised, mediaId, 'this id has no letter to capitalise');
+
+    const patch = await app.inject({
+      method: 'PATCH',
+      url: `/dogs/${FIXTURE_IDS.dog1Id}`,
+      headers: { 'idempotency-key': `patch-${randomUUID()}` },
+      payload: { profile_image_path: capitalised },
+    });
+    assert.equal(patch.statusCode, 200, patch.body);
+    const patched = patch.json() as { profile_image_path: string };
+    assert.ok(
+      patched.profile_image_path.startsWith('https://stub.r2.invalid/'),
+      `resolved url: ${patched.profile_image_path}`,
+    );
+  },
+);
+
+test(
   'PATCH /dogs — pointing profile_image_path at non-dog-profile media → 422',
   SKIP_WHEN_NO_DB,
   async () => {

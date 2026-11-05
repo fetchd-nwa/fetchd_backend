@@ -8,6 +8,7 @@ import { vetsRepository } from '../db/repositories/vetsRepository.js';
 import { ApiError } from '../lib/errors.js';
 import { normalizeOptional } from '../lib/normalize.js';
 import { requireStaff } from '../lib/principalNarrows.js';
+import { uuidId } from '../lib/uuidId.js';
 import { toVetWire, type VetWire } from '../lib/vetWire.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
@@ -51,7 +52,7 @@ export type GetVetsQueryConformance = Expect<
 >;
 
 const paramsSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 // Optional text fields accept `null` to clear explicitly OR a string that

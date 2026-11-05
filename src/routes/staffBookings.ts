@@ -20,6 +20,7 @@ import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import { requireStaff } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
+import { uuidId } from '../lib/uuidId.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
@@ -46,7 +47,7 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * 'attended' | 'no-show' | 'excused'.
  */
 
-const uuidParamSchema = z.object({ id: z.string().uuid() });
+const uuidParamSchema = z.object({ id: uuidId() });
 
 const SERVICE_CATEGORY_VALUES = pgEnumTuple(serviceCategory);
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -83,7 +84,7 @@ const bookingsQuerySchema = z.object({
 
 const attendanceBodySchema = z
   .object({
-    dog_id: z.string().uuid(),
+    dog_id: uuidId(),
     status: z.enum(['attended', 'no-show', 'excused']),
   })
   .strict();

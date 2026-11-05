@@ -12,6 +12,7 @@ import {
   type GroupClassWire,
   type GroupEligibilityWire,
 } from '../lib/groupClassWire.js';
+import { uuidId } from '../lib/uuidId.js';
 import { groupClassesRepository } from '../db/repositories/groupClassesRepository.js';
 import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { dogCompletedClassesRepository } from '../db/repositories/dogCompletedClassesRepository.js';
@@ -48,7 +49,7 @@ const groupClassParamSchema = z.object({
 });
 
 const uuidParamSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 const eligibilityQuerySchema = z.object({

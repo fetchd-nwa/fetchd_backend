@@ -23,6 +23,7 @@ import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBook
 import { ApiError } from '../lib/errors.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
@@ -60,7 +61,7 @@ const viewQuerySchema = z.object({
 });
 
 const uuidParamSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 /**
@@ -90,7 +91,7 @@ const LOCATION_KEYS = LOCATION_SLUGS;
  * case, so a capitalised spelling would otherwise be a second lock for one dog,
  * a second entry past the distinct check, and a second seat at the other campus.
  */
-const dogIdField = z.string().uuid().toLowerCase();
+const dogIdField = uuidId();
 
 /**
  * POST /bookings body — day-program creation (day-school / day-care).
@@ -125,7 +126,7 @@ const postBookingBodySchema = z
     location: z.enum(LOCATION_KEYS),
     notes: z.string().max(2000).optional(),
     payment: z.enum(['credits', 'payg']).optional(),
-    payment_method_id: z.string().uuid().optional(),
+    payment_method_id: uuidId().optional(),
   })
   .strict();
 

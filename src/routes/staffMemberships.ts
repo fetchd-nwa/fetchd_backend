@@ -8,6 +8,7 @@ import type { Tx } from '../db/tx.js';
 import { ApiError } from '../lib/errors.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireStaff } from '../lib/principalNarrows.js';
+import { uuidId } from '../lib/uuidId.js';
 import type { StaffMembershipWire } from '../contracts/wire.js';
 import { loadMembershipPackage, toMembershipWire } from './memberships.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
@@ -35,7 +36,7 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 // § domain:memberships) — it was module-private here, and freezing it is what
 // lets the portal wave consume the pause/resume responses.
 
-const idParamSchema = z.object({ id: z.string().uuid('id must be a UUID') });
+const idParamSchema = z.object({ id: uuidId('id must be a UUID') });
 
 async function loadStaffWire(tx: Tx, id: string): Promise<StaffMembershipWire> {
   const row = await membershipsRepository.findById(tx, id);

@@ -42,7 +42,9 @@ export async function buildProfileImageUrlResolver(
   paths: string[],
   r2: R2Client,
 ): Promise<(path: string) => string> {
-  const ids = [...new Set(paths.filter(isMediaId))];
+  // A stored path is a `z.string()`, kept as it was sent, and a row's id is lowercase,
+  // so the lookup and the map both key on the lowercase id.
+  const ids = [...new Set(paths.filter(isMediaId).map((path) => path.toLowerCase()))];
   if (ids.length === 0) return (path) => path;
 
   const rows = await mediaAssetsRepository.findManyByIds(ids);
@@ -56,7 +58,7 @@ export async function buildProfileImageUrlResolver(
     }),
   );
   const urlById = new Map(signed);
-  return (path) => (isMediaId(path) ? (urlById.get(path) ?? path) : path);
+  return (path) => (isMediaId(path) ? (urlById.get(path.toLowerCase()) ?? path) : path);
 }
 
 /**

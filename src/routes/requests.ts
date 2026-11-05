@@ -22,6 +22,7 @@ import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { type PendingRequestWire } from '../lib/requestWire.js';
+import { uuidId } from '../lib/uuidId.js';
 import { sortRequestsBySubmittedAt, wireManyRequests } from '../lib/wireManyRequests.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
@@ -61,7 +62,7 @@ const statusQuerySchema = z.object({
 });
 
 const uuidParamSchema = z.object({
-  id: z.string().uuid(),
+  id: uuidId(),
 });
 
 /**
@@ -132,9 +133,9 @@ const postRequestBodySchema = z
     // Lowercased at the parse: Postgres reads a uuid in either case, and the distinct
     // check compares strings, so a second spelling reached the primary key as a 500
     // (`bookings.ts`, `dogIdField`).
-    lead_dog_id: z.string().uuid().toLowerCase(),
+    lead_dog_id: uuidId(),
     additional_dog_ids: z
-      .array(z.string().uuid().toLowerCase())
+      .array(uuidId())
       .max(MAX_DOGS_PER_REQUEST - 1)
       .optional(),
     preferred_dates: z.array(isoDateTimeSchema).min(1).max(MAX_PREFERRED_DATES),

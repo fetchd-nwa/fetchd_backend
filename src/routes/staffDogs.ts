@@ -8,6 +8,7 @@ import type { StaffDogWire } from '../contracts/wire.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireStaff } from '../lib/principalNarrows.js';
+import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
@@ -24,7 +25,7 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * sessions in the report's category (this report = `count + 1`).
  */
 
-const sessionCountParamsSchema = z.object({ dogId: z.string().uuid() });
+const sessionCountParamsSchema = z.object({ dogId: uuidId() });
 const sessionCountQuerySchema = z.object({ category: z.enum(pgEnumTuple(serviceCategory)) });
 
 // StaffDogWire is owned by the single-source contract (contracts/wire.ts).
