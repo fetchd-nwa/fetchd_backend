@@ -66,7 +66,7 @@
  * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close).
  */
-export const WIRE_CONTRACT_VERSION = '4.0.0-lg3.1';
+export const WIRE_CONTRACT_VERSION = '4.0.0-lg3.2';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -103,9 +103,15 @@ export const WIRE_CONTRACT_VERSION = '4.0.0-lg3.1';
 //       candidate.
 //     · same key + a different `METHOD path`, or a different canonical-JSON body
 //       hash                                 → 422 `idempotency_mismatch`
-//     · same key still executing             → 409 `idempotency_inflight`
+//     · same key still executing             → 409 `idempotency_inflight`.
+//       On a route that rides the order engine (4.0.0-lg3.2, § payments-invoices)
+//       the claim stays open until the order settles, so a key whose charge
+//       Stripe still reports `processing` answers this even after its 201
 //     · a completed key replays the ORIGINAL status and body verbatim; errors
-//       are never stored, so a retry after a failure re-attempts the work
+//       are never stored, so a retry after a failure re-attempts the work. The
+//       one exception is the order engine's committed 402 `payment_failed`
+//       (design §2.7:3939-3952): it IS stored, a replay returns the same 402,
+//       the card is not tried again, and the next try takes a fresh key
 //   There is NO format, charset, or uniqueness rule: any non-empty string within
 //   the bound is accepted. A v4 UUID (36 chars) is what both clients mint and
 //   what the contract recommends — it is not a validation.
@@ -168,6 +174,11 @@ export const WIRE_CONTRACT_VERSION = '4.0.0-lg3.1';
  * `'service_not_offered'`, each 422. Only `'capacity_below_booked'` carries
  * `details` (`CapacityBelowBookedDetails`); on the other four the code is the
  * whole signal. Each route's doc says which of them it can answer.
+ *
+ * 4.0.0-lg3.2 appends one thrown code, the 31st, after `'service_not_offered'`
+ * — appended, never inserted (design §1.1:925-928; PAY-U05):
+ * `'invoice_payment_in_flight'`, 409, no `details`. `InvoicePayRequest` says
+ * when it answers.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -192,7 +203,7 @@ export type ApiErrorCode =
   | 'already_enrolled' // enrollment blocked — dog already enrolled in this cohort
   | 'already_requested' // request blocked — dog already has an open request of this category
   | 'event_full' // event RSVP blocked — live rsvp dogs + requested > events.capacity
-  | 'payment_failed' // a charge was ATTEMPTED and did not complete — nothing was created or settled
+  | 'payment_failed' // a charge did not complete — nothing it was to pay for stands
   | 'internal' // serializer fallback for any non-ApiError throw — never thrown as ApiError
   | 'setting_inert' // settings PATCH blocked — a key in the body has no v1 reader (2.0.0-lg1.1)
   | 'profile_incomplete' // PATCH /me blocked — the body would blank a mandatory sign-up field (3.0.0-lg2.1)
@@ -200,7 +211,8 @@ export type ApiErrorCode =
   | 'same_day_cutoff_passed' // booking blocked — today's same-day cutoff has passed at this campus (4.0.0-lg3.1)
   | 'beyond_booking_horizon' // create blocked — a date is past day.booking_horizon_months (4.0.0-lg3.1)
   | 'capacity_below_booked' // cap edit blocked — a booked date would fall below its count (4.0.0-lg3.1)
-  | 'service_not_offered'; // request blocked — the service is off at the campus (4.0.0-lg3.1)
+  | 'service_not_offered' // request blocked — the service is off at the campus (4.0.0-lg3.1)
+  | 'invoice_payment_in_flight'; // invoice pay blocked — another order's charge on it is in flight (4.0.0-lg3.2)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -234,6 +246,7 @@ export const API_ERROR_CODES = [
   'beyond_booking_horizon',
   'capacity_below_booked',
   'service_not_offered',
+  'invoice_payment_in_flight',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -244,9 +257,10 @@ export const API_ERROR_CODES = [
  * failures + capacity/credit/duplicate assertions are all 422 — the request
  * was syntactically fine but semantically blocked by current state.
  * `payment_failed` is 402, the one code whose meaning is about MONEY rather
- * than state: the card WAS charged, the charge did not complete, and nothing
- * was created or settled behind it — every other 4xx here means "we didn't
- * try".
+ * than state: the charge did not complete, and nothing it was to pay for
+ * stands. A card was tried, except on `outcome: 'abandoned'`
+ * (`PaymentFailedDetails`), where the order was given up before any confirm
+ * was sent — every other 4xx here means "we didn't try".
  *
  * **`internal` is the exception — 500 is its DEFAULT, not a guarantee**
  * (2.6 adversary finding, fix round 1). The serializer's fallback branch
@@ -304,6 +318,10 @@ export const API_ERROR_STATUS = {
   beyond_booking_horizon: 422,
   capacity_below_booked: 422,
   service_not_offered: 422,
+  // 4.0.0-lg3.2 (new code, so its status is set in the same bump): the invoice
+  // is in a state this request conflicts with, the same family as `conflict`
+  // (design §1.1:925-928).
+  invoice_payment_in_flight: 409,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -520,10 +538,26 @@ export interface AlreadyRequestedDetails {
 /** `charge_blocker` present when the failure derived one (all five emit sites
  *  pass it when known; enrollments.ts omits it when the report carries none —
  *  "we are not going to guess" is expressible). Same `ChargeBlocker`
- *  vocabulary as the settle-site 201s. */
+ *  vocabulary as the settle-site 201s.
+ *
+ *  4.0.0-lg3.2 (design §1.1:880-886; PAY-U05, DAY-U18): a route on the order
+ *  engine also sends `order_id`, `attempts` and `outcome`; a route not on it
+ *  yet omits all three. `outcome: 'abandoned'` is an order that ended with no
+ *  confirm sent, `attempts: 0`, so no card was asked: the sweeper gave it up,
+ *  or *Cancel order* found no intent. `'failed'` is an order that ended after
+ *  `attempts` confirms. With `charge_blocker` a card answered, and the field
+ *  says how. With `charge_blocker: 'processing'` a person cancelled while
+ *  Stripe was still processing, so the money may yet move, and a late success
+ *  is refunded in full, automatically. With no `charge_blocker` no card
+ *  answered, and the intent is stopped or being stopped: no money moved. Either
+ *  way the 402 commits: the failed charge stays recorded, a replay under the
+ *  same key returns the same 402 (§0), and the next try takes a fresh key. */
 export interface PaymentFailedDetails {
   kind: 'payment_failed';
   charge_blocker?: ChargeBlocker;
+  order_id?: string;
+  attempts?: number;
+  outcome?: 'failed' | 'abandoned';
 }
 
 /** Kebab-case `kind`, historical (routes/media.ts:507); rides code
@@ -659,7 +693,20 @@ export type ServiceCategory =
   | 'boarding'
   | 'evaluation';
 
-export type BookingStatus = 'upcoming' | 'past' | 'cancelled';
+/**
+ * `'payment-pending'` (4.0.0-lg3.2, M3.03; design §1.1:887, §2.7:3999-4003;
+ * PAY-U07) is carried only by the rows of a Confirm whose top-up charge is
+ * still processing (question 49): a credits-only Confirm is born `'upcoming'`.
+ * The row IS the seat hold; there is no hold table. Stripe's outcome or a person
+ * moves it: `'upcoming'` once the charge settles, `'cancelled'` if it fails.
+ * A row reads `'upcoming'` only after Stripe reports success (PAY-04).
+ *
+ * A cancel of any one pending row cancels the whole order
+ * (`POST /bookings/:id/cancel`); a per-session cancel exists only once the rows
+ * are `'upcoming'`. A class row is refused first, pending or not, as it is
+ * today. No row carries this value until the top-up is live (P18).
+ */
+export type BookingStatus = 'upcoming' | 'past' | 'cancelled' | 'payment-pending';
 
 export type RequestStatus =
   | 'submitted'
@@ -1538,6 +1585,10 @@ export interface BookingWire {
   // (client's home) or 'public' (public spot). Owner-picked at request time,
   // copied onto the booking at approve; omitted on every other category.
   lesson_setting?: LessonSetting;
+  // The order this session belongs to (4.0.0-lg3.2, M3.02; PAY-U04). Every
+  // session of one `POST /bookings` carries the same id. Omit-on-null: a row
+  // made any other way has no order, and neither does an older one.
+  order_id?: string;
 }
 
 /** Δ 2026-07-14 — where a private lesson happens. */
@@ -1589,6 +1640,22 @@ export interface PendingRequestWire {
   // Private-lesson only (Δ 2026-07-14): where the lesson should happen.
   lesson_setting?: LessonSetting;
 }
+
+/**
+ * `POST /bookings` 201 body (4.0.0-lg3.2; design §1.1:857-863; PAY-U04, DAY-U16).
+ * It replaces the bare `BookingWire[]`: one Confirm is one order, credits-only
+ * included. `sessions` holds one row per date, ascending by `scheduled_at`, each
+ * with `order_id` = `order.id`. A same-key replay returns this body as stored.
+ *
+ * `order.charge_status` is `'none'` unless a top-up was charged, and no request
+ * can ask for one at this step (typed at 4.0.0, P16; live at P18), so today it is
+ * always `'none'` and every session `'upcoming'`.
+ */
+export interface PostBookingsResponse {
+  order: OrderWire;
+  sessions: BookingWire[];
+}
+
 // ---- (a) domain-local value tuples -----------------------------------------
 // Runtime arm lists for the two per-endpoint 422 aliases below (§2.1(d)). They
 // exist because a type alias cannot be asserted in the backend's `test/` tree —
@@ -1597,9 +1664,10 @@ export interface PendingRequestWire {
 // value to check membership against. `satisfies` guards the bogus-member
 // direction here; §16 pins set equality (WC-A1 form).
 
-/** Every `details.kind` `POST /bookings` can 422 with — the runtime twin of
- *  `PostBookingsErrorDetails`. Order mirrors the gate/check execution order in
- *  `lib/bookingGatePreCheck.ts` then `lib/createDayProgramBookings.ts`.
+/** Every `details.kind` `POST /bookings` can refuse with — the runtime twin of
+ *  `PostBookingsErrorDetails`, 422 but for `payment_failed`, which is 402. Order
+ *  mirrors the gate/check execution order in `lib/bookingGatePreCheck.ts` then
+ *  `lib/createDayProgramBookings.ts`, then the charge.
  *  New 1.13.0 (digest bookings/L). */
 export const POST_BOOKINGS_ERROR_DETAIL_KINDS = [
   'payment_required',
@@ -1609,6 +1677,7 @@ export const POST_BOOKINGS_ERROR_DETAIL_KINDS = [
   'insufficient_credits',
   'already_booked',
   'insufficient_capacity',
+  'payment_failed',
 ] as const satisfies readonly [
   PostBookingsErrorDetails['kind'],
   ...PostBookingsErrorDetails['kind'][],
@@ -1680,7 +1749,7 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  * carry `details`.
  *
  * `Idempotency-Key` is required on this endpoint (§0 conventions). The
- * response is 201 `BookingWire[]`.
+ * response is 201 `PostBookingsResponse`.
  * BUSINESS-LOGIC/bookings-scheduling.md R20 @ :90.
  */
 export interface PostBookingsRequest {
@@ -1983,7 +2052,7 @@ export interface GetStaffBookingsQuery {
 // ---- (d) per-endpoint 422 detail unions (§3.5) -----------------------------
 
 /**
- * Every `details` arm `POST /bookings` can 422 with, so a client can narrow
+ * Every `details` arm `POST /bookings` can refuse with, so a client can narrow
  * `ApiErrorEnvelope['error']['details']` once for this endpoint instead of
  * switching over every arm (digest bookings/L). Emit sites, in the order
  * the request hits them:
@@ -1994,6 +2063,9 @@ export interface GetStaffBookingsQuery {
  *   5. `insufficient_credits`  — `createDayProgramBookings` (`lib/createDayProgramBookings.ts`)
  *   6. `already_booked`        — `createDayProgramBookings`
  *   7. `insufficient_capacity` — `dayCapacityRepository.assertCapacityWithinLock`
+ *   8. `payment_failed`        — 402, not 422: the top-up's charge did not
+ *      complete (`PaymentFailedDetails`). Every row is cancelled, every debit
+ *      returned, nothing granted, and the 402 is stored.
  * Arms 1-4 can also arrive from the DB trigger floor with EMPTY arrays
  * (`gateTriggerErrorToApiError`, `lib/bookingErrors.ts`) in the race
  * window — `missing: []` is a legal emission, see §1.
@@ -2002,10 +2074,11 @@ export interface GetStaffBookingsQuery {
  * `invalid_payload`, and 4.0.0-lg3.1's `program_not_offered`,
  * `beyond_booking_horizon` and `same_day_cutoff_passed` (`PostBookingsRequest`).
  *
- * NOT reachable here, despite looking like it should be: `payment_failed`.
- * A PAYG day-program books against an OPEN INVOICE auto-charged ~1h before
- * drop-off (`createDayProgramBookings`); no card is charged inside
- * `POST /bookings`, so no charge can fail inside it.
+ * NOT reachable yet: arm 8. It is typed with the rest of the order's shape
+ * (design §1.1:885; PAY-U05, DAY-U18), but no card is charged inside
+ * `POST /bookings` until the top-up is live (P18), and a PAYG day-program books
+ * against an OPEN INVOICE auto-charged ~1h before drop-off
+ * (`createDayProgramBookings`), so no charge can fail inside it today.
  */
 export type PostBookingsErrorDetails =
   | PaymentRequiredDetails
@@ -2014,7 +2087,8 @@ export type PostBookingsErrorDetails =
   | AgreementUnsignedDetails
   | InsufficientCreditsDetails
   | AlreadyBookedDetails
-  | InsufficientCapacityDetails;
+  | InsufficientCapacityDetails
+  | PaymentFailedDetails;
 
 /**
  * Every `details` arm `POST /requests` can 422 with (digest bookings/L).
@@ -4205,14 +4279,17 @@ export interface InvoicePayWire {
   stripe_payment_intent_id: string;
   /**
    * Stripe's client secret for the PaymentIntent. **Do not treat this as a
-   * completable intent.** Since 1.7.1 every path that confirms an off-session
-   * PaymentIntent and observes a non-succeeded status best-effort CANCELS it
-   * before returning, because no client-side 3DS completion flow exists
-   * anywhere in this system and an uncancelled intent can later auto-succeed
-   * and double-charge against the next attempt's fresh intent. So on the
-   * non-succeeded arm this names a cancelled intent and there is nothing a
-   * client can do with it; it is returned for logging and support lookup only.
-   * A client that "completes" it is building on a dead reference.
+   * completable intent.** No client-side 3DS completion flow exists anywhere in
+   * this system, so there is nothing a client can do with it; it is returned
+   * for logging and support lookup only.
+   *
+   * Since 4.0.0-lg3.2 this route rides the order engine, and 1.7.1's rule
+   * (cancel a non-succeeded intent before returning) no longer applies to it.
+   * The one non-succeeded 201 is a charge Stripe still reports `processing`:
+   * that intent is LIVE and the webhook or the sweeper settles it. A final
+   * decline is 402 `payment_failed`, which carries no secret; the sweeper then
+   * cancels its intent on a later tick. Routes not on the engine keep the rule
+   * (`CreditPurchaseWire.client_secret`).
    *
    * When a 3DS-completion design lands it must revisit the cancel rule for
    * on-session routes -- completion needs a LIVE intent -- and re-document this
@@ -4248,12 +4325,14 @@ export interface InvoicePayWire {
    * same specific sentence. That is what makes `[1.8.0]`'s "one taxonomy
    * across both channels" true rather than aspirational.
    *
-   * This is NOT an invitation to complete authentication: per the 1.7.1 cancel
-   * rule the intent behind `client_secret` is already cancelled on this arm.
-   * The field exists for (a) honest, specific copy today and (b) the future
-   * 3DS-completion design, which needs this signal on a LIVE intent and
-   * revisits the cancel rule -- the field survives that change unmodified;
-   * only the cancel clause of `client_secret`'s comment does.
+   * Since 4.0.0-lg3.2 only `'processing'` reaches this field. Every other
+   * blocker arrives on the 402's `PaymentFailedDetails.charge_blocker`, the
+   * same vocabulary.
+   *
+   * This is NOT an invitation to complete authentication: a card that needs it
+   * cannot pay off-session (question 61). The field exists for (a) honest,
+   * specific copy today and (b) the future 3DS-completion design, which needs
+   * this signal on a LIVE intent -- the field survives that change unmodified.
    */
   charge_blocker?: ChargeBlocker;
 }
@@ -4374,6 +4453,12 @@ export interface LedgerEntryWire {
    * copy change without a backend deploy.
    */
   group_class_name?: string;
+  /**
+   * The order this entry's charge belongs to (4.0.0-lg3.2, M3.02; PAY-U04).
+   * Charge-sourced entries only, and only a charge an order made: omitted on an
+   * open invoice and on a charge from before the engine.
+   */
+  order_id?: string;
 }
 
 /**
@@ -4669,6 +4754,119 @@ export type GetStaffOwnersPaymentsResponse = StaffPaymentWire[];
  *  first, then oldest first). */
 export type GetStaffOwnersPaymentMethodsResponse = PaymentMethodWire[];
 
+// ---- (b) response wires (continued): the order engine (4.0.0-lg3.2) --------
+//
+// New 4.0.0-lg3.2 (plan unit P15, slice S20; design §1.1:857-899, §2.7:3811-4030;
+// PAY-U04, PAY-U05, PAY-U07). An order is one Confirm: one `orders` row (M3.02)
+// holding at most one `charges` row. Automatic capture, two transactions with
+// Stripe between them: no capture-related shape exists. `POST /invoices/:id/pay`
+// is the engine's one caller at this step. The top-up inside `POST /bookings` and
+// the pack purchase join at P18, `POST /staff/invoices/:id/charge` at 7.1.0 and
+// `POST /enrollments` at 8.0.0.
+//   GET  /staff/payments/pending   → GetStaffPaymentsPendingResponse   any role
+//   POST /staff/orders/:id/cancel  → PostStaffOrdersCancelResponse     any role
+// On both an owner (family) principal is 403 `forbidden`, and a malformed
+// `:id` is 400 `bad_request`.
+
+/**
+ * One order, as the Confirm that made it answers: `PostBookingsResponse.order`
+ * (design §1.1:857-863; PAY-U04, DAY-U16). `orders` stores no status: the two
+ * charge fields are read from the order's one `charges` row.
+ */
+export interface OrderWire {
+  id: string;
+  owner_id: string;
+  created_at: string;
+  /**
+   * Not `ChargeStatus`: `'none'` is an order with no charge. `'succeeded'`: the
+   * charge was paid and the sessions are `'upcoming'`. `'requires_payment'`:
+   * Stripe still reports `processing` and the sessions are `'payment-pending'`,
+   * the word `CreditPurchaseWire.charge_status` already uses. A confirm answers
+   * one of those three. `'failed'` is a read-side value: a confirm that fails
+   * answers 402 `payment_failed`, never a 201.
+   */
+  charge_status: 'none' | 'succeeded' | 'requires_payment' | 'failed';
+  /** Why the charge stopped short of `succeeded`, in `ChargeBlocker`'s words:
+   *  `'processing'` on `'requires_payment'`. Omitted on `'none'` and
+   *  `'succeeded'`. */
+  client_action?: ChargeBlocker;
+}
+
+/**
+ * How one confirm's card tries ended (design §1.1:877-879; PAY-U05). `attempts`
+ * counts the confirms sent, at most `pay.card_attempts_max_count`: only a
+ * transient processing or network error spends another, and any other decline
+ * stops at the first (question 55). `'pending'` is the state
+ * `OrderWire.charge_status` calls `'requires_payment'`. `blocker` is omitted on
+ * `'succeeded'`.
+ *
+ * No response carries it at this step. `POST /staff/invoices/:id/charge`, at
+ * 7.1.0, is the first.
+ */
+export interface ChargeAttemptOutcomeWire {
+  attempts: number;
+  outcome: 'succeeded' | 'pending' | 'failed';
+  blocker?: ChargeBlocker;
+}
+
+/**
+ * One order still pending past `pay.processing_hold_max_minutes`: its one
+ * charge is `requires_payment`, and it keeps its seats and is flagged, never
+ * swept (PAY-82; design §1.1:887-891, §2.7:3999-4011). Only Stripe's outcome or
+ * a person moves it, staff through `POST /staff/orders/:id/cancel`.
+ *
+ * `kind`: `'booking'` is a Confirm with a top-up, `'package'` a pack or
+ * single-day purchase, `'class'` a class order. Nothing can be listed until one
+ * of them can stay processing: the first two at P18, `'class'` at 8.0.0.
+ *
+ * `owner.name` is the family's name, or its `email` when the name is empty, as
+ * on `StaffDogWire.owner_name`, so it is never `null`. `amount_cents` is the
+ * charge's. `created_at` is the order's, and `minutes_pending` the whole minutes
+ * since it. `sessions` is the order's rows, ascending, omitted on an order with
+ * none.
+ */
+export interface PendingPaymentWire {
+  order_id: string;
+  owner: { id: string; name: string };
+  kind: 'booking' | 'package' | 'class';
+  amount_cents: number;
+  created_at: string;
+  minutes_pending: number;
+  sessions?: BookingWire[];
+}
+
+/** `GET /staff/payments/pending` response: every `PendingPaymentWire`, oldest
+ *  first, every campus. */
+export type GetStaffPaymentsPendingResponse = PendingPaymentWire[];
+
+/**
+ * `POST /staff/orders/:id/cancel` 200 response: staff *Cancel order*, also for a
+ * pending purchase with no rows (design §1.1:890-898, §2.7:4010-4030; PAY-U07).
+ * Bodyless; `Idempotency-Key` required. It reads what won before it cancels
+ * anything, asking Stripe with no transaction open:
+ *   - `'settled'` — the charge had succeeded on a purchase or a class order. It
+ *     is settled and nothing is cancelled: the lot or the seat stands.
+ *   - `'settled_then_cancelled'` — a top-up's charge had succeeded. It is settled,
+ *     then its rows are cancelled as credits, each back to its lot. Never
+ *     returned for a class order.
+ *   - `'cancelled'` — the order is cancelled, with its rows, its debits returned,
+ *     its charge `failed` and its claim completed with the 402. That includes a
+ *     charge Stripe still reports `processing` and will not cancel: a success
+ *     landing later grants nothing and is refunded in full once, automatically.
+ * An order paying an invoice takes the same arms, and the invoice stays open
+ * unless the charge had succeeded. A class order still `requires_payment` makes
+ * no Stripe call, and its enrolments go `payment-failed` (8.0.0; follow-up 4).
+ *
+ * 404 `not_found` for an id naming no order. 409 `conflict` for an order with
+ * nothing pending: no charge, or a charge already `failed` or `refunded`; or
+ * when the order changed under the cancel, an intent id landing after its read.
+ * Either way nothing is written, and a person may look again.
+ */
+export interface PostStaffOrdersCancelResponse {
+  order_id: string;
+  outcome: 'cancelled' | 'settled' | 'settled_then_cancelled';
+}
+
 // ---- (c) request bodies + query shapes -------------------------------------
 
 /**
@@ -4696,6 +4894,23 @@ export type GetStaffOwnersPaymentMethodsResponse = PaymentMethodWire[];
  * otherwise (tenancy misses collapse to 404 rather than 403 to avoid probing),
  * then repoints `invoices.payment_method_id` at it inside the settle
  * transaction so the receipt names the card actually charged.
+ *
+ * The route rides the order engine since 4.0.0-lg3.2 (design §2.7:3824-3830;
+ * PAY-U05, PAY-U07). Its failure policy leaves the invoice open:
+ *   - 201 `InvoicePayWire` with `invoice_status: 'paid'`: settled.
+ *   - 201 with `charge_status: 'requires_payment'`, `charge_blocker: 'processing'`
+ *     and `invoice_status: 'open'`: Stripe has not answered, so do not retry.
+ *     The webhook or the sweeper settles it.
+ *   - 402 `payment_failed` (`PaymentFailedDetails`): the order ended unpaid; a
+ *     decline was a 201 until now. The invoice stays open with only the failed
+ *     charge recorded. A replay returns the same 402, so the next try takes a
+ *     fresh key, with this card or another.
+ *   - 409 `idempotency_inflight`: no answer exists yet, because the last confirm
+ *     went unanswered or the engine stopped. Re-send under the same key; the
+ *     final answer replays once the order has settled. Nothing more is charged.
+ *   - 409 `invoice_payment_in_flight`, no `details`: another order on this
+ *     invoice holds a `requires_payment` charge inside its lease (several orders
+ *     may try one invoice, one at a time). Nothing is charged.
  */
 export interface InvoicePayRequest {
   payment_method_id?: string;
@@ -4746,11 +4961,12 @@ export interface PatchPaymentMethodsRequest {
 // /requests, POST /enrollments and POST /events/:id/rsvp — the digest-named
 // gate surfaces. No endpoint in this domain 422s with a `details` payload:
 // `POST /invoices/:id/pay` fails with bare `not_found` / `conflict` /
-// `invalid_payload`, and the money-blocked cases it does report ride
-// `InvoicePayWire.charge_blocker` in a 201 body rather than an error envelope.
-// The one `details`-carrying money arm, `payment_failed` / `PaymentFailedDetails`,
-// is emitted by memberships, enrollments and requestConfirmPayment — not here
-// (wire.ts §1, design §3.3).
+// `invalid_payload` / `invoice_payment_in_flight`, and a charge still processing
+// rides `InvoicePayWire.charge_blocker` in a 201 body. The one `details`-carrying
+// money arm, `payment_failed` / `PaymentFailedDetails`, is a 402 and not a 422,
+// so it is no alias here either: `InvoicePayRequest` documents it for this route,
+// and memberships, enrollments and requestConfirmPayment emit it too (wire.ts §1,
+// design §3.3).
 
 // ---- (e) domain helpers ----------------------------------------------------
 //

@@ -24,7 +24,7 @@ import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
 import { runInvoiceAutoChargeOnce } from '../../src/workers/invoiceAutoCharge.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -110,7 +110,7 @@ async function seedOpenInvoice(
 async function cleanup(): Promise<void> {
   await db.delete(creditLedger).where(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id));
   await db.delete(memberships).where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   // Break the scheduled -> feed FK link before dropping either side; the
@@ -147,7 +147,9 @@ async function cleanup(): Promise<void> {
  *  whole rather than one assertion at a time. */
 function stripeFootprint(stripe: StripeStub): { confirms: number; cancels: number; refunds: number } {
   return {
-    confirms: stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+    confirms: stripe.calls.filter(
+      (c) => c.method === 'createAndConfirmPaymentIntent' || c.method === 'confirmPaymentIntent',
+    ).length,
     cancels: stripe.calls.filter((c) => c.method === 'cancelPaymentIntent').length,
     refunds: stripe.calls.filter((c) => c.method === 'createRefund').length,
   };
@@ -174,7 +176,7 @@ function withoutIds(body: Record<string, unknown>): Record<string, unknown> {
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /invoices/:id/pay — a THROWN card decline lands the same 201 + rows as a RETURNED one',
+  'POST /invoices/:id/pay — a THROWN card decline lands the same 402 + rows as a RETURNED one',
   SKIP_WHEN_NO_DB,
   async () => {
     const outcomes: {
@@ -197,13 +199,18 @@ test(
         headers: { 'idempotency-key': `pfc-inv-${fork}-${randomUUID()}` },
         payload: {},
       });
-      assert.equal(res.statusCode, 201, `${fork}: ${res.body}`);
+      assert.equal(res.statusCode, 402, `${fork}: ${res.body}`);
       const [inv] = await db
         .select({ status: invoices.status })
         .from(invoices)
         .where(eq(invoices.id, invoiceId));
+      const { error } = res.json() as {
+        error: { code: string; details: Record<string, unknown> };
+      };
+      const { order_id: orderId, ...details } = error.details;
+      void orderId;
       outcomes.push({
-        body: withoutIds(res.json() as Record<string, unknown>),
+        body: { code: error.code, ...details },
         footprint: stripeFootprint(stripe),
         rows: await chargeRowsForOwner(),
         invoiceStatus: inv?.status,
@@ -214,15 +221,14 @@ test(
     assert.deepEqual(thrown, returned, 'the two forks must be indistinguishable downstream');
     // And the shared outcome is the RIGHT one — an equivalence between two
     // wrong answers would satisfy the assertion above.
-    assert.equal(returned!.body.charge_status, 'requires_payment');
-    assert.equal(returned!.body.invoice_status, 'open');
+    assert.equal(returned!.body.code, 'payment_failed');
     assert.equal(returned!.body.charge_blocker, 'declined');
     assert.equal(returned!.invoiceStatus, 'open', 'the obligation stays open on both forks');
-    assert.equal(returned!.footprint.cancels, 1, 'the 1.7.1 cancel rule fires on both forks');
+    assert.equal(returned!.footprint.cancels, 0, 'wire 1.7.1 is gone from this route');
     assert.deepEqual(
       returned!.rows,
-      [{ status: 'requires_payment', purpose: 'board-train' }],
-      'the audit charge row is written on both forks (R32 keeps it out of the ledger)',
+      [{ status: 'failed', purpose: 'board-train' }],
+      'the failed charge is recorded on both forks (R32 keeps it out of the ledger)',
     );
 
     await cleanup();
@@ -438,23 +444,25 @@ test(
         payload: {},
       });
 
-      assert.equal(res.statusCode, 201, `${scenario}: ${res.body}`);
-      const body = res.json() as Record<string, unknown>;
-      assert.equal(body.charge_blocker, expected, `${scenario}: the owner's sentence`);
+      assert.equal(res.statusCode, 402, `${scenario}: ${res.body}`);
+      const body = res.json() as {
+        error: { code: string; details: { charge_blocker: string } };
+      };
+      assert.equal(
+        body.error.details.charge_blocker,
+        expected,
+        `${scenario}: the owner's sentence`,
+      );
       // Everything that MOVES or RECORDS money is unchanged by which sentence
       // the owner reads — the amended fork invariant, asserted rather than
       // assumed.
-      assert.equal(body.charge_status, 'requires_payment');
-      assert.equal(body.invoice_status, 'open');
+      assert.equal(body.error.code, 'payment_failed');
       const [inv] = await db
         .select({ status: invoices.status })
         .from(invoices)
         .where(eq(invoices.id, invoiceId));
       assert.equal(inv?.status, 'open', 'the obligation stays open on both codes');
-      assert.equal(stripeFootprint(stripe).cancels, 1, 'the 1.7.1 cancel rule still fires');
-      assert.deepEqual(await chargeRowsForOwner(), [
-        { status: 'requires_payment', purpose: 'board-train' },
-      ]);
+      assert.deepEqual(await chargeRowsForOwner(), [{ status: 'failed', purpose: 'board-train' }]);
     }
     await cleanup();
   },
@@ -588,7 +596,8 @@ test(
     await cleanup();
     const invoiceId = await seedOpenInvoice();
     const { app, stripe } = invoicesApp();
-    stripe.setNextIntentThrowsTransport();
+    // Twice: the engine re-sends one lost create under K0, so one failure heals.
+    stripe.nextCreateThrowsTransport(2);
 
     const res = await app.inject({
       method: 'POST',
@@ -597,17 +606,21 @@ test(
       payload: {},
     });
 
-    // NOT 201-with-a-blocker and NOT 402: we do not know whether money moved,
-    // and the client's `network` arm (reused-key retry) is the right recovery.
-    assert.notEqual(res.statusCode, 201);
-    assert.notEqual(res.statusCode, 402);
-    assert.equal((res.json() as { error: { code: string } }).error.code, 'internal');
-    assert.deepEqual(await chargeRowsForOwner(), [], 'no charge row for an unknown outcome');
+    // NOT 201-with-a-blocker and NOT 402: there is no answer yet, and the client's
+    // same-key re-send is the right recovery. The sweeper answers it past the lease.
+    assert.equal(res.statusCode, 409, res.body);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'idempotency_inflight');
+    assert.deepEqual(
+      await chargeRowsForOwner(),
+      [{ status: 'requires_payment', purpose: 'board-train' }],
+      'tx1 committed: the charge is on the books, and no card was tried',
+    );
     const [inv] = await db
       .select({ status: invoices.status })
       .from(invoices)
       .where(eq(invoices.id, invoiceId));
     assert.equal(inv?.status, 'open');
+    assert.equal(stripeFootprint(stripe).confirms, 0, 'no confirm was sent');
     assert.equal(stripeFootprint(stripe).cancels, 0, 'nothing to cancel — we never got an intent');
 
     await cleanup();
@@ -760,10 +773,10 @@ test(
     assert.equal(row?.title, 'Purchase complete');
     // Allison's copy, 2026-08-04. Named amount, named credit count, named dog —
     // "credits were added" without saying whose is the kind of vague that makes
-    // someone open the app to find out.
+    // someone open the app to find out. The figure prints cents since §2.7:3924.
     assert.equal(
       row?.body,
-      'Your $250 credit purchase went through — 5 credits were added for Waffles.',
+      'Your $250.00 credit purchase went through — 5 credits were added for Waffles.',
     );
     assert.equal(
       row?.deepLinkPath,

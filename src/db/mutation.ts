@@ -46,7 +46,7 @@ export const STRIPE_IDEMPOTENCY_KEY_MAX_LEN = 255;
 export const STRIPE_DERIVED_KEY_SUFFIXES = [
   ':refund', // bookings, staffBookings, enrollments cancel/withdraw money-back
   ':dup-subscribe-refund', // memberships subscribe lost-race
-  ':payment-intent', // memberships, invoices, requestConfirmPayment, creditPackages
+  ':payment-intent', // memberships, requestConfirmPayment, creditPackages
   ':customer', // paymentMethods
   ':setup-intent', // paymentMethods
   ':confirm-unwind', // requestConfirmPayment

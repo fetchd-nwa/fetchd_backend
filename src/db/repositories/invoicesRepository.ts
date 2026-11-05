@@ -114,6 +114,21 @@ export const invoicesRepository = {
   },
 
   /**
+   * Row-lock one invoice: tx1 of an invoice payment, so two tenders on one invoice
+   * serialise (design §2.7:3815). No charge lock is held when this is taken. `NO KEY
+   * UPDATE`, because tx1's insert of `orders.invoice_id` already took `KEY SHARE` here,
+   * and `FOR UPDATE` on top of that deadlocks two tenders (`db/locks.ts`).
+   */
+  async lockById(tx: Tx, id: string): Promise<InvoiceRow | undefined> {
+    const [row] = await tx
+      .select(INVOICE_PROJECTION)
+      .from(invoices)
+      .where(eq(invoices.id, id))
+      .for('no key update');
+    return row;
+  },
+
+  /**
    * INSERT an open invoice. Used by `POST /requests/:id/confirm-payment`
    * pay-later branch (B&T) and (Day-19 portal extension) future ad-hoc
    * invoice flows. `next_attempt_at` defaults to `due_at` so the worker

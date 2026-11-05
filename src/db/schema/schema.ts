@@ -5,7 +5,7 @@ import type { NotificationDeepLinkKind } from "../../lib/notificationWire.js"
 export const announcementCategory = pgEnum("announcement_category", ['urgent', 'team', 'class', 'event', 'promo', 'report'])
 export const bookingAttendance = pgEnum("booking_attendance", ['pending', 'attended', 'no-show', 'excused'])
 export const bookingMode = pgEnum("booking_mode", ['school', 'daycare'])
-export const bookingStatus = pgEnum("booking_status", ['upcoming', 'past', 'cancelled'])
+export const bookingStatus = pgEnum("booking_status", ['upcoming', 'past', 'cancelled', 'payment-pending'])
 export const chargePurpose = pgEnum("charge_purpose", ['package', 'payg', 'board-train', 'membership', 'group-class'])
 export const chargeStatus = pgEnum("charge_status", ['requires_payment', 'succeeded', 'failed', 'refunded'])
 export const evaluationStatus = pgEnum("evaluation_status", ['not-evaluated', 'pending', 'passed', 'failed'])
@@ -486,6 +486,26 @@ export const mediaDerivativeJobs = pgTable("media_derivative_jobs", {
 	}
 });
 
+export const orders = pgTable("orders", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	ownerId: uuid("owner_id").notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	invoiceId: uuid("invoice_id"),
+}, (table) => {
+	return {
+		ownerIdx: index("orders_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
+		invoiceIdx: index("orders_invoice_idx").using("btree", table.invoiceId.asc().nullsLast().op("uuid_ops")).where(sql`(invoice_id IS NOT NULL)`),
+		ordersOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "orders_owner_id_fkey"
+		}).onDelete("restrict"),
+		// `orders_invoice_id_fkey` is in schema.sql and not here: `invoices.order_id`
+		// references this table, and declaring both is a circular type. Drizzle is
+		// query-only in this repo, so the metadata has no reader.
+	}
+});
+
 export const bookings = pgTable("bookings", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	ownerId: uuid("owner_id").notNull(),
@@ -515,10 +535,12 @@ export const bookings = pgTable("bookings", {
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	orderId: uuid("order_id"),
 }, (table) => {
 	return {
 		cohortIdx: index("bookings_cohort_idx").using("btree", table.cohortId.asc().nullsLast().op("uuid_ops")),
 		dropoffIdx: index("bookings_dropoff_idx").using("btree", table.dropoffAt.asc().nullsLast().op("timestamptz_ops")).where(sql`(dropoff_at IS NOT NULL)`),
+		orderIdx: index("bookings_order_idx").using("btree", table.orderId.asc().nullsLast().op("uuid_ops")).where(sql`(order_id IS NOT NULL)`),
 		leadDogIdx: index("bookings_lead_dog_idx").using("btree", table.leadDogId.asc().nullsLast().op("uuid_ops"), table.scheduledAt.asc().nullsLast().op("uuid_ops")),
 		locationTimeIdx: index("bookings_location_time_idx").using("btree", table.location.asc().nullsLast().op("text_ops"), table.scheduledAt.asc().nullsLast().op("text_ops")),
 		ownerIdx: index("bookings_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
@@ -529,6 +551,11 @@ export const bookings = pgTable("bookings", {
 			foreignColumns: [owners.id],
 			name: "bookings_owner_id_fkey"
 		}).onDelete("restrict"),
+		bookingsOrderIdFkey: foreignKey({
+			columns: [table.orderId],
+			foreignColumns: [orders.id],
+			name: "bookings_order_id_fkey"
+		}),
 		bookingsLeadDogIdFkey: foreignKey({
 			columns: [table.leadDogId],
 			foreignColumns: [dogs.id],
@@ -1195,9 +1222,33 @@ export const charges = pgTable("charges", {
 	dogId: uuid("dog_id"),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	// M3.02: set means the charge is the order engine's, the order's one charge.
+	orderId: uuid("order_id"),
+	stripeIdempotencyKey: text("stripe_idempotency_key"),
+	attemptCount: integer("attempt_count").default(0).notNull(),
+	blocker: text(),
+	attemptingUntil: timestamp("attempting_until", { withTimezone: true, mode: 'string' }),
+	nextSweepAt: timestamp("next_sweep_at", { withTimezone: true, mode: 'string' }),
+	lastStripeError: text("last_stripe_error"),
+	stripeCustomerId: text("stripe_customer_id"),
+	stripePaymentMethodId: text("stripe_payment_method_id"),
+	paymentMethodId: uuid("payment_method_id"),
 }, (table) => {
 	return {
 		ownerIdx: index("charges_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
+		orderIdUidx: uniqueIndex("charges_order_id_uidx").using("btree", table.orderId.asc().nullsLast().op("uuid_ops")),
+		attemptingIdx: index("charges_attempting_idx").using("btree", table.attemptingUntil.asc().nullsLast().op("timestamptz_ops")).where(sql`((status = 'requires_payment'::charge_status) AND (order_id IS NOT NULL))`),
+		watchIdx: index("charges_watch_idx").using("btree", table.nextSweepAt.asc().nullsLast().op("timestamptz_ops")).where(sql`((status = 'failed'::charge_status) AND (next_sweep_at IS NOT NULL))`),
+		chargesOrderIdFkey: foreignKey({
+			columns: [table.orderId],
+			foreignColumns: [orders.id],
+			name: "charges_order_id_fkey"
+		}),
+		chargesPaymentMethodIdFkey: foreignKey({
+			columns: [table.paymentMethodId],
+			foreignColumns: [paymentMethods.id],
+			name: "charges_payment_method_id_fkey"
+		}),
 		chargesOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],
@@ -1246,8 +1297,16 @@ export const invoices = pgTable("invoices", {
 	paidAt: timestamp("paid_at", { withTimezone: true, mode: 'string' }),
 	externalRef: text("external_ref"),
 	source: recordSource().default('app').notNull(),
+	// M3.02: written only by a purchase's settle. Plain unique, not partial.
+	orderId: uuid("order_id"),
 }, (table) => {
 	return {
+		orderIdUidx: uniqueIndex("invoices_order_id_uidx").using("btree", table.orderId.asc().nullsLast().op("uuid_ops")),
+		invoicesOrderIdFkey: foreignKey({
+			columns: [table.orderId],
+			foreignColumns: [orders.id],
+			name: "invoices_order_id_fkey"
+		}),
 		openIdx: index("invoices_open_idx").using("btree", table.status.asc().nullsLast().op("enum_ops")).where(sql`(status = 'open'::invoice_status)`),
 		ownerIdx: index("invoices_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
 		invoicesOwnerIdFkey: foreignKey({
@@ -1534,9 +1593,16 @@ export const idempotencyKeys = pgTable("idempotency_keys", {
 	responseBody: jsonb("response_body"),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	completedAt: timestamp("completed_at", { withTimezone: true, mode: 'string' }),
+	orderId: uuid("order_id"),
 }, (table) => {
 	return {
 		createdIdx: index("idempotency_keys_created_idx").using("btree", table.createdAt.asc().nullsLast().op("timestamptz_ops")),
+		orderIdx: index("idempotency_keys_order_idx").using("btree", table.orderId.asc().nullsLast().op("uuid_ops")).where(sql`(order_id IS NOT NULL)`),
+		idempotencyKeysOrderIdFkey: foreignKey({
+			columns: [table.orderId],
+			foreignColumns: [orders.id],
+			name: "idempotency_keys_order_id_fkey"
+		}),
 		idempotencyKeysOwnerIdFkey: foreignKey({
 			columns: [table.ownerId],
 			foreignColumns: [owners.id],

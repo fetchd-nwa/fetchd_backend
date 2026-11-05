@@ -388,7 +388,7 @@ const ALARMED_BURIED_HIGH_WATER = new Map<AbandonedRefundClass, number>();
  */
 const ABANDONED_CLASS_MESSAGE: Record<AbandonedRefundClass, string> = {
   'row-keyed':
-    'duplicate refund retry: refunds past the idempotency-key window are still unsent — an owner is double-charged and no automatic path will fix it; refund by hand in the Stripe dashboard against the listed PaymentIntent, searching the listed idempotency key first in case a late retry did land',
+    'duplicate refund retry: refunds past the idempotency-key window are still unsent — an owner is owed this money and no automatic path will return it; refund by hand in the Stripe dashboard against the listed PaymentIntent, searching the listed idempotency key first in case a late retry did land',
   'client-keyed':
     'duplicate refund retry: refunds no sweep will ever retry are still unsent — their original Stripe key was the CLIENT request key and nothing durable can reproduce it; an owner is owed this money, so refund by hand against the listed PaymentIntent, but CHECK it for an existing refund first (a lost response rather than a lost request means the money already went back)',
   'never-sent':

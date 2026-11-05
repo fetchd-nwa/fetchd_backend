@@ -19,7 +19,7 @@ import {
   scheduleNextAttempt,
 } from '../../src/workers/invoiceAutoCharge.js';
 import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS } from './_fixture.js';
 import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
 import { makeExpoPushStub } from './_expoPushStub.js';
@@ -70,7 +70,7 @@ async function clearDeviceTokens(): Promise<void> {
 }
 
 async function cleanup(): Promise<void> {
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   // A parked invoice now enqueues a payment-failed `scheduled_notifications`
@@ -309,7 +309,7 @@ test(
     const succeeded = await paymentNotifications('payment-succeeded');
     assert.equal(succeeded.length, 1, 'exactly one receipt');
     assert.equal(succeeded[0]?.title, 'Payment received');
-    assert.match(succeeded[0]!.body, /\$45 for your day program session/);
+    assert.match(succeeded[0]!.body, /\$45\.00 for your day program session/);
     assert.equal(succeeded[0]?.deepLinkPath, `/account/invoices?invoiceId=${invoiceId}`);
     assert.equal(succeeded[0]?.deepLinkKind, 'invoice');
     assert.equal(succeeded[0]?.deepLinkId, invoiceId);

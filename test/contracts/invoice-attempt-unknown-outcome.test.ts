@@ -36,7 +36,7 @@ import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
 import { makeExpoPushStub } from './_expoPushStub.js';
 import { enqueueInvoiceOverdueWarnings } from '../../src/lib/enqueueInvoiceOverdueWarnings.js';
 import { withActor } from '../../src/db/tx.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -70,7 +70,7 @@ const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
 
 async function cleanup(): Promise<void> {
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
@@ -1045,7 +1045,7 @@ test(
     assert.equal(verify.results[0]?.outcome, 'parked-unconfirmed');
 
     const body = (await pushBody(`payment-unconfirmed:${invoiceId}`)) ?? '';
-    assert.match(body, /We started your \$45 payment/);
+    assert.match(body, /We started your \$45\.00 payment/);
     assert.match(
       body,
       new RegExp(`on ${ATTEMPT_TRIED_ON},`),

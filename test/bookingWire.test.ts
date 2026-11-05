@@ -15,6 +15,7 @@ const DOG_IDS: BookingDogIds = { lead: 'dog-1', additional: [] };
 function row(overrides: Partial<BookingRowForWire> = {}): BookingRowForWire {
   return {
     id: 'b-1',
+    orderId: null,
     category: 'group-class',
     status: 'upcoming',
     scheduledAt: '2026-06-07T15:00:00.000Z',

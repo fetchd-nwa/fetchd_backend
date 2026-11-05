@@ -8,7 +8,7 @@ import { charges, invoices, refunds } from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
 import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -46,7 +46,7 @@ async function seedOpenInvoice(amountCents = 200_000): Promise<string> {
 
 async function cleanupInvoicesAndCharges(): Promise<void> {
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
 }
@@ -82,14 +82,14 @@ test(
     assert.equal(inv?.status, 'paid');
     assert.equal(inv?.paidChargeId, body.charge_id);
 
-    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    const piCalls = stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent');
     assert.equal(piCalls.length, 1);
     await cleanupInvoicesAndCharges();
   },
 );
 
 test(
-  'POST /invoices/:id/pay — requires_action returns client_secret, invoice stays open, charge at requires_payment',
+  'POST /invoices/:id/pay — requires_action is a final decline: 402, invoice stays open, the failed charge recorded',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanupInvoicesAndCharges();
@@ -102,21 +102,23 @@ test(
       headers: { 'idempotency-key': `inv-3ds-${randomUUID()}` },
       payload: {},
     });
-    assert.equal(res.statusCode, 201);
+    // A card that needs authentication cannot pay off-session (question 61).
+    assert.equal(res.statusCode, 402, res.body);
     const body = res.json() as {
-      charge_id: string;
-      charge_status: string;
-      invoice_status: string;
-      client_secret: string | null;
+      error: { code: string; details: { charge_blocker: string } };
     };
-    assert.equal(body.charge_status, 'requires_payment');
-    assert.equal(body.invoice_status, 'open');
-    assert.ok(body.client_secret !== null);
+    assert.equal(body.error.code, 'payment_failed');
+    assert.equal(body.error.details.charge_blocker, 'authentication_required');
     const [inv] = await db
       .select({ status: invoices.status })
       .from(invoices)
       .where(eq(invoices.id, invoiceId));
     assert.equal(inv?.status, 'open');
+    const rows = await db
+      .select({ status: charges.status })
+      .from(charges)
+      .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+    assert.deepEqual(rows, [{ status: 'failed' }]);
     await cleanupInvoicesAndCharges();
   },
 );
@@ -303,13 +305,13 @@ test(
     // pre-check passed (it read 'open'); the claim lost. No `Promise.all`, no
     // timing luck — the interleave is forced by ordering, so the route→
     // postCommit Stripe-fire wiring is asserted on every run.
-    const confirmPaymentIntent = stripe.createAndConfirmPaymentIntent.bind(stripe);
+    const confirmPaymentIntent = stripe.confirmPaymentIntent.bind(stripe);
     let originalChargeId = '';
     let routePaymentIntentId = '';
     let preSettled = false;
     const winnerPaymentIntentId = 'pi_test_winner_mid_flight';
-    stripe.createAndConfirmPaymentIntent = async (args, idempotencyKey) => {
-      const intent = await confirmPaymentIntent(args, idempotencyKey);
+    stripe.confirmPaymentIntent = async (paymentIntentId, args, idempotencyKey, budget) => {
+      const intent = await confirmPaymentIntent(paymentIntentId, args, idempotencyKey, budget);
       routePaymentIntentId = intent.id;
       if (!preSettled) {
         preSettled = true;
@@ -382,7 +384,7 @@ test(
     // the route→postCommit wiring the racy test only covered non-deterministically.
     const refundCalls = stripe.calls.filter((c) => c.method === 'createRefund');
     assert.equal(refundCalls.length, 1, 'exactly one post-commit Stripe refund fired');
-    const piConfirmCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    const piConfirmCalls = stripe.calls.filter((c) => c.method === 'confirmPaymentIntent');
     assert.equal(piConfirmCalls.length, 1, 'the route confirmed exactly one PaymentIntent');
     if (refundCalls[0]?.method === 'createRefund') {
       assert.equal(

@@ -15,7 +15,9 @@ import type { Tx } from '../tx.js';
  *   3. On handler success: `markProcessed(eventId)` (sets `processed_at`).
  *      On handler failure: `release(eventId)` (DELETE so Stripe's next
  *      retry re-enters dispatch). Process crash leaves the row at
- *      `processed_at IS NULL`; admin replay can clean those up.
+ *      `processed_at IS NULL`: a redelivery re-runs it where
+ *      `redispatchUnfinishedEvent` allows, and answers 200 `duplicate` elsewhere. No
+ *      admin replay exists.
  *
  * Permanent table — no soft-expire / TTL; audit history is the point.
  * Reads are admin-only (no client surface).

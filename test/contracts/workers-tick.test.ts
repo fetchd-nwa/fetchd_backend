@@ -55,6 +55,7 @@ const FAKE_RESULT: SchedulerTickResult = {
   invoiceOverdue: { scanned: 0, enqueued: 0 },
   cardExpiry: { scanned: 0, enqueued: 0 },
   invoiceAttemptVerify: { scanned: 0, results: [] },
+  orderSweeper: { scanned: 0, abandoned: 0, settled: 0, failed: 0, lateRefunded: 0, left: 0 },
   captureReconciler: {
     scanned: 0,
     captured: 0,

@@ -35,7 +35,7 @@ import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
 import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
 import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRetry.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -103,7 +103,7 @@ async function ageIntoTheClaimWindow(refundId: string): Promise<void> {
 }
 
 async function cleanup(): Promise<void> {
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
@@ -1130,7 +1130,11 @@ test(
         cancelledBy: 'owner',
         now: FIXTURE_TODAY,
         stripeIdempotencyKey: `intx-${randomUUID()}:refund`,
-        log: { error: (obj, msg) => errors.push({ obj, msg }) },
+        log: {
+          info: () => undefined,
+          warn: () => undefined,
+          error: (obj, msg) => errors.push({ obj, msg }),
+        },
       });
       // Asserted while the tx is STILL OPEN: the announcement has already
       // happened by the time the service returns.

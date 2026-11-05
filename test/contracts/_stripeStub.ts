@@ -7,6 +7,7 @@ import {
   type RecordedScenarioKey,
 } from '../fixtures/recordedStripeErrors.js';
 import type {
+  StripeCallBudget,
   StripeClient,
   StripePaymentIntentResult,
   StripePaymentIntentStatus,
@@ -61,6 +62,14 @@ import type {
  * already-`canceled`. Two callers now read a cancel's throw as evidence about
  * who won a race, so a cancel that never refuses would prove nothing.
  *
+ * The order engine's split (P15) is modelled the same way. An unconfirmed create
+ * rests at `requires_confirmation` and moves no money; `confirmPaymentIntent` is
+ * the only verb here that takes it further, and it consumes the SAME outcome levers
+ * as `createAndConfirmPaymentIntent`, so a route test says "this card declines"
+ * once, whichever verb reaches Stripe. Stripe's refusals are modelled too: a confirm
+ * of an intent past confirming throws, and a create under a key whose first request
+ * is still in flight throws 409 `idempotency_key_in_use`.
+ *
  * All Stripe-facing calls are recorded as discriminated-union entries in
  * `calls`; tests can `.filter(c => c.method === 'createRefund')` to assert
  * that a route fired the expected post-commit call AND get type-safe
@@ -91,6 +100,18 @@ export type StripeStubCall =
       idempotencyKey: string;
     }
   | {
+      method: 'createUnconfirmedPaymentIntent';
+      args: Parameters<StripeClient['createUnconfirmedPaymentIntent']>[0];
+      idempotencyKey: string;
+      budget: StripeCallBudget;
+    }
+  | {
+      method: 'confirmPaymentIntent';
+      args: { paymentIntentId: string; paymentMethodId: string };
+      idempotencyKey: string;
+      budget: StripeCallBudget;
+    }
+  | {
       method: 'detachPaymentMethod';
       args: { paymentMethodId: string };
       idempotencyKey: null;
@@ -99,11 +120,13 @@ export type StripeStubCall =
       method: 'cancelPaymentIntent';
       args: { paymentIntentId: string };
       idempotencyKey: null;
+      budget?: StripeCallBudget;
     }
   | {
       method: 'retrievePaymentIntent';
       args: { paymentIntentId: string };
       idempotencyKey: null;
+      budget?: StripeCallBudget;
     }
   | {
       method: 'capturePaymentIntent';
@@ -133,6 +156,8 @@ export type StripeStubCall =
  */
 export type QueuedIntentOutcome =
   | { kind: 'status'; status: StripePaymentIntentStatus }
+  /** The confirm reached nothing and its answer is a connection error. */
+  | { kind: 'transport' }
   | { kind: 'cardError'; status: StripePaymentIntentStatus; code?: string }
   | { kind: 'recorded'; scenario: RecordedScenarioKey };
 
@@ -240,6 +265,43 @@ export interface StripeStub extends StripeClient {
     status: StripePaymentIntentStatus,
     opts?: { failureCode?: string },
   ): void;
+  /**
+   * Hold the next call of a verb open until `release()`: the verb has REACHED
+   * Stripe and has not answered. With no fake timers involved, this is how a test
+   * stands inside "a 25 s retrieve" or "a confirm that never comes back" and acts
+   * from a second connection while it lasts. The call finishes normally once
+   * released, so a test can also watch what a process that outlived its lease does
+   * with a late answer.
+   *
+   * **A held confirm holds Stripe's object lock on that intent**, as a running confirm
+   * does (`evidence/reviews/opus-r1/lib/fake-stripe.mjs:9-10`): a cancel of it throws
+   * 429 `lock_timeout`, and a retrieve passes and reads the pre-confirm state. To
+   * stage a process frozen BEFORE its confirm left, which holds nothing at Stripe,
+   * wrap `confirmPaymentIntent` in the test instead.
+   */
+  holdNext(verb: 'create' | 'confirm' | 'retrieve'): { reached: Promise<void>; release(): void };
+  /**
+   * The next unconfirmed create outlives its per-call timeout: the caller sees a
+   * connection error at once, while Stripe is still working the request, so the key
+   * stays in flight (a re-send answers 409) until `land()`. `land()` makes the
+   * intent exist, unconfirmed, at Stripe, and returns its id.
+   */
+  createOutlivesTimeout(): { land(): string };
+  /** The next `times` unconfirmed creates throw a connection error, reaching nothing. */
+  nextCreateThrowsTransport(times?: number): void;
+  /** The next `retrievePaymentIntent` throws a connection error. */
+  nextRetrieveThrowsTransport(): void;
+  /**
+   * Make the next `confirmPaymentIntent` land at this status and then lose its
+   * response to a connection error, the arm "or the kill tests prove only the stub"
+   * (design §2.7:3972-3974) names. Default `succeeded`. `failureCode` is the
+   * `last_payment_error.code` a landed decline leaves on the read-back.
+   */
+  confirmLandsThenThrows(status?: StripePaymentIntentStatus, opts?: { failureCode?: string }): void;
+  /** Stripe took a different amount from the one asked: `amount_received`. */
+  setAmountReceived(paymentIntentId: string, amountCents: number): void;
+  /** Every confirm Stripe EXECUTED, in order: a replay is not an execution. */
+  executedConfirms(): readonly string[];
   /** Make the next `detachPaymentMethod` throw. */
   throwOnDetach(): void;
   /**
@@ -359,7 +421,9 @@ export interface StripeStub extends StripeClient {
  * same-key retry would have been rejected live. A stub that ignored metadata
  * would have kept that defect invisible.
  */
-function paramsFingerprint(args: Parameters<StripeClient['createAndConfirmPaymentIntent']>[0]): string {
+function paramsFingerprint(
+  args: Parameters<StripeClient['createAndConfirmPaymentIntent']>[0],
+): string {
   const metadata = Object.keys(args.metadata)
     .sort()
     .map((k) => [k, args.metadata[k]] as const);
@@ -379,9 +443,7 @@ function paramsFingerprint(args: Parameters<StripeClient['createAndConfirmPaymen
  * `idempotency_error`, and the sweep re-building these params differently from
  * the post-commit fire is exactly the regression the byte-equality pin watches.
  */
-function refundParamsFingerprint(
-  args: Parameters<StripeClient['createRefund']>[0],
-): string {
+function refundParamsFingerprint(args: Parameters<StripeClient['createRefund']>[0]): string {
   return JSON.stringify([args.paymentIntentId, args.amountCents, args.reason ?? null]);
 }
 
@@ -411,7 +473,7 @@ const STUB_CANCELLABLE_STATUSES: ReadonlySet<StripePaymentIntentStatus> = new Se
 function unexpectedStateError(
   paymentIntentId: string,
   status: StripePaymentIntentStatus,
-  verb: 'canceled' | 'captured',
+  verb: 'canceled' | 'captured' | 'confirmed',
 ): Error {
   return new Stripe.errors.StripeInvalidRequestError({
     type: 'invalid_request_error',
@@ -435,6 +497,57 @@ interface StubIntentState {
   createdSeconds: number;
   /** `last_payment_error.code` once the intent has failed. */
   failureCode?: string;
+  /** `amount_received` when a test says it differs from `amountCents`. */
+  amountReceivedCents?: number;
+}
+
+/** The statuses Stripe will confirm a PaymentIntent FROM, the stub's own model. */
+const STUB_CONFIRMABLE_STATUSES: ReadonlySet<StripePaymentIntentStatus> = new Set([
+  'requires_confirmation',
+  'requires_payment_method',
+]);
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * What the real SDK throws for a key still in flight, measured through `stripe@22.1.1`
+ * (`evidence/reviews/opus-r1/logs/p01-sdk-facts.log`): a 409 picks `StripeAPIError`,
+ * NOT `StripeIdempotencyError`, with `rawType: 'idempotency_error'`. Only the 400 for
+ * changed parameters is the idempotency class.
+ */
+function keyInFlightError(): Error {
+  return new Stripe.errors.StripeAPIError({
+    type: 'idempotency_error',
+    code: 'idempotency_key_in_use',
+    message: 'There is currently another in-progress request using this Idempotent Key.',
+    statusCode: 409,
+  } as never);
+}
+
+/** Stripe's answer to a call on an object a running request has locked. */
+function lockTimeoutError(paymentIntentId: string): Error {
+  return new Stripe.errors.StripeRateLimitError({
+    type: 'invalid_request_error',
+    code: 'lock_timeout',
+    message: `stub: PaymentIntent ${paymentIntentId} cannot be accessed right now because another API request or Stripe process is currently accessing it.`,
+    statusCode: 429,
+  } as never);
+}
+
+/** Stripe's 404 for an id it does not hold. */
+function noSuchIntentError(paymentIntentId: string): Error {
+  return new Stripe.errors.StripeInvalidRequestError({
+    type: 'invalid_request_error',
+    code: 'resource_missing',
+    message: `stub: no such PaymentIntent ${paymentIntentId}`,
+    statusCode: 404,
+  } as never);
 }
 
 export function makeStripeStub(): StripeStub {
@@ -490,6 +603,33 @@ export function makeStripeStub(): StripeStub {
   const refundedByPi = new Map<string, number>();
   /** Declared refundable balance per PI (see `setRefundableBalance`). */
   const declaredRefundable = new Map<string, number>();
+  /** Held verbs (see `holdNext`). */
+  const holds = new Map<
+    'create' | 'confirm' | 'retrieve',
+    { reached(): void; gate: Promise<void> }
+  >();
+  /** Keys whose first create Stripe is still working (see `createOutlivesTimeout`). */
+  const keysInFlight = new Set<string>();
+  /** Intents a held confirm has locked (see `holdNext`). */
+  const lockedIntents = new Set<string>();
+  let createOutlives:
+    | {
+        landed: boolean;
+        land: (args: {
+          id: string;
+          state: StubIntentState;
+          key: string;
+          fingerprint: string;
+          result: StripePaymentIntentResult;
+        }) => void;
+      }
+    | undefined;
+  let createTransportErrors = 0;
+  let retrieveTransportError = false;
+  let confirmLandsThenThrowsOutcome:
+    | { status: StripePaymentIntentStatus; failureCode?: string }
+    | undefined;
+  const executedConfirmLog: string[] = [];
   let detachShouldThrow = false;
   let refundShouldThrow = false;
   let refundLandsThenThrowsErr: Error | undefined;
@@ -499,13 +639,82 @@ export function makeStripeStub(): StripeStub {
   let captureThrowsRemaining = 0;
   let pmSnapshotOverride: Partial<StripePaymentMethodSnapshot> = {};
   let setupIntentOverride: Partial<StripeSetupIntentSnapshot> = {};
-  // `undefined` = no event queued; `null` = next call throws (bad signature);
-  // an event = next call returns it. Distinguishing null from undefined lets
-  // tests assert "no signature verification ran" vs "explicit bad signature".
-  let nextEvent: StripeWebhookEvent | null | undefined;
+  // Empty = no event queued; `null` = that call throws (bad signature); an event =
+  // that call returns it. Distinguishing null from empty lets tests assert "no
+  // signature verification ran" vs "explicit bad signature". A queue, since P15's
+  // two-connection tests deliver two events at once.
+  const nextEvents: (StripeWebhookEvent | null)[] = [];
 
   const testIdPrefix = (kind: string): string => `${kind}_test_${randomUUID().slice(0, 8)}`;
   const nowSeconds = (): number => Math.floor(Date.now() / 1000);
+
+  /**
+   * Consume the levers for one confirm, of either verb. A keyed outcome (this dog)
+   * or a queued one (the Nth confirm) overrides the single-shot levers for THIS call
+   * by setting them. Keyed wins over queued: it names the call it means, and a test
+   * that sets both meant the specific one. Every lever resets, because a stale one
+   * bleeding into a route's SECOND confirm (multi-dog enroll, replay) would be a lie.
+   */
+  const resolveConfirmOutcome = (
+    idempotencyKey: string,
+    captureMethod?: 'automatic' | 'manual',
+  ): {
+    status: StripePaymentIntentStatus;
+    throwsCard: boolean;
+    throwsCardCode: string;
+    throwsRecorded: RecordedScenarioKey | undefined;
+    transportError: Error | undefined;
+    landsThenThrows: { status: StripePaymentIntentStatus; err: Error } | undefined;
+  } => {
+    const queuedOutcome = outcomeByKey.get(idempotencyKey) ?? outcomeQueue.shift();
+    if (queuedOutcome !== undefined) {
+      switch (queuedOutcome.kind) {
+        case 'status':
+          nextIntentStatus = queuedOutcome.status;
+          nextIntentStatusExplicit = true;
+          break;
+        case 'cardError':
+          nextIntentStatus = queuedOutcome.status;
+          nextIntentStatusExplicit = true;
+          nextIntentThrowsCardCode = queuedOutcome.code ?? 'card_declined';
+          nextIntentThrowsCard = true;
+          break;
+        case 'recorded':
+          nextIntentThrowsRecorded = queuedOutcome.scenario;
+          break;
+        case 'transport':
+          nextIntentTransportError = new Stripe.errors.StripeConnectionError({
+            message: 'stub: cannot reach Stripe',
+          });
+          break;
+      }
+    }
+    // The manual-capture default (2026-08-20): an authorize with no lever rests at
+    // `requires_capture` — funds held, nothing moved — because that is what Stripe
+    // does with `capture_method: 'manual'`. A stub that answered `succeeded` here
+    // would let the whole authorize→enroll→capture protocol pass its tests while
+    // capturing on confirm, which is the exact behavior the protocol exists to stop
+    // doing.
+    if (!nextIntentStatusExplicit && captureMethod === 'manual') {
+      nextIntentStatus = 'requires_capture';
+    }
+    const outcome = {
+      status: nextIntentStatus,
+      throwsCard: nextIntentThrowsCard,
+      throwsCardCode: nextIntentThrowsCardCode,
+      throwsRecorded: nextIntentThrowsRecorded,
+      transportError: nextIntentTransportError,
+      landsThenThrows: nextIntentLandsThenThrows,
+    };
+    nextIntentStatus = 'succeeded';
+    nextIntentStatusExplicit = false;
+    nextIntentThrowsCard = false;
+    nextIntentThrowsCardCode = 'card_declined';
+    nextIntentThrowsRecorded = undefined;
+    nextIntentTransportError = undefined;
+    nextIntentLandsThenThrows = undefined;
+    return outcome;
+  };
 
   const stub: StripeStub = {
     calls,
@@ -558,6 +767,58 @@ export function makeStripeStub(): StripeStub {
             : {}),
       });
     },
+    holdNext(verb) {
+      const reached = deferred();
+      const gate = deferred();
+      holds.set(verb, { reached: reached.resolve, gate: gate.promise });
+      return { reached: reached.promise, release: gate.resolve };
+    },
+    createOutlivesTimeout() {
+      let captured:
+        | {
+            id: string;
+            state: StubIntentState;
+            key: string;
+            fingerprint: string;
+            result: StripePaymentIntentResult;
+          }
+        | undefined;
+      createOutlives = {
+        landed: false,
+        land: (armed) => {
+          captured = armed;
+        },
+      };
+      return {
+        land() {
+          if (captured === undefined) throw new Error('stub: nothing is in flight to land');
+          intents.set(captured.id, captured.state);
+          replays.set(captured.key, { fingerprint: captured.fingerprint, result: captured.result });
+          keysInFlight.delete(captured.key);
+          return captured.id;
+        },
+      };
+    },
+    nextCreateThrowsTransport(times = 1) {
+      createTransportErrors = times;
+    },
+    nextRetrieveThrowsTransport() {
+      retrieveTransportError = true;
+    },
+    confirmLandsThenThrows(status = 'succeeded', opts) {
+      confirmLandsThenThrowsOutcome = {
+        status,
+        ...(opts?.failureCode !== undefined ? { failureCode: opts.failureCode } : {}),
+      };
+    },
+    setAmountReceived(paymentIntentId, amountCents) {
+      const existing = intents.get(paymentIntentId);
+      if (existing === undefined) throw new Error('stub: no such intent to set amount_received on');
+      intents.set(paymentIntentId, { ...existing, amountReceivedCents: amountCents });
+    },
+    executedConfirms() {
+      return executedConfirmLog;
+    },
     throwOnDetach() {
       detachShouldThrow = true;
     },
@@ -596,7 +857,7 @@ export function makeStripeStub(): StripeStub {
       setupIntentOverride = snapshot;
     },
     setNextEvent(event) {
-      nextEvent = event;
+      nextEvents.push(event);
     },
 
     async createCustomer(args, idempotencyKey) {
@@ -653,53 +914,14 @@ export function makeStripeStub(): StripeStub {
         // indistinguishable to every test that could have caught it.
         return { ...recorded.result, replayed: true };
       }
-      // A keyed outcome (this dog) or a queued one (the Nth confirm) overrides
-      // the single-shot levers for THIS call by setting them, so everything
-      // below stays one code path. Keyed wins over queued: it names the call it
-      // means, and a test that sets both meant the specific one.
-      const keyedOutcome = outcomeByKey.get(idempotencyKey);
-      const queuedOutcome = keyedOutcome ?? outcomeQueue.shift();
-      if (queuedOutcome !== undefined) {
-        switch (queuedOutcome.kind) {
-          case 'status':
-            nextIntentStatus = queuedOutcome.status;
-            nextIntentStatusExplicit = true;
-            break;
-          case 'cardError':
-            nextIntentStatus = queuedOutcome.status;
-            nextIntentStatusExplicit = true;
-            nextIntentThrowsCardCode = queuedOutcome.code ?? 'card_declined';
-            nextIntentThrowsCard = true;
-            break;
-          case 'recorded':
-            nextIntentThrowsRecorded = queuedOutcome.scenario;
-            break;
-        }
-      }
-      // The manual-capture default (2026-08-20): an authorize with no lever
-      // rests at `requires_capture` — funds held, nothing moved — because that
-      // is what Stripe does with `capture_method: 'manual'`. A stub that
-      // answered `succeeded` here would let the whole authorize→enroll→capture
-      // protocol pass its tests while capturing on confirm, which is the exact
-      // behavior the protocol exists to stop doing.
-      if (!nextIntentStatusExplicit && args.captureMethod === 'manual') {
-        nextIntentStatus = 'requires_capture';
-      }
-      const status = nextIntentStatus;
-      const throwsCard = nextIntentThrowsCard;
-      const throwsCardCode = nextIntentThrowsCardCode;
-      const throwsRecorded = nextIntentThrowsRecorded;
-      const transportError = nextIntentTransportError;
-      const landsThenThrows = nextIntentLandsThenThrows;
-      // Reset every lever for the next call — a stale one bleeding into a
-      // route's SECOND confirm (multi-dog enroll, replay) would be a lie.
-      nextIntentStatus = 'succeeded';
-      nextIntentStatusExplicit = false;
-      nextIntentThrowsCard = false;
-      nextIntentThrowsCardCode = 'card_declined';
-      nextIntentThrowsRecorded = undefined;
-      nextIntentTransportError = undefined;
-      nextIntentLandsThenThrows = undefined;
+      const {
+        status,
+        throwsCard,
+        throwsCardCode,
+        throwsRecorded,
+        transportError,
+        landsThenThrows,
+      } = resolveConfirmOutcome(idempotencyKey, args.captureMethod);
       calls.push({ method: 'createAndConfirmPaymentIntent', args, idempotencyKey });
 
       const fingerprint = paramsFingerprint(args);
@@ -755,7 +977,8 @@ export function makeStripeStub(): StripeStub {
         // legitimately executes for the first time.
         throw transportError;
       }
-      const clientSecret = status === 'succeeded' ? null : `${id}_secret_${randomUUID().slice(0, 8)}`;
+      const clientSecret =
+        status === 'succeeded' ? null : `${id}_secret_${randomUUID().slice(0, 8)}`;
       if (throwsRecorded !== undefined) {
         // The error Stripe REALLY threw, replayed through the REAL normalizer.
         // Only the call-scoped identifiers are re-pointed; the recorded status
@@ -800,22 +1023,197 @@ export function makeStripeStub(): StripeStub {
       });
     },
 
-    async retrievePaymentIntent(paymentIntentId): Promise<StripePaymentIntentResult> {
+    async createUnconfirmedPaymentIntent(args, idempotencyKey, budget) {
+      calls.push({ method: 'createUnconfirmedPaymentIntent', args, idempotencyKey, budget });
+      const held = holds.get('create');
+      if (held !== undefined) {
+        holds.delete('create');
+        held.reached();
+        await held.gate;
+      }
+      const fingerprint = paramsFingerprint(args);
+      const recorded = replays.get(idempotencyKey);
+      if (recorded !== undefined) {
+        if (recorded.fingerprint !== fingerprint) {
+          throw new Stripe.errors.StripeIdempotencyError({
+            type: 'idempotency_error',
+            code: 'idempotency_error',
+            message:
+              'Keys for idempotent requests can only be used with the same parameters they were first used with.',
+            statusCode: 400,
+          } as never);
+        }
+        return { ...recorded.result, replayed: true };
+      }
+      if (keysInFlight.has(idempotencyKey)) throw keyInFlightError();
+      if (createTransportErrors > 0) {
+        createTransportErrors -= 1;
+        throw new Stripe.errors.StripeConnectionError({ message: 'stub: cannot reach Stripe' });
+      }
+      const id = testIdPrefix('pi');
+      const createdSeconds = nowSeconds();
+      const clientSecret = `${id}_secret_${randomUUID().slice(0, 8)}`;
+      const result: StripePaymentIntentResult = {
+        id,
+        status: 'requires_confirmation',
+        clientSecret,
+        amountCents: args.amountCents,
+        createdAt: new Date(createdSeconds * 1000),
+        replayed: false,
+      };
+      const state: StubIntentState = {
+        status: 'requires_confirmation',
+        amountCents: args.amountCents,
+        clientSecret,
+        createdSeconds,
+        metadata: { ...args.metadata },
+      };
+      if (createOutlives !== undefined) {
+        // The SDK gave up; Stripe did not. Nothing exists yet, and the key is live.
+        createOutlives.land({ id, state, key: idempotencyKey, fingerprint, result });
+        createOutlives = undefined;
+        keysInFlight.add(idempotencyKey);
+        throw new Stripe.errors.StripeConnectionError({
+          message: 'stub: Request aborted due to timeout being reached',
+        });
+      }
+      replays.set(idempotencyKey, { fingerprint, result });
+      intents.set(id, state);
+      return result;
+    },
+
+    async confirmPaymentIntent(paymentIntentId, args, idempotencyKey, budget) {
+      calls.push({
+        method: 'confirmPaymentIntent',
+        args: { paymentIntentId, paymentMethodId: args.paymentMethodId },
+        idempotencyKey,
+        budget,
+      });
+      const held = holds.get('confirm');
+      if (held !== undefined) {
+        holds.delete('confirm');
+        lockedIntents.add(paymentIntentId);
+        held.reached();
+        await held.gate;
+        lockedIntents.delete(paymentIntentId);
+      }
+      const fingerprint = JSON.stringify([paymentIntentId, args.paymentMethodId]);
+      const recorded = replays.get(idempotencyKey);
+      if (recorded !== undefined) {
+        if (recorded.fingerprint !== fingerprint) {
+          throw new Stripe.errors.StripeIdempotencyError({
+            type: 'idempotency_error',
+            code: 'idempotency_error',
+            message:
+              'Keys for idempotent requests can only be used with the same parameters they were first used with.',
+            statusCode: 400,
+          } as never);
+        }
+        return { ...recorded.result, replayed: true };
+      }
+      const state = intents.get(paymentIntentId);
+      if (state === undefined) {
+        throw noSuchIntentError(paymentIntentId);
+      }
+      if (!STUB_CONFIRMABLE_STATUSES.has(state.status)) {
+        throw unexpectedStateError(paymentIntentId, state.status, 'confirmed');
+      }
+      if (confirmLandsThenThrowsOutcome !== undefined) {
+        // Stripe executed it; only the response was lost.
+        const landed = confirmLandsThenThrowsOutcome;
+        confirmLandsThenThrowsOutcome = undefined;
+        executedConfirmLog.push(paymentIntentId);
+        intents.set(paymentIntentId, { ...state, ...landed });
+        throw new Stripe.errors.StripeConnectionError({
+          message: 'stub: confirm reached Stripe, response lost',
+        });
+      }
+
+      const outcome = resolveConfirmOutcome(idempotencyKey);
+      if (outcome.landsThenThrows !== undefined) {
+        executedConfirmLog.push(paymentIntentId);
+        intents.set(paymentIntentId, { ...state, status: outcome.landsThenThrows.status });
+        throw outcome.landsThenThrows.err;
+      }
+      if (outcome.transportError !== undefined) throw outcome.transportError;
+      executedConfirmLog.push(paymentIntentId);
+
+      const remember = (raw: StripePaymentIntentResult): StripePaymentIntentResult => {
+        const executed: StripePaymentIntentResult = {
+          ...raw,
+          ...(raw.status === 'succeeded' ? { amountReceivedCents: state.amountCents } : {}),
+          createdAt: new Date(state.createdSeconds * 1000),
+          replayed: false,
+        };
+        replays.set(idempotencyKey, { fingerprint, result: executed });
+        intents.set(paymentIntentId, {
+          ...state,
+          status: executed.status,
+          ...(executed.failureCode !== undefined ? { failureCode: executed.failureCode } : {}),
+        });
+        return executed;
+      };
+      if (outcome.throwsRecorded !== undefined) {
+        return remember(
+          normalizeThrownConfirmError(
+            rebuildRecordedCardError(outcome.throwsRecorded, {
+              id: paymentIntentId,
+              amount: state.amountCents,
+              client_secret: state.clientSecret ?? `${paymentIntentId}_secret`,
+            }),
+          ),
+        );
+      }
+      if (outcome.throwsCard) {
+        return remember(
+          normalizeThrownConfirmError(
+            new Stripe.errors.StripeCardError({
+              type: 'card_error',
+              code: outcome.throwsCardCode,
+              decline_code: 'generic_decline',
+              message: 'Your card was declined.',
+              statusCode: 402,
+              payment_intent: {
+                id: paymentIntentId,
+                status: outcome.status,
+                client_secret: state.clientSecret,
+                amount: state.amountCents,
+              },
+            } as never),
+          ),
+        );
+      }
+      return remember({
+        id: paymentIntentId,
+        status: outcome.status,
+        clientSecret: state.clientSecret,
+        amountCents: state.amountCents,
+      });
+    },
+
+    async retrievePaymentIntent(paymentIntentId, budget): Promise<StripePaymentIntentResult> {
       calls.push({
         method: 'retrievePaymentIntent',
         args: { paymentIntentId },
         idempotencyKey: null,
+        ...(budget !== undefined ? { budget } : {}),
       });
+      const held = holds.get('retrieve');
+      if (held !== undefined) {
+        holds.delete('retrieve');
+        held.reached();
+        await held.gate;
+      }
+      if (retrieveTransportError) {
+        retrieveTransportError = false;
+        throw new Stripe.errors.StripeConnectionError({ message: 'stub: cannot reach Stripe' });
+      }
       const state = intents.get(paymentIntentId);
       if (state === undefined) {
         // Stripe 404s an unknown PaymentIntent; a test that reaches here has
         // asked about money the stub never minted, which is a test bug worth
         // failing loudly rather than answering with a fiction.
-        throw new Stripe.errors.StripeInvalidRequestError({
-          type: 'invalid_request_error',
-          message: `stub: no such PaymentIntent ${paymentIntentId}`,
-          statusCode: 404,
-        } as never);
+        throw noSuchIntentError(paymentIntentId);
       }
       // Through the PRODUCTION normalizer, exactly as the confirm forks are —
       // so `last_payment_error.code` reaches the blocker map by the real route
@@ -828,6 +1226,8 @@ export function makeStripeStub(): StripeStub {
         client_secret: state.clientSecret,
         amount: state.amountCents,
         created: state.createdSeconds,
+        amount_received:
+          state.amountReceivedCents ?? (state.status === 'succeeded' ? state.amountCents : 0),
         ...(state.metadata !== undefined ? { metadata: state.metadata } : {}),
         ...(state.failureCode !== undefined
           ? { last_payment_error: { code: state.failureCode } }
@@ -835,7 +1235,10 @@ export function makeStripeStub(): StripeStub {
       } as unknown as Stripe.PaymentIntent);
     },
 
-    async capturePaymentIntent(paymentIntentId, idempotencyKey): Promise<StripePaymentIntentResult> {
+    async capturePaymentIntent(
+      paymentIntentId,
+      idempotencyKey,
+    ): Promise<StripePaymentIntentResult> {
       calls.push({ method: 'capturePaymentIntent', args: { paymentIntentId }, idempotencyKey });
 
       // ── Stripe's idempotency layer, BEFORE anything else ──────────────────
@@ -865,11 +1268,7 @@ export function makeStripeStub(): StripeStub {
 
       const state = intents.get(paymentIntentId);
       if (state === undefined) {
-        throw new Stripe.errors.StripeInvalidRequestError({
-          type: 'invalid_request_error',
-          message: `stub: no such PaymentIntent ${paymentIntentId}`,
-          statusCode: 404,
-        } as never);
+        throw noSuchIntentError(paymentIntentId);
       }
       if (state.status !== 'requires_capture') {
         // Stripe refuses a capture from any other state, and the two that most
@@ -906,16 +1305,18 @@ export function makeStripeStub(): StripeStub {
       }
     },
 
-    async cancelPaymentIntent(paymentIntentId) {
+    async cancelPaymentIntent(paymentIntentId, budget) {
       calls.push({
         method: 'cancelPaymentIntent',
         args: { paymentIntentId },
         idempotencyKey: null,
+        ...(budget !== undefined ? { budget } : {}),
       });
       if (cancelShouldThrow) {
         cancelShouldThrow = false;
         throw new Error('stub: cancel failed');
       }
+      if (lockedIntents.has(paymentIntentId)) throw lockTimeoutError(paymentIntentId);
       const state = intents.get(paymentIntentId);
       if (captureBeforeCancelPending && state !== undefined) {
         // The race, staged: a capture landed between the caller's retrieve and
@@ -933,11 +1334,7 @@ export function makeStripeStub(): StripeStub {
       // so a stub that never throws would make every race look like a clean
       // release and prove the opposite of what the tests claim.
       if (state === undefined) {
-        throw new Stripe.errors.StripeInvalidRequestError({
-          type: 'invalid_request_error',
-          message: `stub: no such PaymentIntent ${paymentIntentId}`,
-          statusCode: 404,
-        } as never);
+        throw noSuchIntentError(paymentIntentId);
       }
       if (!STUB_CANCELLABLE_STATUSES.has(state.status)) {
         throw unexpectedStateError(paymentIntentId, state.status, 'canceled');
@@ -985,13 +1382,7 @@ export function makeStripeStub(): StripeStub {
         // recorded here BECAUSE nothing is decided yet — the in-flight call
         // owns the outcome, and this attempt simply loses the race.
         refundKeyInUse = false;
-        throw new Stripe.errors.StripeIdempotencyError({
-          type: 'idempotency_error',
-          code: 'idempotency_key_in_use',
-          message:
-            'There is currently another in-progress request using this Idempotent Key.',
-          statusCode: 409,
-        } as never);
+        throw keyInFlightError();
       }
 
       // ── The cumulative refundable cap ─────────────────────────────────────
@@ -1062,13 +1453,13 @@ export function makeStripeStub(): StripeStub {
         args: { rawBody, signature },
         idempotencyKey: null,
       });
-      if (nextEvent === undefined) {
+      if (nextEvents.length === 0) {
         throw new Error(
           'stub: constructWebhookEvent called with no event queued — call setNextEvent first',
         );
       }
-      const queued = nextEvent;
-      nextEvent = undefined; // reset so a stale event can't bleed across requests
+      const queued = nextEvents.shift(); // consumed, so a stale event can't bleed across requests
+      if (queued === undefined) throw new Error('stub: unreachable, the queue was not empty');
       if (queued === null) {
         // Mirror the real impl's failure shape — ApiError(bad_request)
         // bubbles through the route's existing ApiError→HTTP mapper as 400.

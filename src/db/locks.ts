@@ -1,8 +1,62 @@
-import { eq, sql } from 'drizzle-orm';
-import { bookingMode, cohorts, events, type LocationKey } from './schema/schema.js';
+import { eq, sql, type SQL } from 'drizzle-orm';
+import { bookingMode, charges, cohorts, events, type LocationKey } from './schema/schema.js';
 import type { Tx } from './tx.js';
 
 type BookingMode = (typeof bookingMode.enumValues)[number];
+
+/**
+ * **THE ONE GLOBAL LOCK ORDER** (design §2.7:3975, written once, here):
+ *
+ *   request-key claim
+ *     → `(campus, date)` capacity locks, every date ascending (or the run lock)
+ *       → charge (the order's)
+ *         → the invoice the charge settles
+ *           → bookings, in id order
+ *             → pool `(owner, location, mode, tier)`, the credit-lot slot
+ *               → refunds
+ *
+ * Take each family once for the whole order. A transaction that needs a later lock
+ * and then finds it needs an earlier one has a deadlock waiting for it, so anything
+ * reaching for two of these reads this list first. What P15 uses is claim → charge →
+ * bookings: a pending row cancels through {@link lockCharge} before it locks any row,
+ * which is what stops two cancels of one order from crossing, and the same order holds
+ * on the settle, the webhook, the sweeper and *Cancel order*.
+ *
+ * tx1 of an invoice payment locks the invoice with no charge lock held and takes no
+ * existing charge's lock after it (its in-flight check is a plain read, and the charge
+ * it writes is new), so it cannot cross a settle, which holds the charge and then
+ * updates the invoice. Its lock is `FOR NO KEY UPDATE`, never `FOR UPDATE`: the insert
+ * of `orders.invoice_id` earlier in tx1 already took `FOR KEY SHARE` on that row, so two
+ * tenders each holding that share and asking `FOR UPDATE` deadlock.
+ *
+ * Not on this list yet, because no path takes it alongside a charge: `withDogLocks`,
+ * which the booking core takes before capacity. M4.10 deletes the `(dog, mode,
+ * location)` slot and puts the pool where this list says.
+ */
+
+/**
+ * The instant a lease is judged or written at: Postgres's `now()`, so every replica
+ * reads one clock (design §2.7:3860), unless a test injected one. `now()` in a
+ * transaction is that transaction's start, so a lease begun after a lock wait is short
+ * by that wait, which is the safe direction.
+ */
+export function leaseInstant(at: Date | undefined): SQL {
+  return at === undefined ? sql`now()` : sql`${at.toISOString()}::timestamptz`;
+}
+
+/**
+ * Row-lock an engine charge for the duration of the transaction: the settle's
+ * serialisation point, and the first row lock any order-wide write takes. Returns the
+ * whole row, because everything that takes this lock acts on what it reads under it.
+ * `undefined` if the id doesn't exist; the caller decides what that means.
+ */
+export async function lockCharge(
+  tx: Tx,
+  chargeId: string,
+): Promise<typeof charges.$inferSelect | undefined> {
+  const [row] = await tx.select().from(charges).where(eq(charges.id, chargeId)).for('update');
+  return row;
+}
 
 /**
  * Per-(category, location) transaction-scoped advisory lock — the

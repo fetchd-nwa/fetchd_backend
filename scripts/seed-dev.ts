@@ -27,7 +27,7 @@
  *
  * Re-runnable: wipes the managed tables in child→parent FK order, then inserts.
  */
-import { and, inArray, like, not } from 'drizzle-orm';
+import { and, inArray, isNotNull, like, not } from 'drizzle-orm';
 
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
@@ -48,11 +48,13 @@ import {
   eventRsvps,
   events,
   groupClasses,
+  idempotencyKeys,
   invoices,
   memberships,
   messages,
   notificationDogs,
   notifications,
+  orders,
   owners,
   paymentMethods,
   pendingRequestDogs,
@@ -152,6 +154,15 @@ async function wipe(): Promise<void> {
   await db.delete(pendingRequestPreferredDates);
   await db.delete(pendingRequestDogs);
   await db.delete(pendingRequests);
+  // `orders` is a cycle (M3.02): orders.invoice_id → invoices, and charges, invoices,
+  // bookings and idempotency_keys each carry order_id → orders, while orders.owner_id
+  // holds the owner. One invoice paid in the app leaves all of it, so break the cycle
+  // from the far side and drop the orders before any of those tables goes.
+  await db.update(charges).set({ orderId: null }).where(isNotNull(charges.orderId));
+  await db.update(invoices).set({ orderId: null }).where(isNotNull(invoices.orderId));
+  await db.update(bookings).set({ orderId: null }).where(isNotNull(bookings.orderId));
+  await db.update(idempotencyKeys).set({ orderId: null }).where(isNotNull(idempotencyKeys.orderId));
+  await db.delete(orders);
   // refunds → invoices → creditLedger all reference charges; delete them before
   // charges, and charges before bookings (charges.booking_id) + paymentMethods
   // (invoices.payment_method_id).

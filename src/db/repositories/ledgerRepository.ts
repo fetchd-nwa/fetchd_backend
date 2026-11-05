@@ -77,6 +77,11 @@ export interface LedgerEntryRow {
    * been on this surface.
    */
   groupClassName: string | null;
+  /**
+   * The order a charge-sourced entry's charge belongs to (M3.02). NULL on an open
+   * invoice and on a charge from before the engine.
+   */
+  orderId: string | null;
 }
 
 // A charge is a ledger line only when it represents a completed money event.
@@ -150,6 +155,7 @@ export const ledgerRepository = {
         invoicePaidAt: invoices.paidAt,
         cardBrand: paymentMethods.brand,
         cardLast4: paymentMethods.last4,
+        orderId: charges.orderId,
       })
       .from(charges)
       // **Booking-lane rows only, and the exclusion is deliberate** (ADDENDUM 3
@@ -215,6 +221,7 @@ export const ledgerRepository = {
         // Precise settle time: the invoice's paid_at when linked, else the
         // charge's own created_at.
         settledAt: isPaid ? (row.invoicePaidAt ?? row.date) : null,
+        orderId: row.orderId,
       };
     });
 
@@ -273,6 +280,7 @@ export const ledgerRepository = {
         settledMethod: null,
         settledCard: null,
         settledAt: null,
+        orderId: null,
       };
     });
 

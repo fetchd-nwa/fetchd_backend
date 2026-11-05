@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, test } from 'node:test';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import { bookingDogs, scheduledNotifications } from '../../src/db/schema/schema.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { FIXTURE_NOW } from './_fixture.js';
@@ -57,11 +58,11 @@ async function book(
     headers: { 'idempotency-key': `arrive-${randomUUID()}` },
     payload: { category: 'day-school', lead_dog_id: dogId, dates: [date], location, ...extra },
   });
-  const parsed: unknown = JSON.parse(res.body);
+  const parsed = JSON.parse(res.body) as Partial<PostBookingsResponse>;
   return {
     statusCode: res.statusCode,
     body: res.body,
-    bookings: Array.isArray(parsed) ? (parsed as BookingBody[]) : [],
+    bookings: (parsed.sessions ?? []) as BookingBody[],
   };
 }
 

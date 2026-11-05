@@ -1,10 +1,24 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, lt, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 import type { ChargeStatus } from '../../contracts/wire.js';
 import {
   chargeBelongsToEnrollment,
   type EnrollmentIdentity,
 } from '../../lib/enrollmentIdentity.js';
 import { db } from '../client.js';
+import { leaseInstant } from '../locks.js';
 import { charges } from '../schema/schema.js';
 import { refundsRepository } from './refundsRepository.js';
 import type { Tx } from '../tx.js';
@@ -70,14 +84,16 @@ function narrowPendingCapture(row: {
 
 function pendingGroupClassCaptureWhere(args: { olderThan: Date; mintedAfter: Date }) {
   return and(
-    // R9: enrollment-purpose rows only. This CANNOT by itself exclude the
-    // invoice lane — `POST /invoices/:id/pay` writes `'group-class'` rows with
-    // the same cohort/dog stamps and there is no `invoice_id` on `charges` to
-    // discriminate on — so the retrieve is still the authority for what gets
-    // acted on, and the abandon window below is what stops a foreign row from
+    // R9: enrollment-purpose rows only. `POST /invoices/:id/pay` writes
+    // `'group-class'` rows with the same cohort/dog stamps, and since P15 it writes
+    // them on the order engine, whose charges carry `order_id` and are the engine's
+    // to settle (DECISIONS 142(f)), so they are excluded here. Rows from before the
+    // engine cannot be told apart, so the retrieve is still the authority for what
+    // gets acted on, and the abandon window below is what stops a foreign row from
     // occupying the worklist forever.
     eq(charges.purpose, 'group-class'),
     eq(charges.status, 'requires_payment'),
+    isNull(charges.orderId),
     isNotNull(charges.stripePaymentIntentId),
     isNotNull(charges.cohortId),
     isNotNull(charges.dogId),
@@ -148,6 +164,44 @@ const CHARGE_MEMBERSHIP_PROJECTION = {
   ...CHARGE_PROJECTION,
   createdAtUs: sql<string>`((EXTRACT(EPOCH FROM ${charges.createdAt})::numeric * 1000000)::bigint)::text`,
 } as const;
+
+/**
+ * One row of the order engine's `charges` (M3.02): the whole row, because every
+ * engine write reads it under {@link lockCharge} and acts on what it finds. The
+ * engine's columns are `order_id`, K0, the attempt count, the lease, the stored
+ * outcome and the frozen create parameters. `order_id` set is what makes a charge
+ * the engine's (DECISIONS 142(f)).
+ */
+export type EngineChargeRow = typeof charges.$inferSelect;
+
+/** A budget's milliseconds as a Postgres interval. */
+function spanOf(ms: number): SQL {
+  return sql`make_interval(secs => ${ms}::double precision / 1000)`;
+}
+
+/** The fence on every write that continues an attempt. */
+function inLiveLease(id: string, at: Date | undefined): SQL | undefined {
+  return and(
+    eq(charges.id, id),
+    eq(charges.status, 'requires_payment'),
+    sql`${charges.attemptingUntil} > ${leaseInstant(at)}`,
+    isNull(charges.nextSweepAt),
+  );
+}
+
+/** Past its lease, and no claim of the sweeper's still running on it. */
+function pastLeaseAndDue(at: Date | undefined): SQL | undefined {
+  const now = leaseInstant(at);
+  return and(
+    eq(charges.status, 'requires_payment'),
+    sql`${charges.attemptingUntil} <= ${now}`,
+    or(isNull(charges.nextSweepAt), sql`${charges.nextSweepAt} <= ${now}`),
+  );
+}
+
+function watchDue(at: Date | undefined): SQL | undefined {
+  return and(eq(charges.status, 'failed'), sql`${charges.nextSweepAt} <= ${leaseInstant(at)}`);
+}
 
 export const chargesRepository = {
   /**
@@ -513,12 +567,15 @@ export const chargesRepository = {
   async findAllPendingCaptureForCohortDog(
     tx: Tx,
     args: { cohortId: string; dogId: string; enrollment: EnrollmentIdentity | undefined },
-  ): Promise<{ id: string; amountCents: number; stripePaymentIntentId: string }[]> {
+  ): Promise<
+    { id: string; amountCents: number; stripePaymentIntentId: string; orderId: string | null }[]
+  > {
     const candidates = await tx
       .select({
         id: charges.id,
         amountCents: charges.amountCents,
         stripePaymentIntentId: charges.stripePaymentIntentId,
+        orderId: charges.orderId,
         bookingId: charges.bookingId,
         createdAtUs: sql<string>`((EXTRACT(EPOCH FROM ${charges.createdAt})::numeric * 1000000)::bigint)::text`,
       })
@@ -540,6 +597,7 @@ export const chargesRepository = {
         amountCents: row.amountCents,
         // Narrowed by the IS NOT NULL predicate above.
         stripePaymentIntentId: row.stripePaymentIntentId as string,
+        orderId: row.orderId,
       }));
   },
 
@@ -552,7 +610,10 @@ export const chargesRepository = {
   async findPendingCaptureForCohortDog(
     tx: Tx,
     args: { cohortId: string; dogId: string; enrollment: EnrollmentIdentity | undefined },
-  ): Promise<{ id: string; amountCents: number; stripePaymentIntentId: string } | undefined> {
+  ): Promise<
+    | { id: string; amountCents: number; stripePaymentIntentId: string; orderId: string | null }
+    | undefined
+  > {
     const [newest] = await this.findAllPendingCaptureForCohortDog(tx, args);
     return newest;
   },
@@ -630,14 +691,15 @@ export const chargesRepository = {
    * or the flip itself failed after Stripe took the money. All three are
    * money-visible and none of them resolve themselves.
    *
-   * **This query cannot tell an enrollment hold from an invoice-lane
-   * `'requires_payment'` row, and does not try.** `POST /invoices/:id/pay`
-   * writes a non-succeeded charge for a group-class invoice with the same
-   * purpose and the same cohort/dog stamps, on an AUTOMATIC-capture intent
-   * that was then cancelled. The discriminator is the PaymentIntent's live
-   * status, which only Stripe can answer, so the reconciler RETRIEVES before
-   * it acts and captures nothing that is not `requires_capture`. A cheap query
-   * plus an authoritative check beats a clever query and a guess.
+   * **This query cannot tell an enrollment hold from a pre-engine invoice-lane
+   * `'requires_payment'` row, and does not try.** `POST /invoices/:id/pay` wrote a
+   * non-succeeded charge for a group-class invoice with the same purpose and the
+   * same cohort/dog stamps, on an AUTOMATIC-capture intent that was then cancelled.
+   * The discriminator is the PaymentIntent's live status, which only Stripe can
+   * answer, so the reconciler RETRIEVES before it acts and captures nothing that is
+   * not `requires_capture`. A cheap query plus an authoritative check beats a clever
+   * query and a guess. The route's rows since P15 carry `order_id` and are excluded:
+   * the order engine settles its own charges.
    *
    * `olderThan` is compared against `created_at`, not `updated_at`: a touch
    * trigger moves `updated_at` on any write to the row, which would let an
@@ -709,6 +771,7 @@ export const chargesRepository = {
     const where = and(
       eq(charges.purpose, 'group-class'),
       eq(charges.status, 'requires_payment'),
+      isNull(charges.orderId),
       isNotNull(charges.stripePaymentIntentId),
       isNotNull(charges.cohortId),
       isNotNull(charges.dogId),
@@ -775,5 +838,259 @@ export const chargesRepository = {
       .limit(1)
       .for('update');
     return row;
+  },
+
+  // -------------------------------------------------------------------
+  // The order engine (P15, `lib/confirmCharge.ts`). Two columns, two owners:
+  // `attempting_until` is the request's and `next_sweep_at` the sweeper's. Every write
+  // that continues an attempt is conditional on `status = 'requires_payment'`, on the
+  // lease and on no claim of the sweeper's, and is committed on its own, because the
+  // Stripe call it guards runs with no tx open. Leases are judged and written on
+  // Postgres's `now()` unless a test injected `at` ({@link leaseInstant}).
+  // -------------------------------------------------------------------
+
+  /** tx1's one charge: `requires_payment`, K0, the frozen parameters, the lease. */
+  async createForOrder(
+    tx: Tx,
+    args: {
+      ownerId: string;
+      orderId: string;
+      amountCents: number;
+      purpose: ChargePurpose;
+      bookingId: string | null;
+      cohortId: string | null;
+      dogId: string | null;
+      stripeIdempotencyKey: string;
+      stripeCustomerId: string;
+      stripePaymentMethodId: string;
+      paymentMethodId: string;
+      at?: Date;
+      leaseMs: number;
+    },
+  ): Promise<EngineChargeRow> {
+    const [row] = await tx
+      .insert(charges)
+      .values({
+        ownerId: args.ownerId,
+        orderId: args.orderId,
+        amountCents: args.amountCents,
+        currency: 'usd',
+        status: 'requires_payment',
+        purpose: args.purpose,
+        bookingId: args.bookingId,
+        cohortId: args.cohortId,
+        dogId: args.dogId,
+        stripeIdempotencyKey: args.stripeIdempotencyKey,
+        stripeCustomerId: args.stripeCustomerId,
+        stripePaymentMethodId: args.stripePaymentMethodId,
+        paymentMethodId: args.paymentMethodId,
+        attemptingUntil: sql`${leaseInstant(args.at)} + ${spanOf(args.leaseMs)}`,
+      })
+      .returning();
+    if (!row) throw new Error('chargesRepository.createForOrder: INSERT returned no row');
+    return row;
+  },
+
+  async findEngineById(runner: Tx | typeof db, id: string): Promise<EngineChargeRow | undefined> {
+    const [row] = await runner.select().from(charges).where(eq(charges.id, id)).limit(1);
+    return row;
+  },
+
+  async findEngineByPaymentIntentId(
+    runner: Tx | typeof db,
+    stripePaymentIntentId: string,
+  ): Promise<EngineChargeRow | undefined> {
+    const [row] = await runner
+      .select()
+      .from(charges)
+      .where(eq(charges.stripePaymentIntentId, stripePaymentIntentId))
+      .limit(1);
+    return row;
+  },
+
+  /** An order's one charge; `undefined` is a credits-only order. */
+  async findEngineByOrderId(
+    runner: Tx | typeof db,
+    orderId: string,
+  ): Promise<EngineChargeRow | undefined> {
+    const [row] = await runner.select().from(charges).where(eq(charges.orderId, orderId)).limit(1);
+    return row;
+  },
+
+  /**
+   * The conditional lease renewal before every Stripe call (design §2.7:3859-3862).
+   * `false` means the lease is gone, the sweeper claimed the row, or the charge moved:
+   * stop, the sweeper owns the order. The claim's fence is as needed as the lease: a
+   * renewal that started in time and blocked on the row must fail its re-check once
+   * the claim commits. `countAttempt` commits `attempt_count` in the same write, before
+   * the call.
+   */
+  async renewLease(
+    runner: Tx | typeof db,
+    args: { id: string; at?: Date; leaseMs: number; countAttempt: boolean },
+  ): Promise<boolean> {
+    const rows = await runner
+      .update(charges)
+      .set({
+        attemptingUntil: sql`${leaseInstant(args.at)} + ${spanOf(args.leaseMs)}`,
+        ...(args.countAttempt ? { attemptCount: sql`${charges.attemptCount} + 1` } : {}),
+      })
+      .where(inLiveLease(args.id, args.at))
+      .returning({ id: charges.id });
+    return rows.length > 0;
+  },
+
+  /**
+   * Commit the intent's id, in one short conditional write. Only a charge still
+   * inside its lease and unclaimed takes it: a request that outlived its lease stores
+   * nothing and never confirms, so a charge with no stored id stays a charge no card
+   * was tried on, and the row the sweeper's claim returned cannot go stale.
+   */
+  async storeIntentId(
+    runner: Tx | typeof db,
+    args: { id: string; intentId: string; at?: Date },
+  ): Promise<boolean> {
+    const rows = await runner
+      .update(charges)
+      .set({ stripePaymentIntentId: args.intentId })
+      .where(inLiveLease(args.id, args.at))
+      .returning({ id: charges.id });
+    return rows.length > 0;
+  },
+
+  /** A late success on a charge abandoned with no id: the arm takes it from the event. */
+  async storeLateIntentId(tx: Tx, args: { id: string; intentId: string }): Promise<void> {
+    await tx
+      .update(charges)
+      .set({ stripePaymentIntentId: args.intentId })
+      .where(eq(charges.id, args.id));
+  },
+
+  /** The settle's flip. The caller holds the charge lock and read the status under it. */
+  async markEngineSucceeded(tx: Tx, args: { id: string; intentId: string }): Promise<void> {
+    await tx
+      .update(charges)
+      .set({
+        status: 'succeeded',
+        stripePaymentIntentId: args.intentId,
+        blocker: null,
+        attemptingUntil: null,
+        nextSweepAt: null,
+      })
+      .where(eq(charges.id, args.id));
+  },
+
+  /**
+   * The stored outcome of a failure. The caller holds the charge lock. `nextSweepAt`
+   * opens the watch: a first-look time, which fences nothing, so a process clock is
+   * fine here. NULL means nothing can still move.
+   */
+  async markEngineFailed(
+    tx: Tx,
+    args: {
+      id: string;
+      blocker: string | null;
+      lastError: string | null;
+      nextSweepAt: Date | null;
+    },
+  ): Promise<void> {
+    await tx
+      .update(charges)
+      .set({
+        status: 'failed',
+        blocker: args.blocker,
+        lastStripeError: args.lastError,
+        attemptingUntil: null,
+        nextSweepAt: args.nextSweepAt?.toISOString() ?? null,
+      })
+      .where(eq(charges.id, args.id));
+  },
+
+  /** A `succeeded` row claims no lease and is on no watch. The caller holds the lock. */
+  async clearEngineClaims(tx: Tx, args: { id: string }): Promise<void> {
+    await tx
+      .update(charges)
+      .set({ attemptingUntil: null, nextSweepAt: null })
+      .where(eq(charges.id, args.id));
+  },
+
+  /** `payment_failed` is advisory: this and nothing else. */
+  async writeLastStripeError(tx: Tx, args: { id: string; lastError: string }): Promise<void> {
+    await tx
+      .update(charges)
+      .set({ lastStripeError: args.lastError })
+      .where(eq(charges.id, args.id));
+  },
+
+  /**
+   * The sweeper's first worklist: charges past their lease and due a look, longest-
+   * waiting first, so fresh rows cannot starve a re-look.
+   */
+  async findPastLease(
+    runner: Tx | typeof db,
+    args: { at?: Date; limit: number },
+  ): Promise<EngineChargeRow[]> {
+    return runner
+      .select()
+      .from(charges)
+      .where(and(isNotNull(charges.orderId), pastLeaseAndDue(args.at)))
+      .orderBy(sql`COALESCE(${charges.nextSweepAt}, ${charges.attemptingUntil})`)
+      .limit(args.limit);
+  },
+
+  /**
+   * The sweeper's claim, committed before any Stripe call: a second tick finds the
+   * row claimed and skips it, so overlapping ticks cannot share one. It writes
+   * `next_sweep_at` and never `attempting_until`, so a lease once lost stays lost and
+   * the request is fenced for good. The returned row is what the sweeper acts on: past
+   * this write its intent id cannot change. `undefined`: somebody else has it.
+   */
+  async claimPastLease(
+    runner: Tx | typeof db,
+    args: { id: string; at?: Date; sweepClaimMs: number },
+  ): Promise<EngineChargeRow | undefined> {
+    const [row] = await runner
+      .update(charges)
+      .set({ nextSweepAt: sql`${leaseInstant(args.at)} + ${spanOf(args.sweepClaimMs)}` })
+      .where(and(eq(charges.id, args.id), pastLeaseAndDue(args.at)))
+      .returning();
+    return row;
+  },
+
+  /** The sweeper's second worklist: `failed` charges whose watch is due a look. */
+  async findWatched(
+    runner: Tx | typeof db,
+    args: { at?: Date; limit: number },
+  ): Promise<EngineChargeRow[]> {
+    return runner
+      .select()
+      .from(charges)
+      .where(watchDue(args.at))
+      .orderBy(asc(charges.nextSweepAt))
+      .limit(args.limit);
+  },
+
+  /**
+   * Claim a watched charge, committed before any Stripe call. Rewriting the column
+   * moves the row to the back of the worklist, so 25 stuck rows cannot starve a 26th.
+   */
+  async claimWatched(
+    runner: Tx | typeof db,
+    args: { id: string; at?: Date; sweepClaimMs: number },
+  ): Promise<EngineChargeRow | undefined> {
+    const [row] = await runner
+      .update(charges)
+      .set({ nextSweepAt: sql`${leaseInstant(args.at)} + ${spanOf(args.sweepClaimMs)}` })
+      .where(and(eq(charges.id, args.id), watchDue(args.at)))
+      .returning();
+    return row;
+  },
+
+  /** Nothing left to look at: Stripe has said something final. */
+  async closeWatch(runner: Tx | typeof db, args: { id: string }): Promise<void> {
+    await runner
+      .update(charges)
+      .set({ nextSweepAt: null })
+      .where(and(eq(charges.id, args.id), eq(charges.status, 'failed')));
   },
 };

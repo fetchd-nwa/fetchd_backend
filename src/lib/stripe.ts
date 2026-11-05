@@ -145,6 +145,12 @@ export interface StripePaymentIntentResult {
    */
   metadata?: Record<string, string>;
   /**
+   * Stripe's `amount_received` (P15): the money actually taken, which the order
+   * engine's settle asserts equal to `charges.amount_cents`. `undefined` on the
+   * thrown fork, whose attached intent moved no money.
+   */
+  amountReceivedCents?: number;
+  /**
    * `true` when Stripe answered this confirm from its idempotency record
    * (`idempotent-replayed: true` — the MEASURED header name, not the documented
    * `Idempotency-Replayed`; see {@link REPLAYED_HEADER_NAMES}), `false` when it
@@ -408,6 +414,13 @@ export type StripeWebhookEvent =
     }
   | {
       id: string;
+      type: 'payment_intent.canceled';
+      paymentIntentId: StripePaymentIntentId;
+      amountCents: number;
+      metadata: Record<string, string>;
+    }
+  | {
+      id: string;
       type: 'setup_intent.succeeded';
       setupIntentId: string;
       paymentMethodId: StripePaymentMethodId;
@@ -426,6 +439,53 @@ export type StripeWebhookEvent =
       type: 'unhandled';
       rawType: string;
     };
+
+/**
+ * How long one Stripe call of the order engine may take (design §2.7:3862-3866):
+ * `pay.seat_hold_max_minutes × 60 ÷ (pay.card_attempts_max_count + 1)` seconds, 30
+ * at the seeds. Passed on every call the engine makes (create, each confirm, each
+ * retrieve, a cancel), so the create and every confirm fit the hold.
+ */
+export interface StripeCallBudget {
+  timeoutMs: number;
+}
+
+/**
+ * The SDK's per-request options for one engine call. `maxNetworkRetries: 0` stops the
+ * SDK's retry loop spending the timeout budget two or three times over, on a path that
+ * counts its own attempts. **It does not stop every retry:** stripe-node still re-sends
+ * once, silently and under the same key, on ECONNRESET and EPIPE, whatever this says
+ * (`stripe@22.1.1`, run against a fake server). The same key makes that safe; it does
+ * mean one engine call can be two HTTP requests.
+ */
+export function engineRequestOptions(budget: StripeCallBudget): {
+  timeout: number;
+  maxNetworkRetries: 0;
+} {
+  return { timeout: budget.timeoutMs, maxNetworkRetries: 0 };
+}
+
+/**
+ * Did this call fail without an answer: a timeout, a dropped connection, a Stripe
+ * 5xx? The money may or may not have moved, so the engine reads the intent back
+ * before it decides anything (design §2.7:3866-3867). Read by error class, never by
+ * message, for the reason {@link normalizeThrownConfirmError} gives.
+ */
+export function isStripeNetworkFailure(err: unknown): boolean {
+  return (
+    err instanceof Stripe.errors.StripeConnectionError ||
+    err instanceof Stripe.errors.StripeAPIError
+  );
+}
+
+/**
+ * Stripe's own `code` on a thrown error, read by class for the reason
+ * {@link normalizeThrownConfirmError} gives. `lock_timeout` is a 429 while another
+ * request holds the object; `resource_missing` is a 404, Stripe's final word on an id.
+ */
+export function stripeErrorCode(err: unknown): string | undefined {
+  return err instanceof Stripe.errors.StripeError ? err.code : undefined;
+}
 
 export interface StripeClient {
   /**
@@ -525,6 +585,43 @@ export interface StripeClient {
   ): Promise<StripePaymentIntentResult>;
 
   /**
+   * Create a PaymentIntent WITHOUT confirming it: the order engine's step 2
+   * (design §2.7:3846-3853). Automatic capture, `confirm: false`, and the card
+   * named. **A create moves no money**: an intent no confirm reached cannot charge,
+   * which is what lets a crash or a timeout at this step cost nothing, and what
+   * makes "a charge with no stored intent id is a charge no card was tried on" true.
+   *
+   * The key is K0, order-scoped. A re-send under it repeats these frozen parameters
+   * byte for byte and returns the same intent, marked `replayed`. Nothing here
+   * normalizes a card error: `confirm: false` has no card outcome to report.
+   */
+  createUnconfirmedPaymentIntent(
+    args: {
+      customerId: StripeCustomerId;
+      paymentMethodId: StripePaymentMethodId;
+      amountCents: number;
+      currency: string;
+      metadata: Record<string, string>;
+    },
+    idempotencyKey: string,
+    budget: StripeCallBudget,
+  ): Promise<StripePaymentIntentResult>;
+
+  /**
+   * Confirm an intent {@link createUnconfirmedPaymentIntent} made, off-session, with
+   * the card named again. Each try carries its own key. Same contract as
+   * {@link createAndConfirmPaymentIntent}: a card-level failure RETURNS a
+   * non-succeeded result, with `failureCode` naming it, and only a failure to find
+   * out THROWS.
+   */
+  confirmPaymentIntent(
+    paymentIntentId: StripePaymentIntentId,
+    args: { paymentMethodId: StripePaymentMethodId },
+    idempotencyKey: string,
+    budget: StripeCallBudget,
+  ): Promise<StripePaymentIntentResult>;
+
+  /**
    * Capture a PaymentIntent that is resting at `requires_capture` — the second
    * half of an authorize → capture pair, and the ONLY verb in this system that
    * moves money which was merely held (2026-08-20).
@@ -566,12 +663,15 @@ export interface StripeClient {
    * Cancel a PaymentIntent that didn't settle on an off-session confirm
    * (returned `requires_action` / `processing` / `requires_payment_method`
    * rather than `succeeded`), so it can't later auto-succeed and double-charge
-   * against the next attempt's fresh PI. Every off-session confirm path owes
-   * this call while no client-side 3DS completion flow exists — the auto-charge
-   * worker, `POST /invoices/:id/pay`, `POST /credit-packages/:key/purchase`,
+   * against the next attempt's fresh PI. Every off-session confirm path off the
+   * order engine owes this call while no client-side 3DS completion flow exists —
+   * the auto-charge worker, `POST /credit-packages/:key/purchase`,
    * `POST /memberships`, and `POST /enrollments`. Best-effort: every
    * caller swallows failures — a PI Stripe refuses to cancel (already settling)
    * is covered by the key-scoped Stripe idempotency on the next attempt.
+   *
+   * **The engine's use is the opposite one:** *Cancel order* reads its throw as
+   * evidence of who won (`lib/cancelOrder.ts`), and it carries the budget.
    *
    * **Second job since 2026-08-20: releasing an AUTHORIZATION.** On the
    * manual-capture enrollment path this is what a failure path calls instead of
@@ -582,7 +682,10 @@ export interface StripeClient {
    * this and never `createRefund` (money-safety §1.2 ownership invariant:
    * `refunds` rows stay exclusive to the withdraw arm).
    */
-  cancelPaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<void>;
+  cancelPaymentIntent(
+    paymentIntentId: StripePaymentIntentId,
+    budget?: StripeCallBudget,
+  ): Promise<void>;
 
   /**
    * Read a PaymentIntent's CURRENT state — the verify lane's way of resolving
@@ -596,7 +699,10 @@ export interface StripeClient {
    * retrieved intent exactly as it reads a confirmed one, and its "the argument
    * can only have come from the seam" invariant still holds.
    */
-  retrievePaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<StripePaymentIntentResult>;
+  retrievePaymentIntent(
+    paymentIntentId: StripePaymentIntentId,
+    budget?: StripeCallBudget,
+  ): Promise<StripePaymentIntentResult>;
 
   /**
    * Refund a portion (or all) of a prior PaymentIntent. Used by POST
@@ -780,6 +886,8 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
   // {@link StripePaymentIntentResult.createdAt}. Unix SECONDS at Stripe.
   const created = intentCreatedAt(intent.created);
   const metadata = intentMetadata(intent.metadata);
+  const received: unknown = intent.amount_received;
+  const receivedCents = typeof received === 'number' ? received : undefined;
   if (isPaymentIntentStatus(intent.status)) {
     return {
       id: intent.id,
@@ -788,6 +896,7 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
       amountCents: intent.amount,
       ...(created !== undefined ? { createdAt: created } : {}),
       ...(metadata !== undefined ? { metadata } : {}),
+      ...(receivedCents !== undefined ? { amountReceivedCents: receivedCents } : {}),
     };
   }
   return {
@@ -798,6 +907,7 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
     unknownStatus: String(intent.status),
     ...(created !== undefined ? { createdAt: created } : {}),
     ...(metadata !== undefined ? { metadata } : {}),
+    ...(receivedCents !== undefined ? { amountReceivedCents: receivedCents } : {}),
   };
 }
 
@@ -929,17 +1039,20 @@ export function normalizeRetrievedIntent(intent: Stripe.PaymentIntent): StripePa
  * idempotency error with an unreadable status code reads as `params-mismatch`:
  * of the two, that is the arm that touches no money.
  *
- * Neither condition has been observed live by this project — UNVERIFIED,
- * stub-modelled, documented.
+ * **The two arrive as different classes** (`stripe@22.1.1`, run against a fake server
+ * speaking Stripe's documented bodies): a 400 is `StripeIdempotencyError`, but a 409 is
+ * `StripeAPIError` with `rawType: 'idempotency_error'` and `code:
+ * 'idempotency_key_in_use'`, because the SDK picks the class from the status first. So
+ * a key in flight also reads true to {@link isStripeNetworkFailure}, and any caller
+ * that asks both must ask this one first. Neither has been observed live.
  */
 export type StripeIdempotencyErrorKind = 'params-mismatch' | 'concurrent-request';
 
 export function stripeIdempotencyErrorKind(err: unknown): StripeIdempotencyErrorKind | undefined {
-  // Three checks, not one: `StripeIdempotencyError` is the class stripe-node
-  // generates for a raw `type: 'idempotency_error'`; `rawType` is that same raw
-  // type on a base error; and the `code` check catches the condition arriving
-  // as a plain invalid-request error (the shape `stripe.ts`'s own doc at the
-  // thrown-fork normalizer describes).
+  // Three checks, not one: `StripeIdempotencyError` is the 400's class; `rawType` is
+  // what the 409 carries, on a `StripeAPIError`; and the `code` check catches the
+  // condition arriving as a plain invalid-request error (the shape `stripe.ts`'s own
+  // doc at the thrown-fork normalizer describes).
   if (!(err instanceof Stripe.errors.StripeError)) return undefined;
   const isIdempotency =
     err instanceof Stripe.errors.StripeIdempotencyError ||
@@ -1118,16 +1231,64 @@ export const defaultStripeClient: StripeClient = {
     };
   },
 
+  async createUnconfirmedPaymentIntent(args, idempotencyKey, budget) {
+    const intent = await stripeSingleton.paymentIntents.create(
+      {
+        amount: args.amountCents,
+        currency: args.currency,
+        customer: args.customerId,
+        payment_method: args.paymentMethodId,
+        capture_method: 'automatic',
+        confirm: false,
+        metadata: args.metadata,
+      },
+      { idempotencyKey, ...engineRequestOptions(budget) },
+    );
+    const replayed = replayedFromResponse(intent);
+    return {
+      ...normalizeReturnedConfirm(intent),
+      ...(replayed !== undefined ? { replayed } : {}),
+    };
+  },
+
+  async confirmPaymentIntent(paymentIntentId, args, idempotencyKey, budget) {
+    let intent: Stripe.PaymentIntent;
+    try {
+      intent = await stripeSingleton.paymentIntents.confirm(
+        paymentIntentId,
+        { payment_method: args.paymentMethodId, off_session: true },
+        { idempotencyKey, ...engineRequestOptions(budget) },
+      );
+    } catch (err) {
+      // The same seam as `createAndConfirmPaymentIntent`: a thrown card error is a
+      // payment OUTCOME, and everything else rethrows untouched.
+      return normalizeThrownConfirmError(err);
+    }
+    const replayed = replayedFromResponse(intent);
+    return {
+      ...normalizeReturnedConfirm(intent),
+      ...(replayed !== undefined ? { replayed } : {}),
+    };
+  },
+
   async detachPaymentMethod(paymentMethodId) {
     await stripeSingleton.paymentMethods.detach(paymentMethodId);
   },
 
-  async cancelPaymentIntent(paymentIntentId) {
-    await stripeSingleton.paymentIntents.cancel(paymentIntentId);
+  async cancelPaymentIntent(paymentIntentId, budget) {
+    await stripeSingleton.paymentIntents.cancel(
+      paymentIntentId,
+      {},
+      budget !== undefined ? engineRequestOptions(budget) : {},
+    );
   },
 
-  async retrievePaymentIntent(paymentIntentId) {
-    const intent = await stripeSingleton.paymentIntents.retrieve(paymentIntentId);
+  async retrievePaymentIntent(paymentIntentId, budget) {
+    const intent = await stripeSingleton.paymentIntents.retrieve(
+      paymentIntentId,
+      {},
+      budget !== undefined ? engineRequestOptions(budget) : {},
+    );
     return normalizeRetrievedIntent(intent);
   },
 
@@ -1234,6 +1395,16 @@ export function projectStripeEvent(event: Stripe.Event): StripeWebhookEvent {
       return {
         id: event.id,
         type: 'payment_intent.payment_failed',
+        paymentIntentId: pi.id,
+        amountCents: pi.amount,
+        metadata: pi.metadata ?? {},
+      };
+    }
+    case 'payment_intent.canceled': {
+      const pi = event.data.object as Stripe.PaymentIntent;
+      return {
+        id: event.id,
+        type: 'payment_intent.canceled',
         paymentIntentId: pi.id,
         amountCents: pi.amount,
         metadata: pi.metadata ?? {},

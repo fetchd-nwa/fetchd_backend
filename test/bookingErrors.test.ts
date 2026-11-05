@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { describe, test } from 'node:test';
 import {
   agreementUnsignedError,
+  alreadyBookedError,
   beyondBookingHorizonError,
   capacityBelowBookedError,
   gateTriggerErrorToApiError,
@@ -230,4 +231,52 @@ test('gateTriggerErrorToApiError: non-Error object → undefined', () => {
   assert.equal(gateTriggerErrorToApiError(42), undefined);
   // Object without a `code` field doesn't match the pg-error shape.
   assert.equal(gateTriggerErrorToApiError({ message: 'something' }), undefined);
+});
+
+// ── P15 plan_added (P12 r1 Opus N7): the sentence counted conflicts and said days. ──
+
+describe('alreadyBookedError counts days, and says who', () => {
+  const day1 = '2026-06-01';
+  const day2 = '2026-06-02';
+  const sentence = (conflicts: { dog_id: string; date: string }[]): string =>
+    alreadyBookedError(conflicts.map((c) => ({ ...c, category: 'day-school' as const }))).message;
+
+  test('two dogs on one date is one day', () => {
+    assert.equal(
+      sentence([
+        { dog_id: 'a', date: day1 },
+        { dog_id: 'b', date: day1 },
+      ]),
+      `These dogs already have bookings on ${day1}.`,
+    );
+  });
+
+  test('one dog on two dates is two days', () => {
+    assert.equal(
+      sentence([
+        { dog_id: 'a', date: day1 },
+        { dog_id: 'a', date: day2 },
+      ]),
+      'This dog already has bookings on 2 of the requested days.',
+    );
+  });
+
+  test('two dogs on two dates is two days', () => {
+    assert.equal(
+      sentence([
+        { dog_id: 'a', date: day1 },
+        { dog_id: 'b', date: day1 },
+        { dog_id: 'a', date: day2 },
+        { dog_id: 'b', date: day2 },
+      ]),
+      'These dogs already have bookings on 2 of the requested days.',
+    );
+  });
+
+  test('one dog on one date reads as it always did', () => {
+    assert.equal(
+      sentence([{ dog_id: 'a', date: day1 }]),
+      `This dog already has a booking on ${day1}.`,
+    );
+  });
 });

@@ -35,10 +35,12 @@ import {
   bookings,
   charges,
   creditPackages,
+  idempotencyKeys,
   invoices,
   memberships,
   notificationDogs,
   notifications,
+  orders,
   reports,
 } from '../src/db/schema/schema.js';
 
@@ -620,10 +622,22 @@ async function clearPriorQaRows(): Promise<void> {
   );
   await db.delete(memberships).where(inArray(memberships.id, [QA.membershipEndedId]));
   await db.delete(reports).where(inArray(reports.id, [QA.reportWafflesId]));
-  // Invoices before charges (paid_charge_id FK), bookingDogs before bookings.
+  // A QA invoice someone paid in the app has orders pointing at it, and those orders are
+  // pointed at in turn (M3.02), so they go first or the delete below raises 23503.
+  const qaInvoiceIds = [QA.invoicePaidId, QA.invoiceInPersonId, QA.invoiceOverdueId];
+  const orderIds = (
+    await db.select({ id: orders.id }).from(orders).where(inArray(orders.invoiceId, qaInvoiceIds))
+  ).map((row) => row.id);
+  await db.update(charges).set({ orderId: null }).where(inArray(charges.orderId, orderIds));
+  await db.update(invoices).set({ orderId: null }).where(inArray(invoices.orderId, orderIds));
+  await db.update(bookings).set({ orderId: null }).where(inArray(bookings.orderId, orderIds));
   await db
-    .delete(invoices)
-    .where(inArray(invoices.id, [QA.invoicePaidId, QA.invoiceInPersonId, QA.invoiceOverdueId]));
+    .update(idempotencyKeys)
+    .set({ orderId: null })
+    .where(inArray(idempotencyKeys.orderId, orderIds));
+  await db.delete(orders).where(inArray(orders.id, orderIds));
+  // Invoices before charges (paid_charge_id FK), bookingDogs before bookings.
+  await db.delete(invoices).where(inArray(invoices.id, qaInvoiceIds));
   // Charges BY LINKAGE, not by the id list (Δ 2026-08-22, ADDENDUM 3 §A3.18 D7).
   // `charges.booking_id` has no ON DELETE, and since §A3.17 a group-class charge
   // is ANCHORED to a booking row — so deleting only `QA.chargePaidId` and then

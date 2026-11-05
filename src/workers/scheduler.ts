@@ -8,7 +8,7 @@ import {
 } from '../db/repositories/scheduledNotificationsRepository.js';
 import { shouldSkipPush } from '../lib/pushPreferences.js';
 import type { NotificationPushData } from '../contracts/wire.js';
-import { sweepExpiredIdempotencyKeys } from '../db/idempotency.js';
+import { IDEMPOTENCY_OPEN_CLAIM_MAX_DAYS, sweepExpiredIdempotencyKeys } from '../db/idempotency.js';
 import {
   enqueueAlumniAttendanceFlags,
   type AlumniAttendanceScanResult,
@@ -31,11 +31,8 @@ import {
   type ExpoPushTicket,
 } from '../lib/expoPush.js';
 import type { R2Client } from '../lib/r2.js';
-import type { StripeClient } from '../lib/stripe.js';
-import {
-  runCaptureReconcilerOnce,
-  type CaptureReconcilerTickResult,
-} from './captureReconciler.js';
+import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
+import { runCaptureReconcilerOnce, type CaptureReconcilerTickResult } from './captureReconciler.js';
 import { runInvoiceAutoChargeOnce, type InvoiceAutoChargeTickResult } from './invoiceAutoCharge.js';
 import {
   runInvoiceAttemptVerifyOnce,
@@ -45,6 +42,7 @@ import {
   runDuplicateRefundRetryOnce,
   type DuplicateRefundRetryTickResult,
 } from './duplicateRefundRetry.js';
+import { runOrderSweeperOnce, type OrderSweeperTickResult } from './orderSweeper.js';
 import { runMediaDerivativesOnce, type MediaDerivativesTickResult } from './mediaDerivatives.js';
 
 interface WorkerLogger {
@@ -91,6 +89,11 @@ interface WorkerLogger {
  *      charged. Before the charge pass for the same reason as its neighbours:
  *      resolve what is already in flight before starting anything new.
  *
+ *   3a-quater. **Order sweeper** (P15, design §2.7:3953-3974). Take every order
+ *      charge past its lease and settle it forward, or abandon it if no intent id
+ *      was stored. It never tries a card. Before the charge pass for the same
+ *      reason as its neighbours.
+ *
  *   3a-bis. **Duplicate-refund retry** (2026-08-12). Re-fire lost-race refund
  *      rows still `pending` with no `stripe_refund_id`, under the SAME
  *      idempotency key the first attempt used. Before the charge pass for the
@@ -122,9 +125,11 @@ interface WorkerLogger {
  *   8. **Expiring default cards.** Enqueue `card-expiring` before the
  *      card that backs every auto-charge lapses, and once after.
  *
- *   9. **`idempotency_keys` TTL sweep.** Prune rows older than the
- *      retry-safety window (24h default) per schema.sql lines ~918-920.
- *      One Postgres DELETE; runs on the pool runner outside any tx.
+ *   9. **`idempotency_keys` TTL sweep.** Prune completed rows past the
+ *      retry-safety window (24h) and open ones past 7 days: an open claim may
+ *      be the only record of an order still processing, so it must outlive the
+ *      window a completed one gets. One Postgres DELETE; runs on the pool runner
+ *      outside any tx.
  *
  * Failures are logged-and-swallowed at each phase boundary — every phase since
  * 2026-09-03 (phase 1 was the lone exception, and that hole was the
@@ -228,6 +233,7 @@ export interface SchedulerTickResult {
   cardExpiry: EnqueueCardExpiryWarningsResult;
   invoiceAttemptVerify: InvoiceAttemptVerifyTickResult;
   captureReconciler: CaptureReconcilerTickResult;
+  orderSweeper: OrderSweeperTickResult;
   duplicateRefundRetry: DuplicateRefundRetryTickResult;
   invoiceAutoCharge: InvoiceAutoChargeTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
@@ -383,6 +389,35 @@ export async function runSchedulerTickOnce(
         err: err instanceof Error ? err.message : String(err),
       },
       'capture-reconciler phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 3a-quater — the order sweeper. Crash recovery, forward only, with its own
+  // log-and-swallow boundary like every sibling.
+  let orderSweeperResult: OrderSweeperTickResult = {
+    scanned: 0,
+    abandoned: 0,
+    settled: 0,
+    failed: 0,
+    lateRefunded: 0,
+    left: 0,
+  };
+  try {
+    // `opts.now`, not the resolved `now`: in production nothing is injected, and a lease
+    // is judged on Postgres's clock, never this process's.
+    orderSweeperResult = await runOrderSweeperOnce({
+      stripe: opts.stripe ?? defaultStripeClient,
+      now: opts.now,
+      log,
+    });
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'order-sweeper',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'order-sweeper phase threw at the worker boundary; will retry next tick',
     );
   }
 
@@ -551,9 +586,7 @@ export async function runSchedulerTickOnce(
   // card that backs every auto-charge lapses, and once more after it has.
   let cardExpiryResult: EnqueueCardExpiryWarningsResult = { scanned: 0, enqueued: 0 };
   try {
-    cardExpiryResult = await withActor(SCHEDULER_ACTOR, (tx) =>
-      enqueueCardExpiryWarnings(tx, now),
-    );
+    cardExpiryResult = await withActor(SCHEDULER_ACTOR, (tx) => enqueueCardExpiryWarnings(tx, now));
     log.info(
       {
         workerTick: 'scheduler',
@@ -575,9 +608,15 @@ export async function runSchedulerTickOnce(
   }
 
   const sweepCutoff = new Date(now.getTime() - IDEMPOTENCY_TTL_HOURS * 60 * 60 * 1000);
+  const openClaimCutoff = new Date(
+    now.getTime() - IDEMPOTENCY_OPEN_CLAIM_MAX_DAYS * 24 * 60 * 60 * 1000,
+  );
   let idempotencyKeysSwept = 0;
   try {
-    idempotencyKeysSwept = await sweepExpiredIdempotencyKeys({ olderThan: sweepCutoff });
+    idempotencyKeysSwept = await sweepExpiredIdempotencyKeys({
+      completedBefore: sweepCutoff,
+      openBefore: openClaimCutoff,
+    });
     log.info(
       {
         workerTick: 'scheduler',
@@ -598,6 +637,7 @@ export async function runSchedulerTickOnce(
     membershipRoll: membershipRollResult,
     invoiceAttemptVerify: invoiceAttemptVerifyResult,
     captureReconciler: captureReconcilerResult,
+    orderSweeper: orderSweeperResult,
     duplicateRefundRetry: duplicateRefundRetryResult,
     invoiceAutoCharge: invoiceResult,
     mediaDerivatives: mediaDerivativesResult,
@@ -814,7 +854,7 @@ async function runScheduledNotificationsTick(
         attempt.parked
           ? `scheduled notification PARKED after ${attempt.attempts} attempts — needs a human`
           : `scheduled notification delivery failed (attempt ${attempt.attempts} of ${MAX_DELIVERY_ATTEMPTS}); ` +
-            `row left pending for the next tick`,
+              `row left pending for the next tick`,
       );
     }
   });

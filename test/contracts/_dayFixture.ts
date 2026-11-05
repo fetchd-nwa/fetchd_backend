@@ -11,7 +11,7 @@ import {
   invoices,
   scheduledNotifications,
 } from '../../src/db/schema/schema.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS, topUpCredits } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS, topUpCredits } from './_fixture.js';
 
 /**
  * What P13's day-program test files share: a dog that passes every gate, a way to
@@ -69,7 +69,7 @@ export async function removeDogs(dogIds: string[]): Promise<void> {
     await db
       .delete(scheduledNotifications)
       .where(inArray(scheduledNotifications.bookingId, bookingIds));
-    await clearInvoiceChargeAttempts();
+    await clearInvoiceReferrers();
     await db.delete(invoices).where(inArray(invoices.bookingId, bookingIds));
     await db.delete(creditLedger).where(inArray(creditLedger.bookingId, bookingIds));
   }

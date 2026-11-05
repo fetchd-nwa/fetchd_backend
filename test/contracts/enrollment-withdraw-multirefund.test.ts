@@ -30,7 +30,7 @@ import type { EnrollmentWithdrawResultWire } from '../../src/contracts/wire.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRetry.js';
-import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -80,6 +80,7 @@ async function cleanup(cohortId: string): Promise<void> {
     .update(invoicesTable)
     .set({ paidChargeId: null })
     .where(eq(invoicesTable.cohortId, cohortId));
+  await clearInvoiceReferrers();
   await db.delete(chargesTable).where(eq(chargesTable.cohortId, cohortId));
   await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohortId));
 }
@@ -114,6 +115,11 @@ async function payAttemptProcessing(
   stripe: ReturnType<typeof makeStripeStub>,
   invoiceId: string,
 ): Promise<{ chargeId: string; paymentIntentId: string }> {
+  // Past any earlier attempt's lease: a second tender is what this test is about.
+  await db
+    .update(chargesTable)
+    .set({ attemptingUntil: '2000-01-01T00:00:00Z' })
+    .where(eq(chargesTable.ownerId, FIXTURE_IDS.ownerId));
   stripe.setNextIntentStatus('processing');
   const res = await app.inject({
     method: 'POST',

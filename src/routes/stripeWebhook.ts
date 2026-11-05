@@ -5,7 +5,11 @@ import { invalidatePattern } from '../lib/cache.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { stripeEventsRepository } from '../db/repositories/stripeEventsRepository.js';
 import { firePendingRefundPostCommit } from '../lib/pendingRefund.js';
-import { dispatchStripeEvent } from '../webhooks/stripeEventHandlers.js';
+import {
+  dispatchStripeEvent,
+  redispatchUnfinishedEvent,
+  type WebhookHandlerResult,
+} from '../webhooks/stripeEventHandlers.js';
 
 export interface StripeWebhookOpts {
   /** Stripe seam. Contract tests inject `_stripeStub.ts`. */
@@ -36,12 +40,19 @@ function firstHeader(value: string | string[] | undefined): string | undefined {
  *      Invalid → 400 (ApiError maps it). Stripe stops retrying on 4xx,
  *      so signature failure is permanent — exactly what we want.
  *   2. `stripeEventsRepository.claim(eventId, type)`. Insert-on-conflict
- *      makes this race-safe: duplicate delivery returns 'duplicate'
- *      without running the handler. 200 OK either way.
+ *      makes this race-safe. A duplicate of a finished event returns
+ *      'duplicate' without running anything. A duplicate of an UNFINISHED
+ *      one (`processed_at IS NULL`: its first delivery died, or is still
+ *      running) re-runs it through `redispatchUnfinishedEvent`, which allows
+ *      only the arms safe against a first delivery still alive, and every
+ *      other arm answers 200 'duplicate' as ever.
  *   3. Dispatch the event handler (per-event tx scoped by `withActor`).
  *   4. On success: `markProcessed(eventId)` (sets `processed_at`).
- *      On failure: `release(eventId)` (DELETE so Stripe's next retry
- *      re-enters dispatch) + re-throw → 500 → Stripe retries.
+ *      On a first delivery's failure: `release(eventId)` (DELETE so Stripe's
+ *      next retry re-enters dispatch) + re-throw → 500 → Stripe retries. A
+ *      re-dispatch that throws skips `release`: the row is the first
+ *      delivery's, and that transaction may have committed. It answers 500
+ *      and the row stays unfinished, so the next redelivery re-runs it.
  *
  * Dispatch errors don't leak to the response body — Fastify maps the
  * re-thrown error to 500 via the route's existing ApiError mapper; the
@@ -88,27 +99,8 @@ export function registerStripeWebhookRoute(
         firstHeader(request.headers['stripe-signature']),
       );
 
-      const claim = await stripeEventsRepository.claim(event.id, event.type);
-      if (claim === 'duplicate') {
-        // Stripe redelivered an event we already saw. The first delivery
-        // either succeeded (processed_at set) or is in-flight elsewhere
-        // (processed_at null) — either way returning 200 stops the
-        // retry storm. Log differentiates the two cases for ops.
-        const state = await stripeEventsRepository.findProcessedState(event.id);
-        request.log.info(
-          {
-            stripeEventId: event.id,
-            stripeEventType: event.type,
-            processedAt: state?.processedAt ?? null,
-            outcome: state?.processedAt ? 'duplicate-processed' : 'duplicate-inflight',
-          },
-          'stripe webhook duplicate event',
-        );
-        return reply.code(200).send({ ok: true, outcome: 'duplicate' });
-      }
-
-      try {
-        const result = await dispatchStripeEvent(event, { stripe, log: request.log });
+      /** A dispatch's success path, for a first delivery and a re-dispatch alike. */
+      const finishDispatch = async (result: WebhookHandlerResult): Promise<void> => {
         await stripeEventsRepository.markProcessed(event.id);
         // Post-commit Stripe refund when settling an orphaned invoice charge
         // LOST the `markPaid` race — the owner had already paid that invoice, so
@@ -148,6 +140,38 @@ export function registerStripeWebhookRoute(
           },
           'stripe webhook processed',
         );
+      };
+
+      const claim = await stripeEventsRepository.claim(event.id, event.type);
+      if (claim === 'duplicate') {
+        // Stripe redelivered an event we already saw. The first delivery either
+        // finished (processed_at set), or is unfinished: dead or still running
+        // (processed_at null). Log differentiates the two cases for ops.
+        const state = await stripeEventsRepository.findProcessedState(event.id);
+        request.log.info(
+          {
+            stripeEventId: event.id,
+            stripeEventType: event.type,
+            processedAt: state?.processedAt ?? null,
+            outcome: state?.processedAt ? 'duplicate-processed' : 'duplicate-inflight',
+          },
+          'stripe webhook duplicate event',
+        );
+        if (state !== undefined && state.processedAt === null) {
+          // Outside the try below on purpose: a throw here must not `release` a row
+          // whose first delivery may have committed.
+          const result = await redispatchUnfinishedEvent(event, { stripe, log: request.log });
+          if (result !== undefined) {
+            await finishDispatch(result);
+            return reply.code(200).send({ ok: true, outcome: result.outcome });
+          }
+        }
+        return reply.code(200).send({ ok: true, outcome: 'duplicate' });
+      }
+
+      try {
+        const result = await dispatchStripeEvent(event, { stripe, log: request.log });
+        await finishDispatch(result);
         return reply.code(200).send({ ok: true, outcome: result.outcome });
       } catch (err) {
         // Dispatcher failed — release the claim so Stripe's retry

@@ -55,6 +55,17 @@
  *      `authentication_required` for 4000002500003155, `declined` for
  *      4000000000000341. Anything else and the fix is not doing its job.
  *
+ * WHAT `--engine-split` RUNS INSTEAD, SINCE P15 (DECISIONS 145(c))
+ *
+ * The order engine does not create-and-confirm. It splits them, and everything built on
+ * that split was read from Stripe's docs, not run: that `confirm: false` moves no money,
+ * that a named card confirms off-session, how a card that declines on THAT confirm
+ * answers, and whether `last_payment_error` survives a cancel, which
+ * `blockerOfIntent` falls back on (`designs/p15-engine-recovery.md`, decision 3). The flag
+ * runs that sequence through the production seam (`defaultStripeClient`), in order, and
+ * nothing else: no fixture is read or written, and it prints only intent ids, statuses
+ * and error codes.
+ *
  * SAFETY
  *
  *   · Aborts unless STRIPE_SECRET_KEY starts with `sk_test_`.
@@ -78,10 +89,18 @@ import { fileURLToPath } from 'node:url';
 import type { FastifyBaseLogger } from 'fastify';
 import Stripe from 'stripe';
 import { env } from '../src/env.js';
-import { chargeBlockerForConfirm, normalizeThrownConfirmError } from '../src/lib/stripe.js';
+import {
+  chargeBlockerForConfirm,
+  defaultStripeClient,
+  normalizeThrownConfirmError,
+  stripeErrorCode,
+  type StripePaymentIntentResult,
+} from '../src/lib/stripe.js';
 
 const TEST_KEY_PREFIX = 'sk_test_';
 const PROBE_AMOUNT_CENTS = 4500;
+/** One call's budget at the seeds, as the engine passes it. */
+const ENGINE_CALL_BUDGET = { timeoutMs: 30_000 };
 
 const FIXTURE_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -456,6 +475,110 @@ function probeLogger(): FastifyBaseLogger {
   return logger as unknown as FastifyBaseLogger;
 }
 
+/** One line of `--engine-split`: an id, a status, a code, and nothing else. */
+function printIntent(step: string, intent: StripePaymentIntentResult): void {
+  console.log(
+    `  ${step}: intent=${intent.id} status=${intent.status} ` +
+      `failure_code=${intent.failureCode ?? '(none)'}`,
+  );
+}
+
+/** A step that threw: its error code, which is all the output may say. */
+function printThrown(step: string, err: unknown): void {
+  console.log(`  ${step}: THREW code=${stripeErrorCode(err) ?? '(no stripe code)'}`);
+  process.exitCode = 1;
+}
+
+/** Create unconfirmed, then confirm off-session, with one card. */
+async function createThenConfirm(
+  label: string,
+  customerId: string,
+  paymentMethodId: string,
+): Promise<StripePaymentIntentResult | undefined> {
+  const orderId = randomUUID();
+  const created = await defaultStripeClient.createUnconfirmedPaymentIntent(
+    {
+      customerId,
+      paymentMethodId,
+      amountCents: PROBE_AMOUNT_CENTS,
+      currency: 'usd',
+      metadata: { purpose: 'probe-stripe-thrown-confirm' },
+    },
+    `probe:${orderId}`,
+    ENGINE_CALL_BUDGET,
+  );
+  printIntent(`${label} create confirm:false`, created);
+  printIntent(
+    `${label} retrieve after create`,
+    await defaultStripeClient.retrievePaymentIntent(created.id, ENGINE_CALL_BUDGET),
+  );
+  try {
+    const confirmed = await defaultStripeClient.confirmPaymentIntent(
+      created.id,
+      { paymentMethodId },
+      `probe:${orderId}:confirm:1`,
+      ENGINE_CALL_BUDGET,
+    );
+    printIntent(`${label} confirm off_session`, confirmed);
+    printIntent(
+      `${label} retrieve after confirm`,
+      await defaultStripeClient.retrievePaymentIntent(created.id, ENGINE_CALL_BUDGET),
+    );
+    return confirmed;
+  } catch (err) {
+    printThrown(`${label} confirm off_session`, err);
+    return undefined;
+  }
+}
+
+/** DECISIONS 145(c): the split the engine rides, in order, against test-mode Stripe. */
+async function probeEngineSplit(stripe: Stripe): Promise<void> {
+  console.log('probe:stripe --engine-split: live Stripe, TEST MODE');
+  // Every call is inside a catch that prints a code: a raw message may say anything.
+  let customerId: string;
+  try {
+    const customer = await stripe.customers.create({
+      name: 'P15 engine split probe',
+      metadata: { purpose: 'probe-stripe-thrown-confirm', delete_me: 'true' },
+    });
+    customerId = customer.id;
+  } catch (err) {
+    printThrown('throwaway customer', err);
+    return;
+  }
+  try {
+    await stripe.paymentMethods.attach('pm_card_visa', { customer: customerId });
+    await stripe.paymentMethods.attach('pm_card_chargeCustomerFail', { customer: customerId });
+
+    await createThenConfirm('card-ok', customerId, 'pm_card_visa');
+
+    const declined = await createThenConfirm(
+      'card-declines',
+      customerId,
+      'pm_card_chargeCustomerFail',
+    );
+    if (declined === undefined) return;
+    try {
+      await defaultStripeClient.cancelPaymentIntent(declined.id, ENGINE_CALL_BUDGET);
+      console.log(`  card-declines cancel: intent=${declined.id} ok`);
+    } catch (err) {
+      printThrown('card-declines cancel', err);
+    }
+    const afterCancel = await defaultStripeClient.retrievePaymentIntent(
+      declined.id,
+      ENGINE_CALL_BUDGET,
+    );
+    printIntent('card-declines retrieve after cancel', afterCancel);
+    console.log(`  last_payment_error survives a cancel: ${afterCancel.failureCode !== undefined}`);
+  } catch (err) {
+    printThrown('engine-split', err);
+  } finally {
+    await stripe.customers.del(customerId).catch((err: unknown) => {
+      printThrown('customer cleanup', err);
+    });
+  }
+}
+
 async function main(): Promise<void> {
   const key = env.STRIPE_SECRET_KEY;
   if (!key.startsWith(TEST_KEY_PREFIX)) {
@@ -464,6 +587,11 @@ async function main(): Promise<void> {
       `REFUSING TO RUN: STRIPE_SECRET_KEY does not start with "${TEST_KEY_PREFIX}". ` +
         'This probe issues real declines and must never touch a live account.',
     );
+  }
+
+  if (process.argv.includes('--engine-split')) {
+    await probeEngineSplit(new Stripe(key));
+    return;
   }
 
   const recording = process.argv.includes('--record');

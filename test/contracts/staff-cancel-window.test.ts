@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import { bookings as bookingsTable, cancelWindowSettings } from '../../src/db/schema/schema.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffCancelWindowRoute } from '../../src/routes/staffCancelWindow.js';
@@ -153,7 +154,7 @@ test(
       },
     });
     assert.equal(before.statusCode, 201, before.body);
-    const beforeId = (before.json() as Array<{ id: string }>)[0]!.id;
+    const beforeId = (before.json() as PostBookingsResponse).sessions[0]!.id;
 
     // PATCH policy → 24h (staff).
     const patchRes = await staffOnly.inject({
@@ -178,7 +179,7 @@ test(
       },
     });
     assert.equal(after.statusCode, 201, after.body);
-    const afterId = (after.json() as Array<{ id: string }>)[0]!.id;
+    const afterId = (after.json() as PostBookingsResponse).sessions[0]!.id;
 
     const [beforeRow] = await db
       .select({

@@ -14,7 +14,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import type { LedgerEntryWire } from '../../src/lib/ledgerWire.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -60,7 +60,7 @@ async function cleanup(bookingIds: string[] = []): Promise<void> {
     .delete(scheduledNotifications)
     .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   if (bookingIds.length > 0) {
@@ -169,7 +169,7 @@ test(
     assert.equal(reminder?.status, 'cancelled', 'settling by card tore down the cash reminder');
 
     // Exactly one PaymentIntent — the switch charges once, not once per flag flip.
-    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    const piCalls = stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent');
     assert.equal(piCalls.length, 1);
 
     await cleanup([bookingId]);
@@ -256,10 +256,7 @@ test(
     // never complete.
     stripe.setNextIntentStatus('requires_action');
     const res = await payByCard(app, invoiceId);
-    assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as { invoice_status: string; client_secret: string | null };
-    assert.equal(body.invoice_status, 'open');
-    assert.ok(body.client_secret !== null, '3DS handoff returned to the client');
+    assert.equal(res.statusCode, 402, res.body);
 
     const reminder = await scheduledNotificationsRepository.findByDedupeKey(
       db,
@@ -303,7 +300,7 @@ test(
       .from(charges)
       .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
     assert.equal(chargeRows.length, 1, 'the owner was charged exactly once');
-    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
+    const piCalls = stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent');
     assert.equal(piCalls.length, 1, 'no second PaymentIntent for the replay or the 409');
 
     const reminder = await scheduledNotificationsRepository.findByDedupeKey(

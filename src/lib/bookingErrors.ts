@@ -201,10 +201,17 @@ export function alreadyBookedError(conflicts: readonly AlreadyBookedConflict[]):
   if (conflicts.length === 0) {
     throw new Error('alreadyBookedError: conflicts array must be non-empty');
   }
+  // Days and dogs, each counted once: a conflict is one (dog, date), so two dogs on
+  // one date are two conflicts and one day.
+  const days = new Set(conflicts.map((c) => c.date)).size;
+  const dogs = new Set(conflicts.map((c) => c.dog_id)).size;
+  const who = dogs === 1 ? 'This dog already has' : 'These dogs already have';
   const summary =
-    conflicts.length === 1
-      ? `This dog already has a booking on ${conflicts[0]!.date}.`
-      : `These dogs already have bookings on ${conflicts.length} of the requested days.`;
+    days > 1
+      ? `${who} bookings on ${days} of the requested days.`
+      : dogs === 1
+        ? `${who} a booking on ${conflicts[0]!.date}.`
+        : `${who} bookings on ${conflicts[0]!.date}.`;
   return new ApiError('already_booked', summary, {
     kind: 'already_booked',
     conflicts: [...conflicts],

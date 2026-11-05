@@ -5,15 +5,16 @@ import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/muta
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
+import { orderCreatedAtIso, ordersRepository } from '../db/repositories/ordersRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
-import type { PostBookingsRequest } from '../contracts/wire.js';
+import type { PostBookingsRequest, PostBookingsResponse } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { isInView, type PickupCloseByCampus } from '../lib/bookingBucket.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import type { DayProgramCategory } from '../lib/bookingSchedule.js';
 import type { BookingWire } from '../lib/bookingWire.js';
-import { cancelBookingInTx } from '../lib/cancelBookingService.js';
+import { askWhatWonForPendingRow, cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import {
   createDayProgramBookings,
@@ -251,7 +252,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   // One request → N bookings, one per requested date, atomic. Body:
   //   { category, lead_dog_id, additional_dog_ids?, dates[], location, notes?,
   //     payment?, payment_method_id? }
-  // → 201 BookingWire[] (length = dates.length, ordered ASC by scheduled_at).
+  // → 201 PostBookingsResponse {order, sessions} (one order per Confirm, credits-only
+  //   included; `sessions.length` = dates.length, ordered ASC by scheduled_at).
   //
   // Owner-only (staff portal lives at Day 19). Idempotency-Key required;
   // the same key + body returns the stored response. The same key + a
@@ -288,7 +290,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   app.post(
     '/bookings',
     { preHandler: [authHook] },
-    async (request, reply): Promise<BookingWire[]> => {
+    async (request, reply): Promise<PostBookingsResponse> => {
       const principal = requirePrincipal(request);
       requireOwner(principal, 'create a booking');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
@@ -301,7 +303,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       // the dogs whose balance actually moved.
       let creditDebitedDogIds = new Set<string>();
 
-      const outcome = await withMutation<BookingWire[]>(
+      const outcome = await withMutation<PostBookingsResponse>(
         {
           principal,
           idempotencyKey,
@@ -330,9 +332,14 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             }
           }
 
-          // 3. The shared core. It books every dog or refuses; nothing is parked
+          // 3. One Confirm, one order, credits-only included (PAY-U04). A refusal
+          //    below rolls it back with everything else.
+          const order = await ordersRepository.create(tx, { ownerId: principal.ownerId });
+
+          // 4. The shared core. It books every dog or refuses; nothing is parked
           //    (wire 3.0.0).
           const result = await createDayProgramBookings(tx, {
+            orderId: order.id,
             ownerId: principal.ownerId,
             category: parsed.category,
             leadDogId: parsed.leadDogId,
@@ -345,7 +352,20 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           });
           creditDebitedDogIds = result.creditDebitedDogIds;
 
-          return { status: 201, body: result.wires };
+          // `charge_status` is `'none'` until the top-up is live: a credits-only
+          // Confirm never enters the engine (design §2.7:3829-3831).
+          return {
+            status: 201,
+            body: {
+              order: {
+                id: order.id,
+                owner_id: order.ownerId,
+                created_at: orderCreatedAtIso(order),
+                charge_status: 'none',
+              },
+              sessions: result.wires,
+            },
+          };
         },
       );
 
@@ -404,6 +424,13 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       // Dogs credited back on this cancel (empty on every non-credit-back
       // path); post-commit we wipe each dog's `credits:{dogId}:*` display cache.
       let creditRefundedDogIds: string[] = [];
+      // A pending row cancels its whole order, and that cancel asks Stripe first,
+      // with no transaction open (R5). `undefined` on every other row.
+      const whatWon = await askWhatWonForPendingRow({
+        id,
+        requireOwnerId: principal.ownerId,
+        stripe,
+      });
 
       const outcome = await withMutation<BookingWire>(
         {
@@ -464,6 +491,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             stripeIdempotencyKey: refundIdempotencyKey,
             // The unroutable mint announces itself in-tx through this logger.
             log: request.log,
+            whatWon,
           });
           pendingStripeRefund = result.pendingStripeRefund;
           creditRefundedDogIds = result.creditRefundedDogIds;

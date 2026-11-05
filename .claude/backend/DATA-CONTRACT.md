@@ -742,8 +742,9 @@ Six pieces ship together; all are additive or doc-only (no R1-R8 change).
 1. **POST /bookings body — pinned from §C's `dates[]` placeholder.**
    `{ category: 'day-school'|'day-care', lead_dog_id, additional_dog_ids?,
 dates: 'YYYY-MM-DD'[], location: 'fayetteville'|'bentonville', notes? }`.
-   Returns 201 + `BookingWire[]` (one per date, ASC). No arrival time is
-   asked (wire 4.0.0-lg3.1): each session starts at the campus's
+   Returns 201 + `PostBookingsResponse {order, sessions}` (wire 4.0.0-lg3.2:
+   one order per Confirm, credits-only included; `sessions` one per date, ASC).
+   No arrival time is asked (wire 4.0.0-lg3.1): each session starts at the campus's
    `day.dropoff_open_time`. Limits: `dates.length ∈ [1, 30]`, all distinct,
    all today-or-future in America/Chicago, none past the booking horizon
    (`day.booking_horizon_months` calendar months, 422
@@ -1329,7 +1330,8 @@ Shanthi's domain corrections are the source of truth).**
 
 > **Superseded in part at wire 3.0.0 (P12; DOG-U08, PAY-U19).** Ruling 1's
 > day-program lane and every line below about it are history, kept for the
-> record. `POST /bookings` has one outcome: 201 `BookingWire[]` or a refusal.
+> record. `POST /bookings` has one outcome: 201 `PostBookingsResponse` or a
+> refusal (`BookingWire[]` until 4.0.0-lg3.2).
 > `POST /bookings/preview` and `DivertedBookingWire` are gone. `POST
 > /staff/requests/:id/approve` has no day-program arm: a surviving `day-school`
 > or `day-care` row answers 409 `conflict`, moves nothing, stays `submitted`,
@@ -1643,7 +1645,7 @@ charge_status, stripe_payment_intent_id, client_secret,
 invoice_status }`. 3DS / requires_action: charges at 'requires_payment',
    invoice stays 'open' (known caveat — no `charges.invoice_id` link
    today so the webhook can't re-settle the invoice; next attempt
-   completes).
+   completes). **Superseded at 4.0.0-lg3.2: §P.**
 
 5. **`POST /requests/:id/confirm-payment` `[auth, $]`.** B&T conversion
    verb. Body: `{ payment_method_id, scheduled_at, dropoff_at,
@@ -1942,8 +1944,9 @@ shape + repo extensions + a new signed HTTP entrypoint.
    worker function directly).
 
 7. **`idempotency_keys` TTL sweep (`src/db/idempotency.ts`).**
-   `sweepExpiredIdempotencyKeys({olderThan})` deletes rows
-   older than the retry-safety window (24h default). Composed
+   `sweepExpiredIdempotencyKeys({completedBefore, openBefore})` deletes
+   completed rows past the retry-safety window (24h) and open rows past
+   7 days (narrowed at 4.0.0-lg3.2, §P). Composed
    into the scheduler tick; failure is logged-and-swallowed (next
    tick retries). Honors the schema's "ONE table EXEMPT from
    never-delete" carve-out (schema.sql lines ~918-920).
@@ -2810,6 +2813,7 @@ invisible to the repository layer.
 
 - `GET /availability?from=&to=&location=` — per-campus capacity (the campus's rule, server-side)
 - `PUT` / `DELETE /staff/day-capacity/:location/:date` [staff] — one date's cap (4.0.0-lg3.1)
+- `GET /staff/payments/pending` [staff] · `POST /staff/orders/:id/cancel` [staff, idempotent] — pending orders past `pay.processing_hold_max_minutes`, and *Cancel order* (4.0.0-lg3.2, §P)
 - `GET /dogs/:id/credits` — ledger balance per mode · `GET /credit-packages`
 - `POST /credit-purchases` [$] — Stripe charge → credit_ledger
 - `GET /rates?category=&location=` — current effective `service_rates` (effective-dated; the API resolves the active window)
@@ -2891,11 +2895,11 @@ invisible to the repository layer.
   5th program = became-alumni ⇒ `clearExpiryForDog` (live lots → NULL).
   The DELETE does NOT re-stamp lot expiries (documented in the route).
 - `POST /webhooks/stripe` [public, signed] — **Day 15** — receives `payment_intent.succeeded`/`.payment_failed`/`setup_intent.succeeded`/`charge.refund.updated`. Dedupes via `stripe_events` table; runs under `system:stripe-webhook` actor. Other event types collapse to `unhandled`+200 (future-proof).
-- `GET /invoices` · `POST /invoices/:id/pay` [$] — **Day 15** for `POST /pay` (pay-later settlement, mirrors credit-purchase shape). `GET /invoices` deferred to Day-19 staff portal (no current FE consumer; `invoicesRepository.findOpenByOwner` is ready when needed).
+- `GET /invoices` · `POST /invoices/:id/pay` [$] — **Day 15** for `POST /pay` (pay-later settlement; rides the order engine since 4.0.0-lg3.2, §P). `GET /invoices` deferred to Day-19 staff portal (no current FE consumer; `invoicesRepository.findOpenByOwner` is ready when needed).
 - `POST /invoices/:id/pay-in-person` — **Notifications Phase 4c (2026-07-27, R3)**: owner elects cash/check at drop-off. Charges nothing — flips `invoices.payment_expected` → 'in-person' + enqueues the `payment-due` reminder (~1h before the linked booking's drop-off, else the invoice's `due_at`; past → now) in one tx. Bodyless 204; repeat under a new key → 409. See §A Amendment 2026-07-27 (Phase 4c).
 - `POST /requests/:id/confirm-payment` — **Day 15** — B&T `approved-awaiting-payment` → `converted`. Server-authoritative pricing via `lib/boardTrainPricing.ts`. Pay-now (charges row + booking) or pay-later (open invoice + booking).
 - `GET /refunds` — refund history; refunds are created by the cancel txn (`POST /bookings/:id/cancel`), not a direct client endpoint. Past the `cancel_deadline_at` window the booking is `cancel_forfeited` (no refund); within it → credit `cancel-refund` (credit bookings) or a `refunds` row + Stripe refund (money bookings). **Day 14**: cancel route's money-back branch now fires `stripe.createRefund` post-commit (Day-13 stubbed the seam).
-- `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**12 phases, one result field each on `SchedulerTickResult`** — corrected 2026-08-25, D20-A3 §L5; this line said 7, frozen at §J 2026-07-14, and the Day-20 design said 9): `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice-attempt verify / capture reconciler / duplicate-refund retry / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / invoice-overdue scan / card-expiry scan / `idempotency_keys` TTL sweep. The tick's Railway completion log line carries all twelve phases' counters as of the same date (it carried five, omitting both money phases — DISCREPANCIES NOTE-39). Worker runs under `system:scheduler` actor.
+- `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**13 phases, one result field each on `SchedulerTickResult`** — corrected 2026-08-25, D20-A3 §L5; this line said 7, frozen at §J 2026-07-14, and the Day-20 design said 9; P15 added the order sweeper): `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice-attempt verify / capture reconciler / order sweeper / duplicate-refund retry / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / invoice-overdue scan / card-expiry scan / `idempotency_keys` TTL sweep. The tick's Railway completion log line carries every phase's counters as of the same date (it carried five, omitting both money phases — DISCREPANCIES NOTE-39). Worker runs under `system:scheduler` actor.
 
 > `scheduled_notifications` + `media_derivative_jobs` are server-internal
 > worker queues — no client endpoints; the worker emits pushes /
@@ -3085,8 +3089,9 @@ managed Postgres. All deferred to Node-API stand-up. (Media storage = R2,
 expired_at = NULL` on the existing row, not a second INSERT (either is now
   collision-safe). `dog_completed_classes` gained a surrogate `id` PK.
 - **`idempotency_keys` is the sole never-delete exception** — transport-layer
-  request dedupe, not business state; a TTL sweep prunes rows past the
-  retry-safety window. No `audit_log`, no `expired_at`, by design.
+  request dedupe, not business state; a TTL sweep prunes completed rows past
+  the retry-safety window and open rows past 7 days (§P). No `audit_log`, no
+  `expired_at`, by design.
 - **Staff dogs (#2):** a dog belongs to **either** an `owner` **or** a `staff`
   (`owner_id` XOR `staff_owner_id`). Staff-owned dogs are `capacity_exempt`
   (generated column) and excluded from cohort/day-capacity counts. Staff are
@@ -5485,3 +5490,84 @@ each run, both solo-green, both green in the morning runs) — a
 flake class clustered ~01:30–02:10, queued for the shifted-clock/flake
 sweep (phase 3.2) with all four gate logs preserved in the session
 scratchpad. The 17 net-new suite tests over 1.12.0's 1320 = 1337.
+
+## P. The order engine (wire 4.0.0-lg3.2, 2026-11-05)
+
+Plan unit P15, slice S20; PAY-U04, PAY-U05, PAY-U07, PAY-U01; design
+`designs/fetchd-v1-technical-design.md` §2.7:3799-4050; M3.02, M3.03;
+DECISIONS 142. The shapes are in `src/contracts/wire.ts`; this section is what
+they do not say. Code: `src/lib/confirmCharge.ts`, `src/lib/cancelOrder.ts`,
+`src/lib/orderRows.ts`, `src/workers/orderSweeper.ts`, `src/db/locks.ts`.
+
+- **One order, one charge, one PaymentIntent, automatic capture.** tx1 commits the
+  claim (with `order_id`), the order, the caller's locks and the one `charges` row
+  at `requires_payment`, carrying K0 (`order:<id>`, never derived from the client's
+  key), the frozen create parameters and the lease `attempting_until`. Then, with no
+  transaction open: create with `confirm: false`, commit the intent id in one
+  conditional write, confirm off-session. **A charge with no stored intent id is a
+  charge no card was tried on.** Then the settle, under the charge lock.
+- **`orders` stores no status.** A credits-only Confirm is an order with no charge,
+  and never enters the engine.
+- **The lease.** `attempting_until` is the request's column and `next_sweep_at` the
+  sweeper's. The lease is renewed conditionally before every Stripe call, on Postgres's
+  `now()` unless a test injected a clock. A request that finds it gone, or finds the
+  sweeper's claim on the row, stops for good: the sweeper never writes
+  `attempting_until`, so a lease once lost stays lost. `invoice_payment_in_flight`
+  reads "inside its lease" (DECISIONS 142(b)): past it a second tender goes through,
+  and PAY-35 refunds the loser.
+- **`failed` means no intent, a dead intent, or watched.** A `failed` charge with a live
+  intent carries `next_sweep_at`, and the sweeper looks again until Stripe says
+  `succeeded` (one capped refund, automatically) or `canceled`. No clock ends the watch.
+  Past seven days from `charges.created_at` it raises one alarm per charge per process
+  and keeps looking.
+- **"Failed" waits until nothing can still be running.** A last confirm that goes
+  unanswered and reads back as never landed is not a failure: the charge stays
+  `requires_payment` and the request answers 409 `idempotency_inflight`. The sweeper
+  cancels an unfinished intent before it says "failed", so a confirm still running
+  either beats the cancel or is refused.
+- **Retries.** A transient `processing_error` or a network failure spends another
+  try, up to `pay.card_attempts_max_count`: a confirm of the same intent, one key per
+  attempt, `attempt_count` committed with the renewal, before the call. A timed-out
+  call is answered by a retrieve on the stored id, never by a second intent.
+- **Every settler ends in `settleChargeInTx` or `failChargeInTx`,** whether it is the
+  request, the webhook, the sweeper or a *Cancel order*. Each is state-guarded, so a
+  second settler is a no-op. Whoever settles records the final 201, or the committed
+  402, on the claim, and the request reads its answer from there.
+- **The stored 402.** `idempotency_keys.response_body` holds the envelope
+  `auth/plugin.ts` sends. A replay returns it and tries no card. An open claim
+  answers 409 `idempotency_inflight`, before any pre-validation.
+- **The webhook (ownership is `charges.order_id`).** Retrieve with no transaction
+  open, lock, act on the retrieved status. `payment_failed` writes
+  `last_stripe_error` and nothing else. `canceled` is the failure policy. A success
+  on a charge already `failed` is refunded in full, one `refunds` row with reason
+  `late-success-refund`, and grants nothing. `payment-refunded` is born with M7.09,
+  so no notice goes until LG7. **`payment_intent.canceled` must be enabled on the
+  webhook endpoint in test and live: an ops step no gate sees.**
+- **The sweeper (`workers/orderSweeper.ts`) is forward only and never tries a card.**
+  Its verbs are retrieve and cancel. No intent id: the order is abandoned, with the 402
+  `{outcome: 'abandoned', attempts: 0}` and one `Payment failed` notice. An intent id:
+  retrieved, then `succeeded` settles, `processing` and `requires_capture` wait,
+  `canceled` takes the failure policy, and the other three are cancelled first. A
+  cancel refused with 429 `lock_timeout` is a confirm holding the intent: nothing is
+  written, and the next look reads what it did.
+- **A redelivery of an unfinished event.** `processed_at IS NULL` cannot tell a dead
+  first delivery from a slow one, so `redispatchUnfinishedEvent` re-runs only the arms
+  safe against one still alive: the engine's three and `charge.refund.updated`. Every
+  other arm answers 200 `duplicate`, as it always did.
+- **A pending row cancels the whole order**, owner or staff, through
+  `cancelBookingService`, and asks Stripe first with no transaction open. The class
+  refusal runs before everything. Nothing is forfeited on an order-wide cancel, and
+  only `upcoming` and `payment-pending` rows go: a `past` row is a day attended. Lock
+  order: charge → booking → pool (`db/locks.ts`).
+- **What a pending order tells the owner.** A cancel Stripe answered `canceled`, or
+  one with no intent id, sends the failed-payment notice (`order-cancelled`). A cancel
+  of a charge still `processing` sends no notice until LG7: the true word is
+  `payment-refunded`'s `cancel-while-processing`, and "payment failed" may be false.
+  Its stored 402 carries `charge_blocker: 'processing'`.
+- **Every notice in a money transaction runs in its own savepoint**
+  (`lib/noticeInSavepoint.ts`): a failed notice rolls back alone, one alarm names it,
+  and the money commits.
+- **Reach at this step (DECISIONS 142(c)).** `POST /invoices/:id/pay` is the one live
+  caller. tx1's booking arm and the settle's top-up and pack arms are P18's, so a
+  charge whose order names no invoice reaching `succeeded` raises one named alarm and
+  commits nothing. The cancel side runs on seeded rows until then.

@@ -42,6 +42,7 @@ export interface BookingRowForWire {
   cancelledBy: 'owner' | 'staff' | null;
   cancelReason: string | null;
   cohortId: string | null;
+  orderId: string | null;
 }
 
 export interface BookingDogRow {
@@ -86,6 +87,7 @@ export function toBookingWire(
     wire.cancel_deadline_at = pgTimestampToIso(row.cancelDeadlineAt);
   }
   if (row.cohortId !== null) wire.cohort_id = row.cohortId;
+  if (row.orderId !== null) wire.order_id = row.orderId;
   if (groupClassName !== undefined && groupClassName !== '') {
     wire.group_class_name = groupClassName;
   }

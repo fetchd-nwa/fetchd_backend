@@ -46,6 +46,8 @@ export interface BookingRow {
   pickupAt: string | null;
   trainerStaffId: string | null;
   cohortId: string | null;
+  /** The order this session belongs to (M3.02). NULL on a row made any other way. */
+  orderId: string | null;
 }
 
 /**
@@ -104,6 +106,7 @@ const BOOKING_PROJECTION = {
   pickupAt: bookings.pickupAt,
   trainerStaffId: bookings.trainerStaffId,
   cohortId: bookings.cohortId,
+  orderId: bookings.orderId,
 } as const;
 
 const BOOKING_FULL_PROJECTION = {
@@ -494,6 +497,8 @@ export const bookingsRepository = {
       sessionReportId?: string | null;
       // Δ 2026-07-14: private-lesson only — copied from the request at approve.
       lessonSetting?: 'home' | 'public' | null;
+      // M3.02: only `createDayProgramBookings` passes it. A walk-in opens no order.
+      orderId?: string | null;
     },
   ): Promise<BookingRow> {
     const [bookingRow] = await tx
@@ -509,6 +514,7 @@ export const bookingsRepository = {
         cohortId: values.cohortId ?? null,
         sessionReportId: values.sessionReportId ?? null,
         lessonSetting: values.lessonSetting ?? null,
+        orderId: values.orderId ?? null,
         // status defaults to 'upcoming' (schema), durationMinutes/trainer*/
         // report_id/confirmed*/dropoff*/pickup*/cancelled*/source all
         // remain at their schema defaults (NULL / 'app' / false).
@@ -563,7 +569,7 @@ export const bookingsRepository = {
    * mirrors `lockById`'s "existence-by-id" semantic; the route already
    * decided liveness when it locked the row.
    */
-  async findFullByIdInTx(tx: Tx, id: string): Promise<BookingFullRow | undefined> {
+  async findFullByIdInTx(tx: Tx | typeof db, id: string): Promise<BookingFullRow | undefined> {
     const [row] = await tx
       .select(BOOKING_FULL_PROJECTION)
       .from(bookings)
@@ -645,6 +651,62 @@ export const bookingsRepository = {
         cancelReason: args.cancelReason ?? null,
       })
       .where(eq(bookings.id, args.id));
+  },
+
+  /**
+   * Soft-cancel one row of an order (P15). As {@link markCancelled}, with two
+   * differences that are the point: nothing is forfeited, whatever the deadline says,
+   * since a pending row was never confirmed and a settled top-up's rows go back as
+   * credits; and `cancelledBy` is NULL for a failure no person chose.
+   */
+  async markOrderRowCancelled(
+    tx: Tx,
+    args: {
+      id: string;
+      cancelledBy: 'owner' | 'staff' | null;
+      cancelReason?: string | null;
+      now: Date;
+    },
+  ): Promise<void> {
+    await tx
+      .update(bookings)
+      .set({
+        status: 'cancelled',
+        cancelledAt: args.now.toISOString(),
+        cancelForfeited: false,
+        cancelledBy: args.cancelledBy,
+        cancelReason: args.cancelReason ?? null,
+      })
+      .where(eq(bookings.id, args.id));
+  },
+
+  /**
+   * Row-lock every row of one order a cancel can still take down, in id order, under
+   * the order's charge lock (`db/locks.ts`). Only `upcoming` and `payment-pending`: a
+   * `past` row is a day the dog attended, and no cancel of the order undoes it.
+   */
+  async lockCancellableByOrderId(tx: Tx, orderId: string): Promise<BookingFullRow[]> {
+    return tx
+      .select(BOOKING_FULL_PROJECTION)
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.orderId, orderId),
+          inArray(bookings.status, ['upcoming', 'payment-pending']),
+          live(bookings),
+        ),
+      )
+      .orderBy(asc(bookings.id))
+      .for('update');
+  },
+
+  /** One order's sessions, ascending by date. */
+  async findByOrderId(runner: Tx | typeof db, orderId: string): Promise<BookingRow[]> {
+    return runner
+      .select(BOOKING_PROJECTION)
+      .from(bookings)
+      .where(and(eq(bookings.orderId, orderId), live(bookings)))
+      .orderBy(asc(bookings.scheduledAt));
   },
 
   // -------------------------------------------------------------------

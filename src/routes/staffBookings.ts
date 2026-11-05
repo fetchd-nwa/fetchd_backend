@@ -13,7 +13,7 @@ import type {
   PostStaffBookingsCancelRequest,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
-import { cancelBookingInTx } from '../lib/cancelBookingService.js';
+import { askWhatWonForPendingRow, cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
@@ -237,6 +237,9 @@ export function registerStaffBookingsRoute(
       let creditRefundedDogIds: string[] = [];
       // Computed ONCE, here, so the row stores the same string the fire sends.
       const refundIdempotencyKey = `${idempotencyKey}:refund`;
+      // A pending row cancels its whole order, through the one service (DECISIONS
+      // 142(e)), and asks Stripe first with no transaction open.
+      const whatWon = await askWhatWonForPendingRow({ id, requireOwnerId: null, stripe });
 
       const outcome = await withMutation<BookingWire>(
         {
@@ -278,6 +281,7 @@ export function registerStaffBookingsRoute(
             ...(reason !== undefined ? { cancelReason: reason } : {}),
             now: nowFactory(),
             stripeIdempotencyKey: refundIdempotencyKey,
+            whatWon,
             // The unroutable mint announces itself in-tx through this logger.
             log: request.log,
           });

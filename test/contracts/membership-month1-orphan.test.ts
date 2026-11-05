@@ -25,7 +25,7 @@ import type {
   StripePaymentIntentResult,
   StripeWebhookEvent,
 } from '../../src/lib/stripe.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -290,7 +290,7 @@ async function cleanup(): Promise<void> {
         inArray(notifications.type, ['membership-ended', 'payment-failed', 'payment-succeeded']),
       ),
     );
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
   await db

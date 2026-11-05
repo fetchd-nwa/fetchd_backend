@@ -7,7 +7,7 @@ import type {
 } from 'fastify';
 import type { Principal, StaffRole } from './principal.js';
 import { bypassHeaderEnabled } from '../env.js';
-import { ApiError } from '../lib/errors.js';
+import { ApiError, toErrorEnvelope } from '../lib/errors.js';
 import { verifyAccessToken, type VerifiedToken } from './jwks.js';
 import { resolvePrincipal } from './mirror.js';
 import { staffRole } from '../db/schema/schema.js';
@@ -223,11 +223,7 @@ export function registerAuth(app: FastifyInstance): void {
       if (err.status >= 500) {
         request.log.error({ err }, 'auth integrity fault');
       }
-      const body =
-        err.details === undefined
-          ? { error: { code: err.code, message: err.message } }
-          : { error: { code: err.code, message: err.message, details: err.details } };
-      return reply.code(err.status).send(body);
+      return reply.code(err.status).send(toErrorEnvelope(err));
     }
     // Level split, mirroring the `ApiError` branch above (`:193`). `authenticate`
     // is a preHandler, so body parsing and schema validation run BEFORE auth:

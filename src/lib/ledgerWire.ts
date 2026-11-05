@@ -32,5 +32,6 @@ export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
   if (row.settledCard !== null) wire.settled_card = row.settledCard;
   if (row.settledAt !== null) wire.settled_at = pgTimestampToIso(row.settledAt);
   if (row.groupClassName !== null) wire.group_class_name = row.groupClassName;
+  if (row.orderId !== null) wire.order_id = row.orderId;
   return wire;
 }

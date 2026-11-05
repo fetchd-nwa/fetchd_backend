@@ -678,9 +678,11 @@ test('normalizeThrownConfirmError: the attached intent’s `created` rides throu
 // ── Stripe spends ONE error type on two conditions (2026-08-12) ──────────────
 
 test('stripeIdempotencyErrorKind: a 409 is a concurrency signal, not a bookkeeping one', () => {
-  const err = new Stripe.errors.StripeIdempotencyError({
+  // The class the real SDK throws for this status: `StripeAPIError`, never
+  // `StripeIdempotencyError` (units/P15/evidence/reviews/opus-r1/logs/p01-sdk-facts.log).
+  const err = new Stripe.errors.StripeAPIError({
     type: 'idempotency_error',
-    code: 'idempotency_error',
+    code: 'idempotency_key_in_use',
     statusCode: 409,
     message: 'There is currently another in-progress request using this Idempotency Key.',
   } as never);

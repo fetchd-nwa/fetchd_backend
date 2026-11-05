@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import {
   bookingDogs,
   bookings,
@@ -20,7 +21,7 @@ import { CURRICULUM_PROGRAMS } from '../../src/lib/alumni.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
 import {
-  clearInvoiceChargeAttempts,
+  clearInvoiceReferrers,
   futureWeekday,
   FIXTURE_IDS,
   FIXTURE_NOW,
@@ -62,7 +63,7 @@ after(async () => {
     await db
       .delete(scheduledNotifications)
       .where(inArray(scheduledNotifications.bookingId, bookingIds));
-    await clearInvoiceChargeAttempts();
+    await clearInvoiceReferrers();
     await db.delete(invoices).where(inArray(invoices.bookingId, bookingIds));
     await db.delete(creditLedger).where(inArray(creditLedger.bookingId, bookingIds));
   }
@@ -208,16 +209,16 @@ async function upcomingBookingsOf(dogId: string): Promise<{ id: string; schedule
     .where(and(eq(bookings.leadDogId, dogId), eq(bookings.status, 'upcoming')));
 }
 
-/** The one outcome: 201, `BookingWire[]`, a debit per dog per date, no request. */
+/** The one outcome: 201, `sessions`, a debit per dog per date, no request. */
 async function assertBookedAtOnce(
   res: Awaited<ReturnType<typeof postBooking>>,
   dogId: string,
   count = 1,
 ): Promise<void> {
   assert.equal(res.statusCode, 201, res.body);
-  const body = res.json();
-  assert.ok(Array.isArray(body), `POST /bookings answers BookingWire[], got ${res.body}`);
-  assert.equal(body.length, count);
+  const body = res.json() as PostBookingsResponse;
+  assert.ok(Array.isArray(body.sessions), `POST /bookings answers sessions, got ${res.body}`);
+  assert.equal(body.sessions.length, count);
   assert.equal(await debitsOf(dogId), count, 'a credit debited per booking');
   assert.equal(await requestRowsOf(dogId), 0, 'no pending_requests row');
 }

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import {
   bookings as bookingsTable,
   creditLedger,
@@ -164,7 +165,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, `expected 201 (PAYG bypasses credits), got: ${res.body}`);
-    const body = res.json() as Array<{ id: string }>;
+    const body = (res.json() as PostBookingsResponse).sessions;
     assert.equal(body.length, 1);
     const bookingId = body[0]!.id;
 
@@ -205,7 +206,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as Array<{ id: string }>;
+    const body = (res.json() as PostBookingsResponse).sessions;
     assert.equal(body.length, 2);
 
     for (const { id } of body) {
@@ -335,7 +336,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const bookingId = (res.json() as Array<{ id: string }>)[0]!.id;
+    const bookingId = (res.json() as PostBookingsResponse).sessions[0]!.id;
     assert.equal(
       (await paygInvoicesFor(bookingId))[0]!.status,
       'open',
@@ -370,7 +371,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const bookingId = (res.json() as Array<{ id: string }>)[0]!.id;
+    const bookingId = (res.json() as PostBookingsResponse).sessions[0]!.id;
 
     // Force the cancel window closed (deadline 6h in the past).
     await db
@@ -415,7 +416,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const bookingId = (res.json() as Array<{ id: string }>)[0]!.id;
+    const bookingId = (res.json() as PostBookingsResponse).sessions[0]!.id;
 
     const debits = await bookingDebitsFor(bookingId);
     assert.equal(debits.length, 1, 'credits path debits exactly once per dog');
@@ -447,7 +448,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const bookingId = (res.json() as Array<{ id: string }>)[0]!.id;
+    const bookingId = (res.json() as PostBookingsResponse).sessions[0]!.id;
 
     const invs = await paygInvoicesFor(bookingId);
     assert.equal(invs.length, 1, 'one combined invoice for the booking, not one per dog');
@@ -494,7 +495,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const bookingId = (res.json() as Array<{ id: string }>)[0]!.id;
+    const bookingId = (res.json() as PostBookingsResponse).sessions[0]!.id;
     const invoiceId = await paygInvoiceIdFor(bookingId);
 
     const [booking] = await db

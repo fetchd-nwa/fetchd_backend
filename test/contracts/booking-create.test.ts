@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import {
   agreementDocuments,
   bookings as bookingsTable,
@@ -169,15 +170,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, `expected 201, got ${res.statusCode}: ${res.body}`);
-    const body = res.json() as Array<{
-      id: string;
-      dog_id: string;
-      category: string;
-      status: string;
-      date: string;
-      location: string;
-      additional_dog_ids?: string[];
-    }>;
+    const body = (res.json() as PostBookingsResponse).sessions;
     assert.equal(body.length, 1);
     assert.equal(body[0]!.dog_id, FIXTURE_IDS.dog1Id);
     assert.equal(body[0]!.category, 'day-school');
@@ -266,7 +259,7 @@ test(
       },
     });
     assert.equal(first.statusCode, 201, first.body);
-    const firstId = (first.json() as Array<{ id: string }>)[0]!.id;
+    const firstId = (first.json() as PostBookingsResponse).sessions[0]!.id;
 
     // Cancel it directly (test scaffolding) — a cancelled day frees the slot.
     await db
@@ -463,7 +456,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as Array<{ id: string; dog_id: string; additional_dog_ids?: string[] }>;
+    const body = (res.json() as PostBookingsResponse).sessions;
     assert.equal(body.length, 1);
     assert.deepEqual(body[0]!.additional_dog_ids, [FIXTURE_IDS.dog2Id]);
 
@@ -497,7 +490,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as Array<{ id: string; date: string }>;
+    const body = (res.json() as PostBookingsResponse).sessions;
     assert.equal(body.length, 3);
     // Returned ASC by scheduled_at (route sorts dates ASC before insert).
     const returnedDates = body.map((b) => b.date.slice(0, 10));
@@ -542,7 +535,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as Array<{ id: string }>;
+    const body = (res.json() as PostBookingsResponse).sessions;
     const [row] = await db
       .select({
         scheduledAt: bookingsTable.scheduledAt,
@@ -997,7 +990,7 @@ test(
     assert.equal(b.statusCode, 201);
     assert.deepEqual(a.json(), b.json(), 'replay returns identical body');
     // Exactly ONE debit row (idempotent replay didn't double-debit).
-    const bookingId = (a.json() as Array<{ id: string }>)[0]!.id;
+    const bookingId = (a.json() as PostBookingsResponse).sessions[0]!.id;
     const debits = await db
       .select({ id: creditLedger.id })
       .from(creditLedger)
@@ -1199,7 +1192,7 @@ test(
       },
     });
     assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as Array<{ id: string }>;
+    const body = (res.json() as PostBookingsResponse).sessions;
     const links = await db
       .select({ dogId: bookingDogsTable.dogId, isLead: bookingDogsTable.isLead })
       .from(bookingDogsTable)

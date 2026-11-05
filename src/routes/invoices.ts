@@ -1,8 +1,10 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { actorOf } from '../auth/principal.js';
 import {
   deepLinkToPath,
+  type ApiErrorEnvelope,
   type InvoiceDeepLinkReason,
   type InvoicePayRequest,
   type InvoicePayWire,
@@ -10,64 +12,55 @@ import {
 import type { Expect, Equal } from '../contracts/typeAsserts.js';
 import { db } from '../db/client.js';
 import { bucketToChicagoDate } from '../lib/chicagoDate.js';
-import { peekCompletedIdempotency } from '../db/idempotency.js';
+import { peekCompletedIdempotency, peekEngineClaim } from '../db/idempotency.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
-import { chargesRepository } from '../db/repositories/chargesRepository.js';
-import {
-  invoicesRepository,
-  repointPaymentMethod,
-  type InvoiceRow,
-} from '../db/repositories/invoicesRepository.js';
+import { invoicesRepository, type InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import { ledgerRepository } from '../db/repositories/ledgerRepository.js';
+import { ordersRepository } from '../db/repositories/ordersRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
+import { confirmCharge, type ChargeTerms } from '../lib/confirmCharge.js';
 import { toLedgerEntryWire, type LedgerEntryWire } from '../lib/ledgerWire.js';
 import { ApiError } from '../lib/errors.js';
 import { formatDollars, purposeLabel } from '../lib/invoiceReceiptCopy.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { pgTimestampToDate } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
-import { firePendingRefundPostCommit } from '../lib/pendingRefund.js';
-import {
-  resolveInvoiceAnchorBookingId,
-  settleInvoiceCharge,
-  type PendingDuplicateRefund,
-} from '../lib/settleInvoiceCharge.js';
-import {
-  chargeBlockerForConfirm,
-  defaultStripeClient,
-  stripeIntentStatusToChargeStatus,
-  type StripeClient,
-} from '../lib/stripe.js';
+import { resolveInvoiceAnchorBookingId } from '../lib/settleInvoiceCharge.js';
+import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
- * `POST /invoices/:id/pay` `[auth, $]` — pay-later settlement.
+ * `POST /invoices/:id/pay` `[auth, $]` — pay an open invoice, on the order engine
+ * (P15, `lib/confirmCharge.ts`; design §2.7:3824-3898, PAY-U05, PAY-U07).
  *
- * Owner pays an open invoice with the card they chose at settle time
- * (`payment_method_id` in the body, wire 1.7.0), falling back to the invoice's
- * bound `payment_method_id` when the body omits one. The shape mirrors Day-14's
- * `POST /credit-packages/:key/purchase`:
+ * The owner pays with the card chosen at settle time (`payment_method_id` in the body,
+ * wire 1.7.0), or the invoice's bound card when the body omits one. The route's own
+ * work is thin: replay what the key already answered, pre-validate on the pool, and
+ * hand the engine its tx1 work with the `'leave-invoice-open'` policy.
  *
- *   1. Pre-validate the invoice (owned, open, payment method live).
- *   2. Stripe `paymentIntents.create + confirm` pre-tx (idempotency-keyed).
- *   3. `withMutation` opens the audit-stamped tx:
- *      - INSERT `charges` row mirroring Stripe status.
- *      - On Stripe 'succeeded': `invoices.markPaid` flips the invoice
- *        to 'paid' + links the charge id.
- *      - Non-succeeded (3DS / requires_action / declined): the intent is
- *        CANCELLED pre-tx (wire 1.7.1) and the charge row is written at
- *        its non-succeeded status; the invoice stays open for the next
- *        attempt, which mints a fresh intent.
+ *   1. A stored answer replays, the committed 402 included, and an open claim answers
+ *      409 `idempotency_inflight`.
+ *   2. Pre-validate the invoice (owned, open, payment method live).
+ *   3. {@link confirmCharge}: tx1 claims the key, writes the order, locks the invoice,
+ *      refuses 409 `invoice_payment_in_flight` while another order's charge on it is
+ *      inside its lease, and writes the one charge. Then Stripe, with no transaction
+ *      open. Then the settle.
  *
- * The webhook does NOT currently re-settle the invoice for the async
- * path (only the charge flips). That caveat survives the cancel rule
- * only for the rare `processing` intent Stripe won't let us cancel: it
- * can still flip to succeeded via webhook with the invoice left open.
- * The synchronous path (test mode + stored non-3DS card) settles
- * atomically.
+ * Four answers, whoever settled the order:
+ *
+ *   - 201 `InvoicePayWire`, `invoice_status: 'paid'`.
+ *   - 201 with `charge_status: 'requires_payment'`, `charge_blocker: 'processing'`:
+ *     Stripe has not answered, the intent is LIVE, the claim stays open, and the
+ *     webhook or the sweeper settles it.
+ *   - 402 `payment_failed`: a final decline. It commits: the invoice stays open with
+ *     only the failed charge recorded (PAY-36), the 402 is stored, and a replay
+ *     returns it and tries no card. The next try takes a fresh key. The request cancels
+ *     nothing: the sweeper's watch cancels that intent on a later tick.
+ *   - 409 `idempotency_inflight`: nothing is known yet, and a same-key re-send gets the
+ *     answer once there is one.
  */
 
 export interface InvoicesRouteOptions extends AuthRouteOptions {
@@ -146,39 +139,38 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
   app.post(
     '/invoices/:id/pay',
     { preHandler: [authHook] },
-    async (request, reply): Promise<InvoicePayWire> => {
+    async (request, reply): Promise<InvoicePayWire | ApiErrorEnvelope> => {
       const principal = requirePrincipal(request);
       requireOwner(principal, 'pay an invoice');
       const { id } = parseIdParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
-      // Parse BEFORE the peek: the peek and `withMutation` must agree on the
-      // hash, and since 1.7.0 the chosen card is part of it. Two calls naming
-      // different cards now hash differently — under the old
-      // `hashRequestBody({ id })` they collided, so the second replayed the
-      // first's response and the owner was told a card was charged that wasn't.
+      // Parse BEFORE the peek: the peek and the claim must agree on the hash, and
+      // since 1.7.0 the chosen card is part of it. Two calls naming different cards
+      // hash differently — under the old `hashRequestBody({ id })` they collided, so
+      // the second replayed the first's response and the owner was told a card was
+      // charged that wasn't.
       const payBody = parsePayBody(request.body);
       const requestHash = hashRequestBody({ id, ...payBody });
+      const endpoint = 'POST /invoices/:id/pay';
 
-      // ── Idempotency replay short-circuit ──
-      // The pre-validation below checks `invoice.status === 'open'`, but
-      // this route MUTATES that field on success (open → paid). Without
-      // the early peek a legitimate replay (same key, original call's
-      // 201 already stored) would 409 on the post-paid pre-validation
-      // before withIdempotency could replay. Peek first; replay if
-      // matched; else continue to pre-validation. The peek throws
-      // `idempotency_mismatch` 422 on a key collision with a different
-      // body — same boundary semantic as the inside-tx `withIdempotency`.
-      const replay = await peekCompletedIdempotency<InvoicePayWire>(
+      // ── What the key already answers ──
+      // The pre-validation below checks `invoice.status === 'open'`, but this route
+      // MUTATES that field (open → paid), so without the peek a legitimate replay of
+      // a stored 201 would 409 before anything could replay it. A stored 402 replays
+      // here too, which is why this body is not only `InvoicePayWire`. A key reused
+      // with a different body throws `idempotency_mismatch`; an open claim, 409.
+      const replay = await peekEngineClaim<InvoicePayWire | ApiErrorEnvelope>(
         idempotencyKey,
-        'POST /invoices/:id/pay',
+        endpoint,
         requestHash,
+        principal.ownerId,
       );
       if (replay !== undefined) {
         reply.code(replay.status);
         return replay.body;
       }
 
-      // ── Pre-Stripe validation (pool reads only) ──
+      // ── Pre-validation (pool reads only) ──
       const invoiceRow = await invoicesRepository.findByIdForOwner(db, {
         id,
         ownerId: principal.ownerId,
@@ -202,201 +194,53 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
         paymentMethodId: chargingPaymentMethodId,
       });
 
-      // ── Stripe call (outside tx; idempotency-keyed) ──
-      const intent = await stripe.createAndConfirmPaymentIntent(
+      const result = await confirmCharge(
         {
-          customerId: stripeCtx.stripeCustomerId,
-          paymentMethodId: stripeCtx.stripePaymentMethodId,
-          amountCents: invoiceRow.amountCents,
-          currency: 'usd',
-          metadata: {
-            owner_id: principal.ownerId,
-            invoice_id: invoiceRow.id,
-            purpose: invoiceRow.purpose,
+          actor: actorOf(principal),
+          ownerId: principal.ownerId,
+          claim: {
+            key: idempotencyKey,
+            ownerId: principal.ownerId,
+            endpoint,
+            requestHash,
           },
+          invoiceId: id,
+          card: {
+            paymentMethodId: chargingPaymentMethodId,
+            stripePaymentMethodId: stripeCtx.stripePaymentMethodId,
+            stripeCustomerId: stripeCtx.stripeCustomerId,
+          },
+          inTx1: (tx) => holdInvoiceForPayment(tx, { id, at: opts.now?.(), log: request.log }),
+          stripe,
+          log: request.log,
+          now: opts.now,
         },
-        // Deliberately NOT keyed by the chosen card. Since 1.7.0 the peek above
-        // already 422s a same-key-different-card retry, so the only way to reach
-        // Stripe twice under one key with two cards is a first attempt that
-        // called Stripe and then rolled back without persisting its idempotency
-        // row. Stripe rejects the reused key with changed params, and that loud
-        // error is the outcome we want: the alternative — folding the card into
-        // this key — would make the retry a SECOND capture on top of the first
-        // attempt's orphaned charge. Failing beats charging twice.
-        `${idempotencyKey}:payment-intent`,
+        'leave-invoice-open',
       );
-      const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
-      // Why it stopped, in domain vocabulary — the distinction the line above
-      // destroys by collapsing five Stripe statuses into `requires_payment`,
-      // and the one the copy the owner reads depends on (wire 1.8.0). Derived
-      // in ONE place for all six confirm sites: a thrown card error's `code`
-      // outranks the intent's resting status (which reads the same for a
-      // decline and an authentication failure), except where the status says
-      // money may be in motion. Pre-tx so the warnings inside fire once per
-      // real confirm, not once per replay.
-      const chargeBlocker = chargeBlockerForConfirm(intent, request.log);
 
-      // Non-succeeded confirm: cancel the intent so it can't later auto-succeed
-      // and double-charge against the next attempt's fresh one — the same rule
-      // and the same reason as the auto-charge worker's cancel
-      // (`invoiceAutoCharge.ts`). It applies here too because no client-side 3DS
-      // completion flow exists anywhere in this system, so a live intent buys
-      // nothing to weigh against that hazard; wire 1.7.1 documents
-      // `client_secret` as naming a CANCELLED intent on this arm.
-      //
-      // PRE-TX deliberately: no Stripe call may run inside `withMutation`'s
-      // transaction. Best-effort — an intent Stripe refuses to cancel (a rare
-      // `processing`) is covered by Stripe's changed-params rejection on the
-      // next same-key attempt, and by the duplicate-settle refund on a
-      // fresh-key one.
-      if (chargeStatus !== 'succeeded') {
-        try {
-          await stripe.cancelPaymentIntent(intent.id);
-        } catch (err) {
-          request.log.warn(
-            { err, invoiceId: invoiceRow.id, paymentIntentId: intent.id },
-            'invoice pay: could not cancel unsettled PaymentIntent (best-effort)',
-          );
-        }
-      }
-
-      // Closure-captured handle for the post-commit Stripe refund. Set inside
-      // the withMutation body ONLY when this succeeded charge LOST the settle
-      // race (a concurrent worker auto-charge / webhook flipped the invoice
-      // first); read by the postCommit below. Stays undefined on the clean win
-      // and on the 3DS / requires_action path (postCommit no-ops).
-      let pendingStripeRefund: PendingDuplicateRefund | undefined;
-
-      // ── DB writes (inside withMutation; idempotency-keyed) ──
-      const outcome = await withMutation<InvoicePayWire>(
-        {
-          principal,
-          idempotencyKey,
-          endpoint: 'POST /invoices/:id/pay',
-          requestHash,
-          // Invoices aren't cached, but a §J.1 MEMBERSHIP settle grants a
-          // credit lot inside `settleInvoiceCharge` — the per-dog credit
-          // cache is stale the moment that lands (§3 map: credit_ledger
-          // write → credits:{dogId}:* wipe).
-          patternsToInvalidate: (body) =>
-            body.invoice_status === 'paid' &&
-            invoiceRow.purpose === 'membership' &&
-            invoiceRow.dogId !== null
-              ? [`credits:${invoiceRow.dogId}:*`]
-              : [],
-          // Post-commit Stripe refund for a lost-race duplicate charge. Fires
-          // once per non-replayed outcome; the 'pending' refund row is the
-          // commitment and the webhook reconciles terminal status.
-          //
-          // **Through the shared helper since 2026-08-12 (round 3), and the
-          // idempotency KEY is why.** This used to build its own call keyed
-          // `${idempotencyKey}:dup-settle-refund` — the CLIENT's request key,
-          // which nothing durable can reconstruct afterwards. Every other
-          // caller of this same `settleInvoiceCharge` arm keys the refund by
-          // OUR refund-row uuid, and the new `duplicate-refund-retry` sweep
-          // relies on that: it re-fires unsent `duplicate-invoice-settle` rows
-          // under `duplicateRefundIdempotencyKey(refundId)`. A row written here
-          // but keyed on a request would have been retried under a key Stripe
-          // had never seen — which is how one duplicate charge becomes two
-          // refunds. One row, one key, one refund, whoever fires it.
-          postCommit: async () => {
-            await firePendingRefundPostCommit({
-              pending: pendingStripeRefund,
-              stripe,
-              log: request.log,
-              context: { invoiceId: invoiceRow.id, settlePath: 'invoice-pay-route' },
-            });
-          },
-        },
-        async (tx) => {
-          // 3DS / async path: Stripe didn't settle synchronously, and the intent
-          // was cancelled above. INSERT the charge at its non-succeeded status
-          // as audit trail (R32 keeps it out of the owner ledger) and leave the
-          // invoice open for the owner's next /pay attempt. No race to resolve —
-          // nothing was actually captured.
-          if (chargeStatus !== 'succeeded') {
-            const charge = await chargesRepository.create(tx, {
-              ownerId: principal.ownerId,
-              amountCents: intent.amountCents,
-              status: chargeStatus,
-              purpose: invoiceRow.purpose,
-              stripePaymentIntentId: intent.id,
-              // The invoice's own enrollment anchor (§A3.18 D1), with the
-              // §A3.19 F2 fallback behind it for invoices carrying none.
-              bookingId: await resolveInvoiceAnchorBookingId(tx, invoiceRow, request.log),
-              cohortId: invoiceRow.cohortId,
-              dogId: invoiceRow.dogId,
-            });
-            return {
-              status: 201,
-              body: {
-                charge_id: charge.id,
-                charge_status: chargeStatus,
-                stripe_payment_intent_id: intent.id,
-                client_secret: intent.clientSecret,
-                invoice_status: 'open',
-                charge_refunded: false,
-                charge_blocker: chargeBlocker,
-              },
-            };
-          }
-
-          // Succeeded path: the shared settle primitive INSERTs the charge,
-          // conditionally claims the invoice (open->paid), and on a lost race
-          // writes a 'pending' refund row for this duplicate. notifyOwner=false:
-          // the owner initiated and gets THIS response — a push receipt would
-          // be redundant.
-          const settle = await settleInvoiceCharge(tx, {
-            invoice: invoiceRow,
-            paymentIntentId: intent.id,
-            amountCents: intent.amountCents,
-            purpose: invoiceRow.purpose,
-            notifyOwner: false,
-            log: request.log,
-          });
-
-          if (settle.outcome === 'refunded') {
-            // Lost the race: the invoice is paid (by the winner) and this
-            // duplicate charge is being reversed. Hand the refund to postCommit;
-            // the response carries charge_refunded=true so the client never
-            // claims a clean payment for money on its way back.
-            pendingStripeRefund = settle.pendingStripeRefund;
-          } else if (chargingPaymentMethodId !== invoiceRow.paymentMethodId) {
-            // Clean win on a card the owner PICKED over the bound one: repoint
-            // the invoice at what actually paid it, in the same tx that settled
-            // it. `LedgerEntryWire.settled_card` is derived from
-            // `invoices.payment_method_id` (the `charges` row stores no card),
-            // so without this the receipt would name a card that was never
-            // charged. Same lever, same reason as the expired-card auto-charge
-            // fallback.
-            //
-            // Deliberately NOT on the two other branches: on 'refunded' another
-            // path settled this invoice and its bound card must keep naming
-            // whatever THAT charged; on the 3DS path nothing was captured and
-            // the invoice stays open, so repointing would hand the auto-charge
-            // worker a card the owner never successfully paid with.
-            await repointPaymentMethod(tx, {
-              id: invoiceRow.id,
-              paymentMethodId: chargingPaymentMethodId,
-            });
-          }
-
+      switch (result.kind) {
+        case 'answered':
+          reply.code(result.status);
+          return result.body;
+        case 'processing':
+          // Not stored: the claim stays open, so a same-key request answers 409
+          // until the order settles, and the final answer is what it then replays.
+          reply.code(201);
           return {
-            status: 201,
-            body: {
-              charge_id: settle.chargeId,
-              charge_status: 'succeeded',
-              stripe_payment_intent_id: intent.id,
-              client_secret: intent.clientSecret,
-              invoice_status: 'paid',
-              charge_refunded: settle.outcome === 'refunded',
-            },
+            charge_id: result.chargeId,
+            charge_status: 'requires_payment',
+            stripe_payment_intent_id: result.intent.id,
+            client_secret: result.intent.clientSecret,
+            invoice_status: 'open',
+            charge_refunded: false,
+            charge_blocker: 'processing',
           };
-        },
-      );
-
-      reply.code(outcome.status);
-      return outcome.body;
+        case 'open':
+          throw new ApiError(
+            'idempotency_inflight',
+            'this payment has no answer yet: re-send it under the same Idempotency-Key',
+          );
+      }
     },
   );
 
@@ -593,6 +437,44 @@ async function resolvePaymentDueAnchor(
     }
   }
   return { at: pgTimestampToDate(invoice.dueAt), leadDogId: invoice.dogId };
+}
+
+/**
+ * `/pay`'s work inside tx1: lock the invoice so two tenders serialise, re-check what
+ * the pool read said, refuse while another order's charge on it is inside its lease
+ * (design §2.7:3815), and name what the charge is for. Past the lease the second
+ * tender goes through, and PAY-35 refunds the loser (DECISIONS 142(b)).
+ */
+async function holdInvoiceForPayment(
+  tx: Tx,
+  args: {
+    id: string;
+    at: Date | undefined;
+    log: { warn(obj: Record<string, unknown>, msg: string): void };
+  },
+): Promise<ChargeTerms> {
+  const invoice = await invoicesRepository.lockById(tx, args.id);
+  if (invoice === undefined) {
+    throw new ApiError('not_found', `invoice ${args.id} not found`);
+  }
+  if (invoice.status !== 'open') {
+    throw new ApiError('conflict', `invoice ${args.id} is ${invoice.status}, not open`);
+  }
+  if (await ordersRepository.invoiceHasChargeInLease(tx, { invoiceId: args.id, at: args.at })) {
+    throw new ApiError(
+      'invoice_payment_in_flight',
+      `invoice ${args.id} has another payment in flight`,
+    );
+  }
+  return {
+    amountCents: invoice.amountCents,
+    purpose: invoice.purpose,
+    // The invoice's own enrollment anchor (§A3.18 D1), with the §A3.19 F2 fallback
+    // behind it for invoices carrying none.
+    bookingId: await resolveInvoiceAnchorBookingId(tx, invoice, args.log),
+    cohortId: invoice.cohortId,
+    dogId: invoice.dogId,
+  };
 }
 
 function parseIdParam(params: unknown): { id: string } {

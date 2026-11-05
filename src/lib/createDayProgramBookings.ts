@@ -92,6 +92,8 @@ export interface CreateDayProgramBookingsArgs {
   notes: string | null;
   payment: DayProgramPaymentPlan;
   now: Date;
+  /** The Confirm's order: every session of it carries this id (PAY-U04). */
+  orderId: string;
 }
 
 export interface CreateDayProgramBookingsResult {
@@ -279,6 +281,7 @@ export async function createDayProgramBookings(
           notes: args.notes,
           cancelDeadlineAt,
           additionalDogIds: args.additionalDogIds,
+          orderId: args.orderId,
         });
 
         if (paygPlan !== null) {

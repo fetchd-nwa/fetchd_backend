@@ -27,7 +27,7 @@ import { registerRequestsRoute } from '../../src/routes/requests.js';
 import { registerStaffAlumniRoute } from '../../src/routes/staffAlumni.js';
 import { CURRICULUM_PROGRAMS } from '../../src/lib/alumni.js';
 import { createBookableDog, removeDogs } from './_dayFixture.js';
-import { clearInvoiceChargeAttempts, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -264,7 +264,7 @@ async function clearMemberships(): Promise<void> {
       ),
     );
   await db.delete(creditLedger).where(eq(creditLedger.reason, 'membership-grant'));
-  await clearInvoiceChargeAttempts();
+  await clearInvoiceReferrers();
   await db.delete(invoices).where(isNotNull(invoices.membershipId));
   const chargeIds = (
     await db.select({ id: charges.id }).from(charges).where(eq(charges.purpose, 'membership'))

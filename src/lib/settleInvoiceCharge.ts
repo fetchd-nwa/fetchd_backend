@@ -17,6 +17,7 @@ import { scheduledNotificationsRepository } from '../db/repositories/scheduledNo
 import type { Tx } from '../db/tx.js';
 import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
 import { nextMonthlyPeriodEnd } from './membershipBilling.js';
+import { noticeInSavepoint, type NoticeLog } from './noticeInSavepoint.js';
 import type { PendingStripeRefund } from './pendingRefund.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
 
@@ -61,10 +62,9 @@ export interface SettleInvoiceChargeArgs {
   purpose: ChargePurpose;
   /**
    * Whether to emit the `payment-succeeded` receipt when THIS path settles.
-   * The worker passes true (it initiates silently -- the owner only learns via
-   * the feed). The manual `/invoices/:id/pay` route passes false: the owner
-   * initiated and gets the HTTP response, so a push receipt would be redundant.
-   * The refund (lost-race) branch never notifies under either caller.
+   * Every settler says true since P15: the order engine's settle enqueues it, once,
+   * in the transaction that moves the charge. The refund (lost-race) branch never
+   * notifies.
    */
   notifyOwner: boolean;
   /** Settle instant — the §J.1 membership grant's late-settle floor reads it
@@ -72,11 +72,11 @@ export interface SettleInvoiceChargeArgs {
    * their pinned `now`. */
   now?: Date;
   /**
-   * Where the NULL-anchor fallback's WARN goes (§A3.19 F2). Optional because
-   * not every caller has a logger in scope, but a caller that omits it makes
-   * the tripwire silent — plumb it.
+   * Where the NULL-anchor fallback's WARN goes (§A3.19 F2), and a failed notice's
+   * alarm. Optional because not every caller has a logger in scope, but a caller that
+   * omits it makes the tripwire silent — plumb it.
    */
-  log?: AnchorResolutionLog;
+  log?: AnchorResolutionLog & Partial<NoticeLog>;
 }
 
 /** The one thing the anchor fallback needs from a logger. */
@@ -85,10 +85,22 @@ export interface AnchorResolutionLog {
 }
 
 /**
- * The ONE post-Stripe invoice-settlement primitive both settle paths call --
- * the worker auto-charge and the manual `POST /invoices/:id/pay`. It runs
- * AFTER a path's own Stripe PaymentIntent has already SUCCEEDED, inside one
- * short tx, and resolves the double-charge race between the two paths:
+ * The receipt on today's queue (P15; design §2.7:3888): `scheduled_notifications`,
+ * so the push leaves on the next tick after the money (answer 2). `trigger` is
+ * `order-confirm` from the owner's own request and `settle` from a webhook or a
+ * sweeper (§2.9). Absent, the receipt is the feed row it has always been.
+ */
+export interface ReceiptPush {
+  trigger: 'order-confirm' | 'settle';
+  scheduledFor: Date;
+}
+
+/**
+ * The ONE post-Stripe invoice-settlement primitive every settle path calls: the
+ * worker auto-charge and the webhook's orphan arm here, and the order engine (so
+ * `POST /invoices/:id/pay`) through {@link settleChargeAgainstInvoice}, its second
+ * half. It runs AFTER a path's own Stripe PaymentIntent has already SUCCEEDED,
+ * inside one short tx, and resolves the double-charge race between the paths:
  *
  *   1. INSERT the succeeded `charges` row for this PI.
  *   2. CONDITIONAL `markPaid` -- `invoicesRepository.markPaid` filters
@@ -115,8 +127,7 @@ export async function settleInvoiceCharge(
   tx: Tx,
   args: SettleInvoiceChargeArgs,
 ): Promise<SettleInvoiceChargeResult> {
-  const { invoice, paymentIntentId, amountCents, purpose, notifyOwner } = args;
-  const now = args.now ?? new Date();
+  const { invoice, paymentIntentId, amountCents, purpose } = args;
 
   const charge = await chargesRepository.create(tx, {
     ownerId: invoice.ownerId,
@@ -132,16 +143,33 @@ export async function settleInvoiceCharge(
     cohortId: invoice.cohortId,
     dogId: invoice.dogId,
   });
+  return settleChargeAgainstInvoice(tx, { ...args, chargeId: charge.id });
+}
+
+/**
+ * The second half of {@link settleInvoiceCharge}, for a charge row that already
+ * exists: the order engine writes its charge in tx1, so its settle arrives here with
+ * the row in hand. Everything the invoice owes the money happens in this one place,
+ * so PAY-35 is one arm whoever settles: the claim, or on a lost race the refund.
+ */
+export async function settleChargeAgainstInvoice(
+  tx: Tx,
+  args: SettleInvoiceChargeArgs & { chargeId: string; receiptPush?: ReceiptPush },
+): Promise<SettleInvoiceChargeResult> {
+  const { invoice, paymentIntentId, amountCents, purpose, notifyOwner, chargeId } = args;
+  const now = args.now ?? new Date();
 
   const claimed = await claimInvoiceWithCharge(tx, {
     invoice,
-    chargeId: charge.id,
+    chargeId,
     amountCents,
     purpose,
     notifyOwner,
     now,
+    ...(args.receiptPush !== undefined ? { receiptPush: args.receiptPush } : {}),
+    ...(args.log?.error !== undefined ? { log: args.log as NoticeLog } : {}),
   });
-  if (claimed) return { outcome: 'settled', chargeId: charge.id };
+  if (claimed) return { outcome: 'settled', chargeId };
 
   // Lost the race: the invoice was already settled by the other path. This
   // charge double-bills the same money -> refund it.
@@ -169,7 +197,7 @@ export async function settleInvoiceCharge(
   // predicate as every other writer instead of leaving `reason` to carry the
   // meaning (design §2.1).
   const minted = await refundsRepository.mintCappedPendingRefund(tx, {
-    chargeId: charge.id,
+    chargeId,
     ownerId: invoice.ownerId,
     bookingId: invoice.bookingId,
     // Load-bearing since 2026-08-12: this exact string is what the
@@ -181,12 +209,12 @@ export async function settleInvoiceCharge(
     stripeIdempotencyKey: duplicateRefundIdempotencyKey,
   });
   if (minted.kind !== 'minted') {
-    return { outcome: 'refunded', chargeId: charge.id, pendingStripeRefund: undefined };
+    return { outcome: 'refunded', chargeId, pendingStripeRefund: undefined };
   }
 
   return {
     outcome: 'refunded',
-    chargeId: charge.id,
+    chargeId,
     pendingStripeRefund: {
       refundId: minted.refundId,
       paymentIntentId,
@@ -293,6 +321,10 @@ export async function claimInvoiceWithCharge(
     purpose: ChargePurpose;
     notifyOwner: boolean;
     now?: Date;
+    /** Set: the receipt goes on the push queue. Unset: the feed row it always was. */
+    receiptPush?: ReceiptPush;
+    /** A failed receipt's alarm. Unset, it goes to stderr rather than nowhere. */
+    log?: NoticeLog;
   },
 ): Promise<boolean> {
   const { invoice, chargeId, amountCents, purpose, notifyOwner } = args;
@@ -314,21 +346,51 @@ export async function claimInvoiceWithCharge(
     await grantMembershipMonth(tx, { invoice, chargeId, now: args.now ?? new Date() });
   }
   if (notifyOwner) {
-    await notificationsRepository.enqueue(tx, {
-      ownerId: invoice.ownerId,
-      type: 'payment-succeeded',
-      title: 'Payment received',
-      body: `We charged your card ${formatDollars(amountCents)} for your ${purposeLabel(
-        purpose,
-      )}.`,
-      deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
-      deepLinkKind: 'invoice',
-      deepLinkId: invoice.id,
-      dogIds: invoice.dogId ? [invoice.dogId] : [],
-    });
+    // A notice never un-records money (design §2.7:3993-3998): its own savepoint,
+    // its body composed inside it, and on any error one alarm and the money commits.
+    const dedupeKey = `receipt:${chargeId}`;
+    const { receiptPush } = args;
+    await noticeInSavepoint(
+      tx,
+      { subject: { chargeId }, dedupeKey, log: args.log ?? STDERR_NOTICE_LOG },
+      async (sp) => {
+        const receipt = {
+          ownerId: invoice.ownerId,
+          type: 'payment-succeeded',
+          title: 'Payment received',
+          body: `We charged your card ${formatDollars(amountCents)} for your ${purposeLabel(
+            purpose,
+          )}.`,
+          deepLinkPath: deepLinkToPath({ kind: 'invoice', id: invoice.id }),
+          deepLinkKind: 'invoice',
+          deepLinkId: invoice.id,
+        } as const;
+        if (receiptPush === undefined) {
+          await notificationsRepository.enqueue(sp, {
+            ...receipt,
+            dogIds: invoice.dogId ? [invoice.dogId] : [],
+          });
+          return;
+        }
+        await scheduledNotificationsRepository.enqueueIdempotent(sp, {
+          ...receipt,
+          trigger: receiptPush.trigger,
+          dedupeKey,
+          scheduledFor: receiptPush.scheduledFor,
+          ...(invoice.dogId !== null ? { dogId: invoice.dogId } : {}),
+        });
+      },
+    );
   }
   return true;
 }
+
+/** For the settlers with no logger in scope: an alarm goes somewhere a human can read. */
+const STDERR_NOTICE_LOG: NoticeLog = {
+  error(obj, msg) {
+    process.stderr.write(`${msg ?? ''} ${JSON.stringify(obj)}\n`);
+  },
+};
 
 /**
  * THE Stripe idempotency key for a lost-race duplicate refund. Keyed on OUR

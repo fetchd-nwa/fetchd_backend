@@ -115,7 +115,7 @@ CREATE TYPE service_category AS ENUM (
   'day-school', 'day-care', 'group-class', 'private-lesson',
   'board-and-train', 'boarding', 'evaluation'
 );
-CREATE TYPE booking_status     AS ENUM ('upcoming', 'past', 'cancelled');
+CREATE TYPE booking_status     AS ENUM ('upcoming', 'past', 'cancelled', 'payment-pending');
 CREATE TYPE booking_attendance AS ENUM ('pending', 'attended', 'no-show', 'excused');
 CREATE TYPE request_status     AS ENUM ('submitted', 'approved', 'approved-awaiting-payment', 'converted', 'cancelled');
 CREATE TYPE scheduled_status   AS ENUM ('pending', 'sent', 'cancelled');
@@ -705,6 +705,26 @@ CREATE INDEX media_derivative_jobs_pending_idx
   ON media_derivative_jobs (created_at) WHERE status = 'pending';
 
 -- ----------------------------------------------------------------------------
+-- Orders (M3.02, S20; PAY-U04). One Confirm: at most one charge, the row with
+-- `charges.order_id` set, and any session rows, each with `bookings.order_id`
+-- set. Stores no status: an order's money is read from its charge. A credits-only
+-- Confirm is an order with no charge; a walk-in opens no order.
+--
+-- `invoice_id` names the invoice an invoice payment pays (many orders may try one
+-- invoice, one at a time). `invoices.order_id` is the other direction, written only
+-- by a purchase's settle, and unique. FK added AFTER CREATE TABLE invoices below.
+-- ----------------------------------------------------------------------------
+CREATE TABLE orders (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id   uuid NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  invoice_id uuid
+);
+REVOKE ALL ON orders FROM anon, authenticated;
+CREATE INDEX orders_owner_idx ON orders (owner_id);
+CREATE INDEX orders_invoice_idx ON orders (invoice_id) WHERE invoice_id IS NOT NULL;
+
+-- ----------------------------------------------------------------------------
 -- Bookings (R1 multi-dog via join table; explicit report FK fixes gotcha #8)
 -- ----------------------------------------------------------------------------
 CREATE TABLE bookings (
@@ -759,6 +779,9 @@ CREATE TABLE bookings (
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
   expired_at        timestamptz,                     -- NULL = live; cancellation sets status, deletion expires
+  -- M3.02: the order this session belongs to. Set only by `POST /bookings`; a
+  -- walk-in, a class row, a request row and an evaluation row stay NULL.
+  order_id          uuid REFERENCES orders(id),
   -- #7 cross-column guards: cohort iff group-class; stay window only for stays.
   CHECK ((category = 'group-class') = (cohort_id IS NOT NULL)),
   CHECK (dropoff_at IS NULL OR category IN ('boarding','board-and-train'))
@@ -769,6 +792,7 @@ CREATE INDEX bookings_cohort_idx      ON bookings (cohort_id);
 CREATE INDEX bookings_status_time_idx ON bookings (status, scheduled_at);
 CREATE INDEX bookings_dropoff_idx ON bookings (dropoff_at) WHERE dropoff_at IS NOT NULL;
 CREATE INDEX bookings_location_time_idx ON bookings (location, scheduled_at);
+CREATE INDEX bookings_order_idx ON bookings (order_id) WHERE order_id IS NOT NULL;
 CREATE UNIQUE INDEX bookings_source_ref_uidx
   ON bookings (source, external_ref) WHERE expired_at IS NULL;
 
@@ -1731,9 +1755,38 @@ CREATE TABLE charges (
   cohort_id               uuid REFERENCES cohorts(id),
   dog_id                  uuid REFERENCES dogs(id),
   created_at              timestamptz NOT NULL DEFAULT now(),
-  updated_at              timestamptz NOT NULL DEFAULT now()
+  updated_at              timestamptz NOT NULL DEFAULT now(),
+  -- M3.02 (PAY-U04, PAY-U05). `order_id` set means the charge is the order
+  -- engine's (`lib/confirmCharge.ts`), the order's one charge.
+  --   stripe_idempotency_key: K0, the order-scoped key of the one create.
+  --   attempt_count: confirms sent, committed before each call.
+  --   blocker, last_stripe_error: the stored outcome of the last try.
+  --   attempting_until: the lease. Past it, the sweeper owns the charge.
+  --   next_sweep_at: `attempting_until` is the request's and `next_sweep_at` is the
+  --     sweeper's. On a `requires_payment` charge, `next_sweep_at` set means the
+  --     sweeper has claimed it, and the request may not write again. On a `failed`
+  --     charge, set means its intent can still move and the sweeper looks again at
+  --     this time; NULL means there is nothing left to look at.
+  --   stripe_customer_id, stripe_payment_method_id: with amount_cents, the frozen
+  --     create parameters, repeated byte for byte on a re-send under K0.
+  --   payment_method_id: our card row, which the settle rebinds an invoice to.
+  order_id                 uuid REFERENCES orders(id),
+  stripe_idempotency_key   text,
+  attempt_count            integer NOT NULL DEFAULT 0,
+  blocker                  text,
+  attempting_until         timestamptz,
+  next_sweep_at            timestamptz,
+  last_stripe_error        text,
+  stripe_customer_id       text,
+  stripe_payment_method_id text,
+  payment_method_id        uuid REFERENCES payment_methods(id)
 );
 CREATE INDEX charges_owner_idx ON charges (owner_id);
+CREATE UNIQUE INDEX charges_order_id_uidx ON charges (order_id);
+CREATE INDEX charges_attempting_idx ON charges (attempting_until)
+  WHERE status = 'requires_payment' AND order_id IS NOT NULL;
+CREATE INDEX charges_watch_idx ON charges (next_sweep_at)
+  WHERE status = 'failed' AND next_sweep_at IS NOT NULL;
 -- Δ 2026-08-22 (ADDENDUM 3 §A3.18 D6). `booking_id` stopped being a passive
 -- back-reference when §A3.17 made it money-path IDENTITY: it is read by the
 -- enrollment-membership rule on every withdraw, every reconciler tick and every
@@ -1791,11 +1844,22 @@ CREATE TABLE invoices (
   paid_at        timestamptz,
   external_ref   text,
   source         record_source NOT NULL DEFAULT 'app',
+  -- M3.02: written only by a purchase's settle. An invoice an order PAYS is named
+  -- by `orders.invoice_id`, not here.
+  order_id       uuid REFERENCES orders(id),
   UNIQUE (source, external_ref),
   CHECK (status <> 'paid' OR paid_at IS NOT NULL)        -- #7: paid implies paid_at
 );
 CREATE INDEX invoices_owner_idx  ON invoices (owner_id);
 CREATE INDEX invoices_open_idx   ON invoices (status) WHERE status = 'open';
+-- Plain, not partial: NULLs never conflict, so it holds the invoices with no order,
+-- and `ON CONFLICT (order_id)` infers it with no WHERE repeated. A partial index
+-- answers 42P10 to that statement after Stripe has taken the money.
+CREATE UNIQUE INDEX invoices_order_id_uidx ON invoices (order_id);
+
+ALTER TABLE orders
+  ADD CONSTRAINT orders_invoice_id_fkey
+  FOREIGN KEY (invoice_id) REFERENCES invoices(id);
 
 -- ----------------------------------------------------------------------------
 -- Invoice charge attempts (2026-08-12, `designs/auto-charge-unknown-outcome.md`).
@@ -2100,8 +2164,13 @@ ON CONFLICT (id) DO NOTHING;
 -- response; else INSERT 'in-flight', do the work, record the response.
 -- request_hash guards against a key reused with a different body. This is the
 -- ONE table EXEMPT from the never-delete rule — it is transport-layer dedupe,
--- not business state; a TTL sweep prunes rows past the retry-safety window
--- (e.g. 24h). No audit trigger, no expired_at, by design.
+-- not business state; a TTL sweep prunes rows past the retry-safety window. No
+-- audit trigger, no expired_at, by design.
+--
+-- M3.02: an order-engine claim carries `order_id` and stays open (completed_at
+-- NULL) until the order settles, so the sweep takes completed rows past 24h and
+-- open ones past 7 days (`db/idempotency.ts`). That engine also stores one error:
+-- the committed 402 `payment_failed`, as the envelope the API sends.
 -- ----------------------------------------------------------------------------
 CREATE TABLE idempotency_keys (
   key             text PRIMARY KEY,                       -- client-supplied UUID
@@ -2111,9 +2180,11 @@ CREATE TABLE idempotency_keys (
   response_status integer,
   response_body   jsonb,
   created_at      timestamptz NOT NULL DEFAULT now(),
-  completed_at    timestamptz                              -- NULL = in-flight
+  completed_at    timestamptz,                             -- NULL = in-flight
+  order_id        uuid REFERENCES orders(id)
 );
 CREATE INDEX idempotency_keys_created_idx ON idempotency_keys (created_at);
+CREATE INDEX idempotency_keys_order_idx ON idempotency_keys (order_id) WHERE order_id IS NOT NULL;
 
 -- ----------------------------------------------------------------------------
 -- Messaging (R3: thread.owner_id; polymorphic message sender owner|staff)

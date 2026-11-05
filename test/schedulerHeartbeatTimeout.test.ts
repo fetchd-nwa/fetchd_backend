@@ -58,6 +58,7 @@ const TICK_RESULT_JSON = JSON.stringify({
   },
   membershipRoll: { scanned: 0, rolled: 0, completed: 0 },
   invoiceAttemptVerify: { scanned: 0 },
+  orderSweeper: { scanned: 0, abandoned: 0, settled: 0, failed: 0, lateRefunded: 0, left: 0 },
   captureReconciler: {
     scanned: 0,
     captured: 0,

@@ -472,6 +472,7 @@ test(
         endpoint: 'POST /test/stale',
         requestHash: 'hash-stale',
         createdAt: stale.toISOString(),
+        completedAt: stale.toISOString(),
       },
       {
         key: freshKey,
@@ -623,8 +624,12 @@ test(
       endpoint: 'POST /test/sweep-direct',
       requestHash: 'hash-direct',
       createdAt: new Date(cutoff.getTime() - 1000).toISOString(),
+      completedAt: new Date(cutoff.getTime() - 1000).toISOString(),
     });
-    const swept = await sweepExpiredIdempotencyKeys({ olderThan: cutoff });
+    const swept = await sweepExpiredIdempotencyKeys({
+      completedBefore: cutoff,
+      openBefore: new Date(cutoff.getTime() - 7 * 86_400_000),
+    });
     assert.ok(swept >= 1);
     // Make sure leftover from earlier failures don't poison this test
     await db.delete(idempotencyKeys).where(lt(idempotencyKeys.createdAt, sql`now()`));

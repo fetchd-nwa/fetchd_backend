@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import { invoices as invoicesTable, serviceRates } from '../../src/db/schema/schema.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffRatesRoute } from '../../src/routes/staffRates.js';
@@ -643,7 +644,7 @@ test(
       },
     });
     assert.equal(booking.statusCode, 201, booking.body);
-    const bookingId = (booking.json() as Array<{ id: string }>)[0]!.id;
+    const bookingId = (booking.json() as PostBookingsResponse).sessions[0]!.id;
     const [invoice] = await db
       .select({ amountCents: invoicesTable.amountCents })
       .from(invoicesTable)

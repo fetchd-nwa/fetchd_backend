@@ -1,21 +1,26 @@
-import { deepLinkToPath } from '../contracts/wire.js';
+import { db } from '../db/client.js';
+import { lockCharge } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
-import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
-import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
-import type { ServiceCategory } from './bookingBucket.js';
 import type { BookingWire } from './bookingWire.js';
+import { askWhatWon, cancelOrderInTx, type WhatWon } from './cancelOrder.js';
+import { readEngineBudget, type EngineLog } from './confirmCharge.js';
 import { ApiError } from './errors.js';
+import {
+  noticeBookingCancelled,
+  returnDebitsToLots,
+  tearDownBookingReminders,
+} from './orderRows.js';
 import {
   logUnroutableRefundMint,
   type PendingStripeRefund,
   type UnroutableRefundMint,
 } from './pendingRefund.js';
+import type { StripeClient } from './stripe.js';
 import { wireManyBookings } from './wireManyBookings.js';
 
 export type { PendingStripeRefund };
@@ -101,38 +106,66 @@ export async function cancelBookingInTx(
      * (see the mint below) and a default no-op logger would make losing it a
      * silent, one-argument mistake.
      */
-    log: { error(obj: Record<string, unknown>, msg?: string): void };
+    log: EngineLog;
+    /**
+     * What Stripe said about this row's pending order, asked by the route with no
+     * transaction open ({@link askWhatWonForPendingRow}). `undefined` on any other row.
+     */
+    whatWon?: WhatWon | undefined;
   },
 ): Promise<CancelBookingResult> {
   const { id, requireOwnerId, cancelledBy, cancelReason, now, stripeIdempotencyKey, log } = args;
 
-  // 1. Row-lock; serialize concurrent cancels. 404 collapses not-found,
-  //    expired, and (owner route only) not-yours into one response.
-  const row = await bookingsRepository.lockById(tx, id);
-  if (
-    row === undefined ||
-    row.expiredAt !== null ||
-    (requireOwnerId !== null && row.ownerId !== requireOwnerId)
-  ) {
-    throw new ApiError('not_found', `booking ${id} not found`);
+  // 1. Refusals that write nothing, on a plain read: the 404 collapses not-found,
+  //    expired and (owner route only) not-yours into one response, and the class
+  //    refusal runs first for every booking-level cancel, owner or staff, pending or
+  //    not (design §2.7:4007-4009).
+  const seen = await bookingsRepository.findFullByIdInTx(tx, id);
+  assertCancellable(seen, id, requireOwnerId);
+
+  // 2. The lock order: charge, then the row, then the pool (`db/locks.ts`). A row whose
+  //    order has a charge takes the charge first, so two cancels of one order, and a
+  //    cancel against a settle, serialise there. Today's plain rows have no order and
+  //    lock only themselves.
+  if (seen.orderId !== null) {
+    const charge = await chargesRepository.findEngineByOrderId(tx, seen.orderId);
+    if (charge !== undefined) await lockCharge(tx, charge.id);
   }
+  const row = await bookingsRepository.lockById(tx, id);
+  assertCancellable(row, id, requireOwnerId);
   if (row.status === 'cancelled') {
     throw new ApiError('conflict', `booking ${id} is already cancelled`);
   }
-  if (row.category === 'group-class') {
-    throw new ApiError(
-      'invalid_payload',
-      'group-class bookings cancel via cohort withdraw — not yet implemented',
-    );
+
+  // 3. A pending row cancels the whole order, and a per-session cancel exists only
+  //    once the rows are `upcoming`. A row that was pending when the route asked and
+  //    has since settled falls through to the ordinary cancel below.
+  if (row.status === 'payment-pending') {
+    if (row.orderId === null || args.whatWon === undefined) {
+      throw new Error(`booking ${id} is payment-pending and nothing asked Stripe about it`);
+    }
+    const cancelled = await cancelOrderInTx(tx, {
+      orderId: row.orderId,
+      whatWon: args.whatWon,
+      cancelledBy,
+      ...(cancelReason !== undefined ? { cancelReason } : {}),
+      log,
+      now,
+    });
+    return {
+      wire: await wireOne(tx, id),
+      pendingStripeRefund: cancelled.act.pendingStripeRefund,
+      creditRefundedDogIds: cancelled.cancelled?.creditRefundedDogIds ?? [],
+    };
   }
 
-  // 2. Soft-cancel. `cancelForfeited` is computed in SQL against the
+  // 4. Soft-cancel. `cancelForfeited` is computed in SQL against the
   //    stamped `cancel_deadline_at` and the caller's `now`; the resolved
   //    value lands on commit.
   //    `cancelledBy` + `cancelReason` (R5) record WHO/WHY for the banner.
   await bookingsRepository.markCancelled(tx, { id, cancelledBy, cancelReason, now });
 
-  // 3. Re-read so the refund branch reads the resolved `cancelForfeited`
+  // 5. Re-read so the refund branch reads the resolved `cancelForfeited`
   //    (not the pre-update snapshot).
   const updated = await bookingsRepository.findFullByIdInTx(tx, id);
   if (updated === undefined) {
@@ -141,43 +174,20 @@ export async function cancelBookingInTx(
 
   // The booking's open PAYG invoice, if any — its pending auto-charge is voided
   // on a within-window cancel (below), and its pay-in-person reminder is torn
-  // down in step 5 (R3). Read once now: the void flips it to 'void', so the id
+  // down in step 7 (R3). Read once now: the void flips it to 'void', so the id
   // must be captured before then to survive the teardown lookup.
   const linkedOpenInvoice = await invoicesRepository.findOpenForBooking(tx, { bookingId: id });
 
-  // 4. Refund branching — within the cancel window only.
+  // 6. Refund branching — within the cancel window only.
   let pendingStripeRefund: PendingStripeRefund | undefined;
   let unroutableRefund: UnroutableRefundMint | undefined;
-  const creditRefundedDogIds = new Set<string>();
+  let creditRefundedDogIds: string[] = [];
   if (!updated.cancelForfeited) {
-    const debits = await creditLedgerRepository.findDebitsForBooking(tx, id);
-    if (debits.length > 0) {
-      // CREDIT-BACK: one +1 refund row per original debit, routed back to the
-      // lot it drew from (or a fresh lot if that lot has since expired).
-      // §J.3: an alumni dog's fresh re-mint never expires — one status read
-      // per distinct dog, memoized across this booking's debits. `now` is the
-      // caller's cancel instant (destructured above), so the lot the refund
-      // lands in is dated by the same clock the forfeit check used.
-      const alumniByDogId = new Map<string, boolean>();
-      for (const debit of debits) {
-        let dogIsAlumni = alumniByDogId.get(debit.dogId);
-        if (dogIsAlumni === undefined) {
-          dogIsAlumni = await dogProgramsRepository.isAlumni(debit.dogId, tx);
-          alumniByDogId.set(debit.dogId, dogIsAlumni);
-        }
-        await creditLedgerRepository.refundForBooking(tx, {
-          dogId: debit.dogId,
-          mode: debit.mode,
-          location: debit.location,
-          bookingId: id,
-          lotId: debit.lotId,
-          lotExpiresAt: debit.lotExpiresAt,
-          now,
-          dogIsAlumni,
-        });
-        creditRefundedDogIds.add(debit.dogId);
-      }
-    } else {
+    // CREDIT-BACK: one +1 refund row per original debit, routed back to the lot it
+    // drew from. `now` is the caller's cancel instant, so the lot the refund lands in
+    // is dated by the same clock the forfeit check used.
+    creditRefundedDogIds = await returnDebitsToLots(tx, { bookingId: id, now });
+    if (creditRefundedDogIds.length === 0) {
       const charge = await chargesRepository.findSucceededForBooking(tx, id);
       if (charge !== undefined) {
         // MONEY-BACK: refunds row at 'pending'; cumulative-refund rule
@@ -269,25 +279,19 @@ export async function cancelBookingInTx(
   }
   // Forfeited branch: no refund of any kind.
 
-  // 5. booking-cancelled notification to the booking's owner (dog chips
-  //    resolved from booking_dogs).
-  const dogJoinRows = await bookingsRepository.findDogsByBookingIds([id]);
-  const dogIds = dogJoinRows.map((r) => r.dogId);
-  await notificationsRepository.enqueue(tx, {
+  // 7. booking-cancelled notification to the booking's owner (dog chips
+  //    resolved from booking_dogs), in its own savepoint: a notice never un-records
+  //    the credit or the refund above.
+  await noticeBookingCancelled(tx, {
+    bookingId: id,
     ownerId: row.ownerId,
-    type: 'booking-cancelled',
-    title: 'Booking cancelled',
-    body: cancellationBody(row.category, row.scheduledAt, updated.cancelForfeited),
-    deepLinkPath: deepLinkToPath({ kind: 'booking', id }),
-    deepLinkKind: 'booking',
-    deepLinkId: id,
-    dogIds,
+    category: row.category,
+    scheduledAt: row.scheduledAt,
+    forfeited: updated.cancelForfeited,
+    log,
   });
 
-  // D4: a cancelled booking must never push "reminder tomorrow" / "drop-off
-  // tomorrow" — cancel any still-pending reminder rows for it in the same tx.
-  await scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `booking-reminder:${id}`);
-  await scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `boarding-24h:${id}`);
+  await tearDownBookingReminders(tx, id);
   // R3: same rule for a pay-in-person invoice linked to this booking — with no
   // drop-off left, its "bring $… at drop-off" reminder is stale. Keyed by
   // invoice id (`payment-due:<invoiceId>`), so cancel by the captured invoice.
@@ -298,60 +302,63 @@ export async function cancelBookingInTx(
     );
   }
 
-  // 6. Wire the updated row for the response.
+  // 8. Wire the updated row for the response.
+  return {
+    wire: await wireOne(tx, id),
+    pendingStripeRefund,
+    unroutableRefund,
+    creditRefundedDogIds,
+  };
+}
+
+/** The 404 collapse and the class refusal, before the lock and again under it. */
+function assertCancellable<
+  Row extends { expiredAt: string | null; ownerId: string; category: string },
+>(row: Row | undefined, id: string, requireOwnerId: string | null): asserts row is Row {
+  if (
+    row === undefined ||
+    row.expiredAt !== null ||
+    (requireOwnerId !== null && row.ownerId !== requireOwnerId)
+  ) {
+    throw new ApiError('not_found', `booking ${id} not found`);
+  }
+  if (row.category === 'group-class') {
+    throw new ApiError(
+      'invalid_payload',
+      'group-class bookings cancel via cohort withdraw — not yet implemented',
+    );
+  }
+}
+
+async function wireOne(tx: Tx, id: string): Promise<BookingWire> {
+  const updated = await bookingsRepository.findFullByIdInTx(tx, id);
+  if (updated === undefined) {
+    throw new Error(`cancelBooking ${id}: row vanished after mark-cancelled`);
+  }
   const [wire] = await wireManyBookings([updated]);
   if (wire === undefined) {
     throw new Error(`cancelBooking ${id}: wire assembly returned no row`);
   }
-  return {
-    wire,
-    pendingStripeRefund,
-    unroutableRefund,
-    creditRefundedDogIds: [...creditRefundedDogIds],
-  };
+  return wire;
 }
 
 /**
- * Notification body for the booking-cancelled push. Brief, category-
- * aware, mentions the forfeit state when applicable so the owner doesn't
- * have to open the booking detail to learn the refund didn't land.
- *
- * "Refund is on the way" also covers the `'unroutable'` branch, where it is
- * true because a human will send the money by hand rather than because a worker
- * will. Flagged to Allison with exactly that caveat and **ruled KEEP on
- * 2026-08-20 — explicitly including refunds a human sends by hand** (the money
- * IS coming; the owner does not need to know which channel carries it). Do not
- * "fix" this to a hedged variant without a new ruling.
- *
- * Provenance, because an earlier version of this comment cited the wrong date:
- * 2026-08-19's only ruling was the two flagged push titles. This copy ruling is
- * 2026-08-20.
+ * The half of a pending row's cancel that runs BEFORE the transaction: ask Stripe what
+ * won, with none open (R5). `undefined` for every row that is not pending, which is
+ * every row until P18, so an ordinary cancel asks Stripe nothing. A row this request
+ * may not touch is left to the transaction's own 404, unasked.
  */
-function cancellationBody(
-  category: ServiceCategory,
-  scheduledAtIso: string,
-  forfeited: boolean,
-): string {
-  const when = new Date(scheduledAtIso).toLocaleDateString('en-US', {
-    timeZone: 'America/Chicago',
-    month: 'short',
-    day: 'numeric',
-  });
-  const noun =
-    category === 'boarding'
-      ? `boarding stay starting ${when}`
-      : category === 'board-and-train'
-        ? `board & train starting ${when}`
-        : category === 'private-lesson'
-          ? `private lesson on ${when}`
-          : category === 'day-school'
-            ? `day school on ${when}`
-            : category === 'day-care'
-              ? `day care on ${when}`
-              : category === 'evaluation'
-                ? `evaluation on ${when}`
-                : `session on ${when}`;
-  return forfeited
-    ? `Your ${noun} is cancelled. The cancellation window has passed — no refund.`
-    : `Your ${noun} is cancelled. Refund is on the way.`;
+export async function askWhatWonForPendingRow(args: {
+  id: string;
+  requireOwnerId: string | null;
+  stripe: Pick<StripeClient, 'retrievePaymentIntent' | 'cancelPaymentIntent'>;
+}): Promise<WhatWon | undefined> {
+  const row = await bookingsRepository.findFullByIdInTx(db, args.id);
+  if (row === undefined || row.status !== 'payment-pending' || row.orderId === null) {
+    return undefined;
+  }
+  if (args.requireOwnerId !== null && row.ownerId !== args.requireOwnerId) return undefined;
+  const charge = await chargesRepository.findEngineByOrderId(db, row.orderId);
+  if (charge === undefined) return undefined;
+  return askWhatWon({ charge, stripe: args.stripe, budget: await readEngineBudget() });
 }

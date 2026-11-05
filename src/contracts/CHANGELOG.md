@@ -12,6 +12,95 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [4.0.0-lg3.2] — 2026-11-05
+
+BREAKING. LG3's second step, step 2 of 3 toward 4.0.0 (plan unit P15, slice S20,
+ledger PAY-U04, PAY-U05, PAY-U07, and PAY-U01, which keeps code and has no wire
+of its own; migrations M3.02, M3.03; design §1.1 4.0.0,
+`designs/fetchd-v1-technical-design.md:857-899`, `:925-928`; §2.7 `:3799-4030`).
+Contract-first: the routes keep today's behaviour until P15's backend lands them
+and the two migrations. Resync both clients (`npm run sync:contracts` in mobile
+and portal). Against the resynced copy (a scratch run at their HEADs, not their
+gates) both clients typecheck unchanged. That does not mean mobile is safe: its
+`POST /bookings` call is a cast, so it compiles and then throws on every booking
+until P15's mobile builder lands. The backend fails at one site,
+`contracts/conformance.ts:79`, until M3.03's value reaches `schema.ts`.
+
+Breaking:
+
+- `POST /bookings` returns 201 `PostBookingsResponse {order: OrderWire, sessions:
+  BookingWire[]}` instead of `BookingWire[]` (PAY-U04, DAY-U16). One Confirm is
+  one order, credits-only included. `sessions` holds one row per date, ascending.
+  `order.charge_status` is `'none'` unless a top-up was charged, so it is always
+  `'none'` until the top-up is live (typed at 4.0.0, P16; answered from P18).
+- `POST /invoices/:id/pay` rides the order engine (PAY-U05, PAY-U07). A final
+  decline answers 402 `payment_failed`, where it answered 201 with
+  `charge_blocker`. The invoice stays open with the failed charge recorded. The
+  402 is stored: a replay returns it and the card is not tried again, so the next
+  try takes a fresh key, with the same card or another. `charge_blocker` on the
+  201 is now only ever `'processing'`, and that intent is live: the 1.7.1 cancel
+  rule no longer applies to this route.
+
+Added:
+
+- `OrderWire {id, owner_id, created_at, charge_status: 'none' | 'succeeded' |
+  'requires_payment' | 'failed', client_action?: ChargeBlocker}`. `orders` stores
+  no status: both charge fields are read from the order's one charge. A confirm
+  answers `none`, `succeeded` or `requires_payment`; `failed` is read-side.
+- `BookingWire.order_id?`, `LedgerEntryWire.order_id?` (M3.02), each omitted when
+  the row has no order.
+- `ChargeAttemptOutcomeWire {attempts, outcome: 'succeeded' | 'pending' |
+  'failed', blocker?}` (PAY-U05). No response carries it at this step;
+  `POST /staff/invoices/:id/charge`, at 7.1.0, is the first.
+- `PaymentFailedDetails` gains `order_id?`, `attempts?`, and `outcome?: 'failed' |
+  'abandoned'` (no confirm was sent; `attempts: 0`). A route on the engine sends
+  all three, and a route not on it yet omits them.
+- `'payment_failed'` joins `POST_BOOKINGS_ERROR_DETAIL_KINDS` and
+  `PostBookingsErrorDetails`, as a 402 (PAY-U05, DAY-U18). Not reachable until
+  the top-up is live (P18).
+- `BookingStatus` gains `'payment-pending'` (M3.03; PAY-U07), carried only by the
+  rows of a Confirm whose top-up charge is still processing. The row is the seat
+  hold. A cancel of any one pending row cancels the whole order.
+- `GET /staff/payments/pending` (any role) → `GetStaffPaymentsPendingResponse`,
+  `PendingPaymentWire[] {order_id, owner: {id, name}, kind: 'booking' |
+  'package' | 'class', amount_cents, created_at, minutes_pending, sessions?}`:
+  every order still pending past `pay.processing_hold_max_minutes`. Empty until
+  P18.
+- `POST /staff/orders/:id/cancel` (any role, `Idempotency-Key`, no body) →
+  `PostStaffOrdersCancelResponse {order_id, outcome: 'cancelled' | 'settled' |
+  'settled_then_cancelled'}`. 404 for no such order; 409 `conflict` for an order
+  with nothing pending, or for one that changed under the cancel (an intent id
+  landing after its read). Either way nothing is written.
+- `'invoice_payment_in_flight'` appended to `ApiErrorCode` and `API_ERROR_CODES`,
+  409 in `API_ERROR_STATUS`, no `details` (PAY-U05). `POST /invoices/:id/pay`
+  answers it while another order on the invoice holds a `requires_payment` charge
+  inside its lease.
+
+Changed (doc only, no shape change):
+
+- §0's idempotency list: the engine's 402 is the one stored error, and a claim
+  stays open while its charge is processing, so the same key answers 409
+  `idempotency_inflight` even after the pending 201.
+- `payment_failed`'s two docs no longer say a card was always charged or that
+  nothing was written: `outcome: 'abandoned'` asked no card, and a decline leaves
+  its failed charge recorded.
+- `POST /bookings`'s two detail docs say "refuse", since one arm is a 402.
+- `InvoicePayRequest` lists the route's five answers. `InvoicePayWire`'s
+  `client_secret` and `charge_blocker` docs, and the § payments-invoices note on
+  this route's failures, stop describing the 1.7.1 cancel rule here.
+
+Rows `pay.card_attempts_max_count`, `pay.seat_hold_max_minutes` and
+`pay.processing_hold_max_minutes` need no change: `PaymentSettingWire` has
+carried them since 2.0.0-lg1.1 (M1.13), and P15 gives them their first reader.
+
+Not typed here: `ChargeBlocker`'s two new members, the `insufficient_credits`
+additions, the `payment` object and `credit_expired_before_date` (P16);
+`PostStaffRatesRequest` and `CreditPurchaseWire`'s processing arm (P18); 409
+`payment_pending` (P20); `EnrollmentWire.order_id` and `PostEnrollmentsResponse`
+(P29, with M7.08); `BookingStatus`'s class-row doc and `'payment-refunded'` (P28).
+
+*P14, no bump (DECISIONS 135(d), Fable L3).* Route ids are lowercased at the parse, and the idempotency hash runs on the parsed body, so a key first used on a capitalised body before this release replays as 422 `idempotency_mismatch`. No shipped client capitalises an id, and production starts clean.
+
 ## [4.0.0-lg3.1] — 2026-11-04
 
 BREAKING. LG3's first step, step 1 of 3 toward 4.0.0 (plan unit P13, slice S18,

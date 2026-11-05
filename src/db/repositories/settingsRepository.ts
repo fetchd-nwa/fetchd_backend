@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { db } from '../client.js';
 import {
@@ -405,6 +405,46 @@ export const settingsRepository = {
       );
     }
     return r.value;
+  },
+
+  /**
+   * The three `pay.*` rows the order engine runs on (P15, their first reader). Read
+   * once per engine call, so a PATCH reaches the next order and never one in flight.
+   */
+  async orderEngine(runner: Runner = db): Promise<{
+    card_attempts_max_count: number;
+    seat_hold_max_minutes: number;
+    processing_hold_max_minutes: number;
+  }> {
+    const rows = await runner
+      .select({ key: paymentSettings.key, value: paymentSettings.value })
+      .from(paymentSettings)
+      .where(
+        and(
+          inArray(paymentSettings.key, [
+            'card_attempts_max_count',
+            'seat_hold_max_minutes',
+            'processing_hold_max_minutes',
+          ]),
+          eq(paymentSettings.scope, 'global'),
+        ),
+      );
+    const count = (key: string): number => {
+      const value = seeded(
+        rows.find((r) => r.key === key),
+        `payment_settings ${key}`,
+        'M1.13',
+      ).value;
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+        throw new Error(`payment_settings ${key} holds ${JSON.stringify(value)}, not a count`);
+      }
+      return value;
+    };
+    return {
+      card_attempts_max_count: count('card_attempts_max_count'),
+      seat_hold_max_minutes: count('seat_hold_max_minutes'),
+      processing_hold_max_minutes: count('processing_hold_max_minutes'),
+    };
   },
 
   /**

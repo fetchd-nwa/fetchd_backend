@@ -13,7 +13,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import {
-  clearInvoiceChargeAttempts,
+  clearInvoiceReferrers,
   futureWeekday,
   FIXTURE_IDS,
   FIXTURE_NOW,
@@ -55,7 +55,7 @@ afterEach(async () => {
     await db
       .delete(scheduledNotifications)
       .where(inArray(scheduledNotifications.bookingId, bookingIds));
-    await clearInvoiceChargeAttempts();
+    await clearInvoiceReferrers();
     await db.delete(invoices).where(inArray(invoices.bookingId, bookingIds));
     await db.delete(creditLedger).where(inArray(creditLedger.bookingId, bookingIds));
   }

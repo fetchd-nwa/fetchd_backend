@@ -10,13 +10,9 @@ import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
  * reads to the owner.
  */
 
-/**
- * Whole-dollar-aware USD formatter. Stripe/invoice amounts are cents; `$120`
- * reads better than `$120.00` for round amounts, but cents show when present.
- */
+/** USD from cents, always with the cents: `$85.00` (design §2.7:3924). */
 export function formatDollars(amountCents: number): string {
-  const dollars = amountCents / 100;
-  return `$${Number.isInteger(dollars) ? dollars.toString() : dollars.toFixed(2)}`;
+  return `$${(amountCents / 100).toFixed(2)}`;
 }
 
 /**

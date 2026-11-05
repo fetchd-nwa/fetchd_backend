@@ -35,6 +35,7 @@ import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffDayCapacityRoute } from './routes/staffDayCapacity.js';
 import { registerStaffCreditExpiryRoute } from './routes/staffCreditExpiry.js';
 import { registerStaffInvoicesRoute } from './routes/staffInvoices.js';
+import { registerStaffOrdersRoute } from './routes/staffOrders.js';
 import { registerStaffOwnersRoute } from './routes/staffOwners.js';
 import { registerStaffMembershipsRoute } from './routes/staffMemberships.js';
 import { registerStaffDogsRoute } from './routes/staffDogs.js';
@@ -141,6 +142,7 @@ export function buildApp(): FastifyInstance {
   registerStaffAlumniRoute(app); // [staff] — §J.3 completed-programs record + alumni-flag clear
   registerStaffMembershipsRoute(app); // [staff] — §J.1 pause / resume (staff-mediated)
   registerStaffInvoicesRoute(app); // [staff] — parked-invoice worklist + GET /staff/invoices/:id (2.0.0)
+  registerStaffOrdersRoute(app); // [staff] — pending-payments list + *Cancel order* (4.0.0-lg3.2)
   registerStaffOwnersRoute(app); // [staff] — owner picker + STAFF-U13 billing reads (2.0.0)
   registerStaffRatesRoute(app); // [staff] — per-location service-rate editor (2026-06-20)
   registerStaffDogsRoute(app); // [staff] — Day-19b portal dog directory (name resolution)

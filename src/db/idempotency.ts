@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, lt, sql } from 'drizzle-orm';
+import { and, eq, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { db } from './client.js';
 import { ApiError } from '../lib/errors.js';
 import { idempotencyKeys } from './schema/schema.js';
@@ -62,15 +62,52 @@ export interface IdempotencyOutcome<T> extends MutationResponse<T> {
  * itself. A retry therefore re-attempts the work rather than replaying the
  * error — correct for transient failures, and permanent failures (a 422
  * validation error) are deterministic for a given body so the retry sees the
- * same outcome. We do NOT cache error responses (the schema's contract is
- * "set the response + completed_at" on success — no mention of error storage,
- * and the simpler shape is the one that actually fits the schema's text).
+ * same outcome. Nothing here stores an error.
+ *
+ * **The order engine is the one exception, and it does not run through here**
+ * (P15, design §2.7:3939-3944). Its claim outlives the transaction that made it, so
+ * it uses the two halves below: {@link claimIdempotencyKey} in tx1, and
+ * {@link completeOrderClaim} from whichever step settles the order, days later if
+ * Stripe says so. Its final answer may be the committed 402 `payment_failed`, stored
+ * as the envelope `auth/plugin.ts` sends, so a replay returns the same 402 and no
+ * card is tried. A same-key request that finds the claim open answers 409
+ * `idempotency_inflight`, and a retry never creates a second order or intent.
  */
 export async function withIdempotency<T>(
   tx: Tx,
   claim: IdempotencyClaim,
   fn: () => Promise<MutationResponse<T>>,
 ): Promise<IdempotencyOutcome<T>> {
+  const claimed = await claimIdempotencyKey<T>(tx, claim);
+  if (!claimed.won) return claimed.stored;
+
+  const response = await fn();
+
+  await tx
+    .update(idempotencyKeys)
+    .set({
+      responseStatus: response.status,
+      responseBody: response.body as unknown,
+      completedAt: sql`now()`,
+    })
+    .where(eq(idempotencyKeys.key, claim.key));
+
+  return { ...response, replayed: false };
+}
+
+/** The claim half: this request owns the key, or here is what the key answers. */
+export type IdempotencyClaimResult<T> =
+  | { won: true }
+  | { won: false; stored: IdempotencyOutcome<T> };
+
+/**
+ * Decide the three states of {@link withIdempotency}, and leave the row open if this
+ * request won. Throws `idempotency_mismatch` and `idempotency_inflight`.
+ */
+export async function claimIdempotencyKey<T>(
+  tx: Tx,
+  claim: IdempotencyClaim,
+): Promise<IdempotencyClaimResult<T>> {
   const won = await tx
     .insert(idempotencyKeys)
     .values({
@@ -101,31 +138,87 @@ export async function withIdempotency<T>(
     if (existing.endpoint !== claim.endpoint || existing.requestHash !== claim.requestHash) {
       throw new ApiError('idempotency_mismatch', 'Idempotency-Key reused with a different request');
     }
-    if (existing.completedAt === null) {
-      throw new ApiError(
-        'idempotency_inflight',
-        'a request with this Idempotency-Key is still in progress',
-      );
-    }
+    if (existing.completedAt === null) throw inflight();
     return {
-      status: existing.responseStatus ?? 200,
-      body: existing.responseBody as T,
-      replayed: true,
+      won: false,
+      stored: {
+        status: existing.responseStatus ?? 200,
+        body: existing.responseBody as T,
+        replayed: true,
+      },
     };
   }
+  return { won: true };
+}
 
-  const response = await fn();
+/** How long an OPEN claim survives the sweep (design §2.7:3946-3948): well past any
+ *  processing hold, so a same-key retry can never start a second order. */
+export const IDEMPOTENCY_OPEN_CLAIM_MAX_DAYS = 7;
 
+function inflight(): ApiError {
+  return new ApiError(
+    'idempotency_inflight',
+    'a request with this Idempotency-Key is still in progress',
+  );
+}
+
+/** Name the order on the claim that opened it, in tx1. */
+export async function attachOrderToClaim(
+  tx: Tx,
+  args: { key: string; orderId: string },
+): Promise<void> {
   await tx
     .update(idempotencyKeys)
+    .set({ orderId: args.orderId })
+    .where(eq(idempotencyKeys.key, args.key));
+}
+
+/**
+ * Record an order's final answer on its open claim, from whichever step settles the
+ * order: the settle transaction, the webhook arm, the sweeper, a *Cancel order*.
+ * Only an open claim is touched, so the first settler's answer stands. Nothing to
+ * complete is a no-op: the sweep removed the claim (`IDEMPOTENCY_OPEN_CLAIM_MAX_DAYS`),
+ * or no claim was ever open. It logs one line naming the order, and the money commits.
+ */
+export async function completeOrderClaim<T>(
+  tx: Tx,
+  args: {
+    orderId: string;
+    status: number;
+    body: T;
+    log: { info(obj: Record<string, unknown>, msg?: string): void };
+  },
+): Promise<void> {
+  const completed = await tx
+    .update(idempotencyKeys)
     .set({
-      responseStatus: response.status,
-      responseBody: response.body as unknown,
+      responseStatus: args.status,
+      responseBody: args.body as unknown,
       completedAt: sql`now()`,
     })
-    .where(eq(idempotencyKeys.key, claim.key));
+    .where(and(eq(idempotencyKeys.orderId, args.orderId), isNull(idempotencyKeys.completedAt)))
+    .returning({ key: idempotencyKeys.key });
+  if (completed.length === 0) {
+    args.log.info(
+      { orderId: args.orderId, status: args.status },
+      'no open claim to complete for this order: a re-send cannot replay it',
+    );
+  }
+}
 
-  return { ...response, replayed: false };
+/** The stored answer on a key, read on the pool. `undefined`: none yet. */
+export async function readCompletedClaim<T>(key: string): Promise<MutationResponse<T> | undefined> {
+  const [row] = await db
+    .select({
+      completedAt: idempotencyKeys.completedAt,
+      responseStatus: idempotencyKeys.responseStatus,
+      responseBody: idempotencyKeys.responseBody,
+    })
+    .from(idempotencyKeys)
+    .where(eq(idempotencyKeys.key, key))
+    .limit(1);
+  if (row === undefined || row.completedAt === null) return undefined;
+  return { status: row.responseStatus ?? 200, body: row.responseBody as T };
 }
 
 /**
@@ -169,6 +262,36 @@ export async function peekCompletedIdempotency<T>(
     body: existing.responseBody as T,
     replayed: true,
   };
+}
+
+/**
+ * {@link peekCompletedIdempotency} for a route on the order engine. Its claim stays
+ * open for as long as the order does, so an open claim is not a request about to race
+ * this one but a real answer: 409 `idempotency_inflight`, before any pre-validation
+ * can answer for a state the open order is itself changing.
+ */
+export async function peekEngineClaim<T>(
+  key: string,
+  endpoint: string,
+  requestHash: string,
+  ownerId: string,
+): Promise<IdempotencyOutcome<T> | undefined> {
+  // A stored answer is the owner's who made it: another owner's key reads as absent.
+  const [claim] = await db
+    .select({ ownerId: idempotencyKeys.ownerId })
+    .from(idempotencyKeys)
+    .where(eq(idempotencyKeys.key, key))
+    .limit(1);
+  if (claim?.ownerId !== ownerId) return undefined;
+  const stored = await peekCompletedIdempotency<T>(key, endpoint, requestHash);
+  if (stored !== undefined) return stored;
+  const [open] = await db
+    .select({ key: idempotencyKeys.key })
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.key, key), isNull(idempotencyKeys.completedAt)))
+    .limit(1);
+  if (open !== undefined) throw inflight();
+  return undefined;
 }
 
 /**
@@ -226,19 +349,32 @@ export async function updateStoredResponse<T>(args: {
  * (schema.sql lines ~918-920). Day-16 scheduler composition wires this
  * into the recurring tick.
  *
- * Default window is 24h — comfortably longer than any client-side retry
- * loop (clients drop on timeout long before then) yet short enough that
- * the table stays small. Returns the row count for the worker's tick
- * summary.
+ * Two windows since P15 (design §2.7:3945-3948), because an open claim is no longer
+ * always a request about to finish: one whose charge is processing is the only record
+ * of an order a same-key retry must not start again. A completed claim goes 24h after
+ * it COMPLETED, not after it was opened, so a claim that sat open for three days still
+ * answers a replay of its final answer. An open one goes at 7 days, well past any
+ * processing hold. The caller holds both constants.
  *
  * Pool runner by design: this is maintenance, not part of a request tx.
  * A failed sweep is logged-and-swallowed by the scheduler (the next tick
  * retries; one missed sweep is benign).
  */
-export async function sweepExpiredIdempotencyKeys(args: { olderThan: Date }): Promise<number> {
+export async function sweepExpiredIdempotencyKeys(args: {
+  completedBefore: Date;
+  openBefore: Date;
+}): Promise<number> {
   const deleted = await db
     .delete(idempotencyKeys)
-    .where(lt(idempotencyKeys.createdAt, args.olderThan.toISOString()))
+    .where(
+      or(
+        lt(idempotencyKeys.completedAt, args.completedBefore.toISOString()),
+        and(
+          isNull(idempotencyKeys.completedAt),
+          lt(idempotencyKeys.createdAt, args.openBefore.toISOString()),
+        ),
+      ),
+    )
     .returning({ key: idempotencyKeys.key });
   return deleted.length;
 }

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
+import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import {
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
@@ -150,7 +151,7 @@ async function createCreditPaidBooking(opts: {
     },
   });
   assert.equal(res.statusCode, 201, `seed failed: ${res.body}`);
-  const body = res.json() as Array<{ id: string }>;
+  const body = (res.json() as PostBookingsResponse).sessions;
   return body[0]!.id;
 }
 

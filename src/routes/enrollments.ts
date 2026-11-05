@@ -55,6 +55,7 @@ import {
   paymentRequiredError,
 } from '../lib/bookingErrors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
+import { completeClaimOfWithdrawnCharge, failChargeInTx } from '../lib/confirmCharge.js';
 import { lastBookableDate } from '../lib/bookingHorizon.js';
 import { enrollmentIdentityOf } from '../lib/enrollmentIdentity.js';
 import {
@@ -624,7 +625,14 @@ export function registerEnrollmentsRoute(
            * even when the cap leaves nothing to return — and then mints its
            * capped refund. Every `release_pending` row is left at
            * `'requires_payment'` DELIBERATELY, because the reconciler is the
-           * executor of the promise that word makes (§A3.3).
+           * executor of the promise that word makes (§A3.3). For an engine row
+           * (`order_id` set) the sweeper keeps that promise, not the reconciler.
+           *
+           * An engine row also has a request key waiting on it, so its `released`
+           * goes through `failChargeInTx`, which stores the 402, and its
+           * `refunded` closes the claim with the 201 a lost race stores
+           * (`designs/p15-engine-recovery.md`, decision 5). The money moves
+           * exactly as it does for every other row.
            */
           const applySettledRows = async (
             settlement: WithdrawPreTxSettlement,
@@ -640,6 +648,17 @@ export function registerEnrollmentsRoute(
             for (const row of settlement.rows) {
               switch (row.verdict) {
                 case 'released':
+                  if (row.charge.orderId !== null) {
+                    await failChargeInTx(tx, {
+                      chargeId: row.charge.id,
+                      blocker: undefined,
+                      lastError: null,
+                      intentDead: true,
+                      log: request.log,
+                      now: nowFactory(),
+                    });
+                    break;
+                  }
                   await chargesRepository.markStatus(tx, {
                     id: row.charge.id,
                     status: stripeIntentStatusToChargeStatus('canceled'),
@@ -663,6 +682,12 @@ export function registerEnrollmentsRoute(
                         : refundIdempotencyKey,
                     );
                     if (minted.kind === 'minted') mintedCents += minted.amountCents;
+                  }
+                  if (row.charge.orderId !== null) {
+                    await completeClaimOfWithdrawnCharge(tx, {
+                      chargeId: row.charge.id,
+                      log: request.log,
+                    });
                   }
                   break;
                 case 'release_pending':
@@ -959,7 +984,12 @@ const WITHDRAW_ENDPOINT = 'POST /enrollments/:cohortId/withdraw';
 /** One charge row this withdraw settled at Stripe, plus what Stripe's answer
  *  means for the owner's money (§A3.2 step 4). */
 interface WithdrawSettledRow {
-  charge: { id: string; amountCents: number; stripePaymentIntentId: string };
+  charge: {
+    id: string;
+    amountCents: number;
+    stripePaymentIntentId: string;
+    orderId: string | null;
+  };
   verdict: WithdrawSettleVerdict;
 }
 

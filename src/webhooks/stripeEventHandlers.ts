@@ -27,6 +27,14 @@ import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRep
 import { withActor, type Tx } from '../db/tx.js';
 import { assertNever } from '../lib/assertNever.js';
 import {
+  blockerOfIntent,
+  failChargeInTx,
+  OrderSettleUnreachableError,
+  readEngineBudget,
+  settleChargeInTx,
+  type EngineLog,
+} from '../lib/confirmCharge.js';
+import {
   stripeIntentStatusToChargeStatus,
   type StripeClient,
   type StripeRefundStatus,
@@ -34,6 +42,8 @@ import {
 } from '../lib/stripe.js';
 import { and, eq } from 'drizzle-orm';
 import type { BookingMode } from '../lib/bookingMode.js';
+import { lockCharge } from '../db/locks.js';
+import type { EngineChargeRow } from '../db/repositories/chargesRepository.js';
 
 function isLocationKey(value: string | undefined): value is LocationKey {
   return value === 'fayetteville' || value === 'bentonville';
@@ -56,6 +66,8 @@ export const WEBHOOK_ACTOR = 'system:stripe-webhook';
  */
 export interface WebhookHandlerLog extends AnchorResolutionLog {
   error(obj: Record<string, unknown>, msg?: string): void;
+  /** The order engine's one-line notes (`completeOrderClaim`). */
+  info?(obj: Record<string, unknown>, msg?: string): void;
 }
 
 export interface WebhookHandlerOpts {
@@ -94,6 +106,12 @@ export interface WebhookHandlerResult {
     // Stripe and nowhere here — a staff dashboard refund — now RECORDED instead
     // of retried into the ground. Closes the cumulative cap automatically.
     | 'adopted-out-of-band-refund'
+    // The order engine (P15): a charge with `order_id` set.
+    | 'order-settled'
+    | 'order-lost-race'
+    | 'order-late-refund'
+    | 'order-failed'
+    | 'order-advisory'
     | 'wrote-payment-method'
     | 'payment-method-already-present'
     | 'flipped-refund-succeeded'
@@ -150,9 +168,16 @@ export async function dispatchStripeEvent(
 ): Promise<WebhookHandlerResult> {
   switch (event.type) {
     case 'payment_intent.succeeded':
-      return handlePaymentIntentSucceeded(event, opts);
+      return (await handleEngineCharge(event, opts)) ?? handlePaymentIntentSucceeded(event, opts);
     case 'payment_intent.payment_failed':
-      return handlePaymentIntentFailed(event);
+      return (await handleEngineCharge(event, opts)) ?? handlePaymentIntentFailed(event);
+    case 'payment_intent.canceled':
+      return (
+        (await handleEngineCharge(event, opts)) ?? {
+          outcome: 'noop',
+          note: `payment_intent.canceled on ${event.paymentIntentId}, which no order owns`,
+        }
+      );
     case 'setup_intent.succeeded':
       return handleSetupIntentSucceeded(event, opts);
     case 'charge.refund.updated':
@@ -162,6 +187,171 @@ export async function dispatchStripeEvent(
     default:
       return assertNever(event);
   }
+}
+
+/**
+ * Re-run an event whose claim is unfinished: its first delivery died, or is still
+ * running, and `processed_at IS NULL` cannot tell which. So only an arm safe against a
+ * first delivery still alive runs here, and each of those is under a lock and a guard:
+ * the engine's arms (charge lock, status guard, the refund cap) and
+ * `charge.refund.updated` (charge lock, a re-read, no-op at the target status).
+ * `undefined` keeps the receiver's 200 `duplicate`: the older arms read then write with
+ * no lock, so a slow first delivery could grant twice
+ * (`designs/p15-engine-recovery.md`, decision 1).
+ */
+export async function redispatchUnfinishedEvent(
+  event: StripeWebhookEvent,
+  opts: WebhookHandlerOpts,
+): Promise<WebhookHandlerResult | undefined> {
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+    case 'payment_intent.payment_failed':
+    case 'payment_intent.canceled':
+      return handleEngineCharge(event, opts);
+    case 'charge.refund.updated':
+      return handleChargeRefundUpdated(event, opts);
+    case 'setup_intent.succeeded':
+    case 'unhandled':
+      return undefined;
+    default:
+      return assertNever(event);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The order engine's charges (P15, design §2.7:3905-3938)
+//
+// A charge is the engine's when `charges.order_id` is set (DECISIONS 142(f)); today's
+// arms below keep every other charge. This arm retrieves the live intent with NO
+// transaction open, then takes the charge lock and acts on the retrieved status under
+// the state guard (R5). That is safe because it acts only on `succeeded` and
+// `canceled`, both terminal, and `payment_failed` is advisory.
+// ─────────────────────────────────────────────────────────────────────────
+
+type IntentEvent = Extract<
+  StripeWebhookEvent,
+  {
+    type: 'payment_intent.succeeded' | 'payment_intent.payment_failed' | 'payment_intent.canceled';
+  }
+>;
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The engine charge this event is about, or `undefined` for one today's arm keeps. By
+ * the intent id first. A charge with no stored id is found by the `{order_id, charge_id}`
+ * the create stamped, and both must agree: metadata is a claim, not a key.
+ */
+async function findEngineCharge(event: IntentEvent): Promise<EngineChargeRow | undefined> {
+  const byIntent = await chargesRepository.findEngineByPaymentIntentId(db, event.paymentIntentId);
+  if (byIntent !== undefined) return byIntent.orderId !== null ? byIntent : undefined;
+
+  const chargeId = metadataString(event.metadata, 'charge_id');
+  const orderId = metadataString(event.metadata, 'order_id');
+  if (chargeId === undefined || orderId === undefined || !UUID_SHAPE.test(chargeId)) {
+    return undefined;
+  }
+  const charge = await chargesRepository.findEngineById(db, chargeId);
+  return charge !== undefined && charge.orderId === orderId ? charge : undefined;
+}
+
+function resultOf(act: Awaited<ReturnType<typeof settleChargeInTx>>): WebhookHandlerResult {
+  const outcome: WebhookHandlerResult['outcome'] =
+    act.outcome === 'settled'
+      ? 'order-settled'
+      : act.outcome === 'lost-race'
+        ? 'order-lost-race'
+        : act.outcome === 'late-refund'
+          ? 'order-late-refund'
+          : act.outcome === 'failed'
+            ? 'order-failed'
+            : 'charge-already-terminal';
+  return {
+    outcome,
+    ...(act.pendingStripeRefund !== undefined
+      ? { pendingStripeRefund: act.pendingStripeRefund }
+      : {}),
+    ...(act.creditsDogId !== undefined ? { creditsDogId: act.creditsDogId } : {}),
+  };
+}
+
+async function handleEngineCharge(
+  event: IntentEvent,
+  opts: WebhookHandlerOpts,
+): Promise<WebhookHandlerResult | undefined> {
+  const charge = await findEngineCharge(event);
+  if (charge === undefined) return undefined;
+
+  // The event arrived before the request committed the intent's id: redelivered, not
+  // an orphan. A charge the sweeper already abandoned falls through, and the late
+  // success below takes the id from the event.
+  if (charge.stripePaymentIntentId === null && charge.status === 'requires_payment') {
+    throw new WebhookRetryError(
+      `order ${charge.orderId} has no intent id yet and is still requires_payment`,
+    );
+  }
+
+  const log: EngineLog = {
+    info: (obj, msg) => opts.log?.info?.(obj, msg),
+    warn: (obj, msg) => opts.log?.warn(obj, msg ?? ''),
+    error: (obj, msg) => opts.log?.error(obj, msg),
+  };
+  const budget = await readEngineBudget();
+  const live = await opts.stripe.retrievePaymentIntent(
+    charge.stripePaymentIntentId ?? event.paymentIntentId,
+    budget.call,
+  );
+  const now = new Date();
+
+  switch (live.status) {
+    case 'succeeded':
+      try {
+        return resultOf(
+          await withActor(WEBHOOK_ACTOR, (tx) =>
+            settleChargeInTx(tx, { chargeId: charge.id, live, receiptTrigger: 'settle', log, now }),
+          ),
+        );
+      } catch (err) {
+        // The alarm has been raised. Nothing committed, so Stripe's redelivery
+        // asks again, and a person can reach the order past the hold.
+        if (err instanceof OrderSettleUnreachableError) throw new WebhookRetryError(err.message);
+        throw err;
+      }
+    case 'canceled':
+      return resultOf(
+        await withActor(WEBHOOK_ACTOR, (tx) =>
+          failChargeInTx(tx, {
+            chargeId: charge.id,
+            blocker: blockerOfIntent(live, log),
+            lastError: live.failureCode ?? null,
+            notice: 'charge-failed',
+            intentDead: true,
+            log,
+            now,
+          }),
+        ),
+      );
+    case 'processing':
+    case 'requires_action':
+    case 'requires_capture':
+    case 'requires_confirmation':
+    case 'requires_payment_method':
+      break;
+  }
+
+  // `payment_failed` is advisory (question 38): Stripe sends one per failed attempt
+  // and does not order events, so it records what Stripe said and decides nothing.
+  if (event.type === 'payment_intent.payment_failed' && live.failureCode !== undefined) {
+    const lastError = live.failureCode;
+    await withActor(WEBHOOK_ACTOR, async (tx) => {
+      const locked = await lockCharge(tx, charge.id);
+      if (locked?.status === 'requires_payment') {
+        await chargesRepository.writeLastStripeError(tx, { id: charge.id, lastError });
+      }
+    });
+    return { outcome: 'order-advisory' };
+  }
+  return { outcome: 'noop', note: `order charge ${charge.id} is still ${live.status}` };
 }
 
 // ─────────────────────────────────────────────────────────────────────────

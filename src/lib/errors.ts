@@ -35,7 +35,7 @@
  * envelope serializer in `auth/plugin.ts` reads `details` opaquely — same
  * cross-cutting seam, one place to change the wire shape.
  */
-import type { ApiErrorCode, ApiErrorDetailWire } from '../contracts/wire.js';
+import type { ApiErrorCode, ApiErrorDetailWire, ApiErrorEnvelope } from '../contracts/wire.js';
 import { API_ERROR_STATUS } from '../contracts/wire.js';
 
 export type { ApiErrorCode, ApiErrorDetailWire };
@@ -52,6 +52,16 @@ export class ApiError extends Error {
     this.status = API_ERROR_STATUS[code];
     this.details = details;
   }
+}
+
+/**
+ * The one spelling of the wire's error envelope. `auth/plugin.ts` sends it, and the
+ * order engine stores it (P15): a replayed 402 must be the bytes the first answer was.
+ */
+export function toErrorEnvelope(err: ApiError): ApiErrorEnvelope {
+  return err.details === undefined
+    ? { error: { code: err.code, message: err.message } }
+    : { error: { code: err.code, message: err.message, details: err.details } };
 }
 
 /**
