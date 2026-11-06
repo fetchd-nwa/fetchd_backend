@@ -388,7 +388,7 @@ test(
 
 // ── The card rebind (PAY-12, adjudication 2026-07-31) ────────────────────────
 
-async function boundCard(invoiceId: string): Promise<string> {
+async function boundCard(invoiceId: string): Promise<string | null> {
   return (await invoiceRow(invoiceId)).paymentMethodId;
 }
 

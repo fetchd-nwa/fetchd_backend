@@ -97,9 +97,9 @@ test(
     await cleanup();
     const invoice = await seedOpenInvoice();
 
-    // Both paths reach Stripe and succeed with DIFFERENT PaymentIntents (the
-    // worker attempt-keyed PI vs the manual request-keyed PI). They settle
-    // sequentially against the same open invoice — the second sees flipped=0.
+    // Two tenders reach Stripe and succeed with DIFFERENT PaymentIntents, each under
+    // its own request's key. They settle sequentially against the same open invoice —
+    // the second sees flipped=0.
     const winnerPi = 'pi_test_winner_settle';
     const loserPi = 'pi_test_loser_settle';
     const winner = await settle(invoice, winnerPi, /* notifyOwner */ true);
@@ -210,7 +210,7 @@ test(
 );
 
 test(
-  'settleInvoiceCharge — clean win with notifyOwner=false (manual route) emits no receipt',
+  'settleInvoiceCharge — clean win with notifyOwner=false emits no receipt (no caller passes false today)',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();

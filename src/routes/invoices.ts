@@ -189,6 +189,13 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
       // that isn't a live card of THIS owner, so a chosen card needs no second,
       // driftable check of its own.
       const chargingPaymentMethodId = payBody.payment_method_id ?? invoiceRow.paymentMethodId;
+      if (chargingPaymentMethodId === null) {
+        // Reachable from P25, the first writer of a NULL card: M4.04 opened the column.
+        throw new ApiError(
+          'bad_request',
+          `invoice ${id} has no card on it: name one with payment_method_id`,
+        );
+      }
       const stripeCtx = await loadStripePaymentContext({
         ownerId: principal.ownerId,
         paymentMethodId: chargingPaymentMethodId,
@@ -246,7 +253,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
 
   // `POST /invoices/:id/pay-in-person` `[auth]` — R3 cash/check flag flip.
   //
-  // The owner elects to settle this OPEN, card-backed invoice IN PERSON (cash
+  // The owner elects to settle this OPEN invoice IN PERSON (cash
   // or check at drop-off) rather than on the card. It charges nothing: it flips
   // `payment_expected` → 'in-person' and, in the same tx, schedules a
   // `payment-due` reminder 24h before the linked booking's drop-off (or 24h
@@ -312,7 +319,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
         if (flipped === 0) {
           // A concurrent flip won between the pre-check and here — same
           // row-visibility guard the pay route leans on for `markPaid`. Honest 409.
-          throw new ApiError('conflict', `invoice ${id} is no longer open + card-backed`);
+          throw new ApiError('conflict', `invoice ${id} is no longer open and payable by card`);
         }
 
         // Anchor the reminder PAYMENT_DUE_LEAD_MS before drop-off, clamped to

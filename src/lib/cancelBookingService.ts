@@ -2,9 +2,7 @@ import { db } from '../db/client.js';
 import { lockCharge } from '../db/locks.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
-import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
-import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
 import type { BookingWire } from './bookingWire.js';
 import { askWhatWon, cancelOrderInTx, type WhatWon } from './cancelOrder.js';
@@ -48,7 +46,7 @@ export interface CancelBookingResult {
   /**
    * Distinct dog ids that received a credit-back on this cancel. The route
    * wipes each dog's `credits:{dogId}:*` display cache post-commit. Empty on
-   * every non-credit-back path (forfeit / money-back / PAYG-void / free).
+   * every non-credit-back path (forfeit / money-back / free).
    */
   creditRefundedDogIds: string[];
 }
@@ -172,12 +170,6 @@ export async function cancelBookingInTx(
     throw new Error(`cancelBooking ${id}: row vanished after mark-cancelled`);
   }
 
-  // The booking's open PAYG invoice, if any — its pending auto-charge is voided
-  // on a within-window cancel (below), and its pay-in-person reminder is torn
-  // down in step 7 (R3). Read once now: the void flips it to 'void', so the id
-  // must be captured before then to survive the teardown lookup.
-  const linkedOpenInvoice = await invoicesRepository.findOpenForBooking(tx, { bookingId: id });
-
   // 6. Refund branching — within the cancel window only.
   let pendingStripeRefund: PendingStripeRefund | undefined;
   let unroutableRefund: UnroutableRefundMint | undefined;
@@ -264,16 +256,6 @@ export async function cancelBookingInTx(
             });
           }
         }
-      } else {
-        // PAYG within-window: void the pending auto-charge so the worker
-        // never bills a cancelled session. There's no prior credit debit
-        // (PAYG skips it) and no settled charge yet (due_at is ~1h before
-        // drop-off, inside the cancel window), so the open invoice is the
-        // only money artifact. A genuinely free service (no invoice) is a
-        // no-op — the status flip is the full effect.
-        if (linkedOpenInvoice !== undefined) {
-          await invoicesRepository.markVoid(tx, { id: linkedOpenInvoice.id });
-        }
       }
     }
   }
@@ -292,15 +274,6 @@ export async function cancelBookingInTx(
   });
 
   await tearDownBookingReminders(tx, id);
-  // R3: same rule for a pay-in-person invoice linked to this booking — with no
-  // drop-off left, its "bring $… at drop-off" reminder is stale. Keyed by
-  // invoice id (`payment-due:<invoiceId>`), so cancel by the captured invoice.
-  if (linkedOpenInvoice !== undefined) {
-    await scheduledNotificationsRepository.cancelPendingByDedupePrefix(
-      tx,
-      `payment-due:${linkedOpenInvoice.id}`,
-    );
-  }
 
   // 8. Wire the updated row for the response.
   return {

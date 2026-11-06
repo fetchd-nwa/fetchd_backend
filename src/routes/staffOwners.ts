@@ -31,7 +31,7 @@ import { toPaymentMethodWire } from './paymentMethods.js';
  *   GET /staff/owners/:id/payments         owner and manager (STAFF-U13)
  *   GET /staff/owners/:id/payment-methods  owner and manager (STAFF-U13)
  *
- * (`GET /staff/invoices/:id` is in `staffInvoices.ts`, beside the parked list.)
+ * (`GET /staff/invoices/:id` is in `staffInvoices.ts`.)
  * An owner (family) principal is 403 `forbidden` on every one. A malformed
  * `:id` is 400 `bad_request`; an id naming no `owners` row is 404 `not_found`;
  * an expired family resolves, because invoices, charges and refunds are

@@ -15,7 +15,7 @@
  *   §2      shared enums + value tuples (everything used by ≥2 domains) — orchestrator-owned
  *   §3–§15  one fenced section per domain, ALPHABETICAL:
  *             auth-media · bookings · credits · dogs-profile · enrollments ·
- *             events · memberships · messaging · notifications ·
+ *             events · messaging · notifications ·
  *             payments-invoices · rates-availability · refunds · reports
  *           + settings (2.0.0-lg1.1, design §1.1:588-593: alphabetical, so the
  *             LAST domain section, after reports and before §16; the §16
@@ -64,9 +64,10 @@
  * ships after M1 as 7.0.0 (LG2b), so a design label from 6.1.0 up reads one
  * major up here; 4.0.0, 5.0.0 and 6.0.0 keep theirs (build DECISIONS 6;
  * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
- * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close).
+ * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close). LG4:
+ * 5.0.0-lg4.1 (P17, breaking).
  */
-export const WIRE_CONTRACT_VERSION = '4.0.0';
+export const WIRE_CONTRACT_VERSION = '5.0.0-lg4.1';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -614,8 +615,8 @@ export interface AlreadyRequestedDetails {
   dog_ids: string[];
 }
 
-/** `charge_blocker` present when the failure derived one (all five emit sites
- *  pass it when known; enrollments.ts omits it when the report carries none —
+/** `charge_blocker` present when the failure derived one (every emit site
+ *  passes it when known; enrollments.ts omits it when the report carries none —
  *  "we are not going to guess" is expressible). Same `ChargeBlocker`
  *  vocabulary as the settle-site 201s.
  *
@@ -843,20 +844,15 @@ export type ChargeBlocker =
 /**
  * Why a notification is sending the owner to the settle surface.
  *
- * `payment-unconfirmed` (1.10.0) is NOT a third flavour of failure — it is the
- * absence of knowledge. It exists because the auto-charge worker can end an
- * attempt without learning whether Stripe took the money (a transport failure
- * after the request left), and the other two arms both assert an outcome the
- * worker does not have. Landing that owner on "payment failed, try another
- * card" is how one payment becomes two, so this arm's whole job is to carry
- * "we don't know yet, don't pay again" all the way to the sheet.
+ * 5.0.0-lg4.1 (PAY-U15): `'payment-unconfirmed'` left with the auto-charge
+ * worker, its only producer. A path already stored with that reason is not
+ * rewritten; `deepLinkToPath` only ever writes these two.
  */
-export type InvoiceDeepLinkReason = 'payment-failed' | 'payment-due' | 'payment-unconfirmed';
+export type InvoiceDeepLinkReason = 'payment-failed' | 'payment-due';
 
 export const INVOICE_DEEP_LINK_REASONS = [
   'payment-failed',
   'payment-due',
-  'payment-unconfirmed',
 ] as const satisfies readonly [InvoiceDeepLinkReason, ...InvoiceDeepLinkReason[]];
 
 export type ReportProgram =
@@ -902,8 +898,10 @@ export type MediaPurpose =
 
 export type MediaKind = 'image' | 'video';
 
-/** The 17 notification kinds an owner can receive. A hand-maintained mirror of
- *  the `notification_type` pgEnum; `conformance.ts` pins it to the Drizzle enum. */
+/** The 15 notification kinds an owner can receive. A hand-maintained mirror of
+ *  the `notification_type` pgEnum; `conformance.ts` pins it to the Drizzle enum.
+ *  5.0.0-lg4.1 (M4.02; CRED-U29, ALUM-U17): `'membership-ended'` and
+ *  `'alumni-attendance'` left with the rebuild. */
 export type NotificationType =
   | 'booking-confirmed'
   | 'report-published'
@@ -915,8 +913,6 @@ export type NotificationType =
   | 'credits-expiring'
   | 'payment-failed'
   | 'payment-succeeded'
-  | 'alumni-attendance'
-  | 'membership-ended'
   | 'spay-neuter-reminder'
   // R3 (Allison sim-QA 2026-07-27): the cash/check invoice reminder. Fires 24h
   // before the linked booking's drop-off (or 24h before the invoice due time when
@@ -926,12 +922,12 @@ export type NotificationType =
   | 'payment-due'
   // Allison 2026-07-29. The three below close the gaps she named in the
   // notification sweep:
-  //   `invoice-overdue`  — the safety net: an invoice still open 3 days past due.
-  //                        Every other payment path should have settled it long
-  //                        before this fires, which is the point — it's a
-  //                        precaution, not a dunning ladder. Fires ONCE.
+  //   `invoice-overdue`  — was the safety net: an invoice still open 3 days past
+  //                        due. Nothing enqueues it from 5.0.0-lg4.1: the scan
+  //                        went with the auto-charge lane (design M4.04, question
+  //                        87). The label stays, on rows already written.
   //   `card-expiring`    — the card on file is about to lapse (or just has), so
-  //                        auto-charges don't start failing silently.
+  //                        the next charge to it doesn't fail unannounced.
   //   `waitlist-spot-open`— a seat opened for a waitlisted entry (one freed up,
   //                        or staff overrode the cap). Named for what FIRES, not
   //                        for the outcome: it is an OFFER the owner must accept
@@ -950,7 +946,6 @@ export type NotificationDeepLinkKind =
   | 'report'
   | 'thread'
   | 'invoice'
-  | 'membership'
   | 'dog-profile'
   | 'dog-manage'
   | 'credits'
@@ -1039,7 +1034,6 @@ export const NOTIFICATION_DEEP_LINK_KINDS = [
   'report',
   'thread',
   'invoice',
-  'membership',
   'dog-profile',
   'dog-manage',
   'credits',
@@ -1066,7 +1060,9 @@ export const GROUP_CLASS_KEYS = [
 ] as const satisfies readonly [GroupClassKey, ...GroupClassKey[]];
 
 /** Member order mirrors the `notification_type` pgEnum declaration order; §16
- *  pins set equality. New 1.13.0 (digest notifications item). */
+ *  pins set equality. New 1.13.0 (digest notifications item). 5.0.0-lg4.1:
+ *  M4.02's rebuild keeps the survivors in this order, and `'evaluation-result'`
+ *  is not in it: M2.15 appends it after this rebuild, in LG2b (P10). */
 export const NOTIFICATION_TYPES = [
   'booking-confirmed',
   'report-published',
@@ -1078,8 +1074,6 @@ export const NOTIFICATION_TYPES = [
   'credits-expiring',
   'payment-failed',
   'payment-succeeded',
-  'alumni-attendance',
-  'membership-ended',
   'spay-neuter-reminder',
   'payment-due',
   'invoice-overdue',
@@ -2275,7 +2269,7 @@ export type PostRequestsErrorDetails = EvaluationRequiredDetails | AlreadyReques
  *
  * `remaining` = the lot's grant plus every allocation (debit −/refund +) tagged
  * to it. Exhausted and expired lots are never listed, and never-expiring
- * credits (1-credit packs, alumni grants, legacy/Gingr imports, the pool) are
+ * credits (1-credit packs, legacy/Gingr imports, the pool) are
  * omitted entirely — they are inside `CreditsWire.school`/`.daycare` but have
  * nothing to warn about (BUSINESS-LOGIC/credits-packages.md R30 @ :84, R8 @ :62,
  * R7 @ :61).
@@ -2687,8 +2681,8 @@ export interface FeedingWire {
  *     mobile reads one, but no server code has ever emitted it (DRIFT-27).
  *     Deciding it is a named out-of-scope design item (§17).
  *   - Date conventions: `spay_neuter_planned_on` and `last_seen_on` are
- *     `YYYY-MM-DD`; `evaluation_date` and `alumni_attendance_flagged_at` are
- *     ISO timestamptz (dogs-evaluations.md :135).
+ *     `YYYY-MM-DD`; `evaluation_date` is ISO timestamptz
+ *     (dogs-evaluations.md :135).
  */
 export interface DogWire {
   id: string;
@@ -2709,11 +2703,6 @@ export interface DogWire {
    *  entirely (`lib/dogWire.ts:114`). */
   completed_class_keys?: GroupClassKey[];
   vet?: VetWire;
-  /** Omit-on-null: set when an alumni dog attended <2 qualifying sessions in a
-   *  Chicago month — staff re-check before the next booking. A SOFT surface:
-   *  the dog stays alumni, credits keep no-expiry, and no booking 422 fires
-   *  (BUSINESS-LOGIC/dogs-evaluations.md R23-R24 @ :78-79). */
-  alumni_attendance_flagged_at?: string;
   /** Shanthi 2026-07-14 (omit-on-null = unanswered): a PROFILE question. The
    *  owner's answer is stored, and no booking path reads it until the
    *  spay/neuter refusal lands in a later group (S11, LG2b). */
@@ -2787,15 +2776,15 @@ export interface RequiredVaccineWire {
 
 /**
  * A dog's completed-curriculum record — the §J.3 staff surface. Emitted by all
- * four verbs: `GET /staff/dogs/:dogId/completed-programs`,
- * `POST …/completed-programs` (201), `DELETE …/completed-programs/:program`
- * (200), and `POST /staff/dogs/:dogId/clear-alumni-flag` (200). Staff-only.
+ * three verbs: `GET /staff/dogs/:dogId/completed-programs`,
+ * `POST …/completed-programs` (201) and `DELETE …/completed-programs/:program`
+ * (200). Staff-only.
  * Promoted 1.13.0 from `routes/staffAlumni.ts:47` (digest dogs-profile/S).
  *
  * `is_alumni` is DERIVED from the row count, never stored (R20 @ :75), and
- * recording the 5th program is the became-alumni moment that clears
- * `expires_at` on the dog's live credit lots in the same transaction (R21 @
- * :76). Un-recording does NOT re-stamp those expiries (R22 @ :77).
+ * recording the 5th program is the became-alumni moment (R21 @ :76). It touches
+ * no credit lot: from 5.0.0-lg4.1 an alumni lot takes the ordinary expiry
+ * (ALUM-U16).
  *
  * `completed_programs[].program` is typed `CurriculumProgram` — the DB CHECK
  * (`schema.sql:475-476`) constrains the column to exactly those five, and the
@@ -2810,8 +2799,6 @@ export interface CompletedProgramsWire {
   dog_id: string;
   is_alumni: boolean;
   completed_programs: { program: CurriculumProgram; completed_at: string }[];
-  /** Omit-on-null — see `DogWire.alumni_attendance_flagged_at`. */
-  alumni_attendance_flagged_at?: string;
 }
 
 /**
@@ -3078,8 +3065,9 @@ export type GroupClassEnrollmentType = 'open' | 'cohort';
 
 /** Per-enrollment money state on `GET /enrollments`: `'paid'` (a succeeded
  *  charge belonging to THIS enrollment), `'pay-later'` (a card-backed open
- *  invoice the auto-charge worker bills 24h before the first session), or
- *  `'pending'` (an async/3DS charge not yet settled — rare). Promoted 1.13.0
+ *  invoice, due 24h before the first session, which the owner pays through
+ *  `POST /invoices/:id/pay`; nothing bills it automatically from 5.0.0-lg4.1),
+ *  or `'pending'` (an async/3DS charge not yet settled — rare). Promoted 1.13.0
  *  from `db/repositories/enrollmentsRepository.ts:30` under its existing
  *  exported name (§4.4); that file now re-exports it from here — the
  *  `ChargeStatus` / `chargesRepository.ts:111` precedent. Digest
@@ -3367,8 +3355,10 @@ export interface PostEnrollmentsRequest {
    *  before the enroll transaction and captured after it commits (R25/R26 @
    *  BUSINESS-LOGIC/group-classes-enrollments.md:63-64). `true` = one
    *  card-backed open invoice per dog with `due_at = cohort.start_date − 24h`,
-   *  billed by the shared auto-charge worker; withdrawing before then voids it,
-   *  so a pay-later that is withdrawn early is never charged (R27 @ …:65). */
+   *  which the owner pays through `POST /invoices/:id/pay`. From 5.0.0-lg4.1
+   *  nothing bills it automatically: the auto-charge worker is gone and this
+   *  arm stays until 8.0.0 removes it (PAY-U10). Withdrawing voids an open one,
+   *  so a pay-later that is withdrawn unpaid is never charged (R27 @ …:65). */
   pay_later?: boolean;
   /**
    * Wire 1.11.0 — per-dog partial success. Named for the SEMANTICS it changes,
@@ -3679,219 +3669,6 @@ export interface PostEventsRsvpRequest {
 export type PostEventsRsvpErrorDetails = never;
 
 // <<< domain:events ===========================================================
-
-// >>> domain:memberships ======================================================
-
-// ---- (a) domain-local enums ------------------------------------------------
-
-/**
- * A membership's lifecycle state. `'completed'` = the committed term ran out
- * (the hard stop — there is no auto-renew); `'canceled'` = the owner stopped it
- * early. Both are TERMINAL: no verb reactivates either, and a row is never
- * deleted. — BUSINESS-LOGIC/memberships.md R5 @ :31, R9 @ :35
- *
- * **PAUSED IS NOT A STATUS.** A staff-paused membership is `'active'` with
- * `paused_at` set; rolls skip it, and it still blocks a second membership on
- * the same (dog, mode). — BUSINESS-LOGIC/memberships.md R1 @ :27, R10 @ :36
- *
- * **This union deliberately has NO conformance pin** — there is nothing to pin
- * it to. `memberships.status` is `text NOT NULL DEFAULT 'active'` with no CHECK
- * constraint and no pgEnum (`schema.sql:1354`), so §5.1.1's DB ↔ wire assert
- * cannot be written. The API is the column's only writer and only ever writes
- * these three, which `membershipsRepository.ts:105-107` asserts with a bare
- * `as`. Phase-3 fix 3.1 ("Put a CHECK on memberships.status", digest
- * memberships/fix-S) adds the CHECK and the pin together; until then this union
- * is guarded by code review alone, and saying so is the point.
- *
- * Promoted 1.13.0 from `routes/memberships.ts:117` (the inline union on
- * `MembershipWire.status`) and `db/repositories/membershipsRepository.ts:42`
- * (the duplicate declaration, which now re-exports this type — the
- * `ChargeStatus`/`chargesRepository` precedent). — digest memberships/M
- */
-export type MembershipStatus = 'active' | 'completed' | 'canceled';
-
-// ---- (b) response wires ----------------------------------------------------
-
-/**
- * An owner's credit-package subscription (§J.1): one dog committed to a
- * 3/6/9/12-month term of a specific priced package, month 1 charged
- * synchronously and every later month self-billed through the invoice
- * auto-charge lane (NOT Stripe Billing — `stripe_subscription_id` stays NULL).
- * Emitted by `GET /memberships` (array), `DELETE /memberships/:id` (the
- * canceled row), and nested at `MembershipCreateWire.membership`.
- *
- * `mode` and `location` reference the §2 shared unions rather than
- * re-declaring them: `BookingMode` is the same union the route imported
- * (`lib/bookingMode.ts`, itself a wire re-export since the skeleton), and
- * `LocationKey` is already pinned `Equal` to `LOCATION_SLUGS` at
- * `conformance.ts:80` — type-identical in both cases, zero behavior change.
- *
- * Promoted 1.13.0 VERBATIM from `routes/memberships.ts:107` — digest
- * memberships/M. The route keeps `toMembershipWire` and re-exports this type,
- * so no consumer moved this pass. Business rules:
- * BUSINESS-LOGIC/memberships.md (R1 uniqueness @ :27, R5 hard stop @ :31,
- * R9 owner cancel @ :35, R10/R11 staff pause/resume @ :36-37, R15 package
- * pinning @ :41).
- */
-export interface MembershipWire {
-  id: string;
-  dog_id: string;
-  mode: BookingMode;
-  location: LocationKey;
-  package_key: string;
-  package_label: string;
-  credits_per_month: number;
-  price_cents: number;
-  /**
-   * The committed term in months. `number`, NOT `3 | 6 | 9 | 12`, and
-   * deliberately so: the DDL CHECK (`schema.sql:1348`) and the request body
-   * (`PostMembershipsRequest.term_months`) both constrain what may be WRITTEN
-   * to those four, but the row type this is read from is a plain `integer`
-   * (`membershipsRepository.ts:51`), nothing re-validates the value on read,
-   * and narrowing a RESPONSE field is not on §14.2's closed list of sanctioned
-   * narrowings. Transcribed as emitted; the narrowing is FILED, not enacted
-   * (§14.1).
-   */
-  term_months: number;
-  status: MembershipStatus;
-  started_at: string;
-  current_period_start: string;
-  current_period_end: string;
-  ends_at: string;
-  /** Omit-on-null: present ⇒ staff-paused (rolls skip until staff resume). */
-  paused_at?: string;
-  /**
-   * §J.1: the card this subscription's rolled invoices bill (memberships pin
-   * their payment method at POST). Omitted when the bound card is no longer
-   * live — the dunning lane owns that state, the list stays honest.
-   */
-  payment_method?: { brand: string; last4: string };
-}
-
-/**
- * `POST /memberships` 201 response — the subscribe result.
- *
- * Promoted 1.13.0 VERBATIM from `routes/memberships.ts:132` — digest
- * memberships/M. Also named by the payments-invoices money-surface item
- * (digest payments/M, "membership create"), which cites this declaration
- * rather than re-stating it.
- *
- * Read it with `MembershipWire.status` in mind: on the lost-race branch the
- * nested `membership` is the WINNER's row, not one this request created.
- */
-export interface MembershipCreateWire {
-  membership: MembershipWire;
-  charge_id: string;
-  /**
-   * Always the literal `'succeeded'`: month 1 must charge SYNCHRONOUSLY, so a
-   * membership never exists behind a non-succeeded charge. Every other
-   * PaymentIntent status throws before the 201 — `payment_failed` (402) with a
-   * `charge_blocker`, or `conflict` (409) once the webhook has adjudicated the
-   * money (`memberships.ts:294-311`, `:697-727`, `:846-884`). Transcribed as
-   * declared (`memberships.ts:135`); both emission sites write
-   * `'succeeded' as const` (`memberships.ts:546`, `:590`).
-   */
-  charge_status: 'succeeded';
-  stripe_payment_intent_id: string;
-  credits_granted: number;
-  /**
-   * True only on the uniqueness lost-race branch: a concurrent subscribe for
-   * the same (dog, mode) won during THIS request's Stripe round-trip, so this
-   * charge is a duplicate being refunded post-commit. `membership` then
-   * carries the WINNER's row (the dog IS subscribed) and `credits_granted` is
-   * 0 (only the winning charge granted). Mirrors the invoice-pay wire's
-   * honest lost-race signal.
-   */
-  charge_refunded: boolean;
-}
-
-/**
- * The staff view of a membership: the owner shape plus `owner_id` (staff verbs
- * are cross-owner and need the context the owner shape leaves implicit).
- * Emitted by `POST /staff/memberships/:id/pause` and `.../resume` — the only
- * two staff membership verbs that exist (pause is staff-mediated by design;
- * there is no staff cancel verb and no staff-scoped membership READ endpoint —
- * that one is digest memberships/design-M, [PORTAL], out of scope per §17).
- *
- * Promoted 1.13.0 from `routes/staffMemberships.ts:33`, where it was
- * module-PRIVATE — this is its first exported declaration; the route now
- * imports it from here. Freezing it pins what is emitted today: the portal has
- * zero membership demand (PORTAL-ENDPOINT-MAP §10 @ :1197 — the entire §J.1
- * surface is supply-only) and the pause/resume UI is explicitly parked, so this
- * is a freeze of runtime reality, not a staff-surface design. — digest
- * memberships/M
- */
-export interface StaffMembershipWire extends MembershipWire {
-  owner_id: string;
-}
-
-// ---- (c) request bodies ----------------------------------------------------
-
-/**
- * `POST /memberships` request body — subscribe one dog to a credit package for
- * a committed term. Requires an `Idempotency-Key` header; that key also flows
- * into Stripe (`:payment-intent` / `:dup-subscribe-refund` suffixes), so a
- * client retry can never double-charge. — BUSINESS-LOGIC/memberships.md R16
- * @ :42
- *
- * Promoted 1.13.0 from the Zod schema at `routes/memberships.ts:194-208`,
- * which is `.strict()` — an unknown key is REJECTED (`bad_request`, 400), not
- * ignored. Pinned to that schema by `PostMembershipsBodyConformance` in the
- * same file (§5.1.3, `z.input` — what a client may SEND). — digest
- * memberships/M
- *
- * **Failure arms this body can provoke**, for the client switch (no
- * per-endpoint 422 alias is minted here — §3.5 ships those for its four named
- * surfaces only): `payment_failed` (402) is the ONLY arm carrying `details`
- * (`PaymentFailedDetails` with a `ChargeBlocker`), on the month-1 charge path.
- * `not_found` (404) covers both a retired/unknown `(package_key, location)`
- * and a dog that is not the caller's (the anti-enumeration collapse — never
- * 403). `conflict` (409) is the R1 uniqueness pre-charge probe, and also the
- * post-money-residue "your month-1 payment was returned, start again" answer.
- * `bad_request` (400) is a schema rejection. Contract tests for the full arm
- * matrix are digest memberships/test-S → phase 3.2.
- */
-export interface PostMembershipsRequest {
-  /** The dog to subscribe; must be the caller's own (a miss and a not-yours
-   *  both answer `not_found`). Validated as a UUID. */
-  dog_id: string;
-  /**
-   * Catalog key of the credit package. `package_key` ALONE is ambiguous across
-   * locations — `location` pins the row (the same rule as
-   * `POST /credit-packages/:key/purchase`). Resolved against the
-   * effective-dated catalog for **today in America/Chicago**; a retired or
-   * unknown key 404s, and the resolved package's surrogate id is then pinned
-   * on the membership so later repricing never changes what it bills.
-   * Validated `.min(1).max(64).regex(/^[a-z0-9-]+$/i)`
-   * (`memberships.ts:197-201`). — BUSINESS-LOGIC/memberships.md R15 @ :41
-   */
-  package_key: string;
-  location: LocationKey;
-  /**
-   * The committed term. These four literals are the one vocabulary in three
-   * places that already agree: the DDL CHECK
-   * (`term_months IN (3, 6, 9, 12)`, `schema.sql:1348`), this schema's
-   * `z.union` of literals (`memberships.ts:205`), and mobile's
-   * `MEMBERSHIP_TERM_OPTIONS` (`membershipRepository.ts:23`). —
-   * BUSINESS-LOGIC/memberships.md @ :13
-   */
-  term_months: 3 | 6 | 9 | 12;
-  /**
-   * The card every rolled invoice will bill, pinned at subscribe. If it dies
-   * later the auto-charge parks and the payment-failed push fires — the
-   * existing dunning lane, no membership special case. Validated as a UUID.
-   */
-  payment_method_id: string;
-}
-
-// (d) per-endpoint 422 aliases: none for this domain — §3.5 scopes them to
-//     POST /bookings, /requests, /enrollments, /events/:id/rsvp. The arms are
-//     documented on `PostMembershipsRequest` instead.
-// (e) domain-owned pure helpers: none. `toMembershipWire` /
-//     `loadMembershipPackage` are serializers + loaders and STAY server-side
-//     (§6, "functions only → Stay").
-
-// <<< domain:memberships ======================================================
 
 // >>> domain:messaging ========================================================
 
@@ -4303,23 +4080,6 @@ export function deepLinkToPath(link: NotificationDeepLink): string {
       }
       return `/account/invoices?invoiceId=${link.id}&reason=${reason}`;
     }
-    case 'membership': {
-      // Routing decided AT SEND TIME (Allison 2026-07-27, decision 4): a LONE
-      // membership ending deep-links to that dog's subscriptions page; when the
-      // SAME owner has MULTIPLE memberships completing in one worker tick
-      // (simultaneous endings), the producer omits `params.dogId` so the tap lands
-      // on the `/account/memberships` overview instead. `params.dogId` present ⇒
-      // the dog page, carrying `?highlight=<membershipId>` so the app one-shot
-      // flashes the SPECIFIC ended subscription card (Allison 2026-07-28, R4);
-      // `link.id` is that membership id (producers pass it). Absent ⇒ the overview.
-      // Historical rows persist the old query-less `/account/memberships` AND the
-      // highlight-less `/dog-subscriptions/:dogId`; the parser keeps accepting both
-      // (backward-compat rule).
-      const dogId = link.params?.dogId;
-      return dogId === undefined || dogId === ''
-        ? '/account/memberships'
-        : `/dog-subscriptions/${dogId}?highlight=${link.id}`;
-    }
     case 'dog-profile':
       return `/dog-profile/${link.id}`;
     case 'dog-manage':
@@ -4335,7 +4095,7 @@ export function deepLinkToPath(link: NotificationDeepLink): string {
       return `/announcement/${link.id}`;
     // The expiring card, flashed in the wallet list (`link.id` is the
     // payment_method id) — same "point at the row, not the page" rule as invoice
-    // and membership (Allison 2026-07-29).
+    // (Allison 2026-07-29).
     case 'payment-method':
       return `/payment-methods?highlight=${link.id}`;
     // A waitlist OFFER (`link.id` is the waitlist_entries id). Deliberately not
@@ -4362,12 +4122,11 @@ export function deepLinkToPath(link: NotificationDeepLink): string {
  * `conformance.ts` since 1.13.0). Promoted 1.13.0 from
  * `db/repositories/invoicesRepository.ts:31` (digest payments-invoices/M, "move
  * the money surface into wire.ts … + pin the money enums"); it reaches the wire
- * through `ParkedInvoiceWire.status`.
+ * through `StaffInvoiceWire.status`.
  *
  * Three members, and the two that are ABSENT are the contractful part: there is
- * no 'overdue' and no 'refunded' invoice state. An unpaid invoice stays 'open'
- * — the auto-charge worker dunns it and eventually PARKS it, still 'open' — and
- * a refund is a `charges`-side fact that never changes an invoice's status.
+ * no 'overdue' and no 'refunded' invoice state. An unpaid invoice stays 'open',
+ * and a refund is a `charges`-side fact that never changes an invoice's status.
  * The staff portal's hand vocabulary (`Open|Paid|Overdue|Refunded|Void`)
  * disagrees on both; that is KNOWN drift, not news
  * (BUSINESS-LOGIC/DISCREPANCIES.md DRIFT-17, DRIFT-59), it resolves in the
@@ -4384,25 +4143,21 @@ export type InvoiceStatus = 'open' | 'paid' | 'void';
  * What a `charges` / `invoices` row is FOR. Mirrors the `charge_purpose` pgEnum
  * (pinned in `conformance.ts` since 1.13.0). Promoted 1.13.0 from
  * `db/repositories/chargesRepository.ts:106` (digest payments-invoices/M); it
- * reaches the wire through `ParkedInvoiceWire.purpose`.
+ * reaches the wire through `StaffInvoiceWire.purpose`.
  *
- * Members are transcribed in the SOURCE declaration's order, which differs from
- * the pgEnum's (`'package'` is first there). Only set equality is contractual —
- * the conformance pin is a bidirectional `Equal`, not an order check.
+ * Only set equality is contractual — the conformance pin is a bidirectional
+ * `Equal`, not an order check.
  *
  * Not to be confused with `LedgerEntryWire.kind`, the OWNER-facing collapse of
- * this same vocabulary: `package → 'credit-pack'`, `payg → 'payg'`,
- * `membership → 'membership'`, and BOTH `board-train` and `group-class` →
- * `'session'` (`db/repositories/ledgerRepository.ts:86-98`). Staff read
- * purposes; owners read kinds. The two are not interchangeable and the mapping
- * is lossy in that one direction.
+ * this same vocabulary: `package → 'credit-pack'`, and BOTH `board-train` and
+ * `group-class` → `'session'` (`db/repositories/ledgerRepository.ts:86-98`). Staff
+ * read purposes; owners read kinds. The two are not interchangeable and the
+ * mapping is lossy in that one direction.
  *
- * `'payg'` stays because the pgEnum does, and this release has no migration. From
- * 4.0.0 nothing writes it: a booking pays in credits (design §2.7:3815-3816; R1).
- * It survives on rows already written, which the auto-charge lane reads until
- * P17 deletes that lane.
+ * 5.0.0-lg4.1 (M4.02; CRED-U29, DECISIONS 151(h)): `'membership'` and `'payg'`
+ * left with the rebuild, so no row carries either.
  */
-export type ChargePurpose = 'payg' | 'package' | 'board-train' | 'membership' | 'group-class';
+export type ChargePurpose = 'package' | 'board-train' | 'group-class';
 
 // ---- (b) response wires ----------------------------------------------------
 
@@ -4438,7 +4193,7 @@ export interface InvoicePayWire {
   invoice_status: 'open' | 'paid' | 'void';
   /**
    * True when this charge succeeded at Stripe but LOST the settle race against
-   * a concurrent worker auto-charge (or webhook) -- the invoice is already
+   * another settle of the same invoice -- the invoice is already
    * `paid` by that path, so this duplicate charge is being refunded post-commit
    * (a 'pending' refund row was written in-tx; Stripe + webhook reconcile it).
    * The owner's card nets exactly one charge. Honest signal so the client
@@ -4511,8 +4266,8 @@ export interface CreditPurchaseWire {
  * was the package purchase that funded it.
  *
  * **Omit-on-null throughout**: every optional field below is ABSENT when
- * inapplicable, never `null`. Membership rows carry no dog; only sessions/payg
- * carry a category; only credit-packs carry a mode.
+ * inapplicable, never `null`. Only sessions carry a category; only credit-packs
+ * carry a mode.
  */
 export interface LedgerEntryWire {
   id: string;
@@ -4520,9 +4275,9 @@ export interface LedgerEntryWire {
    * The owner-facing collapse of `ChargePurpose` (see that type): `package`
    * becomes 'credit-pack', `board-train` and `group-class` both become
    * 'session'. Lossy by design — owners read money by what it bought, staff by
-   * what it was booked against. `'payg'` reads only a row written before 4.0.0.
+   * what it was booked against.
    */
-  kind: 'session' | 'credit-pack' | 'membership' | 'payg';
+  kind: 'session' | 'credit-pack';
   /**
    * Ledger-entry state, which is NOT `InvoiceStatus` and must not be unified
    * with it. Three members, and the divergence is real in both directions:
@@ -4570,7 +4325,7 @@ export interface LedgerEntryWire {
   /**
    * Paid entries only: the settling card — present ONLY when the paid charge
    * settled an invoice with a live payment_method. Omitted for direct
-   * package/membership charges and non-paid entries.
+   * package charges and non-paid entries.
    */
   settled_card?: { brand: string; last4: string };
   /**
@@ -4598,61 +4353,6 @@ export interface LedgerEntryWire {
    * open invoice and on a charge from before the engine.
    */
   order_id?: string;
-}
-
-/**
- * `GET /staff/invoices?parked` response row — the staff worklist of PARKED
- * invoices. Promoted 1.13.0 from `routes/staffInvoices.ts:41-50` (digest
- * payments-invoices/M "parked worklist"), where it was file-private and, in the
- * words of its own header, "NOT portal-mirrored yet"
- * (BUSINESS-LOGIC/payments-invoices.md:230). Freezing it is what unblocks the
- * portal wave; the roll-up-4 widened-`StaffInvoiceWire` + `RefundWire` REDESIGN
- * is that wave's work, not this bump's (design §6, §17).
- *
- * **PARKED means `status = 'open'` AND `next_attempt_at IS NULL`** — the
- * auto-charge worker will not touch the invoice again, so only a human can
- * resolve it (chase a card, void it). Read that off the code
- * (`db/repositories/invoicesRepository.ts:530-536`), not off the attempts
- * count: the worker also parks on the FIRST attempt when the card or Stripe
- * customer is missing, so an `auto_charge_attempts >= MAX` predicate would hide
- * exactly the invoices most stuck. Rows come ordered by `due_at` ASC —
- * longest-overdue first, for triage (BUSINESS-LOGIC/payments-invoices.md:32,70
- * R14).
- *
- * **`?parked` is REQUIRED**: omitting it is a 400 (`invalid_payload` family —
- * `bad_request`), deliberately, so the contract stays honest rather than
- * silently returning every invoice. A general staff invoice list does not
- * exist. Any value counts as present, including the bare `?parked`.
- *
- * 2.0.0 (STAFF-U13) adds one family's invoices, `GET /staff/owners/:id/invoices`,
- * and one invoice, `GET /staff/invoices/:id`, both as `StaffInvoiceWire`
- * (below). Neither changes this route or this shape, and `/staff/invoices/:id`
- * is a different path from `/staff/invoices`, so the two never collide. The
- * general list design 6.1.0 calls "STAFF-U13's `GET /staff/invoices`" is not
- * built at 2.0.0 (design.md:4493-4494, "plus the 6.1.0 list").
- *
- * `dog_id` is an explicit `| null`, NOT omit-on-null — this shape predates and
- * does not follow the file-wide omit convention. Transcribed as it emits.
- */
-export interface ParkedInvoiceWire {
-  id: string;
-  owner_id: string;
-  amount_cents: number;
-  /** Always 'open' in practice on this surface — parked is an OPEN state. The
-   *  field carries the full union because the row type does; do not read a
-   *  non-'open' value here as meaningful. */
-  status: InvoiceStatus;
-  purpose: ChargePurpose;
-  /** Explicit null, not omitted — see the type's doc comment. */
-  dog_id: string | null;
-  due_at: string;
-  /**
-   * Dunning attempts the worker made before giving up. R12: max 4, backoff
-   * 1m → 1h → 24h → 72h (BUSINESS-LOGIC/payments-invoices.md:66,
-   * `workers/invoiceAutoCharge.ts:57-73`). **Not the park predicate** — a card-
-   * missing park lands here at 1, or even 0. Display it; do not filter on it.
-   */
-  auto_charge_attempts: number;
 }
 
 /**
@@ -4880,8 +4580,9 @@ export interface StaffPaymentWire extends StaffInvoicePaymentWire {
 export type GetStaffOwnersInvoicesResponse = StaffInvoiceWire[];
 
 // `GET /staff/invoices/:id` (200) returns one `StaffInvoiceWire` and has no
-// alias: the rulebook's name for it, `GetStaffInvoicesResponse`, would name
-// the parked worklist's path (`/staff/invoices`, `ParkedInvoiceWire[]`) too.
+// alias: the rulebook's name for it, `GetStaffInvoicesResponse`, is the name
+// of the list design 6.1.0 builds at `/staff/invoices` (7.1.0 here). No route
+// answers that path from 5.0.0-lg4.1 until then: `?parked` is gone.
 
 /** `GET /staff/owners/:id/payments` response (200), owner and manager. */
 export type GetStaffOwnersPaymentsResponse = StaffPaymentWire[];
@@ -5104,8 +4805,7 @@ export interface PatchPaymentMethodsRequest {
 // rides `InvoicePayWire.charge_blocker` in a 201 body. The one `details`-carrying
 // money arm, `payment_failed` / `PaymentFailedDetails`, is a 402 and not a 422,
 // so it is no alias here either: `InvoicePayRequest` documents it for this route,
-// and memberships, enrollments and requestConfirmPayment emit it too (wire.ts §1,
-// design §3.3).
+// and enrollments and requestConfirmPayment emit it too (wire.ts §1, design §3.3).
 
 // ---- (e) domain helpers ----------------------------------------------------
 //
@@ -5453,8 +5153,8 @@ export interface GetStaffRatesHistoryQuery {
  * surface: nothing outside `refundsRepository` SELECTs the table, and the only
  * refund facts an owner ever receives are cents and booleans elsewhere —
  * `EnrollmentWithdrawResultWire.refunded_cents` / `.owed_cents`,
- * `InvoicePayWire.charge_refunded`, `MembershipCreateWire.charge_refunded`, and
- * the ledger entry's own `'refunded'` status. The union is contracted anyway
+ * `InvoicePayWire.charge_refunded`, and the ledger entry's own `'refunded'`
+ * status. The union is contracted anyway
  * for two reasons: it is the vocabulary the portal wave's staff refund surface
  * (POST /staff/refunds + `RefundWire`, Adjudication 8 — design deferred,
  * `designs/wire-contract-completion.md` §17) must be built against, and a
@@ -5713,8 +5413,7 @@ export interface ReportWire {
  * in 2.3b (design §9; digest reports/M). A bare array with no envelope and no
  * pagination is the house shape for every staff list endpoint that exists
  * today — `GET /staff/dogs` (`staffDogs.ts:45`), `GET /staff/threads`
- * (`staffThreads.ts:54`), `GET /staff/bookings` (`staffBookings.ts:95`),
- * `GET /staff/invoices` (`staffInvoices.ts:74`).
+ * (`staffThreads.ts:54`), `GET /staff/bookings` (`staffBookings.ts:95`).
  *
  * Rows are live reports only (`reports.expired_at IS NULL` — `schema.sql:589`,
  * the `live()` predicate `reportsRepository` already applies to every read).
@@ -5723,7 +5422,7 @@ export type GetStaffReportsResponse = ReportWire[];
 
 /**
  * `GET /staff/reports` query. `dog_id` is REQUIRED — an unscoped cross-owner
- * report list 400s, the `GET /staff/invoices` precedent (Allison ruling
+ * report list 400s (Allison ruling
  * 2026-08-25, wire-contract-completion WC-A5: staff name a dog to list its
  * reports; widening to an optional scope later is additive, narrowing would
  * be breaking). `program`/`category` are optional filters; all three are

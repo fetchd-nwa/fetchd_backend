@@ -12,7 +12,7 @@ import {
   sql,
   type SQL,
 } from 'drizzle-orm';
-import type { ChargeStatus } from '../../contracts/wire.js';
+import type { ChargePurpose, ChargeStatus } from '../../contracts/wire.js';
 import {
   chargeBelongsToEnrollment,
   type EnrollmentIdentity,
@@ -105,11 +105,9 @@ function pendingGroupClassCaptureWhere(args: { olderThan: Date; mintedAfter: Dat
 /**
  * Data-access seam for `charges` (schema.sql ~line 700). Append-only
  * retained financial record — Stripe PaymentIntent rows for package
- * purchases, B&T deposits, group-class enrollment, etc., and the old
- * pay-as-you-go rows the lane settles until P17. NO `expired_at` — charges
- * are never soft-deleted;
- * refunds against a charge are tracked separately in the `refunds`
- * table.
+ * purchases, B&T deposits and group-class enrollment. NO `expired_at` —
+ * charges are never soft-deleted; refunds against a charge are tracked
+ * separately in the `refunds` table.
  *
  * Day 13 introduced the first read here. Day 14 adds the write path:
  *   - `create` — INSERT after Stripe `paymentIntents.create + confirm`
@@ -120,12 +118,12 @@ function pendingGroupClassCaptureWhere(args: { olderThan: Date; mintedAfter: Dat
  *     stubbed here so the cancel + tests can reference the contract.
  */
 
-export type ChargePurpose = 'payg' | 'package' | 'board-train' | 'membership' | 'group-class';
 // Re-exported, not redeclared: `ChargeStatus` moved into the wire contract in
 // 1.7.0 when `InvoicePayWire` did (it reports this value), and `conformance.ts`
 // pins it against the `charge_status` pgEnum. Two copies could drift apart while
-// both still compiled.
-export type { ChargeStatus } from '../../contracts/wire.js';
+// both still compiled, which is what a hand `ChargePurpose` here did until 5.0.0-lg4.1:
+// it kept two dead labels compiling after the database had refused them.
+export type { ChargePurpose, ChargeStatus } from '../../contracts/wire.js';
 
 export interface ChargeRow {
   id: string;
@@ -136,12 +134,7 @@ export interface ChargeRow {
   stripePaymentIntentId: string | null;
   purpose: ChargePurpose;
   /**
-   * The dog this money is for, when the charge is per-dog (membership,
-   * group-class). Added 2026-08-24 (MR-A1.4 fold) because the webhook's
-   * month-1 push has to key its deep link off the ROW rather than off event
-   * metadata: metadata crosses a trust boundary and can arrive empty, and a
-   * push keyed off an absent field simply never fires — which is how an
-   * unattended refund happened with no notification at all.
+   * The dog this money is for, when the charge is per-dog (group-class).
    */
   dogId: string | null;
 }
@@ -314,38 +307,7 @@ export const chargesRepository = {
    * client retry: the unique PI makes the second INSERT a no-op (`DO NOTHING`)
    * that falls through to the re-SELECT, so the grant is written exactly once.
    *
-   * `created` is load-bearing for the membership month-1 arms
-   * (`designs/money-residue.md` §2.2c): `false` means ANOTHER writer owns this
-   * PaymentIntent — the route committing concurrently, or a prior delivery —
-   * and the caller must decide by the found row's status instead of by its own
-   * intent. That re-check is what makes the ordinary subscribe race-safe: a
-   * webhook arriving before the route's commit BLOCKS on the route's
-   * uncommitted unique insert, then reads the committed `'succeeded'` row and
-   * no-ops, so it can never refund a charge whose membership exists.
-   *
-   * **THE CONFLICT FALLBACK BELOW IS A PLAIN READ, AND STAYS ONE** (MR-A2.1,
-   * 2026-08-24). It is not a lock, so a caller that ADJUDICATES money from it
-   * decides while holding nothing — which is exactly the defect MR-A2.1 fixed
-   * in `memberships.ts`. Rather than lock here (which would take the charge
-   * lock on paths that do not need it, including the webhook's own inserts),
-   * the rule is stated at the seam and re-verified per caller. All four,
-   * checked this pass:
-   *
-   *   1. `stripeEventHandlers.maybeReconstructOrphanedPackagePurchase` — ignores
-   *      `created` entirely and uses only `charge.id`; the grant it feeds is
-   *      itself no-op-if-present. Nothing is adjudicated from the status.
-   *   2. `stripeEventHandlers.maybeRefundOrphanedMembershipCharge` — reads the
-   *      status only as a fast-path bail, then hands off to
-   *      `adjudicateMonthOneMembershipCharge`, which RE-READS the row under
-   *      `findByStripePaymentIntentIdForUpdate` and re-decides there. Safe in
-   *      both directions: a plain read can only lag, and the terminal statuses
-   *      are absorbing, so "terminal" can never be a stale lie.
-   *   3. `memberships.ts` arm (b)'s loser fall-through — **re-takes the locked
-   *      read before dispatching** (the MR-A2.1 fix).
-   *   4. `memberships.ts` arm (a)'s `recordProcessingMonthOneCharge` — an
-   *      ANSWER-ONLY read that writes no cap state, ruled sufficient at
-   *      MR-A1.3: a flip racing it at worst answers 402 where 409 just became
-   *      true, and the owner's next tap heals it.
+   * `created` says whether this call wrote the row.
    */
   async insertIfAbsentByPaymentIntent(
     tx: Tx,
@@ -355,14 +317,6 @@ export const chargesRepository = {
       status: ChargeStatus;
       purpose: ChargePurpose;
       stripePaymentIntentId: string;
-      /**
-       * The dog this money is for. Additive (2026-08-24, money-residue §2.2):
-       * a membership charge is per-dog and the orphan arm has the id in hand
-       * from the PaymentIntent metadata, so the reconstructed row carries the
-       * same stamp the route would have written. The package-reconstruct caller
-       * keeps omitting it — a package purchase's dog lives on the ledger row.
-       */
-      dogId?: string | null;
     },
   ): Promise<{ charge: ChargeRow; created: boolean }> {
     const [inserted] = await tx
@@ -374,7 +328,6 @@ export const chargesRepository = {
         status: args.status,
         purpose: args.purpose,
         stripePaymentIntentId: args.stripePaymentIntentId,
-        dogId: args.dogId ?? null,
       })
       .onConflictDoNothing({ target: charges.stripePaymentIntentId })
       .returning(CHARGE_PROJECTION);
@@ -633,36 +586,6 @@ export const chargesRepository = {
       .from(charges)
       .where(eq(charges.stripePaymentIntentId, stripePaymentIntentId))
       .limit(1);
-    return row;
-  },
-
-  /**
-   * The same lookup, under the row's LOCK — the membership month-1 invariant's
-   * serialization point (`designs/money-residue.md` §2.2b).
-   *
-   * A `'requires_payment'` membership charge is an adjudication PENDING, and
-   * whoever flips it terminal adjudicates the money. Three writers can reach
-   * one: the owner's same-key retry (adopt), the webhook's flip arm (refund),
-   * and the uniqueness lost-race branch. Reading it unlocked lets two of them
-   * decide from the same stale answer and both act — which for this row means
-   * a membership AND a refund, or two refunds. `FOR UPDATE` makes the second
-   * arrival block until the first commits and then read what it decided.
-   *
-   * **Charge FIRST, `refunds` never `FOR UPDATE`** — the §A3.19 R1 deadlock
-   * invariant. Callers take this lock, then mint through
-   * `mintCappedPendingRefund` (which re-takes the same row lock it already
-   * holds), so no leg can ever wait on a `refunds` row while holding a charge.
-   */
-  async findByStripePaymentIntentIdForUpdate(
-    tx: Tx,
-    stripePaymentIntentId: string,
-  ): Promise<ChargeRow | undefined> {
-    const [row] = await tx
-      .select(CHARGE_PROJECTION)
-      .from(charges)
-      .where(eq(charges.stripePaymentIntentId, stripePaymentIntentId))
-      .limit(1)
-      .for('update');
     return row;
   },
 

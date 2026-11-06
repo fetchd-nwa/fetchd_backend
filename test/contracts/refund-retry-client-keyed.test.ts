@@ -8,14 +8,10 @@ import {
   bookingDogs as bookingDogsTable,
   charges,
   cohorts as cohortsTable,
-  creditLedger,
   invoices,
-  memberships,
   notifications,
   refunds,
-  scheduledNotifications,
 } from '../../src/db/schema/schema.js';
-import { membershipsRepository } from '../../src/db/repositories/membershipsRepository.js';
 import {
   REFUND_SWEEP_FLOOR,
   refundsRepository,
@@ -31,9 +27,7 @@ import { cancelBookingInTx } from '../../src/lib/cancelBookingService.js';
 import { refundCreateParams } from '../../src/lib/pendingRefund.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
-import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
-import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
 import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRetry.js';
 import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
@@ -49,10 +43,10 @@ import { makeStripeStub, type StripeStub } from './_stripeStub.js';
  * `designs/client-keyed-refund-recovery.md` — the money owed back that nothing
  * retried.
  *
- * THE DEFECT. Four writers mint a `'pending'` refunds row inside a transaction
- * and fire the Stripe `createRefund` after commit. Three of them — booking
- * cancel (owner and staff), group-class withdraw, and the membership subscribe
- * lost-race — keyed that call on the CLIENT's request `Idempotency-Key`, a
+ * THE DEFECT. Writers mint a `'pending'` refunds row inside a transaction and
+ * fire the Stripe `createRefund` after commit. Booking cancel (owner and staff)
+ * and group-class withdraw keyed that call on the CLIENT's request
+ * `Idempotency-Key`, a
  * string that exists only inside that request's closure. So when the
  * post-commit call failed (a rate limit, a 500, a dropped connection) the row
  * sat `'pending'` forever: the retry sweep could not re-fire it, because
@@ -108,17 +102,11 @@ async function cleanup(): Promise<void> {
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   await db
-    .delete(creditLedger)
-    .where(
-      and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'membership-grant')),
-    );
-  await db.delete(memberships).where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
-  await db
     .delete(notifications)
     .where(
       and(
         eq(notifications.ownerId, FIXTURE_IDS.ownerId),
-        inArray(notifications.type, ['booking-cancelled', 'membership-ended', 'payment-succeeded']),
+        inArray(notifications.type, ['booking-cancelled', 'payment-succeeded']),
       ),
     );
 }
@@ -204,7 +192,7 @@ async function seedMoneyPaidBooking(
     bookingId,
     amountCents,
     status: 'succeeded',
-    purpose: 'payg',
+    purpose: 'group-class',
     stripePaymentIntentId: paymentIntentId,
   });
   return { bookingId, chargeId, amountCents, paymentIntentId };
@@ -329,79 +317,6 @@ test(
     assert.equal(
       sweeper.calls.find((c) => c.method === 'createRefund')?.idempotencyKey,
       `${requestKey}:refund`,
-    );
-    await cleanup();
-  },
-);
-
-test(
-  'membership lost-race: the duplicate charge comes back even when the post-commit refund fails',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const base = makeStripeStub();
-    // Deterministic race: the winner's membership lands DURING the loser's
-    // Stripe call — after the route's pre-Stripe probe, before its tx.
-    let winnerId: string | undefined;
-    const racing: StripeStub = {
-      ...base,
-      async createAndConfirmPaymentIntent(args, idempotencyKey) {
-        if (winnerId === undefined) {
-          await withActor('system:scheduler', async (tx) => {
-            const winner = await membershipsRepository.createActive(tx, {
-              ownerId: FIXTURE_IDS.ownerId,
-              dogId: FIXTURE_IDS.dog1Id,
-              mode: 'school',
-              packageId: FIXTURE_IDS.creditPackageSchool5Id,
-              termMonths: 3,
-              paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
-              startedAt: FIXTURE_TODAY,
-              currentPeriodStart: FIXTURE_TODAY,
-              currentPeriodEnd: new Date('2026-06-19T17:00:00Z'),
-              endsAt: new Date('2026-08-19T17:00:00Z'),
-            });
-            winnerId = winner.id;
-          });
-        }
-        return base.createAndConfirmPaymentIntent(args, idempotencyKey);
-      },
-    };
-    base.throwOnRefund();
-
-    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-    registerMembershipsRoute(app, { authenticate, stripe: racing, now: FIXTURE_NOW });
-    const requestKey = randomUUID();
-    const res = await app.inject({
-      method: 'POST',
-      url: '/memberships',
-      headers: { 'idempotency-key': requestKey },
-      payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
-        package_key: FIXTURE_IDS.creditPackageSchool10Key,
-        location: 'fayetteville',
-        term_months: 3,
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-      },
-    });
-    assert.equal(res.statusCode, 201, res.body);
-    assert.equal((res.json() as { charge_refunded: boolean }).charge_refunded, true);
-
-    const row = await theOnlyRefund();
-    assert.equal(row.status, 'pending');
-    assert.equal(row.stripeRefundId, null, 'the post-commit refund threw');
-    assert.equal(
-      row.stripeIdempotencyKey,
-      `${requestKey}:dup-subscribe-refund`,
-      'this writer keeps its own key spelling — storage does not re-key anyone',
-    );
-
-    await ageIntoTheClaimWindow(row.id);
-    const sweeper = makeStripeStub();
-    const tick = await runDuplicateRefundRetryOnce({ stripe: sweeper, now: sweepNow() });
-    assert.equal(tick.sent, 1, 'an owner double-charged for a membership gets it back');
-    assert.equal(
-      sweeper.calls.find((c) => c.method === 'createRefund')?.idempotencyKey,
-      `${requestKey}:dup-subscribe-refund`,
     );
     await cleanup();
   },
@@ -802,7 +717,7 @@ test(
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 3_300,
         status: 'succeeded',
-        purpose: 'payg',
+        purpose: 'group-class',
         stripePaymentIntentId: null,
       })
       .returning({ id: charges.id });
@@ -922,7 +837,7 @@ test(
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 2_500,
         status: 'succeeded',
-        purpose: 'payg',
+        purpose: 'group-class',
         stripePaymentIntentId: `pi_test_${randomUUID().slice(0, 8)}`,
       })
       .returning({ id: charges.id });
@@ -1223,7 +1138,7 @@ test(
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 5_000,
         status: 'succeeded',
-        purpose: 'payg',
+        purpose: 'group-class',
         stripePaymentIntentId: `pi_test_${randomUUID().slice(0, 8)}`,
       })
       .returning({ id: charges.id });
@@ -1309,7 +1224,7 @@ test(
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 6_000,
         status: 'succeeded',
-        purpose: 'payg',
+        purpose: 'group-class',
         stripePaymentIntentId: null,
       })
       .returning({ id: charges.id });
@@ -1543,7 +1458,7 @@ test(
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 50_000,
         status: 'succeeded',
-        purpose: 'payg',
+        purpose: 'group-class',
         stripePaymentIntentId: `pi_test_${randomUUID().slice(0, 8)}`,
       })
       .returning({ id: charges.id });
@@ -1594,7 +1509,7 @@ test(
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 50_000,
         status: 'succeeded',
-        purpose: 'payg',
+        purpose: 'group-class',
         stripePaymentIntentId: `pi_test_${randomUUID().slice(0, 8)}`,
       })
       .returning({ id: charges.id });
@@ -1701,81 +1616,6 @@ test(
       'function',
       'the real implementation is restored',
     );
-    await cleanup();
-  },
-);
-
-// ──────────────────────────────────────────────────────────────────────────
-// 6. The month-1 membership orphan refund joins lane 1
-//    (`designs/money-residue.md` §2.5/10)
-// ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'membership month-1 orphan: a webhook-minted refund whose fire fails is re-fired under the SAME stored key',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { app: hookApp } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-    const stripe = makeStripeStub();
-    registerStripeWebhookRoute(hookApp, { stripe });
-    const piId = `pi_test_m1sweep_${randomUUID().slice(0, 8)}`;
-    const eventId = `evt_test_${randomUUID().slice(0, 8)}`;
-
-    // The post-commit fire fails — before the stored key, a refund minted by an
-    // unattended webhook arm would have been unretryable by anything.
-    stripe.throwOnRefund();
-    stripe.setNextEvent({
-      id: eventId,
-      type: 'payment_intent.succeeded',
-      paymentIntentId: piId,
-      amountCents: 12_000,
-      metadata: {
-        owner_id: FIXTURE_IDS.ownerId,
-        dog_id: FIXTURE_IDS.dog1Id,
-        purpose: 'membership',
-        package_id: FIXTURE_IDS.creditPackageSchool5Id,
-        package_key: FIXTURE_IDS.creditPackageSchool5Key,
-        term_months: '3',
-        credits: '5',
-        mode: 'school',
-        location: 'fayetteville',
-      },
-    });
-    const res = await hookApp.inject({
-      method: 'POST',
-      url: '/webhooks/stripe',
-      headers: { 'stripe-signature': 't=1,v1=fake' },
-      payload: { id: eventId, type: 'payment_intent.succeeded' },
-    });
-    assert.equal(res.statusCode, 200, res.body);
-    assert.equal(
-      (res.json() as { outcome: string }).outcome,
-      'refunded-orphaned-membership-charge',
-    );
-
-    const row = await theOnlyRefund();
-    assert.equal(row.status, 'pending');
-    assert.equal(row.stripeRefundId, null, 'nothing at Stripe knows about this refund');
-    assert.equal(
-      row.stripeIdempotencyKey,
-      `membership-orphan-refund:${row.id}`,
-      'ROW-DERIVED and stored in the minting tx — lane 1 by construction',
-    );
-
-    await ageIntoTheClaimWindow(row.id);
-    const sweeper = makeStripeStub();
-    armRefundCap(piId, 12_000, stripe, sweeper);
-    const tick = await runDuplicateRefundRetryOnce({ stripe: sweeper, now: sweepNow() });
-    assert.equal(tick.scanned, 1, 'lane 1 claims it — the stored key is the whole licence');
-    assert.equal(tick.sent, 1);
-    const retried = sweeper.calls.filter((c) => c.method === 'createRefund');
-    assert.equal(retried.length, 1);
-    assert.equal(retried[0]?.idempotencyKey, `membership-orphan-refund:${row.id}`);
-    assert.ok((await readRefund(row.id))?.stripeRefundId, 'the re_* id closes the row');
-
-    await db
-      .delete(scheduledNotifications)
-      .where(eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId));
     await cleanup();
   },
 );

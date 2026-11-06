@@ -48,7 +48,7 @@ import { uuidId } from '../lib/uuidId.js';
  *
  * Pay-now is all-or-nothing. This is a GRANT-creating confirm site — the
  * booking exists only because the money moved — so it follows the same class
- * rule as `POST /memberships` and `POST /enrollments`: a confirm that returns
+ * rule as `POST /enrollments`: a confirm that returns
  * anything but `succeeded` cancels its PaymentIntent and throws
  * `payment_failed` (402) BEFORE the transaction opens, and a confirm that DID
  * succeed but whose transaction then rolls back is refunded on the way out.
@@ -182,9 +182,8 @@ export function registerRequestConfirmPaymentRoute(
         );
 
         if (stripeResult.status !== 'succeeded') {
-          // REFUSE — the grant-site class rule, whose two other instances are
-          // `memberships.ts` (cancel, then throw before `withMutation` opens)
-          // and `enrollments.ts` (throw + unwind). Creating the booking here on
+          // REFUSE — the grant-site class rule, whose other instance is
+          // `enrollments.ts` (throw + unwind). Creating the booking here on
           // a charge that did not complete would schedule a multi-week stay and
           // enqueue its reminders against money that never moved, with the
           // charges row parked at `requires_payment` and no invoice behind it
@@ -319,9 +318,9 @@ export function registerRequestConfirmPaymentRoute(
             // Pay-now: INSERT the charges row for the money that moved. Its
             // status is a literal, not a mapping, because `capture` exists only
             // on the succeeded arm — a non-succeeded confirm never reaches here.
-            // Pay-later: INSERT an open invoice — the worker auto-charges
-            // at due_at; the charges row + invoice settlement land via
-            // either the worker or `POST /invoices/:id/pay`.
+            // Pay-later: INSERT an open invoice. No worker bills it: the charges
+            // row + invoice settlement land when a person settles it, through
+            // `POST /invoices/:id/pay` or the cash path.
             if (capture !== undefined) {
               await chargesRepository.create(tx, {
                 ownerId: row.ownerId,

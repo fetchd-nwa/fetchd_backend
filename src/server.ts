@@ -19,7 +19,6 @@ import { registerHealthRoute } from './routes/health.js';
 import { registerHealthWatchdogRoute } from './routes/healthWatchdog.js';
 import { registerInvoicesRoute } from './routes/invoices.js';
 import { registerMediaRoute } from './routes/media.js';
-import { registerMembershipsRoute } from './routes/memberships.js';
 import { registerMeRoute } from './routes/me.js';
 import { registerNotificationsRoute } from './routes/notifications.js';
 import { registerPaymentMethodsRoute } from './routes/paymentMethods.js';
@@ -37,7 +36,6 @@ import { registerStaffCreditExpiryRoute } from './routes/staffCreditExpiry.js';
 import { registerStaffInvoicesRoute } from './routes/staffInvoices.js';
 import { registerStaffOrdersRoute } from './routes/staffOrders.js';
 import { registerStaffOwnersRoute } from './routes/staffOwners.js';
-import { registerStaffMembershipsRoute } from './routes/staffMemberships.js';
 import { registerStaffDogsRoute } from './routes/staffDogs.js';
 import { registerStaffRatesRoute } from './routes/staffRates.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
@@ -140,8 +138,7 @@ export function buildApp(): FastifyInstance {
   registerStaffCreditExpiryRoute(app); // [staff] — staff-tunable credit-expiry settings (2026-06-20)
   registerStaffSettingsRoute(app); // [staff] — GET/PATCH /staff/settings/:domain[/:location] (2.0.0)
   registerStaffAlumniRoute(app); // [staff] — §J.3 completed-programs record + alumni-flag clear
-  registerStaffMembershipsRoute(app); // [staff] — §J.1 pause / resume (staff-mediated)
-  registerStaffInvoicesRoute(app); // [staff] — parked-invoice worklist + GET /staff/invoices/:id (2.0.0)
+  registerStaffInvoicesRoute(app); // [staff] — GET /staff/invoices/:id (2.0.0)
   registerStaffOrdersRoute(app); // [staff] — pending-payments list + *Cancel order* (4.0.0-lg3.2)
   registerStaffOwnersRoute(app); // [staff] — owner picker + STAFF-U13 billing reads (2.0.0)
   registerStaffRatesRoute(app); // [staff] — per-location service-rate editor (2026-06-20)
@@ -158,7 +155,6 @@ export function buildApp(): FastifyInstance {
   registerPaymentMethodsRoute(app); // [auth] — owner-only
   registerDeviceTokensRoute(app); // [auth] — owner-only (Day-18c push registration)
   registerInvoicesRoute(app); // [auth, $] — Day-15 invoice settlement
-  registerMembershipsRoute(app); // [auth, $] — §J.1 credit-package subscriptions
   registerRequestConfirmPaymentRoute(app); // [auth, $] — Day-15 B&T conversion
   registerUploadsSignRoute(app); // [auth] — Day-17 presigned R2 PUT
   registerMediaRoute(app); // [auth] — Day-17 register/read/soft-expire media

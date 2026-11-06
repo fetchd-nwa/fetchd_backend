@@ -56,9 +56,6 @@ export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
   };
 
   if (dog.evaluationDate !== null) wire.evaluation_date = pgTimestampToIso(dog.evaluationDate);
-  if (dog.alumniAttendanceFlaggedAt !== null) {
-    wire.alumni_attendance_flagged_at = pgTimestampToIso(dog.alumniAttendanceFlaggedAt);
-  }
   if (dog.spayedNeutered !== null) wire.spayed_neutered = dog.spayedNeutered;
   if (dog.spayNeuterPlannedOn !== null) wire.spay_neuter_planned_on = dog.spayNeuterPlannedOn;
   if (dog.lastSeenOn !== null) wire.last_seen_on = dog.lastSeenOn;

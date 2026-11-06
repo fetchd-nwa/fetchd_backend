@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test, type TestContext } from 'node:test';
+import { eq } from 'drizzle-orm';
 import Fastify from 'fastify';
+import Stripe from 'stripe';
 import { registerAuth } from '../../src/auth/plugin.js';
+import { db } from '../../src/db/client.js';
 import { hashRequestBody, withMutation } from '../../src/db/mutation.js';
+import { stripeEvents } from '../../src/db/schema/schema.js';
 import { env } from '../../src/env.js';
 import {
   alarmForwardingHooks,
@@ -81,10 +85,7 @@ const TICK_RESULT: SchedulerTickResult = {
     pushTicketsOk: 0,
     pushTicketsError: 0,
   },
-  membershipRoll: { scanned: 0, rolled: 0, completed: 0 },
-  invoiceOverdue: { scanned: 0, enqueued: 0 },
   cardExpiry: { scanned: 0, enqueued: 0 },
-  invoiceAttemptVerify: { scanned: 0, results: [] },
   orderSweeper: { scanned: 0, abandoned: 0, settled: 0, failed: 0, lateRefunded: 0, left: 0 },
   captureReconciler: {
     scanned: 0,
@@ -113,10 +114,8 @@ const TICK_RESULT: SchedulerTickResult = {
     },
     results: [],
   },
-  invoiceAutoCharge: { scanned: 0, results: [] },
   mediaDerivatives: { scanned: 0, results: [] },
   creditExpiryWarnings: { scanned: 0, enqueued: 0 },
-  alumniAttendance: { ran: false, scanned: 0, enqueued: 0, flagged: 0 },
   idempotencyKeysSwept: 0,
 };
 
@@ -211,6 +210,74 @@ test('buildApp(): a route that DEMOTES its own logger does not get to exist (§A
   assert.equal(response.statusCode, 204);
   assert.equal(transport.events.length, 1, 'and a normal route still registers, and still pages');
 });
+
+// ---- the orphan succeeded intent, on the production entry ------------------
+
+test(
+  'POST /webhooks/stripe on buildApp(): a real signed succeeded intent with no charges row pages, and the response stays orphan-event',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // DECISIONS 169(b). `WebhookHandlerOpts.log` is optional, so a route that passed
+    // no logger would make this alarm silent while a fake-logger test stayed green.
+    // So nothing here is hand-assembled: `buildApp()`'s route table, its logger and its
+    // default Stripe seam, and only the signature is ours to make. This intent is on no
+    // row, so the handlers reach no Stripe verb at all.
+    const transport = makeRecordingTransport();
+    initObservability({ transport, installProcessHandlers: false });
+
+    const eventId = `evt_orphan_${randomUUID().slice(0, 8)}`;
+    const intentId = `pi_orphan_${randomUUID().slice(0, 8)}`;
+    const payload = JSON.stringify({
+      id: eventId,
+      object: 'event',
+      type: 'payment_intent.succeeded',
+      data: {
+        object: { id: intentId, object: 'payment_intent', amount: 12_500, metadata: {} },
+      },
+    });
+
+    const app = buildApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/stripe',
+      headers: {
+        'content-type': 'application/json',
+        'stripe-signature': Stripe.webhooks.generateTestHeaderString({
+          payload,
+          secret: env.STRIPE_WEBHOOK_SECRET,
+        }),
+      },
+      payload,
+    });
+    await app.close();
+    await db.delete(stripeEvents).where(eq(stripeEvents.eventId, eventId));
+
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json(), { ok: true, outcome: 'orphan-event' });
+
+    assert.equal(
+      transport.events.length,
+      1,
+      `money taken at Stripe with no row here must page; captured ${JSON.stringify(transport.events)}`,
+    );
+    const event = transport.events[0];
+    assert.ok(event !== undefined);
+    assert.equal(event.level, 'error', 'pino level 50');
+    assert.equal(event.logger, 'pino');
+    assert.equal(
+      event.message,
+      'ORPHAN PAYMENT — Stripe took this money and no charge row recorded it when the event landed: look the intent up in charges and in Stripe before refunding or recording anything',
+    );
+    const extra = event.extra as Record<string, unknown>;
+    assert.equal(extra['stripeEventId'], eventId);
+    assert.equal(extra['paymentIntentId'], intentId);
+    assert.equal(extra['amountCents'], 12_500);
+    assert.ok(
+      typeof extra['reqId'] === 'string' && extra['reqId'].length > 0,
+      `the page must carry the route logger's reqId; extra=${JSON.stringify(extra)}`,
+    );
+  },
+);
 
 // ---- 2. a worker alarm on POST /workers/tick reaches the pager -------------
 
@@ -623,10 +690,7 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
         // phase's answer rather than to agree with the fixture.
         queueOk: false,
       },
-      membershipRoll: { scanned: 11, rolled: 12, completed: 13 },
-      invoiceOverdue: { scanned: 21, enqueued: 22 },
       cardExpiry: { scanned: 31, enqueued: 32 },
-      invoiceAttemptVerify: { scanned: 41, results: [] },
       captureReconciler: {
         ...TICK_RESULT.captureReconciler,
         scanned: 51,
@@ -654,7 +718,6 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
           covered: 85,
         },
       },
-      alumniAttendance: { ran: true, scanned: 71, enqueued: 72, flagged: 73 },
     }),
   });
 
@@ -669,15 +732,9 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
   const complete = lines.find((line) => line['msg'] === 'scheduler tick complete');
   assert.ok(complete !== undefined, `no completion line; got ${JSON.stringify(lines)}`);
 
-  // The six phases that were missing — including both money phases.
-  assert.equal(complete['membershipRollScanned'], 11);
-  assert.equal(complete['membershipRolled'], 12);
-  assert.equal(complete['membershipCompleted'], 13);
-  assert.equal(complete['invoiceOverdueScanned'], 21);
-  assert.equal(complete['invoiceOverdueEnqueued'], 22);
+  // The phases that were missing — including both money phases.
   assert.equal(complete['cardExpiryScanned'], 31);
   assert.equal(complete['cardExpiryEnqueued'], 32);
-  assert.equal(complete['invoiceAttemptVerifyScanned'], 41);
   assert.equal(complete['captureReconcilerScanned'], 51);
   assert.equal(complete['captureReconcilerCaptured'], 52);
   assert.equal(complete['captureReconcilerLostHolds'], 53);
@@ -704,10 +761,6 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
   assert.equal(complete['duplicateRefundRetryAbandonedNeverSent'], 83);
   assert.equal(complete['duplicateRefundRetryAbandonedStripeFailed'], 84);
   assert.equal(complete['duplicateRefundRetryAbandonedCovered'], 85);
-  assert.equal(complete['alumniAttendanceRan'], true);
-  assert.equal(complete['alumniAttendanceScanned'], 71);
-  assert.equal(complete['alumniAttendanceEnqueued'], 72);
-  assert.equal(complete['alumniAttendanceFlagged'], 73);
 
   // Phase 1's poison-row leaves (2026-09-03). `scanned - sent` stopped meaning
   // "still due" the moment a row could fail alone or park, so the two counters
@@ -732,7 +785,6 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
     'scheduledSent',
     'pushTicketsOk',
     'pushTicketsError',
-    'invoicesScanned',
     'mediaDerivativesScanned',
     'creditExpiryWarningsScanned',
     'creditExpiryWarningsEnqueued',

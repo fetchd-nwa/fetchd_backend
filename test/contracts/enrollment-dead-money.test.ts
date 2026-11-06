@@ -230,9 +230,13 @@ interface LateSettleWorld {
 }
 
 /**
- * The D1 world, staged through nothing but production verbs: pay-later enroll,
- * withdraw (voids the invoice), re-enroll pay-now with a failing capture, then
- * the webhook's late settle of the VOIDED invoice.
+ * The D1 world: pay-later enroll, withdraw (voids the invoice) and re-enroll pay-now
+ * with a failing capture, all production verbs, then a late settle of the VOIDED
+ * invoice, which is not one. That last step calls `settleInvoiceCharge()`'s first half
+ * by hand. No production path calls it since P17 (DECISIONS 168(a), 169(a)), and on a
+ * real signed event this world answers `orphan-event`. So this holds the anchor rule
+ * and the money reads behind it, never a live writer. The live write is `/pay`'s tx1:
+ * the anchor tests in `invoice-pay.test.ts` hold that.
  *
  * `failDuplicateRefund` reproduces the R18/R19 producer (the bank terminally
  * refuses the void arm's refund), which is what reopens the remainder and turns
@@ -244,8 +248,8 @@ async function buildLateSettleWorld(opts: {
   cohortId: string;
   failDuplicateRefund?: boolean;
 }): Promise<LateSettleWorld> {
-  // ── E1: pay-later. An open invoice, no charge row yet. Off-stage, the
-  //    auto-charge worker has already confirmed a PI that is still settling.
+  // ── E1: pay-later. An open invoice, no charge row yet. The PI this world needs
+  //    came from the auto-charge worker, gone since P17, so it is given, not produced.
   const e1 = await enroll({ app: opts.app, cohortId: opts.cohortId, payLater: true });
   assert.equal(e1.statusCode, 201, e1.body);
   const e1Anchor = (await liveSessionIds(opts.cohortId))[0]!;
@@ -270,11 +274,11 @@ async function buildLateSettleWorld(opts: {
   );
   assert.ok(hold, 'E2 rests on a live hold');
 
-  // ── The webhook lands: E1's voided invoice had a PI that succeeded. This IS
-  //    `maybeSettleOrphanedInvoiceCharge`'s documented invoice-void arm, minus
-  //    the webhook envelope. `markPaid` filters `status='open'`, so the void
-  //    invoice yields flipped=0 → the lost-race arm mints the charge AND the
-  //    full duplicate refund that returns the money.
+  // ── The first half, by hand: E1's voided invoice is given a PI that succeeded. No
+  //    webhook does this any more. It drives the anchor rule into
+  //    `settleChargeAgainstInvoice`'s lost-race arm. `markPaid` filters
+  //    `status='open'`, so the void invoice yields flipped=0 → the lost-race arm mints
+  //    the charge AND the full duplicate refund that returns the money.
   const settle = await withActor(`owner:${FIXTURE_IDS.ownerId}`, async (tx) => {
     const invoice = await invoicesRepository.findById(tx, invoiceRow.id);
     assert.ok(invoice, 'invoice row exists');
@@ -666,9 +670,9 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     // RED against the gated tree: `'already-captured'` — the money was kept
-    // silently, the covering invoice stayed OPEN (so `invoiceAutoCharge` would
-    // collect the SAME class again at due_at), `payment_status` read `'paid'`
-    // off money nothing had reconciled, and nothing paged.
+    // silently, the covering invoice stayed OPEN (so `invoiceAutoCharge`, gone since
+    // P17, would have collected the SAME class again at due_at), `payment_status`
+    // read `'paid'` off money nothing had reconciled, and nothing paged.
     //
     // §A3.18.4 scoped the surplus arm to a PRODUCER ("the reconciler itself
     // decided not-owed and its release lost the race"), so the identical state
@@ -693,8 +697,8 @@ test(
       const invoice = await invoiceRowFor(cohort.id);
       assert.equal(invoice.status, 'paid', 'the invoice is settled, not left for a second charge');
       assert.equal(invoice.paidChargeId, w.chargeId, 'and it names the charge that settled it');
-      // Every invoice claim read filters `status = 'open'`, so a paid invoice is
-      // invisible to `invoiceAutoCharge` — the second collection cannot happen.
+      // `/pay` refuses anything but an open invoice, so a second collection cannot
+      // happen.
       assert.equal(
         await receiptCount(),
         receiptsBefore + 1,
@@ -838,6 +842,8 @@ test(
         const inv = await invoicesRepository.findById(tx, invoice.id);
         assert.ok(inv);
         assert.equal(inv.bookingId, null, 'the legacy invoice really has no anchor');
+        // The anchor rule through the first half, which no production path calls. The
+        // live write is `/pay`'s: the witness test in `invoice-pay.test.ts`.
         return settleInvoiceCharge(tx, {
           invoice: inv,
           paymentIntentId: `pi_late_${randomUUID().slice(0, 12)}`,
@@ -922,6 +928,8 @@ test(
       const settle = await withActor(`owner:${FIXTURE_IDS.ownerId}`, async (tx) => {
         const inv = await invoicesRepository.findById(tx, invoice.id);
         assert.ok(inv);
+        // The anchor rule through the first half, which no production path calls. The
+        // live write is `/pay`'s: the witness test in `invoice-pay.test.ts`.
         return settleInvoiceCharge(tx, {
           invoice: inv,
           paymentIntentId: `pi_orphan_${randomUUID().slice(0, 12)}`,
@@ -976,6 +984,8 @@ test(
       const settle = await withActor(`owner:${FIXTURE_IDS.ownerId}`, async (tx) => {
         const inv = await invoicesRepository.findById(tx, invoice.id);
         assert.ok(inv);
+        // The anchor rule through the first half, which no production path calls. The
+        // live write is `/pay`'s: the no-witness test in `invoice-pay.test.ts`.
         return settleInvoiceCharge(tx, {
           invoice: inv,
           paymentIntentId: `pi_nowitness_${randomUUID().slice(0, 12)}`,

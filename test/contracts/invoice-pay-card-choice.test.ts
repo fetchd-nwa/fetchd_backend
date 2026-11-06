@@ -183,8 +183,6 @@ async function invoiceRowOf(invoiceId: string) {
     .select({
       status: invoices.status,
       paymentMethodId: invoices.paymentMethodId,
-      nextAttemptAt: invoices.nextAttemptAt,
-      autoChargeAttempts: invoices.autoChargeAttempts,
       paidChargeId: invoices.paidChargeId,
       paidAt: invoices.paidAt,
     })
@@ -194,7 +192,7 @@ async function invoiceRowOf(invoiceId: string) {
   return row;
 }
 
-async function boundCardOf(invoiceId: string): Promise<string | undefined> {
+async function boundCardOf(invoiceId: string): Promise<string | null | undefined> {
   const [row] = await db
     .select({ paymentMethodId: invoices.paymentMethodId })
     .from(invoices)
@@ -446,7 +444,7 @@ test(
     assert.equal(res.statusCode, 402, res.body);
 
     // Nothing was captured and the invoice is still open. Repointing here would
-    // silently rewrite the auto-charge worker's target to a card the owner never
+    // silently rewrite the invoice's bound card to one the owner never
     // successfully paid with, as a side effect of an abandoned 3DS prompt.
     assert.equal(
       await boundCardOf(invoiceId),
@@ -514,9 +512,8 @@ test(
     stripe.setNextIntentStatus('requires_action');
     assert.equal((await pay(app, invoiceId, { card: CARD2_ID })).statusCode, 402);
 
-    // The auto-charge worker's schedule and the owner's next manual attempt both
-    // have to proceed as if this attempt never happened — so status, bound card
-    // and the retry clock are all untouched on this arm.
+    // The owner's next attempt has to proceed as if this one never happened, so
+    // the invoice row is untouched on this arm.
     assert.deepEqual(await invoiceRowOf(invoiceId), before);
     assert.equal(before.status, 'open', 'precondition: it was open to begin with');
     await cleanup();
@@ -687,6 +684,28 @@ test(
     const body = replay.json() as Record<string, unknown>;
     assert.equal('charge_blocker' in body, false, 'the field is absent, and that is legal');
     assert.equal(body.charge_status, 'requires_payment', 'the rest of the body still arrives');
+    await cleanup();
+  },
+);
+
+// M4.04 made the column nullable and P25 is its first NULL writer. Until then no row
+// can reach this; the route still has to say something true when one does.
+test(
+  'POST /invoices/:id/pay — no card bound and none named is a 400, and naming one pays it',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanup();
+    const invoiceId = await seedOpenInvoice();
+    await db.update(invoices).set({ paymentMethodId: null }).where(eq(invoices.id, invoiceId));
+    const { app, stripe } = buildApp();
+
+    const refused = await pay(app, invoiceId);
+    assert.equal(refused.statusCode, 400, refused.body);
+    assert.deepEqual(chargedStripeCards(stripe), [], 'no card was tried');
+
+    const paid = await pay(app, invoiceId, { card: FIXTURE_IDS.paymentMethod1Id });
+    assert.equal(paid.statusCode, 201, paid.body);
+    assert.equal((await invoiceRowOf(invoiceId)).status, 'paid');
     await cleanup();
   },
 );

@@ -17,7 +17,7 @@ import {
   type StripeClient,
   type StripePaymentIntentResult,
 } from '../lib/stripe.js';
-import type { WorkerLogger } from './invoiceAutoCharge.js';
+import type { WorkerLogger } from './workerLogger.js';
 
 /**
  * The order sweeper (design §2.7:3953-3974, as `designs/p15-engine-recovery.md` revises

@@ -34,11 +34,10 @@ const stripeSingleton = new Stripe(env.STRIPE_SECRET_KEY);
 
 /**
  * The logger {@link chargeBlockerForConfirm} needs — the two levels it actually
- * calls, structurally. Widened from `FastifyBaseLogger` on 2026-08-12 so the
- * auto-charge worker and the verify lane (which carry their own three-method
- * `WorkerLogger`, not a Fastify request logger) can reach the ONE blocker
- * derivation instead of growing a second one. `FastifyBaseLogger` satisfies
- * this structurally, so every existing route call site is unchanged.
+ * calls, structurally. Wider than `FastifyBaseLogger` so a worker (which carries
+ * the three-method `WorkerLogger`, not a Fastify request logger) reaches the ONE
+ * blocker derivation instead of growing a second one. `FastifyBaseLogger`
+ * satisfies this structurally.
  */
 export interface ChargeBlockerLogger {
   warn(obj: Record<string, unknown>, msg?: string): void;
@@ -119,13 +118,10 @@ export interface StripePaymentIntentResult {
    */
   unknownStatus?: string;
   /**
-   * The PaymentIntent's `created` instant (2026-08-12), carried through the
-   * seam because it is one of only two signals that can tell a REPLAY from a
-   * FRESH EXECUTION — and the whole double-charge defence of the verify lane's
-   * re-issue arm rests on that distinction. An intent created back when the
-   * attempt row was minted is the ORIGINAL being replayed; one created now was
-   * executed now, which means Stripe no longer holds the key
-   * (`invoiceAttemptVerify.reissueLooksReplayed`).
+   * The PaymentIntent's `created` instant (2026-08-12), carried through the seam
+   * because it is one of only two signals that can tell a REPLAY from a FRESH
+   * EXECUTION. Nothing reads it since the verify lane left (P17); the seam keeps
+   * reporting what Stripe said.
    *
    * `undefined` only when the source object carried no readable `created` (the
    * thrown fork's attached intent may not).
@@ -667,8 +663,7 @@ export interface StripeClient {
    * rather than `succeeded`), so it can't later auto-succeed and double-charge
    * against the next attempt's fresh PI. Every off-session confirm path off the
    * order engine owes this call while no client-side 3DS completion flow exists —
-   * the auto-charge worker, `POST /credit-packages/:key/purchase`,
-   * `POST /memberships`, and `POST /enrollments`. Best-effort: every
+   * `POST /credit-packages/:key/purchase` and `POST /enrollments`. Best-effort: every
    * caller swallows failures — a PI Stripe refuses to cancel (already settling)
    * is covered by the key-scoped Stripe idempotency on the next attempt.
    *
@@ -690,10 +685,9 @@ export interface StripeClient {
   ): Promise<void>;
 
   /**
-   * Read a PaymentIntent's CURRENT state — the verify lane's way of resolving
-   * doubt by asking rather than by charging again
-   * (`designs/auto-charge-unknown-outcome.md`, Decision 3). A GET in Stripe's
-   * API: no idempotency key, no money moved by calling it.
+   * Read a PaymentIntent's CURRENT state: how a worker resolves doubt by asking
+   * rather than by charging again. A GET in Stripe's API: no idempotency key, no
+   * money moved by calling it.
    *
    * Returns the same {@link StripePaymentIntentResult} the confirm verbs
    * produce, through the same normalizer — so `chargeBlockerForConfirm` reads a
@@ -998,8 +992,8 @@ function intentCreatedAt(created: unknown): Date | undefined {
  * header). Note the stem — idempot**ent**, not idempot**ency**. Until that probe
  * this function read only the two `idempotency-` spellings, so it returned
  * `false` on every genuine replay and the whole detector silently fell through
- * to `reissueLooksReplayed`'s `created`-timestamp heuristic — which answers
- * correctly in the common case, which is exactly why nothing went red.
+ * to a `created`-timestamp heuristic — which answered correctly in the common
+ * case, which is exactly why nothing went red.
  *
  * The two `idempotency-` spellings stay: they are what Stripe's own docs say,
  * Stripe has renamed response headers across API versions before, and an extra
@@ -1051,12 +1045,9 @@ export function replayedFromResponse(intent: Stripe.PaymentIntent): boolean | un
  * invoice forever (2026-08-12 adversarial review):
  *
  *   - **`params-mismatch` (HTTP 400)** — the key was first used with DIFFERENT
- *     parameters. On the auto-charge path that can only mean our records and
- *     Stripe's disagree about what attempt N was. The one response that must
- *     never follow is a fresh key, which is how a double charge gets
- *     manufactured out of a bookkeeping disagreement, so the verify lane parks
- *     it for a human and charges nothing (`designs/auto-charge-unknown-
- *     outcome.md`, Decision 1).
+ *     parameters, so our records and Stripe's disagree. The one response that
+ *     must never follow is a fresh key, which is how a double charge gets
+ *     manufactured out of a bookkeeping disagreement.
  *   - **`concurrent-request` (HTTP 409)** — "another request is currently using
  *     this Idempotency Key". This says NOTHING about our bookkeeping: it is two
  *     of our own workers (or two overlapping `POST /workers/tick` runs, which
@@ -1112,8 +1103,7 @@ export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentRe
     );
   }
   const clientSecret: unknown = isRecord(attached) ? attached.client_secret : undefined;
-  // Same `created` the returning fork carries, when the attached intent has one
-  // — the verify lane's replay-vs-fresh-execution test must work on both forks.
+  // Same `created` the returning fork carries, when the attached intent has one.
   const createdAt = intentCreatedAt(isRecord(attached) ? attached.created : undefined);
   // The field the pre-2026-08-11 seam dropped, and the whole reason an owner
   // whose card needed verification was told it had been declined. `err.code` is

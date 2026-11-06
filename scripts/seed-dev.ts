@@ -55,9 +55,7 @@ import {
   events,
   groupClasses,
   idempotencyKeys,
-  invoiceChargeAttempts,
   invoices,
-  memberships,
   messages,
   notificationDogs,
   notifications,
@@ -175,13 +173,7 @@ async function wipe(): Promise<void> {
   // charges, and charges before bookings (charges.booking_id) + paymentMethods
   // (invoices.payment_method_id).
   await db.delete(refunds);
-  // Any invoice the auto-charge worker ever touched has an attempt row, which RESTRICTs
-  // both the invoice and its card.
-  await db.delete(invoiceChargeAttempts);
   await db.delete(invoices);
-  // memberships RESTRICT-reference payment_methods + credit_packages + dogs —
-  // delete them before any of those parents.
-  await db.delete(memberships);
   await db.delete(creditLedger);
   await db.delete(creditPackages);
   await db.delete(charges);
@@ -754,8 +746,8 @@ async function seed(): Promise<void> {
   // sides of the R7 eligibility check for Allison.
   await db.insert(dogCompletedClasses).values([{ dogId: SEED.dogLolaId, classKey: 'manners-1' }]);
   // §J.3 alumni demo: Waffles has all 5 day-school curriculum programs →
-  // alumni is DERIVED true, her grants never expire (her seeded 10-credit lot
-  // already carries NULL expiry), and the dog-profile hero shows the badge.
+  // alumni is DERIVED true and the dog-profile hero shows the badge. Her credits
+  // expire like anyone's (ALUM-U16), so her seeded lot carries an expiry.
   await db.insert(dogCompletedPrograms).values(
     CURRICULUM_PROGRAMS.map((program) => ({
       dogId: SEED.dogWafflesId,
@@ -924,23 +916,6 @@ async function seed(): Promise<void> {
       createdAt: daysFromNow(-30, 15),
     },
     {
-      id: SEED.chargePaygId,
-      ownerId: SEED.ownerAllisonId,
-      amountCents: 9000,
-      status: 'succeeded',
-      purpose: 'payg',
-      bookingId: SEED.bookingLolaLessonId,
-      createdAt: daysFromNow(-20, 15),
-    },
-    {
-      id: SEED.chargeMembershipId,
-      ownerId: SEED.ownerAllisonId,
-      amountCents: 7900,
-      status: 'succeeded',
-      purpose: 'membership',
-      createdAt: daysFromNow(-15, 15),
-    },
-    {
       // Refunded group-class charge — exercises the 'refunded' status + the
       // purpose-derived category for a charge with no booking link.
       id: SEED.chargeRefundedId,
@@ -961,6 +936,8 @@ async function seed(): Promise<void> {
       delta: 10,
       reason: 'purchase',
       chargeId: SEED.chargePackageId,
+      // Bought 30 days ago on the schema's 12-month window.
+      expiresAt: daysFromNow(335, 15),
       createdAt: daysFromNow(-30, 15),
     },
   ]);

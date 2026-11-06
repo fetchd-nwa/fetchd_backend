@@ -1,31 +1,28 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, sql } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { invoices } from '../schema/schema.js';
 import type { ChargePurpose } from './chargesRepository.js';
+import { scheduledNotificationsRepository } from './scheduledNotificationsRepository.js';
 import type { Tx } from '../tx.js';
 
 /** Polymorphic runner — pool for pre/post-tx reads, Tx for in-mutation work. */
 type Runner = Tx | typeof db;
 
 /**
- * Data-access seam for `invoices` (schema.sql ~line 763). The pay-later
- * settlement path for B&T approval + group-class enrollment. Distinct
- * from `charges` (an immediate PaymentIntent): an invoice is amount-
- * owed-but-unpaid. When later paid, a `charge` is created and the
- * invoice flips to `'paid'` with `paid_charge_id` + `paid_at` set.
+ * Data-access seam for `invoices`. The pay-later settlement path for B&T
+ * approval + group-class enrollment. Distinct from `charges` (an immediate
+ * PaymentIntent): an invoice is amount-owed-but-unpaid. When later paid, a
+ * `charge` is created and the invoice flips to `'paid'` with `paid_charge_id` +
+ * `paid_at` set.
  *
- * Lifecycle (Day 15):
- *   - INSERT at status='open' (POST /requests/:id/confirm-payment
- *     pay-later branch).
- *   - `markPaid` inside the tx that creates the settling `charges` row
- *     (POST /invoices/:id/pay succeeded path + the worker auto-charge
- *     succeeded path).
- *   - Dunning fields (`auto_charge_attempts` + `next_attempt_at`):
- *     incremented by the worker on Stripe failures with backoff.
+ * Lifecycle:
+ *   - INSERT at status='open' (the pay-later arms of POST /enrollments and
+ *     POST /requests/:id/confirm-payment).
+ *   - `markPaid` inside the tx that settles the `charges` row.
  *
- * Anti-scam invariant (§G): `payment_method_id` is NOT NULL. Every
- * invoice is card-backed; the worker auto-charges at `due_at` and
- * retries on transient failures.
+ * No worker bills a card on its own (wire 5.0.0-lg4.1, PAY-U15), so `due_at` is
+ * a date a person reads, and nothing scans it. `payment_method_id` is nullable
+ * since M4.04, though nothing writes a NULL until P25.
  */
 
 export type InvoiceStatus = 'open' | 'paid' | 'void';
@@ -40,15 +37,12 @@ export interface InvoiceRow {
   cohortId: string | null;
   dogId: string | null;
   requestId: string | null;
-  /** §J.1: set on purpose='membership' rows — the subscription month billed. */
-  membershipId: string | null;
-  paymentMethodId: string;
-  /** R3: 'card' (default auto-charge) or 'in-person' (cash/check due at drop-off). */
+  /** The card this invoice is bound to. NULL is reachable from P25, not before. */
+  paymentMethodId: string | null;
+  /** R3: 'card' (the default) or 'in-person' (cash/check due at drop-off). */
   paymentExpected: 'card' | 'in-person';
   paidChargeId: string | null;
   dueAt: string;
-  nextAttemptAt: string | null;
-  autoChargeAttempts: number;
   paidAt: string | null;
 }
 
@@ -62,13 +56,10 @@ const INVOICE_PROJECTION = {
   cohortId: invoices.cohortId,
   dogId: invoices.dogId,
   requestId: invoices.requestId,
-  membershipId: invoices.membershipId,
   paymentMethodId: invoices.paymentMethodId,
   paymentExpected: invoices.paymentExpected,
   paidChargeId: invoices.paidChargeId,
   dueAt: invoices.dueAt,
-  nextAttemptAt: invoices.nextAttemptAt,
-  autoChargeAttempts: invoices.autoChargeAttempts,
   paidAt: invoices.paidAt,
 } as const;
 
@@ -93,12 +84,9 @@ export const invoicesRepository = {
   },
 
   /**
-   * Look up one invoice by id ALONE — no owner filter, because the two callers
-   * are system actors that have no principal to scope by: the Stripe webhook's
-   * invoice-orphan reconciliation (which validates the PI's `owner_id` metadata
-   * against `invoices.owner_id` itself, as a trust-boundary check the 404
-   * collapse cannot do for it) and the attempt-verify lane (which starts from an
-   * `invoice_charge_attempts` row, not from a request).
+   * Look up one invoice by id ALONE — no owner filter, because the caller has no
+   * principal to scope by: the order engine's settle, reading the invoice its own
+   * order row names.
    *
    * Never reachable from an owner-facing route — those use
    * {@link findByIdForOwner}, whose owner filter is the id-enumeration
@@ -131,12 +119,8 @@ export const invoicesRepository = {
   },
 
   /**
-   * INSERT an open invoice. Used by `POST /requests/:id/confirm-payment`
-   * pay-later branch (B&T) and (Day-19 portal extension) future ad-hoc
-   * invoice flows. `next_attempt_at` defaults to `due_at` so the worker
-   * scoops it at first scan after `due_at`; explicit override lets the
-   * caller delay the first attempt (e.g. invoice issued today, first
-   * auto-charge attempt scheduled for due_at).
+   * INSERT an open invoice. Used by the pay-later arms of `POST /enrollments`
+   * and `POST /requests/:id/confirm-payment`.
    */
   async createOpen(
     tx: Tx,
@@ -146,12 +130,10 @@ export const invoicesRepository = {
       purpose: ChargePurpose;
       paymentMethodId: string;
       dueAt: string;
-      nextAttemptAt?: string;
       bookingId?: string | null;
       cohortId?: string | null;
       dogId?: string | null;
       requestId?: string | null;
-      membershipId?: string | null;
     },
   ): Promise<InvoiceRow> {
     const [row] = await tx
@@ -162,12 +144,10 @@ export const invoicesRepository = {
         purpose: args.purpose,
         paymentMethodId: args.paymentMethodId,
         dueAt: args.dueAt,
-        nextAttemptAt: args.nextAttemptAt ?? args.dueAt,
         bookingId: args.bookingId ?? null,
         cohortId: args.cohortId ?? null,
         dogId: args.dogId ?? null,
         requestId: args.requestId ?? null,
-        membershipId: args.membershipId ?? null,
       })
       .returning(INVOICE_PROJECTION);
     if (!row) {
@@ -202,33 +182,37 @@ export const invoicesRepository = {
 
   /**
    * Flip an OPEN invoice → 'void' (Δ 2026-06-09). The group-class withdraw
-   * verb's pay-later branch: cancelling an enrollment before the auto-charge
-   * fires voids the open invoice so the worker (which scans `status='open'`)
-   * never charges it — "nothing is ever charged". Filtered on `status='open'`
-   * so it can't reverse an already-paid invoice (that path is a refund, not a
-   * void); returns the row count for the caller to detect that race.
+   * verb's pay-later branch: cancelling an enrollment voids its open invoice, so
+   * the debt ends with nothing charged. Filtered on `status='open'` so it can't
+   * reverse an already-paid invoice (that path is a refund, not a void);
+   * returns the row count for the caller to detect that race.
+   *
+   * A void invoice asks for nothing, so its pending pay-in-person reminder ("bring
+   * $… at drop-off") ends in the same transaction. It lives here, not at the caller,
+   * so no later caller can void an invoice and leave the push behind, and it uses the
+   * row's own id, the spelling the reminder was filed under.
    */
   async markVoid(tx: Tx, args: { id: string }): Promise<number> {
     const updated = await tx
       .update(invoices)
-      .set({ status: 'void', nextAttemptAt: null })
+      .set({ status: 'void' })
       .where(and(eq(invoices.id, args.id), eq(invoices.status, 'open')))
       .returning({ id: invoices.id });
+    for (const row of updated) {
+      await scheduledNotificationsRepository.cancelPendingByDedupePrefix(
+        tx,
+        `payment-due:${row.id}`,
+      );
+    }
     return updated.length;
   },
 
   /**
-   * R3 flag flip: mark an OPEN, card-backed invoice as pay-in-person
+   * R3 flag flip: mark an OPEN invoice she meant to pay by card as pay-in-person
    * (cash/check due at drop-off). Filtered on `status='open' AND
    * payment_expected='card'` so a second call — or a call against a paid/void
    * or already-in-person invoice — is a no-op (returns 0); the route reads that
-   * count to 409. `next_attempt_at` is left live (NOT parked to null): the
-   * auto-charge worker's due-batch scans (`leaseDueOpen` / `lockDueOpenForUpdate`)
-   * filter on `payment_expected='card'`, so an in-person invoice is never leased
-   * or charged — the R3 "don't charge the card when they chose cash/check" rule —
-   * while `next_attempt_at` staying non-null keeps it OUT of the parked-invoice
-   * staff worklist (`findParked`, which keys on `next_attempt_at IS NULL`). An
-   * in-person invoice is awaiting a drop-off payment, not stuck.
+   * count to 409.
    */
   async markPayInPerson(tx: Tx, args: { id: string }): Promise<number> {
     const updated = await tx
@@ -297,346 +281,10 @@ export const invoicesRepository = {
       .limit(1);
     return row;
   },
-
-  /**
-   * The open PAYG invoice for one booking, if any — the booking-cancel verb's
-   * "is there a pending auto-charge to void?" probe. A within-window cancel
-   * voids it (nothing is ever charged); past-window leaves it (it charges =
-   * forfeit). Only `status='open'` (a settled one is a charge-refund, handled
-   * by the cancel money-back branch). `purpose='payg'` is the only booking-
-   * linked invoice today, but the filter keeps the read honest as invoice
-   * kinds grow.
-   */
-  async findOpenForBooking(tx: Tx, args: { bookingId: string }): Promise<InvoiceRow | undefined> {
-    const [row] = await tx
-      .select(INVOICE_PROJECTION)
-      .from(invoices)
-      .where(
-        and(
-          eq(invoices.bookingId, args.bookingId),
-          eq(invoices.status, 'open'),
-          eq(invoices.purpose, 'payg'),
-        ),
-      )
-      .limit(1);
-    return row;
-  },
-
-  /**
-   * Worker scan: open invoices whose `next_attempt_at` is due. Uses
-   * `FOR UPDATE SKIP LOCKED` so concurrent worker instances can divide
-   * the queue without blocking each other. Limit caps batch size for
-   * predictable per-tick work; the caller iterates within the tx so
-   * the lock is held until each invoice's processing completes.
-   *
-   * Default limit of 50 mirrors the Day-16 scheduler's expected per-
-   * tick budget — enough to drain a backlog quickly without hogging
-   * connections. Day-16's scheduler tunes this from a config knob.
-   */
-  async lockDueOpenForUpdate(
-    tx: Tx,
-    args: { limit?: number; now?: Date } = {},
-  ): Promise<InvoiceRow[]> {
-    const limit = args.limit ?? 50;
-    const cutoff = args.now
-      ? sql`${invoices.nextAttemptAt} <= ${args.now.toISOString()}::timestamptz`
-      : sql`${invoices.nextAttemptAt} <= now()`;
-    // Drizzle's `.for('update', { skipLocked: true })` builds FOR UPDATE
-    // SKIP LOCKED. Locks released on tx commit/rollback — exactly the
-    // worker's per-invoice unit of work.
-    return tx
-      .select(INVOICE_PROJECTION)
-      .from(invoices)
-      .where(
-        and(
-          eq(invoices.status, 'open'),
-          // R3: never auto-charge a cash/check ('in-person') invoice — the owner
-          // pays it at drop-off, not on the bound card.
-          eq(invoices.paymentExpected, 'card'),
-          isNotNull(invoices.nextAttemptAt),
-          cutoff,
-        ),
-      )
-      .orderBy(asc(invoices.nextAttemptAt))
-      .limit(limit)
-      .for('update', { skipLocked: true });
-  },
-
-  /**
-   * Lease a batch of due open invoices for processing OUTSIDE a transaction.
-   * Locks the due rows (`FOR UPDATE SKIP LOCKED` so parallel workers divide
-   * the queue) and pushes `next_attempt_at` to `leaseUntil` so no other
-   * worker re-scoops them while THIS worker does the Stripe round-trip with
-   * no DB tx open — that's what keeps the Stripe call off the transaction's
-   * latency budget (vs the old `lockDueOpenForUpdate`, which held the row
-   * lock across the network call for the whole batch).
-   *
-   * Returned rows carry the PRE-lease `auto_charge_attempts` (the UPDATE
-   * doesn't touch that column); the worker keys Stripe idempotency on it. A
-   * worker crash before it records the outcome leaves the lease to expire,
-   * and the attempt-keyed idempotency makes the re-lease safe (Stripe returns
-   * the same PI — no double charge).
-   */
-  async leaseDueOpen(
-    tx: Tx,
-    args: { limit?: number; now?: Date; leaseUntil: Date },
-  ): Promise<InvoiceRow[]> {
-    const limit = args.limit ?? 50;
-    const cutoff = args.now
-      ? sql`${invoices.nextAttemptAt} <= ${args.now.toISOString()}::timestamptz`
-      : sql`${invoices.nextAttemptAt} <= now()`;
-    const due = await tx
-      .select({ id: invoices.id })
-      .from(invoices)
-      .where(
-        and(
-          eq(invoices.status, 'open'),
-          // R3: skip cash/check ('in-person') invoices — never auto-charged.
-          eq(invoices.paymentExpected, 'card'),
-          isNotNull(invoices.nextAttemptAt),
-          cutoff,
-        ),
-      )
-      .orderBy(asc(invoices.nextAttemptAt))
-      .limit(limit)
-      .for('update', { skipLocked: true });
-    if (due.length === 0) return [];
-    return tx
-      .update(invoices)
-      .set({ nextAttemptAt: args.leaseUntil.toISOString() })
-      .where(
-        inArray(
-          invoices.id,
-          due.map((r) => r.id),
-        ),
-      )
-      .returning(INVOICE_PROJECTION);
-  },
-
-  /**
-   * Worker dunning: increment attempts + reschedule the next attempt.
-   * Called inside the worker's per-invoice tx after a KNOWN-FAILED charge
-   * attempt. `nextAttemptAt = null` parks the invoice (e.g. exhausted retries
-   * → staff notification + manual resolution).
-   *
-   * **Narrowed 2026-08-12** (`designs/auto-charge-unknown-outcome.md`,
-   * Decision 1). `auto_charge_attempts` now counts ONE thing: how many times
-   * the card actually said no (declined / authentication-required / a cancelled
-   * intent), plus the no-card / no-Stripe-customer parks. It no longer counts
-   * "we never found out" — an unknown outcome leaves the ladder alone and goes
-   * to the verify lane, because incrementing here used to ROTATE THE STRIPE
-   * IDEMPOTENCY KEY (which embedded this counter) and so turned "we don't know
-   * whether money moved" into "ask Stripe for new money". The key's identity
-   * now lives on `invoice_charge_attempts.attempt_no`, which advances only when
-   * the previous attempt is known-dead.
-   *
-   * Existing rows need no migration: the old semantics counted a superset of
-   * the new ones, which can only park an invoice EARLIER, never later — the
-   * safe direction.
-   *
-   * **Filtered on `status='open'`, and the row count is the caller's permission
-   * slip** (round 3, 2026-08-12) — mirroring `parkForReconciliation` and the
-   * verify lane's re-read. The charge lane holds no lock across the Stripe
-   * round-trip (R5 forbids it), so an owner can pay the invoice manually
-   * between the confirm leaving and its answer arriving. Unfiltered, a decline
-   * that raced a real payment still advanced the dunning ladder on a PAID
-   * invoice and — at the last rung — pushed "we tried your payment and your
-   * card was declined. Want to try a different form of payment?" at someone
-   * holding a receipt. Zero rows means the invoice stopped being open; the
-   * caller must then say nothing.
-   */
-  async recordFailedAttempt(
-    tx: Tx,
-    args: { id: string; nextAttemptAt: string | null },
-  ): Promise<number> {
-    const updated = await tx
-      .update(invoices)
-      .set({
-        autoChargeAttempts: sql`auto_charge_attempts + 1`,
-        nextAttemptAt: args.nextAttemptAt,
-      })
-      .where(and(eq(invoices.id, args.id), eq(invoices.status, 'open')))
-      .returning({ id: invoices.id });
-    return updated.length;
-  },
-
-  /**
-   * Park an OPEN invoice for HUMAN reconciliation without touching the dunning
-   * ladder (2026-08-12). The verify lane's terminal arm: an attempt whose
-   * outcome is past the point where anything automatic can learn it — the
-   * idempotency-key window has closed with no PI id and no webhook, or an
-   * intent has sat `processing` past the cap. Nothing failed, so nothing may be
-   * counted as a failure; but nothing may keep charging either, so
-   * `next_attempt_at` goes NULL and the invoice surfaces on the existing staff
-   * worklist (`findParked`).
-   *
-   * Filtered on `status='open'` so it can never re-park a paid/void invoice.
-   * Returns the affected row count.
-   */
-  async parkForReconciliation(tx: Tx, args: { id: string }): Promise<number> {
-    const updated = await tx
-      .update(invoices)
-      .set({ nextAttemptAt: null })
-      .where(and(eq(invoices.id, args.id), eq(invoices.status, 'open')))
-      .returning({ id: invoices.id });
-    return updated.length;
-  },
-
-  /**
-   * Owner-scoped list of open invoices — used by the `GET /invoices`
-   * surface (Day-18+ FE swap) and the worker scan can prefilter by
-   * owner if it ever wants per-owner fairness scheduling.
-   * `lte(invoices.dueAt, now)` not applied here — that's the worker's
-   * call; this read surface returns all open invoices the owner can see.
-   */
-  async findOpenByOwner(runner: Runner, ownerId: string): Promise<InvoiceRow[]> {
-    return runner
-      .select(INVOICE_PROJECTION)
-      .from(invoices)
-      .where(and(eq(invoices.ownerId, ownerId), eq(invoices.status, 'open')));
-  },
-
-  /**
-   * Day-18 FE swap convenience — every open invoice past its due date,
-   * regardless of owner. Pool runner. Not currently called by any
-   * production route; reserved for the Day-19 staff portal.
-   */
-  async findPastDueOpen(runner: Runner, now: Date): Promise<InvoiceRow[]> {
-    return runner
-      .select(INVOICE_PROJECTION)
-      .from(invoices)
-      .where(and(eq(invoices.status, 'open'), lte(invoices.dueAt, now.toISOString())));
-  },
-
-  /**
-   * §J.1 roll accounting: every invoice ever created for this membership,
-   * REGARDLESS of status. `1 (sync month-1 charge) + this count` = periods
-   * billed — the roll phase's term-exhaustion check. Counting all statuses
-   * keeps the term deterministic under status churn (a void/park never
-   * silently extends or shortens the term).
-   */
-  async countForMembership(tx: Tx, membershipId: string): Promise<number> {
-    const [row] = await tx
-      .select({ count: sql<number>`count(*)::int` })
-      .from(invoices)
-      .where(eq(invoices.membershipId, membershipId));
-    return row?.count ?? 0;
-  },
-
-  /**
-   * PARKED invoices for the staff worklist: `status='open'` AND
-   * `next_attempt_at IS NULL` — the auto-charge worker has GIVEN UP (no further
-   * attempt scheduled), so only a human can resolve them (chase a new card,
-   * void, etc). Backs `GET /staff/invoices?parked`.
-   *
-   * Why `next_attempt_at IS NULL` and not just `auto_charge_attempts >= MAX`:
-   * the worker parks an invoice (sets `next_attempt_at = NULL`) in TWO ways —
-   * (a) exhausting MAX dunning attempts, and (b) a missing/expired card or
-   * Stripe customer on the FIRST attempt (no point retrying a charge with no
-   * card). The attempts-only predicate misses case (b), leaving a genuinely
-   * stuck invoice invisible to staff. `next_attempt_at IS NULL` is the single
-   * honest "the worker won't touch this again" signal that covers both.
-   *
-   * `minAttempts` is accepted (the worker's `MAX_AUTO_CHARGE_ATTEMPTS`) for
-   * forward-compat, but the `next_attempt_at IS NULL` predicate is the source
-   * of truth; a row parked at MAX always has it null. Passing the threshold in
-   * keeps this seam free of a worker import (dependency rule: repos don't
-   * import workers). Ordered by `due_at` ASC — the longest-overdue surfaces
-   * first for triage. Pool runner.
-   */
-  async findParked(_args: { minAttempts: number }, runner: Runner = db): Promise<InvoiceRow[]> {
-    return runner
-      .select(INVOICE_PROJECTION)
-      .from(invoices)
-      .where(and(eq(invoices.status, 'open'), isNull(invoices.nextAttemptAt)))
-      .orderBy(asc(invoices.dueAt));
-  },
-
-  /**
-   * Card-backed invoices still open well past their due date that the owner has
-   * NOT already been told about — the `invoice-overdue` safety-net scan
-   * (Allison 2026-07-29). Three predicates carry the whole design:
-   *
-   *  - `payment_expected = 'card'` — an in-person (cash/check) invoice stays
-   *    open until a human marks it paid, and no staff mark-paid flow exists
-   *    yet, so EVERY in-person invoice would trip an overdue alarm the moment
-   *    its grace elapsed. Warning an owner about cash they already handed over
-   *    at drop-off would be false by construction. Bring in-person into scope
-   *    when the staff mark-paid verb ships.
-   *  - `due_at < cutoff` — cutoff is `now - INVOICE_OVERDUE_GRACE_DAYS`.
-   *  - no `payment-failed:<id>` **or `payment-unconfirmed:<id>`** already
-   *    queued — a terminally parked invoice ALREADY produced an
-   *    action-required notification naming this exact invoice. Firing a second
-   *    one is nagging, not a safety net. What survives this filter is the real
-   *    gap: an invoice past due that nothing else has told the owner about
-   *    (still mid-retry, or missed by the charge worker).
-   *
-   *    The `payment-unconfirmed` half is 2026-08-12
-   *    (`designs/auto-charge-unknown-outcome.md`) and it is a MONEY rule, not
-   *    tidiness: that push exists to say "we can't yet confirm whether your
-   *    payment went through — please don't pay it again". An `invoice-overdue`
-   *    nag landing on top of it says the opposite ("check the card on file so
-   *    it doesn't hold up your next booking"), and an owner who acts on the
-   *    later message pays money that may already have moved. Suppression here
-   *    is what keeps the unknown from being nagged into a double charge.
-   *
-   *    Parking (2026-09-03): a `payment-failed` row that PARKED (`failed_at`
-   *    set after MAX_DELIVERY_ATTEMPTS) never reached the owner, so it does
-   *    NOT count as having told them — that arm is filtered on
-   *    `failed_at IS NULL`. The `payment-unconfirmed` arm deliberately is NOT:
-   *    its suppression is about the money state, not about delivery.
-   *
-   * Ordered `due_at` ASC — longest overdue first, so a capped tick warns the
-   * worst cases. Tx runner (the scan enqueues in the same transaction).
-   */
-  async findOverdueForWarning(
-    args: { cutoff: Date },
-    runner: Runner = db,
-  ): Promise<OverdueInvoiceForWarning[]> {
-    const rows = await runner.execute(sql`
-      SELECT i.id, i.owner_id, i.dog_id, i.amount_cents, i.due_at
-      FROM ${invoices} i
-      WHERE i.status = 'open'
-        AND i.payment_expected = 'card'
-        AND i.due_at < ${args.cutoff.toISOString()}
-        AND NOT EXISTS (
-          SELECT 1 FROM scheduled_notifications sn
-          WHERE (
-            -- A PARKED payment-failed row (failed_at set) was never delivered,
-            -- so it has not told the owner anything: it must NOT suppress the
-            -- safety net (2026-09-03, designs/phase-1-poison-row-isolation.md
-            -- A1.3 / A1-R).
-            sn.dedupe_key = 'payment-failed:' || i.id::text AND sn.failed_at IS NULL
-          ) OR (
-            -- payment-unconfirmed suppresses REGARDLESS of delivery or parking:
-            -- money may be in flight, and a "check the card on file" nag on top
-            -- of an unknown outcome is the double-charge path (see above).
-            sn.dedupe_key = 'payment-unconfirmed:' || i.id::text
-          )
-        )
-      ORDER BY i.due_at ASC
-    `);
-    return (
-      rows.rows as {
-        id: string;
-        owner_id: string;
-        dog_id: string | null;
-        amount_cents: number;
-        due_at: string;
-      }[]
-    ).map((r) => ({
-      invoiceId: r.id,
-      ownerId: r.owner_id,
-      dogId: r.dog_id,
-      amountCents: Number(r.amount_cents),
-      dueAt: r.due_at,
-    }));
-  },
 };
 
 /**
- * Rebind an invoice to the card that is actually going to settle it — used when
- * the auto-charge falls back off an expired card (Allison 2026-07-29).
+ * Rebind an invoice to the card that is actually going to settle it.
  *
  * This is NOT bookkeeping neatness. `LedgerEntryWire.settled_card` (the
  * "Visa ••4242" on the paid-invoice modal) is derived from
@@ -653,13 +301,4 @@ export async function repointPaymentMethod(
     .update(invoices)
     .set({ paymentMethodId: args.paymentMethodId })
     .where(eq(invoices.id, args.id));
-}
-
-/** One row of the `invoice-overdue` scan (`findOverdueForWarning`). */
-export interface OverdueInvoiceForWarning {
-  invoiceId: string;
-  ownerId: string;
-  dogId: string | null;
-  amountCents: number;
-  dueAt: string;
 }

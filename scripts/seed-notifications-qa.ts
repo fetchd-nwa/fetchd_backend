@@ -5,12 +5,12 @@
  * Why this exists (Allison 2026-07-29): the notification feed had been QA'd
  * with hand-typed SQL that lived only in shell history, so every environment
  * teardown lost it and the next session re-typed it slightly differently. This
- * makes the QA state reproducible — run it, open the bell, and tap all 17 rows.
+ * makes the QA state reproducible — run it, open the bell, and tap every row.
  *
  * It is ADDITIVE to `seed-dev.ts`, not a replacement: run `db:dev:seed` first
  * (it owns owners/dogs/bookings/invoices/threads/announcements), then this. It
  * creates only what the notification deep links need and `seed-dev` doesn't
- * make — one report, one ended membership — plus the notification rows.
+ * make — one report — plus the notification rows.
  *
  * Re-runnable: every row it writes carries a fixed id from `QA` below, and it
  * deletes those ids first. It never touches anything else.
@@ -22,22 +22,20 @@
  * the real producers use — so a QA row can never point somewhere a real
  * notification couldn't. If a kind's path changes, this seed changes with it.
  */
-import { eq, inArray, or } from 'drizzle-orm';
+import { inArray, or } from 'drizzle-orm';
 
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
 import { deepLinkToPath, type NotificationType } from '../src/contracts/wire.js';
 import { computeDayProgramScheduledAt } from '../src/lib/bookingSchedule.js';
-import { bucketChicagoToday, chicagoShortDate } from '../src/lib/chicagoDate.js';
+import { bucketChicagoToday } from '../src/lib/chicagoDate.js';
 import { formatDollars } from '../src/lib/invoiceReceiptCopy.js';
 import {
   bookingDogs,
   bookings,
   charges,
-  creditPackages,
   idempotencyKeys,
   invoices,
-  memberships,
   notificationDogs,
   notifications,
   orders,
@@ -93,7 +91,6 @@ const BASE = {
  */
 const QA = {
   reportWafflesId: '4e900000-0000-4000-8000-000000000001',
-  membershipEndedId: 'e3b50000-0000-4000-8000-000000000001',
   /** Genuinely cancelled, with attribution — the cancelled banner needs who + why. */
   bookingCancelledId: 'b0070000-0000-4000-8000-00000000c001',
   /** Tomorrow, upcoming — what a "reminder: tomorrow" is actually about. */
@@ -103,8 +100,6 @@ const QA = {
   chargePaidId: 'c0a50000-0000-4000-8000-00000000c001',
   /** Flagged pay-in-person — what `payment-due` is about. */
   invoiceInPersonId: '12005000-0000-4000-8000-00000000c002',
-  /** Open and well past due — what `invoice-overdue` is about. */
-  invoiceOverdueId: '12005000-0000-4000-8000-00000000c003',
 } as const;
 
 /**
@@ -227,12 +222,12 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
   {
     type: 'payment-failed',
     title: 'Payment failed',
-    body:
-      `We tried your ${formatDollars(QA_INVOICE_CENTS)} payment for Day School on ` +
-      `${chicagoShortDate(new Date(Date.now() - HOUR_MS * 3))} and it didn't go through. ` +
-      `Want to try a different form of payment? You can use another card, or pay ` +
-      `in person with cash or check.`,
-    deepLinkPath: deepLinkToPath({ kind: 'invoice', id: BASE.invoiceOpenId }),
+    body: `Your ${formatDollars(QA_INVOICE_CENTS)} payment didn't go through, so you weren't charged.`,
+    deepLinkPath: deepLinkToPath({
+      kind: 'invoice',
+      id: BASE.invoiceOpenId,
+      params: { reason: 'payment-failed' },
+    }),
     deepLinkKind: 'invoice',
     deepLinkId: BASE.invoiceOpenId,
   },
@@ -245,33 +240,12 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
     deepLinkId: QA.invoiceInPersonId,
   },
   {
-    type: 'invoice-overdue',
-    title: 'Payment still outstanding',
-    body: `Your ${formatDollars(QA_INVOICE_CENTS)} invoice hasn’t gone through yet. Check the card on file.`,
-    deepLinkPath: deepLinkToPath({ kind: 'invoice', id: QA.invoiceOverdueId }),
-    deepLinkKind: 'invoice',
-    deepLinkId: QA.invoiceOverdueId,
-  },
-  {
     type: 'card-expiring',
     title: 'Your card expires soon',
     body: 'Visa ••4242 expires this month. Add a new card so your sessions keep booking.',
     deepLinkPath: deepLinkToPath({ kind: 'payment-method', id: BASE.paymentMethodAllisonId }),
     deepLinkKind: 'payment-method',
     deepLinkId: BASE.paymentMethodAllisonId,
-  },
-  {
-    type: 'membership-ended',
-    title: 'Your subscription has ended',
-    body: 'Waffles’ Day School subscription reached the end of its term.',
-    deepLinkPath: deepLinkToPath({
-      kind: 'membership',
-      id: QA.membershipEndedId,
-      params: { dogId: BASE.dogWafflesId },
-    }),
-    deepLinkKind: 'membership',
-    deepLinkId: QA.membershipEndedId,
-    dogIds: [BASE.dogWafflesId],
   },
   {
     type: 'credits-expiring',
@@ -281,16 +255,6 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
     deepLinkKind: 'credits',
     deepLinkId: BASE.dogWafflesId,
     dogIds: [BASE.dogWafflesId],
-  },
-  {
-    type: 'alumni-attendance',
-    title: 'Alumni check-in needed',
-    body: 'Lola attended fewer than 2 sessions last month. Chat with staff or book a Day School to maintain alumni status.',
-    deepLinkPath: deepLinkToPath({ kind: 'dog-profile', id: BASE.dogLolaId }),
-    deepLinkKind: 'dog-profile',
-    deepLinkId: BASE.dogLolaId,
-    dogIds: [BASE.dogLolaId],
-    isRead: true,
   },
   {
     type: 'spay-neuter-reminder',
@@ -334,6 +298,9 @@ const UNSEEDABLE_TYPES: Readonly<Record<string, string>> = {
   // an offer pointing at a booking when the point of the type is that nothing
   // is booked yet. Restore a real row when the waitlist ships.
   'waitlist-spot-open': 'waitlist parked 2026-07-31 — no producer, no entry to link, no screen',
+  // Its scan left with the auto-charge lane at M4.04 and the label stayed (P17's C5),
+  // so a row here would show the feed a sentence nothing can write any more.
+  'invoice-overdue': 'scan removed at M4.04 — no producer; the label stays for stored rows',
 };
 
 /**
@@ -486,7 +453,7 @@ async function seedNotificationSubjects(): Promise<void> {
     ownerId: BASE.ownerAllisonId,
     amountCents: QA_INVOICE_CENTS,
     status: 'succeeded',
-    purpose: 'payg',
+    purpose: 'group-class',
     createdAt: hoursAgo(7),
   });
   await db.insert(invoices).values([
@@ -495,7 +462,7 @@ async function seedNotificationSubjects(): Promise<void> {
       ownerId: BASE.ownerAllisonId,
       amountCents: QA_INVOICE_CENTS,
       status: 'paid',
-      purpose: 'payg',
+      purpose: 'group-class',
       paymentMethodId: BASE.paymentMethodAllisonId,
       paidChargeId: QA.chargePaidId,
       issuedAt: hoursAgo(48),
@@ -508,22 +475,11 @@ async function seedNotificationSubjects(): Promise<void> {
       ownerId: BASE.ownerAllisonId,
       amountCents: QA_INVOICE_CENTS,
       status: 'open',
-      purpose: 'payg',
+      purpose: 'group-class',
       paymentMethodId: BASE.paymentMethodAllisonId,
       paymentExpected: 'in-person',
       issuedAt: hoursAgo(24),
       dueAt: daysFromNow(1, 9),
-    },
-    {
-      // "Payment still outstanding" — open and past the 3-day grace window.
-      id: QA.invoiceOverdueId,
-      ownerId: BASE.ownerAllisonId,
-      amountCents: QA_INVOICE_CENTS,
-      status: 'open',
-      purpose: 'payg',
-      paymentMethodId: BASE.paymentMethodAllisonId,
-      issuedAt: hoursAgo(24 * 12),
-      dueAt: hoursAgo(24 * 6),
     },
   ]);
 }
@@ -544,37 +500,6 @@ async function seedSupportingRows(): Promise<void> {
       'loose-leash walking and he held a much looser line than last week, even past ' +
       'the fence. Recall is still a work in progress with distractions around.',
     visitCount: 12,
-  });
-
-  // A COMPLETED membership so `membership-ended` lands on a real ended card.
-  //
-  // `package_id` is REQUIRED even though the membership has ended: GET
-  // /memberships filters on `hasSubscriptionColumns()` (package_id, term_months,
-  // payment_method_id and current_period_end all non-null), so a row missing any
-  // of them is invisible to the app. The first cut omitted it, and the ended
-  // subscription looked DELETED rather than completed (Allison's sim QA,
-  // 2026-07-31). A real membership from the billing roll always carries one.
-  const [schoolPackage] = await db
-    .select({ id: creditPackages.id })
-    .from(creditPackages)
-    .where(eq(creditPackages.mode, 'school'))
-    .limit(1);
-  if (schoolPackage === undefined) {
-    throw new Error('seed-notifications-qa: no school credit package — run db:dev:seed first');
-  }
-  await db.insert(memberships).values({
-    id: QA.membershipEndedId,
-    ownerId: BASE.ownerAllisonId,
-    dogId: BASE.dogWafflesId,
-    mode: 'school',
-    packageId: schoolPackage.id,
-    termMonths: 6,
-    paymentMethodId: BASE.paymentMethodAllisonId,
-    status: 'completed',
-    startedAt: hoursAgo(24 * 200),
-    currentPeriodStart: hoursAgo(24 * 32),
-    currentPeriodEnd: hoursAgo(24 * 2),
-    endsAt: hoursAgo(24 * 2),
   });
 }
 
@@ -620,11 +545,10 @@ async function clearPriorQaRows(): Promise<void> {
   await db.execute(
     `DELETE FROM notifications WHERE id::text LIKE '${QA_NOTIFICATION_ID_PREFIX}%'`,
   );
-  await db.delete(memberships).where(inArray(memberships.id, [QA.membershipEndedId]));
   await db.delete(reports).where(inArray(reports.id, [QA.reportWafflesId]));
   // A QA invoice someone paid in the app has orders pointing at it, and those orders are
   // pointed at in turn (M3.02), so they go first or the delete below raises 23503.
-  const qaInvoiceIds = [QA.invoicePaidId, QA.invoiceInPersonId, QA.invoiceOverdueId];
+  const qaInvoiceIds = [QA.invoicePaidId, QA.invoiceInPersonId];
   const orderIds = (
     await db.select({ id: orders.id }).from(orders).where(inArray(orders.invoiceId, qaInvoiceIds))
   ).map((row) => row.id);

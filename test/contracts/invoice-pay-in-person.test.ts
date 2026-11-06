@@ -118,7 +118,7 @@ test(
     const res = await payInPerson({ app, invoiceId: capitalised });
     assert.equal(res.statusCode, 204, res.body);
 
-    // A settle and a booking cancel both cancel this reminder by the row's own id.
+    // A settle and a void both cancel this reminder by the row's own id.
     await db.transaction((tx) =>
       scheduledNotificationsRepository.cancelPendingByDedupePrefix(tx, `payment-due:${invoiceId}`),
     );
@@ -188,9 +188,8 @@ test(
   'POST /invoices/:id/pay-in-person — a day-program booking has no drop-off, so the reminder anchors on scheduled_at − 24h',
   SKIP_WHEN_NO_DB,
   async () => {
-    // Moved from `booking-payg.test.ts`, on a seeded row: nothing writes a payg invoice
-    // from 4.0.0, and `resolvePaymentDueAnchor`'s join to a booking with no drop-off
-    // stays. Every other anchor test here has a drop-off, or no booking at all.
+    // `resolvePaymentDueAnchor`'s join to a booking with no drop-off, on a seeded row.
+    // Every other anchor test here has a drop-off, or no booking at all.
     await cleanup();
     const scheduledAt = new Date(REAL_NOW_MS + 9 * ONE_DAY_MS);
     const bookingId = randomUUID();
@@ -207,7 +206,7 @@ test(
       invoicesRepository.createOpen(tx, {
         ownerId: FIXTURE_IDS.ownerId,
         amountCents: 7_500,
-        purpose: 'payg',
+        purpose: 'group-class',
         paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
         dueAt: new Date(scheduledAt.getTime() - 60 * 60 * 1000).toISOString(),
         bookingId,

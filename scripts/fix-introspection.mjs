@@ -81,7 +81,7 @@ repair(RELATIONS, 'relations.ts import → ./schema.js', 'from "./schema"', 'fro
 //    anchor is a complete, unique enum declaration: enums are emitted in a
 //    stable alpha order for a fixed schema, so this line is byte-stable across
 //    pulls. requireReplace fails loud if `ledger_reason` ever drifts.
-const LEDGER_REASON_ENUM = `export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment', 'membership-grant'])`;
+const LEDGER_REASON_ENUM = `export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment'])`;
 const LOCATION_SLUGS_BLOCK = `${LEDGER_REASON_ENUM}
 // Locations are a table since the Δ 2026-06-08 (was the \`location_key\`/\`app_location\`
 // enums). \`slug\` is the natural key + the wire value; \`LOCATION_SLUGS\` is the TS

@@ -148,7 +148,7 @@ test(
 // ──────────────────────────────────────────────────────────────────────────
 // The abandoned PaymentIntent is cancelled (wire 1.7.1)
 //
-// Same class rule as the auto-charge worker and `POST /invoices/:id/pay`: no
+// Same class rule as `POST /invoices/:id/pay`: no
 // client-side 3DS completion flow exists, so an intent left live after a
 // non-succeeded confirm is pure double-charge hazard — it can auto-succeed later
 // while the owner's next purchase captures on a fresh one.

@@ -82,7 +82,7 @@ async function seedCharge(opts: {
     ownerId: FIXTURE_IDS.ownerId,
     amountCents,
     status: 'succeeded',
-    purpose: 'payg',
+    purpose: 'group-class',
     stripePaymentIntentId: paymentIntentId,
   });
   return { chargeId, amountCents, paymentIntentId };

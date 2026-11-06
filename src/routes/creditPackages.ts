@@ -12,7 +12,6 @@ import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
-import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
 import { invalidatePattern } from '../lib/cache.js';
@@ -224,10 +223,9 @@ export function registerCreditPackagesRoute(
       const chargeBlocker = chargeBlockerForConfirm(intent, request.log);
 
       // Non-succeeded confirm: cancel the intent so it can't later auto-succeed
-      // and double-charge against the next attempt's fresh one. Same rule as
-      // the auto-charge worker (`invoiceAutoCharge.ts`) and `POST
-      // /invoices/:id/pay` — it applies to every path that confirms
-      // off-session and sees a non-succeeded status, because no client-side 3DS
+      // and double-charge against the next attempt's fresh one. The rule applies
+      // to every path that confirms off-session and sees a non-succeeded status,
+      // because no client-side 3DS
       // completion flow exists anywhere in this system, so the returned
       // `client_secret` names a cancelled intent and is for support lookup only.
       //
@@ -274,20 +272,16 @@ export function registerCreditPackagesRoute(
           });
 
           if (chargeStatus === 'succeeded') {
-            // §J.3: an alumni dog's lot never expires — skip the window read
-            // entirely. Otherwise stamp from credit_expiry_settings
-            // (per-location → org-default → code default), read inside this tx.
-            // 1-credit packs never expire either (helper returns null).
-            const dogIsAlumni = await dogProgramsRepository.isAlumni(body.dog_id, tx);
-            // Expiry keys off the TOTAL granted: 10 × the never-expiring
-            // single-day pack is a bulk buy and gets the multi-credit window.
-            const expiresAt = dogIsAlumni
-              ? null
-              : resolvePurchaseExpiry(
-                  grantCredits,
-                  await creditExpirySettingsRepository.resolveExpiryWindowMonths(pkg.location, tx),
-                  nowFactory(),
-                );
+            // Stamp from credit_expiry_settings (per-location → org-default →
+            // code default), read inside this tx. 1-credit packs never expire
+            // (helper returns null). Expiry keys off the TOTAL granted: 10 × the
+            // never-expiring single-day pack is a bulk buy and gets the
+            // multi-credit window.
+            const expiresAt = resolvePurchaseExpiry(
+              grantCredits,
+              await creditExpirySettingsRepository.resolveExpiryWindowMonths(pkg.location, tx),
+              nowFactory(),
+            );
             await creditLedgerRepository.creditPurchase(tx, {
               dogId: body.dog_id,
               mode: pkg.mode,

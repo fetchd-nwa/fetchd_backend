@@ -145,9 +145,6 @@ export function registerStaffOrdersRoute(
               ? [`avail:${result.cancelled.location}:*`]
               : []),
             ...(result?.cancelled?.creditRefundedDogIds ?? []).map(creditsInvalidationPattern),
-            ...(result?.act.creditsDogId !== undefined
-              ? [creditsInvalidationPattern(result.act.creditsDogId)]
-              : []),
           ],
           postCommit: async () => {
             await firePendingRefundPostCommit({

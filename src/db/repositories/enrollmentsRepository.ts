@@ -11,9 +11,9 @@ import { db } from '../client.js';
  * which the withdraw verb re-checks authoritatively under the cohort lock).
  *
  * Payment state is derived per ENROLLMENT: a succeeded `charges` row
- * **belonging to this enrollment** → `paid` (pay-now, or a pay-later that
- * already auto-charged); else an open `invoices` row → `pay-later`
- * (card-backed, auto-charges at due_at); else `pending` (an async/3DS charge
+ * **belonging to this enrollment** → `paid` (pay-now, or a pay-later that has
+ * been paid); else an open `invoices` row → `pay-later` (nothing bills it; the
+ * owner pays it); else `pending` (an async/3DS charge
  * not yet settled — rare). The enrollment itself is the live, non-cancelled
  * group-class bookings.
  *

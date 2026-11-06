@@ -6,13 +6,12 @@ export const announcementCategory = pgEnum("announcement_category", ['urgent', '
 export const bookingAttendance = pgEnum("booking_attendance", ['pending', 'attended', 'no-show', 'excused'])
 export const bookingMode = pgEnum("booking_mode", ['school', 'daycare'])
 export const bookingStatus = pgEnum("booking_status", ['upcoming', 'past', 'cancelled', 'payment-pending'])
-export const chargePurpose = pgEnum("charge_purpose", ['package', 'payg', 'board-train', 'membership', 'group-class'])
+export const chargePurpose = pgEnum("charge_purpose", ['package', 'board-train', 'group-class'])
 export const chargeStatus = pgEnum("charge_status", ['requires_payment', 'succeeded', 'failed', 'refunded'])
 export const evaluationStatus = pgEnum("evaluation_status", ['not-evaluated', 'pending', 'passed', 'failed'])
 export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'manners-2', 'public-pups'])
 export const invoiceStatus = pgEnum("invoice_status", ['open', 'paid', 'void'])
-export const invoiceAttemptOutcome = pgEnum("invoice_attempt_outcome", ['pending', 'processing', 'succeeded', 'no-charge'])
-export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment', 'membership-grant'])
+export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment'])
 // Locations are a table since the Δ 2026-06-08 (was the `location_key`/`app_location`
 // enums). `slug` is the natural key + the wire value; `LOCATION_SLUGS` is the TS
 // tuple for z.enum validation (replaces the old LOCATION_SLUGS).
@@ -21,7 +20,7 @@ export type LocationKey = (typeof LOCATION_SLUGS)[number];
 export const mediaDerivativeJobStatus = pgEnum("media_derivative_job_status", ['pending', 'processing', 'done', 'failed'])
 export const mediaKind = pgEnum("media_kind", ['image', 'video'])
 export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avatar', 'report-photo', 'report-video', 'message-attachment'])
-export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'alumni-attendance', 'membership-ended', 'spay-neuter-reminder', 'payment-due', 'invoice-overdue', 'card-expiring', 'waitlist-spot-open'])
+export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'spay-neuter-reminder', 'payment-due', 'invoice-overdue', 'card-expiring', 'waitlist-spot-open'])
 export const rateUnit = pgEnum("rate_unit", ['per-day', 'per-night', 'per-session', 'per-week', 'flat'])
 export const recordSource = pgEnum("record_source", ['app', 'gingr', 'seed'])
 export const refundStatus = pgEnum("refund_status", ['pending', 'succeeded', 'failed', 'unroutable', 'resolved-external'])
@@ -117,9 +116,6 @@ export const dogs = pgTable("dogs", {
 	evaluationStatus: evaluationStatus("evaluation_status").default('not-evaluated').notNull(),
 	evaluationDate: timestamp("evaluation_date", { withTimezone: true, mode: 'string' }),
 	boardingEnabled: boolean("boarding_enabled").default(false).notNull(),
-	// §J.3: set by the monthly alumni attendance scan (<2 qualifying sessions
-	// in the closed Chicago month); cleared by staff after the re-check.
-	alumniAttendanceFlaggedAt: timestamp("alumni_attendance_flagged_at", { withTimezone: true, mode: 'string' }),
 	// Shanthi 2026-07-14: profile question. NULL = unanswered. No booking path
 	// reads it until the refusal lands (S11, LG2b).
 	spayedNeutered: boolean("spayed_neutered"),
@@ -1285,15 +1281,11 @@ export const invoices = pgTable("invoices", {
 	cohortId: uuid("cohort_id"),
 	dogId: uuid("dog_id"),
 	requestId: uuid("request_id"),
-	// §J.1: set on purpose='membership' rows — the subscription month billed.
-	membershipId: uuid("membership_id"),
-	paymentMethodId: uuid("payment_method_id").notNull(),
+	paymentMethodId: uuid("payment_method_id"),
 	paymentExpected: text("payment_expected").$type<'card' | 'in-person'>().default('card').notNull(),
 	paidChargeId: uuid("paid_charge_id"),
 	issuedAt: timestamp("issued_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	dueAt: timestamp("due_at", { withTimezone: true, mode: 'string' }).notNull(),
-	nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true, mode: 'string' }),
-	autoChargeAttempts: integer("auto_charge_attempts").default(0).notNull(),
 	paidAt: timestamp("paid_at", { withTimezone: true, mode: 'string' }),
 	externalRef: text("external_ref"),
 	source: recordSource().default('app').notNull(),
@@ -1334,11 +1326,6 @@ export const invoices = pgTable("invoices", {
 			foreignColumns: [pendingRequests.id],
 			name: "invoices_request_id_fkey"
 		}).onDelete("set null"),
-		invoicesMembershipIdFkey: foreignKey({
-			columns: [table.membershipId],
-			foreignColumns: [memberships.id],
-			name: "invoices_membership_id_fkey"
-		}).onDelete("set null"),
 		invoicesPaymentMethodIdFkey: foreignKey({
 			columns: [table.paymentMethodId],
 			foreignColumns: [paymentMethods.id],
@@ -1352,101 +1339,6 @@ export const invoices = pgTable("invoices", {
 		invoicesSourceExternalRefKey: unique("invoices_source_external_ref_key").on(table.externalRef, table.source),
 		invoicesAmountCentsCheck: check("invoices_amount_cents_check", sql`amount_cents >= 0`),
 		invoicesCheck: check("invoices_check", sql`(status <> 'paid'::invoice_status) OR (paid_at IS NOT NULL)`),
-	}
-});
-
-// 2026-08-12 (`designs/auto-charge-unknown-outcome.md`): one row per auto-charge
-// attempt, written BEFORE the Stripe confirm. Owns the idempotency key identity
-// (`attempt_no`) + the frozen params a same-key re-issue must resend. The
-// partial unique index on (invoice_id) WHERE outcome IN ('pending','processing')
-// is the DB-level interlock — at most one unresolved attempt per invoice.
-export const invoiceChargeAttempts = pgTable("invoice_charge_attempts", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	invoiceId: uuid("invoice_id").notNull(),
-	attemptNo: integer("attempt_no").notNull(),
-	paymentMethodId: uuid("payment_method_id").notNull(),
-	stripePaymentMethodId: text("stripe_payment_method_id").notNull(),
-	stripeCustomerId: text("stripe_customer_id").notNull(),
-	amountCents: integer("amount_cents").notNull(),
-	idempotencyKey: text("idempotency_key").notNull(),
-	stripePaymentIntentId: text("stripe_payment_intent_id"),
-	outcome: invoiceAttemptOutcome().default('pending').notNull(),
-	verifyCount: integer("verify_count").default(0).notNull(),
-	reconcileReason: text("reconcile_reason"),
-	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-}, (table) => {
-	return {
-		unresolvedUq: uniqueIndex("invoice_charge_attempts_unresolved_uq").using("btree", table.invoiceId.asc().nullsLast().op("uuid_ops")).where(sql`(outcome = ANY (ARRAY['pending'::invoice_attempt_outcome, 'processing'::invoice_attempt_outcome]))`),
-		unresolvedIdx: index("invoice_charge_attempts_unresolved_idx").using("btree", table.updatedAt.asc().nullsLast().op("timestamptz_ops")).where(sql`(outcome = ANY (ARRAY['pending'::invoice_attempt_outcome, 'processing'::invoice_attempt_outcome]))`),
-		piIdx: index("invoice_charge_attempts_pi_idx").using("btree", table.stripePaymentIntentId.asc().nullsLast().op("text_ops")).where(sql`(stripe_payment_intent_id IS NOT NULL)`),
-		invoiceChargeAttemptsInvoiceIdFkey: foreignKey({
-			columns: [table.invoiceId],
-			foreignColumns: [invoices.id],
-			name: "invoice_charge_attempts_invoice_id_fkey"
-		}).onDelete("restrict"),
-		invoiceChargeAttemptsPaymentMethodIdFkey: foreignKey({
-			columns: [table.paymentMethodId],
-			foreignColumns: [paymentMethods.id],
-			name: "invoice_charge_attempts_payment_method_id_fkey"
-		}).onDelete("restrict"),
-		invoiceChargeAttemptsIdempotencyKeyKey: unique("invoice_charge_attempts_idempotency_key_key").on(table.idempotencyKey),
-		invoiceChargeAttemptsInvoiceAttemptNoKey: unique("invoice_charge_attempts_invoice_id_attempt_no_key").on(table.invoiceId, table.attemptNo),
-		invoiceChargeAttemptsAmountCentsCheck: check("invoice_charge_attempts_amount_cents_check", sql`amount_cents >= 0`),
-		invoiceChargeAttemptsReconcileReasonCheck: check("invoice_charge_attempts_reconcile_reason_check", sql`reconcile_reason = ANY (ARRAY['key-window-expired'::text, 'in-flight-cap'::text, 'idempotency-conflict'::text, 'fresh-execution'::text])`),
-	}
-});
-
-// §J.1 ACTIVATED 2026-07-09: a membership is a credit-package subscription —
-// self-billed monthly via the invoice auto-charge lane (NOT Stripe Billing;
-// stripe_subscription_id stays NULL), hard-stopping at ends_at. See schema.sql.
-export const memberships = pgTable("memberships", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	ownerId: uuid("owner_id").notNull(),
-	dogId: uuid("dog_id"),
-	mode: bookingMode().notNull(),
-	packageId: uuid("package_id"),
-	termMonths: integer("term_months"),
-	paymentMethodId: uuid("payment_method_id"),
-	stripeSubscriptionId: text("stripe_subscription_id"),
-	status: text().default('active').notNull(),
-	startedAt: timestamp("started_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	currentPeriodStart: timestamp("current_period_start", { withTimezone: true, mode: 'string' }),
-	currentPeriodEnd: timestamp("current_period_end", { withTimezone: true, mode: 'string' }),
-	endsAt: timestamp("ends_at", { withTimezone: true, mode: 'string' }),
-	pausedAt: timestamp("paused_at", { withTimezone: true, mode: 'string' }),
-	pausedByStaffId: uuid("paused_by_staff_id"),
-}, (table) => {
-	return {
-		ownerIdx: index("memberships_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
-		activeRollIdx: index("memberships_active_roll_idx").using("btree", table.currentPeriodEnd.asc().nullsLast().op("timestamptz_ops")).where(sql`(status = 'active'::text)`),
-		membershipsOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "memberships_owner_id_fkey"
-		}).onDelete("restrict"),
-		membershipsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "memberships_dog_id_fkey"
-		}).onDelete("restrict"),
-		membershipsPackageIdFkey: foreignKey({
-			columns: [table.packageId],
-			foreignColumns: [creditPackages.id],
-			name: "memberships_package_id_fkey"
-		}).onDelete("restrict"),
-		membershipsPaymentMethodIdFkey: foreignKey({
-			columns: [table.paymentMethodId],
-			foreignColumns: [paymentMethods.id],
-			name: "memberships_payment_method_id_fkey"
-		}).onDelete("restrict"),
-		membershipsPausedByStaffIdFkey: foreignKey({
-			columns: [table.pausedByStaffId],
-			foreignColumns: [staff.id],
-			name: "memberships_paused_by_staff_id_fkey"
-		}).onDelete("restrict"),
-		membershipsStripeSubscriptionIdKey: unique("memberships_stripe_subscription_id_key").on(table.stripeSubscriptionId),
-		membershipsTermMonthsCheck: check("memberships_term_months_check", sql`term_months IN (3, 6, 9, 12)`),
 	}
 });
 

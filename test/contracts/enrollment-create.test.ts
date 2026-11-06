@@ -897,7 +897,7 @@ test(
     assert.equal(body.refunded_cents, 0, 'nothing was charged, so nothing refunded');
     assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 0);
 
-    // Invoice voided → the auto-charge worker will never bill it.
+    // Invoice voided → `/pay` refuses it, and no worker bills a card.
     const invs = await db
       .select({ status: invoicesTable.status })
       .from(invoicesTable)

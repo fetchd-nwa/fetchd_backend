@@ -14,7 +14,7 @@ import {
   stripeIdempotencyErrorKind,
   type StripeClient,
 } from '../lib/stripe.js';
-import type { WorkerLogger } from './invoiceAutoCharge.js';
+import type { WorkerLogger } from './workerLogger.js';
 
 /**
  * Duplicate-refund RETRY sweep (2026-08-12, round 3 of
@@ -28,9 +28,7 @@ import type { WorkerLogger } from './invoiceAutoCharge.js';
  * `refundsRepository`, no scheduler phase existed, and `charge.refund.updated`
  * cannot arrive for a refund that was never created at Stripe. So one failed
  * `createRefund` — a rate limit, a 500, a lost connection — was a PERMANENT
- * double charge whose only trace was a log line. The webhook's invoice-orphan
- * arm, which settles PIs for invoices the owner may have paid manually, made
- * that path common rather than rare.
+ * double charge whose only trace was a log line.
  *
  * What this phase does, per tick: claim `pending` refunds with no
  * `stripe_refund_id` that have rested a grace interval, and re-fire
@@ -38,9 +36,8 @@ import type { WorkerLogger } from './invoiceAutoCharge.js';
  * ({@link duplicateRefundIdempotencyKey}, keyed on our own refund-row uuid). If
  * the original call actually reached Stripe and only its response was lost, the
  * key replays that refund; if it never landed, this sends it. Exactly one
- * refund exists for one duplicate charge either way — the same "never mint a
- * new identity for a request whose outcome you don't know" rule the auto-charge
- * lane is built on, pointed the other way.
+ * refund exists for one duplicate charge either way: never mint a new identity
+ * for a request whose outcome you don't know.
  *
  * **All three bounds are real and none is silent.** A row stops being retried
  * once it is older than {@link DUPLICATE_REFUND_ABANDON_AFTER_HOURS}, because
@@ -61,8 +58,7 @@ import type { WorkerLogger } from './invoiceAutoCharge.js';
  * row it returns. Now: one alarm per class, each true for its class
  * ({@link ABANDONED_CLASS_MESSAGE}), each row named at ERROR the first time
  * this process sees it and counted at INFO after
- * ({@link ALARMED_REFUND_IDS}) — the verify lane's loud-once/quiet-after
- * posture. They are still owed money that no automatic path will return, and
+ * ({@link ALARMED_REFUND_IDS}): loud once, quiet after. They are still owed money that no automatic path will return, and
  * the one thing worse than a failed refund is a quietly failed one; a report
  * nobody can read is the quiet one.
  *
@@ -179,8 +175,7 @@ export async function runDuplicateRefundRetryOnce(
 
   const results: DuplicateRefundRetryResult[] = [];
   for (const refund of claimed) {
-    // Per-row boundary, for the same reason the verify lane has one: one
-    // refund's failure is one refund's failure, and this claim already spent
+    // Per-row boundary: one refund's failure is one refund's failure, and this claim already spent
     // its interval.
     try {
       results.push(await retryOne(refund, stripe, log));
@@ -252,7 +247,7 @@ async function retryOne(
 
   // THE SAME KEY the post-commit fire used. A retry is never a new refund.
   // Stored on the row since 2026-08-19 — which is the only way this can be true
-  // for the cancel / withdraw / membership writers, whose keys were the
+  // for the cancel / withdraw writers, whose keys were the
   // client's request key. The fallback covers rows minted by round-4-era code:
   // `duplicate-invoice-settle` above `REFUND_SWEEP_FLOOR`, whose key IS
   // derivable from the row. The claim admits nothing else, so a row that
@@ -274,8 +269,7 @@ async function retryOne(
     );
     stripeRefundId = created.id;
   } catch (err) {
-    // Not every failure here means the same thing, and the verify lane already
-    // proved the distinction is worth drawing (`stripeIdempotencyErrorKind`).
+    // Not every failure here means the same thing (`stripeIdempotencyErrorKind`).
     // The outcome is `still-failing` in every arm — the row stays claimable and
     // no money moved — but the SENTENCE differs, because one of these is a code
     // defect that will never fix itself and the others resolve on their own.
@@ -339,11 +333,10 @@ async function retryOne(
  * standing condition, not an event: the same rows are re-read every tick, and
  * at a one-minute cadence an unresolved row emits ~1,440 identical ERRORs a day
  * — so the first real incident after one arrives already buried. Loud once,
- * quiet after, exactly as the verify lane's park arm does it
- * (`invoiceAttemptVerify.ts` `parkForHuman` — ERROR the first time, INFO after).
+ * quiet after: ERROR the first time, INFO after.
  *
- * That lane gets to key its "first time" on a durable row (the push dedupe
- * key); this one has none, and an acknowledgement table is portal-surface work
+ * There is no durable row to key that "first time" on, and an acknowledgement
+ * table is portal-surface work
  * that is deliberately not in this change. So the memory is per-process:
  * a restart re-shouts every outstanding row once, which is the right failure
  * mode — a fresh process SHOULD re-announce owed money, and nothing here can

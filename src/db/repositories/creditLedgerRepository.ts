@@ -1,4 +1,4 @@
-import { and, eq, gt, isNotNull, isNull, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { creditLedger, dogCreditBalance, type LocationKey } from '../schema/schema.js';
 import type { BookingMode } from '../../lib/bookingMode.js';
@@ -81,18 +81,9 @@ export async function findLiveExpiringLots(
 }
 
 /**
- * The lot the NEXT booking debit should draw from — subscription credits
- * first (RULED 2026-07-14, Allison: "use subscription credits first before
- * normal credits"), then everything else soonest-expiry first, never-expiring
- * purchase lots last (the untagged pool). Priority:
- *
- *   1. `membership-grant` lots, soonest-expiry first; an alumni membership
- *      lot (expires_at NULL) sorts after that dog's expiring membership lots
- *      but still ahead of every non-membership lot,
- *   2. other live expiring lots, soonest-expiry first (unchanged FIFO),
- *   3. no row → the never-expiring pool (caller tags the debit lot_id NULL).
- *
- * `created_at ASC` breaks expiry ties deterministically. Caller must hold
+ * The lot the NEXT booking debit should draw from: live expiring lots, soonest-expiry
+ * first, then no row, which is the never-expiring pool (caller tags the debit lot_id
+ * NULL). `created_at ASC` breaks expiry ties deterministically. Caller must hold
  * `withDogLocks` (same contract as `debitForBooking`).
  */
 async function findNextDebitLot(
@@ -113,13 +104,10 @@ async function findNextDebitLot(
       AND lot.mode = ${args.mode}
       AND lot.delta > 0
       AND lot.lot_id IS NULL
-      AND (
-        (lot.expires_at IS NOT NULL AND lot.expires_at > now())
-        OR (lot.expires_at IS NULL AND lot.reason = 'membership-grant')
-      )
+      AND lot.expires_at IS NOT NULL
+      AND lot.expires_at > now()
       AND (lot.delta + COALESCE(a.alloc, 0)) > 0
-    ORDER BY (lot.reason = 'membership-grant') DESC,
-             lot.expires_at ASC NULLS LAST,
+    ORDER BY lot.expires_at ASC,
              lot.created_at ASC
     LIMIT 1
   `);
@@ -217,8 +205,7 @@ export const creditLedgerRepository = {
       bookingId: string;
     },
   ): Promise<void> {
-    // Subscription credits first, then soonest-expiry, pool last — see
-    // findNextDebitLot for the full priority order.
+    // Soonest-expiry first, pool last — see findNextDebitLot.
     const lot = await findNextDebitLot(tx, {
       dogId: args.dogId,
       location: args.location,
@@ -319,8 +306,6 @@ export const creditLedgerRepository = {
       lotId: string | null;
       lotExpiresAt: string | null;
       now: Date;
-      /** §J.3: an alumni dog's freshly-minted refund lot never expires. */
-      dogIsAlumni: boolean;
     },
   ): Promise<void> {
     const lotAlive =
@@ -328,10 +313,9 @@ export const creditLedgerRepository = {
 
     // A fresh refund lot is needed only when the source lot died; resolve the
     // current window (per-location → org-default → code default) for THAT case
-    // alone — skip the read on the common return-to-live-lot path. Alumni dogs
-    // (§J.3) skip the window entirely: their re-mint is never-expire.
+    // alone — skip the read on the common return-to-live-lot path.
     const expiresAt =
-      args.lotId !== null && !lotAlive && !args.dogIsAlumni
+      args.lotId !== null && !lotAlive
         ? resolveRefundExpiry(
             await creditExpirySettingsRepository.resolveExpiryWindowMonths(args.location, tx),
             args.now,
@@ -373,9 +357,6 @@ export const creditLedgerRepository = {
       packageId: string;
       chargeId: string;
       expiresAt: Date | null;
-      /** §J.1: a subscription month's grant is 'membership-grant'; one-time
-       * purchases (the default) stay 'purchase'. Same lot semantics either way. */
-      reason?: 'purchase' | 'membership-grant';
     },
   ): Promise<void> {
     await tx.insert(creditLedger).values({
@@ -383,64 +364,11 @@ export const creditLedgerRepository = {
       mode: args.mode,
       location: args.location,
       delta: args.delta,
-      reason: args.reason ?? 'purchase',
+      reason: 'purchase',
       packageId: args.packageId,
       chargeId: args.chargeId,
       expiresAt: args.expiresAt === null ? null : args.expiresAt.toISOString(),
     });
-  },
-
-  /**
-   * §J.1 pause-resume: move a membership-grant lot's expiry with the shifted
-   * period. The paid month's lot was stamped `expires_at = current_period_end`
-   * at grant; when staff resume a paused membership the period end shifts
-   * forward by the pause gap, and the lot must follow — otherwise the paid
-   * credits die at the ORIGINAL boundary while the membership is officially
-   * paused ("the clock stops" must cover the credits, not just the billing).
-   * Matched by the exact old expiry so only the shifted period's lot moves
-   * (alumni lots are NULL and never match). Returns the lots touched.
-   */
-  async shiftMembershipGrantExpiry(
-    tx: Tx,
-    args: { dogId: string; fromExpiresAt: string; to: Date },
-  ): Promise<number> {
-    const rows = await tx
-      .update(creditLedger)
-      .set({ expiresAt: args.to.toISOString() })
-      .where(
-        and(
-          eq(creditLedger.dogId, args.dogId),
-          eq(creditLedger.reason, 'membership-grant'),
-          isNull(creditLedger.lotId),
-          gt(creditLedger.delta, 0),
-          eq(creditLedger.expiresAt, args.fromExpiresAt),
-        ),
-      )
-      .returning({ id: creditLedger.id });
-    return rows.length;
-  },
-
-  /**
-   * §J.3 became-alumni effect: clear `expires_at` on the dog's live, not-yet-
-   * expired lots — "if you are alumni, no expiration date" covers credits the
-   * dog already holds, not just future grants. Already-EXPIRED lots stay dead
-   * (alumni doesn't resurrect spent windows). Returns the lots touched.
-   */
-  async clearExpiryForDog(tx: Tx, dogId: string, now: Date): Promise<number> {
-    const rows = await tx
-      .update(creditLedger)
-      .set({ expiresAt: null })
-      .where(
-        and(
-          eq(creditLedger.dogId, dogId),
-          isNull(creditLedger.lotId),
-          gt(creditLedger.delta, 0),
-          isNotNull(creditLedger.expiresAt),
-          gt(creditLedger.expiresAt, now.toISOString()),
-        ),
-      )
-      .returning({ id: creditLedger.id });
-    return rows.length;
   },
 };
 

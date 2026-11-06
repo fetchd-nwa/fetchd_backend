@@ -23,8 +23,7 @@ registerFixtureHooks();
 
 const LEDGER = {
   chargePackageId: 'aaaa1111-0000-4000-8000-000000000001',
-  chargePaygId: 'aaaa1111-0000-4000-8000-000000000002',
-  chargeMembershipId: 'aaaa1111-0000-4000-8000-000000000003',
+  chargeSessionId: 'aaaa1111-0000-4000-8000-000000000002',
   chargeGroupRefundedId: 'aaaa1111-0000-4000-8000-000000000004',
   chargePendingId: 'aaaa1111-0000-4000-8000-000000000005',
   invoiceOpenId: 'aaaa2222-0000-4000-8000-000000000001',
@@ -57,21 +56,15 @@ async function seedLedger(): Promise<void> {
       createdAt: '2026-04-01T15:00:00.000Z',
     },
     {
-      id: LEDGER.chargePaygId,
+      // A booking-lane charge: a group-class charge's `booking_id` is an anchor and
+      // is not joined here, so this row is board-train.
+      id: LEDGER.chargeSessionId,
       ownerId: FIXTURE_IDS.ownerId,
       amountCents: 9_000,
       status: 'succeeded',
-      purpose: 'payg',
+      purpose: 'board-train',
       bookingId: FIXTURE_IDS.booking1Id,
       createdAt: '2026-04-10T15:00:00.000Z',
-    },
-    {
-      id: LEDGER.chargeMembershipId,
-      ownerId: FIXTURE_IDS.ownerId,
-      amountCents: 7_900,
-      status: 'succeeded',
-      purpose: 'membership',
-      createdAt: '2026-04-15T15:00:00.000Z',
     },
     {
       id: LEDGER.chargeGroupRefundedId,
@@ -87,7 +80,7 @@ async function seedLedger(): Promise<void> {
       ownerId: FIXTURE_IDS.ownerId,
       amountCents: 5_000,
       status: 'requires_payment',
-      purpose: 'payg',
+      purpose: 'group-class',
       createdAt: '2026-04-20T15:00:00.000Z',
     },
   ]);
@@ -113,16 +106,16 @@ async function seedLedger(): Promise<void> {
       dueAt: '2026-05-02T15:00:00.000Z',
     },
     {
-      // Settled by the payg charge — its ledger entry must expose invoice_id
+      // Settled by the session charge — its ledger entry must expose invoice_id
       // (payment notifications deep-link by INVOICE id; the paid row is
       // charge-keyed, so the back-reference is the client's match key).
       id: LEDGER.invoiceSettledId,
       ownerId: FIXTURE_IDS.ownerId,
       amountCents: 9_000,
       status: 'paid',
-      purpose: 'payg',
+      purpose: 'board-train',
       paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
-      paidChargeId: LEDGER.chargePaygId,
+      paidChargeId: LEDGER.chargeSessionId,
       paidAt: '2026-04-10T15:00:00.000Z', // schema CHECK #7: paid implies paid_at
       issuedAt: '2026-04-10T14:00:00.000Z',
       dueAt: '2026-04-10T15:00:00.000Z',
@@ -170,13 +163,13 @@ test(
       settled_at: '2026-04-01T15:00:00.000Z',
     });
 
-    // Payg charge → category + dog resolved from the linked booking (day-school),
+    // Session charge → category + dog resolved from the linked booking (day-school),
     // and invoice_id from the invoices.paid_charge_id back-reference. It SETTLED
     // an invoice carrying a live payment_method, so the settling card (fixture
     // Visa ••4242) and the invoice's precise paid_at surface.
-    assert.deepEqual(entries.get(LEDGER.chargePaygId), {
-      id: LEDGER.chargePaygId,
-      kind: 'payg',
+    assert.deepEqual(entries.get(LEDGER.chargeSessionId), {
+      id: LEDGER.chargeSessionId,
+      kind: 'session',
       status: 'paid',
       amount_cents: 9_000,
       date: '2026-04-10T15:00:00.000Z',
@@ -186,18 +179,6 @@ test(
       settled_method: 'card',
       settled_card: { brand: 'visa', last4: '4242' },
       settled_at: '2026-04-10T15:00:00.000Z', // invoices.paid_at, not the charge time
-    });
-
-    // Membership charge → no dog, no category. Direct charge: card method, settle
-    // time from created_at, no card chip.
-    assert.deepEqual(entries.get(LEDGER.chargeMembershipId), {
-      id: LEDGER.chargeMembershipId,
-      kind: 'membership',
-      status: 'paid',
-      amount_cents: 7_900,
-      date: '2026-04-15T15:00:00.000Z',
-      settled_method: 'card',
-      settled_at: '2026-04-15T15:00:00.000Z',
     });
 
     // Refunded group-class charge with no booking → session, purpose-derived
@@ -238,7 +219,7 @@ test(
     }
 
     // Direct paid charges (no invoice link) settle by card but expose no card chip.
-    for (const id of [LEDGER.chargePackageId, LEDGER.chargeMembershipId]) {
+    for (const id of [LEDGER.chargePackageId]) {
       assert.equal('settled_card' in entries.get(id)!, false);
     }
 

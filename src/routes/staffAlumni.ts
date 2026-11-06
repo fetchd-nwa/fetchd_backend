@@ -8,7 +8,6 @@ import type {
   PostStaffDogsCompletedProgramsRequest,
 } from '../contracts/wire.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import type { Tx } from '../db/tx.js';
@@ -20,26 +19,17 @@ import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
- * §J.3 staff verbs — the alumni completed-programs record + attendance-flag
- * clear (DATA-CONTRACT §J.3, ruled 2026-07-09). Follows `staffCreditExpiry.ts`
- * conventions: requireStaff, withMutation + Idempotency-Key on writes, inline
- * wire type (NOT portal-mirrored yet — the portal UI lives in the other repo).
+ * §J.3 staff verbs — the alumni completed-programs record (DATA-CONTRACT §J.3,
+ * ruled 2026-07-09). Follows `staffCreditExpiry.ts` conventions: requireStaff,
+ * withMutation + Idempotency-Key on writes, inline wire type (NOT portal-mirrored
+ * yet — the portal UI lives in the other repo).
  *
- *   GET    /staff/dogs/:dogId/completed-programs           list + is_alumni + flag
+ *   GET    /staff/dogs/:dogId/completed-programs           list + is_alumni
  *   POST   /staff/dogs/:dogId/completed-programs {program} record a completion
  *   DELETE /staff/dogs/:dogId/completed-programs/:program  soft-expire a mistake
- *   POST   /staff/dogs/:dogId/clear-alumni-flag            clear the §J.3 flag
  *
- * Alumni is DERIVED (all 5 live rows) — recording the 5th program is the
- * became-alumni moment: the dog's existing live credit lots get
- * `expires_at = NULL` (`clearExpiryForDog`) inside the same tx.
- *
- * The DELETE deliberately does NOT re-stamp lot expiries: lots cleared at the
- * became-alumni moment stay never-expire even if a completion is later
- * un-recorded (re-stamping would need the original windows, which the clear
- * discarded — and a staff data-entry fix shouldn't silently shorten credits
- * the owner already saw as non-expiring). Future grants DO expire again,
- * because `isAlumni` is re-derived at every grant site.
+ * Alumni is DERIVED (all 5 live rows). Becoming alumni touches no credit: alumni
+ * lots take the ordinary expiry (ALUM-U16).
  */
 
 const dogIdParamSchema = z.object({ dogId: uuidId('dogId must be a UUID') });
@@ -75,15 +65,14 @@ export type CurriculumProgramConformance = Expect<
 // enforces it.
 
 /**
- * Assemble the wire from the two repo halves (programs list + dogs-row flag).
+ * Assemble the wire from the dog's live completions.
  * `undefined` when the dog is missing/expired — callers map to 404.
  */
 async function loadCompletedProgramsWire(
   dogId: string,
   runner?: Tx,
 ): Promise<CompletedProgramsWire | undefined> {
-  const flag = await dogsRepository.findAlumniFlagForStaff(dogId, runner);
-  if (flag === undefined) return undefined;
+  if (!(await dogsRepository.existsLive(dogId, runner))) return undefined;
   const programs = await dogProgramsRepository.findLiveByDog(dogId, runner);
   const wire: CompletedProgramsWire = {
     dog_id: dogId,
@@ -93,14 +82,11 @@ async function loadCompletedProgramsWire(
       completed_at: pgTimestampToIso(p.completedAt),
     })),
   };
-  if (flag.alumniAttendanceFlaggedAt !== null) {
-    wire.alumni_attendance_flagged_at = pgTimestampToIso(flag.alumniAttendanceFlaggedAt);
-  }
   return wire;
 }
 
 export interface StaffAlumniRouteOptions extends AuthRouteOptions {
-  /** Injectable clock for the became-alumni lot-clear + flag stamps. */
+  /** Injectable clock for the un-record's soft-expire stamp. */
   now?: () => Date;
 }
 
@@ -130,8 +116,7 @@ export function registerStaffAlumniRoute(
   // --- POST /staff/dogs/:dogId/completed-programs -----------------------
   // Record one course completion. Idempotent at two levels: the
   // Idempotency-Key replay AND the partial-unique no-op (re-recording an
-  // already-live (dog, program) succeeds without a second row). Recording
-  // the 5th program is the became-alumni moment → clearExpiryForDog.
+  // already-live (dog, program) succeeds without a second row).
   app.post(
     '/staff/dogs/:dogId/completed-programs',
     { preHandler: [authHook] },
@@ -141,7 +126,6 @@ export function registerStaffAlumniRoute(
       const { dogId } = parseDogIdParam(request.params);
       const body = parseOrThrow(recordBodySchema, request.body, 'body');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
-      const now = nowFactory();
 
       const outcome = await withMutation<CompletedProgramsWire>(
         {
@@ -149,29 +133,21 @@ export function registerStaffAlumniRoute(
           idempotencyKey,
           endpoint: 'POST /staff/dogs/:dogId/completed-programs',
           requestHash: hashRequestBody({ dogId, body }),
-          // Becoming alumni rewrites live lots' expires_at — the cached
-          // per-dog credit reads are stale the moment that lands.
-          patternsToInvalidate: (wire) => (wire.is_alumni ? [`credits:${dogId}:*`] : []),
+          keysToInvalidate: () => [],
         },
         async (tx) => {
-          // Row-lock the dog first: serializes concurrent program records so
-          // the "5th program" count is race-free (see lockForAlumniUpdate).
+          // Row-lock the dog first: serializes concurrent program records, so
+          // the `is_alumni` this answers counts them all (see lockForAlumniUpdate).
           const dogExists = await dogsRepository.lockForAlumniUpdate(tx, dogId);
           if (!dogExists) {
             throw new ApiError('not_found', `dog ${dogId} not found`);
           }
 
-          const inserted = await dogProgramsRepository.recordCompletion(tx, {
+          await dogProgramsRepository.recordCompletion(tx, {
             dogId,
             program: body.program,
             staffId: principal.staffId,
           });
-          // `undefined` = already recorded (live row exists) — success, and
-          // by definition not the became-alumni moment, so no lot clear.
-          if (inserted !== undefined && (await dogProgramsRepository.isAlumni(dogId, tx))) {
-            await creditLedgerRepository.clearExpiryForDog(tx, dogId, now);
-          }
-
           const wire = await loadCompletedProgramsWire(dogId, tx);
           if (wire === undefined) {
             throw new Error(`staffAlumni: dog ${dogId} vanished mid-mutation`);
@@ -186,8 +162,7 @@ export function registerStaffAlumniRoute(
   );
 
   // --- DELETE /staff/dogs/:dogId/completed-programs/:program ------------
-  // Soft-expire a mistaken record. Does NOT re-stamp lot expiries (see the
-  // module doc). 404 when there's no live completion to expire.
+  // Soft-expire a mistaken record. 404 when there's no live completion to expire.
   app.delete(
     '/staff/dogs/:dogId/completed-programs/:program',
     { preHandler: [authHook] },
@@ -215,45 +190,6 @@ export function registerStaffAlumniRoute(
           if (!expired) {
             throw new ApiError('not_found', `dog ${dogId} has no live ${program} completion`);
           }
-          const wire = await loadCompletedProgramsWire(dogId, tx);
-          if (wire === undefined) {
-            throw new Error(`staffAlumni: dog ${dogId} vanished mid-mutation`);
-          }
-          return { status: 200, body: wire };
-        },
-      );
-
-      return outcome.body;
-    },
-  );
-
-  // --- POST /staff/dogs/:dogId/clear-alumni-flag -------------------------
-  // Staff clear after the re-check/eval. Idempotent — clearing an already-
-  // clear flag returns the same 200 wire. The monthly scan won't re-flag
-  // within the same month (the notification dedupe row doubles as the guard).
-  app.post(
-    '/staff/dogs/:dogId/clear-alumni-flag',
-    { preHandler: [authHook] },
-    async (request): Promise<CompletedProgramsWire> => {
-      const principal = requirePrincipal(request);
-      requireStaff(principal, 'clear an alumni attendance flag');
-      const { dogId } = parseDogIdParam(request.params);
-      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
-
-      const outcome = await withMutation<CompletedProgramsWire>(
-        {
-          principal,
-          idempotencyKey,
-          endpoint: 'POST /staff/dogs/:dogId/clear-alumni-flag',
-          requestHash: hashRequestBody({ dogId }),
-          keysToInvalidate: () => [],
-        },
-        async (tx) => {
-          const dogExists = await dogsRepository.findAlumniFlagForStaff(dogId, tx);
-          if (dogExists === undefined) {
-            throw new ApiError('not_found', `dog ${dogId} not found`);
-          }
-          await dogsRepository.clearAlumniAttendanceFlag(tx, dogId);
           const wire = await loadCompletedProgramsWire(dogId, tx);
           if (wire === undefined) {
             throw new Error(`staffAlumni: dog ${dogId} vanished mid-mutation`);

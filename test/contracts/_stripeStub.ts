@@ -251,7 +251,7 @@ export interface StripeStub extends StripeClient {
    * RESPONSE was lost. The caller sees the same thrown transport error as
    * `setNextIntentThrowsTransport`, but a later re-issue under the same key
    * REPLAYS this outcome instead of executing fresh — which is precisely the
-   * property the auto-charge design rests on, and precisely what a stub that
+   * property any same-key retry rests on, and precisely what a stub that
    * minted a new `pi_test_*` per call made untestable.
    *
    * `status` is what Stripe recorded (default `succeeded` — the case where the
@@ -432,9 +432,9 @@ export interface StripeStub extends StripeClient {
 /**
  * The fingerprint Stripe hashes an idempotency key against — the request body.
  * Modelled here as a stable serialization of every confirm parameter, metadata
- * included, because metadata IS part of that hash: the pre-2026-08-12 worker
- * stamped a mutable counter into `auto_charge_attempt`, so even a correct
- * same-key retry would have been rejected live. A stub that ignored metadata
+ * included, because metadata IS part of that hash: the auto-charge worker, gone since
+ * P17, stamped a mutable counter into `auto_charge_attempt` until 2026-08-12, so even
+ * a correct same-key retry would have been rejected live. A stub that ignored metadata
  * would have kept that defect invisible.
  */
 function paramsFingerprint(
@@ -627,7 +627,7 @@ export function makeStripeStub(): StripeStub {
   // response Stripe recorded). Same key + same params replays that response;
   // same key + DIFFERENT params is an `idempotency_error`. The old stub minted
   // a fresh `pi_test_*` on every confirm regardless of key, so "same key ⇒ same
-  // outcome" — the mechanism the auto-charge worker's safety rests on — was
+  // outcome" — the mechanism a same-key retry's safety rests on — was
   // simply untestable, and a same-key retry modelled as two captures.
   const replays = new Map<string, { fingerprint: string; result: StripePaymentIntentResult }>();
   // Live PaymentIntent state, so `retrievePaymentIntent` answers what Stripe

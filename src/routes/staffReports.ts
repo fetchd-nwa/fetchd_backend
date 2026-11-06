@@ -71,13 +71,12 @@ const uuidParamSchema = z.object({ id: uuidId() });
 /**
  * `GET /staff/reports` query. `dog_id` is REQUIRED — Allison's 2026-08-25
  * ruling (wire-contract-completion WC-A5): staff name a dog to list its
- * reports; an unscoped cross-owner dump 400s, the `GET /staff/invoices?parked`
- * precedent (`staffInvoices.ts:66-70`). Zod's own required-key failure IS that
- * 400, so there is no second hand-rolled guard.
+ * reports; an unscoped cross-owner dump 400s. Zod's own required-key failure IS
+ * that 400, so there is no second hand-rolled guard.
  *
  * NOT `.strict()`, matching every other query schema on this surface
  * (`bookings.ts:80`, `requests.ts:52`, `staffRequests.ts:82`): an unknown key
- * is dropped, not rejected. `staffInvoices` is the lone strict outlier.
+ * is dropped, not rejected.
  */
 const getReportsQuerySchema = z.object({
   dog_id: uuidId(),

@@ -9,6 +9,7 @@ import {
   invoices,
   paymentMethods,
 } from '../schema/schema.js';
+import type { LedgerEntryWire } from '../../contracts/wire.js';
 import type { ChargePurpose, ChargeStatus } from './chargesRepository.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { Tx } from '../tx.js';
@@ -16,7 +17,7 @@ import type { Tx } from '../tx.js';
 /** Polymorphic runner — pool for pre/post-tx reads, Tx for in-mutation work. */
 type Runner = Tx | typeof db;
 
-export type LedgerKind = 'session' | 'credit-pack' | 'membership' | 'payg';
+export type LedgerKind = LedgerEntryWire['kind'];
 export type LedgerStatus = 'paid' | 'open' | 'refunded';
 export type LedgerMode = 'school' | 'daycare';
 
@@ -55,8 +56,7 @@ export interface LedgerEntryRow {
    * Paid entries only: the card that settled the entry, recoverable ONLY when
    * the paid charge back-references an invoice carrying a live payment_method
    * (`invoices.paid_charge_id` + `invoices.payment_method_id`). NULL for direct
-   * package/membership charges (no invoice link, no card) and for non-paid
-   * entries.
+   * package charges (no invoice link, no card) and for non-paid entries.
    */
   settledCard: { brand: string; last4: string } | null;
   /**
@@ -92,17 +92,13 @@ function kindForPurpose(purpose: ChargePurpose): LedgerKind {
   switch (purpose) {
     case 'package':
       return 'credit-pack';
-    case 'payg':
-      return 'payg';
-    case 'membership':
-      return 'membership';
     case 'board-train':
     case 'group-class':
       return 'session';
   }
 }
 
-// Category fallback for session/payg rows whose charge/invoice isn't linked to
+// Category fallback for session rows whose charge/invoice isn't linked to
 // a booking (e.g. a B&T invoice still keyed to the request, or a group-class
 // charge spanning multiple bookings). The booking's category wins when present.
 function categoryForPurpose(purpose: ChargePurpose): ServiceCategory | null {
@@ -127,12 +123,12 @@ export const ledgerRepository = {
    *     `package` purchase that funded them is the money event. This is the
    *     real billing model, not the prototype's per-session fabrication.
    *   - dog/mode come from `credit_ledger` for package purchases; dog/category
-   *     come from the linked `booking` for payg/board-train/group-class.
+   *     come from the linked `booking` for board-train/group-class.
    *   - Card brand/last4 is recovered for a paid charge that SETTLED an invoice
    *     (`invoices.paid_charge_id` back-reference → `invoices.payment_method_id`
    *     → `payment_methods`). `charges` itself carries no payment_method link
-   *     (only `stripe_payment_intent_id`), so a DIRECT package/membership charge
-   *     — with no invoice link — still renders no card chip rather than a
+   *     (only `stripe_payment_intent_id`), so a DIRECT package charge — with
+   *     no invoice link — still renders no card chip rather than a
    *     fabricated one.
    */
   async listForOwner(runner: Runner, ownerId: string): Promise<LedgerEntryRow[]> {

@@ -86,7 +86,7 @@ async function seedSucceededCharge(bookingId: string, amountCents: number): Prom
     bookingId,
     amountCents,
     status: 'succeeded',
-    purpose: 'payg',
+    purpose: 'group-class',
     stripePaymentIntentId: `pi_test_${randomUUID().slice(0, 8)}`,
   });
 }

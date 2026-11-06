@@ -43,19 +43,6 @@ test('deepLinkToPath: invoice → /account/invoices?invoiceId=:id (the specific 
   );
 });
 
-test('deepLinkToPath: membership without params → /account/memberships (overview)', () => {
-  assert.equal(deepLinkToPath({ kind: 'membership', id: 'm-1' }), '/account/memberships');
-});
-
-test('deepLinkToPath: membership with params.dogId → /dog-subscriptions/:dogId?highlight=:id (lone ending)', () => {
-  // R4 (2026-07-28): the dog page carries ?highlight=<membershipId> (link.id) so
-  // the app one-shot flashes the SPECIFIC ended subscription card.
-  assert.equal(
-    deepLinkToPath({ kind: 'membership', id: 'm-1', params: { dogId: 'dog-7' } }),
-    '/dog-subscriptions/dog-7?highlight=m-1',
-  );
-});
-
 test('deepLinkToPath: dog-profile → /dog-profile/:id', () => {
   assert.equal(deepLinkToPath({ kind: 'dog-profile', id: 'dog-7' }), '/dog-profile/dog-7');
 });

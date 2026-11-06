@@ -135,10 +135,11 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  *      writes the `charges` row at `'requires_payment'`, the honest status for
  *      a hold, and the post-commit capture flips it to `'succeeded'`. A
  *      declined card blocks enrollment on this response shape and blocks only
- *      THAT DOG on the `allow_partial` one. Pay-later: a card-backed open
- *      `invoices` row per dog due 24h before the first session — the
- *      auto-charge worker bills it then. Withdrawing before the first session
- *      refunds the charge / voids the open invoice.
+ *      THAT DOG on the `allow_partial` one. Pay-later: an open `invoices` row per
+ *      dog due 24h before the first session. No worker bills it: the owner pays
+ *      it through `POST /invoices/:id/pay` (DECISIONS 162(a), until P29).
+ *      Withdrawing before the first session refunds the charge / voids the open
+ *      invoice.
  *  10. Post-commit: capture each enrolled dog's hold, flip its charge row, and
  *      amend the stored idempotency response so a replay tells post-capture
  *      truth. Release every hold that did NOT enroll — cancel, never refund;
@@ -178,12 +179,11 @@ import { parseOrThrow } from '../lib/zodIssues.js';
 const MAX_DOGS_PER_REQUEST = 5;
 
 /**
- * Pay-later auto-charge lead time (Δ 2026-06-09): a card-backed open invoice
- * is created with `due_at = cohort_start − 24h`, and the existing invoice
- * auto-charge worker charges it then. Unenrolling before that voids the
- * invoice, so a pay-later that's withdrawn early is never charged.
+ * How long before the first session a pay-later invoice is due (Δ 2026-06-09): an
+ * open invoice is created with `due_at = cohort_start − 24h`. Nothing bills it at
+ * that time, the date is what she reads, and unenrolling voids the invoice.
  */
-const GROUP_CLASS_AUTOCHARGE_LEAD_MS = 24 * 60 * 60 * 1000;
+const GROUP_CLASS_INVOICE_DUE_LEAD_MS = 24 * 60 * 60 * 1000;
 
 const postEnrollmentBodySchema = z
   .object({
@@ -193,7 +193,7 @@ const postEnrollmentBodySchema = z
     dog_ids: z.array(uuidId()).min(1).max(MAX_DOGS_PER_REQUEST),
     payment_method_id: uuidId('payment_method_id must be a UUID'),
     // pay-now (the default) authorizes each dog's card immediately; pay-later
-    // defers to the auto-charge worker 24h before the first session.
+    // opens an invoice the owner pays herself.
     pay_later: z.boolean().optional(),
     /**
      * Wire 1.11.0 — per-dog partial success. Named for the SEMANTICS it
@@ -759,8 +759,8 @@ export function registerEnrollmentsRoute(
             dogId,
           });
           // markVoid only touches rows still 'open' and returns the count. If
-          // the auto-charge worker settled the invoice between findOpen and
-          // here (0 voided), fall through to the refund path — otherwise a
+          // a settle landed on the invoice between findOpen and here (0
+          // voided), fall through to the refund path — otherwise a
           // now-CHARGED invoice would be left un-refunded (the #2 race bug).
           const voidedCount =
             openInvoice !== undefined
@@ -1535,8 +1535,8 @@ async function runAllOrNothingEnrollment(
         // 8. `filled` counter bump — atomic under the row lock.
         await cohortsRepository.bumpFilled(tx, cohortRow.id, requested);
 
-        // 9. Money rows, per dog. Pay-later: a card-backed open invoice due
-        //    24h before the first session. Pay-now: a charge row at the
+        // 9. Money rows, per dog. Pay-later: an open invoice due 24h before the
+        //    first session. Pay-now: a charge row at the
         //    HONEST status for a hold — `requires_payment`
         //    (`stripeIntentStatusToChargeStatus('requires_capture')`) — which
         //    the capture step below flips to 'succeeded' once money moves.
@@ -1544,7 +1544,7 @@ async function runAllOrNothingEnrollment(
         //    capture takes, on the row the billing ledger reads.
         if (parsed.payLater) {
           const dueAt = new Date(
-            pgTimestampToDate(cohortRow.startDate).getTime() - GROUP_CLASS_AUTOCHARGE_LEAD_MS,
+            pgTimestampToDate(cohortRow.startDate).getTime() - GROUP_CLASS_INVOICE_DUE_LEAD_MS,
           ).toISOString();
           for (const dogId of sortedDogIds) {
             await invoicesRepository.createOpen(tx, {
@@ -1934,7 +1934,7 @@ async function runPartialEnrollmentInner(
           tx,
         );
         const dueAt = new Date(
-          pgTimestampToDate(cohortRow.startDate).getTime() - GROUP_CLASS_AUTOCHARGE_LEAD_MS,
+          pgTimestampToDate(cohortRow.startDate).getTime() - GROUP_CLASS_INVOICE_DUE_LEAD_MS,
         ).toISOString();
 
         const bookingWires: BookingWire[] = [];

@@ -1,8 +1,6 @@
 import { eq, sql, type SQL } from 'drizzle-orm';
-import { bookingMode, charges, cohorts, events, type LocationKey } from './schema/schema.js';
+import { charges, cohorts, events, type LocationKey } from './schema/schema.js';
 import type { Tx } from './tx.js';
-
-type BookingMode = (typeof bookingMode.enumValues)[number];
 
 /**
  * **THE ONE GLOBAL LOCK ORDER** (design §2.7:3975, written once, here):
@@ -44,6 +42,17 @@ type BookingMode = (typeof bookingMode.enumValues)[number];
  * is `FOR NO KEY UPDATE`, which `KEY SHARE` does not conflict with and which conflicts
  * with itself. `FOR UPDATE` is a 40P01, the invoice's lesson above. A statement-level
  * trace cannot see an FK check, so `order-lock-order.test.ts` pins it on real connections.
+ *
+ * `dogs` and `bookings` are parents the same re-check reaches. A settle asks `KEY SHARE`
+ * of the dog twice, on the charge insert and on the second `UPDATE` of its invoice, and
+ * the one row lock on a dog, `dogsRepository.lockForAlumniUpdate`, is `FOR NO KEY UPDATE`
+ * and wants nothing after it, so there is no wait. A class invoice's charge names
+ * `booking_id` too, which is safe only because the withdraw writes those rows with a
+ * plain `UPDATE` and a per-booking cancel refuses class rows. A board-train invoice's
+ * charge names it as well, against `lockById`'s `FOR UPDATE`, and that is a wait and not
+ * a cycle: the cancel holds the booking and touches no invoice, so `/pay` queues behind
+ * it. The 40P01 here was `payg`'s, whose cancel voided the invoice `/pay` held, and that
+ * void left with `payg` at P17.
  *
  * A final failure's `invoiceStillOwed` takes the invoice under its charge, in this list's
  * order. The sweeper looks at one row at a time, so a tick waits behind a held invoice,
@@ -104,34 +113,6 @@ export async function withServiceRateLock<T>(
   await tx.execute(
     sql`SELECT pg_advisory_xact_lock(hashtext(${`service-rate:${category}:${location}`}))`,
   );
-  return fn();
-}
-
-/**
- * Per-(dog, mode) transaction-scoped advisory lock — the membership-create
- * serializer (`POST /memberships`, uniqueness ruling 2026-07-16: one ACTIVE
- * membership per (dog, mode)). The route pre-checks before the Stripe charge
- * (friendly 409, no money moves), but that read races the seconds-wide Stripe
- * round-trip of a concurrent subscribe: both calls can pass the pre-check,
- * both charge, and both insert. This lock + an in-tx re-check serialize the
- * insert decision so the loser detects the winner's row and refunds its
- * duplicate charge instead of double-subscribing. The partial unique index
- * (`memberships_one_active_per_dog_mode`) is the constraint floor beneath
- * both.
- *
- * Key: `hashtext('membership:<dogId>:<mode>')`. The prefix keeps this
- * namespace disjoint from the booking (`dog:<dogId>`) and
- * `service-rate:` locks; int4 hash collisions only cause spurious
- * serialization, never incorrect behavior. The key is a string, so `dogId` must
- * be the lowercased id: `POST /memberships` normalises it at its parse boundary.
- */
-export async function withMembershipCreateLock<T>(
-  tx: Tx,
-  dogId: string,
-  mode: BookingMode,
-  fn: () => Promise<T>,
-): Promise<T> {
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`membership:${dogId}:${mode}`}))`);
   return fn();
 }
 

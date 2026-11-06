@@ -158,10 +158,7 @@ export const creditPackagesRepository = {
   },
 
   /**
-   * §J.1 — lookup by surrogate id, NO effective-window filter: a membership
-   * pins the exact priced version it bills (`memberships.package_id`), and a
-   * later repricing/retirement must not change what an in-flight subscription
-   * delivers. The roll phase + the membership settle branch read this.
+   * Lookup by surrogate id, NO effective-window filter.
    */
   async findById(runner: Runner, id: string): Promise<CreditPackageWithId | undefined> {
     const [row] = await runner

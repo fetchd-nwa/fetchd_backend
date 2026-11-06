@@ -19,14 +19,12 @@ import {
   type ChargePurpose,
   type EngineChargeRow,
 } from '../db/repositories/chargesRepository.js';
-import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { invoicesRepository, repointPaymentMethod } from '../db/repositories/invoicesRepository.js';
 import { ordersRepository, type OrderRow } from '../db/repositories/ordersRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { withActor, type Tx } from '../db/tx.js';
-import { invalidatePattern } from './cache.js';
 import { ApiError, toErrorEnvelope } from './errors.js';
 import { formatDollars } from './invoiceReceiptCopy.js';
 import { noticeInSavepoint } from './noticeInSavepoint.js';
@@ -201,8 +199,6 @@ export function paymentFailedEnvelope(args: {
 export interface EngineAct {
   outcome: 'settled' | 'lost-race' | 'late-refund' | 'failed' | 'no-op';
   pendingStripeRefund?: PendingStripeRefund;
-  /** A membership settle granted a lot: this dog's balance cache goes stale. */
-  creditsDogId?: string;
   /** The rows a `cancel-order` failure took down. */
   cancelled?: CancelledOrderRows;
 }
@@ -223,17 +219,6 @@ export async function finishEngineAct(
     stripe: args.stripe,
     log: args.log,
     context: args.context,
-  });
-  if (act.creditsDogId === undefined) return;
-  await invalidatePattern(creditsInvalidationPattern(act.creditsDogId)).catch((err: unknown) => {
-    args.log.warn(
-      {
-        ...args.context,
-        dogId: act.creditsDogId,
-        err: err instanceof Error ? err.message : String(err),
-      },
-      'order settle post-commit credits invalidation failed',
-    );
   });
 }
 
@@ -326,7 +311,7 @@ async function refundLateSuccess(
 /**
  * Settle a locked `requires_payment` charge whose intent succeeded. Only this moves a
  * charge to `succeeded`, so only this enqueues the receipt. The invoice flips through
- * the same `settleChargeAgainstInvoice` the worker and the webhook use, which keeps
+ * the same `settleChargeAgainstInvoice` the webhook uses, which keeps
  * PAY-35: a lost race refunds this charge, and the card rebind (PAY-12) fires only on
  * the clean win.
  */
@@ -372,7 +357,6 @@ async function settleOpenCharge(
     purpose: charge.purpose,
     notifyOwner: true,
     receiptPush: { trigger: args.receiptTrigger, scheduledFor: now },
-    now,
     log,
   });
 
@@ -403,9 +387,6 @@ async function settleOpenCharge(
     outcome: won ? 'settled' : 'lost-race',
     ...(settled.outcome === 'refunded' && settled.pendingStripeRefund !== undefined
       ? { pendingStripeRefund: settled.pendingStripeRefund }
-      : {}),
-    ...(won && invoice.purpose === 'membership' && invoice.dogId !== null
-      ? { creditsDogId: invoice.dogId }
       : {}),
   };
 }

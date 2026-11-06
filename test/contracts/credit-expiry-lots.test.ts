@@ -58,21 +58,6 @@ async function insertLot(delta: number, expiresAt: string | null): Promise<strin
   return id;
 }
 
-/** Insert a subscription source lot (`membership-grant`) and return its id. */
-async function insertMembershipLot(delta: number, expiresAt: string | null): Promise<string> {
-  const id = randomUUID();
-  await db.insert(creditLedger).values({
-    id,
-    dogId: DOG,
-    mode: SCHOOL,
-    location: FAY,
-    delta,
-    reason: 'membership-grant',
-    expiresAt,
-  });
-  return id;
-}
-
 /** Lot-aware live balance via the repository (reads the canonical view). */
 async function balance(): Promise<number> {
   return db.transaction(
@@ -131,56 +116,6 @@ test(
   },
 );
 
-test(
-  'subscription credits first: a membership-grant lot beats a SOONER-expiring purchase lot',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await resetDog1Ledger();
-    const purchaseSoon = await insertLot(1, isoIn(5)); // purchase, expires in days
-    const membership = await insertMembershipLot(1, isoIn(25)); // subscription month
-    assert.equal(await balance(), 2);
-
-    assert.equal(
-      await debit(FIXTURE_IDS.booking1Id),
-      membership,
-      'membership-grant lot consumed first despite the later expiry (2026-07-14 ruling)',
-    );
-    assert.equal(
-      await debit(FIXTURE_IDS.booking2Id),
-      purchaseSoon,
-      'purchase lot only after subscription credits are exhausted',
-    );
-    assert.equal(await balance(), 0);
-  },
-);
-
-test(
-  'alumni membership lot (NULL expiry) still beats purchase lots and the pool; expiring membership lot beats it',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await resetDog1Ledger();
-    const alumniMembership = await insertMembershipLot(1, null); // alumni grant — never expires
-    const membershipExpiring = await insertMembershipLot(1, isoIn(20));
-    const purchase = await insertLot(1, isoIn(10));
-    await insertLot(1, null); // never-expiring purchase pool
-    assert.equal(await balance(), 4);
-
-    assert.equal(
-      await debit(FIXTURE_IDS.booking1Id),
-      membershipExpiring,
-      'expiring membership lot first within the subscription bucket',
-    );
-    assert.equal(
-      await debit(FIXTURE_IDS.booking2Id),
-      alumniMembership,
-      'alumni NULL-expiry membership lot next — still ahead of every purchase lot',
-    );
-    assert.equal(await debit(FIXTURE_IDS.booking3Id), purchase, 'then expiring purchase lots');
-    assert.equal(await debit(FIXTURE_IDS.booking4Id), null, 'never-expiring pool last');
-    assert.equal(await balance(), 0);
-  },
-);
-
 test('expired lots are excluded from the balance', SKIP_WHEN_NO_DB, async () => {
   await resetDog1Ledger();
   await insertLot(5, isoIn(-1)); // expired yesterday
@@ -206,7 +141,6 @@ test(
         lotId: lot,
         lotExpiresAt: isoIn(365),
         now: new Date(),
-        dogIsAlumni: false,
       });
     });
 
@@ -244,7 +178,6 @@ test(
         lotId: expiredLot,
         lotExpiresAt: isoIn(-1),
         now: new Date(),
-        dogIsAlumni: false,
       });
     });
 

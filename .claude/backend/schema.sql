@@ -143,20 +143,11 @@ CREATE TYPE notification_type  AS ENUM (
   -- Credit-expiry Phase-3 amendment 2026-06-20: the money-adjacent feed
   -- arms. `credits-expiring` is the scheduled-scan warning (a lot is
   -- within its location's warning_lead_days of expiry); `payment-failed`
-  -- + `payment-succeeded` are the invoice auto-charge receipts — failed
-  -- emitted ONLY when an invoice parks (terminal, MAX attempts), succeeded
-  -- on every successful auto-charge. Shared by the delivered feed + the
-  -- scheduled queue.
+  -- + `payment-succeeded` are the money receipts: a failed card and a
+  -- settled charge. Shared by the delivered feed + the scheduled queue.
+  -- M4.02 (wire 5.0.0-lg4.1) rebuilt this type without `alumni-attendance`
+  -- and `membership-ended`.
   'credits-expiring', 'payment-failed', 'payment-succeeded',
-  -- §J.3 amendment 2026-07-09: the alumni monthly attendance scan — an
-  -- alumni dog attended <2 qualifying sessions in the just-closed Chicago
-  -- month, so its attendance flag was set (dog stays alumni; staff will
-  -- re-check before the next booking).
-  'alumni-attendance',
-  -- §J.1 amendment 2026-07-14: the membership roll emits this feed entry
-  -- when a subscription hits its term hard stop ("you'll be notified when
-  -- your subscription ends" — the FE promise made on the subscribe page).
-  'membership-ended',
   -- Shanthi ruling 2026-07-14: fires on the owner's stated spay/neuter
   -- planned date, prompting them to update the dog's profile.
   'spay-neuter-reminder',
@@ -164,14 +155,11 @@ CREATE TYPE notification_type  AS ENUM (
   -- before the linked booking's drop-off (or ~1h before the invoice's due time
   -- when no booking is linked), telling the owner to bring payment at drop-off.
   'payment-due',
-  -- Allison 2026-07-29 (notification sweep). `invoice-overdue` is the safety
-  -- net — an invoice still open INVOICE_OVERDUE_GRACE_DAYS past its due date.
-  -- Every other payment path (auto-charge, pay-in-person at drop-off) should
-  -- have settled it well before this fires, which is exactly the point: it's a
-  -- precaution, not a dunning ladder, and it fires ONCE per invoice.
+  -- Nothing writes `invoice-overdue` since M4.04 (q87's default): its scan left
+  -- with the lane. The label stays so rows already written still read.
   'invoice-overdue',
   -- The owner's default card is within CARD_EXPIRY_WARNING_DAYS of lapsing (or
-  -- lapsed yesterday), so auto-charges don't start failing silently.
+  -- lapsed yesterday), so she can replace it before it is next charged.
   'card-expiring',
   -- A waitlisted request got a seat — either one opened up or staff overrode
   -- the cap. Deep-links to the booking that was just created.
@@ -194,9 +182,9 @@ CREATE TYPE booking_mode       AS ENUM ('school', 'daycare');  -- credits axis
 CREATE TYPE record_source      AS ENUM ('app', 'gingr', 'seed');
 CREATE TYPE sender_kind        AS ENUM ('owner', 'staff');
 CREATE TYPE group_class_key    AS ENUM ('puppy', 'manners-1', 'manners-2', 'public-pups');
-CREATE TYPE charge_purpose     AS ENUM ('package','payg','board-train','membership','group-class');
+CREATE TYPE charge_purpose     AS ENUM ('package','board-train','group-class');
 CREATE TYPE charge_status      AS ENUM ('requires_payment','succeeded','failed','refunded');
-CREATE TYPE ledger_reason      AS ENUM ('purchase','booking-debit','cancel-refund','adjustment','membership-grant');
+CREATE TYPE ledger_reason      AS ENUM ('purchase','booking-debit','cancel-refund','adjustment');
 -- 2026-08-19 (`designs/client-keyed-refund-recovery.md` §4): 'unroutable' is a
 -- TERMINAL fourth state, not a variant of 'pending'. It means "money is owed
 -- back and no automatic path can ever send it" — the charge behind the refund
@@ -348,14 +336,6 @@ CREATE TABLE dogs (
   -- (dog-profile boarding tile, boarding booking flow) hide boarding for dogs
   -- where this is false; not a server booking-gate trigger like evaluation.
   boarding_enabled   boolean NOT NULL DEFAULT false,
-  -- §J.3 alumni attendance flag (2026-07-09). Set by the monthly scan when an
-  -- ALUMNI dog (all 5 curriculum programs completed — dog_completed_programs)
-  -- attended <2 qualifying sessions (group-class / day-school / day-care) in
-  -- the just-closed Chicago month. The dog STAYS alumni and its credits keep
-  -- no-expiry; the flag means "staff re-check (eval) before the next booking."
-  -- Staff clear it (set NULL) after the re-check. Soft surface — not a
-  -- booking-gate trigger like evaluation.
-  alumni_attendance_flagged_at timestamptz,
   -- Spay/neuter (Shanthi ruling 2026-07-14): a PROFILE question. NULL =
   -- unanswered. No booking path reads it from wire 3.0.0 until the refusal
   -- lands (S11, LG2b). planned_on: the owner's stated spay/neuter date — a
@@ -511,8 +491,7 @@ CREATE UNIQUE INDEX dog_completed_classes_uidx
 -- Staff-authored (report `results` are per-skill JSONB with no per-course
 -- aggregate, so completion needs its own record — same reasoning as
 -- dog_completed_classes above). ALUMNI STATUS IS DERIVED: a dog with all 5
--- live rows is alumni; no separate status row to drift. Becoming alumni
--- (5th row) clears expires_at on the dog's live credit lots (§J.3).
+-- live rows is alumni; no separate status row to drift.
 CREATE TABLE dog_completed_programs (
   id                     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   dog_id                 uuid NOT NULL REFERENCES dogs(id) ON DELETE CASCADE,
@@ -1597,11 +1576,8 @@ INSERT INTO staff_settings (
 --     packs, the never-expiring "pool"); a timestamp = forfeit once passed.
 --   • A debit (delta<0) / refund (delta>0) row sets lot_id to the source lot
 --     it draws from / returns to. lot_id NULL on a debit = drawn from the
---     never-expiring pool. Debit priority (Δ 2026-07-14, Allison ruling
---     "subscription credits first"): membership-grant lots first (soonest
---     expiry first; an alumni NULL-expiry membership lot after that dog's
---     expiring ones), then other lots soonest-expiry first, pool last —
---     see api creditLedgerRepository.findNextDebitLot.
+--     never-expiring pool. Debit priority: lots soonest-expiry first, pool
+--     last — see api creditLedgerRepository.findNextDebitLot.
 -- NON-RETROACTIVE: expires_at is stamped once at purchase from the then-current
 -- window (mirrors cancel_window_settings); a later window change affects future
 -- purchases only. Existing + Gingr-imported credits stay NULL (grandfathered,
@@ -1680,7 +1656,7 @@ CREATE VIEW dog_credit_balance AS
 -- Payments (built day one; Stripe test keys dev/staging, live keys prod;
 -- payments_enabled = operational kill switch, NOT a v1 deferral)
 -- Append-only / retained: financial owner FKs are ON DELETE RESTRICT so a
--- stray delete can never destroy charge/invoice/ledger/membership history.
+-- stray delete can never destroy charge/invoice/ledger history.
 -- ----------------------------------------------------------------------------
 -- PCI: raw PAN/CVC never touch this DB. We store only the Stripe token + the
 -- displayable bits Stripe returns. Stripe Secret Key lives in the Node env.
@@ -1751,7 +1727,7 @@ CREATE TABLE charges (
   booking_id              uuid REFERENCES bookings(id),
   -- Δ 2026-06-09: group-class enrollment is paid per-(cohort, dog) so a single
   -- dog can be unenrolled + refunded independently. Both NULL for non-enrollment
-  -- charges (packages, B&T, payg). The pay-later twin lives on invoices.
+  -- charges (packages, B&T). The pay-later twin lives on invoices.
   cohort_id               uuid REFERENCES cohorts(id),
   dog_id                  uuid REFERENCES dogs(id),
   created_at              timestamptz NOT NULL DEFAULT now(),
@@ -1820,27 +1796,26 @@ CREATE TABLE invoices (
   cohort_id      uuid REFERENCES cohorts(id) ON DELETE SET NULL,
   dog_id         uuid REFERENCES dogs(id) ON DELETE SET NULL,   -- Δ 2026-06-09: per-dog group-class enrollment (pay-later twin of charges.dog_id)
   request_id     uuid REFERENCES pending_requests(id) ON DELETE SET NULL,
-  -- §J.1 (2026-07-09): the subscription month this invoice bills. Set only on
-  -- purpose='membership' rows (the scheduler rolls one per period); the settle
-  -- path reads it to grant the month's credit lot (reason 'membership-grant').
-  -- FK added AFTER CREATE TABLE memberships below (invoices is created first).
-  membership_id  uuid,
-  -- Anti-scam (locked 2026-05-19): every invoice is CARD-BACKED + auto-charged.
-  -- No open-ended unpaid balance — payment_method_id is REQUIRED and the worker
-  -- auto-charges at due_at (retrying via next_attempt_at/auto_charge_attempts),
-  -- so a client cannot defer-and-ghost the way Gingr allowed.
-  payment_method_id uuid NOT NULL REFERENCES payment_methods(id) ON DELETE RESTRICT,
-  -- R3 (Allison sim-QA 2026-07-27): how the owner intends to settle. 'card' =
-  -- the default card-backed auto-charge described above; 'in-person' = cash/check
-  -- due at drop-off (POST /invoices/:id/pay-in-person flips it + schedules a
-  -- payment-due reminder). Adjudicated "cash/check invoices due by drop-off"; the
-  -- drop-off flagging + auto-charge stop are portal-side, later.
+  -- Anti-scam (locked 2026-05-19): an invoice used to be auto-charged to its bound
+  -- card at due_at, so a client could not defer-and-ghost the way Gingr allowed.
+  -- That lane left at M4.04 (wire 5.0.0-lg4.1, PAY-U15): NO WORKER BILLS A CARD ON
+  -- ITS OWN. An open invoice stays open until a person settles it: the owner through
+  -- POST /invoices/:id/pay or in person, or staff charging the card on file through
+  -- a custom invoice (PAY-41). So until P29 removes `pay_later` a class pay-later
+  -- invoice can sit unpaid past its due date with nothing chasing it (DECISIONS
+  -- 162(a), Blocked #16; test mode only). This column is the card the invoice is
+  -- bound to, which the settle rebinds. NULL means no card: nothing writes one until
+  -- P25.
+  payment_method_id uuid REFERENCES payment_methods(id) ON DELETE RESTRICT,
+  -- R3 (Allison sim-QA 2026-07-27): how the owner intends to settle. 'card' = by
+  -- card through the app; 'in-person' = cash/check due at drop-off (POST
+  -- /invoices/:id/pay-in-person flips it + schedules a payment-due reminder).
+  -- Adjudicated "cash/check invoices due by drop-off"; the drop-off flagging is
+  -- portal-side, later.
   payment_expected text NOT NULL DEFAULT 'card' CHECK (payment_expected IN ('card','in-person')),
   paid_charge_id uuid REFERENCES charges(id),
   issued_at      timestamptz NOT NULL DEFAULT now(),
   due_at         timestamptz NOT NULL,
-  next_attempt_at timestamptz,
-  auto_charge_attempts integer NOT NULL DEFAULT 0,
   paid_at        timestamptz,
   external_ref   text,
   source         record_source NOT NULL DEFAULT 'app',
@@ -1860,144 +1835,6 @@ CREATE UNIQUE INDEX invoices_order_id_uidx ON invoices (order_id);
 ALTER TABLE orders
   ADD CONSTRAINT orders_invoice_id_fkey
   FOREIGN KEY (invoice_id) REFERENCES invoices(id);
-
--- ----------------------------------------------------------------------------
--- Invoice charge attempts (2026-08-12, `designs/auto-charge-unknown-outcome.md`).
---
--- The auto-charge worker used to keep TWO jobs in one integer: the dunning
--- ladder (`invoices.auto_charge_attempts`) AND the Stripe idempotency key's
--- identity (`auto-charge:{invoiceId}:{attempts}`). A transport failure — the
--- one class where we do NOT know whether money moved — incremented that counter
--- and thereby MINTED A NEW KEY, so the next tick asked Stripe for new money for
--- a charge that may already have succeeded. Splitting the jobs is the fix:
--- `auto_charge_attempts` keeps the ladder (known-failed attempts only) and the
--- key identity moves HERE, where `attempt_no` advances only when the previous
--- attempt is known-dead.
---
--- One row per attempt, written BEFORE the Stripe confirm so a worker that dies
--- mid-flight leaves the doubt on the books instead of in a log:
---   'pending'    -- we do not know (pre-call, crash, or transport-unknown)
---   'processing' -- Stripe has it and the money is in flight
---   'succeeded'  -- settled (charges/invoices rows carry the money truth)
---   'no-charge'  -- known-dead: declined / auth-required / canceled
--- The last two are terminal. `payment_method_id` + `stripe_payment_method_id` +
--- `amount_cents` + `stripe_customer_id` are the params FROZEN at mint time: a
--- re-issue under the same key must send byte-identical params or Stripe rejects
--- it (`idempotency_error`) — which is the desired loud failure, not a reason to
--- mint a fresh key. `stripe_customer_id` joined them 2026-08-12: it is part of
--- the request Stripe hashes the key against, and re-reading it from
--- `stripe_customers` at re-issue time meant a re-link between mint and verify
--- silently drifted the fingerprint into the permanent-park arm.
---
--- `reconcile_reason` is the DURABLE half of a park. Every park arm looks
--- identical in the invoice row (`next_attempt_at = NULL`), so the fact a human
--- most needs — WHY automation stopped, and in particular whether our records
--- disagree with Stripe's — used to live only in a log line.
---
--- NOT a wire surface (no `conformance.ts` pin, no client mirror) — worker
--- telemetry + the operator's answer to "what happened to this money?".
--- ----------------------------------------------------------------------------
-CREATE TYPE invoice_attempt_outcome AS ENUM
-  ('pending', 'processing', 'succeeded', 'no-charge');
-
-CREATE TABLE invoice_charge_attempts (
-  id                        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  invoice_id                uuid NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
-  attempt_no                integer NOT NULL,
-  payment_method_id         uuid NOT NULL REFERENCES payment_methods(id) ON DELETE RESTRICT,
-  stripe_payment_method_id  text NOT NULL,
-  stripe_customer_id        text NOT NULL,  -- frozen with the other confirm params
-  amount_cents              integer NOT NULL CHECK (amount_cents >= 0),
-  idempotency_key           text NOT NULL UNIQUE,
-  stripe_payment_intent_id  text,          -- NULL until a response/webhook names it
-  outcome                   invoice_attempt_outcome NOT NULL DEFAULT 'pending',
-  verify_count              integer NOT NULL DEFAULT 0,
-  -- Why the verify lane handed this attempt to a human. NULL = never parked.
-  --   'key-window-expired'  -- past the key window with no PI id and no webhook
-  --   'in-flight-cap'       -- 'processing' longer than the cap allows
-  --   'idempotency-conflict'-- Stripe rejected our frozen params on our own key
-  --   'fresh-execution'     -- a re-issue EXECUTED instead of replaying: the
-  --                         -- key window assumption did not hold, so a second
-  --                         -- charge may exist for this debt
-  reconcile_reason          text CHECK (reconcile_reason IN
-                              ('key-window-expired', 'in-flight-cap',
-                               'idempotency-conflict', 'fresh-execution')),
-  created_at                timestamptz NOT NULL DEFAULT now(),
-  updated_at                timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (invoice_id, attempt_no)
-);
--- THE interlock: at most one unresolved attempt per invoice, enforced by the
--- database, not by worker discipline. The charge lane cannot mint attempt N+1
--- while attempt N is in doubt even if its code path is wrong.
-CREATE UNIQUE INDEX invoice_charge_attempts_unresolved_uq
-  ON invoice_charge_attempts (invoice_id)
-  WHERE outcome IN ('pending', 'processing');
--- The verify lane's worklist: oldest unresolved first.
-CREATE INDEX invoice_charge_attempts_unresolved_idx
-  ON invoice_charge_attempts (updated_at)
-  WHERE outcome IN ('pending', 'processing');
--- The webhook's orphan match target (metadata carries the PI id, not our uuid).
-CREATE INDEX invoice_charge_attempts_pi_idx
-  ON invoice_charge_attempts (stripe_payment_intent_id)
-  WHERE stripe_payment_intent_id IS NOT NULL;
-
--- The 3 Day School payment modes from the DS: PAYG (charges.purpose='payg'),
--- packages (credit_packages + credit_ledger), memberships (below).
---
--- §J.1 ACTIVATED 2026-07-09 (was dormant scaffolding): a membership is a
--- credit-package SUBSCRIPTION — the package's credits granted each month on a
--- recurring charge, for a committed term of 3/6/9/12 months that HARD-STOPS
--- at ends_at (no auto-renew). Renewals are SELF-BILLED via the invoice
--- auto-charge lane (purpose='membership' + invoices.membership_id), NOT
--- Stripe Billing — stripe_subscription_id stays NULL and is retained only
--- for a possible future Billing migration. Month 1 charges synchronously at
--- POST /memberships (same charge→grant path as a package purchase); the
--- scheduler rolls each later period. A month's granted lot expires at that
--- period's end (expires_at = current_period_end; alumni dogs NULL) — that is
--- what makes the "X days left to use X credits" reminder ride the existing
--- credits-expiring scan. Pause is staff-mediated (paused_at set/cleared by
--- staff; the roll phase skips paused rows). status: active|completed|canceled
--- (completed = term ran out; canceled = staff/owner stop — status, not delete).
-CREATE TABLE memberships (
-  id                     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id               uuid NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,
-  -- §J.1: required — credit grants land per-dog like every package purchase.
-  -- (Kept nullable in DDL for the dormant-era shape; the API requires it.)
-  dog_id                 uuid REFERENCES dogs(id) ON DELETE RESTRICT,
-  mode                   booking_mode NOT NULL,
-  -- §J.1: the priced package version this subscription delivers monthly.
-  -- FK the surrogate id (not key) so a later repricing never changes what an
-  -- in-flight subscription bills — same pin-the-version rule as charges.
-  package_id             uuid REFERENCES credit_packages(id) ON DELETE RESTRICT,
-  term_months            integer CHECK (term_months IN (3, 6, 9, 12)),
-  -- §J.1: the card every rolled invoice bills (invoices.payment_method_id is
-  -- NOT NULL). Chosen at POST; if it dies later the auto-charge parks + the
-  -- payment-failed push fires — the existing dunning lane, no special case.
-  payment_method_id      uuid REFERENCES payment_methods(id) ON DELETE RESTRICT,
-  stripe_subscription_id text UNIQUE,
-  status                 text NOT NULL DEFAULT 'active',  -- cancellation = status, not delete
-  started_at             timestamptz NOT NULL DEFAULT now(),
-  current_period_start   timestamptz,
-  current_period_end     timestamptz,
-  ends_at                timestamptz,                     -- §J.1 hard stop (started_at + term)
-  paused_at              timestamptz,                     -- §J.1 staff-mediated pause
-  paused_by_staff_id     uuid REFERENCES staff(id) ON DELETE RESTRICT
-);
-CREATE INDEX memberships_owner_idx ON memberships (owner_id);
--- The roll phase's scan: active rows whose period has ended.
-CREATE INDEX memberships_active_roll_idx
-  ON memberships (current_period_end) WHERE status = 'active';
--- Membership uniqueness (Allison ruling 2026-07-16): one ACTIVE membership
--- per (dog, mode) — day-school + daycare may coexist on one dog; two of the
--- same mode may not. The POST /memberships pre-charge probe + advisory-locked
--- in-tx re-check give the friendly 409 / duplicate-refund paths; this partial
--- unique index is the constraint floor beneath both.
-CREATE UNIQUE INDEX memberships_one_active_per_dog_mode
-  ON memberships (dog_id, mode) WHERE status = 'active';
--- §J.1: invoices.membership_id FK, deferred to here — invoices is created
--- before memberships in this file (financial tables block ordering).
-ALTER TABLE invoices ADD CONSTRAINT invoices_membership_id_fkey
-  FOREIGN KEY (membership_id) REFERENCES memberships(id) ON DELETE SET NULL;
 
 -- ----------------------------------------------------------------------------
 -- Refunds (locked 2026-05-19) — a refund against a prior Stripe charge. Partial
@@ -2451,7 +2288,7 @@ CREATE TABLE audit_log (
   id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   table_name text NOT NULL,
   row_pk     text NOT NULL,            -- stringified PK of the affected row
-  op         text NOT NULL,            -- 'UPDATE' | 'DELETE'
+  op         text NOT NULL,            -- 'UPDATE' | 'DELETE' | 'MIGRATION-DROP' (a step's snapshot of a row it drops)
   before     jsonb NOT NULL,           -- the OLD row
   actor      text,                     -- current_setting('app.actor', true)
   txid       bigint NOT NULL DEFAULT txid_current(),
@@ -2507,11 +2344,7 @@ BEGIN
     'owners','dogs','vets','reports','bookings','pending_requests','charges','refunds',
     -- Day-17 §A amendment 2026-05-27: worker queue carries updated_at so
     -- the dashboard can surface stalled 'processing' rows.
-    'media_derivative_jobs',
-    -- 2026-08-12: the verify lane claims unresolved attempts by `updated_at`,
-    -- so every outcome/verify_count write must move it or a resolved-then-
-    -- reopened row could sort ahead of a genuinely older one.
-    'invoice_charge_attempts'
+    'media_derivative_jobs'
   ]) LOOP
     EXECUTE format(
       'CREATE TRIGGER %I_touch BEFORE UPDATE ON %I
@@ -2521,8 +2354,7 @@ END $$;
 
 -- Attach audit_capture to every soft-expire entity + join table (AFTER
 -- UPDATE OR DELETE). Append-only/immutable-by-nature tables are intentionally
--- excluded (credit_ledger, charges, invoices, invoice_charge_attempts, refunds,
--- agreement_signatures,
+-- excluded (credit_ledger, charges, invoices, refunds, agreement_signatures,
 -- scheduled_notifications, notifications, media_derivative_jobs, audit_log) as
 -- is idempotency_keys (transport dedupe, TTL-pruned). day_capacity is
 -- included — it carries expired_at; its first write is an INSERT, which this
@@ -2547,7 +2379,7 @@ BEGIN
     'dog_feeding','dog_completed_classes','group_classes','cohorts','reports',
     'media_assets','bookings','booking_dogs','after_school_optins',
     'pending_requests','pending_request_dogs','pending_request_preferred_dates',
-    'day_capacity','payment_methods','memberships','agreement_documents',
+    'day_capacity','payment_methods','agreement_documents',
     'service_rates','threads','thread_dogs','messages','event_series','events',
     'event_rsvps','event_rsvp_dogs','announcements','device_tokens',
     -- M1.18 (STAFF-U22): every settings edit keeps the value it replaced —
@@ -2572,8 +2404,8 @@ END $$;
 -- Gingr because training proceeded with no card on file + no upfront pay). DB
 -- backstop IN ADDITION to the API: a paid booking cannot be created unless the
 -- owner has a live card on file. Staff-owned dogs (capacity_exempt) are exempt
--- — staff aren't billed. Full coverage (credits/membership/charge/card-backed
--- invoice) is asserted in the booking txn (see notes below); this trigger is
+-- — staff aren't billed. Full coverage (credits, a charge, or an open invoice) is
+-- asserted in the booking txn (see notes below); this trigger is
 -- the unconditional "no card, no booking" floor no code path can bypass.
 -- Only real once Stripe is LIVE (v1 is test-mode/payments-gated) — built now,
 -- protective at the prod launch when live keys land.
@@ -2756,7 +2588,7 @@ CREATE TRIGGER bookings_eval_gate_check
 --    on the existing row, NOT a second INSERT — natural-key UNIQUEs are now
 --    partial on `expired_at IS NULL` so either approach is collision-safe.
 --    Account deletion = expire owner + NULL/scrub PII columns; financial rows
---    (charges/invoices/refunds/ledger/memberships) are RESTRICT-protected and
+--    (charges/invoices/refunds/ledger) are RESTRICT-protected and
 --    retained for legal/tax. The audit_log trigger preserves the prior state
 --    of every UPDATE/DELETE.
 --
@@ -2769,7 +2601,7 @@ CREATE TRIGGER bookings_eval_gate_check
 --    table exempt from never-delete).
 --
 --  enrollInGroupClass(cohort, dogIds): ONE transaction —
---    SELECT ... FROM cohorts WHERE id = $1 FOR UPDATE;        -- lock row
+--    SELECT ... FROM cohorts WHERE id = $1 FOR NO KEY UPDATE; -- lock row
 --    assert filled + len(non-staff dogIds) <= capacity;       -- gotcha #5
 --    INSERT len(dogIds) * cohort.weeks booking rows
 --      (+ booking_dogs, cohort_id, session_report_id when the cohort report
@@ -2791,9 +2623,8 @@ CREATE TRIGGER bookings_eval_gate_check
 --    in priority order payment → evaluation → vaccine → agreement so the
 --    user fixes the most-fundamental gap first):
 --      1. PAYMENT GUARANTEE (anti-scam): owner has a live payment_methods row
---         AND coverage = sufficient credits OR active membership OR a
---         successful charge OR a card-backed auto-charged invoice. No bare
---         "pay later". All paid services (group/B&T/private/day-school/care).
+--         AND coverage = sufficient credits OR a successful charge OR an open
+--         invoice. All paid services (group/B&T/private/day-school/care).
 --      2. EVALUATION GATE (dog readiness — added Day 12b): lead dog has
 --         evaluation_status='passed'. Gates day-school, day-care,
 --         board-and-train, boarding. 'evaluation' category bypasses by
@@ -2816,8 +2647,8 @@ CREATE TRIGGER bookings_eval_gate_check
 --      dog on the date, day school and daycare together, plus the request's;
 --    INSERT booking (+ booking_dogs);
 --    INSERT credit_ledger (delta = -1, reason='booking-debit', booking_id)
---      per dog per mode; assert post-balance >= 0 OR a charge/membership
---      covers it. (payments_enabled = runtime kill switch, not a deferral.)
+--      per dog per mode; assert post-balance >= 0 OR a charge covers it.
+--      (payments_enabled = runtime kill switch, not a deferral.)
 --
 --  cancelBooking(bookingId): ONE transaction (Day 13) —
 --    1. lockById(tx, bookings) — row lock, serialize concurrent cancel
@@ -2906,10 +2737,8 @@ COMMENT ON TABLE  credit_packages                IS 'Effective-dated catalog of 
 COMMENT ON TABLE  credit_ledger                  IS 'Append-only credit transactions (purchase grants, booking debits, refunds) modeled as expiring LOTS (Δ 2026-06-18): a source row (delta>0, lot_id NULL) carries expires_at; debits/refunds carry lot_id. Balance counts only live lots. Corrections are reversing entries.';
 COMMENT ON TABLE  stripe_customers               IS 'Maps an owner to their Stripe customer id (1:1).';
 COMMENT ON TABLE  payment_methods                IS 'Owner saved Stripe payment methods (token + displayable brand/last4); raw PAN never stored. Removal = expire (retained for charge history).';
-COMMENT ON TABLE  charges                        IS 'Stripe PaymentIntent records (package purchase, pay-as-you-go, board-and-train, membership, group-class). Retained financial record.';
-COMMENT ON TABLE  invoices                       IS 'Card-backed pay-later (anti-scam): every invoice has a required payment_method + due_at and is auto-charged by the worker — no open-ended unpaid balance. Distinct from charges; flips to paid when settled.';
-COMMENT ON TABLE  invoice_charge_attempts        IS 'One row per auto-charge attempt, written BEFORE the Stripe confirm. Owns the Stripe idempotency key identity (attempt_no advances only when the previous attempt is known-dead) and the frozen params a same-key re-issue must resend. A partial unique index allows at most one unresolved (pending/processing) attempt per invoice.';
-COMMENT ON TABLE  memberships                    IS 'Recurring Day School membership subscriptions (Stripe subscription-backed). Cancellation = status, never deleted.';
+COMMENT ON TABLE  charges                        IS 'Stripe PaymentIntent records (package purchase, board-and-train, group-class). Retained financial record.';
+COMMENT ON TABLE  invoices                       IS 'Money owed and unpaid: the pay-later twin of a charge, with a due_at. No worker bills an invoice on its own: it stays open until a person settles it, and it flips to paid when settled.';
 COMMENT ON TABLE  refunds                        IS 'Refunds against a prior Stripe charge (partial allowed). Append-only retained financial record; money-back, distinct from a credit_ledger cancel-refund.';
 COMMENT ON TABLE  agreement_documents            IS 'Catalog of liability waivers / policy docs that gate bookings; applies_to empty = all categories. current_version drives the signature gate.';
 COMMENT ON TABLE  agreement_signatures           IS 'Append-only legal fact: an owner signed document_key at version. Immutable — a new version is a new row, never edited/deleted.';

@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm/relations";
-import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditExpirySettings, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, memberships, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs } from "./schema.js";
+import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditExpirySettings, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs } from "./schema.js";
 
 export const ownersRelations = relations(owners, ({one, many}) => ({
 	location: one(locations, {
@@ -15,7 +15,6 @@ export const ownersRelations = relations(owners, ({one, many}) => ({
 	paymentMethods: many(paymentMethods),
 	charges: many(charges),
 	invoices: many(invoices),
-	memberships: many(memberships),
 	refunds: many(refunds),
 	agreementSignatures: many(agreementSignatures),
 	idempotencyKeys: many(idempotencyKeys),
@@ -85,7 +84,6 @@ export const dogsRelations = relations(dogs, ({one, many}) => ({
 	creditLedgers: many(creditLedger),
 	charges: many(charges),
 	invoices: many(invoices),
-	memberships: many(memberships),
 	scheduledNotifications: many(scheduledNotifications),
 	notificationDogs: many(notificationDogs),
 	threadDogs: many(threadDogs),
@@ -436,17 +434,6 @@ export const invoicesRelations = relations(invoices, ({one}) => ({
 	charge: one(charges, {
 		fields: [invoices.paidChargeId],
 		references: [charges.id]
-	}),
-}));
-
-export const membershipsRelations = relations(memberships, ({one}) => ({
-	owner: one(owners, {
-		fields: [memberships.ownerId],
-		references: [owners.id]
-	}),
-	dog: one(dogs, {
-		fields: [memberships.dogId],
-		references: [dogs.id]
 	}),
 }));
 

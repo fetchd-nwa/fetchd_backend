@@ -65,10 +65,9 @@ export type ScheduledNotificationType =
   | 'boarding-profile-check'
   | 'credits-expiring'
   // `payment-failed` routes through the scheduled queue so it gets the PUSH
-  // channel. Two producers: a PARKED invoice (terminal auto-charge failure —
-  // action-required, the owner must fix their card) and, since wire 1.9.0, a
-  // credit purchase whose `processing` intent later settled as FAILED at the
-  // webhook.
+  // channel. Two producers: the order engine's final failure on an invoice
+  // payment and, since wire 1.9.0, a credit purchase whose `processing` intent
+  // later settled as FAILED at the webhook.
   | 'payment-failed'
   // `payment-succeeded` is feed-only on the INVOICE receipt path (emitted
   // directly by `settleInvoiceCharge`, never here). It joined this queue at
@@ -76,10 +75,6 @@ export type ScheduledNotificationType =
   // the 201 already told the owner "still processing — we'll let you know" and
   // the push is that promise being kept. Same enum member, no DDL.
   | 'payment-succeeded'
-  // §J.3 monthly attendance scan: an alumni dog attended <2 qualifying
-  // sessions in the just-closed Chicago month. Dedupe key doubles as the
-  // once-per-month-per-dog guard (`alumni-attendance:<dogId>:<YYYY-MM>`).
-  | 'alumni-attendance'
   // Shanthi 2026-07-14: fires on the owner's stated spay/neuter planned
   // date, prompting a profile update (`spay-neuter:<dogId>:<date>`).
   | 'spay-neuter-reminder'
@@ -87,11 +82,10 @@ export type ScheduledNotificationType =
   // enqueued by `POST /invoices/:id/pay-in-person`. Push-capable (urgent-
   // updates) so the owner is reminded to bring payment 24h before drop-off.
   | 'payment-due'
-  // Allison 2026-07-29. Both are scheduled-scan arms (no single triggering
-  // event) and both are push-capable under 'urgent-updates' — each one means
-  // money is about to stop moving and only the owner can fix it.
-  // `invoice-overdue:<invoiceId>` fires once per invoice;
-  // `card-expiring:<pmId>:warn|lapsed` fires at most twice per card.
+  // Allison 2026-07-29. Both are push-capable under 'urgent-updates'. Nothing
+  // enqueues `invoice-overdue` since its scan left at M4.04; the arm stays while
+  // the label does. `card-expiring:<pmId>:warn|lapsed` fires at most twice per
+  // card.
   | 'invoice-overdue'
   | 'card-expiring';
 

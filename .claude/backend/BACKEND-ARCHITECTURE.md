@@ -40,7 +40,7 @@ flowchart TD
   PORTAL -->|"HTTPS + Bearer JWT"| MW
   MW --> SVC --> REPO --> PG
   SVC <-->|"cache hot reads / invalidate on write"| REDIS
-  SVC -->|"PaymentIntent / SetupIntent / Subscription"| STRIPE
+  SVC -->|"PaymentIntent / SetupIntent"| STRIPE
   STRIPE -->|"webhook (signed) → charges/credit_ledger"| MW
   SVC -->|"push on booking-confirmed / report-published / message"| EXPO
   EXPO -->|"APNs / FCM"| RN
@@ -128,7 +128,6 @@ erDiagram
   owners ||--o{ threads : participates
   owners ||--o{ payment_methods : has
   owners ||--o{ charges : billed
-  owners ||--o{ memberships : subscribes
   owners ||--o{ notifications : receives
   owners ||--o| stripe_customers : maps
   owners ||--o{ device_tokens : registers
@@ -160,7 +159,7 @@ erDiagram
 
   credit_packages ||--o{ credit_ledger : grants
   charges ||--o{ credit_ledger : "funds (purchase)"
-  charges }o--o| bookings : "pays for (payg)"
+  charges }o--o| bookings : "pays for"
 
   threads ||--o{ thread_dogs : about
   threads ||--o{ messages : contains
@@ -261,11 +260,10 @@ Both are correct; the choice is driven by **whether the per-row work is
 IO-bound or CPU-bound** — which dictates how long it's reasonable to hold
 a `pg` pool connection open.
 
-### Pattern A — **all-in-tx** (current Day-15 + Day-16 workers)
+### Pattern A — **all-in-tx** (the Day-16 worker)
 
-Used by `runInvoiceAutoChargeOnce` (Day-15 — Stripe payment-intent calls
-for invoice dunning) and `runScheduledNotificationsTick` (Day-16 — claim
-+ INSERT notifications + per-row device-token lookups).
+Used by `runScheduledNotificationsTick` (Day-16 — claim + INSERT notifications
++ per-row device-token lookups).
 
 ```
 withActor(actor, async (tx) => {
@@ -339,13 +337,13 @@ analytics calls).
 ### Choice rule
 
 - **External-API IO, predictable latency, simpler is better** →
-  Pattern A. Day-15 invoice dunning + Day-16 scheduled notifications.
+  Pattern A. Day-16 scheduled notifications.
 - **CPU-bound work OR long-tail latency** → Pattern B. Day-17 media
   derivatives.
 
 ### Day-20 follow-up (flagged here, not in this doc's commit)
 
-The Day-15 + Day-16 workers use Pattern A today. **Day-20 scale-out
+The Day-16 worker uses Pattern A today. **Day-20 scale-out
 hardening should consider refactoring them to Pattern B** to remove
 the pool-exhaustion ceiling, since the same justification applies
 (Stripe + Expo are both IO-bound with long-tail latency under load).
@@ -383,8 +381,10 @@ Landed with the credit-expiry P2/P3 lane, the double-settle hardening, and the
 
 ### Unified invoice settlement — `settleInvoiceCharge` + refund-the-loser
 
-Both settle paths (the auto-charge worker and the owner-initiated `POST
-/invoices/:id/pay`) route through ONE primitive, `src/lib/settleInvoiceCharge.ts`.
+Every settle path claims through ONE primitive in `src/lib/settleInvoiceCharge.ts`:
+the order engine (so `POST /invoices/:id/pay`) enters at `settleChargeAgainstInvoice`,
+the capture reconciler at `claimInvoiceWithCharge`, which both reach. No worker bills a
+card on its own since wire 5.0.0-lg4.1 (P17, PAY-U15).
 The atomic claim is a conditional `markPaid` — `UPDATE invoices SET status='paid'
 WHERE id=? AND status='open' RETURNING id` — so under concurrency exactly one
 caller's UPDATE matches a row; the loser sees 0 rows. The Stripe PaymentIntent is
@@ -408,13 +408,11 @@ future per-location tunable (cancel window, rates already do similar).
 
 ### `payment-failed` → scheduled-notifications push routing
 
-A parked invoice's `payment-failed` notification routes through
-`scheduled_notifications` (the generic push channel; `deliverOne` is type-agnostic)
-so it lands as feed **+ push**. `payment-succeeded` stays feed-only — a receipt
-shouldn't interrupt. Dedupe is `dedupe_key='payment-failed:<invoiceId>'` (a column
-`UNIQUE` + `ON CONFLICT DO NOTHING`) → exactly one push per parked invoice. Trade:
-the feed entry now lands on the NEXT scheduler tick (carrying the push) instead of
-instantly — same deferral the `credits-expiring` scan accepts.
+A `payment-failed` notification routes through `scheduled_notifications` (the
+generic push channel; `deliverOne` is type-agnostic) so it lands as feed **+ push**.
+Dedupe is the column `dedupe_key` (`UNIQUE` + `ON CONFLICT DO NOTHING`), keyed on the
+charge, so one push per failed charge. Trade: the feed entry lands on the NEXT
+scheduler tick (carrying the push) instead of instantly.
 
 ### Shared wire contract single-source + compile-time conformance (#5)
 

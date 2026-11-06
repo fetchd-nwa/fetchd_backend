@@ -23,7 +23,6 @@ import {
   eventSeries,
   events,
   groupClasses,
-  invoiceChargeAttempts,
   messages,
   deviceTokens,
   notificationDogs,
@@ -1710,12 +1709,9 @@ export async function topUpCredits(
  * because race-on-shared-DB is the test container's failure mode.
  */
 /**
- * Drop everything that FK-restricts `invoices`: every `invoice_charge_attempts`
- * row (2026-08-12) and every order (P15).
+ * Drop everything that FK-restricts `invoices`: every order (P15).
  *
- * The auto-charge attempt ledger restricts `invoices` deliberately, since an invoice
- * is a retained financial record and its attempt history is the operator's answer to
- * "what happened to this money?". `orders.invoice_id` does too, and an order sits in
+ * `orders.invoice_id` restricts it, and an order sits in
  * a cycle no delete order can walk: orders → invoices (`invoice_id`), invoices →
  * charges (`paid_charge_id`), charges → orders (`order_id`). So the `order_id` columns
  * are cleared first, and only then do the orders go. EVERY test teardown that
@@ -1727,7 +1723,6 @@ export async function topUpCredits(
  * would be one more thing to get wrong in fifteen files.
  */
 export async function clearInvoiceReferrers(): Promise<void> {
-  await db.delete(invoiceChargeAttempts);
   await db.update(charges).set({ orderId: null }).where(isNotNull(charges.orderId));
   await db.update(invoices).set({ orderId: null }).where(isNotNull(invoices.orderId));
   await db.update(bookings).set({ orderId: null }).where(isNotNull(bookings.orderId));

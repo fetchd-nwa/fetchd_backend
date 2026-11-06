@@ -338,57 +338,25 @@ async function softExpire(tx: Tx, id: string): Promise<Dog | undefined> {
 }
 
 /**
- * §J.3 attendance-flag stamp. `WHERE ... IS NULL` makes the stamp
- * first-write-wins: a dog already flagged (say, last month's flag staff
- * haven't cleared yet) keeps its ORIGINAL flag timestamp — the flag
- * records "since when has this dog needed a re-check", not "most recent
- * miss". Returns true when this call set it.
+ * Does this dog exist and live? The staff alumni routes' 404: a staff read crosses
+ * owners, so it asks by id alone.
  */
-async function setAlumniAttendanceFlag(tx: Tx, dogId: string, now: Date): Promise<boolean> {
-  const rows = await tx
-    .update(dogs)
-    .set({ alumniAttendanceFlaggedAt: now.toISOString() })
-    .where(and(eq(dogs.id, dogId), sql`${dogs.alumniAttendanceFlaggedAt} IS NULL`, live(dogs)))
-    .returning({ id: dogs.id });
-  return rows.length > 0;
-}
-
-/**
- * §J.3 staff clear — after the re-check/eval, staff clear the flag and
- * the dog books normally again. Idempotent: clearing an already-clear
- * flag is a no-op (the staff verb returns 200 either way).
- */
-async function clearAlumniAttendanceFlag(tx: Tx, dogId: string): Promise<void> {
-  await tx
-    .update(dogs)
-    .set({ alumniAttendanceFlaggedAt: null })
-    .where(and(eq(dogs.id, dogId), live(dogs)));
-}
-
-/**
- * Cross-owner (staff) read of one live dog's §J.3 alumni-flag state.
- * `undefined` = missing/expired → the staff route's 404. The completed-
- * programs list itself comes from `dogProgramsRepository`; this covers
- * the half that lives on the `dogs` row.
- */
-async function findAlumniFlagForStaff(
-  dogId: string,
-  runner: Runner = db,
-): Promise<{ alumniAttendanceFlaggedAt: string | null } | undefined> {
+async function existsLive(dogId: string, runner: Runner = db): Promise<boolean> {
   const [row] = await runner
-    .select({ alumniAttendanceFlaggedAt: dogs.alumniAttendanceFlaggedAt })
+    .select({ id: dogs.id })
     .from(dogs)
     .where(and(eq(dogs.id, dogId), live(dogs)))
     .limit(1);
-  return row;
+  return row !== undefined;
 }
 
 /**
  * Serialize §J.3 completed-program writes per dog: two concurrent staff
- * recording programs #4 and #5 would each count 4 live rows under READ
- * COMMITTED and NEITHER would fire the became-alumni lot clear. Locking the
- * dogs row first makes the second tx wait, re-count 5, and clear. Returns
- * false when the dog is missing/expired (the route's 404).
+ * recording programs #4 and #5 would each read 4 live rows under READ COMMITTED
+ * and BOTH would answer `is_alumni: false`. Locking the dogs row first makes the
+ * second tx wait and read 5. `no key update`, because `dogs` is a parent the
+ * settle's FK re-check reaches (`db/locks.ts`). Returns false when the dog is
+ * missing/expired (the route's 404).
  */
 async function lockForAlumniUpdate(tx: Tx, dogId: string): Promise<boolean> {
   const rows = await tx
@@ -396,7 +364,7 @@ async function lockForAlumniUpdate(tx: Tx, dogId: string): Promise<boolean> {
     .from(dogs)
     .where(and(eq(dogs.id, dogId), live(dogs)))
     .limit(1)
-    .for('update');
+    .for('no key update');
   return rows.length > 0;
 }
 
@@ -530,12 +498,10 @@ export const dogsRepository = {
   findOwnerIdInTx,
   findOwnerIdAnyInTx,
   findNameInTx,
-  findAlumniFlagForStaff,
+  existsLive,
   lockForAlumniUpdate,
   findAllLiveForStaff,
   create,
   update,
   softExpire,
-  setAlumniAttendanceFlag,
-  clearAlumniAttendanceFlag,
 };

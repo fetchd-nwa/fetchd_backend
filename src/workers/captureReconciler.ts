@@ -22,7 +22,7 @@ import {
   type StripeClient,
 } from '../lib/stripe.js';
 import { cancelAndConfirm } from '../lib/withdrawSettlement.js';
-import type { WorkerLogger } from './invoiceAutoCharge.js';
+import type { WorkerLogger } from './workerLogger.js';
 
 /**
  * Capture reconciler (2026-08-20, `designs/partial-success-enrollment.md` §3.7;
@@ -797,8 +797,7 @@ async function settlePostWithdrawRefund(
   // defect: the succeeded-at-retrieve caller reached the IDENTICAL state (row
   // live, not owed, duplicate money in hand) and returned `'already-captured'`
   // silently. Its ordinary producer is the invoice pay route's async arm, and
-  // it left the covering invoice OPEN for `invoiceAutoCharge` to collect the
-  // same class a second time.
+  // it left the covering invoice OPEN to collect the same class a second time.
   //
   // `rowEnrollmentLive` implies live bookings, so `!owed` is EXHAUSTIVE by
   // construction — an open invoice, or money collected elsewhere — and those
@@ -892,9 +891,9 @@ async function settlePostWithdrawRefund(
  * intent survives its cancel attempt, the charge row is written at
  * `requires_payment` as audit trail stamped with the invoice's anchor, the
  * invoice is deliberately left OPEN for the owner's next attempt — and then the
- * intent succeeds anyway. Refunding that and letting `invoiceAutoCharge`
- * collect the same class again at `due_at` is the worst statement an owner
- * could see for a payment that simply went through.
+ * intent succeeds anyway. Refunding that and leaving the invoice open to collect
+ * the same class again is the worst statement an owner could see for a payment
+ * that simply went through.
  *
  * **Belt-and-braces before we settle anything**: the invoice's own anchor must
  * belong to THIS charge's enrollment. Post-D1 both are stamped, and a mismatch
@@ -950,8 +949,7 @@ async function settleCoveringInvoice(
       amountCents: row.amountCents,
       purpose: 'group-class',
       // The owner never got an HTTP response for this settle — the worker
-      // initiated it — so the receipt is the only way they learn, exactly as
-      // the auto-charge lane reasons.
+      // initiated it — so the receipt is the only way they learn.
       notifyOwner: true,
     }),
   );
@@ -968,7 +966,7 @@ async function settleCoveringInvoice(
       ownerId: row.ownerId,
       amountCents: row.amountCents,
     },
-    'capture-reconciler settled an open invoice with money that turned out to be its own payment arriving late — the owner is charged once, the invoice is closed, and the auto-charge lane will not bill this class again',
+    'capture-reconciler settled an open invoice with money that turned out to be its own payment arriving late — the owner is charged once and the invoice is closed',
   );
   return 'settled-invoice';
 }
@@ -1052,7 +1050,7 @@ async function enrollmentStillOwesMoney(
   // Withdrawn (or never seated): nothing is owed for a class we are not
   // delivering. `undefined` identity IS the empty live set.
   if (enrollment === undefined) return false;
-  // The pay-later lane will bill it; that is not this phase's money.
+  // An open invoice is still owed, and a person settles it: not this phase's money.
   if (openInvoice !== undefined) return false;
   const collected = await chargesRepository.findUnsettledSucceededCharge(tx, {
     cohortId: row.cohortId,

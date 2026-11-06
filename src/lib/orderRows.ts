@@ -1,7 +1,6 @@
 import { deepLinkToPath } from '../contracts/wire.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
-import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
@@ -10,8 +9,7 @@ import { noticeInSavepoint, type NoticeLog } from './noticeInSavepoint.js';
 
 /**
  * Return every credit one booking row debited, each to the lot it drew from (or a
- * fresh lot if that lot has since expired). §J.3: an alumni dog's fresh re-mint never
- * expires, one status read per distinct dog. `now` is the caller's cancel instant, so
+ * fresh lot if that lot has since expired). `now` is the caller's cancel instant, so
  * the lot the refund lands in is dated by the same clock as the cancel.
  *
  * Returns the distinct dogs credited, or nothing if this row debited nothing.
@@ -21,13 +19,9 @@ export async function returnDebitsToLots(
   args: { bookingId: string; now: Date },
 ): Promise<string[]> {
   const debits = await creditLedgerRepository.findDebitsForBooking(tx, args.bookingId);
-  const alumniByDogId = new Map<string, boolean>();
+  const creditedDogIds = new Set<string>();
   for (const debit of debits) {
-    let dogIsAlumni = alumniByDogId.get(debit.dogId);
-    if (dogIsAlumni === undefined) {
-      dogIsAlumni = await dogProgramsRepository.isAlumni(debit.dogId, tx);
-      alumniByDogId.set(debit.dogId, dogIsAlumni);
-    }
+    creditedDogIds.add(debit.dogId);
     await creditLedgerRepository.refundForBooking(tx, {
       dogId: debit.dogId,
       mode: debit.mode,
@@ -36,10 +30,9 @@ export async function returnDebitsToLots(
       lotId: debit.lotId,
       lotExpiresAt: debit.lotExpiresAt,
       now: args.now,
-      dogIsAlumni,
     });
   }
-  return [...alumniByDogId.keys()];
+  return [...creditedDogIds];
 }
 
 /**

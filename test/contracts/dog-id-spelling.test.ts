@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { afterEach, test } from 'node:test';
-import { and, eq, inArray, isNotNull } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
-import pg from 'pg';
 import { db } from '../../src/db/client.js';
 import {
   bookingDogs,
@@ -12,22 +11,17 @@ import {
   creditLedger,
   dogCompletedPrograms,
   eventRsvpDogs,
-  invoices,
-  memberships,
-  notifications,
   pendingRequestDogs,
-  refunds,
 } from '../../src/db/schema/schema.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { registerCreditsRoute } from '../../src/routes/credits.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerEventsRoute } from '../../src/routes/events.js';
-import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
 import { registerStaffAlumniRoute } from '../../src/routes/staffAlumni.js';
 import { CURRICULUM_PROGRAMS } from '../../src/lib/alumni.js';
 import { createBookableDog, removeDogs } from './_dayFixture.js';
-import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -58,7 +52,6 @@ const createdDogIds: string[] = [];
 const createdCohortIds: string[] = [];
 
 afterEach(async () => {
-  await clearMemberships();
   await removeDogs(createdDogIds.splice(0));
   if (createdCohortIds.length > 0) {
     await db.delete(cohorts).where(inArray(cohorts.id, createdCohortIds.splice(0)));
@@ -252,127 +245,6 @@ test(
   },
 );
 
-// ── POST /memberships: found by the probe, an advisory key built from the body ──
-
-async function clearMemberships(): Promise<void> {
-  await db
-    .delete(notifications)
-    .where(
-      and(
-        eq(notifications.ownerId, FIXTURE_IDS.ownerId),
-        eq(notifications.type, 'membership-ended'),
-      ),
-    );
-  await db.delete(creditLedger).where(eq(creditLedger.reason, 'membership-grant'));
-  await clearInvoiceReferrers();
-  await db.delete(invoices).where(isNotNull(invoices.membershipId));
-  const chargeIds = (
-    await db.select({ id: charges.id }).from(charges).where(eq(charges.purpose, 'membership'))
-  ).map((c) => c.id);
-  if (chargeIds.length > 0) await db.delete(refunds).where(inArray(refunds.chargeId, chargeIds));
-  await db.delete(charges).where(eq(charges.purpose, 'membership'));
-  await db.delete(memberships).where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
-}
-
-function subscribe(app: FastifyInstance, dogId: string) {
-  return app.inject({
-    method: 'POST',
-    url: '/memberships',
-    headers: { 'idempotency-key': randomUUID() },
-    payload: {
-      dog_id: dogId,
-      package_key: FIXTURE_IDS.creditPackageSchool10Key,
-      location: 'fayetteville',
-      term_months: 3,
-      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-    },
-  });
-}
-
-test(
-  'POST /memberships: a capitalised id takes the lowercase lock, so it queues behind it',
-  { ...SKIP_WHEN_NO_DB, timeout: 20_000 },
-  async () => {
-    const { lower, upper } = await dogWithLetters();
-    const app = appWith((a, authenticate) =>
-      registerMembershipsRoute(a, { authenticate, stripe: makeStripeStub(), now: FIXTURE_NOW }),
-    );
-    const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
-    await holder.connect();
-    try {
-      await holder.query('BEGIN');
-      await holder.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [
-        `membership:${lower}:school`,
-      ]);
-
-      let settled = false;
-      const pending = subscribe(app, upper).then((res) => {
-        settled = true;
-        return res;
-      });
-      const deadline = Date.now() + 2000;
-      let queued = 0;
-      while (Date.now() < deadline && !settled && queued === 0) {
-        const waiting = await holder.query<{ n: number }>(
-          `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
-        );
-        queued = waiting.rows[0]?.n ?? 0;
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      await holder.query('COMMIT');
-
-      assert.equal(queued, 1, 'the request queued on the lowercase key');
-      assert.equal((await pending).statusCode, 201);
-    } finally {
-      await holder.query('ROLLBACK').catch(() => undefined);
-      await holder.end();
-    }
-  },
-);
-
-test(
-  'POST /memberships: two subscribes in two cases past the probe, and the loser is refunded',
-  { ...SKIP_WHEN_NO_DB, timeout: 30_000 },
-  async () => {
-    const { lower, upper } = await dogWithLetters();
-    const stub = makeStripeStub();
-    // Both charges land before either write, the seconds-wide race the re-check under
-    // the lock exists for.
-    let arrived = 0;
-    let bothCharged: () => void = () => undefined;
-    const charged = new Promise<void>((resolve) => {
-      bothCharged = resolve;
-    });
-    const stripe: StripeStub = {
-      ...stub,
-      async createAndConfirmPaymentIntent(args, key) {
-        const intent = await stub.createAndConfirmPaymentIntent(args, key);
-        arrived += 1;
-        if (arrived === 2) bothCharged();
-        await charged;
-        return intent;
-      },
-    };
-    const app = appWith((a, authenticate) =>
-      registerMembershipsRoute(a, { authenticate, stripe, now: FIXTURE_NOW }),
-    );
-
-    const answers = await Promise.all([subscribe(app, lower), subscribe(app, upper)]);
-
-    assert.deepEqual(
-      answers.map((res) => res.statusCode),
-      [201, 201],
-      answers.map((res) => res.body).join(' | '),
-    );
-    const refunded = answers.filter(
-      (res) => (res.json() as { charge_refunded: boolean }).charge_refunded,
-    );
-    assert.equal(refunded.length, 1, 'the owner is told which charge came back');
-    assert.equal((await db.select().from(memberships)).length, 1);
-    assert.equal((await db.select().from(refunds)).length, 1, 'the second charge has its refund');
-  },
-);
-
 // ── POST /credit-packages/:key/purchase: a cache key built from the body ─────
 
 test(
@@ -463,7 +335,7 @@ test(
 );
 
 test(
-  'POST /staff/dogs/:dogId/completed-programs: a capitalised path wipes the lowercase credits cache',
+  'POST /staff/dogs/:dogId/completed-programs: a capitalised path records the lowercase dog and moves no lot',
   SKIP_WHEN_NO_DB,
   async () => {
     const { lower, upper } = await dogWithLetters();
@@ -490,7 +362,7 @@ test(
     try {
       assert.equal(await expiringLots(), 1, 'read once, so the expiring lot is cached');
 
-      // The fifth program makes her an alumna, which clears every live expiry.
+      // The fifth program makes her an alumna, and her credits expire like anyone's.
       for (const program of CURRICULUM_PROGRAMS) {
         const res = await staff.inject({
           method: 'POST',
@@ -501,7 +373,12 @@ test(
         assert.equal(res.statusCode, 201, res.body);
       }
 
-      assert.equal(await expiringLots(), 0, 'the cleared expiry shows on the next read');
+      const recorded = await db
+        .select({ program: dogCompletedPrograms.program })
+        .from(dogCompletedPrograms)
+        .where(eq(dogCompletedPrograms.dogId, lower));
+      assert.equal(recorded.length, CURRICULUM_PROGRAMS.length, 'on the lowercase dog');
+      assert.equal(await expiringLots(), 1, 'the lot still expires');
     } finally {
       await db.delete(dogCompletedPrograms).where(eq(dogCompletedPrograms.dogId, lower));
     }

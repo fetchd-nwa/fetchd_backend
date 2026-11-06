@@ -1,13 +1,26 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
-import { charges, creditLedger, dogCompletedPrograms, dogs } from '../../src/db/schema/schema.js';
+import { creditExpirySettingsRepository } from '../../src/db/repositories/creditExpirySettingsRepository.js';
+import {
+  charges,
+  creditLedger,
+  dogCompletedPrograms,
+  notifications,
+  scheduledNotifications,
+} from '../../src/db/schema/schema.js';
+import { withActor } from '../../src/db/tx.js';
 import { CURRICULUM_PROGRAMS } from '../../src/lib/alumni.js';
+import { resolvePurchaseExpiry } from '../../src/lib/creditExpiry.js';
+import { returnDebitsToLots } from '../../src/lib/orderRows.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { registerDogsRoute } from '../../src/routes/dogs.js';
 import { registerStaffAlumniRoute } from '../../src/routes/staffAlumni.js';
+import { dispatchStripeEvent } from '../../src/webhooks/stripeEventHandlers.js';
+import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
+import { makeExpoPushStub } from './_expoPushStub.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
@@ -21,13 +34,15 @@ import type { Principal } from '../../src/auth/principal.js';
 import type { CompletedProgramsWire } from '../../src/contracts/wire.js';
 
 /**
- * §J.3 staff alumni verbs + the derived-alumni effects:
+ * §J.3 staff alumni verbs and what alumni status does:
  *   - GET/POST/DELETE /staff/dogs/:dogId/completed-programs
- *   - POST /staff/dogs/:dogId/clear-alumni-flag
- *   - recording the 5th program flips `is_alumni` on the §B dog wire AND
- *     clears `expires_at` on the dog's LIVE lots (expired lots stay dead)
- *   - a purchase AFTER becoming alumni grants a never-expiring lot
- *   - un-recording (DELETE) flips the wire back and does NOT re-stamp lots
+ *   - recording the 5th program flips `is_alumni` on the §B dog wire
+ *   - ALUM-U16 (wire 5.0.0-lg4.1): alumni credits expire like everyone's. No lot's
+ *     expiry moves when a dog becomes alumni, a purchase takes the ordinary expiry at
+ *     both grant sites, and a cancel follows the ordinary rule
+ *   - ALUM-U01, a KEEP: one status, and no lapse. The third half, the exemption from
+ *     the three-month clock, is `booking-no-divert.test.ts`'s
+ *     'an alumni dog with no attended day books at once'
  */
 
 registerFixtureHooks();
@@ -61,10 +76,6 @@ type ProgramsWire = CompletedProgramsWire;
 
 async function resetAlumniState(): Promise<void> {
   await db.delete(dogCompletedPrograms).where(eq(dogCompletedPrograms.dogId, FIXTURE_IDS.dog1Id));
-  await db
-    .update(dogs)
-    .set({ alumniAttendanceFlaggedAt: null })
-    .where(eq(dogs.id, FIXTURE_IDS.dog1Id));
 }
 
 async function recordProgram(
@@ -100,23 +111,28 @@ test(
       url: PROGRAMS_URL,
     });
     assert.equal(ownerRes.statusCode, 403, ownerRes.body);
-
-    const unknownRes = await app.inject({
-      method: 'GET',
-      url: `/staff/dogs/${randomUUID()}/completed-programs`,
-    });
-    assert.equal(unknownRes.statusCode, 404, unknownRes.body);
   },
 );
 
+// The dog-exists check used to live on a read of the attendance flag. With the flag
+// gone this 404 is the only thing that says the route still looks for the dog.
+test('GET completed-programs for a dog that does not exist: 404', SKIP_WHEN_NO_DB, async () => {
+  const { app } = staffApp();
+  const res = await app.inject({
+    method: 'GET',
+    url: `/staff/dogs/${randomUUID()}/completed-programs`,
+  });
+  assert.equal(res.statusCode, 404, res.body);
+});
+
 test(
-  'recording all 5 programs — wire flips at the 5th, live lots clear, expired lots stay dead',
+  'recording all 5 programs: the wire flips at the 5th and no lot moves',
   SKIP_WHEN_NO_DB,
   async () => {
     await resetAlumniState();
     const { app } = staffApp();
 
-    // Seed one LIVE expiring lot + one already-EXPIRED lot for dog1.
+    // One LIVE expiring lot and one already-EXPIRED lot for dog1.
     const liveLotId = randomUUID();
     const expiredLotId = randomUUID();
     const past = '2026-01-01T00:00:00.000Z';
@@ -142,97 +158,198 @@ test(
       },
     ]);
 
-    // First 4 programs: not yet alumni, lots untouched.
-    for (const program of CURRICULUM_PROGRAMS.slice(0, 4)) {
-      const body = await recordProgram(app, program);
-      assert.equal(body.is_alumni, false, `${program}: 4 or fewer ⇒ not alumni`);
+    const expiryOf = async (id: string): Promise<string | null | undefined> => {
+      const [row] = await db
+        .select({ expiresAt: creditLedger.expiresAt })
+        .from(creditLedger)
+        .where(eq(creditLedger.id, id));
+      return row?.expiresAt;
+    };
+    const liveBefore = await expiryOf(liveLotId);
+    const expiredBefore = await expiryOf(expiredLotId);
+    assert.ok(liveBefore !== null && liveBefore !== undefined);
+
+    try {
+      for (const program of CURRICULUM_PROGRAMS.slice(0, 4)) {
+        const body = await recordProgram(app, program);
+        assert.equal(body.is_alumni, false, `${program}: 4 or fewer ⇒ not alumni`);
+      }
+
+      // The 5th program makes the dog alumni and changes no lot's expiry (ALUM-U16).
+      const fifth = await recordProgram(app, CURRICULUM_PROGRAMS[4]);
+      assert.equal(fifth.is_alumni, true, 'all 5 ⇒ alumni');
+      assert.equal(fifth.completed_programs.length, 5);
+      assert.equal(await expiryOf(liveLotId), liveBefore, 'the live lot keeps its expiry');
+      assert.equal(await expiryOf(expiredLotId), expiredBefore, 'the expired lot stays expired');
+
+      // §B dog wire flips too.
+      const dogRes = await ownerDogsApp().app.inject({
+        method: 'GET',
+        url: `/dogs/${FIXTURE_IDS.dog1Id}`,
+      });
+      assert.equal(dogRes.statusCode, 200, dogRes.body);
+      assert.equal((dogRes.json() as { is_alumni: boolean }).is_alumni, true);
+
+      // Re-recording an already-live program is an idempotent no-op: still 201, 5 rows.
+      const repeat = await recordProgram(app, CURRICULUM_PROGRAMS[4]);
+      assert.equal(repeat.completed_programs.length, 5);
+    } finally {
+      await db.delete(creditLedger).where(eq(creditLedger.id, liveLotId));
+      await db.delete(creditLedger).where(eq(creditLedger.id, expiredLotId));
     }
-    const [liveBefore] = await db
-      .select({ expiresAt: creditLedger.expiresAt })
-      .from(creditLedger)
-      .where(eq(creditLedger.id, liveLotId));
-    assert.ok(liveBefore?.expiresAt, 'live lot still expiring before the 5th program');
+  },
+);
 
-    // The 5th program is the became-alumni moment.
-    const fifth = await recordProgram(app, CURRICULUM_PROGRAMS[4]);
-    assert.equal(fifth.is_alumni, true, 'all 5 ⇒ alumni');
-    assert.equal(fifth.completed_programs.length, 5);
+/** dog1's 10-credit purchase lots: what the two grant-site tests below read. */
+async function tenCreditLots(): Promise<Array<{ id: string; expiresAt: string | null }>> {
+  return db
+    .select({ id: creditLedger.id, expiresAt: creditLedger.expiresAt })
+    .from(creditLedger)
+    .where(
+      and(
+        eq(creditLedger.dogId, FIXTURE_IDS.dog1Id),
+        eq(creditLedger.reason, 'purchase'),
+        eq(creditLedger.delta, 10),
+      ),
+    );
+}
 
-    const [liveAfter] = await db
-      .select({ expiresAt: creditLedger.expiresAt })
-      .from(creditLedger)
-      .where(eq(creditLedger.id, liveLotId));
-    assert.equal(liveAfter?.expiresAt, null, 'live lot cleared to never-expire');
-    const [expiredAfter] = await db
-      .select({ expiresAt: creditLedger.expiresAt })
-      .from(creditLedger)
-      .where(eq(creditLedger.id, expiredLotId));
-    assert.ok(expiredAfter?.expiresAt, 'already-expired lot stays dead');
+async function removeTenCreditLots(): Promise<void> {
+  await db
+    .delete(creditLedger)
+    .where(
+      and(
+        eq(creditLedger.dogId, FIXTURE_IDS.dog1Id),
+        eq(creditLedger.reason, 'purchase'),
+        eq(creditLedger.delta, 10),
+      ),
+    );
+  await db.delete(charges).where(eq(charges.purpose, 'package'));
+}
 
-    // §B dog wire flips too.
-    const dogRes = await ownerDogsApp().app.inject({
-      method: 'GET',
-      url: `/dogs/${FIXTURE_IDS.dog1Id}`,
-    });
-    assert.equal(dogRes.statusCode, 200, dogRes.body);
-    const dogWire = dogRes.json() as { is_alumni: boolean };
-    assert.equal(dogWire.is_alumni, true);
+/** The expiry an ordinary dog's 10-credit Fayetteville purchase stamps at `now`. */
+async function ordinaryTenCreditExpiry(now: Date): Promise<Date | null> {
+  return resolvePurchaseExpiry(
+    10,
+    await creditExpirySettingsRepository.resolveExpiryWindowMonths('fayetteville'),
+    now,
+  );
+}
 
-    // Re-recording an already-live program is an idempotent no-op (still 201,
-    // still 5 rows, and NOT a second became-alumni lot clear).
-    const repeat = await recordProgram(app, CURRICULUM_PROGRAMS[4]);
-    assert.equal(repeat.completed_programs.length, 5);
+test("an alumni dog's pack purchase writes a lot with an expiry", SKIP_WHEN_NO_DB, async () => {
+  // dog1 is alumni from the prior test's records (same-file serial order);
+  // re-assert rather than assume.
+  const staffRes = await staffApp().app.inject({ method: 'GET', url: PROGRAMS_URL });
+  assert.equal((staffRes.json() as ProgramsWire).is_alumni, true, 'precondition: alumni');
 
-    await db.delete(creditLedger).where(eq(creditLedger.id, liveLotId));
-    await db.delete(creditLedger).where(eq(creditLedger.id, expiredLotId));
+  const res = await purchaseApp().app.inject({
+    method: 'POST',
+    url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool10Key}/purchase`,
+    headers: { 'idempotency-key': randomUUID() },
+    payload: {
+      dog_id: FIXTURE_IDS.dog1Id,
+      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      location: 'fayetteville',
+    },
+  });
+  assert.equal(res.statusCode, 201, res.body);
+
+  try {
+    const lots = await tenCreditLots();
+    assert.equal(lots.length, 1, 'exactly one 10-credit lot');
+    const expected = await ordinaryTenCreditExpiry(FIXTURE_NOW());
+    assert.ok(expected !== null, 'precondition: a 10-credit pack has a window');
+    assert.ok(lots[0]!.expiresAt !== null, 'an alumni lot takes the ordinary expiry');
+    assert.equal(new Date(lots[0]!.expiresAt).getTime(), expected.getTime());
+  } finally {
+    // This purchase goes, so later files see the seeded ledger only.
+    await removeTenCreditLots();
+  }
+});
+
+test(
+  "the webhook's catch-up grant gives an alumni dog the ordinary expiry too",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const staffRes = await staffApp().app.inject({ method: 'GET', url: PROGRAMS_URL });
+    assert.equal((staffRes.json() as ProgramsWire).is_alumni, true, 'precondition: alumni');
+
+    const paymentIntentId = `pi_alumni_${randomUUID()}`;
+    const result = await dispatchStripeEvent(
+      {
+        id: `evt_${randomUUID()}`,
+        type: 'payment_intent.succeeded',
+        paymentIntentId,
+        amountCents: 10_000,
+        metadata: {
+          owner_id: FIXTURE_IDS.ownerId,
+          dog_id: FIXTURE_IDS.dog1Id,
+          package_id: FIXTURE_IDS.creditPackageSchool5Id,
+          credits: '10',
+          mode: 'school',
+          location: 'fayetteville',
+        },
+      },
+      { stripe: makeStripeStub() },
+    );
+    assert.equal(result.outcome, 'reconstructed-package-purchase');
+
+    try {
+      const lots = await tenCreditLots();
+      assert.equal(lots.length, 1, 'exactly one 10-credit lot');
+      assert.ok(lots[0]!.expiresAt !== null, 'an alumni lot takes the ordinary expiry');
+    } finally {
+      await removeTenCreditLots();
+    }
   },
 );
 
 test(
-  'purchase AFTER alumni — multi-credit lot grants with NULL expiry',
+  "a cancel returning a credit to an alumni dog's dead lot follows the ordinary rule",
   SKIP_WHEN_NO_DB,
   async () => {
-    // dog1 is alumni from the prior test's records (same-file serial order);
-    // re-assert rather than assume.
     const staffRes = await staffApp().app.inject({ method: 'GET', url: PROGRAMS_URL });
     assert.equal((staffRes.json() as ProgramsWire).is_alumni, true, 'precondition: alumni');
 
-    const res = await purchaseApp().app.inject({
-      method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool10Key}/purchase`,
-      headers: { 'idempotency-key': randomUUID() },
-      payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
-      },
+    const bookingId = FIXTURE_IDS.booking2Id;
+    const deadLotId = randomUUID();
+    await db.insert(creditLedger).values({
+      id: deadLotId,
+      dogId: FIXTURE_IDS.dog1Id,
+      mode: 'school',
+      location: 'fayetteville',
+      delta: 1,
+      reason: 'purchase',
+      expiresAt: '2026-01-01T00:00:00.000Z',
     });
-    assert.equal(res.statusCode, 201, res.body);
+    await db.insert(creditLedger).values({
+      dogId: FIXTURE_IDS.dog1Id,
+      mode: 'school',
+      location: 'fayetteville',
+      delta: -1,
+      reason: 'booking-debit',
+      bookingId,
+      lotId: deadLotId,
+    });
 
-    const lots = await db
-      .select({ expiresAt: creditLedger.expiresAt })
-      .from(creditLedger)
-      .where(
-        and(
-          eq(creditLedger.dogId, FIXTURE_IDS.dog1Id),
-          eq(creditLedger.reason, 'purchase'),
-          eq(creditLedger.delta, 10),
-        ),
+    try {
+      await withActor('test:alumni-cancel', (tx) =>
+        returnDebitsToLots(tx, { bookingId, now: FIXTURE_NOW() }),
       );
-    assert.equal(lots.length, 1, 'exactly one 10-credit lot');
-    assert.equal(lots[0]!.expiresAt, null, 'alumni purchase never expires (§J.3)');
 
-    // Cleanup this purchase so later files see the seeded ledger only.
-    await db
-      .delete(creditLedger)
-      .where(
-        and(
-          eq(creditLedger.dogId, FIXTURE_IDS.dog1Id),
-          eq(creditLedger.delta, 10),
-          isNull(creditLedger.expiresAt),
-        ),
-      );
-    await db.delete(charges).where(eq(charges.purpose, 'package'));
+      const [refund] = await db
+        .select({ lotId: creditLedger.lotId, expiresAt: creditLedger.expiresAt })
+        .from(creditLedger)
+        .where(
+          and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')),
+        );
+      assert.ok(refund !== undefined, 'the credit came back');
+      assert.equal(refund.lotId, null, 'a fresh lot, the source being dead');
+      assert.ok(refund.expiresAt !== null, "and it expires like anyone's");
+    } finally {
+      await db.delete(creditLedger).where(eq(creditLedger.bookingId, bookingId));
+      await db.delete(creditLedger).where(eq(creditLedger.id, deadLotId));
+    }
   },
 );
 
@@ -259,38 +376,6 @@ test('DELETE un-records — wire flips back, second DELETE 404s', SKIP_WHEN_NO_D
   await resetAlumniState();
 });
 
-test('clear-alumni-flag — clears, surfaces on the wire, idempotent', SKIP_WHEN_NO_DB, async () => {
-  await resetAlumniState();
-  await db
-    .update(dogs)
-    .set({ alumniAttendanceFlaggedAt: '2026-05-01T12:00:00.000Z' })
-    .where(eq(dogs.id, FIXTURE_IDS.dog1Id));
-
-  const { app } = staffApp();
-  const before = await app.inject({ method: 'GET', url: PROGRAMS_URL });
-  assert.equal(
-    (before.json() as ProgramsWire).alumni_attendance_flagged_at,
-    '2026-05-01T12:00:00.000Z',
-  );
-
-  const res = await app.inject({
-    method: 'POST',
-    url: `/staff/dogs/${FIXTURE_IDS.dog1Id}/clear-alumni-flag`,
-    headers: { 'idempotency-key': randomUUID() },
-  });
-  assert.equal(res.statusCode, 200, res.body);
-  const body = res.json() as ProgramsWire;
-  assert.equal('alumni_attendance_flagged_at' in body, false, 'flag cleared');
-
-  // Clearing an already-clear flag stays 200 (idempotent staff verb).
-  const again = await app.inject({
-    method: 'POST',
-    url: `/staff/dogs/${FIXTURE_IDS.dog1Id}/clear-alumni-flag`,
-    headers: { 'idempotency-key': randomUUID() },
-  });
-  assert.equal(again.statusCode, 200, again.body);
-});
-
 test(
   'completed_programs[].program is always a CURRICULUM_PROGRAMS member (wire narrowing pin)',
   SKIP_WHEN_NO_DB,
@@ -310,5 +395,60 @@ test(
         `emitted program ${entry.program} is outside CurriculumProgram`,
       );
     }
+  },
+);
+
+// ALUM-U01, a KEEP. dog1 holds all five from the test above.
+
+test(
+  'one alumni status: the dog wire and the staff wire carry one boolean',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const staffRes = await staffApp().app.inject({ method: 'GET', url: PROGRAMS_URL });
+    const staffBody = staffRes.json() as Record<string, unknown>;
+    assert.equal(staffBody['is_alumni'], true, 'precondition: alumni');
+    assert.deepEqual(
+      Object.keys(staffBody).filter((key) => /alum|tier/i.test(key)),
+      ['is_alumni'],
+    );
+
+    const dogRes = await ownerDogsApp().app.inject({
+      method: 'GET',
+      url: `/dogs/${FIXTURE_IDS.dog1Id}`,
+    });
+    const dogBody = dogRes.json() as Record<string, unknown>;
+    assert.equal(dogBody['is_alumni'], true);
+    assert.deepEqual(
+      Object.keys(dogBody).filter((key) => /alum|tier/i.test(key)),
+      ['is_alumni'],
+    );
+  },
+);
+
+test(
+  'no lapse: an alumni dog that attended nothing stays alumni through a tick on the first of the month',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const firstOfJuneChicago = new Date('2026-06-01T17:00:00Z');
+    await runSchedulerTickOnce({ expoPush: makeExpoPushStub(), now: firstOfJuneChicago });
+
+    const staffRes = await staffApp().app.inject({ method: 'GET', url: PROGRAMS_URL });
+    assert.equal((staffRes.json() as ProgramsWire).is_alumni, true, 'still alumni');
+    const dogRes = await ownerDogsApp().app.inject({
+      method: 'GET',
+      url: `/dogs/${FIXTURE_IDS.dog1Id}`,
+    });
+    assert.equal((dogRes.json() as { is_alumni: boolean }).is_alumni, true, 'on the dog wire too');
+
+    const queued = await db
+      .select({ id: scheduledNotifications.id })
+      .from(scheduledNotifications)
+      .where(sql`${scheduledNotifications.type}::text = 'alumni-attendance'`);
+    assert.deepEqual(queued, [], 'nobody is told their dog is slipping');
+    const delivered = await db
+      .select({ id: notifications.id })
+      .from(notifications)
+      .where(sql`${notifications.type}::text = 'alumni-attendance'`);
+    assert.deepEqual(delivered, []);
   },
 );

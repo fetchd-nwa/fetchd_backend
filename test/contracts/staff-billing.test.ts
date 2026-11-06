@@ -88,8 +88,8 @@ async function seed(): Promise<Seeded> {
     })
     .returning({ id: charges.id });
   await db.insert(charges).values([
-    { ownerId: OWNER, amountCents: 1000, status: 'failed', purpose: 'payg' },
-    { ownerId: OWNER, amountCents: 2000, status: 'requires_payment', purpose: 'payg' },
+    { ownerId: OWNER, amountCents: 1000, status: 'failed', purpose: 'group-class' },
+    { ownerId: OWNER, amountCents: 2000, status: 'requires_payment', purpose: 'group-class' },
   ]);
   const chargeId = (charge as { id: string }).id;
   const paid = await db.transaction((tx) =>
@@ -113,7 +113,7 @@ async function seed(): Promise<Seeded> {
     invoicesRepository.createOpen(tx, {
       ownerId: OWNER,
       amountCents: 1500,
-      purpose: 'payg',
+      purpose: 'group-class',
       paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
       dueAt: '2026-11-15T00:00:00Z',
     }),
@@ -475,10 +475,10 @@ test(
 );
 
 test(
-  'GET /staff/invoices keeps its ?parked contract beside /staff/invoices/:id',
+  'no route answers the bare /staff/invoices until P24, beside /staff/invoices/:id',
   SKIP_WHEN_NO_DB,
   async () => {
-    assert.equal((await get(FIXTURE_STAFF_PRINCIPAL, '/staff/invoices')).statusCode, 400);
-    assert.equal((await get(FIXTURE_STAFF_PRINCIPAL, '/staff/invoices?parked')).statusCode, 200);
+    assert.equal((await get(FIXTURE_STAFF_PRINCIPAL, '/staff/invoices')).statusCode, 404);
+    assert.equal((await get(FIXTURE_STAFF_PRINCIPAL, '/staff/invoices?parked')).statusCode, 404);
   },
 );

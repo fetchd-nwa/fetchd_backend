@@ -493,8 +493,7 @@ test('PATCH /staff/reports/:id — owner principal → 403', SKIP_WHEN_NO_DB, as
 // GET /staff/reports — the cross-owner staff report list (wire 1.13.0, 2.3b)
 //
 // `GetStaffReportsQuery`: `dog_id` REQUIRED (Allison ruling WC-A5 — an
-// unscoped cross-owner dump 400s, the `GET /staff/invoices?parked` precedent
-// at `staffInvoices.ts:81-84`), `program`/`category` optional filters.
+// unscoped cross-owner dump 400s), `program`/`category` optional filters.
 // Response is a bare `ReportWire[]`, live rows only, newest first.
 // ──────────────────────────────────────────────────────────────────────────
 

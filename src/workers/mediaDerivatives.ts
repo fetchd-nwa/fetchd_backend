@@ -12,17 +12,12 @@ import {
 } from '../db/repositories/mediaDerivativeJobsRepository.js';
 import { withActor } from '../db/tx.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
-
-interface WorkerLogger {
-  info(obj: Record<string, unknown>, msg?: string): void;
-  warn(obj: Record<string, unknown>, msg?: string): void;
-  error(obj: Record<string, unknown>, msg?: string): void;
-}
+import type { WorkerLogger } from './workerLogger.js';
 
 /**
- * Media derivatives worker (Day 17). Composed as the fourth phase of
+ * Media derivatives worker (Day 17). Composed as a phase of
  * `runSchedulerTickOnce` so one cron firing handles outbound notifications,
- * invoice dunning, idempotency-key sweep, AND derivative generation. Pattern
+ * the idempotency-key sweep, AND derivative generation. Pattern
  * matches the other workers: one-shot function, injectable seam, returns a
  * per-job result summary.
  *

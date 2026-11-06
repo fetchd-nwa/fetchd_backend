@@ -9,8 +9,8 @@ import {
   recordQueueOk,
   recordSchedulerTick,
 } from '../lib/schedulerHeartbeat.js';
-import type { WorkerLogger } from '../workers/invoiceAutoCharge.js';
 import { runSchedulerTickOnce, type SchedulerTickResult } from '../workers/scheduler.js';
+import type { WorkerLogger } from '../workers/workerLogger.js';
 
 /**
  * `POST /workers/tick` `[public, signed]` — production scheduler trigger.
@@ -104,19 +104,18 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
     // EVERY phase's counters (D20-A3 §A3.4.1). This line is nominated by the
     // ops SQL, the design's proof plan, and Allison's runbook as THE authority
     // on whether a tick ran — all three called it "the same counters" as the
-    // JSON body while it reported five of twelve phases, omitting
+    // JSON body while it reported five of the phases of the day, omitting
     // `captureReconciler` and `duplicateRefundRetry`: the two money phases
-    // whose alarms this cycle exists to page on. (Pre-existing as
+    // whose alarms that cycle existed to page on. (Pre-existing as
     // DISCREPANCIES NOTE-39; nominating the line as the authority made closing
-    // it this cycle's job.) Additive only — every pre-existing key keeps its
-    // name and meaning, so anything already reading them still works.
+    // it that cycle's job.) `test/contracts/scheduler-tick-shape.test.ts` pins
+    // the keys, because they are read by name.
     //
-    // "EVERY phase's counters" means every LEAF, not every phase (D20-A7.2).
-    // All 11 phases were present while 7 leaves were not: both
-    // `abandonedTruncated` flags and all 5 `abandonedByClass` members. Nothing
-    // logged understated a total — `abandoned` is the true count — but this
-    // line is the nominated authority, so a leaf missing from it is a leaf a
-    // human reading the log cannot get to. Making the sentence true was the
+    // "EVERY phase's counters" means every LEAF, not every phase (D20-A7.2):
+    // both `abandonedTruncated` flags and all 5 `abandonedByClass` members.
+    // Nothing logged understated a total — `abandoned` is the true count — but
+    // this line is the nominated authority, so a leaf missing from it is a leaf
+    // a human reading the log cannot get to. Making the sentence true was the
     // ruling both times it came up; weakening it was not.
     request.log.info(
       {
@@ -142,10 +141,6 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
         scheduledQueueOk: result.scheduledNotifications.queueOk,
         pushTicketsOk: result.scheduledNotifications.pushTicketsOk,
         pushTicketsError: result.scheduledNotifications.pushTicketsError,
-        membershipRollScanned: result.membershipRoll.scanned,
-        membershipRolled: result.membershipRoll.rolled,
-        membershipCompleted: result.membershipRoll.completed,
-        invoiceAttemptVerifyScanned: result.invoiceAttemptVerify.scanned,
         orderSweeperScanned: result.orderSweeper.scanned,
         orderSweeperAbandoned: result.orderSweeper.abandoned,
         orderSweeperSettled: result.orderSweeper.settled,
@@ -180,16 +175,9 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
           result.duplicateRefundRetry.abandonedByClass['stripe-failed'],
         duplicateRefundRetryAbandonedCovered:
           result.duplicateRefundRetry.abandonedByClass.covered,
-        invoicesScanned: result.invoiceAutoCharge.scanned,
         mediaDerivativesScanned: result.mediaDerivatives.scanned,
         creditExpiryWarningsScanned: result.creditExpiryWarnings.scanned,
         creditExpiryWarningsEnqueued: result.creditExpiryWarnings.enqueued,
-        alumniAttendanceRan: result.alumniAttendance.ran,
-        alumniAttendanceScanned: result.alumniAttendance.scanned,
-        alumniAttendanceEnqueued: result.alumniAttendance.enqueued,
-        alumniAttendanceFlagged: result.alumniAttendance.flagged,
-        invoiceOverdueScanned: result.invoiceOverdue.scanned,
-        invoiceOverdueEnqueued: result.invoiceOverdue.enqueued,
         cardExpiryScanned: result.cardExpiry.scanned,
         cardExpiryEnqueued: result.cardExpiry.enqueued,
         idempotencyKeysSwept: result.idempotencyKeysSwept,
@@ -227,7 +215,7 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
     // This restores the monitor coverage step 1's phase-1 boundary removed. A
     // throw used to answer 500, never reach `recordSchedulerTick`, and go red
     // on heartbeat staleness inside ten minutes; the boundary made it a 200 on
-    // purpose (the 500 also stopped phases 2-12, the four money phases
+    // purpose (the 500 also stopped every later phase, the money phases
     // included) and the systemic branch closed the parked-row path to a red as
     // well. Without this key an all-day queue outage is pager-only.
     if (result.scheduledNotifications.queueOk) {

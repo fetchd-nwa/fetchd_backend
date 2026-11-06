@@ -4,17 +4,28 @@ import { test } from 'node:test';
 import { eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
-import { charges, invoices, refunds } from '../../src/db/schema/schema.js';
+import {
+  bookingDogs,
+  bookings,
+  charges,
+  cohorts,
+  invoices,
+  refunds,
+} from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
 import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
+import { registerBookingsRoute } from '../../src/routes/bookings.js';
+import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { clearInvoiceReferrers, FIXTURE_IDS } from './_fixture.js';
+import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
+  makeLogCapture,
   registerFixtureHooks,
+  type LogCapture,
 } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
 import type { Principal } from '../../src/auth/principal.js';
@@ -404,6 +415,277 @@ test(
       );
     }
 
+    await cleanupInvoicesAndCharges();
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────
+// The anchor on the charge `/pay` writes (§A3.18 D1, §A3.19 F2)
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * `holdInvoiceForPayment` (`routes/invoices.ts`) is the live write of a charge's
+ * `booking_id`: tx1 of every real `/pay`. The §A3.18 and §A3.19 tests in
+ * `enrollment-partial.test.ts` and `enrollment-dead-money.test.ts` hold the same rule
+ * through `settleInvoiceCharge()`'s first half, which no production path calls
+ * (DECISIONS 168(a), 169(a)), so these are the tests of the write itself. The stake is
+ * the board-train cancel below, which finds the charge it refunds by this column alone.
+ */
+const ANCHOR_COHORT_START = '2026-07-06T23:00:00Z';
+const ANCHOR_DAY_MS = 24 * 60 * 60 * 1000;
+
+function anchorApp(capture?: LogCapture): {
+  app: ReturnType<typeof makeContractApp>['app'];
+  stripe: ReturnType<typeof makeStripeStub>;
+} {
+  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL, capture);
+  const stripe = makeStripeStub();
+  registerInvoicesRoute(app, { authenticate, stripe });
+  registerEnrollmentsRoute(app, { authenticate, stripe, now: FIXTURE_NOW });
+  registerBookingsRoute(app, { authenticate, stripe, now: FIXTURE_NOW });
+  return { app, stripe };
+}
+
+async function seedAnchorCohort(): Promise<string> {
+  const id = randomUUID();
+  await db.insert(cohorts).values({
+    id,
+    classKey: 'puppy',
+    location: 'fayetteville',
+    startDate: ANCHOR_COHORT_START,
+    endDate: null,
+    weeklyTime: '6:00 PM',
+    weeks: 4,
+    capacity: 6,
+    filled: 0,
+  });
+  return id;
+}
+
+/** A real pay-later enroll, so the invoice is stamped by the path that stamps it. */
+async function enrolPayLater(
+  app: ReturnType<typeof makeContractApp>['app'],
+  dogId: string,
+): Promise<typeof invoices.$inferSelect> {
+  const cohortId = await seedAnchorCohort();
+  const enrolled = await app.inject({
+    method: 'POST',
+    url: '/enrollments',
+    headers: { 'idempotency-key': `anchor-enrol-${randomUUID()}` },
+    payload: {
+      cohort_id: cohortId,
+      dog_ids: [dogId],
+      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      pay_later: true,
+    },
+  });
+  assert.equal(enrolled.statusCode, 201, enrolled.body);
+  const [invoice] = await db.select().from(invoices).where(eq(invoices.cohortId, cohortId));
+  assert.ok(invoice !== undefined, 'the pay-later enroll wrote an invoice');
+  return invoice;
+}
+
+/** A board-train stay and its invoice, dated by the clock the cancel route runs on. */
+async function seedBoardTrainInvoice(
+  amountCents: number,
+): Promise<{ bookingId: string; invoiceId: string }> {
+  const scheduledAt = new Date(FIXTURE_TODAY.getTime() + 20 * ANCHOR_DAY_MS);
+  const bookingId = randomUUID();
+  await db.insert(bookings).values({
+    id: bookingId,
+    ownerId: FIXTURE_IDS.ownerId,
+    leadDogId: FIXTURE_IDS.dog1Id,
+    category: 'board-and-train',
+    status: 'upcoming',
+    scheduledAt: scheduledAt.toISOString(),
+    dropoffAt: scheduledAt.toISOString(),
+    pickupAt: new Date(scheduledAt.getTime() + 14 * ANCHOR_DAY_MS).toISOString(),
+    cancelDeadlineAt: new Date(scheduledAt.getTime() - 10 * ANCHOR_DAY_MS).toISOString(),
+    location: 'fayetteville',
+  });
+  await db.insert(bookingDogs).values({ bookingId, dogId: FIXTURE_IDS.dog1Id, isLead: true });
+  const invoice = await db.transaction(async (tx) =>
+    invoicesRepository.createOpen(tx, {
+      ownerId: FIXTURE_IDS.ownerId,
+      amountCents,
+      purpose: 'board-train',
+      paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+      dueAt: scheduledAt.toISOString(),
+      bookingId,
+      dogId: FIXTURE_IDS.dog1Id,
+    }),
+  );
+  return { bookingId, invoiceId: invoice.id };
+}
+
+/** Pay through the real route, and read what that tender wrote. */
+async function payForCharge(
+  app: ReturnType<typeof makeContractApp>['app'],
+  invoiceId: string,
+): Promise<{ chargeId: string; bookingId: string | null; intentId: string }> {
+  const res = await app.inject({
+    method: 'POST',
+    url: `/invoices/${invoiceId}/pay`,
+    headers: { 'idempotency-key': `anchor-pay-${randomUUID()}` },
+    payload: {},
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  const body = res.json() as {
+    charge_id: string;
+    invoice_status: string;
+    stripe_payment_intent_id: string;
+  };
+  assert.equal(body.invoice_status, 'paid');
+  const [charge] = await db
+    .select({ bookingId: charges.bookingId, status: charges.status })
+    .from(charges)
+    .where(eq(charges.id, body.charge_id));
+  assert.ok(charge !== undefined, 'the tender wrote a charge');
+  assert.equal(charge.status, 'succeeded');
+  return {
+    chargeId: body.charge_id,
+    bookingId: charge.bookingId,
+    intentId: body.stripe_payment_intent_id,
+  };
+}
+
+test(
+  'POST /invoices/:id/pay — a class invoice: the charge carries the anchor the invoice names (§A3.18 D1)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanupInvoicesAndCharges();
+    const { app } = anchorApp();
+    const invoice = await enrolPayLater(app, FIXTURE_IDS.dog1Id);
+    assert.ok(invoice.bookingId !== null, 'the enroll stamped its anchor on the invoice');
+    const [anchor] = await db
+      .select({ cohortId: bookings.cohortId, leadDogId: bookings.leadDogId })
+      .from(bookings)
+      .where(eq(bookings.id, invoice.bookingId));
+    assert.deepEqual(anchor, { cohortId: invoice.cohortId, leadDogId: FIXTURE_IDS.dog1Id });
+
+    const { bookingId } = await payForCharge(app, invoice.id);
+
+    assert.equal(bookingId, invoice.bookingId);
+    await cleanupInvoicesAndCharges();
+  },
+);
+
+test(
+  'POST /invoices/:id/pay — a board-train invoice: the charge carries the invoice’s own booking',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanupInvoicesAndCharges();
+    const { app } = anchorApp();
+    const { bookingId, invoiceId } = await seedBoardTrainInvoice(300_000);
+
+    const charge = await payForCharge(app, invoiceId);
+
+    assert.equal(charge.bookingId, bookingId);
+    await cleanupInvoicesAndCharges();
+  },
+);
+
+test(
+  'POST /invoices/:id/pay — the stake: a paid board-train invoice, its booking cancelled in the window, refunds in full',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // `cancelBookingService` finds the charge with `findSucceededForBooking`, by
+    // `charges.booking_id` and nothing else. With no anchor the cancel still answers
+    // 200, and $3,000.00 stays taken with no refund row and no alarm.
+    await cleanupInvoicesAndCharges();
+    const { app, stripe } = anchorApp();
+    const { bookingId, invoiceId } = await seedBoardTrainInvoice(300_000);
+    const { chargeId, intentId } = await payForCharge(app, invoiceId);
+
+    const cancelled = await app.inject({
+      method: 'POST',
+      url: `/bookings/${bookingId}/cancel`,
+      headers: { 'idempotency-key': `anchor-cancel-${randomUUID()}` },
+      payload: {},
+    });
+    assert.equal(cancelled.statusCode, 200, cancelled.body);
+    const body = cancelled.json() as { status: string; cancel_forfeited: boolean };
+    assert.equal(body.status, 'cancelled');
+    assert.equal(body.cancel_forfeited, false, 'inside the window, so the money comes back');
+
+    const rows = await db
+      .select({
+        chargeId: refunds.chargeId,
+        amountCents: refunds.amountCents,
+        reason: refunds.reason,
+      })
+      .from(refunds)
+      .where(eq(refunds.bookingId, bookingId));
+    assert.deepEqual(rows, [{ chargeId, amountCents: 300_000, reason: 'cancel' }]);
+
+    const sent = stripe.calls.filter((call) => call.method === 'createRefund');
+    assert.equal(sent.length, 1, 'and the refund is sent to Stripe, once');
+    const args = sent[0]?.args as { paymentIntentId: string; amountCents: number };
+    assert.equal(args.paymentIntentId, intentId);
+    assert.equal(args.amountCents, 300_000);
+    await cleanupInvoicesAndCharges();
+  },
+);
+
+test(
+  'POST /invoices/:id/pay — a class invoice that lost its anchor: the same-transaction witness names it, and WARNs (§A3.19 F2)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // What `ON DELETE SET NULL` leaves, or an invoice minted before the stamp existed.
+    // The enroll wrote the invoice and its bookings in one transaction, so
+    // `bookings.created_at = invoices.issued_at` still names them.
+    await cleanupInvoicesAndCharges();
+    const capture = makeLogCapture();
+    const { app } = anchorApp(capture);
+    const invoice = await enrolPayLater(app, FIXTURE_IDS.dog2Id);
+    const anchor = invoice.bookingId;
+    assert.ok(anchor !== null);
+    await db.update(invoices).set({ bookingId: null }).where(eq(invoices.id, invoice.id));
+
+    const { bookingId } = await payForCharge(app, invoice.id);
+
+    assert.equal(bookingId, anchor, 'the witness finds the enrollment the stamp named');
+    const warns = capture.lines.filter(
+      (line) => line.level === 40 && line.invoiceId === invoice.id,
+    );
+    assert.equal(warns.length, 1, 'every firing of the fallback WARNs');
+    assert.equal(warns[0]?.resolvedBookingId, anchor);
+    await cleanupInvoicesAndCharges();
+  },
+);
+
+test(
+  'POST /invoices/:id/pay — no anchor and no witness: it pays, the charge’s booking_id is NULL, and the WARN names the invoice',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Minted on its own, so no booking shares its transaction instant. Nothing is proven
+    // about whose money this is, so nothing is claimed, and the legacy time rule is the
+    // net behind the NULL.
+    await cleanupInvoicesAndCharges();
+    const capture = makeLogCapture();
+    const { app } = anchorApp(capture);
+    const cohortId = await seedAnchorCohort();
+    const invoice = await db.transaction(async (tx) =>
+      invoicesRepository.createOpen(tx, {
+        ownerId: FIXTURE_IDS.ownerId,
+        amountCents: 25_000,
+        purpose: 'group-class',
+        paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+        dueAt: ANCHOR_COHORT_START,
+        cohortId,
+        dogId: FIXTURE_IDS.dog1Id,
+      }),
+    );
+    assert.equal(invoice.bookingId, null);
+
+    const { bookingId } = await payForCharge(app, invoice.id);
+
+    assert.equal(bookingId, null);
+    const warns = capture.lines.filter(
+      (line) => line.level === 40 && line.invoiceId === invoice.id,
+    );
+    assert.equal(warns.length, 1, 'a human can find it');
+    assert.match(String(warns[0]?.msg), /NO enrollment anchor/);
     await cleanupInvoicesAndCharges();
   },
 );

@@ -8,10 +8,9 @@ import type { Tx } from '../db/tx.js';
 
 /**
  * Card-expiry warning scan (Allison 2026-07-29). Same scheduled-scan shape as
- * `enqueueCreditExpiryWarnings`. Every invoice in this system is card-backed and
- * auto-charged (the anti-scam floor locked 2026-05-19), so a lapsed default card
- * doesn't degrade gracefully — it turns every future charge into a decline. This
- * warns before that happens, and once more after it has, so the failure mode is
+ * `enqueueCreditExpiryWarnings`. A lapsed default card doesn't degrade gracefully:
+ * it turns the next charge to it into a decline. This warns before that happens,
+ * and once more after it has, so the failure mode is
  * "you were told twice" rather than "your bookings quietly stopped working".
  *
  * Each card fires at most twice, on distinct dedupe keys:

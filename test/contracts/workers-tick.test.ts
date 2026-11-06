@@ -51,10 +51,7 @@ const FAKE_RESULT: SchedulerTickResult = {
     pushTicketsOk: 0,
     pushTicketsError: 0,
   },
-  membershipRoll: { scanned: 0, rolled: 0, completed: 0 },
-  invoiceOverdue: { scanned: 0, enqueued: 0 },
   cardExpiry: { scanned: 0, enqueued: 0 },
-  invoiceAttemptVerify: { scanned: 0, results: [] },
   orderSweeper: { scanned: 0, abandoned: 0, settled: 0, failed: 0, lateRefunded: 0, left: 0 },
   captureReconciler: {
     scanned: 0,
@@ -83,10 +80,8 @@ const FAKE_RESULT: SchedulerTickResult = {
     },
     results: [],
   },
-  invoiceAutoCharge: { scanned: 0, results: [] },
   mediaDerivatives: { scanned: 0, results: [] },
   creditExpiryWarnings: { scanned: 0, enqueued: 0 },
-  alumniAttendance: { ran: false, scanned: 0, enqueued: 0, flagged: 0 },
   idempotencyKeysSwept: 0,
 };
 

@@ -228,7 +228,7 @@ export async function seedPendingPurchaseOrder(
   return { orderId, bookingIds: [], ...seeded };
 }
 
-/** An open invoice with a due date no auto-charge tick will reach. */
+/** An open invoice with a far-off due date. */
 export async function seedOpenInvoice(amountCents = 8_500): Promise<string> {
   const row = await db.transaction(async (tx) =>
     invoicesRepository.createOpen(tx, {

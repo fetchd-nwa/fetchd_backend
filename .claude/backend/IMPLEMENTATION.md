@@ -1531,6 +1531,8 @@ observable behavior, not "looks right."
   rule flips `charges.status` to 'refunded'.
 
 ### Day 15 — Stripe webhooks + invoices + dunning worker
+> Dated log. The invoice auto-charge worker, its dunning ladder and `recordFailedAttempt`
+> left at wire 5.0.0-lg4.1 (P17, PAY-U15): no worker bills a card on its own today.
 - **Owner:** Allison
 - **Depends on:** Day 14
 - **Governing contract:** DATA-CONTRACT payments; schema.sql invoices/refunds
@@ -1652,8 +1654,8 @@ observable behavior, not "looks right."
     mark schedule row `'sent'` + link `emitted_notification_id`. Push
     messages collected in-memory; dispatched post-commit (best-effort —
     DB is source of truth; transport failure logged-and-swallowed).
-  - **Phase 2** — `runInvoiceAutoChargeOnce` (Day-15 composed). One
-    cron firing handles BOTH outbound notifications AND invoice dunning.
+  - **Phase 2** — `runInvoiceAutoChargeOnce` (Day-15 composed; removed at wire
+    5.0.0-lg4.1, P17). The tick's phases of record are `SchedulerTickResult`'s.
   - **Phase 3** — `sweepExpiredIdempotencyKeys` (24h cutoff). Per
     schema.sql lines ~918-920 — the ONE table exempt from never-delete.
   **Trigger catalog** (`lib/enqueueBookingReminders.ts`, called from all

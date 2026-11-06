@@ -4,13 +4,11 @@ import { test } from 'node:test';
 import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import type { PostBookingsResponse } from '../../src/contracts/wire.js';
-import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import {
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
   charges,
   creditLedger,
-  invoices,
   notifications,
   refunds,
   scheduledNotifications,
@@ -18,13 +16,7 @@ import {
 import { redis } from '../../src/redis.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
-import {
-  clearInvoiceReferrers,
-  FIXTURE_IDS,
-  FIXTURE_NOW,
-  FIXTURE_TODAY,
-  topUpCredits,
-} from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY, topUpCredits } from './_fixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
@@ -210,57 +202,11 @@ async function seedSucceededCharge(opts: {
     bookingId: opts.bookingId,
     amountCents: opts.amountCents,
     status: 'succeeded',
-    purpose: 'payg',
+    purpose: 'group-class',
     stripePaymentIntentId: `pi_test_${randomUUID().slice(0, 8)}`,
   });
   return id;
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// An old pay-as-you-go row: nothing writes one from 4.0.0 (R1), and the reader stays
-// until P17 deletes the lane. Moved from `booking-payg.test.ts`, on a seeded row.
-// ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'POST /bookings/:id/cancel — within window voids an old open payg invoice (no auto-charge)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const scheduledAt = new Date(FIXTURE_NOW_MS + 30 * 24 * ONE_HOUR_MS);
-    const bookingId = await seedRawBooking({
-      category: 'day-school',
-      scheduledAt,
-      cancelDeadlineAt: new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS),
-      location: 'fayetteville',
-    });
-    const invoice = await db.transaction((tx) =>
-      invoicesRepository.createOpen(tx, {
-        ownerId: FIXTURE_IDS.ownerId,
-        amountCents: 7_500,
-        purpose: 'payg',
-        paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
-        dueAt: new Date(scheduledAt.getTime() - ONE_HOUR_MS).toISOString(),
-        bookingId,
-      }),
-    );
-    const { app } = cancelApp();
-
-    const cancel = await postCancel({
-      app,
-      bookingId,
-      idempotencyKey: `pg-cn-in-${randomUUID()}`,
-    });
-
-    assert.equal(cancel.statusCode, 200, cancel.body);
-    assert.notEqual((cancel.json() as { cancel_forfeited?: boolean }).cancel_forfeited, true);
-    const [row] = await db
-      .select({ status: invoices.status })
-      .from(invoices)
-      .where(eq(invoices.id, invoice.id));
-    assert.equal(row?.status, 'void', 'within-window cancel voids the pending auto-charge');
-    await clearInvoiceReferrers();
-    await db.delete(invoices).where(eq(invoices.id, invoice.id));
-  },
-);
 
 // ──────────────────────────────────────────────────────────────────────────
 // Branch 1 — Forfeit

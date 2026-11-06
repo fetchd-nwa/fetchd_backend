@@ -130,9 +130,10 @@ export const ROW_KEYED_REFUND_REASON = 'duplicate-invoice-settle';
  * than a `reason` value (2026-08-13, round 4).
  *
  * `reason = 'duplicate-invoice-settle'` has been written since 2026-06-21
- * (`cade494`), by `settleInvoiceCharge`'s lost-race arm — which BOTH the worker
- * and `POST /invoices/:id/pay` call. The worker's post-commit fire was always
- * keyed on our refund-row uuid. The route's was NOT: until this branch it built
+ * (`cade494`), by `settleInvoiceCharge`'s lost-race arm — which the auto-charge
+ * worker of the day and `POST /invoices/:id/pay` both called. The worker's
+ * post-commit fire was always keyed on our refund-row uuid. The route's was NOT:
+ * until this branch it built
  * its own key, `` `${idempotencyKey}:dup-settle-refund` ``, from the CLIENT's
  * request key. So the reason string alone cannot tell a row-keyed refund from a
  * client-keyed one — and re-firing a client-keyed row under
@@ -206,9 +207,8 @@ export const REFUND_SWEEP_FLOOR = new Date('2026-08-14T00:00:00.000Z');
  *     the top of each sweep. It survives as the honest answer for a row the
  *     flip has not reached yet (the flip is batched), not as a standing class.
  *   - `client-keyed` — no stored key AND not legacy-reconstructible: the reason
- *     is not {@link ROW_KEYED_REFUND_REASON} (`'cancel'`,
- *     `'duplicate-membership-subscribe'`), or it is but the row predates
- *     {@link REFUND_SWEEP_FLOOR}. Operationally identical: the original Stripe
+ *     is not {@link ROW_KEYED_REFUND_REASON} (`'cancel'`, for one), or it is but
+ *     the row predates {@link REFUND_SWEEP_FLOOR}. Operationally identical: the original Stripe
  *     idempotency key was the client's request key, no automatic path can
  *     reproduce it, and a human must CHECK Stripe for an existing refund before
  *     issuing one. **Frozen and finite** — since 2026-08-19 every writer stores
@@ -883,14 +883,6 @@ export const refundsRepository = {
       .orderBy(asc(refunds.createdAt));
   },
 
-  async countAnyForCharge(tx: Tx, chargeId: string): Promise<number> {
-    const [row] = await tx
-      .select({ total: sql<number>`count(*)::int` })
-      .from(refunds)
-      .where(eq(refunds.chargeId, chargeId));
-    return row?.total ?? 0;
-  },
-
   async countPendingForCharge(tx: Tx, chargeId: string): Promise<number> {
     const [row] = await tx
       .select({ total: sql<number>`count(*)::int` })
@@ -1087,16 +1079,14 @@ export const refundsRepository = {
 
   /**
    * The retry sweep's CLAIM (2026-08-12, round 3) — select + lease in one short
-   * tx, mirroring `invoiceChargeAttemptsRepository.claimUnresolvedForVerify`.
+   * tx.
    *
    * The worklist: refunds still `pending` with NO `stripe_refund_id`, which is
    * exactly "the money-back row was written but the Stripe call never landed".
    * Until this existed, nothing retried them — no worker imported this
    * repository, and `charge.refund.updated` cannot arrive for a refund that was
    * never created at Stripe. Every `firePendingRefundPostCommit` failure was
-   * therefore a permanent double charge whose only trace was one log line, and
-   * the webhook's invoice-orphan arm made lost-race refunds a COMMON path
-   * rather than a rare one.
+   * therefore a permanent double charge whose only trace was one log line.
    *
    * **A retry is only safe when it can reproduce the key the ORIGINAL call
    * used**; under a different key Stripe executes a SECOND refund instead of
@@ -1106,7 +1096,7 @@ export const refundsRepository = {
    *   1. **The stored-key lane** (`stripe_idempotency_key IS NOT NULL`) — since
    *      2026-08-19 every writer records its exact key in the minting tx, so
    *      the row itself says what to send. This is the lane that finally covers
-   *      the cancel / withdraw / membership-lost-race writers, whose keys were
+   *      the cancel / withdraw writers, whose keys were
    *      derived from the CLIENT's request `Idempotency-Key` and existed only
    *      inside that request's closure. Note what it does NOT need: a date
    *      constant. `stripe_idempotency_key IS NULL` IS the deploy boundary,
@@ -1134,9 +1124,8 @@ export const refundsRepository = {
    * the owner a second time, unattended. Hence the floor; see its own doc for
    * why the boundary has to be a date.
    *
-   * The other pending-refund writers (`reason='cancel'` from the
-   * cancel/withdraw paths, and `'duplicate-membership-subscribe'`) keyed on
-   * `${idempotencyKey}:…` until 2026-08-19 — nothing durable can reconstruct
+   * The other pending-refund writers (`reason='cancel'` from the cancel/withdraw
+   * paths) keyed on `${idempotencyKey}:…` until 2026-08-19 — nothing durable can reconstruct
    * that, so their PRE-EXISTING rows still fall outside both lanes and remain a
    * named, un-swept, and now finite gap. Their new rows carry a stored key and
    * are retried by lane 1.
@@ -1153,8 +1142,7 @@ export const refundsRepository = {
    *   - `mintedAfter` (on `created_at`) is the ABANDON bound. A refund older
    *     than that has outlived Stripe's ~24h idempotency-key lifetime, so a
    *     retry under the same key could execute a SECOND refund rather than
-   *     replay the first — the mirror image of the auto-charge key window, and
-   *     the same answer: stop, and hand it to a human
+   *     replay the first. So: stop, and hand it to a human
    *     (see `findAbandonedPending`).
    *   - {@link REFUND_SWEEP_FLOOR} (on `created_at`) is the DEPLOY bound of the
    *     LEGACY lane, and it is applied HERE rather than by the caller so no

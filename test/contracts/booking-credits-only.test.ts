@@ -181,6 +181,25 @@ test(
   },
 );
 
+// M4.02's red-first (`design.md:2844`, DECISIONS 162(h)): `ledger_reason` lost
+// 'membership-grant', so a raw-SQL literal naming it answers 22P02 on every debit.
+test(
+  'POST /bookings: one credit day books, 201, and spends one credit',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const dogId = await fundedDog(2);
+    const { app } = buildApp();
+
+    const res = await post(app, {
+      ...bodyFor([dogId], [futureWeekday(1)]),
+      payment: { kind: 'credits' },
+    });
+
+    assert.equal(res.statusCode, 201, res.body);
+    assert.equal(await balanceOf(dogId), 1);
+  },
+);
+
 test(
   'POST /bookings: `payment` is part of the body the key hashes, so one spelling is one booking',
   SKIP_WHEN_NO_DB,
@@ -444,20 +463,6 @@ function literalsOf(value: string): Literal[] {
   return found;
 }
 
-/**
- * The only places the word may be spelled once its writer is gone: the types, and
- * the readers that keep old rows legible until P17 deletes the lane. A writer has to
- * spell it, so a writer that returns turns up here as a line nobody listed.
- */
-const PAYG_READERS: readonly string[] = [
-  'contracts/wire.ts',
-  'db/repositories/chargesRepository.ts',
-  'db/repositories/invoicesRepository.ts',
-  'db/repositories/ledgerRepository.ts',
-  'db/schema/schema.ts',
-  'lib/invoiceReceiptCopy.ts',
-];
-
 test('nothing in src/ writes purpose payg: a writer that returns goes red here', () => {
   // The instrument first: it can see a writer, or its silence proves nothing.
   const writers = literalsOf('group-class').filter((l) => l.property === 'purpose');
@@ -466,24 +471,8 @@ test('nothing in src/ writes purpose payg: a writer that returns goes red here',
     `the walk found no live purpose writer, so it cannot see a dead one: ${JSON.stringify(writers)}`,
   );
 
-  const spelled = literalsOf('payg');
-  assert.deepEqual(
-    spelled.filter((l) => l.property === 'purpose' || l.property === 'payment'),
-    [],
-    'nothing sets a purpose, or any payment, to payg',
-  );
-  assert.deepEqual(
-    [...new Set(spelled.map((l) => l.file))].filter((file) => !PAYG_READERS.includes(file)),
-    [],
-    'and no file outside the readers spells the word',
-  );
-  for (const literal of spelled.filter((l) => l.file.startsWith('db/repositories/'))) {
-    assert.match(
-      literal.under,
-      /LiteralType|CaseClause|ReturnStatement|CallExpression/,
-      `${literal.file}: a type, a case, a mapped return or an eq() reader, not ${literal.under}`,
-    );
-  }
+  // Since P17 no reader is left either, so a writer that returns is the only spelling.
+  assert.deepEqual(literalsOf('payg'), [], 'nothing in src/ spells the word');
 });
 
 // ── What no type holds (notes mutant mG) ────────────────────────────────────

@@ -58,7 +58,7 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
  * Amount sanity band. min 1¢ — a rate exists to charge something (a "$0 rate"
  * is a different concept, not a price). max $10,000 — a generous ceiling that
  * still covers a flat board-and-train package, while stopping a fat-finger from
- * setting a $1M/day price that would auto-charge cards before anyone noticed.
+ * setting a $1M/day price that would reach a card before anyone noticed.
  */
 const MIN_AMOUNT_CENTS = 1;
 const MAX_AMOUNT_CENTS = 1_000_000;

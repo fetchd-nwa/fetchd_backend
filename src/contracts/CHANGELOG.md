@@ -12,6 +12,77 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [5.0.0-lg4.1] — 2026-11-06
+
+BREAKING. LG4's first of three steps toward 5.0.0 (plan unit P17, slice S28;
+ledger CRED-U29, PAY-U15, ALUM-U17, and ALUM-U16 for its doc lines; MSG-U35 and
+ALUM-U01 have no wire of their own; migrations M4.01 to M4.04; design §1.1 5.0.0,
+`designs/fetchd-v1-technical-design.md:964-972`, `:1020`; §2.4 `:2834-2855`; §4
+`:6203-6206`). 5.0.0-lg4.1 lands for clients when P17 is gate-green and pushed on
+`v1/build`. Contract-first: the routes and the worker keep today's behaviour until
+P17's backend lands them. Resync both clients (`npm run sync:contracts` in mobile
+and portal). Against the resynced copy (a scratch run at the P16 commits, not their
+gates) the portal typechecks unchanged, mobile fails 23 times in 11 files
+and the backend 26 times in 14 files. Closing those closes neither the lane nor
+the membership screens: the portal's own `Package.subscription`, the backend's own
+`ChargePurpose` in `chargesRepository.ts` and every raw-SQL literal are outside
+tsc's reach, so tsc is not the work list.
+
+Breaking:
+
+- The `memberships` domain section is removed: `MembershipStatus`,
+  `MembershipWire`, `MembershipCreateWire`, `StaffMembershipWire`,
+  `PostMembershipsRequest`. Routes `POST /memberships`, `GET /memberships`,
+  `DELETE /memberships/:id`, `POST /staff/memberships/:id/pause` and `/resume` are
+  removed (CRED-U29, M4.01).
+- `NotificationType` and `NOTIFICATION_TYPES` lose `'membership-ended'` (CRED-U29)
+  and `'alumni-attendance'` (ALUM-U17): 15 kinds where the comment said 17, the
+  survivors in their order. Pinned to the pgEnum, so M4.02 lands in the same
+  commit. `'evaluation-result'` is not in the rebuild: M2.15 appends it in LG2b (P10).
+- `NotificationDeepLinkKind`, `NOTIFICATION_DEEP_LINK_KINDS` and `deepLinkToPath`
+  lose `'membership'` (CRED-U29). `deepLinkToPath` throws on that kind.
+- `ChargePurpose` is `'package' | 'board-train' | 'group-class'`: `'membership'`
+  (CRED-U29) and `'payg'` (DECISIONS 151(h)) leave with M4.02's `charge_purpose`
+  rebuild, in the order of the pgEnum that survives it.
+- `LedgerEntryWire.kind` is `'session' | 'credit-pack'`: `'membership'` and
+  `'payg'` removed. Inline, so no tuple or pin holds it.
+- `ParkedInvoiceWire` and `GET /staff/invoices?parked` removed (PAY-U15). `GET
+  /staff/invoices/:id` stays. No route answers `GET /staff/invoices` until the list
+  design 6.1.0 builds there (7.1.0 here).
+- `InvoiceDeepLinkReason` and `INVOICE_DEEP_LINK_REASONS` lose
+  `'payment-unconfirmed'`, whose only producer was the auto-charge worker (PAY-U15).
+  `deepLinkToPath` throws on it. A path already stored with it parses with the
+  reason dropped.
+- `DogWire.alumni_attendance_flagged_at`,
+  `CompletedProgramsWire.alumni_attendance_flagged_at` and `POST
+  /staff/dogs/:dogId/clear-alumni-flag` removed (ALUM-U17, M4.03).
+
+Changed (doc only, no shape change):
+
+- `EnrollmentPaymentStatus` and `PostEnrollmentsRequest.pay_later`: nothing bills
+  a pay-later invoice automatically from this version. The owner pays it through
+  `POST /invoices/:id/pay`, and the arm stays until 8.0.0 removes it (PAY-U10).
+- `NotificationType`'s `'invoice-overdue'` comment: nothing enqueues it from this
+  version (M4.04, question 87). The label stays, on rows already written.
+  `'card-expiring'` no longer speaks of auto-charges.
+- `CreditLotWire` stops listing alumni grants as never-expiring, and
+  `CompletedProgramsWire` stops saying the fifth program clears lot expiries
+  (ALUM-U16). The 1-credit and import clauses stay for P18.
+- `InvoiceStatus` and `ChargePurpose` name `StaffInvoiceWire` as how they reach
+  the wire, and `ChargePurpose` drops its note on declaration order.
+- `InvoicePayWire.charge_refunded` says another settle of the same invoice, not
+  the worker.
+- `PaymentFailedDetails`: "all five emit sites" was stale, and memberships' go
+  here; it says every emit site.
+- `RefundStatus`, `GetStaffReportsResponse` and `GetStaffReportsQuery` stop naming
+  a removed shape or route. `GetStaffInvoicesResponse`'s no-alias comment now
+  names the 6.1.0 list.
+
+Not typed here: everything else of 5.0.0, which is P18's (S23, S24, S25, S27:
+`OwnerCreditsWire`, `CreditGap`'s re-key, the catalog fields, hand edits, the
+purchase body, `CreditExpirySettingWire`'s removal) and P19's (S26: the shop's
+refusals and `withheld_reason`).
+
 ## [4.0.0] — 2026-11-05
 
 BREAKING. LG3's third and last step: this sets 4.0.0, the group's target, and

@@ -6,24 +6,18 @@ import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
-import { invoiceChargeAttemptsRepository } from '../../src/db/repositories/invoiceChargeAttemptsRepository.js';
-import { membershipsRepository } from '../../src/db/repositories/membershipsRepository.js';
 import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import {
   charges,
   creditLedger,
   invoices,
-  memberships,
   notifications,
   scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
-import { enqueueInvoiceOverdueWarnings } from '../../src/lib/enqueueInvoiceOverdueWarnings.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
-import { registerMembershipsRoute } from '../../src/routes/memberships.js';
 import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
-import { runInvoiceAutoChargeOnce } from '../../src/workers/invoiceAutoCharge.js';
 import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
@@ -77,13 +71,6 @@ function creditsApp(): { app: ReturnType<typeof makeContractApp>['app']; stripe:
   return { app, stripe };
 }
 
-function membershipsApp(): { app: ReturnType<typeof makeContractApp>['app']; stripe: StripeStub } {
-  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-  const stripe = makeStripeStub();
-  registerMembershipsRoute(app, { authenticate, stripe, now: FIXTURE_NOW });
-  return { app, stripe };
-}
-
 function webhookApp(): { app: ReturnType<typeof makeContractApp>['app']; stripe: StripeStub } {
   const { app } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
   const stripe = makeStripeStub();
@@ -92,7 +79,7 @@ function webhookApp(): { app: ReturnType<typeof makeContractApp>['app']; stripe:
 }
 
 async function seedOpenInvoice(
-  opts: { dueAt?: string; nextAttemptAt?: string; amountCents?: number } = {},
+  opts: { dueAt?: string; amountCents?: number } = {},
 ): Promise<string> {
   const row = await db.transaction(async (tx) =>
     invoicesRepository.createOpen(tx, {
@@ -101,7 +88,6 @@ async function seedOpenInvoice(
       purpose: 'board-train',
       paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
       dueAt: opts.dueAt ?? '2026-06-15T00:00:00Z',
-      ...(opts.nextAttemptAt !== undefined ? { nextAttemptAt: opts.nextAttemptAt } : {}),
     }),
   );
   return row.id;
@@ -109,7 +95,6 @@ async function seedOpenInvoice(
 
 async function cleanup(): Promise<void> {
   await db.delete(creditLedger).where(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id));
-  await db.delete(memberships).where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
   await clearInvoiceReferrers();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
@@ -125,7 +110,7 @@ async function cleanup(): Promise<void> {
     .where(
       and(
         eq(notifications.ownerId, FIXTURE_IDS.ownerId),
-        inArray(notifications.type, ['payment-succeeded', 'payment-failed', 'invoice-overdue']),
+        inArray(notifications.type, ['payment-succeeded', 'payment-failed']),
       ),
     );
   await db
@@ -137,7 +122,6 @@ async function cleanup(): Promise<void> {
           'payment-succeeded',
           'payment-failed',
           'payment-due',
-          'invoice-overdue',
         ]),
       ),
     );
@@ -297,119 +281,6 @@ test(
   },
 );
 
-test(
-  'POST /memberships — a THROWN card decline 402s with the same blocker and creates nothing',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const outcomes: {
-      status: number;
-      error: unknown;
-      footprint: ReturnType<typeof stripeFootprint>;
-      memberships: number;
-      charges: number;
-    }[] = [];
-
-    for (const fork of ['returned', 'thrown'] as const) {
-      await cleanup();
-      const { app, stripe } = membershipsApp();
-      if (fork === 'returned') stripe.setNextIntentStatus('requires_payment_method');
-      else stripe.setNextIntentThrowsCardError('requires_payment_method');
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/memberships',
-        headers: { 'idempotency-key': `pfc-mem-${fork}-${randomUUID()}` },
-        payload: {
-          dog_id: FIXTURE_IDS.dog1Id,
-          package_key: FIXTURE_IDS.creditPackageSchool5Key,
-          location: 'fayetteville',
-          term_months: 6,
-          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        },
-      });
-      const rows = await db
-        .select({ id: memberships.id })
-        .from(memberships)
-        .where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
-      outcomes.push({
-        status: res.statusCode,
-        error: res.json(),
-        footprint: stripeFootprint(stripe),
-        memberships: rows.length,
-        charges: (await chargeRowsForOwner()).length,
-      });
-    }
-
-    const [returned, thrown] = outcomes;
-    assert.deepEqual(thrown, returned);
-    assert.equal(returned!.status, 402);
-    assert.deepEqual(returned!.error, {
-      error: {
-        code: 'payment_failed',
-        message:
-          'card could not be charged synchronously (declined or requires authentication) — memberships need a card that charges without extra steps; try a different card',
-        details: { kind: 'payment_failed', charge_blocker: 'declined' },
-      },
-    });
-    // Run what would go red if the refusal leaked: no membership, no charge.
-    assert.equal(returned!.memberships, 0, 'no half-created membership on either fork');
-    assert.equal(returned!.charges, 0, 'the refusal beats withMutation — nothing written');
-
-    await cleanup();
-  },
-);
-
-test(
-  'invoice auto-charge worker — a THROWN card decline now CANCELS the intent, like the returned fork',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const outcomes: {
-      outcome: string;
-      footprint: ReturnType<typeof stripeFootprint>;
-      attempts: number | undefined;
-      invoiceStatus: string | undefined;
-    }[] = [];
-
-    for (const fork of ['returned', 'thrown'] as const) {
-      await cleanup();
-      const invoiceId = await seedOpenInvoice({
-        dueAt: '2026-01-01T00:00:00Z',
-        nextAttemptAt: '2026-01-01T00:00:00Z',
-      });
-      const stripe = makeStripeStub();
-      if (fork === 'returned') stripe.setNextIntentStatus('requires_payment_method');
-      else stripe.setNextIntentThrowsCardError('requires_payment_method');
-
-      const tick = await runInvoiceAutoChargeOnce({
-        stripe,
-        limit: 1,
-        now: new Date('2026-02-01T12:00:00Z'),
-      });
-      const [inv] = await db
-        .select({ status: invoices.status, attempts: invoices.autoChargeAttempts })
-        .from(invoices)
-        .where(eq(invoices.id, invoiceId));
-      outcomes.push({
-        outcome: tick.results[0]!.outcome,
-        footprint: stripeFootprint(stripe),
-        attempts: inv?.attempts,
-        invoiceStatus: inv?.status,
-      });
-    }
-
-    const [returned, thrown] = outcomes;
-    assert.deepEqual(thrown, returned);
-    assert.equal(returned!.outcome, 'failed-retry-scheduled');
-    assert.equal(returned!.attempts, 1, 'the attempt still counts toward the park cap');
-    assert.equal(returned!.invoiceStatus, 'open');
-    // The behavior CHANGE this design bought the worker: a thrown decline used
-    // to hit the catch and leave the failed PI live. It is cancelled now.
-    assert.equal(returned!.footprint.cancels, 1, 'the failed intent is cancelled on both forks');
-
-    await cleanup();
-  },
-);
-
 // ──────────────────────────────────────────────────────────────────────────
 // 1b. RECORDED Stripe — the arm wire 1.8.0 exists for, reached at last
 //
@@ -514,84 +385,6 @@ test(
   },
 );
 
-test(
-  'POST /memberships — a RECORDED 3DS failure 402s with authentication_required and creates nothing',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    for (const [scenario, expected] of [
-      ['authentication-required', 'authentication_required'],
-      ['saved-card-declined', 'declined'],
-    ] as const) {
-      await cleanup();
-      const { app, stripe } = membershipsApp();
-      stripe.setNextIntentThrowsRecorded(scenario);
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/memberships',
-        headers: { 'idempotency-key': `pfc-mem-rec-${scenario}-${randomUUID()}` },
-        payload: {
-          dog_id: FIXTURE_IDS.dog1Id,
-          package_key: FIXTURE_IDS.creditPackageSchool5Key,
-          location: 'fayetteville',
-          term_months: 6,
-          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        },
-      });
-
-      assert.equal(res.statusCode, 402, `${scenario}: ${res.body}`);
-      const body = res.json() as { error: { code: string; details: { charge_blocker: string } } };
-      assert.equal(body.error.code, 'payment_failed');
-      assert.equal(body.error.details.charge_blocker, expected);
-      assert.equal(stripeFootprint(stripe).cancels, 1, 'the PI is cancelled before the refusal');
-      // Run what would go red if the refusal leaked past the guard.
-      const rows = await db
-        .select({ id: memberships.id })
-        .from(memberships)
-        .where(eq(memberships.ownerId, FIXTURE_IDS.ownerId));
-      assert.equal(rows.length, 0, 'no half-created membership');
-      assert.equal((await chargeRowsForOwner()).length, 0, 'the refusal beats withMutation');
-    }
-    await cleanup();
-  },
-);
-
-test(
-  'invoice auto-charge worker — a RECORDED 3DS failure takes the same arm as a decline',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    // The worker derives no blocker (its `payment-failed` push copy is
-    // deliberately blocker-agnostic), so this is a PIN, not a new behavior: the
-    // fix must not have disturbed the arm the worker travels. Cancel still
-    // fires, the attempt still counts, the schedule is unchanged.
-    for (const scenario of ['authentication-required', 'saved-card-declined'] as const) {
-      await cleanup();
-      const invoiceId = await seedOpenInvoice({
-        dueAt: '2026-01-01T00:00:00Z',
-        nextAttemptAt: '2026-01-01T00:00:00Z',
-      });
-      const stripe = makeStripeStub();
-      stripe.setNextIntentThrowsRecorded(scenario);
-
-      const tick = await runInvoiceAutoChargeOnce({
-        stripe,
-        limit: 1,
-        now: new Date('2026-02-01T12:00:00Z'),
-      });
-      const [inv] = await db
-        .select({ status: invoices.status, attempts: invoices.autoChargeAttempts })
-        .from(invoices)
-        .where(eq(invoices.id, invoiceId));
-
-      assert.equal(tick.results[0]!.outcome, 'failed-retry-scheduled', scenario);
-      assert.equal(inv?.attempts, 1, `${scenario}: the attempt still counts toward the park cap`);
-      assert.equal(inv?.status, 'open');
-      assert.equal(stripeFootprint(stripe).cancels, 1, `${scenario}: the failed intent is cancelled`);
-    }
-    await cleanup();
-  },
-);
-
 // ──────────────────────────────────────────────────────────────────────────
 // 2. A transport failure is not a decline
 // ──────────────────────────────────────────────────────────────────────────
@@ -657,50 +450,6 @@ test(
     assert.notEqual(res.statusCode, 201);
     assert.equal((res.json() as { error: { code: string } }).error.code, 'internal');
     assert.deepEqual(await chargeRowsForOwner(), []);
-
-    await cleanup();
-  },
-);
-
-test(
-  'invoice auto-charge worker — a transport error takes the catch and counts NOTHING (2026-08-12)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const invoiceId = await seedOpenInvoice({
-      dueAt: '2026-01-01T00:00:00Z',
-      nextAttemptAt: '2026-01-01T00:00:00Z',
-    });
-    const stripe = makeStripeStub();
-    stripe.setNextIntentThrowsTransport();
-
-    const tick = await runInvoiceAutoChargeOnce({
-      stripe,
-      limit: 1,
-      now: new Date('2026-02-01T12:00:00Z'),
-    });
-    // This assertion INVERTED on 2026-08-12
-    // (`designs/auto-charge-unknown-outcome.md`). It used to read
-    // `'failed-retry-scheduled'` + `attempts === 1`, and it was pinning the
-    // defect: counting a transport failure as a dunning attempt incremented
-    // `auto_charge_attempts`, which was the Stripe idempotency key's suffix, so
-    // the next tick charged a NEW PaymentIntent for money that may already have
-    // moved. The catch is the arm that runs when nobody knows what happened,
-    // and the only safe thing it can do is record the doubt and stop.
-    assert.equal(tick.results[0]!.outcome, 'unknown-outcome-pending');
-    const [inv] = await db
-      .select({ status: invoices.status, attempts: invoices.autoChargeAttempts })
-      .from(invoices)
-      .where(eq(invoices.id, invoiceId));
-    assert.equal(inv?.attempts, 0, 'an unknown outcome is not a dunning failure');
-    assert.equal(inv?.status, 'open');
-    // The catch has no intent id to cancel — that is precisely why the card
-    // fork must NOT arrive here any more.
-    assert.equal(stripeFootprint(stripe).cancels, 0);
-    // The doubt is on the books, which is what makes the verify lane possible.
-    const attempts = await invoiceChargeAttemptsRepository.findAllForInvoice(db, invoiceId);
-    assert.equal(attempts.length, 1, 'the attempt row was written BEFORE the Stripe call');
-    assert.equal(attempts[0]?.outcome, 'pending');
 
     await cleanup();
   },
@@ -895,43 +644,6 @@ test(
 );
 
 test(
-  'webhook: a MEMBERSHIP month-1 charge carrying package fields pushes nothing (§J.1)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const piId = `pi_mem_${randomUUID().slice(0, 8)}`;
-    // Same package metadata a membership month-1 PI carries — the one guard
-    // that knows the difference is `purpose: 'membership'`.
-    const charge = await withActor('test', async (tx) =>
-      chargesRepository.create(tx, {
-        ownerId: FIXTURE_IDS.ownerId,
-        amountCents: 25_000,
-        status: 'requires_payment',
-        purpose: 'package',
-        stripePaymentIntentId: piId,
-        dogId: FIXTURE_IDS.dog1Id,
-      }),
-    );
-    const { app, stripe } = webhookApp();
-
-    await postWebhook(app, stripe, {
-      id: `evt_${randomUUID().slice(0, 8)}`,
-      type: 'payment_intent.succeeded',
-      paymentIntentId: piId,
-      amountCents: 25_000,
-      metadata: { ...PACKAGE_METADATA, purpose: 'membership' },
-    });
-    assert.equal(
-      await scheduledNotificationsRepository.findByDedupeKey(db, `package-flip:${charge.id}`),
-      undefined,
-      'a membership month-1 PI is never a package purchase',
-    );
-
-    await cleanup();
-  },
-);
-
-test(
   'webhook: a RECONSTRUCTED orphan purchase also pushes (the owner has no 201 naming it)',
   SKIP_WHEN_NO_DB,
   async () => {
@@ -1004,56 +716,31 @@ test(
 );
 
 // ──────────────────────────────────────────────────────────────────────────
-// 4. The last reason-bearing producer (the other three are pinned in their
-//    own files: the parked-invoice push, the pay-in-person reminder, and the
-//    receipt that deliberately carries NO reason).
+// 4. The receipt, which deliberately carries no reason.
 // ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'invoice-overdue safety net — emits &reason=payment-due',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const invoiceId = await seedOpenInvoice({ dueAt: '2026-01-01T00:00:00Z' });
-
-    const result = await withActor('test', async (tx) =>
-      enqueueInvoiceOverdueWarnings(tx, new Date('2026-02-01T12:00:00Z')),
-    );
-    assert.equal(result.enqueued, 1, 'the scan found the overdue invoice');
-
-    const row = await scheduledNotificationsRepository.findByDedupeKey(
-      db,
-      `invoice-overdue:${invoiceId}`,
-    );
-    assert.equal(
-      row?.deepLinkPath,
-      `/account/invoices?invoiceId=${invoiceId}&reason=payment-due`,
-      'money is still owed — the sheet must open saying so',
-    );
-
-    await cleanup();
-  },
-);
 
 test(
   'the settle receipt deliberately carries NO reason (a paid invoice has no settle framing)',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
-    const invoiceId = await seedOpenInvoice({
-      dueAt: '2026-01-01T00:00:00Z',
-      nextAttemptAt: '2026-01-01T00:00:00Z',
+    const invoiceId = await seedOpenInvoice({ dueAt: '2026-01-01T00:00:00Z' });
+    const { app } = invoicesApp(); // default: succeeds
+    const res = await app.inject({
+      method: 'POST',
+      url: `/invoices/${invoiceId}/pay`,
+      headers: { 'idempotency-key': `receipt-${randomUUID()}` },
+      payload: {},
     });
-    const stripe = makeStripeStub(); // default: succeeds
-    await runInvoiceAutoChargeOnce({ stripe, limit: 1, now: new Date('2026-02-01T12:00:00Z') });
+    assert.equal(res.statusCode, 201, res.body);
 
     const [receipt] = await db
-      .select({ deepLinkPath: notifications.deepLinkPath })
-      .from(notifications)
+      .select({ deepLinkPath: scheduledNotifications.deepLinkPath })
+      .from(scheduledNotifications)
       .where(
         and(
-          eq(notifications.ownerId, FIXTURE_IDS.ownerId),
-          eq(notifications.type, 'payment-succeeded'),
+          eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId),
+          eq(scheduledNotifications.type, 'payment-succeeded'),
         ),
       );
     assert.equal(
@@ -1062,108 +749,6 @@ test(
       'byte-identical to the pre-1.9.0 path — a receipt opens a PAID invoice',
     );
 
-    await cleanup();
-  },
-);
-
-// Keep the fixture's membership repo import honest: the memberships test above
-// asserts absence through the table directly, and this guards the helper the
-// route uses to find an existing subscription (a stale one would make that
-// absence assertion pass for the wrong reason).
-test('fixture baseline: the owner holds no active school membership', SKIP_WHEN_NO_DB, async () => {
-  await cleanup();
-  const existing = await membershipsRepository.findActiveForDogMode(db, {
-    dogId: FIXTURE_IDS.dog1Id,
-    mode: 'school',
-  });
-  assert.equal(existing, undefined);
-});
-
-
-// ──────────────────────────────────────────────────────────────────────────
-// 5. Parking vs the overdue safety net (2026-09-03, design
-//    phase-1-poison-row-isolation.md A1.3 as corrected by A1-R). A parked row
-//    was never delivered, so it has not "told the owner" anything — but the
-//    two suppression keys mean different things and get different rules.
-// ──────────────────────────────────────────────────────────────────────────
-
-async function parkScheduledRow(dedupeKey: string): Promise<void> {
-  const updated = await db
-    .update(scheduledNotifications)
-    .set({ failedAt: new Date().toISOString(), attempts: 3 })
-    .where(eq(scheduledNotifications.dedupeKey, dedupeKey))
-    .returning({ id: scheduledNotifications.id });
-  assert.equal(updated.length, 1, `expected to park exactly one row for ${dedupeKey}`);
-}
-
-async function enqueueSuppressor(invoiceId: string, dedupeKey: string): Promise<void> {
-  // Type is 'payment-failed' for BOTH keys so `cleanup()` (which deletes by
-  // type) reaches them; the suppression predicate reads only `dedupe_key`.
-  const row = await db.transaction(async (tx) =>
-    scheduledNotificationsRepository.enqueueIdempotent(tx, {
-      ownerId: FIXTURE_IDS.ownerId,
-      type: 'payment-failed',
-      trigger: 'test-suppressor',
-      dedupeKey,
-      scheduledFor: new Date('2026-01-02T00:00:00Z'),
-      title: 'suppressor',
-      body: 'suppressor',
-      deepLinkPath: `/account/invoices?invoiceId=${invoiceId}`,
-      deepLinkKind: null,
-      deepLinkId: null,
-      bookingId: null,
-      dogId: null,
-    }),
-  );
-  assert.ok(row !== undefined, 'the suppressor row must insert');
-}
-
-test(
-  'overdue safety net — a PARKED payment-failed row must not suppress it (the owner was never told)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const invoiceId = await seedOpenInvoice({ dueAt: '2026-01-01T00:00:00Z' });
-    await enqueueSuppressor(invoiceId, `payment-failed:${invoiceId}`);
-
-    // Control: a LIVE (undelivered-but-pending) payment-failed row suppresses,
-    // exactly as before this change.
-    const suppressed = await withActor('test', async (tx) =>
-      enqueueInvoiceOverdueWarnings(tx, new Date('2026-02-01T12:00:00Z')),
-    );
-    assert.equal(suppressed.enqueued, 0, 'a pending payment-failed row still suppresses the nag');
-
-    // Park it: three failures, failed_at stamped, out of the claim forever.
-    await parkScheduledRow(`payment-failed:${invoiceId}`);
-    const unsuppressed = await withActor('test', async (tx) =>
-      enqueueInvoiceOverdueWarnings(tx, new Date('2026-02-01T12:00:00Z')),
-    );
-    assert.equal(
-      unsuppressed.enqueued,
-      1,
-      'a PARKED payment-failed row never reached the owner, so the overdue fallback must fire',
-    );
-    await cleanup();
-  },
-);
-
-test(
-  'overdue safety net — a PARKED payment-unconfirmed row STILL suppresses it (money may be in flight)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const invoiceId = await seedOpenInvoice({ dueAt: '2026-01-01T00:00:00Z' });
-    await enqueueSuppressor(invoiceId, `payment-unconfirmed:${invoiceId}`);
-    await parkScheduledRow(`payment-unconfirmed:${invoiceId}`);
-
-    const result = await withActor('test', async (tx) =>
-      enqueueInvoiceOverdueWarnings(tx, new Date('2026-02-01T12:00:00Z')),
-    );
-    assert.equal(
-      result.enqueued,
-      0,
-      'payment-unconfirmed suppresses regardless of delivery: a "check your card" nag on top of an unknown outcome is the double-charge path',
-    );
     await cleanup();
   },
 );

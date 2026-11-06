@@ -48,7 +48,7 @@ flowchart TD
   PORTAL -->|"HTTPS + Bearer JWT"| MW
   MW --> SVC --> DAL --> PG
   SVC <-->|"read-through cache / invalidate on write"| REDIS
-  SVC -->|"PaymentIntent / SetupIntent / Subscription"| STRIPE
+  SVC -->|"PaymentIntent / SetupIntent"| STRIPE
   STRIPE -->|"signed webhook → charges / credit_ledger"| MW
   SVC -->|"booking-confirmed · report-published · message"| EXPO
   EXPO -->|"APNs / FCM"| RN
@@ -261,13 +261,6 @@ erDiagram
     charge_purpose purpose
     uuid booking_id FK
   }
-  memberships {
-    uuid id PK
-    uuid owner_id FK
-    uuid dog_id FK
-    booking_mode mode
-    text stripe_subscription_id UK
-  }
   refunds {
     uuid id PK
     uuid owner_id FK
@@ -402,7 +395,6 @@ erDiagram
   owners ||--o{ threads : participates
   owners ||--o{ payment_methods : has
   owners ||--o{ charges : billed
-  owners ||--o{ memberships : subscribes
   owners ||--o{ notifications : receives
   owners ||--o| stripe_customers : maps
   owners ||--o{ event_rsvps : rsvps
@@ -430,7 +422,6 @@ erDiagram
   dogs ||--o{ thread_dogs : about
   dogs ||--o{ event_rsvp_dogs : attends
   dogs ||--o{ notification_dogs : about
-  dogs ||--o{ memberships : covered
 
   group_classes ||--o{ cohorts : runs
   group_classes ||--o{ dog_completed_classes : credited
@@ -444,7 +435,7 @@ erDiagram
   dogs ||--o{ after_school_optins : opts-in
   bookings ||--o| reports : "report_id (1:1)"
   bookings ||--o{ credit_ledger : debits
-  bookings ||--o{ charges : "pays (payg)"
+  bookings ||--o{ charges : pays
 
   pending_requests ||--o{ pending_request_dogs : includes
   pending_requests ||--o{ pending_request_preferred_dates : ranks

@@ -57,8 +57,6 @@ export const SEED = {
   // Billing ledger for Allison (the full-history owner the owner-app dev
   // principal should point at) — one row per FE ledger kind/status.
   chargePackageId: 'c0a50000-0000-4000-8000-000000000001',
-  chargePaygId: 'c0a50000-0000-4000-8000-000000000002',
-  chargeMembershipId: 'c0a50000-0000-4000-8000-000000000003',
   chargeRefundedId: 'c0a50000-0000-4000-8000-000000000004',
   invoiceOpenId: '12005000-0000-4000-8000-000000000001',
 

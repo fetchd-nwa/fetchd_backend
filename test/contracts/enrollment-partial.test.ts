@@ -2425,14 +2425,14 @@ test(
 );
 
 test(
-  '§9.24c the INVOICE carries its OWN enrollment’s anchor, and every invoice-lane charge copies it',
+  '§9.24c the INVOICE carries its OWN enrollment’s anchor, and the anchor rule hands it on (driven through the first half, which no production path calls)',
   SKIP_WHEN_NO_DB,
   async () => {
     // **This test's premise was REVERSED by ADDENDUM 3 §A3.18 D1.** §A3.17
     // ruled that invoices themselves stay unstamped and the charge would
     // RESOLVE its anchor from the live set at settle time. The adversary
-    // executed the cost: the webhook settle lane deliberately settles VOIDED
-    // invoices, so a settle landing after a withdraw + re-enroll filed the OLD
+    // executed the cost: the webhook settle lane, gone since P17, deliberately settled
+    // VOIDED invoices, so a settle landing after a withdraw + re-enroll filed the OLD
     // enrollment's money under the NEW one — and stamping NULL instead was no
     // better, because a late settle post-dates the new enrollment's birth and
     // the legacy time rule then claims it by construction.
@@ -2441,6 +2441,11 @@ test(
     // tx that created those bookings, and the charge simply COPIES it. The
     // asserted direction below is the exact inverse of what this test asserted
     // when it was written, which is the honest way to record a reversal.
+    //
+    // What this holds since P17 is the rule, `resolveInvoiceAnchorBookingId`, driven
+    // through `settleInvoiceCharge()`'s first half, which no production path calls
+    // (DECISIONS 168(a), 169(a)). The live write is `/pay`'s tx1: the anchor tests in
+    // `invoice-pay.test.ts` hold that.
     const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, weeks: 4 });
     const { app } = enrollApp();
     const res = await postPartial({
@@ -2453,9 +2458,11 @@ test(
     assert.equal(res.statusCode, 201, res.body);
     const sessions = await sessionRowsFor(cohort.id, FIXTURE_IDS.dog1Id);
 
-    // The enrollment is GONE before the settle lands — the R11 worker/withdraw
-    // race, and the shape the webhook's void-settle arm exists for. The anchor
-    // must NOT follow the world; it must name the enrollment this money was for.
+    // The enrollment is GONE before the rule runs. The R11 worker/withdraw race and
+    // the webhook's void-settle arm staged this and both left at P17, so no live path
+    // lands here: on a real signed event this world answers `orphan-event`. The rule
+    // stands: the anchor must NOT follow the world, it must name the enrollment this
+    // money was for.
     await db
       .update(bookingsTable)
       .set({ status: 'cancelled' })
@@ -2474,6 +2481,7 @@ test(
       );
       const invoice = await invoicesRepository.findById(tx, invoiceRow.id);
       assert.ok(invoice);
+      // The first half, called by hand: the anchor rule, not a settle path.
       return settleInvoiceCharge(tx, {
         invoice,
         paymentIntentId: `pi_paylater_${randomUUID().slice(0, 12)}`,
@@ -2489,10 +2497,11 @@ test(
     assert.equal(
       paid?.bookingId,
       sessions[0]!.id,
-      'the charge copies it — a CANCELLED anchor, which is exactly right: this money belongs to the enrollment that no longer exists',
+      'the first half’s charge copies it — a CANCELLED anchor, which is exactly right: this money belongs to the enrollment that no longer exists',
     );
 
-    // **An unstamped invoice is no longer a silent NULL (§A3.19 F2 re-pin.)**
+    // **An unstamped invoice is no longer a silent NULL (§A3.19 F2).** The rule
+    // again, through the first half; `/pay`'s no-witness test holds the live write.
     // This invoice is minted by its own transaction with no bookings written in
     // it, so the same-transaction witness finds nothing — the fallback's
     // FAILURE arm — and that is the only remaining way a post-deploy

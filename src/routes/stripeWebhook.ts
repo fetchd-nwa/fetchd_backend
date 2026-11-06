@@ -102,12 +102,12 @@ export function registerStripeWebhookRoute(
       /** A dispatch's success path, for a first delivery and a re-dispatch alike. */
       const finishDispatch = async (result: WebhookHandlerResult): Promise<void> => {
         await stripeEventsRepository.markProcessed(event.id);
-        // Post-commit Stripe refund when settling an orphaned invoice charge
-        // LOST the `markPaid` race — the owner had already paid that invoice, so
-        // this PaymentIntent double-bills and its 'pending' refund row is
-        // waiting. Fired here, never inside the handler's tx (R5), exactly as
-        // the auto-charge worker fires its own; a failure leaves the pending
-        // row for retry rather than a silent double charge. This is the second
+        // Post-commit Stripe refund when an order's settle LOST the `markPaid`
+        // race — the owner had already paid that invoice, so this
+        // PaymentIntent double-bills and its 'pending' refund row is
+        // waiting. Fired here, never inside the handler's tx (R5); a failure
+        // leaves the pending row for retry rather than a silent double charge.
+        // This is the second
         // half of "two charges, one refund, no human".
         await firePendingRefundPostCommit({
           pending: result.pendingStripeRefund,

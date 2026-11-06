@@ -504,24 +504,6 @@ test(
 );
 
 test(
-  'runSchedulerTickOnce — invoice auto-charge tick composes (empty queue returns scanned=0)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await clearScheduled();
-    const expoPush = makeExpoPushStub();
-    const result = await runSchedulerTickOnce({
-      expoPush,
-      now: new Date('2026-05-26T12:00:00Z'),
-    });
-    // No invoices seeded → invoice phase reports empty scan, no throws.
-    // The composition contract is the assertion: scheduler tick returns
-    // a non-undefined invoiceAutoCharge result.
-    assert.ok(result.invoiceAutoCharge);
-    assert.equal(typeof result.invoiceAutoCharge.scanned, 'number');
-  },
-);
-
-test(
   'runSchedulerTickOnce — media-derivatives tick composes (empty queue returns scanned=0)',
   SKIP_WHEN_NO_DB,
   async () => {
@@ -871,7 +853,6 @@ test(
       // The phases BEHIND it ran: the TTL sweep is the last phase and always
       // reports a count, and the money phases each report a scan.
       assert.equal(typeof result.idempotencyKeysSwept, 'number');
-      assert.equal(typeof result.invoiceAutoCharge.scanned, 'number');
       assert.equal(typeof result.captureReconciler.scanned, 'number');
       // Exactly one alarm, and it names the phase — the alarm channel is the
       // logger (workersTick.ts hands `request.log`), so this IS the page.

@@ -183,7 +183,7 @@ async function paymentFailedNotices() {
     );
 }
 
-async function invoiceCard(id: string): Promise<string | undefined> {
+async function invoiceCard(id: string): Promise<string | null | undefined> {
   const [row] = await db
     .select({ paymentMethodId: invoices.paymentMethodId })
     .from(invoices)

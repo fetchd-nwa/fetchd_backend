@@ -9,20 +9,11 @@ import {
 import { shouldSkipPush } from '../lib/pushPreferences.js';
 import type { NotificationPushData } from '../contracts/wire.js';
 import { IDEMPOTENCY_OPEN_CLAIM_MAX_DAYS, sweepExpiredIdempotencyKeys } from '../db/idempotency.js';
-import {
-  enqueueAlumniAttendanceFlags,
-  type AlumniAttendanceScanResult,
-} from '../lib/alumniAttendanceScan.js';
 import { type EnqueueCreditExpiryWarningsResult } from '../lib/enqueueCreditExpiryWarnings.js';
-import {
-  enqueueInvoiceOverdueWarnings,
-  type EnqueueInvoiceOverdueWarningsResult,
-} from '../lib/enqueueInvoiceOverdueWarnings.js';
 import {
   enqueueCardExpiryWarnings,
   type EnqueueCardExpiryWarningsResult,
 } from '../lib/enqueueCardExpiryWarnings.js';
-import { rollDueMemberships, type MembershipRollResult } from '../lib/membershipRoll.js';
 import { withActor, type Tx } from '../db/tx.js';
 import {
   defaultExpoPushClient,
@@ -33,23 +24,13 @@ import {
 import type { R2Client } from '../lib/r2.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { runCaptureReconcilerOnce, type CaptureReconcilerTickResult } from './captureReconciler.js';
-import { runInvoiceAutoChargeOnce, type InvoiceAutoChargeTickResult } from './invoiceAutoCharge.js';
-import {
-  runInvoiceAttemptVerifyOnce,
-  type InvoiceAttemptVerifyTickResult,
-} from './invoiceAttemptVerify.js';
 import {
   runDuplicateRefundRetryOnce,
   type DuplicateRefundRetryTickResult,
 } from './duplicateRefundRetry.js';
 import { runOrderSweeperOnce, type OrderSweeperTickResult } from './orderSweeper.js';
 import { runMediaDerivativesOnce, type MediaDerivativesTickResult } from './mediaDerivatives.js';
-
-interface WorkerLogger {
-  info(obj: Record<string, unknown>, msg?: string): void;
-  warn(obj: Record<string, unknown>, msg?: string): void;
-  error(obj: Record<string, unknown>, msg?: string): void;
-}
+import type { WorkerLogger } from './workerLogger.js';
 
 /**
  * Scheduler worker (Day 16). One-shot function — production drives it
@@ -68,46 +49,23 @@ interface WorkerLogger {
  *      broken row fails alone and PARKS after `MAX_DELIVERY_ATTEMPTS`
  *      instead of rolling back every batch-mate on every tick forever.
  *
- *   2. **§J.1 membership roll.** Open each due subscription's next month
- *      (advance period + card-backed invoice) or hard-stop at term end.
- *      Before the charge pass so a rolled invoice charges this tick.
+ *   2. **Capture reconciler** (2026-08-20, wire 1.11.0). Finish collecting
+ *      money we already HOLD. Manual capture on `POST /enrollments` leaves one
+ *      new state behind — a dog enrolled with its authorization not yet
+ *      captured — and this phase captures it, or raises the one alarm a human
+ *      must see: an enrolled dog whose hold is GONE will never be charged.
  *
- *   3a. **Invoice attempt verify** (2026-08-12,
- *      `designs/auto-charge-unknown-outcome.md`). Resolve every auto-charge
- *      attempt whose outcome is still unknown — retrieve the PaymentIntent
- *      when its id is known, re-issue the identical request under the SAME
- *      idempotency key when it isn't, park for a human past the window.
- *      Deliberately BEFORE the charge pass: the charge lane refuses to charge
- *      an invoice with an unresolved attempt, so resolving doubt first is what
- *      keeps that refusal from also meaning "and therefore never charged".
+ *   3. **Order sweeper** (P15, design §2.7:3953-3974). Take every order charge
+ *      past its lease and settle it forward, or abandon it if no intent id was
+ *      stored. It never tries a card.
  *
- *   3a-ter. **Capture reconciler** (2026-08-20, wire 1.11.0). Finish
- *      collecting money we already HOLD. Manual capture on `POST /enrollments`
- *      leaves one new state behind — a dog enrolled with its authorization not
- *      yet captured — and this phase captures it, or raises the one alarm a
- *      human must see: an enrolled dog whose hold is GONE will never be
- *      charged. Before the charge pass for the same reason as its neighbours:
- *      resolve what is already in flight before starting anything new.
+ *   4. **Duplicate-refund retry** (2026-08-12). Re-fire lost-race refund rows
+ *      still `pending` with no `stripe_refund_id`, under the SAME idempotency
+ *      key the first attempt used.
  *
- *   3a-quater. **Order sweeper** (P15, design §2.7:3953-3974). Take every order
- *      charge past its lease and settle it forward, or abandon it if no intent id
- *      was stored. It never tries a card. Before the charge pass for the same
- *      reason as its neighbours.
+ *   5. **Media derivatives** (Day 17). Claim → sharp → settle per job.
  *
- *   3a-bis. **Duplicate-refund retry** (2026-08-12). Re-fire lost-race refund
- *      rows still `pending` with no `stripe_refund_id`, under the SAME
- *      idempotency key the first attempt used. Before the charge pass for the
- *      same reason the verify lane is: money we already owe back outranks
- *      money we are about to ask for.
- *
- *   3b. **Invoice auto-charge.** Compose Day-15's
- *      `runInvoiceAutoChargeOnce` so one cron firing handles BOTH
- *      outbound notifications AND invoice dunning — fewer moving parts
- *      operationally.
- *
- *   4. **Media derivatives** (Day 17). Claim → sharp → settle per job.
- *
- *   5. **Credit-expiry warnings — retired at 2.0.0** (S01, design §2.1,
+ *   6. **Credit-expiry warnings — retired at 2.0.0** (S01, design §2.1,
  *      r3-fable #2). The scan read `credit_expiry_settings.warning_lead_days`
  *      (60), a store no setting names from 2.0.0, so every one-month lot was
  *      inside its window the day it was bought. The phase no longer runs; its
@@ -115,33 +73,29 @@ interface WorkerLogger {
  *      CRED-U13 builds the real notice off `cred.expiry_warning_lead_days` at
  *      7.1.0; S25 (M4.07) removes the scan and its table.
  *
- *   6. **§J.3 alumni attendance** (monthly, self-gated on the 1st
- *      Chicago). Flag + notify alumni dogs under 2 attended qualifying
- *      sessions in the just-closed month.
+ *   7. **Expiring default cards.** Enqueue `card-expiring` before the owner's
+ *      default card lapses, and once after.
  *
- *   7. **Overdue invoices.** Enqueue `invoice-overdue` for card-backed
- *      invoices still open past their grace window.
- *
- *   8. **Expiring default cards.** Enqueue `card-expiring` before the
- *      card that backs every auto-charge lapses, and once after.
- *
- *   9. **`idempotency_keys` TTL sweep.** Prune completed rows past the
+ *   8. **`idempotency_keys` TTL sweep.** Prune completed rows past the
  *      retry-safety window (24h) and open ones past 7 days: an open claim may
  *      be the only record of an order still processing, so it must outlive the
  *      window a completed one gets. One Postgres DELETE; runs on the pool runner
  *      outside any tx.
  *
+ * **No worker bills a card on its own.** The auto-charge lane left at wire
+ * 5.0.0-lg4.1 (P17, PAY-U15): no phase here charges an invoice, retries one or
+ * chases one. The money phases above finish a charge a person already started,
+ * or send back what is owed.
+ *
  * Failures are logged-and-swallowed at each phase boundary — every phase since
  * 2026-09-03 (phase 1 was the lone exception, and that hole was the
- * 2026-09-02 production incident) — so a flaky Expo call can't block invoice
- * dunning, and a stuck dunning attempt can't block the TTL sweep. Returns a
+ * 2026-09-02 production incident) — so a flaky Expo call can't block the money
+ * phases, and a stuck money phase can't block the TTL sweep. Returns a
  * per-phase result summary.
  *
  * The scheduler actor — `system:scheduler` — is distinct from the
- * Day-15 invoice worker's `system:stripe-webhook`. Different
- * principal-of-mutation = different audit-log lineage. The composed
- * invoice run inside this scheduler tick keeps its own actor (Day-15
- * decision), so audit trails remain readable.
+ * webhook's `system:stripe-webhook`. Different principal-of-mutation =
+ * different audit-log lineage, so audit trails remain readable.
  */
 
 const SCHEDULER_ACTOR = 'system:scheduler';
@@ -172,15 +126,11 @@ export interface SchedulerTickOpts {
   expoPush?: ExpoPushClient;
   /** R2 client for the media-derivatives phase (Day 17). */
   r2?: R2Client;
-  /** Stripe client for the invoice auto-charge phase. Defaults to the
-   *  production client inside `runInvoiceAutoChargeOnce`; the §J lifecycle
-   *  integration test injects the stub to drive roll → charge → settle
-   *  through one composed tick. */
+  /** Stripe client for the money phases. Defaults to the production client
+   *  inside each phase; tests inject the stub. */
   stripe?: StripeClient;
   /** Per-tick batch size for the scheduled_notifications scan. Default 50. */
   notificationsLimit?: number;
-  /** Per-tick batch size for the invoice auto-charge scan. Default 50. */
-  invoiceLimit?: number;
   /** Per-tick batch size for the media-derivatives scan. Default 5
    *  (sharp is CPU-bound; small batch keeps tick latency bounded). */
   mediaDerivativesLimit?: number;
@@ -228,17 +178,12 @@ export interface ScheduledNotificationsTickResult {
 
 export interface SchedulerTickResult {
   scheduledNotifications: ScheduledNotificationsTickResult;
-  membershipRoll: MembershipRollResult;
-  invoiceOverdue: EnqueueInvoiceOverdueWarningsResult;
   cardExpiry: EnqueueCardExpiryWarningsResult;
-  invoiceAttemptVerify: InvoiceAttemptVerifyTickResult;
   captureReconciler: CaptureReconcilerTickResult;
   orderSweeper: OrderSweeperTickResult;
   duplicateRefundRetry: DuplicateRefundRetryTickResult;
-  invoiceAutoCharge: InvoiceAutoChargeTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
   creditExpiryWarnings: EnqueueCreditExpiryWarningsResult;
-  alumniAttendance: AlumniAttendanceScanResult;
   idempotencyKeysSwept: number;
 }
 
@@ -251,8 +196,7 @@ const NOOP_LOG: WorkerLogger = {
 /**
  * Run one scheduler tick. Safe to call concurrently — the
  * `FOR UPDATE SKIP LOCKED` claim ensures each scheduled row is processed
- * by exactly one worker; the invoice sub-tick inherits the same lock
- * discipline from Day-15.
+ * by exactly one worker.
  */
 export async function runSchedulerTickOnce(
   opts: SchedulerTickOpts = {},
@@ -265,9 +209,8 @@ export async function runSchedulerTickOnce(
   // boundary, like every sibling phase below. It was the ONLY phase without one
   // until 2026-09-03: on 2026-09-02 the first production tick hit a schema drift
   // here (`column "deep_link_kind" does not exist`), the throw escaped, the
-  // route answered 500, and phases 2–12 — including the four money phases —
-  // never ran, 27 ticks in a row. The comment at phase 3b below records the
-  // previous time this exact class was found about a different phase.
+  // route answered 500, and every later phase, the money phases included, never
+  // ran, 27 ticks in a row.
   let notificationsResult: ScheduledNotificationsTickResult = {
     scanned: 0,
     sent: 0,
@@ -305,63 +248,10 @@ export async function runSchedulerTickOnce(
     );
   }
 
-  // Phase 2 — §J.1 membership roll. Runs BEFORE the invoice auto-charge so a
-  // freshly-rolled month's invoice (due_at = period start ≤ now) is scooped
-  // by THIS tick's charge pass rather than waiting a full tick. Own tx, own
-  // log-and-swallow boundary so a roll failure can't block dunning.
-  let membershipRollResult: MembershipRollResult = { scanned: 0, rolled: 0, completed: 0 };
-  try {
-    membershipRollResult = await withActor(SCHEDULER_ACTOR, (tx) => rollDueMemberships(tx, now));
-    log.info(
-      {
-        workerTick: 'scheduler',
-        phase: 'membership-roll',
-        scanned: membershipRollResult.scanned,
-        rolled: membershipRollResult.rolled,
-        completed: membershipRollResult.completed,
-      },
-      'membership roll complete',
-    );
-  } catch (err) {
-    log.error(
-      {
-        workerTick: 'scheduler',
-        phase: 'membership-roll',
-        err: err instanceof Error ? err.message : String(err),
-      },
-      'membership-roll phase threw at the worker boundary; will retry next tick',
-    );
-  }
-
-  // Phase 3a — resolve unknown auto-charge outcomes BEFORE charging anything.
-  // Its own log-and-swallow boundary: a Stripe outage in the verify lane must
-  // not stop the dunning ladder for every other invoice (the charge lane
-  // refuses only the invoices that actually carry an unresolved attempt).
-  let invoiceAttemptVerifyResult: InvoiceAttemptVerifyTickResult = { scanned: 0, results: [] };
-  try {
-    invoiceAttemptVerifyResult = await runInvoiceAttemptVerifyOnce({
-      ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
-      now,
-      log,
-    });
-  } catch (err) {
-    log.error(
-      {
-        workerTick: 'scheduler',
-        phase: 'invoice-attempt-verify',
-        err: err instanceof Error ? err.message : String(err),
-      },
-      'invoice-attempt-verify phase threw at the worker boundary; will retry next tick',
-    );
-  }
-
-  // Phase 3a-ter — finish collecting money we already HOLD, before anything
-  // else touches a card. Manual capture (wire 1.11.0) leaves exactly one new
-  // state behind — a dog enrolled with its authorization not yet captured —
-  // and this is the phase that closes it or names it. It runs before the
-  // charge lane for the same reason the verify lane does: resolve what is
-  // already in flight before starting anything new. Own log-and-swallow
-  // boundary like every sibling.
+  // Phase 2 — finish collecting money we already HOLD. Manual capture (wire
+  // 1.11.0) leaves exactly one new state behind — a dog enrolled with its
+  // authorization not yet captured — and this is the phase that closes it or
+  // names it. Own log-and-swallow boundary like every sibling.
   let captureReconcilerResult: CaptureReconcilerTickResult = {
     scanned: 0,
     captured: 0,
@@ -392,7 +282,7 @@ export async function runSchedulerTickOnce(
     );
   }
 
-  // Phase 3a-quater — the order sweeper. Crash recovery, forward only, with its own
+  // Phase 3 — the order sweeper. Crash recovery, forward only, with its own
   // log-and-swallow boundary like every sibling.
   let orderSweeperResult: OrderSweeperTickResult = {
     scanned: 0,
@@ -421,11 +311,10 @@ export async function runSchedulerTickOnce(
     );
   }
 
-  // Phase 3a-bis — send back the money we already know we owe, BEFORE charging
-  // anyone anything new. These are `refunds` rows written 'pending' by a lost
-  // settle race whose post-commit Stripe call failed; nothing retried them
-  // until this phase existed, so each one was a permanent double charge. Own
-  // log-and-swallow boundary like every sibling.
+  // Phase 4 — send back the money we already know we owe. These are `refunds`
+  // rows written 'pending' by a lost settle race whose post-commit Stripe call
+  // failed; nothing retried them until this phase existed, so each one was a
+  // permanent double charge. Own log-and-swallow boundary like every sibling.
   let duplicateRefundRetryResult: DuplicateRefundRetryTickResult = {
     scanned: 0,
     sent: 0,
@@ -457,32 +346,7 @@ export async function runSchedulerTickOnce(
     );
   }
 
-  // Phase 3b — the charge lane. Its own log-and-swallow boundary, like every
-  // sibling phase: it was the ONLY phase without one, and the thing most likely
-  // to throw out of it is the DB interlock (`invoice_charge_attempts_unresolved_uq`)
-  // doing its job. That would have cost the remaining leased invoices AND every
-  // later phase — media derivatives, credit expiry, the idempotency sweep —
-  // once a minute for as long as the condition held.
-  let invoiceResult: InvoiceAutoChargeTickResult = { scanned: 0, results: [] };
-  try {
-    invoiceResult = await runInvoiceAutoChargeOnce({
-      ...(opts.stripe !== undefined ? { stripe: opts.stripe } : {}),
-      limit: opts.invoiceLimit,
-      now,
-      log,
-    });
-  } catch (err) {
-    log.error(
-      {
-        workerTick: 'scheduler',
-        phase: 'invoice-auto-charge',
-        err: err instanceof Error ? err.message : String(err),
-      },
-      'invoice-auto-charge phase threw at the worker boundary; will retry next tick',
-    );
-  }
-
-  // Phase 4 — media derivatives (Day 17). Each job runs claim → sharp →
+  // Phase 5 — media derivatives (Day 17). Each job runs claim → sharp →
   // settle independently; failures stay parked on the job row and don't
   // block the rest of the tick. The composed worker uses its own R2
   // client seam (defaults to the production client when not injected).
@@ -505,7 +369,7 @@ export async function runSchedulerTickOnce(
     mediaDerivativesResult = { scanned: 0, results: [] };
   }
 
-  // Phase 5 — credit-expiry warnings: RETIRED at 2.0.0 (S01; see the header).
+  // Phase 6 — credit-expiry warnings: RETIRED at 2.0.0 (S01; see the header).
   // `enqueueCreditExpiryWarnings` read the legacy 60-day lead, so it noticed a
   // one-month lot the day it was bought. Nothing calls it from here; the result
   // stays zero so `creditExpiryWarnings*` keep their place in the tick log.
@@ -514,76 +378,8 @@ export async function runSchedulerTickOnce(
     enqueued: 0,
   };
 
-  // Phase 6 — §J.3 alumni attendance (monthly). Self-gated on the 1st
-  // (Chicago) inside the scan; every other day it returns `ran: false` at the
-  // cost of one Intl format. Enqueues `alumni-attendance` notifications +
-  // stamps `dogs.alumni_attendance_flagged_at` for alumni dogs that attended
-  // <2 qualifying sessions in the just-closed month. Own tx, own
-  // log-and-swallow boundary.
-  let alumniAttendanceResult: AlumniAttendanceScanResult = {
-    ran: false,
-    scanned: 0,
-    enqueued: 0,
-    flagged: 0,
-  };
-  try {
-    alumniAttendanceResult = await withActor(SCHEDULER_ACTOR, (tx) =>
-      enqueueAlumniAttendanceFlags(tx, now),
-    );
-    if (alumniAttendanceResult.ran) {
-      log.info(
-        {
-          workerTick: 'scheduler',
-          phase: 'alumni-attendance',
-          scanned: alumniAttendanceResult.scanned,
-          enqueued: alumniAttendanceResult.enqueued,
-          flagged: alumniAttendanceResult.flagged,
-        },
-        'alumni-attendance monthly scan complete',
-      );
-    }
-  } catch (err) {
-    log.error(
-      {
-        workerTick: 'scheduler',
-        phase: 'alumni-attendance',
-        err: err instanceof Error ? err.message : String(err),
-      },
-      'alumni-attendance phase threw at the worker boundary; will retry next tick',
-    );
-  }
-
-  // Phase 7 — overdue invoices (Allison 2026-07-29). The safety net beneath the
-  // auto-charge lane: a card-backed invoice still open past its grace window
-  // that nothing else has told the owner about. Own tx, own log-and-swallow
-  // boundary, same as every scan phase above.
-  let invoiceOverdueResult: EnqueueInvoiceOverdueWarningsResult = { scanned: 0, enqueued: 0 };
-  try {
-    invoiceOverdueResult = await withActor(SCHEDULER_ACTOR, (tx) =>
-      enqueueInvoiceOverdueWarnings(tx, now),
-    );
-    log.info(
-      {
-        workerTick: 'scheduler',
-        phase: 'invoice-overdue',
-        scanned: invoiceOverdueResult.scanned,
-        enqueued: invoiceOverdueResult.enqueued,
-      },
-      'invoice-overdue scan complete',
-    );
-  } catch (err) {
-    log.error(
-      {
-        workerTick: 'scheduler',
-        phase: 'invoice-overdue',
-        err: err instanceof Error ? err.message : String(err),
-      },
-      'invoice-overdue phase threw at the worker boundary; will retry next tick',
-    );
-  }
-
-  // Phase 8 — expiring default cards (Allison 2026-07-29). Warns before the
-  // card that backs every auto-charge lapses, and once more after it has.
+  // Phase 7 — expiring default cards (Allison 2026-07-29). Warns before the
+  // owner's default card lapses, and once more after it has.
   let cardExpiryResult: EnqueueCardExpiryWarningsResult = { scanned: 0, enqueued: 0 };
   try {
     cardExpiryResult = await withActor(SCHEDULER_ACTOR, (tx) => enqueueCardExpiryWarnings(tx, now));
@@ -634,16 +430,11 @@ export async function runSchedulerTickOnce(
 
   return {
     scheduledNotifications: notificationsResult,
-    membershipRoll: membershipRollResult,
-    invoiceAttemptVerify: invoiceAttemptVerifyResult,
     captureReconciler: captureReconcilerResult,
     orderSweeper: orderSweeperResult,
     duplicateRefundRetry: duplicateRefundRetryResult,
-    invoiceAutoCharge: invoiceResult,
     mediaDerivatives: mediaDerivativesResult,
     creditExpiryWarnings: creditExpiryWarningsResult,
-    alumniAttendance: alumniAttendanceResult,
-    invoiceOverdue: invoiceOverdueResult,
     cardExpiry: cardExpiryResult,
     idempotencyKeysSwept,
   };

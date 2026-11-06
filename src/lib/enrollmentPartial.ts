@@ -56,7 +56,7 @@ import {
  *      Structurally, not by discipline: this module does not import it, and
  *      the route's failure paths route through here.
  *
- * Enrollments-scoped today. When B&T and memberships convert, this generalizes
+ * Enrollments-scoped today. When B&T converts, this generalizes
  * into the shared `grantSiteCapture.ts` the money-safety design names — noted
  * so a single-site helper isn't read as drift from it.
  */

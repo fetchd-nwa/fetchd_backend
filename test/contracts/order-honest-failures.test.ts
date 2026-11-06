@@ -20,7 +20,6 @@ import { registerStaffOrdersRoute } from '../../src/routes/staffOrders.js';
 import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
 import { PAY_HOLD_SEED_MS } from '../../src/lib/confirmCharge.js';
 import type { StripeWebhookEvent } from '../../src/lib/stripe.js';
-import { parkArmForBlocker } from '../../src/workers/invoiceAutoCharge.js';
 import { runOrderSweeperOnce } from '../../src/workers/orderSweeper.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -714,9 +713,5 @@ for (const [blocker, code, declineCode] of HONEST_REASONS) {
 
     assert.equal((await chargeRow(seeded.chargeId)).blocker, blocker);
     assert.equal((await storedDetails(seeded.claimKey)).charge_blocker, blocker);
-  });
-
-  test(`PAY-U06: the auto-charge park reads ${blocker} as a decline, not an unknown`, () => {
-    assert.equal(parkArmForBlocker(blocker), 'declined');
   });
 }

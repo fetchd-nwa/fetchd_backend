@@ -5593,3 +5593,41 @@ they do not say. Code: `src/lib/confirmCharge.ts`, `src/lib/cancelOrder.ts`,
   caller. tx1's booking arm and the settle's top-up and pack arms are P18's, so a
   charge whose order names no invoice reaching `succeeded` raises one named alarm and
   commits nothing. The cancel side runs on seeded rows until then.
+
+## Q. Memberships, the auto-charge lane and the alumni scan left (wire 5.0.0-lg4.1, 2026-11-06)
+
+Plan unit P17, slice S28; CRED-U29, PAY-U15, MSG-U35, ALUM-U16, ALUM-U17, ALUM-U01;
+design `designs/fetchd-v1-technical-design.md` §2.4:2834-2855; M4.01-M4.04; DECISIONS
+162. A dated entry: what §J, §K.2, §N and the sections before them say about these
+stands as the record of what was built, and this says what left. The shapes are in
+`src/contracts/wire.ts`.
+
+- **No membership product.** `POST`/`GET /memberships`, `DELETE /memberships/:id`,
+  `POST /staff/memberships/:id/pause` and `/resume`, the `memberships` table and
+  `invoices.membership_id` are gone. A pack is a one-time purchase (CRED-50).
+- **No worker bills a card on its own.** The auto-charge worker, the attempt-verify
+  lane, the dunning ladder, `invoice_charge_attempts`, `invoices.next_attempt_at`,
+  `invoices.auto_charge_attempts`, `GET /staff/invoices?parked` and the overdue scan are
+  gone (q87's default). This is narrower than "no off-session charge": staff may charge
+  the card on file through a custom invoice (PAY-41). `POST /invoices/:id/pay` and
+  `settleInvoiceCharge` stay. `invoices.payment_method_id` is nullable, and nothing
+  writes a NULL until P25.
+- **The webhook's invoice-orphan arm left too** (§K.2's `metadata.invoice_id` reconciler;
+  DECISIONS 167(b)). Nothing stamps `invoice_id` on an intent, so a succeeded one naming
+  an invoice with no `charges` row answers `orphan-event` and writes nothing.
+- **Class `pay_later` stays until P29 and nothing bills it** (DECISIONS 162(a),
+  Blocked #16). The arm keeps minting open invoices, and the owner pays through
+  `POST /invoices/:id/pay`.
+- **The labels.** M4.02 rebuilt `charge_purpose` without `membership` and `payg`,
+  `ledger_reason` without `membership-grant`, and `notification_type` without
+  `membership-ended` and `alumni-attendance`, first snapshotting every row it deleted
+  into `audit_log` (`op 'MIGRATION-DROP'`, actor `system:migration:M4.02`). A row another
+  money row references fails the step. `invoice-overdue` keeps its label and has no
+  writer (C5). `InvoiceDeepLinkReason` lost `payment-unconfirmed`; a stored path is not
+  rewritten.
+- **Alumni.** One status, no lapse, exempt from the three-month clock (ALUM-U01). The
+  attendance scan, `dogs.alumni_attendance_flagged_at` and
+  `POST /staff/dogs/:dogId/clear-alumni-flag` are gone, and alumni credits expire like
+  everyone's: no grant site branches on it and becoming alumni moves no lot (ALUM-U16).
+- **The tick** has eight phases (`SchedulerTickResult`), pinned by name, with its
+  completion log line, in `test/contracts/scheduler-tick-shape.test.ts`.

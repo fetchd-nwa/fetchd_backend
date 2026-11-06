@@ -1,24 +1,29 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
+import Stripe from 'stripe';
 import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
+import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import { refundsRepository } from '../../src/db/repositories/refundsRepository.js';
 import {
   charges,
   creditLedger,
+  invoices,
   paymentMethods,
   refunds,
   stripeEvents,
 } from '../../src/db/schema/schema.js';
+import { env } from '../../src/env.js';
 import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
-import type { StripeWebhookEvent } from '../../src/lib/stripe.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { defaultStripeClient, type StripeWebhookEvent } from '../../src/lib/stripe.js';
+import { clearInvoiceReferrers, FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
+  makeLogCapture,
   registerFixtureHooks,
 } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
@@ -596,3 +601,137 @@ test('unhandled event types 200 + outcome=noop', SKIP_WHEN_NO_DB, async () => {
 
   await db.delete(stripeEvents).where(eq(stripeEvents.eventId, eventId));
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// A succeeded PaymentIntent that names an invoice, with no charges row
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * DECISIONS 167(b): nothing here stamps `invoice_id` on an intent, so a succeeded one
+ * naming an invoice with no charges row did not come from us. It is an orphan whatever
+ * the invoice's state: the receiver answers `orphan-event` and moves nothing. The
+ * signature and the projection are the real ones, and every other Stripe verb is the
+ * stub, so a refund fired from here would show in `calls`.
+ *
+ * The money is still taken at Stripe, and no row here says so, so a person hears
+ * (DECISIONS 169(b)): one level-50 line on the route's own logger. Read from the
+ * capture, because a fake logger handed to the handler would stay green on a route
+ * that passes none. `observability-tap.test.ts` carries it to the pager on `buildApp()`.
+ */
+const ORPHAN_ALARM =
+  'ORPHAN PAYMENT — Stripe took this money and no charge row recorded it when the event landed: look the intent up in charges and in Stripe before refunding or recording anything';
+
+async function clearOwnerInvoices(): Promise<void> {
+  await clearInvoiceReferrers();
+  await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
+  await cleanupTestState();
+}
+
+async function moneyRows() {
+  const { rows } = await db.execute(sql`
+    SELECT (SELECT count(*)::int FROM charges) AS charges,
+           (SELECT count(*)::int FROM refunds) AS refunds,
+           (SELECT count(*)::int FROM credit_ledger) AS credit_ledger,
+           (SELECT count(*)::int FROM invoices) AS invoices,
+           (SELECT count(*)::int FROM orders) AS orders,
+           (SELECT count(*)::int FROM notifications) AS notifications,
+           (SELECT count(*)::int FROM scheduled_notifications) AS scheduled_notifications
+  `);
+  return rows[0];
+}
+
+for (const state of ['open', 'paid', 'void'] as const) {
+  test(
+    `a succeeded intent naming a ${state} invoice, with no charges row, on a real signed event: orphan-event, and nothing written`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      await clearOwnerInvoices();
+      const invoice = await db.transaction(async (tx) => {
+        const row = await invoicesRepository.createOpen(tx, {
+          ownerId: FIXTURE_IDS.ownerId,
+          amountCents: 12_500,
+          purpose: 'board-train',
+          paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+          dueAt: '2026-06-15T00:00:00Z',
+        });
+        if (state === 'void') await invoicesRepository.markVoid(tx, { id: row.id });
+        if (state === 'paid') {
+          const paidBy = await chargesRepository.create(tx, {
+            ownerId: FIXTURE_IDS.ownerId,
+            amountCents: 12_500,
+            status: 'succeeded',
+            purpose: 'board-train',
+            stripePaymentIntentId: `pi_paid_${randomUUID().slice(0, 8)}`,
+          });
+          await invoicesRepository.markPaid(tx, { id: row.id, paidChargeId: paidBy.id });
+        }
+        return row;
+      });
+
+      const eventId = evtId();
+      const intentId = `pi_names_invoice_${randomUUID().slice(0, 8)}`;
+      const payload = JSON.stringify({
+        id: eventId,
+        object: 'event',
+        type: 'payment_intent.succeeded',
+        data: {
+          object: {
+            id: intentId,
+            object: 'payment_intent',
+            amount: 12_500,
+            metadata: { invoice_id: invoice.id, owner_id: FIXTURE_IDS.ownerId },
+          },
+        },
+      });
+      const stub = makeStripeStub();
+      const capture = makeLogCapture();
+      const { app } = makeContractApp(FIXTURE_OWNER_PRINCIPAL, capture);
+      registerStripeWebhookRoute(app, {
+        stripe: { ...stub, constructWebhookEvent: defaultStripeClient.constructWebhookEvent },
+      });
+
+      const invoiceRow = () => db.select().from(invoices).where(eq(invoices.id, invoice.id));
+      const before = {
+        status: 200,
+        outcome: 'orphan-event',
+        stripeCalls: [] as string[],
+        rows: await moneyRows(),
+        invoice: await invoiceRow(),
+      };
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/webhooks/stripe',
+        headers: {
+          'content-type': 'application/json',
+          'stripe-signature': Stripe.webhooks.generateTestHeaderString({
+            payload,
+            secret: env.STRIPE_WEBHOOK_SECRET,
+          }),
+        },
+        payload,
+      });
+
+      assert.deepEqual(
+        {
+          status: res.statusCode,
+          outcome: (res.json() as { outcome?: string }).outcome,
+          stripeCalls: stub.calls.map((call) => call.method),
+          rows: await moneyRows(),
+          invoice: await invoiceRow(),
+        },
+        before,
+      );
+
+      const alarms = capture.lines.filter((line) => line.level === 50);
+      assert.equal(alarms.length, 1, 'one alarm, on the route’s own logger');
+      assert.equal(alarms[0]?.msg, ORPHAN_ALARM);
+      assert.equal(alarms[0]?.stripeEventId, eventId);
+      assert.equal(alarms[0]?.paymentIntentId, intentId);
+      assert.equal(alarms[0]?.amountCents, 12_500);
+
+      await db.delete(stripeEvents).where(eq(stripeEvents.eventId, eventId));
+      await clearOwnerInvoices();
+    },
+  );
+}

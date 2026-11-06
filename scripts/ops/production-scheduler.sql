@@ -3,21 +3,21 @@
 -- =============================================================================
 --
 -- WHAT THIS IS. `POST /workers/tick` is the scheduler entry point: it runs the
--- 12-phase tick (`src/workers/scheduler.ts`) that sends scheduled
--- notifications, rolls memberships, resolves unknown charge outcomes,
--- reconciles uncaptured group-class holds, retries duplicate refunds,
--- auto-charges invoices, builds media derivatives, warns on expiring credits
--- and cards, flags alumni attendance, chases overdue invoices, and sweeps
--- idempotency keys. NOTHING CALLS IT ON A CADENCE UNTIL THIS FILE IS RUN. On
+-- 8-phase tick (`src/workers/scheduler.ts`) that sends scheduled notifications,
+-- reconciles uncaptured group-class holds, sweeps stale orders, retries duplicate
+-- refunds, builds media derivatives, warns on expiring cards, and sweeps
+-- idempotency keys. No phase bills a card on its own (P17, PAY-U15). NOTHING CALLS
+-- IT ON A CADENCE UNTIL THIS FILE IS RUN. On
 -- 2026-08-24 Allison confirmed that pg_cron and pg_net are NOT installed in the
 -- production Supabase project, which means production has never ticked once.
 --
--- (Phase count of record: TWELVE, one field each on `SchedulerTickResult`
--- (`scheduler.ts:169-182`) — eleven per-phase result objects plus
--- `idempotencyKeysSwept`, which the worker's own doc numbers as phase 9. Two
--- other counts were in circulation and are wrong: the Day-20 design §1 said 9
--- (it counted the top-level numbers and missed 3a / 3a-bis / 3a-ter) and
--- `PORTAL-ENDPOINT-MAP.md` said 7. Both corrected 2026-08-25, D20-A3 §L5.)
+-- (Phase count of record: EIGHT, one field each on `SchedulerTickResult`
+-- (`src/workers/scheduler.ts`) — seven per-phase result objects plus
+-- `idempotencyKeysSwept`, which the worker's own doc numbers as phase 8.
+-- `creditExpiryWarnings` is one of the eight and always reads zero: its scan is
+-- retired. `test/contracts/scheduler-tick-shape.test.ts` pins the list. Thirteen
+-- until P17 took out the membership roll, the attempt verify, the auto-charge, the
+-- alumni scan and the overdue scan.)
 --
 -- WHY IT IS NOT IN schema.sql. The Day-16 lock (`.claude/backend/
 -- IMPLEMENTATION.md`, Day-16 "Production scheduler trigger") stands: the cron
@@ -372,6 +372,6 @@ SELECT cron.schedule(
 --   SELECT cron.unschedule('scheduler-tick-every-minute');
 --   SELECT cron.unschedule('job-run-details-purge-weekly');
 --
--- Unscheduling the tick stops ALL background money work: no invoice
--- auto-charge, no hold reconciliation, no refund retries, no credit expiry,
--- no notifications. It is an incident action, not a maintenance one.
+-- Unscheduling the tick stops ALL background money work: no hold
+-- reconciliation, no refund retries, no credit expiry, no notifications.
+-- It is an incident action, not a maintenance one.

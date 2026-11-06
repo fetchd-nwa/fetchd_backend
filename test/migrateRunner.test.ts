@@ -430,7 +430,7 @@ describe('the step file', () => {
   test('every step file the rehearsal would apply parses, with M1.19 still carrying its census gate', () => {
     const files = rehearsedStepFiles(path.join(REPO_ROOT, 'migrations'));
     assert.ok(files.length >= 19, `only ${files.length} step files found`);
-    for (const group of ['lg1', 'lg2', 'lg3']) {
+    for (const group of ['lg1', 'lg2', 'lg3', 'lg4']) {
       assert.ok(
         files.some((file) => file.includes(`${path.sep}${group}${path.sep}`)),
         `${group} is not in the set the static checks walk`,

@@ -2,12 +2,8 @@ import { deepLinkToPath } from '../contracts/wire.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
-import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
-import { dogProgramsRepository } from '../db/repositories/dogProgramsRepository.js';
 import type { InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
-import { membershipsRepository } from '../db/repositories/membershipsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import {
   refundsRepository,
@@ -16,10 +12,8 @@ import {
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
 import { formatDollars, purposeLabel } from './invoiceReceiptCopy.js';
-import { nextMonthlyPeriodEnd } from './membershipBilling.js';
 import { noticeInSavepoint, type NoticeLog } from './noticeInSavepoint.js';
 import type { PendingStripeRefund } from './pendingRefund.js';
-import { pgTimestampToDate } from './pgTimestamp.js';
 
 /**
  * The post-Stripe handle the caller fires after commit: on a lost settle race
@@ -67,10 +61,6 @@ export interface SettleInvoiceChargeArgs {
    * notifies.
    */
   notifyOwner: boolean;
-  /** Settle instant — the §J.1 membership grant's late-settle floor reads it
-   * (see `grantMembershipMonth`). Defaults to wall clock; workers/tests pass
-   * their pinned `now`. */
-  now?: Date;
   /**
    * Where the NULL-anchor fallback's WARN goes (§A3.19 F2), and a failed notice's
    * alarm. Optional because not every caller has a logger in scope, but a caller that
@@ -96,9 +86,12 @@ export interface ReceiptPush {
 }
 
 /**
- * The ONE post-Stripe invoice-settlement primitive every settle path calls: the
- * worker auto-charge and the webhook's orphan arm here, and the order engine (so
- * `POST /invoices/:id/pay`) through {@link settleChargeAgainstInvoice}, its second
+ * The post-Stripe invoice settlement for a PaymentIntent with no `charges` row yet:
+ * it writes the row, then runs {@link settleChargeAgainstInvoice}, the half the order
+ * engine enters at (the capture reconciler enters a level further in, at
+ * {@link claimInvoiceWithCharge}). No production path calls this first half today.
+ * The webhook's orphan arm was the last, and it left at P17 (DECISIONS 167(b)); the order engine
+ * (so `POST /invoices/:id/pay`) writes its charge in tx1 and enters at the second
  * half. It runs AFTER a path's own Stripe PaymentIntent has already SUCCEEDED,
  * inside one short tx, and resolves the double-charge race between the paths:
  *
@@ -157,7 +150,6 @@ export async function settleChargeAgainstInvoice(
   args: SettleInvoiceChargeArgs & { chargeId: string; receiptPush?: ReceiptPush },
 ): Promise<SettleInvoiceChargeResult> {
   const { invoice, paymentIntentId, amountCents, purpose, notifyOwner, chargeId } = args;
-  const now = args.now ?? new Date();
 
   const claimed = await claimInvoiceWithCharge(tx, {
     invoice,
@@ -165,7 +157,6 @@ export async function settleChargeAgainstInvoice(
     amountCents,
     purpose,
     notifyOwner,
-    now,
     ...(args.receiptPush !== undefined ? { receiptPush: args.receiptPush } : {}),
     ...(args.log?.error !== undefined ? { log: args.log as NoticeLog } : {}),
   });
@@ -176,8 +167,7 @@ export async function settleChargeAgainstInvoice(
   //
   // **This arm also serves the VOIDED invoice** — a withdraw voids the invoice
   // while its PaymentIntent is still settling, and the webhook lands minutes
-  // later (`stripeEventHandlers.ts` — "invoice void (withdrawn before the
-  // charge resolved) → same lost-race arm"). `markPaid` filters
+  // later. `markPaid` filters
   // `status = 'open'`, so a void invoice yields `flipped = 0` and arrives here.
   // The money MOVED, so the ledger row is written and this returns it. That is
   // the whole return path for §A3.18 D1's dead money, and it already existed.
@@ -302,9 +292,8 @@ export async function resolveInvoiceAnchorBookingId(
  * settle an invoice: a `requires_payment` group-class charge whose intent
  * succeeded, covering a LIVE enrollment whose money is an OPEN invoice, is not
  * surplus — it is that invoice's own payment, arrived late. Two callers now
- * share ONE implementation of "the invoice is settled", so the receipt, the
- * reminder teardown and the membership grant cannot be present on one path and
- * forgotten on the other.
+ * share ONE implementation of "the invoice is settled", so the receipt and the
+ * reminder teardown cannot be present on one path and forgotten on the other.
  *
  * The `markPaid` claim is the atomic arbiter, unchanged: it filters
  * `status = 'open'`, so the UPDATE row count IS the claim (R11's guard), and a
@@ -320,7 +309,6 @@ export async function claimInvoiceWithCharge(
     amountCents: number;
     purpose: ChargePurpose;
     notifyOwner: boolean;
-    now?: Date;
     /** Set: the receipt goes on the push queue. Unset: the feed row it always was. */
     receiptPush?: ReceiptPush;
     /** A failed receipt's alarm. Unset, it goes to stderr rather than nowhere. */
@@ -342,9 +330,6 @@ export async function claimInvoiceWithCharge(
     tx,
     `payment-due:${invoice.id}`,
   );
-  if (invoice.purpose === 'membership' && invoice.membershipId !== null) {
-    await grantMembershipMonth(tx, { invoice, chargeId, now: args.now ?? new Date() });
-  }
   if (notifyOwner) {
     // A notice never un-records money (design §2.7:3993-3998): its own savepoint,
     // its body composed inside it, and on any error one alarm and the money commits.
@@ -412,77 +397,4 @@ const STDERR_NOTICE_LOG: NoticeLog = {
  */
 export function duplicateRefundIdempotencyKey(refundId: string): string {
   return `dup-settle-refund:${refundId}`;
-}
-
-/**
- * §J.1 — the WINNING settle of a `purpose='membership'` invoice grants that
- * month's credit lot (`reason='membership-grant'`). Expiry (alumni dogs NULL,
- * §J.3) is the end of the period THIS INVOICE billed — recomputed from
- * `invoice.due_at` (the period start the roll stamped), NOT the membership's
- * live `current_period_end`: a parked invoice can settle via the manual
- * `POST /invoices/:id/pay` months later, after further rolls moved (or a
- * completion froze) `current_period_end`, which would stamp the wrong
- * period — including one already past, a lot dead at birth.
- *
- * Late-settle floor: when the billed period has ALREADY ended at settle
- * time, the owner is paying a full month's price for it — grant a fresh
- * clamped month from `now` instead of dead credits. The period-scoped expiry
- * is what a "X days left to use X credits" reminder would read — but the
- * scheduler's credits-expiring scan is retired at 2.0.0 (S01: it read the
- * legacy 60-day lead), so no such reminder is sent until CRED-U13 builds the
- * real notice off `cred.expiry_warning_lead_days` (7.1.0).
- *
- * The late settle ALSO re-aligns the membership clock (roll-while-parked
- * ruling, 2026-07-16): while this invoice sat open the roll skipped the
- * membership (`lockDueForRoll`'s open-invoice predicate), so
- * `current_period_end` froze in the past. `alignPeriodAfterLateSettle` moves
- * the current period onto the freshly-granted month so the next roll bills
- * when THIS month is used up — never a catch-up cascade over the parked gap.
- * The verb self-filters to active + un-paused rows; a completed/canceled
- * clock stays frozen (the grant still lands — the owner paid) and a
- * staff-paused one is `resume`'s gap-shift to move.
- *
- * The loads throw on missing rows rather than skip: a membership invoice
- * whose membership/package can't be resolved is corrupt state, and silently
- * settling it would take the owner's money without granting credits. The
- * throw rolls back this settle; the invoice stays open for retry/park and
- * the staff worklist surfaces it.
- */
-async function grantMembershipMonth(
-  tx: Tx,
-  args: { invoice: InvoiceRow; chargeId: string; now: Date },
-): Promise<void> {
-  const { invoice, chargeId, now } = args;
-  if (invoice.membershipId === null) {
-    throw new Error(`settleInvoiceCharge: invoice ${invoice.id} has no membership_id`);
-  }
-  const membership = await membershipsRepository.findById(tx, invoice.membershipId);
-  if (membership === undefined) {
-    throw new Error(`settleInvoiceCharge: membership ${invoice.membershipId} not found`);
-  }
-  const pkg = await creditPackagesRepository.findById(tx, membership.packageId);
-  if (pkg === undefined) {
-    throw new Error(`settleInvoiceCharge: credit package ${membership.packageId} not found`);
-  }
-  const billedPeriodEnd = nextMonthlyPeriodEnd(pgTimestampToDate(invoice.dueAt));
-  const isLateSettle = billedPeriodEnd <= now;
-  const expiresAt = isLateSettle ? nextMonthlyPeriodEnd(now) : billedPeriodEnd;
-  const dogIsAlumni = await dogProgramsRepository.isAlumni(membership.dogId, tx);
-  await creditLedgerRepository.creditPurchase(tx, {
-    dogId: membership.dogId,
-    mode: pkg.mode,
-    location: pkg.location,
-    delta: pkg.credits,
-    packageId: pkg.id,
-    chargeId,
-    expiresAt: dogIsAlumni ? null : expiresAt,
-    reason: 'membership-grant',
-  });
-  if (isLateSettle) {
-    await membershipsRepository.alignPeriodAfterLateSettle(tx, {
-      id: membership.id,
-      periodStart: now,
-      periodEnd: nextMonthlyPeriodEnd(now),
-    });
-  }
 }

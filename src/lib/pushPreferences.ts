@@ -33,7 +33,6 @@ type PushCategoryKey = 'booking-reminders' | 'urgent-updates';
 type PushCapableType =
   | 'booking-reminder'
   | 'boarding-profile-check'
-  | 'alumni-attendance'
   | 'payment-failed'
   // Wire 1.9.0. Only the credit-purchase webhook flip enqueues this type (the
   // invoice receipt is feed-only and never reaches the scheduler), and it is
@@ -53,7 +52,6 @@ type PushCapableType =
 const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'booking-reminder': 'booking-reminders',
   'boarding-profile-check': 'booking-reminders',
-  'alumni-attendance': 'booking-reminders',
   'payment-failed': 'urgent-updates',
   'payment-succeeded': 'urgent-updates',
   // R3: the cash/check "bring payment at drop-off" reminder is action-required.
@@ -61,7 +59,9 @@ const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'credits-expiring': 'urgent-updates',
   'spay-neuter-reminder': 'urgent-updates',
   // Allison 2026-07-29: both mean money is about to stop moving and only the
-  // owner can fix it — the definition of urgent-updates.
+  // owner can fix it — the definition of urgent-updates. Nothing enqueues
+  // `invoice-overdue` since its scan left at M4.04; a row already queued still
+  // delivers under this category.
   'invoice-overdue': 'urgent-updates',
   'card-expiring': 'urgent-updates',
 };
