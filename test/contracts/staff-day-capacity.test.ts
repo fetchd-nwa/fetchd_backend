@@ -146,6 +146,7 @@ async function bookDogs(
       url: '/bookings',
       headers: { 'idempotency-key': randomUUID() },
       payload: {
+        payment: { kind: 'credits' },
         category: 'day-school',
         location,
         lead_dog_id: await createFundedDog(createdDogIds, 2),
@@ -386,6 +387,7 @@ test(
         url: '/bookings',
         headers: { 'idempotency-key': randomUUID() },
         payload: {
+          payment: { kind: 'credits' },
           category: 'day-school',
           location: 'bentonville',
           lead_dog_id: dogId,
@@ -439,6 +441,7 @@ test(
         url: '/bookings',
         headers: { 'idempotency-key': randomUUID() },
         payload: {
+          payment: { kind: 'credits' },
           category: 'day-school',
           location: 'bentonville',
           lead_dog_id: randomUUID(),
@@ -470,6 +473,7 @@ test(
       url: '/bookings',
       headers: { 'idempotency-key': randomUUID() },
       payload: {
+        payment: { kind: 'credits' },
         category: 'day-care',
         location: 'bentonville',
         lead_dog_id: await createFundedDog(createdDogIds, 2),
@@ -848,6 +852,7 @@ async function racers(): Promise<Record<Racer, () => Promise<Answer>>> {
         url: '/bookings',
         headers: { 'idempotency-key': randomUUID() },
         payload: {
+          payment: { kind: 'credits' },
           category: 'day-school',
           location: 'bentonville',
           lead_dog_id: dogId,
@@ -980,7 +985,13 @@ async function bookDog(dogId: string, date: string): Promise<Answer> {
     method: 'POST',
     url: '/bookings',
     headers: { 'idempotency-key': randomUUID() },
-    payload: { category: 'day-school', location: 'bentonville', lead_dog_id: dogId, dates: [date] },
+    payload: {
+      category: 'day-school',
+      location: 'bentonville',
+      lead_dog_id: dogId,
+      dates: [date],
+      payment: { kind: 'credits' },
+    },
   });
 }
 

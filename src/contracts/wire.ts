@@ -66,7 +66,7 @@
  * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close).
  */
-export const WIRE_CONTRACT_VERSION = '4.0.0-lg3.2';
+export const WIRE_CONTRACT_VERSION = '4.0.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -179,6 +179,11 @@ export const WIRE_CONTRACT_VERSION = '4.0.0-lg3.2';
  * — appended, never inserted (design §1.1:925-928; PAY-U05):
  * `'invoice_payment_in_flight'`, 409, no `details`. `InvoicePayRequest` says
  * when it answers.
+ *
+ * 4.0.0 appends one thrown code, the 32nd, after `'invoice_payment_in_flight'`
+ * — appended, never inserted (design §1.1:917-920; CRED-U12):
+ * `'credit_expired_before_date'`, 422, with `details`
+ * (`CreditExpiredBeforeDateDetails`). No route answers it until P18.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -194,7 +199,7 @@ export type ApiErrorCode =
   | 'payment_required' // booking blocked — owner has no live payment_methods row
   | 'vaccine_missing' // booking blocked — required vaccines missing/expired (per dog)
   | 'agreement_unsigned' // booking blocked — required agreements unsigned at current version
-  | 'insufficient_credits' // booking blocked — per-dog credit balance would go negative
+  | 'insufficient_credits' // booking blocked — credits do not cover the dates, or a top_up no longer fits them
   | 'insufficient_capacity' // booking blocked — the (location,date) seat cap is exhausted
   | 'cohort_full' // enrollment blocked — cohort.filled + requested > cohort.capacity
   | 'eligibility_missing' // enrollment blocked — dog(s) missing OR-prereq for cohort's class
@@ -212,7 +217,8 @@ export type ApiErrorCode =
   | 'beyond_booking_horizon' // create blocked — a date is past day.booking_horizon_months (4.0.0-lg3.1)
   | 'capacity_below_booked' // cap edit blocked — a booked date would fall below its count (4.0.0-lg3.1)
   | 'service_not_offered' // request blocked — the service is off at the campus (4.0.0-lg3.1)
-  | 'invoice_payment_in_flight'; // invoice pay blocked — another order's charge on it is in flight (4.0.0-lg3.2)
+  | 'invoice_payment_in_flight' // invoice pay blocked — another order's charge on it is in flight (4.0.0-lg3.2)
+  | 'credit_expired_before_date'; // booking blocked — a date no credit she holds or can buy today reaches (4.0.0)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -247,6 +253,7 @@ export const API_ERROR_CODES = [
   'capacity_below_booked',
   'service_not_offered',
   'invoice_payment_in_flight',
+  'credit_expired_before_date',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -322,6 +329,10 @@ export const API_ERROR_STATUS = {
   // is in a state this request conflicts with, the same family as `conflict`
   // (design §1.1:925-928).
   invoice_payment_in_flight: 409,
+  // 4.0.0 (new code, so its status is set in the same bump): a gate on the
+  // booking's dates, the same family as `insufficient_credits` (design
+  // §1.1:917-920).
+  credit_expired_before_date: 422,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -485,9 +496,77 @@ export interface AgreementUnsignedDetails {
   missing: AgreementGap[];
 }
 
+/**
+ * `POST /bookings`' refusal when credits do not cover the dates. Atomic: nothing
+ * is written, no order and no debit, and no card is touched. 4.0.0 adds what
+ * the owner's sheet is built from (design §1.1:902-913, §2.3:2644-2656; PAY-U09,
+ * DAY-U17), so a client does no credit arithmetic of its own.
+ *
+ * `shortfall` is how many credits are missing: one per dog per date nothing
+ * pays. 7 credits for 8 dates is 1. `0` answers only a `top_up` that no longer
+ * fits (`PostBookingsRequest`): `gaps` and `short_dates` are then `[]`,
+ * `top_up_offer` is `null`, and the client re-sends without `top_up`, on credits
+ * alone.
+ *
+ * `short_dates` has one entry per missing credit, ascending by date, so its
+ * length is `shortfall` and a date two dogs are short on appears twice. `reason`
+ * is `'no_credit'`, or `'credits_expire_first'` when her credits die before the
+ * date, and then `expires_at` (ISO-8601, as `CreditLotWire.expires_at`) says
+ * when: "Your 3 credits expire Tue 27 Oct, before these days". Expiry binds a
+ * date from P18, so until then every entry is `'no_credit'`.
+ *
+ * `top_up_offer` is the purchase that completes the booking: `count` credits of
+ * the single-day row `package_key` of the booking's campus and program, at
+ * `unit_price_cents` each, `total_cents` in all. An alumni-tier booking is
+ * offered its campus's regular day-school single day. The client shows these
+ * numbers and sends them back (`PostBookingsRequest`'s `top_up`). **`null` on
+ * every answer until P18**, which lands those rows and the live path (design
+ * §1.3).
+ *
+ * `alternative_package_key` names a pack as the second choice (the Day Care
+ * Package, the Alumni 10 Visits pack, or the pool's smallest pack once the
+ * shortfall reaches its credit count), which *Yes* may buy instead through
+ * `top_up.package_key`. Omitted until P18: no row it can name is seeded before.
+ *
+ * `gaps` stays, one entry per dog short, as `CreditGap` reads today. 5.0.0
+ * re-keys that shape on the pool.
+ */
 export interface InsufficientCreditsDetails {
   kind: 'insufficient_credits';
   gaps: CreditGap[];
+  shortfall: number;
+  short_dates: {
+    date: string;
+    reason: 'no_credit' | 'credits_expire_first';
+    expires_at?: string;
+  }[];
+  top_up_offer: {
+    count: number;
+    unit_price_cents: number;
+    total_cents: number;
+    package_key: string;
+  } | null;
+  alternative_package_key?: string;
+}
+
+/**
+ * Rides code `credit_expired_before_date` (422) — `kind` equals `code`. New
+ * 4.0.0, typed with the booking body (design §1.1:917-920, §2.3:2656-2659,
+ * §2.4:2910-2912; CRED-U12). **No route emits it until its predicate lands
+ * (P18).**
+ *
+ * `dates` lists EVERY date of the request that no lot of hers can pay and a
+ * credit bought today would not reach (`cred.package_expiry_months` from now),
+ * `YYYY-MM-DD`, ascending, never empty. A date a bought credit does reach is a
+ * shortfall and gets the top-up instead (`InsufficientCreditsDetails`).
+ * `expires_at` is ISO-8601: the latest expiry among her live lots or, with no
+ * live lot, the reach of a credit bought today. Atomic: a refused request writes
+ * nothing.
+ */
+export interface CreditExpiredBeforeDateDetails {
+  kind: 'credit_expired_before_date';
+  expires_at: string;
+  dates: string[];
 }
 
 /** FLAT grammar: the `CapacityGap` fields spread beside `kind`, not nested. */
@@ -548,10 +627,12 @@ export interface AlreadyRequestedDetails {
  *  `attempts` confirms. With `charge_blocker` a card answered, and the field
  *  says how. With `charge_blocker: 'processing'` a person cancelled while
  *  Stripe was still processing, so the money may yet move, and a late success
- *  is refunded in full, automatically. With no `charge_blocker` no card
- *  answered, and the intent is stopped or being stopped: no money moved. Either
- *  way the 402 commits: the failed charge stays recorded, a replay under the
- *  same key returns the same 402 (§0), and the next try takes a fresh key. */
+ *  is refunded in full, automatically. With no `charge_blocker` no reason is
+ *  recorded: a card may have answered, since Stripe keeps no reason on a
+ *  cancelled intent, but the intent is stopped or being stopped, so no money
+ *  moved. Either way the 402 commits: the failed charge stays recorded, a replay
+ *  under the same key returns the same 402 (§0), and the next try takes a fresh
+ *  key. */
 export interface PaymentFailedDetails {
   kind: 'payment_failed';
   charge_blocker?: ChargeBlocker;
@@ -657,7 +738,8 @@ export interface CapacityBelowBookedDetails {
  * phase B builds `routes/staffSettings.ts`. 3.0.0-lg2.1 appends
  * `ProfileIncompleteDetails` (`PATCH /me`). 4.0.0-lg3.1 appends
  * `CapacityBelowBookedDetails`, contract-first: no route emits it until P13's
- * backend lands.
+ * backend lands. 4.0.0 appends `CreditExpiredBeforeDateDetails`, contract-first:
+ * no route emits it until P18.
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -676,7 +758,8 @@ export type ApiErrorDetailWire =
   | RefusedKeysDetails
   | SettingInertDetails
   | ProfileIncompleteDetails
-  | CapacityBelowBookedDetails;
+  | CapacityBelowBookedDetails
+  | CreditExpiredBeforeDateDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -724,10 +807,15 @@ export type ThreadCategory = 'sessions' | 'billing' | 'enrollment' | 'other';
 export type ChargeStatus = 'requires_payment' | 'succeeded' | 'failed' | 'refunded';
 
 /**
- * Why a confirm stopped short of `succeeded`, at the domain level. Three
- * different true sentences with three different next actions for the owner:
- * the card needs verification we cannot complete, the card was declined, or
- * the payment is still in flight and must NOT be retried.
+ * Why a confirm stopped short of `succeeded`, at the domain level. Five
+ * different true sentences for the owner: the card needs verification we cannot
+ * complete, the card was declined, the payment is still in flight and must NOT
+ * be retried, the card has insufficient funds, or the card has expired.
+ *
+ * 4.0.0 appends the last two (design §1.1:900-901, §2.7:4051-4056; PAY-U06).
+ * Each is a decline with its reason named, and `'declined'` stays the decline
+ * Stripe gave no narrower reason for. On all three the app offers another card,
+ * add card and update card, and never cash or check (R2).
  *
  * This exists because `ChargeStatus` cannot carry the distinction -- it is
  * pinned to the `charge_status` pgEnum, and the mapping into it collapses
@@ -735,7 +823,12 @@ export type ChargeStatus = 'requires_payment' | 'succeeded' | 'failed' | 'refund
  * processing / requires_capture into the single value `requires_payment`. The
  * copy the owner reads depends on exactly what that collapse destroys.
  */
-export type ChargeBlocker = 'authentication_required' | 'declined' | 'processing';
+export type ChargeBlocker =
+  | 'authentication_required'
+  | 'declined'
+  | 'processing'
+  | 'insufficient_funds'
+  | 'expired_card';
 
 /**
  * The framing a payment notification carries to the invoice surface it opens.
@@ -1014,6 +1107,8 @@ export const CHARGE_BLOCKERS = [
   'authentication_required',
   'declined',
   'processing',
+  'insufficient_funds',
+  'expired_card',
 ] as const satisfies readonly [ChargeBlocker, ...ChargeBlocker[]];
 
 // >>> domain:auth-media =======================================================
@@ -1247,7 +1342,7 @@ export interface StaffMeWire {
  * Each flag uses the rule its verb's guard uses, or will use when the verb
  * lands. One designed gap: `edit_prices` is false for every role while
  * `POST /staff/rates` still takes an owner's or manager's rate (§2.1:2087-2091;
- * that route goes at design 4.0.0). A list-backed
+ * DAY-U23 narrows that route at P18, not at 4.0.0: design §1.3). A list-backed
  * flag is true when the caller's role is `owner` OR is on that list: the owner
  * role passes every list whatever the list holds (STAFF-09), so the owner
  * can never be edited out of a verb. Five of the nine are data (owner-edited
@@ -1268,8 +1363,8 @@ export interface StaffCapabilitiesWire {
    *  price is its seed), so the registry refuses every price key with 403
    *  `refused_keys`. True only when PAY-U44 gives prices an editor.
    *  The legacy `POST /staff/rates` and `/staff/rates/:id/void` do NOT read
-   *  this flag: they are owner and manager by role until design 4.0.0
-   *  narrows the route (DAY-U23; §2.1:2084-2091). */
+   *  this flag: they are owner and manager by role until P18 narrows the
+   *  route (DAY-U23, moved from design 4.0.0 by §1.3; §2.1:2084-2091). */
   edit_prices: boolean;
   /** Edit a `money`-class setting (STAFF-77). Owner and manager; the trainer
    *  never. A fixed role rule with no list or switch (STAFF-U08 folds in;
@@ -1647,9 +1742,9 @@ export interface PendingRequestWire {
  * included. `sessions` holds one row per date, ascending by `scheduled_at`, each
  * with `order_id` = `order.id`. A same-key replay returns this body as stored.
  *
- * `order.charge_status` is `'none'` unless a top-up was charged, and no request
- * can ask for one at this step (typed at 4.0.0, P16; live at P18), so today it is
- * always `'none'` and every session `'upcoming'`.
+ * `order.charge_status` is `'none'` unless a top-up was charged. `top_up` is typed
+ * at 4.0.0 and refused until P18 (`PostBookingsRequest`), so today it is always
+ * `'none'` and every session `'upcoming'`.
  */
 export interface PostBookingsResponse {
   order: OrderWire;
@@ -1674,6 +1769,7 @@ export const POST_BOOKINGS_ERROR_DETAIL_KINDS = [
   'evaluation_required',
   'vaccine_missing',
   'agreement_unsigned',
+  'credit_expired_before_date',
   'insufficient_credits',
   'already_booked',
   'insufficient_capacity',
@@ -1717,7 +1813,10 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  * is the setting below); `notes` ≤ 2000 chars. The body is `.strict()`: an
  * unknown key is 400 `bad_request`,
  * like every Zod failure on this route (`parseOrThrow`), and since 4.0.0-lg3.1
- * that includes `dropoff_time`.
+ * that includes `dropoff_time`. `payment` and `payment.top_up` are `.strict()`
+ * too. `top_up.count` and `top_up.expected_total_cents` are positive integers,
+ * `top_up.payment_method_id` a UUID, `top_up.package_key` a `CreditPackageWire`
+ * key.
  *
  * Cross-field rules Zod does not express (§4.6 — doc comments, not type
  * gymnastics). Each limit is a setting read at runtime, never a constant, and
@@ -1728,10 +1827,6 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  *     (`invalid_payload`).
  *   - every date is distinct and today-or-later in America/Chicago
  *     (`invalid_payload`).
- *   - `payment_method_id` is REQUIRED when `payment: 'payg'`
- *     (`resolvePaymentPlan`, `routes/bookings.ts`); sending one on a
- *     `'credits'` group is accepted and ignored — deliberately backward-
- *     compatible, do not "fix" it (§14.1).
  *
  * Three refusals have a code of their own (4.0.0-lg3.1; design §2.3:2325-2328),
  * each 422 with no `details`, and each refuses the whole request:
@@ -1748,6 +1843,33 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  * `insufficient_capacity`. `PostBookingsErrorDetails` lists the arms that do
  * carry `details`.
  *
+ * Credits are the only tender (4.0.0; design §1.1:864-874; R1). `payment` is
+ * required, so every booking says so, and it has no pay-as-you-go and no card
+ * arm: a booking is never charged. The strings `'credits'` and `'payg'`, a
+ * missing `payment` and a top-level `payment_method_id` are each 400
+ * `bad_request`.
+ *
+ * `payment.top_up` buys the missing credits inside this request (design
+ * §2.3:2613-2630, §2.7:4061-4092; PAY-U09). The client answers the 422's
+ * `top_up_offer` by re-sending the same body with `top_up` under a fresh
+ * `Idempotency-Key`, so *Yes* is one order and a decline books nothing.
+ * `count` and `expected_total_cents` are what the sheet showed, and
+ * `payment_method_id` the card it named. `package_key` defaults to the offer's
+ * row and may name any live catalog row of the booking's pool; a pack is bought
+ * whole, so its `count` is 1. Under its locks, before it writes anything, the
+ * server re-reads the row and recomputes the shortfall. A total that differs,
+ * or a `count` the shortfall no longer needs, answers a fresh 422
+ * `insufficient_credits`, with nothing written and no Stripe call, so she is
+ * never charged a price she did not see or for more days than the dates need.
+ *
+ * **Typed here, live at P18.** No offer exists until then, so no `top_up` can
+ * be honoured, and every body carrying one gets that same answer: past the
+ * gates, at the credit check, 422 `insufficient_credits` with the current
+ * `shortfall` and `top_up_offer: null`, nothing written and no order made. The
+ * card is not read. With credits enough for the dates that is `shortfall: 0`,
+ * and the client re-sends without `top_up`. `tier` is accepted and not read
+ * until P18 either: until then a dog has one balance per mode and campus.
+ *
  * `Idempotency-Key` is required on this endpoint (§0 conventions). The
  * response is 201 `PostBookingsResponse`.
  * BUSINESS-LOGIC/bookings-scheduling.md R20 @ :90.
@@ -1760,11 +1882,17 @@ export interface PostBookingsRequest {
   dates: string[];
   location: LocationKey;
   notes?: string;
-  /** Omitted ⇒ `'credits'`. `'payg'` skips the credit debit and rides an open
-   *  invoice auto-charged ~1h before drop-off. */
-  payment?: 'credits' | 'payg';
-  /** REQUIRED when `payment: 'payg'`; ignored otherwise. */
-  payment_method_id?: string;
+  /** Credits, the only tender (see above). */
+  payment: {
+    kind: 'credits';
+    tier?: 'regular' | 'alumni';
+    top_up?: {
+      count: number;
+      payment_method_id: string;
+      package_key?: string;
+      expected_total_cents: number;
+    };
+  };
 }
 
 /**
@@ -2060,10 +2188,15 @@ export interface GetStaffBookingsQuery {
  *   2. `evaluation_required`   — `checkBookingGates`
  *   3. `vaccine_missing`       — `checkBookingGates`
  *   4. `agreement_unsigned`    — `checkBookingGates`
- *   5. `insufficient_credits`  — `createDayProgramBookings` (`lib/createDayProgramBookings.ts`)
- *   6. `already_booked`        — `createDayProgramBookings`
- *   7. `insufficient_capacity` — `dayCapacityRepository.assertCapacityWithinLock`
- *   8. `payment_failed`        — 402, not 422: the top-up's charge did not
+ *   5. `credit_expired_before_date` — `createDayProgramBookings`
+ *      (`lib/createDayProgramBookings.ts`). Before arm 6, because the credit
+ *      check's first pass finds it and its second counts the shortfall
+ *      (design §2.3:2634-2639): a top-up cannot complete a booking with such a
+ *      date in it, so she is not offered one.
+ *   6. `insufficient_credits`  — `createDayProgramBookings`
+ *   7. `already_booked`        — `createDayProgramBookings`
+ *   8. `insufficient_capacity` — `dayCapacityRepository.assertCapacityWithinLock`
+ *   9. `payment_failed`        — 402, not 422: the top-up's charge did not
  *      complete (`PaymentFailedDetails`). Every row is cancelled, every debit
  *      returned, nothing granted, and the 402 is stored.
  * Arms 1-4 can also arrive from the DB trigger floor with EMPTY arrays
@@ -2074,17 +2207,18 @@ export interface GetStaffBookingsQuery {
  * `invalid_payload`, and 4.0.0-lg3.1's `program_not_offered`,
  * `beyond_booking_horizon` and `same_day_cutoff_passed` (`PostBookingsRequest`).
  *
- * NOT reachable yet: arm 8. It is typed with the rest of the order's shape
- * (design §1.1:885; PAY-U05, DAY-U18), but no card is charged inside
- * `POST /bookings` until the top-up is live (P18), and a PAYG day-program books
- * against an OPEN INVOICE auto-charged ~1h before drop-off
- * (`createDayProgramBookings`), so no charge can fail inside it today.
+ * NOT reachable yet: arms 5 and 9. Arm 5 is typed with the booking body and its
+ * predicate lands with the lots (P18). Arm 9 is typed with the rest of the
+ * order's shape (design §1.1:885; PAY-U05, DAY-U18), but no card is charged
+ * inside `POST /bookings` until the top-up is live (P18), and from 4.0.0 a booking
+ * opens no invoice, so no charge can fail inside it today.
  */
 export type PostBookingsErrorDetails =
   | PaymentRequiredDetails
   | EvaluationRequiredDetails
   | VaccineMissingDetails
   | AgreementUnsignedDetails
+  | CreditExpiredBeforeDateDetails
   | InsufficientCreditsDetails
   | AlreadyBookedDetails
   | InsufficientCapacityDetails
@@ -4262,6 +4396,11 @@ export type InvoiceStatus = 'open' | 'paid' | 'void';
  * `'session'` (`db/repositories/ledgerRepository.ts:86-98`). Staff read
  * purposes; owners read kinds. The two are not interchangeable and the mapping
  * is lossy in that one direction.
+ *
+ * `'payg'` stays because the pgEnum does, and this release has no migration. From
+ * 4.0.0 nothing writes it: a booking pays in credits (design §2.7:3815-3816; R1).
+ * It survives on rows already written, which the auto-charge lane reads until
+ * P17 deletes that lane.
  */
 export type ChargePurpose = 'payg' | 'package' | 'board-train' | 'membership' | 'group-class';
 
@@ -4381,7 +4520,7 @@ export interface LedgerEntryWire {
    * The owner-facing collapse of `ChargePurpose` (see that type): `package`
    * becomes 'credit-pack', `board-train` and `group-class` both become
    * 'session'. Lossy by design — owners read money by what it bought, staff by
-   * what it was booked against.
+   * what it was booked against. `'payg'` reads only a row written before 4.0.0.
    */
   kind: 'session' | 'credit-pack' | 'membership' | 'payg';
   /**
@@ -5001,9 +5140,8 @@ export interface PatchPaymentMethodsRequest {
  * Selection: a location-specific row beats a null-location row; no row
  * active at today ⇒ 404 `not_found` (`routes/rates.ts:54-60`). Reference
  * data — owner and staff principals get identical bytes
- * (BUSINESS-LOGIC/payments-invoices.md:172). The PAYG day-program charger
- * reads the same catalog and requires `unit === 'per-day'`
- * (BUSINESS-LOGIC/bookings-scheduling.md:152, R10 @ :64).
+ * (BUSINESS-LOGIC/payments-invoices.md:172). From 4.0.0 no day-program booking
+ * reads this catalog: a day is paid in credits (R1).
  */
 export interface RateWire {
   category: ServiceCategory;
@@ -5024,7 +5162,11 @@ export interface RateWire {
  *  (`requireStaffRole('owner', 'manager')`, STAFF-U07; design §1.1:706-709,
  *  §2.1:2080-2084): a trainer is 403 `forbidden`, no `details`. The two
  *  reads, `GET /staff/rates` and `GET /staff/rates/history`, stay any staff
- *  role. */
+ *  role.
+ *
+ *  4.0.0 (design §2.7:4058-4059; PAY-U41): voiding a row whose `effective_from`
+ *  is before today in America/Chicago, when it has a predecessor, is 409
+ *  `conflict`: it would reopen the predecessor over dates already past. */
 export interface StaffRateWire {
   id: string;
   category: ServiceCategory;
@@ -5135,10 +5277,12 @@ export interface CancelWindowSettingWire {
  *     (`staffRates.ts:163-168`).
  *   • `note` — max 500 chars.
  * Cross-field rule, enforced in the route rather than the schema (§4.6):
- * `day-school` and `day-care` MUST be `unit: 'per-day'`, because PAYG bills
- * those per booking DATE straight off `amount_cents` and any other unit
- * would be silently billed as a daily one (`staffRates.ts:61, :169-174`;
- * R10 @ BUSINESS-LOGIC/bookings-scheduling.md:64).
+ * `day-school` and `day-care` MUST be `unit: 'per-day'`, a rule from PAYG,
+ * which billed those per booking DATE straight off `amount_cents`
+ * (`staffRates.ts:61, :169-174`;
+ * R10 @ BUSINESS-LOGIC/bookings-scheduling.md:64). PAYG left at 4.0.0, so
+ * nothing bills these rows now, and the rule stands until DAY-U23 removes them
+ * (P18).
  *
  * `location` is non-nullable here while `RateWire.location` is
  * `LocationKey | null`. That asymmetry is transcribed, not fixed: no route
@@ -5155,8 +5299,9 @@ export interface CancelWindowSettingWire {
  * §1.1:706-709, §2.1:2080-2094), so a trainer is 403 `forbidden`, no
  * `details`; an owner principal is 403 as before. The guard is the role, not
  * `StaffCapabilitiesWire.edit_prices`: that flag is false for every role in
- * v1, yet this route accepts an owner's or a manager's rate until design
- * 4.0.0 narrows it to the evaluation's seed (DAY-U23; §2.1:2087-2091). The
+ * v1, yet this route accepts an owner's or a manager's rate until P18 narrows
+ * it to the evaluation's seed (DAY-U23, moved from design 4.0.0 by §1.3;
+ * §2.1:2087-2091). The
  * (category, campus) track has no trainer axis; a trainer's own lesson price
  * is STAFF-U23's, later.
  */

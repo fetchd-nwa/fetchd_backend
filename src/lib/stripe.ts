@@ -92,18 +92,20 @@ export interface StripePaymentIntentResult {
   amountCents: number;
   /**
    * Domain blocker derived from the THROWN card error's `err.code`, mapped at
-   * the seam ({@link THROWN_CARD_CODE_TO_BLOCKER}). Absent on the returning
-   * fork — which has no code to read — and absent for codes the map doesn't
-   * cover. Strictly MORE specific than {@link status}: the probe of 2026-08-11
+   * the seam ({@link cardFailureOf}). Absent when there is no code to read, as on
+   * a returned intent with no `last_payment_error`, and absent for codes the map
+   * doesn't cover. Strictly MORE specific than {@link status}: the probe of 2026-08-11
    * showed a decline and an authentication failure resting at the identical
    * status (`requires_payment_method`), with only the code telling them apart.
    * Never wire-emitted raw; {@link chargeBlockerForConfirm} is the one reader.
    */
   blocker?: ChargeBlocker;
   /**
-   * The raw `err.code` string off a thrown card error — informational only,
-   * for the unmapped-code log line and support forensics. Never persisted,
-   * never on the wire (raw Stripe vocabulary would couple two clients to it).
+   * The raw code off a card failure, thrown or on `last_payment_error` — for the
+   * unmapped-code log line, support forensics and `charges.last_stripe_error`. Its
+   * presence is the one evidence that a card answered at all
+   * (`blockerOfIntent`). Never on the wire (raw Stripe vocabulary would couple two
+   * clients to it).
    */
   failureCode?: string;
   /**
@@ -294,8 +296,8 @@ function stripeIntentStatusToChargeBlocker(
  *
  * Two sources of truth arrive here and they can disagree:
  *
- *   - `intent.blocker` — mapped at the seam from the THROWN card error's
- *     `err.code`. Attempt-scoped: it names what happened on THIS confirm.
+ *   - `intent.blocker` — mapped at the seam from a card failure's two codes
+ *     ({@link cardFailureOf}). Attempt-scoped: it names what happened on THIS confirm.
  *   - `intent.status` — where the PaymentIntent now rests. Intent-scoped, and
  *     NOT a diagnosis: Stripe parks a PI at `requires_payment_method` after any
  *     terminally failed attempt, so it reads the same for a decline and for an
@@ -543,11 +545,11 @@ export interface StripeClient {
    * test proves nothing about the fork it didn't simulate.
    *
    * **Erasing the fork is not the same as erasing its evidence (2026-08-11).**
-   * The thrown fork carries strictly MORE information than the returning one —
-   * `err.code` names the failure where the attached status cannot — so the
-   * result it produces may carry `blocker` / `failureCode`, and an
-   * implementation that drops them re-creates the defect this seam was
-   * repaired for. What implementations owe each other is the amended
+   * A card failure's codes name the failure where the resting status cannot, on
+   * the thrown error and on a returned intent's `last_payment_error` alike, so
+   * the result may carry `blocker` / `failureCode`, and an implementation that
+   * drops them re-creates the defect this seam was repaired for. What
+   * implementations owe each other is the amended
    * invariant on {@link normalizeThrownConfirmError}: identical money
    * behavior, a blocker that may be more specific, and never a contradiction
    * of the `processing` reading.
@@ -694,8 +696,7 @@ export interface StripeClient {
    * API: no idempotency key, no money moved by calling it.
    *
    * Returns the same {@link StripePaymentIntentResult} the confirm verbs
-   * produce, with `blocker`/`failureCode` stamped from `last_payment_error.code`
-   * through the same observed-code map — so `chargeBlockerForConfirm` reads a
+   * produce, through the same normalizer — so `chargeBlockerForConfirm` reads a
    * retrieved intent exactly as it reads a confirmed one, and its "the argument
    * can only have come from the seam" invariant still holds.
    */
@@ -768,33 +769,77 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Thrown-card-error `err.code` → domain blocker. **Only rows OBSERVED against
- * live Stripe are here** (`npm run probe:stripe`, test mode, 2026-08-11,
- * recorded in `test/fixtures/stripe-thrown-confirm.json`):
+ * A card failure's top-level `code` → domain blocker. The first two rows were
+ * **observed against live Stripe** (`npm run probe:stripe`, test mode, 2026-08-11,
+ * recorded in `test/fixtures/stripe-thrown-confirm.json`). The third was **observed by
+ * `--engine-split`** (test mode, 2026-11-05, DECISIONS 152(a)): through the split create
+ * and confirm, a lapsed card rests with `expired_card` in both `code` and `decline_code`,
+ * on the confirm and on the retrieve (design §2.7:4051, PAY-U06). That card was refused
+ * at attach, so it ran unattached: **the saved-card path stays unproven**, since no test
+ * card attaches and then declines.
  *
- *   | `err.code`                 | blocker                   | card              |
+ *   | `code`                     | blocker                   | card              |
  *   | -------------------------- | ------------------------- | ----------------- |
  *   | `authentication_required`  | `authentication_required` | 4000002500003155  |
  *   | `card_declined`            | `declined`                | 4000000000000341  |
+ *   | `expired_card`             | `expired_card`            | 4000000000000069  |
  *
  * Everything else falls through to status-derived and logs a warning
  * ({@link chargeBlockerForConfirm}) — deliberately, not as an oversight:
- *
- *   - `insufficient_funds` is not a top-level code at all. Stripe reports it as
- *     `code='card_declined'` + `decline_code='insufficient_funds'`, so the
- *     `card_declined` row already covers it; `decline_code` granularity is
- *     below the `ChargeBlocker` vocabulary and stays unread.
- *   - `expired_card`, `processing_error`, `incorrect_cvc`, … all degrade to
- *     `declined` via `requires_payment_method`, which is the right owner
- *     ACTION ("try a different card") even where the tone is imperfect. Mapping
- *     them now would encode an unobserved assumption into a money path — the
- *     exact failure mode this table exists to undo. The warn line is how their
- *     real frequency and shape become known before anything maps them.
+ * `processing_error`, `incorrect_cvc`, … all degrade to `declined` via
+ * `requires_payment_method`, which is the right owner ACTION ("try a different
+ * card") even where the tone is imperfect. The warn line is how their real
+ * frequency and shape become known before anything maps them.
  */
-const THROWN_CARD_CODE_TO_BLOCKER: Readonly<Record<string, ChargeBlocker>> = {
+const CARD_CODE_TO_BLOCKER: Readonly<Record<string, ChargeBlocker>> = {
   authentication_required: 'authentication_required',
   card_declined: 'declined',
+  expired_card: 'expired_card',
 };
+
+/**
+ * Stripe's `decline_code` under `card_declined` → the narrower reason, where one is
+ * worth a different sentence. `insufficient_funds` is not a top-level code at all:
+ * Stripe reports it as `code='card_declined'` + `decline_code='insufficient_funds'`.
+ * `expired_card` is read here too, in case it arrives this way rather than as the
+ * code. Any other `decline_code` stays `declined`: the owner's action is the same.
+ */
+const DECLINE_CODE_TO_BLOCKER: Readonly<Record<string, ChargeBlocker>> = {
+  insufficient_funds: 'insufficient_funds',
+  expired_card: 'expired_card',
+};
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
+ * THE one reading of a card failure's two codes, for all three forks: the thrown error,
+ * and `last_payment_error` on a returned or a retrieved intent. One derivation, not
+ * three that happen to agree. `Object.hasOwn` before each lookup: both values cross a
+ * trust boundary, and a bare index into an object literal also finds INHERITED keys.
+ */
+function cardFailureOf(
+  rawCode: unknown,
+  rawDeclineCode: unknown,
+): Pick<StripePaymentIntentResult, 'blocker' | 'failureCode'> {
+  const code = nonEmptyString(rawCode);
+  const declineCode = nonEmptyString(rawDeclineCode);
+  const failureCode = code ?? declineCode;
+  if (failureCode === undefined) return {};
+  const narrowed =
+    declineCode !== undefined &&
+    (code === undefined || code === 'card_declined') &&
+    Object.hasOwn(DECLINE_CODE_TO_BLOCKER, declineCode)
+      ? DECLINE_CODE_TO_BLOCKER[declineCode]
+      : undefined;
+  const blocker =
+    narrowed ??
+    (code !== undefined && Object.hasOwn(CARD_CODE_TO_BLOCKER, code)
+      ? CARD_CODE_TO_BLOCKER[code]
+      : undefined);
+  return { ...(blocker !== undefined ? { blocker } : {}), failureCode };
+}
 
 /**
  * THE thrown-fork normalizer (wire 1.9.0) — the one place in this system that
@@ -819,8 +864,9 @@ const THROWN_CARD_CODE_TO_BLOCKER: Readonly<Record<string, ChargeBlocker>> = {
  * `code=authentication_required` while its attached intent already rests at
  * `requires_payment_method` (probe, 2026-08-11), so the status-only derivation
  * above it rendered "declined — try a different card" for a card that would
- * work with verification. The result now carries `blocker` + `failureCode`, on
- * the thrown fork only. The amended equivalence invariant:
+ * work with verification. The result now carries `blocker` + `failureCode`, read
+ * by {@link cardFailureOf}, as a returned or retrieved intent's does. The amended
+ * equivalence invariant:
  *
  *   > The two forks agree on everything that MOVES or RECORDS money —
  *   > obligation semantics (201-open vs 402-refuse), `charge_status`, the
@@ -863,9 +909,14 @@ const THROWN_CARD_CODE_TO_BLOCKER: Readonly<Record<string, ChargeBlocker>> = {
  * test.ts` fails if a future SDK moves it.
  */
 /**
- * The RETURNING fork's normalizer — the sibling of
- * {@link normalizeThrownConfirmError}, and exported for the same reason: a
- * money-path trust boundary that only a real test can hold honest.
+ * The RETURNING fork's normalizer, and the RETRIEVE fork's: a GET on an intent whose
+ * outcome nobody learned reads exactly as a confirm's answer does. The sibling of
+ * {@link normalizeThrownConfirmError}, and exported for the same reason: a money-path
+ * trust boundary that only a real test can hold honest.
+ *
+ * An intent that has failed carries `last_payment_error`, the same two codes a thrown
+ * error carries and the only fields that tell a decline from an authentication failure
+ * (both rest at `requires_payment_method`), so both go through {@link cardFailureOf}.
  *
  * This fork used to assert rather than verify (`intent.status as
  * StripePaymentIntentStatus`), so a status Stripe adds later fell off the end
@@ -888,12 +939,17 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
   const metadata = intentMetadata(intent.metadata);
   const received: unknown = intent.amount_received;
   const receivedCents = typeof received === 'number' ? received : undefined;
+  const failure = cardFailureOf(
+    intent.last_payment_error?.code,
+    intent.last_payment_error?.decline_code,
+  );
   if (isPaymentIntentStatus(intent.status)) {
     return {
       id: intent.id,
       status: intent.status,
       clientSecret: intent.client_secret,
       amountCents: intent.amount,
+      ...failure,
       ...(created !== undefined ? { createdAt: created } : {}),
       ...(metadata !== undefined ? { metadata } : {}),
       ...(receivedCents !== undefined ? { amountReceivedCents: receivedCents } : {}),
@@ -905,6 +961,7 @@ export function normalizeReturnedConfirm(intent: Stripe.PaymentIntent): StripePa
     clientSecret: intent.client_secret,
     amountCents: intent.amount,
     unknownStatus: String(intent.status),
+    ...failure,
     ...(created !== undefined ? { createdAt: created } : {}),
     ...(metadata !== undefined ? { metadata } : {}),
     ...(receivedCents !== undefined ? { amountReceivedCents: receivedCents } : {}),
@@ -988,33 +1045,6 @@ export function replayedFromResponse(intent: Stripe.PaymentIntent): boolean | un
 }
 
 /**
- * The RETRIEVE fork's normalizer (2026-08-12) — a GET on a PaymentIntent whose
- * outcome the worker never learned. Structurally the returning fork plus one
- * thing: a retrieved intent that has already failed carries
- * `last_payment_error.code`, the same field the thrown fork reads and the only
- * one that distinguishes a decline from an authentication failure (both rest at
- * `requires_payment_method`). Mapped through the SAME observed-code table, so
- * the verify lane's park copy is derived by the identical rule as the charge
- * lane's — one derivation, not two that happen to agree.
- */
-export function normalizeRetrievedIntent(intent: Stripe.PaymentIntent): StripePaymentIntentResult {
-  const base = normalizeReturnedConfirm(intent);
-  const rawCode: unknown = intent.last_payment_error?.code;
-  const code = typeof rawCode === 'string' && rawCode.length > 0 ? rawCode : undefined;
-  // `Object.hasOwn` before the lookup — same trust-boundary discipline as the
-  // thrown fork: a bare index also finds INHERITED keys.
-  const blocker =
-    code !== undefined && Object.hasOwn(THROWN_CARD_CODE_TO_BLOCKER, code)
-      ? THROWN_CARD_CODE_TO_BLOCKER[code]
-      : undefined;
-  return {
-    ...base,
-    ...(blocker !== undefined ? { blocker } : {}),
-    ...(code !== undefined ? { failureCode: code } : {}),
-  };
-}
-
-/**
  * WHICH idempotency error is this? Stripe spends one error type
  * (`idempotency_error`) on two conditions that could not be further apart on a
  * money path, and reading them as one is how a transient blip parked a healthy
@@ -1092,18 +1122,17 @@ export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentRe
   // Carried as a pre-mapped `blocker` (so nothing downstream re-derives a
   // second mapping that can drift) plus the raw string for the log line.
   //
-  // `Object.hasOwn` before the lookup, same discipline as `isPaymentIntentStatus`
-  // above and for the same reason: `err.code` crosses a trust boundary, and a
-  // bare index into an object literal also finds INHERITED keys —
-  // `THROWN_CARD_CODE_TO_BLOCKER['toString']` is a function at runtime while
-  // TypeScript types it `ChargeBlocker | undefined`. Unreachable in practice
-  // (Stripe would have to send `code: 'constructor'`), and one line to make
-  // impossible rather than merely unlikely on a money path.
-  const code = typeof err.code === 'string' && err.code.length > 0 ? err.code : undefined;
-  const blocker =
-    code !== undefined && Object.hasOwn(THROWN_CARD_CODE_TO_BLOCKER, code)
-      ? THROWN_CARD_CODE_TO_BLOCKER[code]
-      : undefined;
+  // `decline_code` is read off the error, then off the attached intent's
+  // `last_payment_error`: the recording has it in both places on a create-and-confirm.
+  // `--engine-split` answered the split confirm (test mode, DECISIONS 152(a)): both
+  // reasons read through this seam on the confirm and on the retrieve, though its log
+  // does not show which fork answered. Both cards ran unattached, so the saved-card
+  // path stays unproven.
+  const lastError = isRecord(attached) ? attached.last_payment_error : undefined;
+  const failure = cardFailureOf(
+    err.code,
+    nonEmptyString(err.decline_code) ?? (isRecord(lastError) ? lastError.decline_code : undefined),
+  );
   return {
     id,
     status,
@@ -1111,10 +1140,9 @@ export function normalizeThrownConfirmError(err: unknown): StripePaymentIntentRe
     // Amount is informational on this arm (nothing was captured), so a missing
     // one degrades to 0 rather than costing the owner a real sentence.
     amountCents: typeof amount === 'number' ? amount : 0,
-    // Omitted rather than set to `undefined` — the returning fork emits neither
-    // key, and "absent both ways" is one less shape for a consumer to model.
-    ...(blocker !== undefined ? { blocker } : {}),
-    ...(code !== undefined ? { failureCode: code } : {}),
+    // Omitted rather than set to `undefined`: "absent on every fork" is one less
+    // shape for a consumer to model.
+    ...failure,
     ...(createdAt !== undefined ? { createdAt } : {}),
   };
 }
@@ -1289,7 +1317,7 @@ export const defaultStripeClient: StripeClient = {
       {},
       budget !== undefined ? engineRequestOptions(budget) : {},
     );
-    return normalizeRetrievedIntent(intent);
+    return normalizeReturnedConfirm(intent);
   },
 
   async capturePaymentIntent(paymentIntentId, idempotencyKey) {

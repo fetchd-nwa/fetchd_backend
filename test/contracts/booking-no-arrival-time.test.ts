@@ -56,7 +56,14 @@ async function book(
     method: 'POST',
     url: '/bookings',
     headers: { 'idempotency-key': `arrive-${randomUUID()}` },
-    payload: { category: 'day-school', lead_dog_id: dogId, dates: [date], location, ...extra },
+    payload: {
+      category: 'day-school',
+      lead_dog_id: dogId,
+      dates: [date],
+      location,
+      payment: { kind: 'credits' },
+      ...extra,
+    },
   });
   const parsed = JSON.parse(res.body) as Partial<PostBookingsResponse>;
   return {

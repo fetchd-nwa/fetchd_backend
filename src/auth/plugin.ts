@@ -5,6 +5,7 @@ import type {
   FastifyRequest,
   preHandlerHookHandler,
 } from 'fastify';
+import Stripe from 'stripe';
 import type { Principal, StaffRole } from './principal.js';
 import { bypassHeaderEnabled } from '../env.js';
 import { ApiError, toErrorEnvelope } from '../lib/errors.js';
@@ -234,7 +235,17 @@ export function registerAuth(app: FastifyInstance): void {
     // queued 200 pages in 18 ms, and Sentry's quota is consumed at ingest, so
     // draining it silently disables the SURPLUS REFUND page. 5xx is ours and
     // pages; 4xx is the client's and warns. Bodies and status codes unchanged.
-    const status = typeof err.statusCode === 'number' ? err.statusCode : 500;
+    //
+    // One exception, and it is not the client's. A Stripe error carries Stripe's status,
+    // and a 401 or 403 from Stripe is Stripe refusing OUR key. Passed through, a bad or
+    // rotated key on *Cancel order* answers 401 and the portal signs the staff member
+    // out for a fault that is not hers, while nobody is told the key is dead. So it is
+    // ours: a 500, which pages. Every other Stripe status passes through as it always
+    // has, 429 above all, which is retryable and must not page.
+    const carried = typeof err.statusCode === 'number' ? err.statusCode : 500;
+    const stripeRefusedOurKey =
+      err instanceof Stripe.errors.StripeError && (carried === 401 || carried === 403);
+    const status = stripeRefusedOurKey ? 500 : carried;
     if (status >= 500) request.log.error({ err }, 'unhandled error');
     else request.log.warn({ err }, 'client error');
     return reply

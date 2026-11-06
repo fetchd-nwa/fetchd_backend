@@ -179,7 +179,7 @@ schema/transaction design deliberately corrects:
 | Mock gotcha | Production fix |
 |---|---|
 | `enrollInGroupClass` = 2 non-transactional writes | one txn: row-lock cohort → capacity assert → N×M inserts → fill bump |
-| No cohort capacity enforcement anywhere | `cohorts.filled <= capacity` CHECK + `SELECT … FOR UPDATE` |
+| No cohort capacity enforcement anywhere | `cohorts.filled <= capacity` CHECK + `SELECT … FOR NO KEY UPDATE` |
 | Report join is `(dogId,category,sameDay)` first-match, lossy | explicit `bookings.report_id` / `session_report_id` FK |
 | Client-minted `req-local-${Date.now()}` ids collide | server `gen_random_uuid()` |
 | Prereq eligibility = client-trusted `completed_class_keys` | server-derived from `dog_completed_classes` (R7) |

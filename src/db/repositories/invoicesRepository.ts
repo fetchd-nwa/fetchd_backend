@@ -115,9 +115,11 @@ export const invoicesRepository = {
 
   /**
    * Row-lock one invoice: tx1 of an invoice payment, so two tenders on one invoice
-   * serialise (design §2.7:3815). No charge lock is held when this is taken. `NO KEY
-   * UPDATE`, because tx1's insert of `orders.invoice_id` already took `KEY SHARE` here,
-   * and `FOR UPDATE` on top of that deadlocks two tenders (`db/locks.ts`).
+   * serialise (design §2.7:3815), with no charge lock held; and a final failure asking
+   * whether the invoice is still owed, under its charge lock, so it reads past a settle
+   * that has not committed. `NO KEY UPDATE`, because tx1's insert of `orders.invoice_id`
+   * already took `KEY SHARE` here, and `FOR UPDATE` on top of that deadlocks two tenders
+   * (`db/locks.ts`).
    */
   async lockById(tx: Tx, id: string): Promise<InvoiceRow | undefined> {
     const [row] = await tx

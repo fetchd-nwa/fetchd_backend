@@ -12,6 +12,83 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [4.0.0] — 2026-11-05
+
+BREAKING. LG3's third and last step: this sets 4.0.0, the group's target, and
+closes LG3 (plan unit P16, slices S21, S22; ledger PAY-U06, PAY-U09, DAY-U17,
+DAY-U19, and PAY-U41 for one doc line; PAY-U45 and TAX-U01 have no wire of their
+own; no migration; design §1.1 4.0.0,
+`designs/fetchd-v1-technical-design.md:864-874`, `:900-913`, `:917-920`; §2.3
+`:2613-2659`; §2.7 `:4051-4092`). 4.0.0 lands for clients when P16 is gate-green
+and pushed on `v1/build`. Contract-first: the routes keep today's behaviour until
+P16's backend lands them. Resync both clients (`npm run sync:contracts` in mobile
+and portal). Against the resynced copy (a scratch run at their HEADs, not their
+gates) the portal typechecks unchanged and mobile fails at
+`repositories/bookingRepository.ts:594`, `:602` and `:603`. The backend fails at
+`lib/bookingErrors.ts:115`, `routes/bookings.ts:143` and
+`routes/enrollments.ts:1654`. Closing those six closes tsc and leaves the
+pay-as-you-go lane compiling in both repos, so tsc is not the work list.
+
+Breaking:
+
+- `PostBookingsRequest.payment` is required, and is `{kind: 'credits', tier?:
+  'regular' | 'alumni', top_up?: {count, payment_method_id, package_key?,
+  expected_total_cents}}` where it was `'credits' | 'payg'` (PAY-U09, DAY-U17,
+  CRED-U10). Credits are the only tender: no pay-as-you-go arm, no card arm, no
+  `lines[]`. A missing `payment` or a string `payment` is 400 `bad_request`.
+- `PostBookingsRequest.payment_method_id` removed. It is an unknown key to
+  `.strict()`, so 400 `bad_request`, on a credits body too, where it used to be
+  accepted and ignored.
+
+Added:
+
+- `payment.top_up`, typed here and live at P18. Until then `top_up_offer` is
+  always `null`, and a body carrying `top_up` answers as tx1 answers an offer
+  that no longer holds: 422 `insufficient_credits` with the current `shortfall`
+  and `top_up_offer: null`, nothing written, no order, the card not read, no
+  Stripe call. With credits enough for the dates that is `shortfall: 0`, and the
+  client re-sends without `top_up`. `tier` is accepted and not read until P18.
+- `InsufficientCreditsDetails` gains `shortfall`, `short_dates: {date, reason:
+  'no_credit' | 'credits_expire_first', expires_at?}[]`, `top_up_offer: {count,
+  unit_price_cents, total_cents, package_key} | null` and
+  `alternative_package_key?` (PAY-U09, DAY-U17). `gaps` stays. `short_dates` has
+  one entry per missing credit, so its length is `shortfall`. Every `reason` is
+  `'no_credit'` and `alternative_package_key` is omitted until P18.
+- `ChargeBlocker` and `CHARGE_BLOCKERS` gain `'insufficient_funds'` and
+  `'expired_card'` (PAY-U06), on every route that carries a blocker.
+- `'credit_expired_before_date'` appended to `ApiErrorCode` and `API_ERROR_CODES`,
+  422 in `API_ERROR_STATUS` (CRED-U12). `CreditExpiredBeforeDateDetails
+  {expires_at, dates}` joins `ApiErrorDetailWire` and `PostBookingsErrorDetails`,
+  and the code joins `POST_BOOKINGS_ERROR_DETAIL_KINDS` before
+  `'insufficient_credits'`, because a date no credit can reach is found first
+  and a top-up could not complete that booking. Not reachable until its predicate
+  lands (P18).
+
+Changed (doc only, no shape change):
+
+- `PaymentFailedDetails`: "With no `charge_blocker` no card answered" is false on
+  real Stripe, which keeps no reason on a cancelled intent (test-mode run,
+  DECISIONS 147(b), 149(b)). It now says no reason is recorded, and "no money
+  moved" stands. A doc error on a landed version, so it rides this bump.
+- `POST /bookings`' refusal arms are renumbered, and "NOT reachable yet" names
+  arms 5 and 9. The pay-as-you-go sentences leave `PostBookingsRequest`,
+  `PostBookingsErrorDetails` and `PostBookingsResponse`.
+- `ChargePurpose` and `LedgerEntryWire.kind` say `'payg'` stays, pinned to the
+  pgEnum with no migration here, that nothing writes it from 4.0.0, and that it
+  survives on rows already written until P17 deletes the auto-charge lane.
+- `RateWire` and `PostStaffRatesRequest` lose their pay-as-you-go reasons. Three
+  rate docs that said "design 4.0.0" now say P18: DAY-U23 moved to S23 (design
+  §1.3).
+- `StaffRateWire`: voiding a past-dated row that has a predecessor is 409
+  `conflict` (PAY-U41).
+- `ApiErrorCode`'s `insufficient_credits` comment covers a `top_up` that no longer
+  fits.
+
+Not typed here: `PostStaffRatesRequest`'s narrowing and `GET /rates` (DAY-U23,
+P18); `CreditPurchaseWire`'s processing arm (P18); the `CreditGap` re-key (P18);
+409 `payment_pending` (P20); `EnrollmentWire.order_id` and
+`PostEnrollmentsResponse` (P29).
+
 ## [4.0.0-lg3.2] — 2026-11-05
 
 BREAKING. LG3's second step, step 2 of 3 toward 4.0.0 (plan unit P15, slice S20,

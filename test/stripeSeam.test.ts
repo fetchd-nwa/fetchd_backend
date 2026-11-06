@@ -51,11 +51,12 @@ import {
 function cardErrorWithIntent(
   intent: Record<string, unknown>,
   code = 'card_declined',
+  declineCode = 'generic_decline',
 ): InstanceType<typeof Stripe.errors.StripeCardError> {
   return new Stripe.errors.StripeCardError({
     type: 'card_error',
     code,
-    decline_code: 'generic_decline',
+    decline_code: declineCode,
     message: 'Your card was declined.',
     statusCode: 402,
     payment_intent: intent,
@@ -114,8 +115,8 @@ function attachedIntent(
   };
 }
 
-/** What the RETURNING fork produces for the same intent — no `blocker`, no
- *  `failureCode`, because a returned intent carries no error code to read. */
+/** What the RETURNING fork produces for an intent with no `last_payment_error` — no
+ *  `blocker`, no `failureCode`, because there is no code to read. */
 function returnedForkResult(status: StripePaymentIntentStatus): StripePaymentIntentResult {
   return {
     id: 'pi_thrown_1',
@@ -125,10 +126,9 @@ function returnedForkResult(status: StripePaymentIntentStatus): StripePaymentInt
   };
 }
 
-/** What the THROWN fork produces: the returning fork's shape PLUS the two
- *  fields only a thrown error can carry. Since 2026-08-11 the forks are
- *  deliberately not byte-identical — the thrown one knows which failure
- *  happened, and erasing that is the defect this file now pins. */
+/** What the THROWN fork produces: the bare returned shape PLUS the two fields a card
+ *  failure carries. Since 2026-08-11 they differ whenever Stripe named the failure, and
+ *  erasing that is the defect this file now pins. */
 function thrownForkResult(
   status: StripePaymentIntentStatus,
   over: Partial<StripePaymentIntentResult> = {},
@@ -351,9 +351,9 @@ test('defaultStripeClient.createAndConfirmPaymentIntent: the RETURNING fork maps
     }),
   );
 
-  // Exactly the returning-fork shape — no `blocker`, no `failureCode`. There is
-  // no code to read on this fork, and inventing one from the status is the
-  // original defect running backwards.
+  // Exactly the returning-fork shape — no `blocker`, no `failureCode`. This intent
+  // carries no `last_payment_error`, so there is no code to read, and inventing one
+  // from the status is the original defect running backwards.
   assert.deepEqual(
     await defaultStripeClient.createAndConfirmPaymentIntent(CONFIRM_ARGS, 'idem-seam-ok'),
     returnedForkResult('requires_payment_method'),
@@ -439,22 +439,119 @@ test('the recorded pair are distinguishable ONLY by code — the status cannot t
 // ── The precedence rule and its one carve-out ─────────────────────────────
 
 test('chargeBlockerForConfirm: an UNMAPPED code falls back to the status AND warns', () => {
-  // HAND-BUILT from the recorded intent: `expired_card` is Stripe-documented
+  // HAND-BUILT from the recorded intent: `incorrect_cvc` is Stripe-documented
   // but has never been observed on this path, and a speculative row in a
   // money-path map is how a wrong observation gets invented. Fallback gives the
   // right owner ACTION ("try a different card"); the warn is how we would learn
   // to map it for real.
   const { log, warns } = capturingLogger();
   const result = normalizeThrownConfirmError(
-    cardErrorWithIntent(recordedScenario('saved-card-declined').error.payment_intent, 'expired_card'),
+    cardErrorWithIntent(
+      recordedScenario('saved-card-declined').error.payment_intent,
+      'incorrect_cvc',
+    ),
   );
 
   assert.equal(result.blocker, undefined, 'unmapped codes must not invent a blocker');
-  assert.equal(result.failureCode, 'expired_card', 'but the raw code is carried for the log');
+  assert.equal(result.failureCode, 'incorrect_cvc', 'but the raw code is carried for the log');
   assert.equal(chargeBlockerForConfirm(result, log), 'declined');
   assert.equal(warns.length, 1, 'an unmapped code on a money path is never silent');
   assert.match(warns[0]!.msg, /unmapped code/);
-  assert.equal(warns[0]!.obj.code, 'expired_card');
+  assert.equal(warns[0]!.obj.code, 'incorrect_cvc');
+});
+
+// ── `decline_code` (PAY-U06): the three forks read it alike ─────────────────
+//
+// HAND-BUILT, and labelled so: `npm run probe:stripe -- --engine-split` is what asks where
+// a real decline leaves these two fields through the split create and confirm. These
+// rows pin what the seam does with them wherever Stripe puts them.
+
+const DECLINE_REASONS: readonly (readonly [string, string, string | undefined, string])[] = [
+  ['no funds', 'card_declined', 'insufficient_funds', 'insufficient_funds'],
+  ['a lapsed card, top-level', 'expired_card', undefined, 'expired_card'],
+  ['a lapsed card, both fields', 'expired_card', 'expired_card', 'expired_card'],
+  ['a lapsed card, under card_declined', 'card_declined', 'expired_card', 'expired_card'],
+  ['a decline Stripe gave no narrower reason for', 'card_declined', 'generic_decline', 'declined'],
+  ['a decline code this map does not hold', 'card_declined', 'lost_card', 'declined'],
+];
+
+for (const [name, code, declineCode, blocker] of DECLINE_REASONS) {
+  const lastPaymentError = {
+    code,
+    ...(declineCode !== undefined ? { decline_code: declineCode } : {}),
+  };
+  const resting = {
+    id: 'pi_thrown_1',
+    status: 'requires_payment_method',
+    client_secret: 'pi_thrown_1_secret_abc',
+    amount: 12_500,
+    last_payment_error: lastPaymentError,
+  };
+
+  test(`the thrown fork reads ${name} as ${blocker}`, () => {
+    const { log } = capturingLogger();
+    const result = normalizeThrownConfirmError(
+      cardErrorWithIntent(attachedIntent('requires_payment_method'), code, declineCode),
+    );
+    assert.equal(result.blocker, blocker);
+    assert.equal(result.failureCode, code, 'the raw code stays the top-level one');
+    assert.equal(chargeBlockerForConfirm(result, log), blocker);
+  });
+
+  test(`the thrown fork finds ${name} on the attached intent when the error omits it`, () => {
+    const { log } = capturingLogger();
+    const bare = new Stripe.errors.StripeCardError({
+      type: 'card_error',
+      code,
+      message: 'Your card was declined.',
+      statusCode: 402,
+      payment_intent: resting,
+    } as never);
+    assert.equal(chargeBlockerForConfirm(normalizeThrownConfirmError(bare), log), blocker);
+  });
+
+  test(`the returning fork reads ${name} as ${blocker}`, () => {
+    const { log } = capturingLogger();
+    const result = normalizeReturnedConfirm(resting as unknown as Stripe.PaymentIntent);
+    assert.equal(result.blocker, blocker);
+    assert.equal(result.failureCode, code);
+    assert.equal(chargeBlockerForConfirm(result, log), blocker);
+  });
+
+  test(`the retrieve reads ${name} as ${blocker}`, async (t) => {
+    const paymentIntentsPrototype = Object.getPrototypeOf(
+      new Stripe('sk_test_seam').paymentIntents,
+    ) as { retrieve: (...a: unknown[]) => Promise<unknown> };
+    t.mock.method(paymentIntentsPrototype, 'retrieve', () => Promise.resolve(resting));
+    const { log } = capturingLogger();
+    const result = await defaultStripeClient.retrievePaymentIntent('pi_thrown_1');
+    assert.equal(result.blocker, blocker);
+    assert.equal(chargeBlockerForConfirm(result, log), blocker);
+  });
+}
+
+test('a decline code never overrides a processing status either', () => {
+  const { log } = capturingLogger();
+  const result = normalizeReturnedConfirm({
+    id: 'pi_thrown_1',
+    status: 'processing',
+    client_secret: null,
+    amount: 12_500,
+    last_payment_error: { code: 'card_declined', decline_code: 'insufficient_funds' },
+  } as unknown as Stripe.PaymentIntent);
+  assert.equal(chargeBlockerForConfirm(result, log), 'processing');
+});
+
+test('no last_payment_error: the returning fork and the retrieve say nothing', () => {
+  const result = normalizeReturnedConfirm({
+    id: 'pi_thrown_1',
+    status: 'requires_payment_method',
+    client_secret: null,
+    amount: 12_500,
+    last_payment_error: null,
+  } as unknown as Stripe.PaymentIntent);
+  assert.equal('blocker' in result, false);
+  assert.equal('failureCode' in result, false);
 });
 
 test('chargeBlockerForConfirm: a code NEVER overrides a processing status (the double-charge shield)', () => {
@@ -510,7 +607,7 @@ test('chargeBlockerForConfirm: a code AGREEING with a processing status warns ab
 
 // ── The RETURNING fork must not regress ───────────────────────────────────
 
-test('chargeBlockerForConfirm: the returning fork still derives from status alone', () => {
+test('chargeBlockerForConfirm: an intent with no code still derives from status alone', () => {
   const { log, warns } = capturingLogger();
   // Full results via `returnedForkResult`, never a bare `{ status }`:
   // `chargeBlockerForConfirm` takes the whole `StripePaymentIntentResult` on

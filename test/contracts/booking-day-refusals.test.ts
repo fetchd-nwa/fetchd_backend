@@ -78,7 +78,12 @@ async function book(
     method: 'POST',
     url: '/bookings',
     headers: { 'idempotency-key': key },
-    payload: { category: 'day-school', location: 'bentonville', ...payload },
+    payload: {
+      category: 'day-school',
+      location: 'bentonville',
+      payment: { kind: 'credits' },
+      ...payload,
+    },
   });
   return result(res);
 }

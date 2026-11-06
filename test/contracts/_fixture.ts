@@ -1957,9 +1957,7 @@ export async function teardownFixture(): Promise<void> {
  * next weekday). Booking-surface tests want weekdays because a weekend is
  * unticked in `open_weekdays_list` as seeded, so its cap is 0 — a weekend
  * date 422s on insufficient_capacity before the behavior under test runs.
- * Extracted 2026-07-15 (the 6th per-file copy tripped the duplication bar);
- * booking-payg keeps its local dual-anchor variant (it also derives weekdays
- * from REAL now for the PAYG due-at math).
+ * Extracted 2026-07-15 (the 6th per-file copy tripped the duplication bar).
  */
 export function futureWeekday(nth: number): string {
   const ONE_DAY = 86_400_000;

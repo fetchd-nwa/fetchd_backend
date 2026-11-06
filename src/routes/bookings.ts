@@ -16,10 +16,7 @@ import type { DayProgramCategory } from '../lib/bookingSchedule.js';
 import type { BookingWire } from '../lib/bookingWire.js';
 import { askWhatWonForPendingRow, cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
-import {
-  createDayProgramBookings,
-  type DayProgramPaymentPlan,
-} from '../lib/createDayProgramBookings.js';
+import { createDayProgramBookings } from '../lib/createDayProgramBookings.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
 import { ApiError } from '../lib/errors.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -104,12 +101,31 @@ const dogIdField = uuidId();
  * express cleanly (dates distinct, lead not in additionals). No arrival
  * time is taken (DAY-U11): `dropoff_time` is an unknown key to `.strict()`.
  *
- * `payment` (Δ 2026-06-19): a day-program group pays from the credit balance
- * (default, omitted) or pay-as-you-go (`'payg'` — skip the credit debit, charge
- * the card ~1h before drop-off via an open `'payg'` invoice). `payment_method_id`
- * is required when `payment: 'payg'` (the cross-field rule lives in
- * `validateBookingBody`; Zod only enforces shape here).
+ * `payment` says credits, the only tender (R1): required, so every booking says so
+ * and one body has one spelling, which is what the request key hashes. `.strict()`
+ * here too, so `kind: 'payg'`, `kind: 'card'` and a top-level `payment_method_id` are
+ * 400. `tier` is accepted and read by nothing until P18. `top_up` is P18's live path:
+ * until then the core refuses it at the credit check.
  */
+const bookingPaymentSchema = z
+  .object({
+    kind: z.literal('credits'),
+    tier: z.enum(['regular', 'alumni']).optional(),
+    top_up: z
+      .object({
+        count: z.number().int().positive(),
+        payment_method_id: uuidId(),
+        package_key: z
+          .string()
+          .regex(/^[a-z0-9-]{1,64}$/)
+          .optional(),
+        expected_total_cents: z.number().int().positive(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 const postBookingBodySchema = z
   .object({
     category: z.enum(['day-school', 'day-care']),
@@ -126,8 +142,7 @@ const postBookingBodySchema = z
       .max(MAX_DATES_PER_REQUEST),
     location: z.enum(LOCATION_KEYS),
     notes: z.string().max(2000).optional(),
-    payment: z.enum(['credits', 'payg']).optional(),
-    payment_method_id: uuidId().optional(),
+    payment: bookingPaymentSchema,
   })
   .strict();
 
@@ -250,10 +265,10 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   // bookSession transaction-contract notes).
   //
   // One request → N bookings, one per requested date, atomic. Body:
-  //   { category, lead_dog_id, additional_dog_ids?, dates[], location, notes?,
-  //     payment?, payment_method_id? }
-  // → 201 PostBookingsResponse {order, sessions} (one order per Confirm, credits-only
-  //   included; `sessions.length` = dates.length, ordered ASC by scheduled_at).
+  //   { category, lead_dog_id, additional_dog_ids?, dates[], location, notes?, payment }
+  // → 201 PostBookingsResponse {order, sessions} (one order per Confirm, and every
+  //   Confirm is credits-only until P18's top-up; `sessions.length` = dates.length,
+  //   ordered ASC by scheduled_at).
   //
   // Owner-only (staff portal lives at Day 19). Idempotency-Key required;
   // the same key + body returns the stored response. The same key + a
@@ -278,7 +293,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   //      the same total acquisition order; the settings read once under the locks;
   //      `program_not_offered` → the past-date check and `beyond_booking_horizon` →
   //      `same_day_cutoff_passed`; the gates; credits; the overlap guard; then, per
-  //      session, capacity → INSERT → money → reminders.
+  //      session, capacity → INSERT → the credit debits → reminders.
   //   4. Post-commit (handled by withMutation): `patternsToInvalidate` wipes
   //      `avail:{location}:*` and each debited dog's balance cache.
   //
@@ -298,9 +313,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       const parsed = validateBookingBody(body);
 
       // Closure-captured (same pattern as the cancel route's
-      // `pendingStripeRefund`): the credits branch debits every dog, PAYG
-      // debits none. `patternsToInvalidate` reads this post-commit to wipe only
-      // the dogs whose balance actually moved.
+      // `pendingStripeRefund`): a refusal debits nobody. `patternsToInvalidate`
+      // reads this post-commit to wipe only the dogs whose balance actually moved.
       let creditDebitedDogIds = new Set<string>();
 
       const outcome = await withMutation<PostBookingsResponse>(
@@ -540,8 +554,8 @@ async function pickupCloseByCampus(): Promise<PickupCloseByCampus> {
  * Validated, derived form of the request body. `parseOrThrow` handles
  * the Zod-shape errors; this helper layers on the cross-field invariants
  * Zod doesn't express cleanly and that need NO CLOCK AND NO SETTING: dates
- * distinct, lead not in additionals, the card named on a PAYG group. A rule
- * that reads either belongs inside `withMutation`, or a replay meets it.
+ * distinct, lead not in additionals. A rule that reads either belongs inside
+ * `withMutation`, or a replay meets it.
  *
  * Returns the route-internal `ValidatedBookingBody` — every downstream
  * call (gate pre-check, capacity assertion, INSERT) takes this typed
@@ -556,9 +570,7 @@ interface ValidatedBookingBody {
   sortedDates: string[];
   location: (typeof LOCATION_KEYS)[number];
   notes: string | null;
-  // Tagged union (Δ 2026-06-19) — `paymentMethodId` exists only on the PAYG
-  // arm; the cross-field requirement is enforced in `resolvePaymentPlan`.
-  payment: DayProgramPaymentPlan;
+  payment: PostBookingBody['payment'];
 }
 
 function validateBookingBody(body: PostBookingBody): ValidatedBookingBody {
@@ -589,21 +601,6 @@ function validateBookingBody(body: PostBookingBody): ValidatedBookingBody {
     sortedDates,
     location: body.location,
     notes: body.notes ?? null,
-    payment: resolvePaymentPlan(body),
+    payment: body.payment,
   };
-}
-
-/**
- * Resolve the body's payment fields into the tagged `DayProgramPaymentPlan`.
- * Default is `'credits'` (omitted `payment`). PAYG requires
- * `payment_method_id` — the card's ownership + liveness is validated in-tx
- * (`resolvePaygPlan`); here we only enforce presence. A `payment_method_id`
- * sent on a `'credits'` group is ignored (additive, backward-compatible).
- */
-function resolvePaymentPlan(body: PostBookingBody): DayProgramPaymentPlan {
-  if ((body.payment ?? 'credits') === 'credits') return { kind: 'credits' };
-  if (body.payment_method_id === undefined) {
-    throw new ApiError('invalid_payload', 'payment_method_id is required when payment is payg');
-  }
-  return { kind: 'payg', paymentMethodId: body.payment_method_id };
 }

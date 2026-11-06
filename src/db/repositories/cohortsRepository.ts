@@ -78,7 +78,7 @@ export const cohortsRepository = {
   // Day 11 — write path. Tx-only. `lockCohort` (db/locks.ts) is the lock
   // primitive; this method composes after the lock and applies the
   // `filled` counter bump under the same row lock. Caller is responsible
-  // for having `SELECT ... FOR UPDATE`-ed the row first — without that
+  // for having `SELECT ... FOR NO KEY UPDATE`-ed the row first — without that
   // lock, concurrent enrollments could each pass a capacity assertion
   // against a snapshot that hadn't yet seen the other's bump.
   // -------------------------------------------------------------------

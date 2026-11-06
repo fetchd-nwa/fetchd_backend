@@ -85,8 +85,13 @@ test('agreementUnsignedError throws on empty missing[]', () => {
   assert.throws(() => agreementUnsignedError([]), /missing array must be non-empty/);
 });
 
+const THREE_DATES = ['2026-06-01', '2026-06-02', '2026-06-03'];
+
 test('insufficientCreditsError single-dog gap', () => {
-  const err = insufficientCreditsError([{ dog_id: 'd1', mode: 'school', balance: 1, required: 3 }]);
+  const err = insufficientCreditsError(
+    [{ dog_id: 'd1', mode: 'school', balance: 1, required: 3 }],
+    THREE_DATES,
+  );
   assert.equal(err.code, 'insufficient_credits');
   assert.equal(err.status, 422);
   assert.equal((err.details as { kind: string; gaps: unknown[] }).kind, 'insufficient_credits');
@@ -95,15 +100,50 @@ test('insufficientCreditsError single-dog gap', () => {
 });
 
 test('insufficientCreditsError multi-dog gap collapses message', () => {
-  const err = insufficientCreditsError([
-    { dog_id: 'd1', mode: 'school', balance: 1, required: 3 },
-    { dog_id: 'd2', mode: 'school', balance: 0, required: 3 },
-  ]);
+  const err = insufficientCreditsError(
+    [
+      { dog_id: 'd1', mode: 'school', balance: 1, required: 3 },
+      { dog_id: 'd2', mode: 'school', balance: 0, required: 3 },
+    ],
+    THREE_DATES,
+  );
   assert.match(err.message, /Insufficient credits across 2 dogs\./);
 });
 
-test('insufficientCreditsError throws on empty gaps[]', () => {
-  assert.throws(() => insufficientCreditsError([]), /gaps array must be non-empty/);
+test('insufficientCreditsError gives each dog its last missing dates, one per credit', () => {
+  const err = insufficientCreditsError(
+    [
+      { dog_id: 'biscuit', mode: 'school', balance: 1, required: 3 },
+      { dog_id: 'waffles', mode: 'school', balance: 2, required: 3 },
+    ],
+    THREE_DATES,
+  );
+  assert.deepEqual(err.details, {
+    kind: 'insufficient_credits',
+    gaps: [
+      { dog_id: 'biscuit', mode: 'school', balance: 1, required: 3 },
+      { dog_id: 'waffles', mode: 'school', balance: 2, required: 3 },
+    ],
+    shortfall: 3,
+    short_dates: [
+      { date: '2026-06-02', reason: 'no_credit' },
+      { date: '2026-06-03', reason: 'no_credit' },
+      { date: '2026-06-03', reason: 'no_credit' },
+    ],
+    top_up_offer: null,
+  });
+});
+
+test('insufficientCreditsError on no gaps is a 422 with shortfall 0, not a 500', () => {
+  const err = insufficientCreditsError([], THREE_DATES);
+  assert.equal(err.status, 422);
+  assert.deepEqual(err.details, {
+    kind: 'insufficient_credits',
+    gaps: [],
+    shortfall: 0,
+    short_dates: [],
+    top_up_offer: null,
+  });
 });
 
 test('insufficientCapacityError carries location/date/remaining/requested, and no mode', () => {

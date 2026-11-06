@@ -3,12 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
-import type { PostBookingsResponse } from '../../src/contracts/wire.js';
-import { invoices as invoicesTable, serviceRates } from '../../src/db/schema/schema.js';
-import { registerBookingsRoute } from '../../src/routes/bookings.js';
+import { serviceRates } from '../../src/db/schema/schema.js';
 import { registerStaffRatesRoute } from '../../src/routes/staffRates.js';
-import { futureWeekday, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
-import { makeStripeStub } from './_stripeStub.js';
+import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_MANAGER_PRINCIPAL,
@@ -47,12 +44,6 @@ function staffApp(principal = FIXTURE_MANAGER_PRINCIPAL): {
 } {
   const { app, authenticate } = makeContractApp(principal);
   registerStaffRatesRoute(app, { authenticate, now: FIXTURE_NOW });
-  return { app };
-}
-
-function ownerBookingApp(): { app: ReturnType<typeof makeContractApp>['app'] } {
-  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-  registerBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe: makeStripeStub() });
   return { app };
 }
 
@@ -145,6 +136,26 @@ test(
       body.some((r) => r.category === 'day-school' && r.location === null),
       'null-location row present with explicit null',
     );
+  },
+);
+
+test(
+  'POST /staff/rates — TAX-10: a price in fractions of a cent is 400',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffApp();
+    const res = await postRate({
+      app,
+      idempotencyKey: `sr-fraction-${randomUUID()}`,
+      payload: {
+        category: 'private-lesson',
+        location: 'fayetteville',
+        amount_cents: 7_550.5,
+        unit: 'flat',
+      },
+    });
+    assert.equal(res.statusCode, 400, res.body);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'bad_request');
   },
 );
 
@@ -340,6 +351,127 @@ test(
     assert.equal(live.length, 1, 'only the original window remains');
     assert.equal(live[0]!.amountCents, 8500);
     assert.equal(live[0]!.effectiveTo, null, 'predecessor reopened to open-ended (no pricing gap)');
+  },
+);
+
+/** PAY-74's own track, so nothing here moves a seeded rate. Returns ids in the order given. */
+async function seedPrivateLessonTrack(
+  rows: readonly { effectiveFrom: string; effectiveTo: string | null }[],
+): Promise<string[]> {
+  await clearPrivateLessonTrack();
+  const ids: string[] = [];
+  for (const row of rows) {
+    const [inserted] = await db
+      .insert(serviceRates)
+      .values({
+        category: 'private-lesson',
+        location: 'bentonville',
+        amountCents: 5000 + ids.length,
+        unit: 'flat',
+        effectiveFrom: row.effectiveFrom,
+        effectiveTo: row.effectiveTo,
+      })
+      .returning({ id: serviceRates.id });
+    assert.ok(inserted);
+    ids.push(inserted.id);
+  }
+  return ids;
+}
+
+async function clearPrivateLessonTrack(): Promise<void> {
+  await db
+    .delete(serviceRates)
+    .where(
+      and(eq(serviceRates.category, 'private-lesson'), eq(serviceRates.location, 'bentonville')),
+    );
+}
+
+test(
+  'POST /staff/rates/:id/void — a row begun before today with a predecessor is 409 conflict, and nothing moves',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const [olderId, pastId] = await seedPrivateLessonTrack([
+      { effectiveFrom: '2026-01-01', effectiveTo: '2026-03-01' },
+      { effectiveFrom: '2026-03-01', effectiveTo: null },
+    ]);
+    assert.ok(pastId);
+    const { app } = staffApp();
+
+    const res = await voidRate(app, pastId);
+
+    assert.equal(res.statusCode, 409, res.body);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'conflict');
+    const rows = await rowsForTrack('private-lesson', 'bentonville');
+    const older = rows.find((r) => r.id === olderId);
+    const past = rows.find((r) => r.id === pastId);
+    assert.equal(older?.effectiveTo, '2026-03-01', 'the old price does not reopen over past dates');
+    assert.equal(past?.voidedAt, null, 'and the row stands');
+    await clearPrivateLessonTrack();
+  },
+);
+
+test(
+  'POST /staff/rates/:id/void — a row begun before today with no predecessor stays voidable',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const [onlyId] = await seedPrivateLessonTrack([
+      { effectiveFrom: '2026-03-01', effectiveTo: null },
+    ]);
+    assert.ok(onlyId);
+    const { app } = staffApp();
+
+    const res = await voidRate(app, onlyId);
+
+    assert.equal(res.statusCode, 200, res.body);
+    const [row] = await rowsForTrack('private-lesson', 'bentonville');
+    assert.notEqual(row?.voidedAt, null);
+    await clearPrivateLessonTrack();
+  },
+);
+
+test(
+  'POST /staff/rates/:id/void — a row begun today, or scheduled, voids and reopens its predecessor',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    for (const effectiveFrom of ['2026-05-19', '2026-05-20']) {
+      const [olderId, rowId] = await seedPrivateLessonTrack([
+        { effectiveFrom: '2026-01-01', effectiveTo: effectiveFrom },
+        { effectiveFrom, effectiveTo: null },
+      ]);
+      assert.ok(rowId);
+      const { app } = staffApp();
+
+      const res = await voidRate(app, rowId);
+
+      assert.equal(res.statusCode, 200, res.body);
+      const older = (await rowsForTrack('private-lesson', 'bentonville')).find(
+        (r) => r.id === olderId,
+      );
+      assert.equal(older?.effectiveTo, null, `reopened over ${effectiveFrom} onward`);
+    }
+    await clearPrivateLessonTrack();
+  },
+);
+
+test(
+  'POST /staff/rates/:id/void — "before today" is a Chicago day: at 03:00Z on 2 Jun, 1 Jun is still today',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const [, rowId] = await seedPrivateLessonTrack([
+      { effectiveFrom: '2026-01-01', effectiveTo: '2026-06-01' },
+      { effectiveFrom: '2026-06-01', effectiveTo: null },
+    ]);
+    assert.ok(rowId);
+    const { app, authenticate } = makeContractApp(FIXTURE_MANAGER_PRINCIPAL);
+    registerStaffRatesRoute(app, {
+      authenticate,
+      now: () => new Date('2026-06-02T03:00:00Z'),
+    });
+
+    const res = await voidRate(app, rowId);
+
+    assert.equal(res.statusCode, 200, res.body);
+    await clearPrivateLessonTrack();
   },
 );
 
@@ -605,86 +737,6 @@ test(
         ),
       );
     assert.equal(liveOpen.length, 1, 'exactly one live open window after concurrent edits');
-  },
-);
-
-// ──────────────────────────────────────────────────────────────────────────
-// Integration — set rate drives the PAYG charge; per-day defense-in-depth
-// ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'POST /staff/rates — a new rate is what the next PAYG booking is charged',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { app: staff } = staffApp();
-    const { app: owner } = ownerBookingApp();
-    const set = await postRate({
-      app: staff,
-      idempotencyKey: `sr-int-${randomUUID()}`,
-      payload: {
-        category: 'day-school',
-        location: 'bentonville',
-        amount_cents: 7200,
-        unit: 'per-day',
-      },
-    });
-    assert.equal(set.statusCode, 200, set.body);
-
-    const booking = await owner.inject({
-      method: 'POST',
-      url: '/bookings',
-      headers: { 'idempotency-key': `sr-int-book-${randomUUID()}` },
-      payload: {
-        category: 'day-school',
-        lead_dog_id: FIXTURE_IDS.dog1Id,
-        dates: [futureWeekday(41)],
-        location: 'bentonville',
-        payment: 'payg',
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-      },
-    });
-    assert.equal(booking.statusCode, 201, booking.body);
-    const bookingId = (booking.json() as PostBookingsResponse).sessions[0]!.id;
-    const [invoice] = await db
-      .select({ amountCents: invoicesTable.amountCents })
-      .from(invoicesTable)
-      .where(eq(invoicesTable.bookingId, bookingId));
-    assert.equal(invoice!.amountCents, 7200, 'charged the staff-set rate');
-  },
-);
-
-test(
-  'PAYG booking — a non-per-day day-program rate is refused (defense-in-depth), not mis-billed',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { app: owner } = ownerBookingApp();
-    // Bypass the editor's unit guard with a direct insert (simulating a bad
-    // seed/SQL row): a day-care @bentonville priced PER-WEEK.
-    await db
-      .delete(serviceRates)
-      .where(and(eq(serviceRates.category, 'day-care'), eq(serviceRates.location, 'bentonville')));
-    await db.insert(serviceRates).values({
-      category: 'day-care',
-      location: 'bentonville',
-      amountCents: 30000,
-      unit: 'per-week',
-      effectiveFrom: '2026-01-01',
-    });
-
-    const booking = await owner.inject({
-      method: 'POST',
-      url: '/bookings',
-      headers: { 'idempotency-key': `sr-guard-book-${randomUUID()}` },
-      payload: {
-        category: 'day-care',
-        lead_dog_id: FIXTURE_IDS.dog1Id,
-        dates: [futureWeekday(42)],
-        location: 'bentonville',
-        payment: 'payg',
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-      },
-    });
-    assert.equal(booking.statusCode, 500, 'refuses to charge a non-per-day day-program rate');
   },
 );
 

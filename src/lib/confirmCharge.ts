@@ -98,6 +98,21 @@ export interface EngineLog extends ChargeBlockerLogger {
 /** What a final failure does with the order (design §2.7:3899-3902). */
 export type FinalFailurePolicy = 'cancel-order' | 'leave-invoice-open';
 
+/**
+ * How long a phone waits on a payment's answer: the seed of `pay.seat_hold_max_minutes`,
+ * and deliberately not the setting. The owner's settings document does not carry it
+ * (`OwnerPaymentSettingsWire`), so her phone runs on the seed whatever staff set. This is
+ * the server's half of one number: the phone's is `PAY_HOLD_SEED_MS` in
+ * `mobile/src/lib/payResend.ts`, and the two change together.
+ *
+ * "Told once" holds within one re-send interval, about 5 s, not to the instant. The two
+ * clocks start apart and the phone only reads on a re-send, so its last send can leave up
+ * to that long past the hold: a decline landing in that gap is a 402 on screen and a push,
+ * told twice. One landing after her last send and ahead of this mark, about the first
+ * request's latency, is neither. Both are seconds wide, and no money turns on either.
+ */
+export const PAY_HOLD_SEED_MS = 2 * 60 * 1000;
+
 /** One order's Stripe budget, read once per call of the engine. */
 export interface EngineBudget {
   attemptsMax: number;
@@ -230,6 +245,8 @@ const NO_INVOICE_SETTLE_ALARM =
   'an engine charge whose order has no invoice reached succeeded: only a top-up or a pack can, and neither is on the engine yet';
 const LATE_SUCCESS_ALARM =
   'a charge succeeded after its order was cancelled: it grants nothing and is being refunded in full, automatically';
+const LATE_SUCCESS_NO_INTENT_ALARM =
+  'a charge succeeded after its order was cancelled, and no refund could be minted because the row names no intent: an owner is owed this money, its watch stays open, and a person must refund it';
 
 /** The `refunds.reason` of the automatic refund (follow-up 4, SIGNOFF.md:208-209). */
 export const LATE_SUCCESS_REFUND_REASON = 'late-success-refund';
@@ -255,8 +272,9 @@ async function requireOrder(tx: Tx, charge: EngineChargeRow): Promise<OrderRow> 
  * `requires_payment` settles, and it is refunded in full by this arm, reached from the
  * webhook or the sweeper's watch (design §2.7:3916-3927). The refund is capped under the
  * charge lock, so the second of those mints nothing, and the watch closes in the same
- * transaction whatever the mint answered, so a refund Stripe later fails goes to a person
- * and is not minted again here. The school absorbs the fee. `payment-refunded` is born
+ * transaction, so a refund Stripe later fails goes to a person and is not minted again
+ * here. The one mint that leaves the watch open is `no-payment-intent`: money is owed and
+ * no refund exists, so it alarms. The school absorbs the fee. `payment-refunded` is born
  * with M7.09, so until LG7 this writes the row and no notice (design §2.7:3926).
  */
 async function refundLateSuccess(
@@ -274,6 +292,15 @@ async function refundLateSuccess(
     reason: LATE_SUCCESS_REFUND_REASON,
     stripeIdempotencyKey: (refundId) => `late-success-refund:${refundId}`,
   });
+  if (minted.kind === 'no-payment-intent') {
+    // Unreachable while the id above is stored in this transaction. If it ever isn't,
+    // money is owed and nothing was minted, so nothing here may look finished.
+    args.log.error(
+      { chargeId: charge.id, orderId: charge.orderId, amountCents: minted.amountCents },
+      LATE_SUCCESS_NO_INTENT_ALARM,
+    );
+    return NOTHING_DONE;
+  }
   await chargesRepository.closeWatch(tx, { id: charge.id });
   if (minted.kind !== 'minted') return NOTHING_DONE;
   args.log.error(
@@ -435,6 +462,22 @@ function failureNoticeCopy(
       };
 }
 
+/**
+ * Is what this notice says still true of her invoice? "You weren't charged" cannot land
+ * after "We charged your card": a second tender may have paid the invoice in the gap
+ * before this failure was reached, and then the owner owes nothing and has heard so. An
+ * order with no invoice has nothing else that can answer for it.
+ *
+ * Under the invoice's row lock, because a plain read says `open` from a settle's `UPDATE`
+ * to its `COMMIT`: this waits for that commit and reads what it left. The charge is held
+ * here, so this is charge then invoice, the one order (`db/locks.ts`).
+ */
+async function invoiceStillOwed(tx: Tx, order: OrderRow): Promise<boolean> {
+  if (order.invoiceId === null) return true;
+  const invoice = await invoicesRepository.lockById(tx, order.invoiceId);
+  return invoice?.status === 'open';
+}
+
 /** The failed-payment notice, in its own savepoint. A decline at Confirm writes none. */
 export async function noticePaymentFailed(
   tx: Tx,
@@ -483,6 +526,9 @@ export async function noticePaymentFailed(
  * unless the caller says Stripe has already killed that intent (`intentDead`), so the
  * rule never reads the blocker: it covers `processing`, every decline, and a confirm
  * answered `requires_confirmation`.
+ *
+ * The 402 is stored whatever the invoice reads, because it answers this order's key.
+ * `notice` is said to her, so it goes only where it is still true.
  */
 export async function failChargeInTx(
   tx: Tx,
@@ -532,7 +578,7 @@ export async function failChargeInTx(
     }),
     log: args.log,
   });
-  if (args.notice !== undefined) {
+  if (args.notice !== undefined && (await invoiceStillOwed(tx, order))) {
     await noticePaymentFailed(tx, {
       charge,
       order,
@@ -547,9 +593,11 @@ export async function failChargeInTx(
 /**
  * Why a card stopped, from where the intent rests. `requires_confirmation` means no
  * confirm landed at all, so nothing is known about the card and `chargeBlockerForConfirm`
- * would invent a reason: the blocker stays absent, as the wire allows. The same goes
- * for a `canceled` intent with no `last_payment_error`: the sweeper's own cancel ends
- * here when its webhook arrives first, and that is a card nobody asked.
+ * would invent a reason: the blocker stays absent, as the wire allows. The same goes for
+ * a `canceled` intent with no `last_payment_error`, which is the sweeper's own cancel when
+ * its webhook arrives first, and for `requires_payment_method` with none, which
+ * {@link judgeReadBack} reads as a confirm that never landed. Each can be a card nobody
+ * asked, and a status never says a card answered: a code does.
  */
 export function blockerOfIntent(
   live: StripePaymentIntentResult,
@@ -557,7 +605,8 @@ export function blockerOfIntent(
 ): ChargeBlocker | undefined {
   const nothingKnown =
     live.status === 'requires_confirmation' ||
-    (live.status === 'canceled' && live.failureCode === undefined);
+    ((live.status === 'canceled' || live.status === 'requires_payment_method') &&
+      live.failureCode === undefined);
   return nothingKnown ? undefined : chargeBlockerForConfirm(live, log);
 }
 
@@ -638,6 +687,8 @@ interface Run {
   chargeId: string;
   orderId: string;
   amountCents: number;
+  /** When she tapped, on the clock this run's notices are stamped with. */
+  tappedAt: Date;
 }
 
 type Began =
@@ -844,6 +895,7 @@ export async function confirmCharge(
   args: ConfirmChargeArgs,
   onFinalFailure: FinalFailurePolicy,
 ): Promise<ConfirmChargeResult> {
+  const tappedAt = args.now?.() ?? new Date();
   const budget = await readEngineBudget();
   const began = await beginOrder(args, budget);
   if (began.kind === 'replay') {
@@ -855,6 +907,7 @@ export async function confirmCharge(
     chargeId: began.chargeId,
     orderId: began.orderId,
     amountCents: began.amountCents,
+    tappedAt,
   };
 
   const created = await createIntent(run);
@@ -901,17 +954,24 @@ export async function confirmCharge(
     case 'requires_confirmation':
     case 'requires_payment_method': {
       const blocker = blockerOfIntent(live, args.log);
+      const now = args.now?.() ?? new Date();
+      const canceled = live.status === 'canceled';
+      // A decline inside the hold is the 402 she is looking at. Past it her phone has
+      // stopped waiting, so nobody's screen holds this answer and a push is the only way
+      // she hears (the same reason the sweeper's arms send one). The phone's clock is the
+      // seed, not the setting, so this one is too: told once, within one re-send interval
+      // (`PAY_HOLD_SEED_MS`), whatever staff set.
+      const phoneStoppedWaiting = now.getTime() - run.tappedAt.getTime() > PAY_HOLD_SEED_MS;
       await withActor(args.actor, (tx) =>
         failChargeInTx(tx, {
           chargeId: run.chargeId,
           policy: onFinalFailure,
           blocker,
           lastError: live.failureCode ?? null,
-          ...(live.status === 'canceled'
-            ? { notice: 'charge-failed' as const, intentDead: true as const }
-            : {}),
+          ...(canceled || phoneStoppedWaiting ? { notice: 'charge-failed' as const } : {}),
+          ...(canceled ? { intentDead: true as const } : {}),
           log: args.log,
-          now: args.now?.() ?? new Date(),
+          now,
         }),
       );
       return storedAnswer(args.claim);

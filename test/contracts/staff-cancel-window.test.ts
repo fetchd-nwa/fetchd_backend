@@ -147,6 +147,7 @@ test(
       url: '/bookings',
       headers: { 'idempotency-key': `pcw-before-${randomUUID()}` },
       payload: {
+        payment: { kind: 'credits' },
         category: 'day-school',
         lead_dog_id: FIXTURE_IDS.dog1Id,
         dates: [date1],
@@ -172,6 +173,7 @@ test(
       url: '/bookings',
       headers: { 'idempotency-key': `pcw-after-${randomUUID()}` },
       payload: {
+        payment: { kind: 'credits' },
         category: 'day-school',
         lead_dog_id: FIXTURE_IDS.dog1Id,
         dates: [date2],

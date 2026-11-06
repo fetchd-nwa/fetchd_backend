@@ -9,11 +9,12 @@ type BookingMode = (typeof bookingMode.enumValues)[number];
  *
  *   request-key claim
  *     → `(campus, date)` capacity locks, every date ascending (or the run lock)
- *       → charge (the order's)
- *         → the invoice the charge settles
- *           → bookings, in id order
- *             → pool `(owner, location, mode, tier)`, the credit-lot slot
- *               → refunds
+ *       → cohort, `FOR NO KEY UPDATE` (enrollment and the withdraw)
+ *         → charge (the order's)
+ *           → the invoice the charge settles
+ *             → bookings, in id order
+ *               → pool `(owner, location, mode, tier)`, the credit-lot slot
+ *                 → refunds
  *
  * Take each family once for the whole order. A transaction that needs a later lock
  * and then finds it needs an earlier one has a deadlock waiting for it, so anything
@@ -28,6 +29,26 @@ type BookingMode = (typeof bookingMode.enumValues)[number];
  * updates the invoice. Its lock is `FOR NO KEY UPDATE`, never `FOR UPDATE`: the insert
  * of `orders.invoice_id` earlier in tx1 already took `FOR KEY SHARE` on that row, so two
  * tenders each holding that share and asking `FOR UPDATE` deadlock.
+ *
+ * The withdraw takes its cohort, then every charge it will write, ascending, then its
+ * bookings, then its invoice: those last two run against this list, which holds only
+ * while a class's rows carry no order, so nothing else wants both.
+ *
+ * The cohort is on this list for a lock no statement asks for: the FK re-check. `FOR KEY
+ * SHARE` lands on the cohort from any insert carrying `cohort_id`, tx1's charge among
+ * them, and from a second `UPDATE` of one invoice in one transaction, because Postgres
+ * re-checks every FK of a row version its own transaction wrote, which is a settle on
+ * another card reaching `repointPaymentMethod`. Both hold the invoice by then, so each
+ * asks for the cohort against this list, while the withdraw holds the cohort on its way
+ * to that charge and invoice. It stays safe only because nobody waits there: `lockCohort`
+ * is `FOR NO KEY UPDATE`, which `KEY SHARE` does not conflict with and which conflicts
+ * with itself. `FOR UPDATE` is a 40P01, the invoice's lesson above. A statement-level
+ * trace cannot see an FK check, so `order-lock-order.test.ts` pins it on real connections.
+ *
+ * A final failure's `invoiceStillOwed` takes the invoice under its charge, in this list's
+ * order. The sweeper looks at one row at a time, so a tick waits behind a held invoice,
+ * one look at a time, bounded by a settle: no settle holds a row across a Stripe call,
+ * and one that did would make the tick wait on Stripe.
  *
  * Not on this list yet, because no path takes it alongside a charge: `withDogLocks`,
  * which the booking core takes before capacity. M4.10 deletes the `(dog, mode,
@@ -121,6 +142,12 @@ export async function withMembershipCreateLock<T>(
  * attempts on the same cohort serialize on this row so the
  * `filled + len(non-staff dogs) <= capacity` assertion is race-free.
  *
+ * `FOR NO KEY UPDATE`, never `FOR UPDATE` (the FK re-check, at the top of this file). It
+ * conflicts with itself and with `bumpFilled`'s `UPDATE`, so two enrollments still read
+ * each other's `filled`, and a second withdraw of one dog waits here and then finds her
+ * rows gone. All it lets past is the `KEY SHARE` of a child row naming this cohort, and
+ * that reads no seat count.
+ *
  * Returns the locked row to the caller (who does the capacity arithmetic
  * and the `UPDATE cohorts SET filled = filled + ...`). `undefined` if the
  * cohort id doesn't exist — the caller decides the error semantic.
@@ -135,7 +162,11 @@ export async function lockCohort(
   tx: Tx,
   cohortId: string,
 ): Promise<typeof cohorts.$inferSelect | undefined> {
-  const [row] = await tx.select().from(cohorts).where(eq(cohorts.id, cohortId)).for('update');
+  const [row] = await tx
+    .select()
+    .from(cohorts)
+    .where(eq(cohorts.id, cohortId))
+    .for('no key update');
   return row;
 }
 

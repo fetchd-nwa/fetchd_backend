@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import Stripe from 'stripe';
 import { ApiError } from '../../src/lib/errors.js';
-import { normalizeRetrievedIntent, normalizeThrownConfirmError } from '../../src/lib/stripe.js';
+import { normalizeReturnedConfirm, normalizeThrownConfirmError } from '../../src/lib/stripe.js';
 import {
   rebuildRecordedCardError,
   type RecordedScenarioKey,
@@ -158,7 +158,13 @@ export type QueuedIntentOutcome =
   | { kind: 'status'; status: StripePaymentIntentStatus }
   /** The confirm reached nothing and its answer is a connection error. */
   | { kind: 'transport' }
-  | { kind: 'cardError'; status: StripePaymentIntentStatus; code?: string }
+  | { kind: 'cardError'; status: StripePaymentIntentStatus; code?: string; declineCode?: string }
+  /**
+   * Stripe RETURNED the intent at `requires_payment_method` with `last_payment_error` on
+   * it, rather than throwing: the returning fork of a real decline, run through the
+   * production normalizer.
+   */
+  | { kind: 'returnedDecline'; code: string; declineCode?: string }
   | { kind: 'recorded'; scenario: RecordedScenarioKey };
 
 export interface StripeStub extends StripeClient {
@@ -216,9 +222,14 @@ export interface StripeStub extends StripeClient {
    *   > `processing` status.
    *
    * So a test comparing the two forks must pass a `code` consistent with
-   * `status`, or expect (and assert) the more specific blocker.
+   * `status`, or expect (and assert) the more specific blocker. `declineCode` is
+   * Stripe's `decline_code`, `generic_decline` unless a test names one.
    */
-  setNextIntentThrowsCardError(status: StripePaymentIntentStatus, code?: string): void;
+  setNextIntentThrowsCardError(
+    status: StripePaymentIntentStatus,
+    code?: string,
+    declineCode?: string,
+  ): void;
   /**
    * Force the next PaymentIntent confirm to throw the error live Stripe
    * ACTUALLY threw for this scenario, rebuilt from the committed recording and
@@ -258,12 +269,14 @@ export interface StripeStub extends StripeClient {
    * authentication failure (both rest at `requires_payment_method`). Without it
    * the retrieve fork can only ever produce the status-derived blocker, so the
    * verify lane's blocker-aware copy would look tested while nothing had
-   * exercised the code path that makes it specific.
+   * exercised the code path that makes it specific. `declineCode` is its
+   * `last_payment_error.decline_code`. A `canceled` intent holds neither, whatever is
+   * passed here: Stripe drops them ({@link StripeStub.cancelPaymentIntent}).
    */
   setIntentState(
     paymentIntentId: string,
     status: StripePaymentIntentStatus,
-    opts?: { failureCode?: string },
+    opts?: { failureCode?: string; declineCode?: string },
   ): void;
   /**
    * Hold the next call of a verb open until `release()`: the verb has REACHED
@@ -294,10 +307,13 @@ export interface StripeStub extends StripeClient {
   /**
    * Make the next `confirmPaymentIntent` land at this status and then lose its
    * response to a connection error, the arm "or the kill tests prove only the stub"
-   * (design §2.7:3972-3974) names. Default `succeeded`. `failureCode` is the
-   * `last_payment_error.code` a landed decline leaves on the read-back.
+   * (design §2.7:3972-3974) names. Default `succeeded`. `failureCode` and `declineCode`
+   * are the `last_payment_error` a landed decline leaves on the read-back.
    */
-  confirmLandsThenThrows(status?: StripePaymentIntentStatus, opts?: { failureCode?: string }): void;
+  confirmLandsThenThrows(
+    status?: StripePaymentIntentStatus,
+    opts?: { failureCode?: string; declineCode?: string },
+  ): void;
   /** Stripe took a different amount from the one asked: `amount_received`. */
   setAmountReceived(paymentIntentId: string, amountCents: number): void;
   /** Every confirm Stripe EXECUTED, in order: a replay is not an execution. */
@@ -497,8 +513,44 @@ interface StubIntentState {
   createdSeconds: number;
   /** `last_payment_error.code` once the intent has failed. */
   failureCode?: string;
+  /** `last_payment_error.decline_code` beside it. */
+  declineCode?: string;
   /** `amount_received` when a test says it differs from `amountCents`. */
   amountReceivedCents?: number;
+}
+
+/**
+ * An intent moved to `status`, as Stripe keeps it. **`last_payment_error` does not survive
+ * a cancel** (the live probe, DECISIONS 147(b)): a retrieve after one reads `canceled` with
+ * no code. So the stub never holds a code on a cancelled intent, or it flatters an arm
+ * Stripe does not fire.
+ */
+function restingAt(state: StubIntentState, status: StripePaymentIntentStatus): StubIntentState {
+  if (status !== 'canceled') return { ...state, status };
+  const kept = { ...state, status };
+  delete kept.failureCode;
+  delete kept.declineCode;
+  return kept;
+}
+
+/** A decline Stripe returned rather than threw, through the production normalizer. */
+function returnedDeclineThroughTheSeam(args: {
+  id: string;
+  clientSecret: string | null;
+  amountCents: number;
+  code: string;
+  declineCode?: string;
+}): StripePaymentIntentResult {
+  return normalizeReturnedConfirm({
+    id: args.id,
+    status: 'requires_payment_method',
+    client_secret: args.clientSecret,
+    amount: args.amountCents,
+    last_payment_error: {
+      code: args.code,
+      ...(args.declineCode !== undefined ? { decline_code: args.declineCode } : {}),
+    },
+  } as unknown as Stripe.PaymentIntent);
 }
 
 /** The statuses Stripe will confirm a PaymentIntent FROM, the stub's own model. */
@@ -555,6 +607,8 @@ export function makeStripeStub(): StripeStub {
   let nextIntentStatus: StripePaymentIntentStatus = 'succeeded';
   let nextIntentThrowsCard = false;
   let nextIntentThrowsCardCode = 'card_declined';
+  let nextIntentThrowsDeclineCode = 'generic_decline';
+  let nextIntentReturnsDecline: { code: string; declineCode?: string } | undefined;
   let nextIntentThrowsRecorded: RecordedScenarioKey | undefined;
   let nextIntentTransportError: Error | undefined;
   let nextIntentLandsThenThrows: { status: StripePaymentIntentStatus; err: Error } | undefined;
@@ -627,7 +681,7 @@ export function makeStripeStub(): StripeStub {
   let createTransportErrors = 0;
   let retrieveTransportError = false;
   let confirmLandsThenThrowsOutcome:
-    | { status: StripePaymentIntentStatus; failureCode?: string }
+    | { status: StripePaymentIntentStatus; failureCode?: string; declineCode?: string }
     | undefined;
   const executedConfirmLog: string[] = [];
   let detachShouldThrow = false;
@@ -662,6 +716,8 @@ export function makeStripeStub(): StripeStub {
     status: StripePaymentIntentStatus;
     throwsCard: boolean;
     throwsCardCode: string;
+    throwsDeclineCode: string;
+    returnsDecline: { code: string; declineCode?: string } | undefined;
     throwsRecorded: RecordedScenarioKey | undefined;
     transportError: Error | undefined;
     landsThenThrows: { status: StripePaymentIntentStatus; err: Error } | undefined;
@@ -677,7 +733,16 @@ export function makeStripeStub(): StripeStub {
           nextIntentStatus = queuedOutcome.status;
           nextIntentStatusExplicit = true;
           nextIntentThrowsCardCode = queuedOutcome.code ?? 'card_declined';
+          nextIntentThrowsDeclineCode = queuedOutcome.declineCode ?? 'generic_decline';
           nextIntentThrowsCard = true;
+          break;
+        case 'returnedDecline':
+          nextIntentReturnsDecline = {
+            code: queuedOutcome.code,
+            ...(queuedOutcome.declineCode !== undefined
+              ? { declineCode: queuedOutcome.declineCode }
+              : {}),
+          };
           break;
         case 'recorded':
           nextIntentThrowsRecorded = queuedOutcome.scenario;
@@ -702,6 +767,8 @@ export function makeStripeStub(): StripeStub {
       status: nextIntentStatus,
       throwsCard: nextIntentThrowsCard,
       throwsCardCode: nextIntentThrowsCardCode,
+      throwsDeclineCode: nextIntentThrowsDeclineCode,
+      returnsDecline: nextIntentReturnsDecline,
       throwsRecorded: nextIntentThrowsRecorded,
       transportError: nextIntentTransportError,
       landsThenThrows: nextIntentLandsThenThrows,
@@ -710,6 +777,8 @@ export function makeStripeStub(): StripeStub {
     nextIntentStatusExplicit = false;
     nextIntentThrowsCard = false;
     nextIntentThrowsCardCode = 'card_declined';
+    nextIntentThrowsDeclineCode = 'generic_decline';
+    nextIntentReturnsDecline = undefined;
     nextIntentThrowsRecorded = undefined;
     nextIntentTransportError = undefined;
     nextIntentLandsThenThrows = undefined;
@@ -722,10 +791,11 @@ export function makeStripeStub(): StripeStub {
       nextIntentStatus = status;
       nextIntentStatusExplicit = true;
     },
-    setNextIntentThrowsCardError(status, code = 'card_declined') {
+    setNextIntentThrowsCardError(status, code = 'card_declined', declineCode = 'generic_decline') {
       nextIntentStatus = status;
       nextIntentStatusExplicit = true;
       nextIntentThrowsCardCode = code;
+      nextIntentThrowsDeclineCode = declineCode;
       nextIntentThrowsCard = true;
     },
     setNextIntentThrowsRecorded(scenario) {
@@ -753,19 +823,24 @@ export function makeStripeStub(): StripeStub {
     },
     setIntentState(paymentIntentId, status, opts) {
       const existing = intents.get(paymentIntentId);
-      intents.set(paymentIntentId, {
-        amountCents: existing?.amountCents ?? 0,
-        clientSecret: existing?.clientSecret ?? null,
-        createdSeconds: existing?.createdSeconds ?? nowSeconds(),
-        // Moving an intent's STATUS never changes whose it is.
-        ...(existing?.metadata !== undefined ? { metadata: existing.metadata } : {}),
-        status,
-        ...(opts?.failureCode !== undefined
-          ? { failureCode: opts.failureCode }
-          : existing?.failureCode !== undefined
-            ? { failureCode: existing.failureCode }
-            : {}),
-      });
+      const failureCode = opts?.failureCode ?? existing?.failureCode;
+      const declineCode = opts?.declineCode ?? existing?.declineCode;
+      intents.set(
+        paymentIntentId,
+        restingAt(
+          {
+            amountCents: existing?.amountCents ?? 0,
+            clientSecret: existing?.clientSecret ?? null,
+            createdSeconds: existing?.createdSeconds ?? nowSeconds(),
+            // Moving an intent's STATUS never changes whose it is.
+            ...(existing?.metadata !== undefined ? { metadata: existing.metadata } : {}),
+            status,
+            ...(failureCode !== undefined ? { failureCode } : {}),
+            ...(declineCode !== undefined ? { declineCode } : {}),
+          },
+          status,
+        ),
+      );
     },
     holdNext(verb) {
       const reached = deferred();
@@ -809,6 +884,7 @@ export function makeStripeStub(): StripeStub {
       confirmLandsThenThrowsOutcome = {
         status,
         ...(opts?.failureCode !== undefined ? { failureCode: opts.failureCode } : {}),
+        ...(opts?.declineCode !== undefined ? { declineCode: opts.declineCode } : {}),
       };
     },
     setAmountReceived(paymentIntentId, amountCents) {
@@ -918,6 +994,8 @@ export function makeStripeStub(): StripeStub {
         status,
         throwsCard,
         throwsCardCode,
+        throwsDeclineCode,
+        returnsDecline,
         throwsRecorded,
         transportError,
         landsThenThrows,
@@ -933,7 +1011,10 @@ export function makeStripeStub(): StripeStub {
        * returns this same snapshot with `replayed: true`, and its `createdAt`
        * still names the moment below, not the moment of the replay.
        */
-      const remember = (result: StripePaymentIntentResult): StripePaymentIntentResult => {
+      const remember = (
+        result: StripePaymentIntentResult,
+        declineCode?: string,
+      ): StripePaymentIntentResult => {
         const executed: StripePaymentIntentResult = {
           ...result,
           createdAt: new Date(createdSeconds * 1000),
@@ -951,6 +1032,7 @@ export function makeStripeStub(): StripeStub {
           // cross-owner assertion untestable.
           metadata: { ...args.metadata },
           ...(executed.failureCode !== undefined ? { failureCode: executed.failureCode } : {}),
+          ...(declineCode !== undefined ? { declineCode } : {}),
         });
         return executed;
       };
@@ -1002,7 +1084,7 @@ export function makeStripeStub(): StripeStub {
             new Stripe.errors.StripeCardError({
               type: 'card_error',
               code: throwsCardCode,
-              decline_code: 'generic_decline',
+              decline_code: throwsDeclineCode,
               message: 'Your card was declined.',
               statusCode: 402,
               payment_intent: {
@@ -1013,6 +1095,18 @@ export function makeStripeStub(): StripeStub {
               },
             } as never),
           ),
+          throwsDeclineCode,
+        );
+      }
+      if (returnsDecline !== undefined) {
+        return remember(
+          returnedDeclineThroughTheSeam({
+            id,
+            clientSecret,
+            amountCents: args.amountCents,
+            ...returnsDecline,
+          }),
+          returnsDecline.declineCode,
         );
       }
       return remember({
@@ -1138,7 +1232,10 @@ export function makeStripeStub(): StripeStub {
       if (outcome.transportError !== undefined) throw outcome.transportError;
       executedConfirmLog.push(paymentIntentId);
 
-      const remember = (raw: StripePaymentIntentResult): StripePaymentIntentResult => {
+      const remember = (
+        raw: StripePaymentIntentResult,
+        declineCode?: string,
+      ): StripePaymentIntentResult => {
         const executed: StripePaymentIntentResult = {
           ...raw,
           ...(raw.status === 'succeeded' ? { amountReceivedCents: state.amountCents } : {}),
@@ -1150,6 +1247,7 @@ export function makeStripeStub(): StripeStub {
           ...state,
           status: executed.status,
           ...(executed.failureCode !== undefined ? { failureCode: executed.failureCode } : {}),
+          ...(declineCode !== undefined ? { declineCode } : {}),
         });
         return executed;
       };
@@ -1170,7 +1268,7 @@ export function makeStripeStub(): StripeStub {
             new Stripe.errors.StripeCardError({
               type: 'card_error',
               code: outcome.throwsCardCode,
-              decline_code: 'generic_decline',
+              decline_code: outcome.throwsDeclineCode,
               message: 'Your card was declined.',
               statusCode: 402,
               payment_intent: {
@@ -1181,6 +1279,18 @@ export function makeStripeStub(): StripeStub {
               },
             } as never),
           ),
+          outcome.throwsDeclineCode,
+        );
+      }
+      if (outcome.returnsDecline !== undefined) {
+        return remember(
+          returnedDeclineThroughTheSeam({
+            id: paymentIntentId,
+            clientSecret: state.clientSecret,
+            amountCents: state.amountCents,
+            ...outcome.returnsDecline,
+          }),
+          outcome.returnsDecline.declineCode,
         );
       }
       return remember({
@@ -1220,7 +1330,7 @@ export function makeStripeStub(): StripeStub {
       // rather than by a lookalike the stub invented. A retrieve is a GET, so
       // no `Idempotency-Replayed` is modelled here: `replayed` has no meaning
       // for it, and the verify lane must not read one.
-      return normalizeRetrievedIntent({
+      return normalizeReturnedConfirm({
         id: paymentIntentId,
         status: state.status,
         client_secret: state.clientSecret,
@@ -1230,7 +1340,12 @@ export function makeStripeStub(): StripeStub {
           state.amountReceivedCents ?? (state.status === 'succeeded' ? state.amountCents : 0),
         ...(state.metadata !== undefined ? { metadata: state.metadata } : {}),
         ...(state.failureCode !== undefined
-          ? { last_payment_error: { code: state.failureCode } }
+          ? {
+              last_payment_error: {
+                code: state.failureCode,
+                ...(state.declineCode !== undefined ? { decline_code: state.declineCode } : {}),
+              },
+            }
           : {}),
       } as unknown as Stripe.PaymentIntent);
     },
@@ -1343,7 +1458,7 @@ export function makeStripeStub(): StripeStub {
       // and a later retrieve must say so. (A cancel that throws leaves the
       // state alone, which is the whole reason callers treat its success as
       // evidence and its failure as none.)
-      intents.set(paymentIntentId, { ...state, status: 'canceled' });
+      intents.set(paymentIntentId, restingAt(state, 'canceled'));
     },
 
     async createRefund(args, idempotencyKey): Promise<StripeRefundResult> {

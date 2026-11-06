@@ -68,7 +68,13 @@ async function book(
     method: 'POST',
     url: '/bookings',
     headers: { 'idempotency-key': `cap-${randomUUID()}` },
-    payload: { category, lead_dog_id: dogId, dates: [date], location },
+    payload: {
+      category,
+      lead_dog_id: dogId,
+      dates: [date],
+      location,
+      payment: { kind: 'credits' },
+    },
   });
   return { statusCode: res.statusCode, body: res.body };
 }

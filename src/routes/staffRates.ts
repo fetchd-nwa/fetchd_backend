@@ -40,9 +40,10 @@ import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
  * `service_rates` is **append-only**: a price change closes the open window's
  * `effective_to` and inserts a new row; a same-day re-edit voids the prior
  * entry and inserts a new one; a cancel voids an entry (reopening its
- * predecessor). `amount_cents`/`unit`/`note` are never overwritten — so a past
- * booking's as-charged rate (and a locked PAYG invoice) survive every change,
- * and the rows themselves form the audit-able change history. All writes run
+ * predecessor), unless reopening it would reprice past dates (PAY-74).
+ * `amount_cents`/`unit`/`note` are never overwritten — so a past booking's
+ * as-charged rate survives every change, and the rows themselves form the
+ * audit-able change history. All writes run
  * under `withServiceRateLock` (per-track advisory lock) so concurrent edits
  * can't corrupt the windows.
  */
@@ -63,11 +64,10 @@ const MIN_AMOUNT_CENTS = 1;
 const MAX_AMOUNT_CENTS = 1_000_000;
 
 /**
- * PAYG charges day-school / day-care per booking DATE straight off
- * `amount_cents` (see routes/bookings.ts), so those two categories MUST be
- * priced `per-day` — a `per-week`/`flat` figure would be silently billed as a
- * daily one. Other categories have no live rate-charged money path yet, so
- * their unit is unconstrained here (the PAYG charger also guards this defensively).
+ * A rule from pay-as-you-go, which billed day-school / day-care per booking DATE
+ * straight off `amount_cents`. PAYG left at wire 4.0.0, so nothing bills these rows
+ * now, and the rule stands until DAY-U23 removes them (P18). Other categories have no
+ * live rate-charged money path, so their unit is unconstrained here.
  */
 const PER_DAY_REQUIRED_CATEGORIES = new Set<string>(['day-school', 'day-care']);
 
@@ -207,7 +207,7 @@ export function registerStaffRatesRoute(
           endpoint: 'POST /staff/rates',
           requestHash: hashRequestBody({ ...body, effective_from: effectiveFrom }),
           // No cache wipe: service_rates is read direct from pg (no Redis read-
-          // through) by both GET /rates and the PAYG booking path.
+          // through) by GET /rates and GET /settings.
           keysToInvalidate: () => [],
         },
         async (tx) => {
@@ -231,9 +231,11 @@ export function registerStaffRatesRoute(
   );
 
   // --- POST /staff/rates/:id/void ---------------------------------------
-  // Cancel/remove one entry (a scheduled future change or the current rate).
-  // Soft-voids it and reopens its predecessor so no pricing gap opens — there
-  // is no way to trap a track. Returns the voided row. Idempotency-Key required.
+  // Cancel/remove one entry: a scheduled future change, a rate that began today,
+  // or a track's first row. Soft-voids it and reopens its predecessor so no pricing
+  // gap opens — there is no way to trap a track. A row that began before today with a
+  // predecessor is 409 `conflict`, since reopening would reprice past dates (PAY-74).
+  // Returns the voided row. Idempotency-Key required.
   app.post(
     '/staff/rates/:id/void',
     { preHandler: [authHook, ownerOrManager] },
@@ -259,7 +261,11 @@ export function registerStaffRatesRoute(
             throw new ApiError('not_found', `service rate ${id} not found`);
           }
           const voided = await withServiceRateLock(tx, track.category, track.location ?? '', () =>
-            serviceRatesRepository.voidRate(tx, { id, voidedByStaffId: principal.staffId }),
+            serviceRatesRepository.voidRate(tx, {
+              id,
+              voidedByStaffId: principal.staffId,
+              today: bucketChicagoToday(nowFactory()),
+            }),
           );
           if (voided === undefined) {
             // Vanished or already voided between the track read and the lock.

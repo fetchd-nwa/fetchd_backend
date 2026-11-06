@@ -19,7 +19,11 @@
  * `bookings_payment_guarantee` trigger), and dogs are `evaluation_status =
  * 'passed'` (the eval gate). The vaccine + agreement guards pass *vacuously*
  * because we deliberately seed no `required_vaccines` / `agreement_documents`
- * rows — the portal reads neither, so a dev seed needn't carry them.
+ * rows — the portal reads neither, so a dev seed needn't carry them. A dev
+ * database can hold both (onboarding asks for the waiver), and one live document the
+ * seeded owners never signed refuses every seeded booking, so `wipe` erases every
+ * `required_vaccines`, `agreement_signatures` and `agreement_documents` row, any a
+ * person made in dev included, and the seed re-seeds neither requirement.
  *
  * Safety: refuses to run unless DATABASE_URL points at localhost and NODE_ENV
  * is not production — this script wipes tables, and must never touch a remote
@@ -32,6 +36,8 @@ import { and, inArray, isNotNull, like, not } from 'drizzle-orm';
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
 import {
+  agreementDocuments,
+  agreementSignatures,
   announcements,
   bookingDogs,
   bookings,
@@ -49,6 +55,7 @@ import {
   events,
   groupClasses,
   idempotencyKeys,
+  invoiceChargeAttempts,
   invoices,
   memberships,
   messages,
@@ -61,6 +68,7 @@ import {
   pendingRequestPreferredDates,
   pendingRequests,
   refunds,
+  requiredVaccines,
   scheduledNotifications,
   serviceRates,
   staff,
@@ -167,6 +175,9 @@ async function wipe(): Promise<void> {
   // charges, and charges before bookings (charges.booking_id) + paymentMethods
   // (invoices.payment_method_id).
   await db.delete(refunds);
+  // Any invoice the auto-charge worker ever touched has an attempt row, which RESTRICTs
+  // both the invoice and its card.
+  await db.delete(invoiceChargeAttempts);
   await db.delete(invoices);
   // memberships RESTRICT-reference payment_methods + credit_packages + dogs —
   // delete them before any of those parents.
@@ -187,6 +198,11 @@ async function wipe(): Promise<void> {
   await db.delete(dogCompletedClasses);
   await db.delete(dogCompletedPrograms);
   await db.delete(dogs);
+  // `dog_vaccines` went with the dogs. Any owner who finished onboarding signed something,
+  // and a signature RESTRICTs both its owner and its document.
+  await db.delete(requiredVaccines);
+  await db.delete(agreementSignatures);
+  await db.delete(agreementDocuments);
   await db.delete(owners);
   await db.delete(staff);
 }

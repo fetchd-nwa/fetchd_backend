@@ -25,7 +25,7 @@ import {
   withMutation,
   IDEMPOTENCY_KEY_MAX_LEN,
 } from '../db/mutation.js';
-import { lockCohort } from '../db/locks.js';
+import { lockCharge, lockCohort } from '../db/locks.js';
 import { agreementSignaturesRepository } from '../db/repositories/agreementSignaturesRepository.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
@@ -107,7 +107,7 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  *
  * The transaction protocol (matches schema.sql ~line 1298):
  *   1. Ownership gate per dog (`dogsRepository.findOwnedExists`).
- *   2. `lockCohort(tx, cohort_id)` — `SELECT ... FOR UPDATE` on the
+ *   2. `lockCohort(tx, cohort_id)` — `SELECT ... FOR NO KEY UPDATE` on the
  *      cohort row. All concurrent enrollments to this cohort
  *      serialize here.
  *   3. Liveness check — `expiredAt !== null` → 404 (soft-expired
@@ -484,6 +484,22 @@ export function registerEnrollmentsRoute(
               'this class has already started — contact us to withdraw',
             );
           }
+
+          // The charges, ascending, ahead of any row of hers. Only the charges moved: the
+          // bookings and the invoice keep this transaction's old order, against the one
+          // list, and `db/locks.ts` says why that holds. This transaction writes every row
+          // the pre-tx phase settled and refunds the charge read here, after its bookings
+          // and its invoice, and a settle or a failure holds that charge and then wants the
+          // invoice: taken later, the two deadlock. After the cohort, not before it,
+          // because every withdraw takes that first, so two of one dog cannot cross here.
+          const refundable = await chargesRepository.findUnsettledSucceededCharge(tx, {
+            cohortId,
+            dogId,
+            enrollment: enrollmentIdentityOf(enrolledBookings),
+          });
+          const chargeIds = new Set((preTx?.rows ?? []).map((row) => row.charge.id));
+          if (refundable !== undefined) chargeIds.add(refundable.id);
+          for (const id of [...chargeIds].sort()) await lockCharge(tx, id);
 
           // 5. Soft-cancel every weekly booking + release the cohort seat.
           //    Owner self-serve withdraw → cancelledBy 'owner' (R5).
@@ -1374,8 +1390,7 @@ async function runAllOrNothingEnrollment(
         // hold someone else released is a refusal with no cause we know, and
         // `'declined'` renders "Your card was declined. Try a different card."
         // for a card that was never asked. The field is optional on every wire
-        // shape carrying it (`wire.ts:723`, `:745`, `:819`) precisely so
-        // "we are not going to guess" is expressible.
+        // shape carrying it precisely so "we are not going to guess" is expressible.
         throw new ApiError(
           'payment_failed',
           'the card charge did not complete — no dogs were enrolled',
@@ -1655,6 +1670,8 @@ const ENROLL_BLOCKER_HAZARD_RANK: Readonly<Record<ChargeBlocker, number>> = {
   processing: 2,
   declined: 1,
   authentication_required: 1,
+  insufficient_funds: 1,
+  expired_card: 1,
 };
 
 /**

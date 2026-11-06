@@ -104,7 +104,7 @@ test(
   },
 );
 
-// lockCohort is a typed wrapper around SELECT ... FOR UPDATE — Postgres
+// lockCohort is a typed wrapper around SELECT ... FOR NO KEY UPDATE — Postgres
 // provides the locking semantic; this test proves the wrapper returns the
 // right shape (smoke), not that Postgres locks correctly (that's Postgres's
 // job, tested by Postgres).

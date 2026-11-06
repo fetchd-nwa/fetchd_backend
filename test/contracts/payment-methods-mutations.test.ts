@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
-import { owners, paymentMethods, stripeCustomers } from '../../src/db/schema/schema.js';
+import {
+  bookings,
+  creditLedger,
+  owners,
+  paymentMethods,
+  stripeCustomers,
+} from '../../src/db/schema/schema.js';
+import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerPaymentMethodsRoute } from '../../src/routes/paymentMethods.js';
-import { FIXTURE_IDS } from './_fixture.js';
+import { createFundedDog, removeDogs } from './_dayFixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW, futureWeekday } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -503,6 +511,74 @@ test(
       .where(eq(paymentMethods.id, newId));
     assert.ok(row?.expiredAt !== null, 'soft-expire committed despite Stripe failure');
     await db.delete(paymentMethods).where(eq(paymentMethods.id, newId));
+  },
+);
+
+test(
+  'PAY-U45: removing the only saved card succeeds, the next booking is 422 payment_required, and no credit moved',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const dogs: string[] = [];
+    const dogId = await createFundedDog(dogs, 3);
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    const stripe = makeStripeStub();
+    registerPaymentMethodsRoute(app, { authenticate, stripe });
+    registerBookingsRoute(app, { authenticate, stripe, now: FIXTURE_NOW });
+    const liveCards = await db
+      .select({ id: paymentMethods.id })
+      .from(paymentMethods)
+      .where(
+        and(eq(paymentMethods.ownerId, FIXTURE_IDS.ownerId), isNull(paymentMethods.expiredAt)),
+      );
+    assert.deepEqual(
+      liveCards.map((c) => c.id),
+      [FIXTURE_IDS.paymentMethod1Id],
+      'precondition: this is her only card',
+    );
+
+    try {
+      const removed = await app.inject({
+        method: 'DELETE',
+        url: `/payment-methods/${FIXTURE_IDS.paymentMethod1Id}`,
+        headers: { 'idempotency-key': `pm-only-${randomUUID()}` },
+      });
+      assert.equal(removed.statusCode, 204, removed.body);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/bookings',
+        headers: { 'idempotency-key': `pm-only-book-${randomUUID()}` },
+        payload: {
+          category: 'day-school',
+          lead_dog_id: dogId,
+          dates: [futureWeekday(1)],
+          location: 'fayetteville',
+          payment: { kind: 'credits' },
+        },
+      });
+
+      assert.equal(res.statusCode, 422, res.body);
+      const { error } = res.json() as { error: { code: string; details: { kind: string } } };
+      assert.equal(error.code, 'payment_required');
+      assert.equal(error.details.kind, 'payment_required');
+      const rows = await db.select().from(bookings).where(eq(bookings.leadDogId, dogId));
+      assert.equal(rows.length, 0, 'no booking');
+      const ledger = await db
+        .select({ delta: creditLedger.delta })
+        .from(creditLedger)
+        .where(eq(creditLedger.dogId, dogId));
+      assert.deepEqual(
+        ledger.filter((row) => row.delta < 0),
+        [],
+        'no credit moved',
+      );
+    } finally {
+      await db
+        .update(paymentMethods)
+        .set({ expiredAt: null, isDefault: true })
+        .where(eq(paymentMethods.id, FIXTURE_IDS.paymentMethod1Id));
+      await removeDogs(dogs);
+    }
   },
 );
 

@@ -33,7 +33,7 @@ import {
  *
  * Every round races two real requests against the real Postgres, and each test
  * tallies the whole outcome per round: the statuses, the bookings, and the money.
- * A key that carried the campus lets R1, R4 and R5 through; one that carried the
+ * A key that carried the campus lets R1 and R4 through; one that carried the
  * mode lets R3 through as well. R0 and R2 are the controls: those two never raced,
  * because the same campus shares the `capacity:<location>:<date>` lock.
  */
@@ -118,7 +118,7 @@ async function postBooking(app: App, payload: Record<string, unknown>): Promise<
     method: 'POST',
     url: '/bookings',
     headers: { 'idempotency-key': `race-${randomUUID()}` },
-    payload,
+    payload: { payment: { kind: 'credits' }, ...payload },
   });
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -147,15 +147,6 @@ async function upcomingBookingIds(dogIds: string[]): Promise<string[]> {
     .from(bookings)
     .where(and(inArray(bookings.leadDogId, dogIds), eq(bookings.status, 'upcoming')));
   return rows.map((r) => r.id);
-}
-
-async function openInvoicesOf(bookingIds: string[]): Promise<number> {
-  if (bookingIds.length === 0) return 0;
-  const rows = await db
-    .select({ id: invoices.id })
-    .from(invoices)
-    .where(and(inArray(invoices.bookingId, bookingIds), eq(invoices.status, 'open')));
-  return rows.length;
 }
 
 /** Runs `round` ROUNDS times and returns how many rounds ended each way. */
@@ -245,32 +236,6 @@ test(
 );
 
 test(
-  'R5: PAYG, one dog, one day, two campuses: one booking, one open invoice, no credit',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const app = ownerApp();
-    const rounds = await tally(async (i) => {
-      const dogId = await createTestDog();
-      const base = {
-        category: 'day-school',
-        lead_dog_id: dogId,
-        dates: [futureWeekday(10 + i)],
-        payment: 'payg',
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-      };
-      const [ra, rb] = await Promise.all([
-        postBooking(app, { ...base, location: 'fayetteville' }),
-        postBooking(app, { ...base, location: 'bentonville' }),
-      ]);
-      const ids = await upcomingBookingIds([dogId]);
-      const open = await openInvoicesOf(ids);
-      return `${statusesOf(ra, rb)}; bookings ${ids.length}; open invoices ${open}; debits ${await debitsOf(dogId)}`;
-    });
-    assert.deepEqual(rounds, { [`${ONE_WINNER}; bookings 1; open invoices 1; debits 0`]: ROUNDS });
-  },
-);
-
-test(
   'R6 control: one dog, two DIFFERENT days, two campuses: both book, the lock only queues them',
   SKIP_WHEN_NO_DB,
   async () => {
@@ -303,7 +268,7 @@ test(
  * in either case. So a capitalised spelling of one dog's id used to reach
  * `withDogLocks` as a second key, and two campuses took two seats and two credits.
  * The id is lowercased at the parse boundary, so every reader past `parseOrThrow`
- * holds one spelling. R14, R14b, R15 and R16 are the review's probes, kept as pins.
+ * holds one spelling. R14, R15 and R16 are the review's probes, kept as pins.
  */
 test(
   'R14: one request spells the dog in capitals: still one dog, one booking, one credit',
@@ -333,31 +298,6 @@ test(
     assert.deepEqual(rounds, { [`${ONE_WINNER}; bookings 1; debits 1`]: ROUNDS });
   },
 );
-
-test('R14b: the same on PAYG: one booking and one open invoice', SKIP_WHEN_NO_DB, async () => {
-  const app = ownerApp();
-  const rounds = await tally(async (i) => {
-    const dogId = await createTestDog();
-    const base = {
-      category: 'day-school',
-      dates: [futureWeekday(10 + i)],
-      payment: 'payg',
-      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-    };
-    const [ra, rb] = await Promise.all([
-      postBooking(app, { ...base, location: 'fayetteville', lead_dog_id: dogId }),
-      postBooking(app, {
-        ...base,
-        location: 'bentonville',
-        lead_dog_id: dogId.toUpperCase(),
-      }),
-    ]);
-    const ids = await upcomingBookingIds([dogId]);
-    const open = await openInvoicesOf(ids);
-    return `${statusesOf(ra, rb)}; bookings ${ids.length}; open invoices ${open}`;
-  });
-  assert.deepEqual(rounds, { [`${ONE_WINNER}; bookings 1; open invoices 1`]: ROUNDS });
-});
 
 test(
   'R15: one dog twice on a roster, once in each case, is the same dog: 422, not a 500',

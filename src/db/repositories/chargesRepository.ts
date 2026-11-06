@@ -105,8 +105,9 @@ function pendingGroupClassCaptureWhere(args: { olderThan: Date; mintedAfter: Dat
 /**
  * Data-access seam for `charges` (schema.sql ~line 700). Append-only
  * retained financial record — Stripe PaymentIntent rows for package
- * purchases, pay-as-you-go bookings, B&T deposits, group-class
- * enrollment, etc. NO `expired_at` — charges are never soft-deleted;
+ * purchases, B&T deposits, group-class enrollment, etc., and the old
+ * pay-as-you-go rows the lane settles until P17. NO `expired_at` — charges
+ * are never soft-deleted;
  * refunds against a charge are tracked separately in the `refunds`
  * table.
  *
@@ -983,7 +984,10 @@ export const chargesRepository = {
   /**
    * The stored outcome of a failure. The caller holds the charge lock. `nextSweepAt`
    * opens the watch: a first-look time, which fences nothing, so a process clock is
-   * fine here. NULL means nothing can still move.
+   * fine here. NULL means nothing can still move. A `lastError` of NULL says this
+   * settler heard no reason, not that none was given: Stripe drops `last_payment_error`
+   * on a cancel, and `last_stripe_error` is the desk's only record of a decline, so what
+   * the advisory `payment_failed` wrote stays.
    */
   async markEngineFailed(
     tx: Tx,
@@ -999,7 +1003,7 @@ export const chargesRepository = {
       .set({
         status: 'failed',
         blocker: args.blocker,
-        lastStripeError: args.lastError,
+        lastStripeError: sql`COALESCE(${args.lastError}, ${charges.lastStripeError})`,
         attemptingUntil: null,
         nextSweepAt: args.nextSweepAt?.toISOString() ?? null,
       })

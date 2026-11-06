@@ -190,8 +190,15 @@ test(
       await cleanup();
       const invoiceId = await seedOpenInvoice();
       const { app, stripe } = invoicesApp();
-      if (fork === 'returned') stripe.setNextIntentStatus('requires_payment_method');
-      else stripe.setNextIntentThrowsCardError('requires_payment_method');
+      // A real returned decline carries its code on `last_payment_error`, so the two
+      // forks read one card's answer alike (P16). A bare status names no card.
+      if (fork === 'returned') {
+        stripe.queueIntentOutcomes([
+          { kind: 'returnedDecline', code: 'card_declined', declineCode: 'generic_decline' },
+        ]);
+      } else {
+        stripe.setNextIntentThrowsCardError('requires_payment_method');
+      }
 
       const res = await app.inject({
         method: 'POST',

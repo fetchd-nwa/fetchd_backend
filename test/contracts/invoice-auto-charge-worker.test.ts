@@ -343,6 +343,37 @@ test(
   },
 );
 
+for (const [reason, code, declineCode] of [
+  ['no funds', 'card_declined', 'insufficient_funds'],
+  ['a lapsed card', 'expired_card', 'generic_decline'],
+] as const) {
+  test(
+    `auto-charge notify — a card with ${reason} parks on the decline sentence`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      await cleanup();
+      const invoiceId = await seedDueInvoice({ amountCents: 12000, purpose: 'group-class' });
+      await setAttemptsToOneBeforePark(invoiceId);
+      const stripe = makeStripeStub();
+      stripe.setNextIntentThrowsCardError('requires_payment_method', code, declineCode);
+
+      const result = await runInvoiceAutoChargeOnce({ stripe, limit: 5 });
+
+      assert.equal(result.results[0]?.outcome, 'failed-parked');
+      const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+        db,
+        `payment-failed:${invoiceId}`,
+      );
+      assert.match(
+        scheduled!.body,
+        /your card was declined/i,
+        'the reason, not "we cannot say why"',
+      );
+      await cleanup();
+    },
+  );
+}
+
 test(
   'auto-charge notify — PARK enqueues a payment-failed scheduled push (not a direct feed row)',
   SKIP_WHEN_NO_DB,

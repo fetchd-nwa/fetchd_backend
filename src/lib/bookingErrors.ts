@@ -103,16 +103,43 @@ export function agreementUnsignedError(missing: readonly AgreementGap[]): ApiErr
   );
 }
 
-export function insufficientCreditsError(gaps: readonly CreditGap[]): ApiError {
-  if (gaps.length === 0) {
-    throw new Error('insufficientCreditsError: gaps array must be non-empty');
-  }
+/**
+ * What the owner's sheet is built from (`InsufficientCreditsDetails`). `dates` are the
+ * request's, ascending. A dog's credits pay her earliest dates, as the debits do, so
+ * what is missing is her last ones, one entry per missing credit: Biscuit holds 1 and
+ * Waffles 2 over d1 to d3 is d2, d3, d3. A dog in debt still owes one credit per date
+ * nothing pays, so `short_dates.length` is `shortfall` whatever `gaps` reads. That is the
+ * clamp below: a negative balance counts as zero, so `shortfall` is the dates nothing pays
+ * and not `required − balance`, and no `src` writer drives a balance below zero, since the
+ * booking debit follows the core's check under the dog lock and the webhook's reversal
+ * needs a purchase row on an unsettled charge, which nothing writes. Every `reason` is
+ * `'no_credit'` until expiry binds a date (P18), and no offer exists before that either.
+ *
+ * Empty `gaps` is a `top_up` with nothing missing: `shortfall: 0`, still a 422, so the
+ * client re-sends on credits alone.
+ */
+export function insufficientCreditsError(
+  gaps: readonly CreditGap[],
+  dates: readonly string[],
+): ApiError {
+  const shortDates = gaps
+    .flatMap((gap) => dates.slice(Math.max(gap.balance, 0)))
+    .sort()
+    .map((date) => ({ date, reason: 'no_credit' as const }));
   return new ApiError(
     'insufficient_credits',
-    gaps.length === 1
-      ? `Insufficient ${gaps[0]!.mode} credits — need ${gaps[0]!.required}, have ${gaps[0]!.balance}.`
-      : `Insufficient credits across ${gaps.length} dogs.`,
-    { kind: 'insufficient_credits', gaps: [...gaps] },
+    gaps.length === 0
+      ? 'No credit is missing for these dates, so no top-up can be taken.'
+      : gaps.length === 1
+        ? `Insufficient ${gaps[0]!.mode} credits — need ${gaps[0]!.required}, have ${gaps[0]!.balance}.`
+        : `Insufficient credits across ${gaps.length} dogs.`,
+    {
+      kind: 'insufficient_credits',
+      gaps: [...gaps],
+      shortfall: shortDates.length,
+      short_dates: shortDates,
+      top_up_offer: null,
+    },
   );
 }
 

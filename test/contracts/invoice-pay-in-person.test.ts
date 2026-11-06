@@ -185,6 +185,63 @@ test(
 );
 
 test(
+  'POST /invoices/:id/pay-in-person — a day-program booking has no drop-off, so the reminder anchors on scheduled_at − 24h',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Moved from `booking-payg.test.ts`, on a seeded row: nothing writes a payg invoice
+    // from 4.0.0, and `resolvePaymentDueAnchor`'s join to a booking with no drop-off
+    // stays. Every other anchor test here has a drop-off, or no booking at all.
+    await cleanup();
+    const scheduledAt = new Date(REAL_NOW_MS + 9 * ONE_DAY_MS);
+    const bookingId = randomUUID();
+    await db.insert(bookings).values({
+      id: bookingId,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: FIXTURE_IDS.dog2Id,
+      category: 'day-school',
+      status: 'upcoming',
+      scheduledAt: scheduledAt.toISOString(),
+      location: 'fayetteville',
+    });
+    const row = await db.transaction((tx) =>
+      invoicesRepository.createOpen(tx, {
+        ownerId: FIXTURE_IDS.ownerId,
+        amountCents: 7_500,
+        purpose: 'payg',
+        paymentMethodId: FIXTURE_IDS.paymentMethod1Id,
+        dueAt: new Date(scheduledAt.getTime() - 60 * 60 * 1000).toISOString(),
+        bookingId,
+      }),
+    );
+
+    const { app } = buildApp();
+    const res = await payInPerson({ app, invoiceId: row.id });
+    assert.equal(res.statusCode, 204, res.body);
+
+    const invoice = await invoicesRepository.findByIdForOwner(db, {
+      id: row.id,
+      ownerId: FIXTURE_IDS.ownerId,
+    });
+    assert.equal(invoice?.paymentExpected, 'in-person');
+    assert.equal(invoice?.status, 'open', 'the flag charges nothing');
+    assert.equal(invoice?.amountCents, 7_500, 'and leaves the amount alone (TAX-13)');
+    const scheduled = await scheduledNotificationsRepository.findByDedupeKey(
+      db,
+      `payment-due:${row.id}`,
+    );
+    assert.ok(scheduled !== undefined, 'payment-due reminder enqueued');
+    assert.equal(scheduled?.dogId, FIXTURE_IDS.dog2Id, 'tagged the booking lead dog');
+    assert.equal(
+      pgTimestampToDate(scheduled!.scheduledFor).getTime(),
+      scheduledAt.getTime() - ONE_DAY_MS,
+      'scheduled_for = scheduled_at − 24h (no drop-off to prefer)',
+    );
+
+    await cleanup([bookingId]);
+  },
+);
+
+test(
   'POST /invoices/:id/pay-in-person — due-date anchor (no booking): scheduled_for = due_at − 24h, no dog tag',
   SKIP_WHEN_NO_DB,
   async () => {

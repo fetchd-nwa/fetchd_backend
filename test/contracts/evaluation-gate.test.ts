@@ -233,6 +233,7 @@ test(
         url: '/bookings',
         headers: { 'idempotency-key': `eval-day-school-${randomUUID()}` },
         payload: {
+          payment: { kind: 'credits' },
           category: 'day-school',
           lead_dog_id: FIXTURE_IDS.dog2Id,
           dates: [futureWeekday(5)],
@@ -273,6 +274,7 @@ test(
         url: '/bookings',
         headers: { 'idempotency-key': `eval-day-care-multi-${randomUUID()}` },
         payload: {
+          payment: { kind: 'credits' },
           category: 'day-care',
           lead_dog_id: FIXTURE_IDS.dog1Id,
           additional_dog_ids: [FIXTURE_IDS.dog2Id],
@@ -497,6 +499,7 @@ test(
           url: '/bookings',
           headers: { 'idempotency-key': `eval-priority-${randomUUID()}` },
           payload: {
+            payment: { kind: 'credits' },
             category: 'day-school',
             lead_dog_id: FIXTURE_IDS.dog2Id,
             dates: [futureWeekday(7)],

@@ -703,6 +703,30 @@ test(
   },
 );
 
+// Fable L2. Mutant Mx3 passed every test here: the transient arm of `judgeReadBack` was
+// unpinned, and under it a lost `processing_error` was declined without its try.
+test(
+  'a confirm that lands a processing_error and loses its response spends the try the design grants: two confirms, one intent, 201',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const invoiceId = await seedOpenInvoice();
+    const { app, stripe } = buildApp();
+    stripe.confirmLandsThenThrows('requires_payment_method', { failureCode: 'processing_error' });
+
+    const res = await pay(app, invoiceId, `readback-transient-${randomUUID()}`);
+
+    assert.equal(res.statusCode, 201, res.body);
+    assert.equal(stripe.executedConfirms().length, 2, 'the lost try landed, and one more ran');
+    const [charge] = await db
+      .select()
+      .from(charges)
+      .where(eq(charges.id, (res.json() as { charge_id: string }).charge_id));
+    assert.equal(charge?.status, 'succeeded');
+    assert.equal(charge?.attemptCount, 2, 'it spent exactly one more try');
+    assert.equal(new Set(stripe.executedConfirms()).size, 1, 'both on one intent');
+  },
+);
+
 test(
   'seedInvoiceOrder lays down what tx1 commits (the kill tests rest on it)',
   SKIP_WHEN_NO_DB,

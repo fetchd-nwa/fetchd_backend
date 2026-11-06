@@ -154,7 +154,7 @@ observable behavior, not "looks right."
   `pg_advisory_xact_lock(hashtext('dog:' || dogId))`, keyed on the dog's lowercased
   id alone (P13) (the booking serializability primitive — no double-spend under
   concurrent retries, in any mode at either campus); `lockCohort(id, tx)`,
-  a `SELECT ... FOR UPDATE` helper (its `lockDayCapacity` sibling never had a
+  a `SELECT ... FOR NO KEY UPDATE` helper (its `lockDayCapacity` sibling never had a
   production caller: `withCapacityLocks` took the job, and P13 deleted it);
   `bucketToChicagoDate(ts)` + day-window utilities (every calendar/day calc
   routes through this — never raw UTC).

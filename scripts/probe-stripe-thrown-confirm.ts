@@ -66,6 +66,29 @@
  * nothing else: no fixture is read or written, and it prints only intent ids, statuses
  * and error codes.
  *
+ * WHAT `--engine-split` ALSO ASKS, SINCE P16 (PAY-U06, DECISIONS 151(i))
+ *
+ * Where does `decline_code` rest on a confirm that declines through that split? The
+ * stubs and Stripe's docs say `last_payment_error.decline_code`; the one recording is a
+ * create-and-confirm. Two more cards run through the same create and confirm:
+ *
+ *   · `pm_card_visa_chargeDeclinedInsufficientFunds` (4000000000009995): expected
+ *     `card_declined` + `decline_code=insufficient_funds`, blocker `insufficient_funds`
+ *   · `pm_card_chargeDeclinedExpiredCard` (4000000000000069): expected `expired_card`,
+ *     blocker `expired_card`
+ *
+ * Both tokens are from Stripe's published test-card list and neither has been run here.
+ * A wrong spelling answers `resource_missing`, which the output would show. Each is
+ * expected to be REFUSED at attach, as `pm_card_chargeDeclined` is (see `SCENARIOS`): no
+ * test card is known to attach and then decline with either reason, and
+ * `pm_card_chargeCustomerFail` declines only as `generic_decline`. So each case tries the
+ * attach and says what happened. If the card attaches, it takes the seam's create. If
+ * not, the same create parameters go through the SDK with no `customer`, because the
+ * seam's verb requires one, and the confirm still goes through the seam. An unattached
+ * card is a shape production never has; what it measures is the decline's fields, not
+ * the saved-card path. The exit code is non-zero if a blocker differs from the expected
+ * one.
+ *
  * SAFETY
  *
  *   · Aborts unless STRIPE_SECRET_KEY starts with `sk_test_`.
@@ -479,7 +502,7 @@ function probeLogger(): FastifyBaseLogger {
 function printIntent(step: string, intent: StripePaymentIntentResult): void {
   console.log(
     `  ${step}: intent=${intent.id} status=${intent.status} ` +
-      `failure_code=${intent.failureCode ?? '(none)'}`,
+      `failure_code=${intent.failureCode ?? '(none)'} blocker=${intent.blocker ?? '(none)'}`,
   );
 }
 
@@ -531,6 +554,116 @@ async function createThenConfirm(
   }
 }
 
+/** The cancel of a declined intent, and what survives it (DECISIONS 147(b)). */
+async function cancelAndReadBack(declined: StripePaymentIntentResult): Promise<void> {
+  try {
+    await defaultStripeClient.cancelPaymentIntent(declined.id, ENGINE_CALL_BUDGET);
+    console.log(`  card-declines cancel: intent=${declined.id} ok`);
+  } catch (err) {
+    printThrown('card-declines cancel', err);
+  }
+  const afterCancel = await defaultStripeClient.retrievePaymentIntent(
+    declined.id,
+    ENGINE_CALL_BUDGET,
+  );
+  printIntent('card-declines retrieve after cancel', afterCancel);
+  console.log(`  last_payment_error survives a cancel: ${afterCancel.failureCode !== undefined}`);
+}
+
+/** The two reasons the header names, and the blocker each must read as. */
+const DECLINE_REASON_CARDS = [
+  {
+    label: 'no-funds',
+    token: 'pm_card_visa_chargeDeclinedInsufficientFunds',
+    expected: 'insufficient_funds',
+  },
+  { label: 'expired-card', token: 'pm_card_chargeDeclinedExpiredCard', expected: 'expired_card' },
+] as const;
+
+/**
+ * An unconfirmed intent for one reason's card: through the seam when Stripe let the card
+ * attach, else the seam's own create parameters with no `customer`. Returns the intent id
+ * and the card's id to confirm with.
+ */
+async function createForDeclineReason(
+  stripe: Stripe,
+  card: (typeof DECLINE_REASON_CARDS)[number],
+  customerId: string,
+): Promise<{ intentId: string; paymentMethodId: string }> {
+  let attachedId: string | undefined;
+  try {
+    attachedId = (await stripe.paymentMethods.attach(card.token, { customer: customerId })).id;
+    console.log(`  ${card.label} attach: ok`);
+  } catch (err) {
+    // An answer, not a failure: the header says why this is the expected branch.
+    console.log(`  ${card.label} attach: refused code=${stripeErrorCode(err) ?? '(no code)'}`);
+  }
+  if (attachedId !== undefined) {
+    const created = await defaultStripeClient.createUnconfirmedPaymentIntent(
+      {
+        customerId,
+        paymentMethodId: attachedId,
+        amountCents: PROBE_AMOUNT_CENTS,
+        currency: 'usd',
+        metadata: { purpose: 'probe-stripe-thrown-confirm' },
+      },
+      `probe:${randomUUID()}`,
+      ENGINE_CALL_BUDGET,
+    );
+    return { intentId: created.id, paymentMethodId: attachedId };
+  }
+  const created = await stripe.paymentIntents.create(
+    {
+      amount: PROBE_AMOUNT_CENTS,
+      currency: 'usd',
+      payment_method: card.token,
+      capture_method: 'automatic',
+      confirm: false,
+      metadata: { purpose: 'probe-stripe-thrown-confirm' },
+    },
+    { idempotencyKey: `probe:${randomUUID()}` },
+  );
+  const paymentMethod = created.payment_method;
+  const paymentMethodId = typeof paymentMethod === 'string' ? paymentMethod : paymentMethod?.id;
+  if (paymentMethodId === undefined) {
+    throw new Error(`${card.label}: the create named no payment method`);
+  }
+  return { intentId: created.id, paymentMethodId };
+}
+
+/** DECISIONS 151(i): one reason's card through the split, and where its codes rest. */
+async function probeDeclineReason(
+  stripe: Stripe,
+  card: (typeof DECLINE_REASON_CARDS)[number],
+  customerId: string,
+): Promise<void> {
+  const log = probeLogger();
+  const { intentId, paymentMethodId } = await createForDeclineReason(stripe, card, customerId);
+  const confirmed = await defaultStripeClient.confirmPaymentIntent(
+    intentId,
+    { paymentMethodId },
+    `probe:${randomUUID()}:confirm:1`,
+    ENGINE_CALL_BUDGET,
+  );
+  printIntent(`${card.label} confirm off_session`, confirmed);
+  const lastError = (await stripe.paymentIntents.retrieve(intentId)).last_payment_error;
+  console.log(
+    `  ${card.label} last_payment_error: code=${lastError?.code ?? '(none)'} ` +
+      `decline_code=${lastError?.decline_code ?? '(none)'}`,
+  );
+  const retrieved = await defaultStripeClient.retrievePaymentIntent(intentId, ENGINE_CALL_BUDGET);
+  printIntent(`${card.label} retrieve after confirm`, retrieved);
+  const fromConfirm = chargeBlockerForConfirm(confirmed, log);
+  const fromRetrieve = chargeBlockerForConfirm(retrieved, log);
+  const held = fromConfirm === card.expected && fromRetrieve === card.expected;
+  console.log(
+    `  ${card.label} blocker: confirm=${fromConfirm ?? '(none)'} ` +
+      `retrieve=${fromRetrieve ?? '(none)'} expected=${card.expected} ` +
+      `${held ? 'HELD' : '*** DIFFERS ***'}`,
+  );
+  if (!held) process.exitCode = 1;
+}
+
 /** DECISIONS 145(c): the split the engine rides, in order, against test-mode Stripe. */
 async function probeEngineSplit(stripe: Stripe): Promise<void> {
   console.log('probe:stripe --engine-split: live Stripe, TEST MODE');
@@ -557,19 +690,15 @@ async function probeEngineSplit(stripe: Stripe): Promise<void> {
       customerId,
       'pm_card_chargeCustomerFail',
     );
-    if (declined === undefined) return;
-    try {
-      await defaultStripeClient.cancelPaymentIntent(declined.id, ENGINE_CALL_BUDGET);
-      console.log(`  card-declines cancel: intent=${declined.id} ok`);
-    } catch (err) {
-      printThrown('card-declines cancel', err);
+    if (declined !== undefined) await cancelAndReadBack(declined);
+
+    for (const card of DECLINE_REASON_CARDS) {
+      try {
+        await probeDeclineReason(stripe, card, customerId);
+      } catch (err) {
+        printThrown(card.label, err);
+      }
     }
-    const afterCancel = await defaultStripeClient.retrievePaymentIntent(
-      declined.id,
-      ENGINE_CALL_BUDGET,
-    );
-    printIntent('card-declines retrieve after cancel', afterCancel);
-    console.log(`  last_payment_error survives a cancel: ${afterCancel.failureCode !== undefined}`);
   } catch (err) {
     printThrown('engine-split', err);
   } finally {

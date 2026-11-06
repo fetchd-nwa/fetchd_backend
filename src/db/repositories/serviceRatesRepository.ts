@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm';
+import { ApiError } from '../../lib/errors.js';
 import { db } from '../client.js';
 import { rateUnit, serviceCategory, serviceRates, type LocationKey } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -17,7 +18,7 @@ type RateUnit = (typeof rateUnit.enumValues)[number];
  * a price change closes the open row's `effective_to` and inserts a new row; a
  * mistake/cancellation sets `voided_at` (a soft-void excluded from "active").
  * `amount_cents`/`unit`/`note` are NEVER UPDATEd after insert — history holds, a
- * past booking's as-charged rate (and a locked PAYG invoice) survive any change.
+ * past booking's as-charged rate survives any change.
  *
  * Precedence (active lookup): a `location`-specific row beats a `location IS
  * NULL` (applies-to-all) row — `ORDER BY location NULLS LAST, effective_from
@@ -101,8 +102,7 @@ export const serviceRatesRepository = {
   /**
    * The single active rate for (`category`, `location`) at `today` (Chicago
    * YYYY-MM-DD). Excludes voided rows. Returns `undefined` when none matches
-   * (route maps to 404). Polymorphic runner so the PAYG booking branch can read
-   * inside its mutation tx.
+   * (route maps to 404). Polymorphic runner, so a caller can read inside its own tx.
    */
   async findActiveRate(
     category: ServiceCategory,
@@ -284,10 +284,15 @@ export const serviceRatesRepository = {
    * change leaves no pricing gap. Voiding the only/first row leaves the track
    * unset (the legitimate "no rate" state). Returns `undefined` if the id
    * doesn't exist or is already voided (route → 404).
+   *
+   * **What reopening cannot do (PAY-74; design §2.7:4058-4059).** A row that began
+   * before `today` with a predecessor has prices on past dates, and reopening would
+   * hand those dates back to the old price: 409 `conflict`. With no predecessor nothing
+   * reopens, so it stays voidable.
    */
   async voidRate(
     tx: Tx,
-    args: { id: string; voidedByStaffId: string },
+    args: { id: string; voidedByStaffId: string; today: string },
   ): Promise<StaffServiceRateRow | undefined> {
     const [target] = await tx
       .select(STAFF_RATE_PROJECTION)
@@ -310,6 +315,12 @@ export const serviceRatesRepository = {
         )
         .limit(1);
       if (pred !== undefined) {
+        if (target.effective_from < args.today) {
+          throw new ApiError(
+            'conflict',
+            `rate ${args.id} began on ${target.effective_from}: voiding it would reopen the rate before it over past dates`,
+          );
+        }
         // Reopen the predecessor to span the voided window (NULL = open-ended,
         // or the voided row's own successor). effective_to is window management,
         // not a value overwrite.

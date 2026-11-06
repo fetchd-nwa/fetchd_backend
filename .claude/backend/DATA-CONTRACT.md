@@ -58,6 +58,23 @@ The four flagged engineering deviations were walked with Allison and ruled:
 
 The contract (this doc + `schema.sql` + `BACKEND-ARCHITECTURE.md`) is **frozen**.
 
+**Amendment 2026-11-05 (wire 4.0.0, P16; R1, R2): credits are the only tender.**
+`POST /bookings` carries a required `payment: {kind: 'credits', tier?, top_up?}`. The
+strings `'credits'` and `'payg'`, a missing `payment`, `kind: 'payg'`, `kind: 'card'` and
+a top-level `payment_method_id` are each 400 `bad_request`, and `payment` is `.strict()`
+at both levels. A booking opens no invoice and touches no card, so `charge_purpose =
+'payg'` is written by nothing: it survives on rows already written, which the auto-charge
+lane reads until P17 deletes it. Short on credits answers 422 `insufficient_credits` with
+`shortfall` and `short_dates` (one entry per missing credit, a dog's last dates, so their
+length is `shortfall`) and `top_up_offer: null`. `top_up` is typed and refused: any body
+carrying it gets that 422, past the gates and with the card unread, and with credits
+enough that is `shortfall: 0`. `tier` is accepted and read by nothing; P18 makes both
+live. `ChargeBlocker` gains `insufficient_funds` (Stripe's `decline_code` under
+`card_declined`) and `expired_card`. Voiding a rate that began before today, when it
+has a predecessor, is 409 `conflict` (PAY-U41). Every amendment below that describes
+pay-as-you-go on a booking is a dated record, not the contract: `src/contracts/wire.ts`
+is.
+
 **Amendment 2026-05-19 (launch scope, not the register).** The v1
 _payments-deferral_ is dropped. Payments are **built from day one** against
 Stripe **test mode** (test keys in dev/staging — fully functional, fake
@@ -741,7 +758,8 @@ Six pieces ship together; all are additive or doc-only (no R1-R8 change).
 
 1. **POST /bookings body — pinned from §C's `dates[]` placeholder.**
    `{ category: 'day-school'|'day-care', lead_dog_id, additional_dog_ids?,
-dates: 'YYYY-MM-DD'[], location: 'fayetteville'|'bentonville', notes? }`.
+dates: 'YYYY-MM-DD'[], location: 'fayetteville'|'bentonville', notes?, payment }`,
+   `payment` required since wire 4.0.0 (the amendment at the head of these).
    Returns 201 + `PostBookingsResponse {order, sessions}` (wire 4.0.0-lg3.2:
    one order per Confirm, credits-only included; `sessions` one per date, ASC).
    No arrival time is asked (wire 4.0.0-lg3.1): each session starts at the campus's
@@ -879,16 +897,20 @@ values (`amount_cents`/`unit`/`note`) are **never UPDATEd** after insert — onl
 
 **No-trap guarantee:** every row (current or scheduled) is voidable; voiding
 reopens the predecessor; setting a rate never conflicts. Any state is reachable
-and recoverable. All writes run under `withServiceRateLock` (per-track advisory
-lock). **Defense-in-depth:** the PAYG charger (`resolvePaygPlan`) refuses (500) a
-resolved day-program rate whose `unit ≠ 'per-day'`, so a bad seed/SQL row can't
-mis-bill. Code: `serviceRatesRepository` (supersedeRate/voidRate/findHistoryForTrack/
+and recoverable. **One exception since wire 4.0.0 (PAY-U41, PAY-74):** a row that
+began before today in America/Chicago, with a predecessor, is 409 `conflict`,
+because reopening would hand past dates back to the old price. All writes run
+under `withServiceRateLock` (per-track advisory lock). The PAYG charger's
+`unit ≠ 'per-day'` refusal left with the charger at wire 4.0.0. Code: `serviceRatesRepository` (supersedeRate/voidRate/findHistoryForTrack/
 findTrackById), `routes/staffRates.ts`, `routes/bookings.ts`; tests
 `staff-rates.test.ts`. **Still deferred:** the portal real Supabase auth (the
 portal milestone — until then the editor rides the API dev-bypass).
 
 **Amendment 2026-06-19 (PAYG for day-school / day-care — mobile signal +
-backend branch LANDED).** Day programs can be paid pay-as-you-go instead of
+backend branch LANDED). SUPERSEDED at wire 4.0.0: this writer, its route fields and
+`resolvePaygPlan` are gone and `booking-payg.test.ts` is deleted. The reader of an old
+row stays until P17: `invoicesRepository.findOpenForBooking` and the cancel's void.
+Kept as the record.** Day programs can be paid pay-as-you-go instead of
 from a credit balance — the over-credits sheet already offers it. The FE wire
 signal shipped first; **the backend PAYG branch then landed** (POST /bookings
 schedules a `'payg'` invoice instead of debiting; cancel voids it within the
@@ -2797,7 +2819,7 @@ invisible to the repository layer.
 
 - `GET /bookings?view=upcoming|past` — runtime-bucketed by session end-time
 - `GET /bookings/up-next` · `GET /bookings/:id` · `GET /dogs/:id/bookings?view=`
-- `POST /bookings` — book Day School/Care (multi-dog body; credit-debit txn) [$ if over-balance — charge/membership covers shortfall]
+- `POST /bookings` — book Day School/Care (multi-dog body; credit-debit txn). Credits only (wire 4.0.0): short is 422 `insufficient_credits`, and no booking moves money.
 - `POST /bookings/:id/cancel` — cancel + credit-back or money-back refund branching (Day 13); group-class returns 422 (cohort-withdraw is a separate verb)
 - `GET /staff/cancel-window` [staff] · `PATCH /staff/cancel-window/:category` [staff] — Day-13 admin-config surface: Shanthi tunes the per-category free-cancel hours from the staff portal. Affects future bookings only; existing rows keep their stamped `cancel_deadline_at`.
 
@@ -2928,10 +2950,10 @@ of all six — they differ only in how a row gets _created_.
 
 **Model 1 — Direct, credit/charge-debited.** Day School · Day Care.
 
-- `POST /bookings` `{ category, lead_dog_id, additional_dog_ids[], dates[] }`.
+- `POST /bookings` `{ category, lead_dog_id, additional_dog_ids[], dates[], payment }`.
 - ONE txn: insert booking (+booking_dogs); per dog per mode insert
   `credit_ledger` debit (delta −1, reason `booking-debit`); assert post-balance
-  ≥ 0 **or** covered by a membership **or** a PAYG `charge` ([$]).
+  ≥ 0. No charge, and no invoice (wire 4.0.0).
 - 8 AM–5 PM, `duration_minutes 540`; runtime end-time forced to 17:00.
 - Day School only: optional **After School Coaching opt-in** sub-phase (per-dog,
   with a school-day count). Persisted as an `after_school_optins` row; the
@@ -2946,7 +2968,7 @@ of all six — they differ only in how a row gets _created_.
 **Model 2 — Enrollment, capacity-gated, real bookings.** Group Class.
 
 - `POST /enrollments` `{ cohort_id, dog_ids[] }`.
-- ONE txn: `SELECT … cohorts FOR UPDATE` → assert `filled + |dogs| ≤ capacity`
+- ONE txn: `SELECT … cohorts FOR NO KEY UPDATE` → assert `filled + |dogs| ≤ capacity`
   → insert |dogs| × cohort.weeks booking rows (category `group-class`,
   `cohort_id`, shared `session_report_id`) → `cohorts.filled += |dogs|`.
 - Eligibility (Manners-2 needs Manners-1) is **server-derived**

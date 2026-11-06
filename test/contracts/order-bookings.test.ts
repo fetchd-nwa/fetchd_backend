@@ -62,7 +62,7 @@ function book(
       lead_dog_id: dogId,
       dates,
       location: 'fayetteville',
-      payment: 'credits',
+      payment: { kind: 'credits' },
     },
   });
 }

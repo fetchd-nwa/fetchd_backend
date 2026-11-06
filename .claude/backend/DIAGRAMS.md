@@ -512,7 +512,7 @@ transaction-contract notes at the bottom of `schema.sql`).
 ```mermaid
 flowchart TD
   A["POST /enrollments<br/>{ cohortId, dogIds[] }"] --> B{"BEGIN txn"}
-  B --> C["SELECT cohorts WHERE id=$1 FOR UPDATE<br/>(row lock)"]
+  B --> C["SELECT cohorts WHERE id=$1 FOR NO KEY UPDATE<br/>(row lock)"]
   C --> D{"filled + len(dogIds)<br/>≤ capacity ?"}
   D -- no --> E["ROLLBACK → 409 capacity"]
   D -- yes --> F["INSERT len(dogIds) × cohort.weeks<br/>bookings (+ booking_dogs,<br/>cohort_id, session_report_id)"]

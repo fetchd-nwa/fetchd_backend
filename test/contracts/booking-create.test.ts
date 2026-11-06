@@ -141,7 +141,7 @@ async function postBooking(opts: {
     method: 'POST',
     url: '/bookings',
     headers,
-    payload: opts.payload,
+    payload: { payment: { kind: 'credits' }, ...opts.payload },
   });
 }
 
@@ -899,6 +899,9 @@ test(
         details: {
           kind: string;
           gaps: { dog_id: string; mode: string; balance: number; required: number }[];
+          shortfall: number;
+          short_dates: { date: string; reason: string }[];
+          top_up_offer: null;
         };
       };
     };
@@ -917,6 +920,11 @@ test(
     assert.equal(body.error.details.gaps[0]!.mode, 'school');
     assert.equal(body.error.details.gaps[0]!.required, 1);
     assert.equal(body.error.details.gaps[0]!.balance, 0);
+    assert.equal(body.error.details.shortfall, 1);
+    assert.deepEqual(body.error.details.short_dates, [
+      { date: futureDate(24), reason: 'no_credit' },
+    ]);
+    assert.equal(body.error.details.top_up_offer, null);
   },
 );
 

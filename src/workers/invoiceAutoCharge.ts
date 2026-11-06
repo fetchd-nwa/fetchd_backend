@@ -529,11 +529,13 @@ function uniqueViolationConstraint(err: unknown): string | undefined {
 }
 
 /**
- * Which park sentence a known-dead attempt earns. `declined` and
+ * Which park sentence a known-dead attempt earns. A decline and
  * `authentication_required` are the two the owner can act on differently, so
  * they get their own copy; anything else falls to the honest generic —
  * Allison's shipped 2026-08-01 sentence, which is exactly "it failed and we
- * can't tell you more".
+ * can't tell you more". A card with no funds, or one that lapsed, is a decline
+ * with its reason named: "your card was declined" is true of both, and "we can't
+ * tell you more" would be false.
  *
  * `processing` reaches here only when the cancel SUCCEEDED (an in-flight intent
  * we stopped), and the generic is right for it: nothing about the card was
@@ -544,6 +546,8 @@ export function parkArmForBlocker(
 ): AutoChargeParkArm {
   switch (blocker) {
     case 'declined':
+    case 'insufficient_funds':
+    case 'expired_card':
       return 'declined';
     case 'authentication_required':
       return 'authentication-required';

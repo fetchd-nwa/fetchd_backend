@@ -168,7 +168,7 @@ async function postBooking(
     method: 'POST',
     url: '/bookings',
     headers: { 'idempotency-key': `no-divert-${randomUUID()}` },
-    payload,
+    payload: { payment: { kind: 'credits' }, ...payload },
   });
   return { statusCode: res.statusCode, body: res.body, json: () => res.json() };
 }
@@ -396,33 +396,6 @@ test(
       .from(bookingDogs)
       .where(eq(bookingDogs.bookingId, created!.id));
     assert.deepEqual(roster.map((r) => r.dogId).sort(), [lead, never].sort());
-  },
-);
-
-test(
-  'PAYG: a dog with no attended day books at once on an open payg invoice with no debit (moved from the approve conversion)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const dogId = await createTestDog();
-
-    const res = await postBooking(ownerApp(), {
-      category: 'day-school',
-      lead_dog_id: dogId,
-      dates: [futureWeekday(27)],
-      location: 'fayetteville',
-      payment: 'payg',
-      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-    });
-    assert.equal(res.statusCode, 201, res.body);
-    assert.equal(await requestRowsOf(dogId), 0, 'no pending_requests row');
-    assert.equal(await debitsOf(dogId), 0, 'PAYG debits no credit');
-
-    const [created] = await upcomingBookingsOf(dogId);
-    const rows = await db
-      .select({ purpose: invoices.purpose, status: invoices.status })
-      .from(invoices)
-      .where(eq(invoices.bookingId, created!.id));
-    assert.deepEqual(rows, [{ purpose: 'payg', status: 'open' }]);
   },
 );
 

@@ -24,6 +24,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { makeStripeStub } from './_stripeStub.js';
+import type { ChargeBlocker } from '../../src/contracts/wire.js';
 import type { StripePaymentIntentStatus } from '../../src/lib/stripe.js';
 
 /**
@@ -546,12 +547,15 @@ test(
  * is known about the card and the wire's "we are not going to guess" applies. Nor
  * does a `canceled` intent with no `last_payment_error`: a card's answer comes from
  * that field, never from `canceled` (`designs/p15-engine-recovery.md`, decision 3).
+ * Nor, since P16, does `requires_payment_method` with none: these are bare statuses,
+ * and a status never says a card answered. A real decline carries its code, and
+ * `BLOCKER_BY_DECLINE` below is that row.
  */
 const BLOCKER_BY_RAW_STATUS: ReadonlyArray<
   readonly [StripePaymentIntentStatus, string | undefined, 201 | 402]
 > = [
   ['requires_action', 'authentication_required', 402],
-  ['requires_payment_method', 'declined', 402],
+  ['requires_payment_method', undefined, 402],
   ['processing', 'processing', 201],
   ['requires_confirmation', undefined, 402],
   ['requires_capture', 'processing', 201],
@@ -591,6 +595,35 @@ for (const [rawStatus, blocker, status] of BLOCKER_BY_RAW_STATUS) {
           .where(eq(orders.invoiceId, invoiceId));
         assert.equal(row?.nextSweepAt === null, rawStatus === 'canceled');
       }
+      await cleanup();
+    },
+  );
+}
+
+/** What a card that answered reads, on both forks (PAY-U06). */
+const BLOCKER_BY_DECLINE: ReadonlyArray<readonly [string, string | undefined, ChargeBlocker]> = [
+  ['card_declined', 'generic_decline', 'declined'],
+  ['card_declined', 'insufficient_funds', 'insufficient_funds'],
+  ['expired_card', undefined, 'expired_card'],
+  ['authentication_required', undefined, 'authentication_required'],
+];
+
+for (const [code, declineCode, blocker] of BLOCKER_BY_DECLINE) {
+  test(
+    `POST /invoices/:id/pay — ${code}${declineCode !== undefined ? `/${declineCode}` : ''} answers 402 with charge_blocker ${blocker}`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      await cleanup();
+      await seedCards();
+      const invoiceId = await seedOpenInvoice();
+      const { app, stripe } = buildApp();
+      stripe.setNextIntentThrowsCardError('requires_payment_method', code, declineCode);
+
+      const res = await pay(app, invoiceId, { card: CARD2_ID });
+
+      assert.equal(res.statusCode, 402, res.body);
+      const body = res.json() as { error: { details: { charge_blocker?: string } } };
+      assert.equal(body.error.details.charge_blocker, blocker);
       await cleanup();
     },
   );
