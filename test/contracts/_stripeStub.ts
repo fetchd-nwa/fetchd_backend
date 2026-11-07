@@ -201,6 +201,30 @@ export interface StripeStub extends StripeClient {
   /** Force the next PaymentIntent confirm to return this status. */
   setNextIntentStatus(status: StripePaymentIntentStatus): void;
   /**
+   * Run `fn` once, after the next confirm has been answered at Stripe and before that
+   * answer reaches the caller, on either confirm verb. This is the window between
+   * Stripe's answer and the settle: an event delivered here beats the settle, and a
+   * process that dies here took the money and wrote nothing.
+   */
+  afterNextConfirmAnswer(fn: (answer: StripePaymentIntentResult) => Promise<void>): void;
+  /**
+   * Take on an intent another process created (a child this test killed), so this stub
+   * can answer a retrieve about it.
+   */
+  adoptIntent(args: {
+    id: string;
+    status: StripePaymentIntentStatus;
+    amountCents: number;
+    metadata: Record<string, string>;
+  }): void;
+  /** What Stripe holds for an intent: what a real event would carry. */
+  intentSnapshot(id: string): { amountCents: number; metadata: Record<string, string> };
+  /**
+   * Every intent from here on carries this `created` (default: the wall clock), so a
+   * test on a fixed clock can pin an expiry that is anchored on it.
+   */
+  setIntentsCreatedAt(at: Date): void;
+  /**
    * Force the next PaymentIntent confirm to take Stripe's THROWN fork: a
    * HAND-BUILT `StripeCardError` carrying a failed PaymentIntent at `status`
    * with the given `code`, run through the production normalizer. Per the
@@ -700,7 +724,9 @@ export function makeStripeStub(): StripeStub {
   const nextEvents: (StripeWebhookEvent | null)[] = [];
 
   const testIdPrefix = (kind: string): string => `${kind}_test_${randomUUID().slice(0, 8)}`;
-  const nowSeconds = (): number => Math.floor(Date.now() / 1000);
+  let intentsCreatedAt: Date | undefined;
+  let confirmAnswered: ((answer: StripePaymentIntentResult) => Promise<void>) | undefined;
+  const nowSeconds = (): number => Math.floor((intentsCreatedAt ?? new Date()).getTime() / 1000);
 
   /**
    * Consume the levers for one confirm, of either verb. A keyed outcome (this dog)
@@ -787,6 +813,26 @@ export function makeStripeStub(): StripeStub {
 
   const stub: StripeStub = {
     calls,
+    setIntentsCreatedAt(at) {
+      intentsCreatedAt = at;
+    },
+    afterNextConfirmAnswer(fn) {
+      confirmAnswered = fn;
+    },
+    adoptIntent({ id, status, amountCents, metadata }) {
+      intents.set(id, {
+        status,
+        amountCents,
+        clientSecret: null,
+        createdSeconds: nowSeconds(),
+        metadata,
+      });
+    },
+    intentSnapshot(id) {
+      const state = intents.get(id);
+      if (state === undefined) throw new Error(`stub: no intent ${id}`);
+      return { amountCents: state.amountCents, metadata: state.metadata ?? {} };
+    },
     setNextIntentStatus(status) {
       nextIntentStatus = status;
       nextIntentStatusExplicit = true;
@@ -1583,6 +1629,22 @@ export function makeStripeStub(): StripeStub {
       return queued;
     },
   };
+
+  // After the verbs, so `afterNextConfirmAnswer` sees Stripe's state already moved. A
+  // verb that throws has no answer to report, so the hook waits for one that does.
+  const answerThenReturn = async (
+    answer: StripePaymentIntentResult,
+  ): Promise<StripePaymentIntentResult> => {
+    const hook = confirmAnswered;
+    confirmAnswered = undefined;
+    if (hook !== undefined) await hook(answer);
+    return answer;
+  };
+  const { createAndConfirmPaymentIntent, confirmPaymentIntent } = stub;
+  stub.createAndConfirmPaymentIntent = async (...args) =>
+    answerThenReturn(await createAndConfirmPaymentIntent.apply(stub, args));
+  stub.confirmPaymentIntent = async (...args) =>
+    answerThenReturn(await confirmPaymentIntent.apply(stub, args));
 
   return stub;
 }

@@ -486,6 +486,25 @@ test(
 );
 
 test(
+  'an open claim answers 409 before the pre-validation can answer for an invoice it no longer reads as open',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const invoiceId = await seedOpenInvoice();
+    const { app, stripe } = buildApp();
+    stripe.setNextIntentStatus('processing');
+    const key = `pay-open-claim-${randomUUID()}`;
+    const res = await pay(app, invoiceId, key);
+    assert.equal(res.statusCode, 201, res.body);
+
+    await db.update(invoices).set({ status: 'void' }).where(eq(invoices.id, invoiceId));
+
+    const retry = await pay(app, invoiceId, key);
+    assert.equal(retry.statusCode, 409, retry.body);
+    assert.equal((retry.json() as ErrorBody).error.code, 'idempotency_inflight');
+  },
+);
+
+test(
   'processing: 201 with the intent live, no cancel, the claim stays open, a same-key retry is 409',
   SKIP_WHEN_NO_DB,
   async () => {

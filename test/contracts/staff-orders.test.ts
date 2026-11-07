@@ -1,18 +1,21 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, afterEach, test } from 'node:test';
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   bookings,
+  creditPackages,
   charges,
   creditLedger,
   idempotencyKeys,
   invoices,
+  notifications,
   orders,
   owners,
   scheduledNotifications,
 } from '../../src/db/schema/schema.js';
+import { deepLinkToPath } from '../../src/contracts/wire.js';
 import type {
   ApiErrorEnvelope,
   BookingWire,
@@ -290,6 +293,19 @@ test(
     assert.equal(await chargeStatus(seeded.chargeId), 'succeeded', 'the money stands');
     assert.deepEqual(await statuses(seeded), ['cancelled', 'cancelled']);
     assert.equal(await balance(dogId), before, 'each back to its lot');
+    // An ordinary cancel of each row: one notice a row, by the row's own link.
+    for (const bookingId of seeded.bookingIds) {
+      const rowNotices = await db
+        .select({ id: notifications.id })
+        .from(notifications)
+        .where(
+          and(
+            eq(notifications.type, 'booking-cancelled'),
+            eq(notifications.deepLinkPath, deepLinkToPath({ kind: 'booking', id: bookingId })),
+          ),
+        );
+      assert.equal(rowNotices.length, 1, 'one ordinary notice per row');
+    }
   },
 );
 
@@ -410,6 +426,67 @@ test(
 );
 
 // ── GET /staff/payments/pending ──────────────────────────────────────────────
+
+test(
+  'GET /staff/payments/pending: a package row names its pack, from charges.package_id, and no other kind carries the label',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    const [pack] = await db
+      .select({ id: creditPackages.id })
+      .from(creditPackages)
+      .where(eq(creditPackages.key, 'school-2x-weekly-fayetteville'));
+    assert.ok(pack);
+    const longAgo = new Date(T0.getTime() - 60 * 60_000);
+    const purchase = await seedPendingPurchaseOrder(stripe, {
+      now: T0,
+      createdAt: longAgo,
+      amountCents: 45_600,
+      packageId: pack.id,
+      creditsCount: 8,
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/staff/payments/pending' });
+
+    assert.equal(res.statusCode, 200, res.body);
+    const row = (res.json() as GetStaffPaymentsPendingResponse).find(
+      (r) => r.order_id === purchase.orderId,
+    );
+    assert.equal(row?.kind, 'package');
+    assert.equal(row?.package_label, 'Fayetteville 2x Weekly');
+  },
+);
+
+test(
+  'GET /staff/payments/pending: a top-up names its rows and no package_label',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const dogId = await createFundedDog(createdDogs, 1);
+    const { app, stripe } = buildApp(FIXTURE_MANAGER_PRINCIPAL);
+    const [pack] = await db
+      .select({ id: creditPackages.id })
+      .from(creditPackages)
+      .where(eq(creditPackages.key, 'school-2x-weekly-fayetteville'));
+    assert.ok(pack);
+    const seeded = await seedPendingBookingOrder(stripe, {
+      dogId,
+      dates: [futureWeekday(1)],
+      now: T0,
+      createdAt: new Date(T0.getTime() - 60 * 60_000),
+    });
+    await db.update(charges).set({ packageId: pack.id }).where(eq(charges.id, seeded.chargeId));
+
+    const res = await app.inject({ method: 'GET', url: '/staff/payments/pending' });
+
+    assert.equal(res.statusCode, 200, res.body);
+    const row = (res.json() as GetStaffPaymentsPendingResponse).find(
+      (r) => r.order_id === seeded.orderId,
+    );
+    assert.ok(row);
+    assert.notEqual(row.kind, 'package');
+    assert.equal('package_label' in row, false);
+  },
+);
 
 test(
   'GET /staff/payments/pending: past the limit, oldest first, every campus, with sessions on a booking order',

@@ -103,9 +103,8 @@ requireReplace(
 //    hits exactly those 10 sites in two forms (5 notNull / 5 nullable). The FK
 //    itself is emitted by drizzle as a table-level foreignKey() callback, so we
 //    add ONLY the brand here — no inline .references() (that would duplicate it).
-//    The nullable form grew 4 → 5 with credit_expiry_settings.location
-//    (2026-06-20): NULL = org-wide default, a slug = per-location override —
-//    still a locations.slug FK, so the same brand applies.
+//    A nullable location is NULL = org-wide default, a slug = per-location
+//    override: still a locations.slug FK, so the same brand applies.
 repair(
   SCHEMA,
   'LocationKey brand → location text().notNull() (×5)',

@@ -6,15 +6,12 @@ import type { FastifyInstance } from 'fastify';
 import { db } from '../../src/db/client.js';
 import {
   bookingDogs,
-  charges,
   cohorts,
   creditLedger,
   dogCompletedPrograms,
   eventRsvpDogs,
   pendingRequestDogs,
 } from '../../src/db/schema/schema.js';
-import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
-import { registerCreditsRoute } from '../../src/routes/credits.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerEventsRoute } from '../../src/routes/events.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
@@ -247,121 +244,36 @@ test(
 
 // ── POST /credit-packages/:key/purchase: a cache key built from the body ─────
 
-test(
-  'a purchase with a capitalised id wipes the lowercase credits cache: the next read is fresh',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { lower, upper } = await dogWithLetters();
-    const app = appWith((a, authenticate) => {
-      registerCreditsRoute(a, { authenticate });
-      registerCreditPackagesRoute(a, { authenticate, stripe: makeStripeStub(), now: FIXTURE_NOW });
-    });
-    const schoolBalance = async (): Promise<number> => {
-      const res = await app.inject({
-        method: 'GET',
-        url: `/dogs/${lower}/credits?location=fayetteville`,
-      });
-      assert.equal(res.statusCode, 200, res.body);
-      return (res.json() as { school: number }).school;
-    };
-
-    try {
-      assert.equal(await schoolBalance(), 0, 'read once, so the balance is cached');
-
-      const res = await app.inject({
-        method: 'POST',
-        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-        headers: { 'idempotency-key': randomUUID() },
-        payload: {
-          dog_id: upper,
-          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-          location: 'fayetteville',
-        },
-      });
-      assert.equal(res.statusCode, 201, res.body);
-
-      assert.equal(await schoolBalance(), 5, 'the purchase shows on the next read');
-    } finally {
-      await db.delete(creditLedger).where(eq(creditLedger.dogId, lower));
-      await db.delete(charges).where(eq(charges.dogId, lower));
-    }
-  },
-);
-
 // ── Path params that reach a cache key (Fable probe F4; P14) ─────────────────
-
-test(
-  'GET /dogs/:id/credits: a capitalised read is fresh after a purchase',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { lower, upper } = await dogWithLetters();
-    const app = appWith((a, authenticate) => {
-      registerCreditsRoute(a, { authenticate });
-      registerCreditPackagesRoute(a, { authenticate, stripe: makeStripeStub(), now: FIXTURE_NOW });
-    });
-    const read = async (id: string): Promise<{ dog_id: string; school: number }> => {
-      const res = await app.inject({
-        method: 'GET',
-        url: `/dogs/${id}/credits?location=fayetteville`,
-      });
-      assert.equal(res.statusCode, 200, res.body);
-      return res.json() as { dog_id: string; school: number };
-    };
-
-    try {
-      assert.equal((await read(upper)).school, 0, 'read in capitals, so the balance is cached');
-
-      const res = await app.inject({
-        method: 'POST',
-        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-        headers: { 'idempotency-key': randomUUID() },
-        payload: {
-          dog_id: lower,
-          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-          location: 'fayetteville',
-        },
-      });
-      assert.equal(res.statusCode, 201, res.body);
-
-      assert.equal((await read(lower)).school, 5, 'the lowercase read is fresh');
-      const capitalised = await read(upper);
-      assert.equal(capitalised.school, 5, 'and the capitalised read is the same read');
-      assert.equal(capitalised.dog_id, lower, 'the wire holds one spelling');
-    } finally {
-      await db.delete(creditLedger).where(eq(creditLedger.dogId, lower));
-      await db.delete(charges).where(eq(charges.dogId, lower));
-    }
-  },
-);
 
 test(
   'POST /staff/dogs/:dogId/completed-programs: a capitalised path records the lowercase dog and moves no lot',
   SKIP_WHEN_NO_DB,
   async () => {
     const { lower, upper } = await dogWithLetters();
-    const reader = appWith((a, authenticate) => registerCreditsRoute(a, { authenticate }));
-    const expiringLots = async (): Promise<number> => {
-      const res = await reader.inject({
-        method: 'GET',
-        url: `/dogs/${lower}/credits?location=fayetteville`,
-      });
-      assert.equal(res.statusCode, 200, res.body);
-      return (res.json() as { expiring_lots: unknown[] }).expiring_lots.length;
-    };
     const { app: staff, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     registerStaffAlumniRoute(staff, { authenticate, now: FIXTURE_NOW });
-    await db.insert(creditLedger).values({
-      dogId: lower,
-      mode: 'school',
-      location: 'fayetteville',
-      delta: 3,
-      reason: 'purchase',
-      expiresAt: new Date(Date.now() + 60 * 86_400_000).toISOString(),
-    });
+    const expiresAt = new Date(Date.now() + 60 * 86_400_000).toISOString();
+    const [lot] = await db
+      .insert(creditLedger)
+      .values({
+        ownerId: FIXTURE_IDS.ownerId,
+        mode: 'school',
+        location: 'fayetteville',
+        delta: 3,
+        reason: 'purchase',
+        expiresAt,
+      })
+      .returning({ id: creditLedger.id });
+    const stampOf = async (): Promise<number> => {
+      const [row] = await db
+        .select({ expiresAt: creditLedger.expiresAt })
+        .from(creditLedger)
+        .where(eq(creditLedger.id, lot?.id as string));
+      return new Date(row?.expiresAt as string).getTime();
+    };
 
     try {
-      assert.equal(await expiringLots(), 1, 'read once, so the expiring lot is cached');
-
       // The fifth program makes her an alumna, and her credits expire like anyone's.
       for (const program of CURRICULUM_PROGRAMS) {
         const res = await staff.inject({
@@ -378,9 +290,10 @@ test(
         .from(dogCompletedPrograms)
         .where(eq(dogCompletedPrograms.dogId, lower));
       assert.equal(recorded.length, CURRICULUM_PROGRAMS.length, 'on the lowercase dog');
-      assert.equal(await expiringLots(), 1, 'the lot still expires');
+      assert.equal(await stampOf(), new Date(expiresAt).getTime(), 'the lot still expires');
     } finally {
       await db.delete(dogCompletedPrograms).where(eq(dogCompletedPrograms.dogId, lower));
+      await db.delete(creditLedger).where(eq(creditLedger.id, lot?.id as string));
     }
   },
 );

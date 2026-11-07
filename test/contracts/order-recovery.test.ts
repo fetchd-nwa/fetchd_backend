@@ -5,18 +5,15 @@ import { and, eq, like, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
 import {
-  bookings,
   charges,
-  creditLedger,
   idempotencyKeys,
   invoices,
-  notifications,
   orders,
   refunds,
   scheduledNotifications,
   stripeEvents,
 } from '../../src/db/schema/schema.js';
-import { deepLinkToPath, type ApiErrorEnvelope } from '../../src/contracts/wire.js';
+import type { ApiErrorEnvelope } from '../../src/contracts/wire.js';
 import type { Principal } from '../../src/auth/principal.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { registerStaffOrdersRoute } from '../../src/routes/staffOrders.js';
@@ -26,8 +23,7 @@ import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRe
 import { runOrderSweeperOnce } from '../../src/workers/orderSweeper.js';
 import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
 import { makeExpoPushStub } from './_expoPushStub.js';
-import { createFundedDog, removeDogs } from './_dayFixture.js';
-import { FIXTURE_IDS, futureWeekday } from './_fixture.js';
+import { FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -40,7 +36,6 @@ import {
   clearOrderRows,
   seedInvoiceOrder,
   seedOpenInvoice,
-  seedPendingBookingOrder,
   type SeededOrder,
 } from './_orderFixture.js';
 import { makeStripeStub, type StripeStub } from './_stripeStub.js';
@@ -54,10 +49,8 @@ import { makeStripeStub, type StripeStub } from './_stripeStub.js';
  * stub's object lock is `evidence/reviews/opus-r1/lib/fake-stripe.mjs:9-10`'s reading.
  */
 
-const createdDogs: string[] = [];
 after(async () => {
   await clearOrderRows();
-  await removeDogs(createdDogs);
 });
 registerFixtureHooks();
 afterEach(async () => {
@@ -151,14 +144,6 @@ async function invoiceStatus(id: string): Promise<string | undefined> {
     .from(invoices)
     .where(eq(invoices.id, id));
   return row?.status;
-}
-
-async function creditBalance(dogId: string): Promise<number> {
-  const rows = await db
-    .select({ delta: creditLedger.delta })
-    .from(creditLedger)
-    .where(eq(creditLedger.dogId, dogId));
-  return rows.reduce((sum, r) => sum + r.delta, 0);
 }
 
 function countCalls(stripe: StripeStub, method: string): number {
@@ -1047,61 +1032,5 @@ test(
     assert.equal(rows[0]?.trigger, 'charge-failed');
     assert.equal(rows[0]?.dedupeKey, `charge-failed:${seeded.chargeId}`);
     assert.equal(rows[0]?.body, "Your $85.00 payment didn't go through, so you weren't charged.");
-  },
-);
-
-// ── Decision 7. M5: Stripe says succeeded on a booking order ────────────────
-
-test(
-  'Cancel order on an order with rows, Stripe answering succeeded, settles first, cancels every row, returns every debit, and answers settled_then_cancelled',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const world = build();
-    const { stripe } = world;
-    const dogId = await createFundedDog(createdDogs, 3);
-    const ledgerBefore = await creditBalance(dogId);
-    const seeded = await seedPendingBookingOrder(stripe, {
-      dogId,
-      dates: [futureWeekday(1), futureWeekday(2)],
-      now: T0,
-      amountCents: 8_500,
-      intentStatus: 'requires_confirmation',
-    });
-    assert.equal(await creditBalance(dogId), ledgerBefore - 2, 'the seed debited two');
-    // A shape production never has: it proves the arm's order of work, and P18 owes
-    // the real top-up (designs/p15-engine-recovery.md, decision 7).
-    const invoiceId = await seedOpenInvoice();
-    await db.update(orders).set({ invoiceId }).where(eq(orders.id, seeded.orderId));
-    stripe.captureBeforeCancel();
-
-    const res = await cancelOrder(world.staff, seeded.orderId);
-
-    assert.equal(res.statusCode, 200, res.body);
-    assert.equal((res.json() as { outcome: string }).outcome, 'settled_then_cancelled');
-    assert.equal(await invoiceStatus(invoiceId), 'paid', 'the settle ran first');
-    const rows = await db
-      .select({ status: bookings.status })
-      .from(bookings)
-      .where(eq(bookings.orderId, seeded.orderId));
-    assert.deepEqual(
-      rows.map((r) => r.status),
-      ['cancelled', 'cancelled'],
-    );
-    // By the row's own link: the owner's feed also holds the fixture's `notification1Id`
-    // until the first `afterEach`, so a count of the feed depends on the test order.
-    assert.equal(seeded.bookingIds.length, 2);
-    for (const bookingId of seeded.bookingIds) {
-      const notices = await db
-        .select({ id: notifications.id })
-        .from(notifications)
-        .where(
-          and(
-            eq(notifications.type, 'booking-cancelled'),
-            eq(notifications.deepLinkPath, deepLinkToPath({ kind: 'booking', id: bookingId })),
-          ),
-        );
-      assert.equal(notices.length, 1, 'one ordinary notice per row');
-    }
-    assert.equal(await creditBalance(dogId), ledgerBefore, 'every debit returned');
   },
 );

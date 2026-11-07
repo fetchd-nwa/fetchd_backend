@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, notInArray, or } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, ne, notInArray, or } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   agreementDocuments,
@@ -10,6 +10,7 @@ import {
   classPrereqOptions,
   cohorts,
   creditLedger,
+  creditLotExpiryEdits,
   creditPackages,
   dayCapacity,
   dayProgramSettings,
@@ -128,12 +129,11 @@ export const FIXTURE_IDS = {
   // path reads attendance since wire 3.0.0; the rows stay because the read
   // suites count them (DECISIONS 118(d)).
   bookingDog2PastCareId: '77777777-7777-4777-8777-77777777777b',
-  // Day-5b: credit_packages catalog keys + credit_ledger ids + service_rates
-  // ids. Packages use `test-*` text prefixes for the same reason as the
-  // catalog rows above (no collision with a future production seed).
+  // Day-5b: credit_packages catalog keys + credit_ledger ids. Packages use
+  // `test-*` text prefixes for the same reason as the catalog rows above: they
+  // sit beside the ten rows schema.sql seeds (M4.06), and never collide with them.
   creditPackageSchool5Key: 'test-school-5',
   creditPackageSchool10Key: 'test-school-10',
-  creditPackageDaycare8Key: 'test-daycare-8',
   creditPackageRetiredKey: 'test-retired-pack',
   // The surrogate id of the CURRENT-window test-school-5 @ fayetteville row
   // (Δ 2026-06-08 effective-dating) — the exact priced version the fixture
@@ -142,16 +142,6 @@ export const FIXTURE_IDS = {
   creditLedgerPurchaseId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1',
   creditLedgerDebitId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc2',
   creditLedgerBentonvilleId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc3',
-  serviceRateSchoolFayId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd1',
-  serviceRateSchoolNullLocId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd2',
-  serviceRateDaycareCurrentId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd3',
-  serviceRateDaycareFutureId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd4',
-  // Day-5b edge-case rows: soft-expired day_capacity override (live() must
-  // skip it), closed-window day-care @ bentonville (effective-date filter
-  // must skip it so the null-location row wins), boarding rate with empty-
-  // string note (optional-omit must drop it from the wire).
-  serviceRateDaycareBentonClosedId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd5',
-  serviceRateBoardingEmptyNoteId: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd6',
   // Day-6a: requests + group classes + cohorts + prereq option.
   // group_class keys are NOT prefixed with `test-` because they ARE the
   // canonical `group_class_key` enum values; production seed coexists via
@@ -268,6 +258,71 @@ export const EVALUATION_RATE_SEED_IDS = [
   'e7a10000-0000-4000-8000-000000000001',
   'e7a10000-0000-4000-8000-000000000002',
 ];
+
+/** M4.06's ten keys, the rows schema.sql seeds into `credit_packages`, and the
+ *  `effective_from` every one of them carries. */
+export const CATALOG_SEED_KEYS = [
+  'school-2x-weekly-fayetteville',
+  'school-3x-weekly-fayetteville',
+  'school-alumni-10-fayetteville',
+  'single-day-school-fayetteville',
+  'school-2x-weekly-bentonville',
+  'school-3x-weekly-bentonville',
+  'school-5x-weekly-bentonville',
+  'single-day-school-bentonville',
+  'daycare-10-bentonville',
+  'single-day-daycare-bentonville',
+];
+export const CATALOG_SEED_EFFECTIVE_FROM = '2026-01-01';
+
+/**
+ * M4.06's ten rows stay across files, as M3.05's two rates do. A test that edits one's
+ * months opens a successor, or closes the seed row, so the successor goes and the seed
+ * row comes back open at its seed. A missing one stays missing, so the suite says so.
+ */
+export async function resetCatalogSeed(): Promise<void> {
+  await db
+    .delete(creditPackages)
+    .where(
+      and(
+        inArray(creditPackages.key, CATALOG_SEED_KEYS),
+        ne(creditPackages.effectiveFrom, CATALOG_SEED_EFFECTIVE_FROM),
+      ),
+    );
+  await db
+    .update(creditPackages)
+    .set({ effectiveTo: null, expiryMonths: 1 })
+    .where(
+      and(
+        inArray(creditPackages.key, CATALOG_SEED_KEYS),
+        or(isNotNull(creditPackages.effectiveTo), ne(creditPackages.expiryMonths, 1)),
+      ),
+    );
+}
+
+/**
+ * Clears the whole table but M3.05's two evaluation rows, not just a test's own ids:
+ * the rate editor inserts rows with random UUIDs, so an id-scoped delete would leak
+ * them across files and pollute every later rate lookup. schema.sql seeds those two
+ * rows and nothing else, so they stay, and `GET /rates` for an evaluation reads the
+ * volume's own row. A test that closes or voids one gets it back open here; a missing
+ * one stays missing, so the suite says so.
+ */
+export async function resetServiceRates(): Promise<void> {
+  await db.delete(serviceRates).where(notInArray(serviceRates.id, EVALUATION_RATE_SEED_IDS));
+  await db
+    .update(serviceRates)
+    .set({ effectiveTo: null, voidedAt: null, voidedByStaffId: null })
+    .where(
+      and(
+        inArray(serviceRates.id, EVALUATION_RATE_SEED_IDS),
+        or(isNotNull(serviceRates.effectiveTo), isNotNull(serviceRates.voidedAt)),
+      ),
+    );
+}
+
+/** A lot that outlives every clock these suites read: `lot_is_live` is Postgres's. */
+export const FIXTURE_LOT_EXPIRES_AT = '2036-01-01T00:00:00.000Z';
 
 export const FIXTURE_TODAY = new Date('2026-05-19T17:00:00Z');
 export const FIXTURE_NOW = (): Date => FIXTURE_TODAY;
@@ -729,17 +784,18 @@ export async function seedFixture(): Promise<void> {
   ]);
 
   // Day-5b catalog, effective-dated since Δ 2026-06-08 (parity with
-  // service_rates). At FIXTURE_TODAY (2026-05-19) the live catalog is exactly
-  // the three current-window fayetteville packs + the one bentonville pack, so
-  // the snapshot is byte-identical to the pre-effective-dating shape. The extra
-  // windows exercise the filter:
-  //   - test-school-5 @ fayetteville carries THREE windows of one key — a
-  //     superseded past price, the CURRENT price (the row the purchase ledger +
-  //     snapshot point at), and a FUTURE scheduled reprice — proving "pick the
-  //     window that contains today" (past + future both excluded).
+  // service_rates). These rows sit beside the ten schema.sql seeds (M4.06), so at
+  // FIXTURE_TODAY (2026-05-19) Fayetteville's live catalog is its four seeded rows
+  // plus the two current-window packs here, and Bentonville's is its six seeded
+  // rows. The extra windows exercise the filter:
+  //   - test-school-5 carries THREE windows of one key — a superseded past price,
+  //     the CURRENT price (the row the purchase ledger + snapshot point at), and a
+  //     FUTURE scheduled reprice — proving "pick the window that contains today"
+  //     (past + future both excluded).
   //   - the retired pack's only window is already closed at FIXTURE_TODAY → it
   //     is absent from the catalog (this is the retire mechanism now, replacing
   //     the old active=false switch).
+  // A key names one campus (M4.05), so no key here is at both.
   // Enum order: booking_mode declared 'school','daycare' → school emits first.
   await db.insert(creditPackages).values([
     // test-school-5 @ fayetteville — superseded prior price (window closed).
@@ -792,30 +848,6 @@ export async function seedFixture(): Promise<void> {
       effectiveFrom: '2026-01-01',
       effectiveTo: null,
     },
-    {
-      key: FIXTURE_IDS.creditPackageDaycare8Key,
-      location: 'fayetteville',
-      mode: 'daycare',
-      credits: 8,
-      priceCents: 30_000,
-      label: '8 Daycare Credits (fixture)',
-      isPopular: false,
-      effectiveFrom: '2026-01-01',
-      effectiveTo: null,
-    },
-    // Δ 2026-06-04: same pack key at Bentonville with a DIFFERENT price —
-    // exercises per-location pricing.
-    {
-      key: FIXTURE_IDS.creditPackageSchool5Key,
-      location: 'bentonville',
-      mode: 'school',
-      credits: 5,
-      priceCents: 27_500,
-      label: '5 School Credits (Bentonville fixture)',
-      isPopular: false,
-      effectiveFrom: '2026-01-01',
-      effectiveTo: null,
-    },
     // Fully retired: window already closed at FIXTURE_TODAY, no replacement →
     // absent from the catalog (replaces the old active=false retire switch).
     {
@@ -859,84 +891,6 @@ export async function seedFixture(): Promise<void> {
     },
   ]);
 
-  // Day-5b: service_rates. Two key behaviors:
-  //   - location-specific row beats null-location row at the same category
-  //     (day-school @ fayetteville $75 vs day-school @ null-location $70 →
-  //     fayetteville query returns $75; bentonville query returns $70 via
-  //     the null-location fallback)
-  //   - effective-dated lookup: day-care @ null-location $45 (active
-  //     [2025-12-01, 2026-06-01)) covers FIXTURE_TODAY=2026-05-19; the
-  //     $50 row opens 2026-06-01 and must NOT be returned today
-  await db.insert(serviceRates).values([
-    {
-      id: FIXTURE_IDS.serviceRateSchoolFayId,
-      category: 'day-school',
-      location: 'fayetteville',
-      amountCents: 7500,
-      unit: 'per-day',
-      effectiveFrom: '2026-01-01',
-      effectiveTo: null,
-      note: 'Standard day-school rate, Fayetteville (fixture)',
-    },
-    {
-      id: FIXTURE_IDS.serviceRateSchoolNullLocId,
-      category: 'day-school',
-      location: null,
-      amountCents: 7000,
-      unit: 'per-day',
-      effectiveFrom: '2026-01-01',
-      effectiveTo: null,
-      note: null,
-    },
-    {
-      id: FIXTURE_IDS.serviceRateDaycareCurrentId,
-      category: 'day-care',
-      location: null,
-      amountCents: 4500,
-      unit: 'per-day',
-      effectiveFrom: '2025-12-01',
-      effectiveTo: '2026-06-01',
-      note: null,
-    },
-    {
-      id: FIXTURE_IDS.serviceRateDaycareFutureId,
-      category: 'day-care',
-      location: null,
-      amountCents: 5000,
-      unit: 'per-day',
-      effectiveFrom: '2026-06-01',
-      effectiveTo: null,
-      note: 'Mid-year increase (fixture)',
-    },
-    // Day-care @ bentonville $40 — CLOSED window [2025-12-01, 2026-04-01).
-    // FIXTURE_TODAY=2026-05-19 is past effective_to → the effective-date
-    // filter drops this row, and the null-location $45 wins. Exercises
-    // "closed-specific-window falls back to null-location."
-    {
-      id: FIXTURE_IDS.serviceRateDaycareBentonClosedId,
-      category: 'day-care',
-      location: 'bentonville',
-      amountCents: 4000,
-      unit: 'per-day',
-      effectiveFrom: '2025-12-01',
-      effectiveTo: '2026-04-01',
-      note: 'Bentonville intro pricing (expired)',
-    },
-    // Boarding @ fayetteville with explicit empty-string note. The wire
-    // emit logic omits `note` when null OR empty — this row exercises
-    // the empty-string branch (the other rows test null + populated).
-    {
-      id: FIXTURE_IDS.serviceRateBoardingEmptyNoteId,
-      category: 'boarding',
-      location: 'fayetteville',
-      amountCents: 8500,
-      unit: 'per-night',
-      effectiveFrom: '2026-01-01',
-      effectiveTo: null,
-      note: '',
-    },
-  ]);
-
   // One booking_dogs row per booking_dog pair. Lead is always present;
   // booking 3 is the only multi-dog row (Waffles lead + Lola additional).
   await db.insert(bookingDogs).values([
@@ -970,16 +924,15 @@ export async function seedFixture(): Promise<void> {
     },
   ]);
 
-  // Day-5b: credit_ledger entries for Waffles only (Lola has zero ledger
-  // rows → exercises the zero-sentinel branch of GET /dogs/:id/credits via
-  // the LEFT JOIN through dogs in creditsRepository).
+  // Day-5b: the fixture owner's credits, one pool per campus, program and tier.
   //   +5 school purchase (references the current test-school-5 @ fay row by id)
   //   -1 school debit  (references booking1 — Waffles' upcoming day-school)
-  // Resulting balance: { school: 4, daycare: 0 }
+  // Resulting balance: Fayetteville school 4, Bentonville daycare 2.
   await db.insert(creditLedger).values([
     {
       id: FIXTURE_IDS.creditLedgerPurchaseId,
-      dogId: FIXTURE_IDS.dog1Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      expiresAt: FIXTURE_LOT_EXPIRES_AT,
       mode: 'school',
       location: 'fayetteville',
       delta: 5,
@@ -989,7 +942,9 @@ export async function seedFixture(): Promise<void> {
     },
     {
       id: FIXTURE_IDS.creditLedgerDebitId,
+      ownerId: FIXTURE_IDS.ownerId,
       dogId: FIXTURE_IDS.dog1Id,
+      lotId: FIXTURE_IDS.creditLedgerPurchaseId,
       mode: 'school',
       location: 'fayetteville',
       delta: -1,
@@ -997,12 +952,11 @@ export async function seedFixture(): Promise<void> {
       bookingId: FIXTURE_IDS.booking1Id,
       note: 'Fixture debit for booking1',
     },
-    // Δ 2026-06-04: a Bentonville grant so Waffles' balance differs by
-    // location — Fayetteville {school:4, daycare:0}, Bentonville {school:0,
-    // daycare:2}. Proves GET /dogs/:id/credits is location-scoped.
+    // Δ 2026-06-04: a Bentonville grant, so the owner's pools differ by campus.
     {
       id: FIXTURE_IDS.creditLedgerBentonvilleId,
-      dogId: FIXTURE_IDS.dog1Id,
+      ownerId: FIXTURE_IDS.ownerId,
+      expiresAt: FIXTURE_LOT_EXPIRES_AT,
       mode: 'daycare',
       location: 'bentonville',
       delta: 2,
@@ -1665,14 +1619,20 @@ export async function topUpCredits(
   amount: number,
   location: 'fayetteville' | 'bentonville' = 'fayetteville',
 ): Promise<void> {
-  const { creditLedger } = await import('../../src/db/schema/schema.js');
+  const { creditLedger, dogs } = await import('../../src/db/schema/schema.js');
   const { randomUUID } = await import('node:crypto');
+  const [dog] = await db.select({ ownerId: dogs.ownerId }).from(dogs).where(eq(dogs.id, dogId));
+  if (dog?.ownerId == null) throw new Error(`topUpCredits: ${dogId} has no owner`);
+  // A grant names no dog in production. `dog_id` here is only what a test's teardown keys
+  // on: the credits are the owner's, whichever dog this helper was handed.
   await db.insert(creditLedger).values({
+    ownerId: dog.ownerId,
     dogId,
     mode,
     location,
     delta: amount,
     reason: 'purchase',
+    expiresAt: FIXTURE_LOT_EXPIRES_AT,
     note: `Test top-up ${randomUUID()}`,
   });
 }
@@ -1869,9 +1829,10 @@ export async function teardownFixture(): Promise<void> {
   // attaches the ledger row to a charge), so ledger must drop BEFORE
   // charges. Filtering by dog_id alone misses charge-attached rows for
   // OTHER dogs; widen to "any charge from this owner" before purging.
+  await db.delete(creditLotExpiryEdits);
   await db
     .delete(creditLedger)
-    .where(inArray(creditLedger.dogId, [FIXTURE_IDS.dog1Id, FIXTURE_IDS.dog2Id]));
+    .where(eq(creditLedger.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(bookings).where(eq(bookings.ownerId, FIXTURE_IDS.ownerId));
   // Catch BOTH the fixture-id cohorts AND any per-test cohorts attached to
@@ -1891,27 +1852,11 @@ export async function teardownFixture(): Promise<void> {
       inArray(creditPackages.key, [
         FIXTURE_IDS.creditPackageSchool5Key,
         FIXTURE_IDS.creditPackageSchool10Key,
-        FIXTURE_IDS.creditPackageDaycare8Key,
         FIXTURE_IDS.creditPackageRetiredKey,
       ]),
     );
-  // Clear the whole table but M3.05's two evaluation rows, not just the fixture
-  // ids: the staff rate-editor write path (`POST /staff/rates`) inserts rows with
-  // random UUIDs, so an id-scoped delete would leak them across files and pollute
-  // every later rate lookup. schema.sql seeds those two rows and nothing else, so
-  // they stay, and `GET /rates` for an evaluation reads the volume's own row. A
-  // test that closes or voids one gets it back open here; a missing one stays
-  // missing, so the suite says so.
-  await db.delete(serviceRates).where(notInArray(serviceRates.id, EVALUATION_RATE_SEED_IDS));
-  await db
-    .update(serviceRates)
-    .set({ effectiveTo: null, voidedAt: null, voidedByStaffId: null })
-    .where(
-      and(
-        inArray(serviceRates.id, EVALUATION_RATE_SEED_IDS),
-        or(isNotNull(serviceRates.effectiveTo), isNotNull(serviceRates.voidedAt)),
-      ),
-    );
+  await resetCatalogSeed();
+  await resetServiceRates();
   await db.delete(dayCapacity).where(eq(dayCapacity.location, 'fayetteville'));
   await db.delete(paymentMethods).where(eq(paymentMethods.ownerId, FIXTURE_IDS.ownerId));
   // Day-14: stripe_customers FK→owners is ON DELETE RESTRICT, so it must

@@ -52,6 +52,7 @@ const NOT_UUID_PARAMS: Readonly<Record<string, readonly string[]>> = {
   '/staff/cancel-window/:category': ['category'],
   '/staff/dogs/:dogId/completed-programs/:program': ['program'],
   '/credit-packages/:key/purchase': ['key'],
+  '/staff/credit-packages/:key': ['key'],
   '/group-classes/:key': ['key'],
   '/group-classes/:key/cohorts': ['key'],
   '/device-tokens/:token': ['token'],
@@ -136,7 +137,7 @@ test(
     const paths = new Set(routes.map((route) => route.path));
 
     // A walk that read nothing would pass everything below.
-    assert.ok(paths.has('/dogs/:id/credits'), `the walk read: ${[...paths].join(' ')}`);
+    assert.ok(paths.has('/dogs/:id/bookings'), `the walk read: ${[...paths].join(' ')}`);
 
     const notRoutes = routes
       .filter((route) => paramsOf(route.path).length > 0)
@@ -195,7 +196,7 @@ test(
     }
 
     t.diagnostic(`${checked.length} uuid path params checked across ${routes.length} table paths`);
-    assert.ok(checked.includes('GET /dogs/:id/credits :id'), `checked: ${checked.join('\n')}`);
+    assert.ok(checked.includes('GET /dogs/:id/bookings :id'), `checked: ${checked.join('\n')}`);
     assert.deepEqual(failures, [], `${failures.length} of ${checked.length} params not refused`);
   },
 );

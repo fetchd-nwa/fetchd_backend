@@ -285,6 +285,10 @@ observable behavior, not "looks right."
   fires on `mode` + `location` query params).
 
 ### Day 5b — Read: availability / per-dog credits / credit-packages / rates
+
+> `GET /dogs/:id/credits` and `dog_credit_balance` left at wire 5.0.0-lg4.2 (P18): credits are
+> the owner's, read at `GET /credits` over `owner_credit_balance`.
+
 - **Owner:** Allison
 - **Depends on:** Day 5a
 - **Governing contract:** DATA-CONTRACT §B (Credits, DayCapacity,
@@ -1452,6 +1456,12 @@ observable behavior, not "looks right."
   charge.amount_cents). Day-13 only writes the 'pending' row.
 
 ### Day 14 — Stripe test-mode core
+
+> The synchronous purchase below left at wire 5.0.0-lg4.2 (P18): a pack rides the order engine,
+> one order and one charge, settled by the route, the webhook or the sweeper. A lot's date is
+> its row's `expiry_months` through `addChicagoMonths`, and a single-day pack expires like any
+> other.
+
 - **Owner:** Allison
 - **Depends on:** Day 13
 - **Governing contract:** DATA-CONTRACT payments §G; schema.sql payments

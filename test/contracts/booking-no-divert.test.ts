@@ -405,11 +405,13 @@ test(
   async () => {
     const dogId = await createTestDog();
 
+    // Bentonville day school: credits are the owner's, and the fixture's are Fayetteville's.
+    // Within the month a bought credit reaches: past it the answer is `credit_expired_before_date`.
     const res = await postBooking(ownerApp(), {
       category: 'day-school',
       lead_dog_id: dogId,
-      dates: [futureWeekday(28)],
-      location: 'fayetteville',
+      dates: [futureWeekday(3)],
+      location: 'bentonville',
     });
     assert.equal(res.statusCode, 422, res.body);
     const body = res.json() as { error: { code: string } };

@@ -234,7 +234,7 @@ export function registerStaffBookingsRoute(
       const reason = parseCancelReason(request.body);
 
       let pendingStripeRefund: PendingStripeRefund | undefined;
-      let creditRefundedDogIds: string[] = [];
+      let creditRefundedOwnerId: string | undefined;
       // Computed ONCE, here, so the row stores the same string the fire sends.
       const refundIdempotencyKey = `${idempotencyKey}:refund`;
       // A pending row cancels its whole order, through the one service (DECISIONS
@@ -257,8 +257,8 @@ export function registerStaffBookingsRoute(
             if (body.location !== undefined && body.location !== null) {
               patterns.push(`avail:${body.location}:*`);
             }
-            for (const dogId of creditRefundedDogIds) {
-              patterns.push(creditsInvalidationPattern(dogId));
+            if (creditRefundedOwnerId !== undefined) {
+              patterns.push(creditsInvalidationPattern(creditRefundedOwnerId));
             }
             return patterns;
           },
@@ -286,7 +286,7 @@ export function registerStaffBookingsRoute(
             log: request.log,
           });
           pendingStripeRefund = result.pendingStripeRefund;
-          creditRefundedDogIds = result.creditRefundedDogIds;
+          creditRefundedOwnerId = result.creditRefundedOwnerId;
           return { status: 200, body: result.wire };
         },
       );

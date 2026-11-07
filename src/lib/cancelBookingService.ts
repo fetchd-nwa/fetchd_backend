@@ -44,11 +44,11 @@ export interface CancelBookingResult {
    */
   unroutableRefund?: UnroutableRefundMint;
   /**
-   * Distinct dog ids that received a credit-back on this cancel. The route
-   * wipes each dog's `credits:{dogId}:*` display cache post-commit. Empty on
-   * every non-credit-back path (forfeit / money-back / free).
+   * The owner credited back on this cancel. The route wipes her `credits:{ownerId}:*`
+   * display cache post-commit. Absent on every non-credit-back path (forfeit / money-back
+   * / free).
    */
-  creditRefundedDogIds: string[];
+  creditRefundedOwnerId?: string;
 }
 
 /**
@@ -153,7 +153,9 @@ export async function cancelBookingInTx(
     return {
       wire: await wireOne(tx, id),
       pendingStripeRefund: cancelled.act.pendingStripeRefund,
-      creditRefundedDogIds: cancelled.cancelled?.creditRefundedDogIds ?? [],
+      ...(cancelled.cancelled?.creditRefundedOwnerId !== undefined
+        ? { creditRefundedOwnerId: cancelled.cancelled.creditRefundedOwnerId }
+        : {}),
     };
   }
 
@@ -173,13 +175,13 @@ export async function cancelBookingInTx(
   // 6. Refund branching — within the cancel window only.
   let pendingStripeRefund: PendingStripeRefund | undefined;
   let unroutableRefund: UnroutableRefundMint | undefined;
-  let creditRefundedDogIds: string[] = [];
+  let creditRefundedOwnerId: string | undefined;
   if (!updated.cancelForfeited) {
     // CREDIT-BACK: one +1 refund row per original debit, routed back to the lot it
     // drew from. `now` is the caller's cancel instant, so the lot the refund lands in
     // is dated by the same clock the forfeit check used.
-    creditRefundedDogIds = await returnDebitsToLots(tx, { bookingId: id, now });
-    if (creditRefundedDogIds.length === 0) {
+    creditRefundedOwnerId = await returnDebitsToLots(tx, { bookingIds: [id], now });
+    if (creditRefundedOwnerId === undefined) {
       const charge = await chargesRepository.findSucceededForBooking(tx, id);
       if (charge !== undefined) {
         // MONEY-BACK: refunds row at 'pending'; cumulative-refund rule
@@ -280,7 +282,7 @@ export async function cancelBookingInTx(
     wire: await wireOne(tx, id),
     pendingStripeRefund,
     unroutableRefund,
-    creditRefundedDogIds,
+    ...(creditRefundedOwnerId !== undefined ? { creditRefundedOwnerId } : {}),
   };
 }
 
@@ -317,9 +319,9 @@ async function wireOne(tx: Tx, id: string): Promise<BookingWire> {
 
 /**
  * The half of a pending row's cancel that runs BEFORE the transaction: ask Stripe what
- * won, with none open (R5). `undefined` for every row that is not pending, which is
- * every row until P18, so an ordinary cancel asks Stripe nothing. A row this request
- * may not touch is left to the transaction's own 404, unasked.
+ * won, with none open (R5). `undefined` for every row that is not pending, so an ordinary
+ * cancel asks Stripe nothing. A row this request may not touch is left to the
+ * transaction's own 404, unasked.
  */
 export async function askWhatWonForPendingRow(args: {
   id: string;

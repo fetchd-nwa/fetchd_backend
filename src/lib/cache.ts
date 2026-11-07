@@ -33,8 +33,7 @@ import { unlinkMatching } from './redisPattern.js';
  * | Group-class prereqs        | `groupclasses:prereqs:{classKey}`        | prereq-options edit (Day 19)     | (covered by `groupclasses:*` wipe above)                    |
  * | Availability range         | `avail:{location}:{from}:{to}`           | `day_capacity` write (Day 9+)    | `invalidatePattern('avail:{location}:*')` (single date hits many ranges) |
  * | Credit-packages catalog    | `creditpackages:{location}:{today}`      | reprice (staff portal, ext repo) | daily key + 5-min TTL; portal should `invalidatePattern('creditpackages:{location}:*')` on reprice |
- * | Credit balance (display)   | `credits:{dogId}:{ownerId}:balance:{loc}`| `credit_ledger` write            | `invalidatePattern('credits:{dogId}:*')` — purchase (sync+webhook), booking debit, cancel credit-refund, payment_failed reversal |
- * | Credit expiring-lots       | `credits:{dogId}:lots:{location}`        | `credit_ledger` write            | (covered by the `credits:{dogId}:*` wipe above)             |
+ * | Credit pools (display)     | `credits:{ownerId}:{location}`           | `credit_ledger` write            | `invalidatePattern('credits:{ownerId}:*')` — a settle's grant, booking debit, cancel credit-refund |
  *
  * Adding a new cached entity? Three rules: (1) every key has an entity
  * prefix; (2) every mutation that touches the underlying table updates
@@ -129,4 +128,19 @@ export async function invalidate(keys: string[]): Promise<void> {
  */
 export async function invalidatePattern(pattern: string): Promise<void> {
   await unlinkMatching(redis, pattern);
+}
+
+/**
+ * Wipe these patterns post-commit, for a caller with no `withMutation` to do it. Best
+ * effort: the money is committed, and each TTL heals a stale read.
+ */
+export async function invalidateAll(
+  patterns: readonly string[],
+  log: { warn(obj: Record<string, unknown>, msg?: string): void },
+): Promise<void> {
+  for (const pattern of patterns) {
+    await invalidatePattern(pattern).catch((err: unknown) => {
+      log.warn({ pattern, err: String(err) }, 'post-commit cache wipe failed');
+    });
+  }
 }

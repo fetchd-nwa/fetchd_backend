@@ -6,20 +6,27 @@ import type { Tx } from './tx.js';
  * **THE ONE GLOBAL LOCK ORDER** (design §2.7:3975, written once, here):
  *
  *   request-key claim
- *     → `(campus, date)` capacity locks, every date ascending (or the run lock)
- *       → cohort, `FOR NO KEY UPDATE` (enrollment and the withdraw)
- *         → charge (the order's)
- *           → the invoice the charge settles
- *             → bookings, in id order
- *               → pool `(owner, location, mode, tier)`, the credit-lot slot
- *                 → refunds
+ *     → dog, every dog ascending (`withDogLocks`)
+ *       → `(campus, date)` capacity locks, every date ascending (or the run lock)
+ *         → cohort, `FOR NO KEY UPDATE` (enrollment and the withdraw)
+ *           → charge (the order's)
+ *             → the invoice the charge settles
+ *               → bookings, in id order
+ *                 → pool `(owner, location, mode, tier)`, the credit-lot slot, the alumni
+ *                   pool before the regular one (`lockPools`)
+ *                   → refunds
  *
  * Take each family once for the whole order. A transaction that needs a later lock
  * and then finds it needs an earlier one has a deadlock waiting for it, so anything
- * reaching for two of these reads this list first. What P15 uses is claim → charge →
- * bookings: a pending row cancels through {@link lockCharge} before it locks any row,
- * which is what stops two cancels of one order from crossing, and the same order holds
- * on the settle, the webhook, the sweeper and *Cancel order*.
+ * reaching for two of these reads this list first. That holds inside a family too: two
+ * `lockPools` calls in one transaction are two orders, so a settle takes the pool it grants
+ * into with the pools its order debited, because a cancel's return follows it in the same
+ * transaction, and an alumni top-up's tx1 holds alumni on its way to regular.
+ *
+ * What P15 uses is claim → charge → bookings: a pending row cancels through
+ * {@link lockCharge} before it locks any row, which is what stops two cancels of one order
+ * from crossing, and the same order holds on the settle, the webhook, the sweeper and
+ * *Cancel order*.
  *
  * tx1 of an invoice payment locks the invoice with no charge lock held and takes no
  * existing charge's lock after it (its in-flight check is a plain read, and the charge
@@ -59,9 +66,12 @@ import type { Tx } from './tx.js';
  * one look at a time, bounded by a settle: no settle holds a row across a Stripe call,
  * and one that did would make the tick wait on Stripe.
  *
- * Not on this list yet, because no path takes it alongside a charge: `withDogLocks`,
- * which the booking core takes before capacity. M4.10 deletes the `(dog, mode,
- * location)` slot and puts the pool where this list says.
+ * **The dog lock stays** (DECISIONS 123(c), 174(h)). §2.4:2947 and §2.7:3983 delete "the
+ * `(dog, mode, location)` slot" with M4.10, which is a slot the code no longer has. The lock
+ * today is the dog alone, and it is what makes the overlap guard hold across campuses:
+ * capacity locks are per campus, so with no dog lock one dog could be booked at both on
+ * one day. It crosses nothing, because every holder takes it first, before capacity, and
+ * the pool comes last.
  */
 
 /**
@@ -86,6 +96,49 @@ export async function lockCharge(
 ): Promise<typeof charges.$inferSelect | undefined> {
   const [row] = await tx.select().from(charges).where(eq(charges.id, chargeId)).for('update');
   return row;
+}
+
+/** One pool's advisory-lock key: the unit a spend or a grant serialises on. */
+function poolLockKey(pool: {
+  ownerId: string;
+  location: string;
+  mode: string;
+  tier: string;
+}): string {
+  return `pool:${pool.ownerId}:${pool.location}:${pool.mode}:${pool.tier}`;
+}
+
+/**
+ * Lock these pools until the transaction ends: the credit-lot slot of the order above,
+ * after the charge and after any booking row the path locks. What a holder reads of a pool
+ * stays true until its writes commit, which is why a pool cannot be overspent. `alumni`
+ * sorts before `regular`, so an alumni top-up takes the alumni pool first, as §2.7 asks.
+ */
+export async function lockPools(
+  tx: Tx,
+  pools: readonly { ownerId: string; location: string; mode: string; tier: string }[],
+): Promise<void> {
+  for (const key of [...new Set(pools.map(poolLockKey))].sort()) {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${key}))`);
+  }
+}
+
+/**
+ * Per-key transaction-scoped advisory lock on one catalog row's versions: the
+ * serializer of `PATCH /staff/credit-packages/:key`. The edit's statement reads the
+ * row live today and closes or corrects it, so two edits of one key must not both read
+ * the same row: the second would wait on it, then open the same successor and die on
+ * `UNIQUE (key, effective_from)`, a 500. Under the lock the second reads what the first
+ * committed and corrects it. Takes no other lock, and no path holds a booking lock
+ * across it.
+ */
+export async function withCreditPackageLock<T>(
+  tx: Tx,
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`credit-package:${key}`}))`);
+  return fn();
 }
 
 /**
@@ -240,9 +293,10 @@ export async function withCapacityLocks<T>(
  * The booking core's dog lock: one transaction-scoped advisory lock per dog,
  * acquired in canonical ASC dogId order so two concurrent N-dog bookings on
  * overlapping dog sets can never deadlock — both observe the same total
- * acquisition order. It serializes the credit balance check, the FIFO lot
- * choice and the overlap guard, so the `credit_ledger` debit can't race any of
- * them. Held until the outer transaction commits OR rolls back.
+ * acquisition order. It serializes the overlap guard, across campuses: a dog
+ * can be in one place on a day, so two pools never make two bookings safe
+ * (DECISIONS 174(h)). The lot choice is `lockPools`'s to serialize. Held until
+ * the outer transaction commits OR rolls back.
  *
  * The key is the dog alone, `hashtext('dog:<dogId>')`, and `<dogId>` is the
  * lowercased id. The key is a string and Postgres reads a uuid in either case, so
@@ -252,8 +306,8 @@ export async function withCapacityLocks<T>(
  * the overlap guard reads her bookings across every mode and campus, and any two
  * bookings for her must be able to see each other. A key carrying the campus or
  * the mode lets two concurrent requests both pass the guard, and each spends a
- * credit or opens an invoice for one day. Credits stay per-(dog, mode, location);
- * only the queue is per dog.
+ * credit or opens an invoice for one day. Credits are the owner's, so the pool lock
+ * ({@link lockPools}) is what serialises spending them; this queue is per dog.
  *
  * Acquisition is sequential — postgres holds advisory locks until the
  * transaction commits, and the lock-acquire round-trips are cheap

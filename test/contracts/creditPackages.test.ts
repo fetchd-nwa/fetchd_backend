@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { CreditPackageWire } from '../../src/contracts/wire.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
-import { FIXTURE_NOW } from './_fixture.js';
+import { CATALOG_SEED_KEYS, FIXTURE_NOW } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -53,6 +54,45 @@ test(
       throw new Error(`/credit-packages returned ${res.statusCode}: ${res.body}`);
     }
     assert.deepStrictEqual(res.json(), loadSnapshot('credit-packages-bentonville'));
+  },
+);
+
+test(
+  'CRED-U07: the two campuses list the ten seeded rows, every one complete and buyable',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditPackagesRoute(app, { authenticate, now: FIXTURE_NOW });
+
+    const rows: CreditPackageWire[] = [];
+    for (const location of ['fayetteville', 'bentonville']) {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/credit-packages?location=${location}`,
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      rows.push(...(res.json() as CreditPackageWire[]));
+    }
+    const seeded = rows.filter((r) => CATALOG_SEED_KEYS.includes(r.key));
+    assert.equal(seeded.length, 10);
+    assert.deepEqual(new Set(seeded.map((r) => r.expiry_months)), new Set([1]));
+    assert.deepEqual(
+      seeded.filter((r) => r.single_day).map((r) => [r.key, r.price_cents, r.credits]),
+      [
+        ['single-day-school-fayetteville', 6000, 1],
+        ['single-day-school-bentonville', 6000, 1],
+        ['single-day-daycare-bentonville', 3500, 1],
+      ],
+    );
+    assert.deepEqual(
+      seeded.filter((r) => r.tier === 'alumni').map((r) => [r.key, r.location, r.mode]),
+      [['school-alumni-10-fayetteville', 'fayetteville', 'school']],
+    );
+    assert.equal(
+      rows.some((r) => r.mode === 'daycare' && r.location === 'fayetteville'),
+      false,
+      'no daycare pack sells at Fayetteville',
+    );
   },
 );
 

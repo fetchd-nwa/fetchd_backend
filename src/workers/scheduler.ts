@@ -9,7 +9,6 @@ import {
 import { shouldSkipPush } from '../lib/pushPreferences.js';
 import type { NotificationPushData } from '../contracts/wire.js';
 import { IDEMPOTENCY_OPEN_CLAIM_MAX_DAYS, sweepExpiredIdempotencyKeys } from '../db/idempotency.js';
-import { type EnqueueCreditExpiryWarningsResult } from '../lib/enqueueCreditExpiryWarnings.js';
 import {
   enqueueCardExpiryWarnings,
   type EnqueueCardExpiryWarningsResult,
@@ -66,12 +65,12 @@ import type { WorkerLogger } from './workerLogger.js';
  *   5. **Media derivatives** (Day 17). Claim → sharp → settle per job.
  *
  *   6. **Credit-expiry warnings — retired at 2.0.0** (S01, design §2.1,
- *      r3-fable #2). The scan read `credit_expiry_settings.warning_lead_days`
- *      (60), a store no setting names from 2.0.0, so every one-month lot was
+ *      r3-fable #2). The scan read a 60-day lead no setting named from 2.0.0, so every
+ *      one-month lot was
  *      inside its window the day it was bought. The phase no longer runs; its
  *      result stays `{scanned: 0, enqueued: 0}` so the tick log keeps its keys.
  *      CRED-U13 builds the real notice off `cred.expiry_warning_lead_days` at
- *      7.1.0; S25 (M4.07) removes the scan and its table.
+ *      7.1.0; S25 removed the scan, and M4.07 its table.
  *
  *   7. **Expiring default cards.** Enqueue `card-expiring` before the owner's
  *      default card lapses, and once after.
@@ -183,7 +182,7 @@ export interface SchedulerTickResult {
   orderSweeper: OrderSweeperTickResult;
   duplicateRefundRetry: DuplicateRefundRetryTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
-  creditExpiryWarnings: EnqueueCreditExpiryWarningsResult;
+  creditExpiryWarnings: { scanned: number; enqueued: number };
   idempotencyKeysSwept: number;
 }
 
@@ -369,14 +368,11 @@ export async function runSchedulerTickOnce(
     mediaDerivativesResult = { scanned: 0, results: [] };
   }
 
-  // Phase 6 — credit-expiry warnings: RETIRED at 2.0.0 (S01; see the header).
-  // `enqueueCreditExpiryWarnings` read the legacy 60-day lead, so it noticed a
-  // one-month lot the day it was bought. Nothing calls it from here; the result
-  // stays zero so `creditExpiryWarnings*` keep their place in the tick log.
-  const creditExpiryWarningsResult: EnqueueCreditExpiryWarningsResult = {
-    scanned: 0,
-    enqueued: 0,
-  };
+  // Phase 6 — credit-expiry warnings: RETIRED at 2.0.0 (S01; see the header), and its
+  // scan deleted with S25: it read the legacy 60-day lead, so it noticed a one-month lot
+  // the day it was bought. CRED-U13 rebuilds it. The result stays zero so
+  // `creditExpiryWarnings*` keep their place in the tick log.
+  const creditExpiryWarningsResult = { scanned: 0, enqueued: 0 };
 
   // Phase 7 — expiring default cards (Allison 2026-07-29). Warns before the
   // owner's default card lapses, and once more after it has.

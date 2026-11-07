@@ -1,29 +1,74 @@
 [
   {
+    "key": "single-day-school-fayetteville",
+    "location": "fayetteville",
+    "mode": "school",
+    "tier": "regular",
+    "credits": 1,
+    "price_cents": 6000,
+    "label": "Single Day School Day · Fayetteville",
+    "is_popular": false,
+    "single_day": true,
+    "expiry_months": 1
+  },
+  {
     "key": "test-school-5",
     "location": "fayetteville",
     "mode": "school",
+    "tier": "regular",
     "credits": 5,
     "price_cents": 25000,
     "label": "5 School Credits (fixture)",
-    "is_popular": false
+    "is_popular": false,
+    "single_day": false,
+    "expiry_months": 1
+  },
+  {
+    "key": "school-2x-weekly-fayetteville",
+    "location": "fayetteville",
+    "mode": "school",
+    "tier": "regular",
+    "credits": 8,
+    "price_cents": 45600,
+    "label": "Fayetteville 2x Weekly",
+    "is_popular": false,
+    "single_day": false,
+    "expiry_months": 1
+  },
+  {
+    "key": "school-alumni-10-fayetteville",
+    "location": "fayetteville",
+    "mode": "school",
+    "tier": "alumni",
+    "credits": 10,
+    "price_cents": 32000,
+    "label": "Alumni Fayetteville 10 Visits",
+    "is_popular": false,
+    "single_day": false,
+    "expiry_months": 1
   },
   {
     "key": "test-school-10",
     "location": "fayetteville",
     "mode": "school",
+    "tier": "regular",
     "credits": 10,
     "price_cents": 45000,
     "label": "10 School Credits (fixture)",
-    "is_popular": true
+    "is_popular": true,
+    "single_day": false,
+    "expiry_months": 1
   },
   {
-    "key": "test-daycare-8",
+    "key": "school-3x-weekly-fayetteville",
     "location": "fayetteville",
-    "mode": "daycare",
-    "credits": 8,
-    "price_cents": 30000,
-    "label": "8 Daycare Credits (fixture)",
-    "is_popular": false
+    "mode": "school",
+    "tier": "regular",
+    "credits": 12,
+    "price_cents": 64800,
+    "label": "Fayetteville 3x Weekly",
+    "is_popular": true,
+    "single_day": false,
+    "expiry_months": 1
   }
 ]

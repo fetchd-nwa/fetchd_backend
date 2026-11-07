@@ -11,6 +11,7 @@ import type {
   EligibilityGap,
   EnrollmentDogResultWire,
   EvaluationGap,
+  InsufficientCreditsDetails,
   UnpassedEvaluationStatus,
   VaccineGap,
 } from '../contracts/wire.js';
@@ -104,43 +105,53 @@ export function agreementUnsignedError(missing: readonly AgreementGap[]): ApiErr
 }
 
 /**
- * What the owner's sheet is built from (`InsufficientCreditsDetails`). `dates` are the
- * request's, ascending. A dog's credits pay her earliest dates, as the debits do, so
- * what is missing is her last ones, one entry per missing credit: Biscuit holds 1 and
- * Waffles 2 over d1 to d3 is d2, d3, d3. A dog in debt still owes one credit per date
- * nothing pays, so `short_dates.length` is `shortfall` whatever `gaps` reads. That is the
- * clamp below: a negative balance counts as zero, so `shortfall` is the dates nothing pays
- * and not `required − balance`, and no `src` writer drives a balance below zero, since the
- * booking debit follows the core's check under the dog lock and the webhook's reversal
- * needs a purchase row on an unsettled charge, which nothing writes. Every `reason` is
- * `'no_credit'` until expiry binds a date (P18), and no offer exists before that either.
+ * What the owner's sheet is built from (`InsufficientCreditsDetails`), counted on the lots
+ * by the two-pass picker and never on `balance`: a pool can hold enough credits and still
+ * be short, because a lot pays a date only while it reaches that date. So `shortfall` is
+ * `short_dates.length`, one entry per credit missing, and no subtraction of `gaps` can
+ * disagree with it.
  *
- * Empty `gaps` is a `top_up` with nothing missing: `shortfall: 0`, still a 422, so the
- * client re-sends on credits alone.
+ * With nothing short this is a `top_up` that no longer fits: `shortfall: 0`, `gaps: []`,
+ * no offer, still a 422, so the client re-sends on credits alone.
  */
-export function insufficientCreditsError(
-  gaps: readonly CreditGap[],
-  dates: readonly string[],
-): ApiError {
-  const shortDates = gaps
-    .flatMap((gap) => dates.slice(Math.max(gap.balance, 0)))
-    .sort()
-    .map((date) => ({ date, reason: 'no_credit' as const }));
+export function insufficientCreditsError(args: {
+  gap: CreditGap;
+  shortDates: readonly InsufficientCreditsDetails['short_dates'][number][];
+  offer: InsufficientCreditsDetails['top_up_offer'];
+  alternativePackageKey?: string;
+}): ApiError {
+  const shortfall = args.shortDates.length;
   return new ApiError(
     'insufficient_credits',
-    gaps.length === 0
+    shortfall === 0
       ? 'No credit is missing for these dates, so no top-up can be taken.'
-      : gaps.length === 1
-        ? `Insufficient ${gaps[0]!.mode} credits — need ${gaps[0]!.required}, have ${gaps[0]!.balance}.`
-        : `Insufficient credits across ${gaps.length} dogs.`,
+      : `Insufficient ${args.gap.mode} credits: ${shortfall} short.`,
     {
       kind: 'insufficient_credits',
-      gaps: [...gaps],
-      shortfall: shortDates.length,
-      short_dates: shortDates,
-      top_up_offer: null,
+      gaps: shortfall === 0 ? [] : [args.gap],
+      shortfall,
+      short_dates: [...args.shortDates],
+      top_up_offer: shortfall === 0 ? null : args.offer,
+      ...(shortfall > 0 && args.alternativePackageKey !== undefined
+        ? { alternative_package_key: args.alternativePackageKey }
+        : {}),
     },
   );
+}
+
+/**
+ * Every date no lot of hers can pay and a credit bought today would not reach. `expiresAt`
+ * is the latest expiry among her live lots or, with none, that reach.
+ */
+export function creditExpiredBeforeDateError(args: {
+  expiresAt: string;
+  dates: readonly string[];
+}): ApiError {
+  return new ApiError('credit_expired_before_date', `No credit reaches ${args.dates.join(', ')}.`, {
+    kind: 'credit_expired_before_date',
+    expires_at: args.expiresAt,
+    dates: [...args.dates],
+  });
 }
 
 export function insufficientCapacityError(gap: CapacityGap): ApiError {

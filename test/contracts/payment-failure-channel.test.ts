@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import Stripe from 'stripe';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
@@ -23,6 +22,7 @@ import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
+  makeLogCapture,
   registerFixtureHooks,
 } from './_harness.js';
 import { makeStripeStub, type StripeStub } from './_stripeStub.js';
@@ -71,8 +71,11 @@ function creditsApp(): { app: ReturnType<typeof makeContractApp>['app']; stripe:
   return { app, stripe };
 }
 
-function webhookApp(): { app: ReturnType<typeof makeContractApp>['app']; stripe: StripeStub } {
-  const { app } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+function webhookApp(capture?: ReturnType<typeof makeLogCapture>): {
+  app: ReturnType<typeof makeContractApp>['app'];
+  stripe: StripeStub;
+} {
+  const { app } = makeContractApp(FIXTURE_OWNER_PRINCIPAL, capture);
   const stripe = makeStripeStub();
   registerStripeWebhookRoute(app, { stripe });
   return { app, stripe };
@@ -94,7 +97,7 @@ async function seedOpenInvoice(
 }
 
 async function cleanup(): Promise<void> {
-  await db.delete(creditLedger).where(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id));
+  await db.delete(creditLedger).where(isNotNull(creditLedger.chargeId));
   await clearInvoiceReferrers();
   await db.delete(invoices).where(eq(invoices.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
@@ -129,7 +132,11 @@ async function cleanup(): Promise<void> {
 
 /** The Stripe-side footprint of one request, so two forks can be compared as a
  *  whole rather than one assertion at a time. */
-function stripeFootprint(stripe: StripeStub): { confirms: number; cancels: number; refunds: number } {
+function stripeFootprint(stripe: StripeStub): {
+  confirms: number;
+  cancels: number;
+  refunds: number;
+} {
   return {
     confirms: stripe.calls.filter(
       (c) => c.method === 'createAndConfirmPaymentIntent' || c.method === 'confirmPaymentIntent',
@@ -144,15 +151,6 @@ async function chargeRowsForOwner(): Promise<{ status: string; purpose: string }
     .select({ status: charges.status, purpose: charges.purpose })
     .from(charges)
     .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
-}
-
-/** Strip the server-generated ids so two runs of the same request compare. */
-function withoutIds(body: Record<string, unknown>): Record<string, unknown> {
-  const { charge_id, stripe_payment_intent_id, client_secret, ...rest } = body;
-  void charge_id;
-  void stripe_payment_intent_id;
-  void client_secret;
-  return rest;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -227,11 +225,11 @@ test(
 );
 
 test(
-  'POST /credit-packages/:key/purchase — a THROWN card decline lands the same 201 + rows as a RETURNED one',
+  'POST /credit-packages/:key/purchase — a THROWN card decline lands the same 402 + rows as a RETURNED one',
   SKIP_WHEN_NO_DB,
   async () => {
     const outcomes: {
-      body: Record<string, unknown>;
+      details: Record<string, unknown>;
       footprint: ReturnType<typeof stripeFootprint>;
       rows: { status: string; purpose: string }[];
       ledger: number;
@@ -253,18 +251,20 @@ test(
         url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
         headers: { 'idempotency-key': `pfc-cp-${fork}-${randomUUID()}` },
         payload: {
-          dog_id: FIXTURE_IDS.dog1Id,
           payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-          location: 'fayetteville',
         },
       });
-      assert.equal(res.statusCode, 201, `${fork}: ${res.body}`);
+      assert.equal(res.statusCode, 402, `${fork}: ${res.body}`);
       const ledger = await db
         .select({ id: creditLedger.id })
         .from(creditLedger)
-        .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+        .where(isNotNull(creditLedger.chargeId));
+      const details = {
+        ...(res.json() as { error: { details: Record<string, unknown> } }).error.details,
+      };
+      delete details.order_id;
       outcomes.push({
-        body: withoutIds(res.json() as Record<string, unknown>),
+        details,
         footprint: stripeFootprint(stripe),
         rows: await chargeRowsForOwner(),
         ledger: ledger.length,
@@ -273,8 +273,7 @@ test(
 
     const [returned, thrown] = outcomes;
     assert.deepEqual(thrown, returned);
-    assert.equal(returned!.body.charge_blocker, 'authentication_required');
-    assert.equal(returned!.body.credits_granted, 0);
+    assert.equal(returned!.details.charge_blocker, 'authentication_required');
     assert.equal(returned!.ledger, 0, 'no grant on either fork');
 
     await cleanup();
@@ -363,23 +362,20 @@ test(
         url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
         headers: { 'idempotency-key': `pfc-cp-rec-${scenario}-${randomUUID()}` },
         payload: {
-          dog_id: FIXTURE_IDS.dog1Id,
           payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-          location: 'fayetteville',
         },
       });
 
-      assert.equal(res.statusCode, 201, `${scenario}: ${res.body}`);
-      const body = res.json() as Record<string, unknown>;
-      assert.equal(body.charge_blocker, expected);
-      assert.equal(body.charge_status, 'requires_payment');
-      assert.equal(body.credits_granted, 0, 'no grant on either code');
+      assert.equal(res.statusCode, 402, `${scenario}: ${res.body}`);
+      const body = res.json() as { error: { details: { charge_blocker: string } } };
+      assert.equal(body.error.details.charge_blocker, expected);
       const ledger = await db
         .select({ id: creditLedger.id })
         .from(creditLedger)
-        .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+        .where(isNotNull(creditLedger.chargeId));
       assert.equal(ledger.length, 0, 'run what would go red: nothing was granted');
-      assert.equal(stripeFootprint(stripe).cancels, 1);
+      assert.deepEqual(await chargeRowsForOwner(), [{ status: 'failed', purpose: 'package' }]);
+      assert.equal(stripeFootprint(stripe).cancels, 0, 'the watch cancels it, not the request');
     }
     await cleanup();
   },
@@ -433,23 +429,25 @@ test(
   async () => {
     await cleanup();
     const { app, stripe } = creditsApp();
-    stripe.setNextIntentThrowsTransport(
-      new Stripe.errors.StripeRateLimitError({ message: 'slow down' }),
-    );
+    // Twice: the engine re-sends one lost create under K0, so one failure heals.
+    stripe.nextCreateThrowsTransport(2);
 
     const res = await app.inject({
       method: 'POST',
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': `pfc-cp-net-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
-    assert.notEqual(res.statusCode, 201);
-    assert.equal((res.json() as { error: { code: string } }).error.code, 'internal');
-    assert.deepEqual(await chargeRowsForOwner(), []);
+    // No answer yet: the client's same-key re-send is the recovery, and the sweeper
+    // answers it past the lease.
+    assert.equal(res.statusCode, 409, res.body);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'idempotency_inflight');
+    assert.deepEqual(await chargeRowsForOwner(), [
+      { status: 'requires_payment', purpose: 'package' },
+    ]);
+    assert.equal(stripeFootprint(stripe).confirms, 0, 'no confirm was sent');
 
     await cleanup();
   },
@@ -465,7 +463,6 @@ const PACKAGE_METADATA: Record<string, string> = {
   package_id: FIXTURE_IDS.creditPackageSchool5Id,
   package_key: FIXTURE_IDS.creditPackageSchool5Key,
   credits: '5',
-  quantity: '1',
   mode: 'school',
   location: 'fayetteville',
 };
@@ -503,105 +500,28 @@ async function postWebhook(
 }
 
 test(
-  'webhook: a package charge flipping to SUCCEEDED enqueues the late-settle push, once',
+  'webhook: a package charge with no order grants nothing, and one alarm reaches the log',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
     const piId = `pi_late_${randomUUID().slice(0, 8)}`;
     const chargeId = await seedProcessingPackageCharge(piId);
-    const { app, stripe } = webhookApp();
-
-    const first = await postWebhook(app, stripe, {
-      id: `evt_${randomUUID().slice(0, 8)}`,
-      type: 'payment_intent.succeeded',
-      paymentIntentId: piId,
-      amountCents: 25_000,
-      metadata: PACKAGE_METADATA,
-    });
-    assert.equal(first.outcome, 'flipped-charge-succeeded');
-
-    const row = await scheduledNotificationsRepository.findByDedupeKey(
-      db,
-      `package-flip:${chargeId}`,
-    );
-    assert.ok(row !== undefined, 'the promised follow-up was enqueued');
-    assert.equal(row?.type, 'payment-succeeded');
-    assert.equal(row?.title, 'Purchase complete');
-    // Allison's copy, 2026-08-04. Named amount, named credit count, named dog —
-    // "credits were added" without saying whose is the kind of vague that makes
-    // someone open the app to find out. The figure prints cents since §2.7:3924.
-    assert.equal(
-      row?.body,
-      'Your $250.00 credit purchase went through — 5 credits were added for Waffles.',
-    );
-    assert.equal(
-      row?.deepLinkPath,
-      `/dog-profile/${FIXTURE_IDS.dog1Id}?highlight=credits`,
-      'the tap lands on the credits card that just changed',
-    );
-    assert.equal(row?.deepLinkKind, 'credits');
-    assert.equal(row?.dogId, FIXTURE_IDS.dog1Id);
-
-    // A REPLAYED delivery of the same flip must not push twice. The event id
-    // differs, so the receiver's `stripe_events` dedupe does not cover this —
-    // the per-charge dedupe key is what does.
-    const replay = await postWebhook(app, stripe, {
-      id: `evt_${randomUUID().slice(0, 8)}`,
-      type: 'payment_intent.succeeded',
-      paymentIntentId: piId,
-      amountCents: 25_000,
-      metadata: PACKAGE_METADATA,
-    });
-    assert.equal(replay.outcome, 'charge-already-terminal', 'the charge is terminal now');
-    const rows = await db
-      .select({ id: scheduledNotifications.id })
-      .from(scheduledNotifications)
-      .where(
-        and(
-          eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId),
-          eq(scheduledNotifications.type, 'payment-succeeded'),
-        ),
-      );
-    assert.equal(rows.length, 1, 'exactly one push per flipped charge, ever');
-
-    await cleanup();
-  },
-);
-
-test(
-  'webhook: a package charge flipping to FAILED enqueues the "you were not charged" push',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const piId = `pi_latefail_${randomUUID().slice(0, 8)}`;
-    const chargeId = await seedProcessingPackageCharge(piId);
-    const { app, stripe } = webhookApp();
+    const capture = makeLogCapture();
+    const { app, stripe } = webhookApp(capture);
 
     const result = await postWebhook(app, stripe, {
       id: `evt_${randomUUID().slice(0, 8)}`,
-      type: 'payment_intent.payment_failed',
+      type: 'payment_intent.succeeded',
       paymentIntentId: piId,
       amountCents: 25_000,
       metadata: PACKAGE_METADATA,
     });
-    assert.equal(result.outcome, 'flipped-charge-failed');
 
-    const row = await scheduledNotificationsRepository.findByDedupeKey(
-      db,
-      `package-flip-failed:${chargeId}`,
-    );
-    assert.ok(row !== undefined, 'the owner is told the purchase resolved badly');
-    assert.equal(row?.type, 'payment-failed');
-    assert.equal(
-      row?.body,
-      "Your credit purchase didn't go through — you weren't charged. No credits were added.",
-    );
-    assert.equal(row?.deepLinkPath, `/dog-profile/${FIXTURE_IDS.dog1Id}?highlight=credits`);
-    // And no succeeded twin was enqueued alongside it.
-    assert.equal(
-      await scheduledNotificationsRepository.findByDedupeKey(db, `package-flip:${chargeId}`),
-      undefined,
-    );
+    assert.equal(result.outcome, 'flipped-charge-succeeded');
+    const alarms = capture.lines.filter((l) => l.level === 50 && l.chargeId === chargeId);
+    assert.equal(alarms.length, 1, 'a person hears');
+    const lots = await db.select().from(creditLedger).where(eq(creditLedger.chargeId, chargeId));
+    assert.deepEqual(lots, [], 'metadata buys nothing');
 
     await cleanup();
   },
@@ -638,39 +558,6 @@ test(
       undefined,
       'a synchronous purchase gets its answer in the 201, not on the push channel',
     );
-
-    await cleanup();
-  },
-);
-
-test(
-  'webhook: a RECONSTRUCTED orphan purchase also pushes (the owner has no 201 naming it)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const piId = `pi_orphan_${randomUUID().slice(0, 8)}`;
-    const { app, stripe } = webhookApp();
-
-    const result = await postWebhook(app, stripe, {
-      id: `evt_${randomUUID().slice(0, 8)}`,
-      type: 'payment_intent.succeeded',
-      paymentIntentId: piId,
-      amountCents: 25_000,
-      metadata: PACKAGE_METADATA,
-    });
-    assert.equal(result.outcome, 'reconstructed-package-purchase');
-
-    const [charge] = await db
-      .select({ id: charges.id })
-      .from(charges)
-      .where(eq(charges.stripePaymentIntentId, piId));
-    assert.ok(charge !== undefined);
-    const row = await scheduledNotificationsRepository.findByDedupeKey(
-      db,
-      `package-flip:${charge!.id}`,
-    );
-    assert.ok(row !== undefined, 'a reconstruct is exactly when the push matters most');
-    assert.equal(row?.type, 'payment-succeeded');
 
     await cleanup();
   },

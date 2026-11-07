@@ -22,8 +22,8 @@ import { mayEditClass } from './settingsRegistry.js';
 
 /** STAFF-09: the owner role passes every list whatever it holds, so the owner
  *  can never be edited out of a verb; any other role passes when it is on the
- *  list. The rule every list-backed verb applies (`requireMoneyVerb`, when its
- *  first verb lands at design 5.0.0, reads lists through this same function). */
+ *  list. The rule every list-backed verb applies (`requireCreditEditRole`, the
+ *  first, reads its list through this same function). */
 export function passesRoleList(role: StaffRole, list: readonly StaffRole[]): boolean {
   return role === 'owner' || list.includes(role);
 }

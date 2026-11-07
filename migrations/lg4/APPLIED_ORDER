@@ -1,0 +1,17 @@
+# The order LG4's steps land in, which `scripts/migrate-rehearse.sh` replays: pass
+# order (build plan P18 `migrations_note`), not step order. M4.07 drops
+# credit_expiry_settings after every reader has left it, and M4.09's CHECKs and
+# partial unique index land after every writer they constrain exists. Against §4's
+# numeric order those two move later, and neither adds a column.
+M4.01
+M4.02
+M4.03
+M4.04
+M4.05
+M4.06
+M4.08
+M4.10
+M4.11
+M4.12
+M4.07
+M4.09

@@ -122,8 +122,9 @@ export const ledgerRepository = {
    *   - Credit-funded day-school/day-care sessions are NOT ledger lines — the
    *     `package` purchase that funded them is the money event. This is the
    *     real billing model, not the prototype's per-session fabrication.
-   *   - dog/mode come from `credit_ledger` for package purchases; dog/category
-   *     come from the linked `booking` for board-train/group-class.
+   *   - mode comes from `credit_ledger` for package purchases, whose credits are the
+   *     owner's and name no dog; dog/category come from the linked `booking` for
+   *     board-train/group-class.
    *   - Card brand/last4 is recovered for a paid charge that SETTLED an invoice
    *     (`invoices.paid_charge_id` back-reference → `invoices.payment_method_id`
    *     → `payment_methods`). `charges` itself carries no payment_method link
@@ -145,7 +146,6 @@ export const ledgerRepository = {
         // belongs to (Q16). Both NULL on every other purpose.
         chargeDogId: charges.dogId,
         groupClassName: groupClasses.name,
-        packDogId: creditLedger.dogId,
         packMode: creditLedger.mode,
         settledInvoiceId: invoices.id,
         invoicePaidAt: invoices.paidAt,
@@ -180,7 +180,12 @@ export const ledgerRepository = {
       )
       .leftJoin(cohorts, eq(cohorts.id, charges.cohortId))
       .leftJoin(groupClasses, eq(groupClasses.key, cohorts.classKey))
-      .leftJoin(creditLedger, eq(creditLedger.chargeId, charges.id))
+      // The grant alone: a top-up's debits and a refund's adjustment can carry this
+      // charge too, and any second row here would be a second ledger line.
+      .leftJoin(
+        creditLedger,
+        and(eq(creditLedger.chargeId, charges.id), eq(creditLedger.reason, 'purchase')),
+      )
       .leftJoin(invoices, eq(invoices.paidChargeId, charges.id))
       .leftJoin(paymentMethods, eq(paymentMethods.id, invoices.paymentMethodId))
       .where(and(eq(charges.ownerId, ownerId), inArray(charges.status, LEDGER_CHARGE_STATUSES)));
@@ -197,10 +202,9 @@ export const ledgerRepository = {
         status,
         amountCents: row.amountCents,
         date: row.date,
-        // Three sources, one per money shape: the credit grant funds a package,
-        // the money row itself names the dog for a group class (Q16), and every
-        // other kind reads the booking it is linked to.
-        dogId: isPackage ? row.packDogId : isGroupClass ? row.chargeDogId : row.bookingLeadDog,
+        // A pack names no dog: its credits are the owner's. The money row itself names
+        // the dog for a group class (Q16), and every other kind reads its booking.
+        dogId: isPackage ? null : isGroupClass ? row.chargeDogId : row.bookingLeadDog,
         category: isPackage ? null : (row.bookingCategory ?? categoryForPurpose(row.purpose)),
         mode: isPackage ? row.packMode : null,
         groupClassName: isGroupClass ? row.groupClassName : null,

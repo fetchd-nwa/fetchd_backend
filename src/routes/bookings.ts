@@ -1,14 +1,25 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { actorOf } from '../auth/principal.js';
+import { peekEngineClaim } from '../db/idempotency.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { orderCreatedAtIso, ordersRepository } from '../db/repositories/ordersRepository.js';
+import {
+  orderCreatedAtIso,
+  ordersRepository,
+  type OrderRow,
+} from '../db/repositories/ordersRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
-import type { PostBookingsRequest, PostBookingsResponse } from '../contracts/wire.js';
+import type { Tx } from '../db/tx.js';
+import type {
+  ApiErrorEnvelope,
+  PostBookingsRequest,
+  PostBookingsResponse,
+} from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { isInView, type PickupCloseByCampus } from '../lib/bookingBucket.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
@@ -16,7 +27,10 @@ import type { DayProgramCategory } from '../lib/bookingSchedule.js';
 import type { BookingWire } from '../lib/bookingWire.js';
 import { askWhatWonForPendingRow, cancelBookingInTx } from '../lib/cancelBookingService.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
+import { invalidateAll } from '../lib/cache.js';
+import { confirmCharge } from '../lib/confirmCharge.js';
 import { createDayProgramBookings } from '../lib/createDayProgramBookings.js';
+import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { sortBookingsByScheduledAt, wireManyBookings } from '../lib/wireManyBookings.js';
 import { ApiError } from '../lib/errors.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -104,8 +118,7 @@ const dogIdField = uuidId();
  * `payment` says credits, the only tender (R1): required, so every booking says so
  * and one body has one spelling, which is what the request key hashes. `.strict()`
  * here too, so `kind: 'payg'`, `kind: 'card'` and a top-level `payment_method_id` are
- * 400. `tier` is accepted and read by nothing until P18. `top_up` is P18's live path:
- * until then the core refuses it at the credit check.
+ * 400. `tier` names the pool. `top_up` buys what the dates are short, on the engine.
  */
 const bookingPaymentSchema = z
   .object({
@@ -266,9 +279,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   //
   // One request → N bookings, one per requested date, atomic. Body:
   //   { category, lead_dog_id, additional_dog_ids?, dates[], location, notes?, payment }
-  // → 201 PostBookingsResponse {order, sessions} (one order per Confirm, and every
-  //   Confirm is credits-only until P18's top-up; `sessions.length` = dates.length,
-  //   ordered ASC by scheduled_at).
+  // → 201 PostBookingsResponse {order, sessions} (one order per Confirm;
+  //   `sessions.length` = dates.length, ordered ASC by scheduled_at).
   //
   // Owner-only (staff portal lives at Day 19). Idempotency-Key required;
   // the same key + body returns the stored response. The same key + a
@@ -295,7 +307,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   //      `same_day_cutoff_passed`; the gates; credits; the overlap guard; then, per
   //      session, capacity → INSERT → the credit debits → reminders.
   //   4. Post-commit (handled by withMutation): `patternsToInvalidate` wipes
-  //      `avail:{location}:*` and each debited dog's balance cache.
+  //      `avail:{location}:*` and the owner's balance cache.
   //
   // The DB-side BEFORE-INSERT gate triggers (schema.sql lines 1184/1231/1272)
   // remain the unbypassable floor — the route pre-check produces friendly
@@ -305,69 +317,147 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   app.post(
     '/bookings',
     { preHandler: [authHook] },
-    async (request, reply): Promise<PostBookingsResponse> => {
+    async (request, reply): Promise<PostBookingsResponse | ApiErrorEnvelope> => {
       const principal = requirePrincipal(request);
       requireOwner(principal, 'create a booking');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postBookingBodySchema, request.body, 'body');
       const parsed = validateBookingBody(body);
 
-      // Closure-captured (same pattern as the cancel route's
-      // `pendingStripeRefund`): a refusal debits nobody. `patternsToInvalidate`
-      // reads this post-commit to wipe only the dogs whose balance actually moved.
-      let creditDebitedDogIds = new Set<string>();
+      // The ceiling, the ownership gate and the core, in whichever path's transaction.
+      const book = async (tx: Tx, orderId: string) => {
+        // 1. The roster ceiling, read at runtime (the protocol above).
+        const { max_dogs_per_booking_count: maxDogs } = await settingsRepository.dayGlobal(tx);
+        if (parsed.allDogIds.length > maxDogs) {
+          throw new ApiError(
+            'invalid_payload',
+            `at most ${maxDogs} dogs per booking (got ${parsed.allDogIds.length})`,
+          );
+        }
+
+        // 2. Ownership gate — every dog must belong to the principal.
+        for (const dogId of parsed.allDogIds) {
+          const exists = await dogsRepository.findOwnedExists(dogId, principal.ownerId, tx);
+          if (!exists) {
+            throw new ApiError('not_found', `dog ${dogId} not found`);
+          }
+        }
+
+        // 4. The shared core. It books every dog or refuses; nothing is parked
+        //    (wire 3.0.0).
+        return createDayProgramBookings(tx, {
+          orderId,
+          ownerId: principal.ownerId,
+          category: parsed.category,
+          leadDogId: parsed.leadDogId,
+          additionalDogIds: parsed.additionalDogIds,
+          dates: parsed.sortedDates,
+          location: parsed.location,
+          notes: parsed.notes,
+          payment: parsed.payment,
+          now: nowFactory(),
+        });
+      };
+      const endpoint = 'POST /bookings';
+      const requestHash = hashRequestBody(body);
+      const cachePatterns = [
+        `avail:${parsed.location}:*`,
+        creditsInvalidationPattern(principal.ownerId),
+      ];
+
+      // A `top_up` is one engine order: one charge, under `cancel-order`, so a decline
+      // books nothing and returns every debit (design §2.3:2664-2677, §2.7:4083-4098).
+      const topUp = parsed.payment.top_up;
+      if (topUp !== undefined) {
+        const replay = await peekEngineClaim<PostBookingsResponse | ApiErrorEnvelope>(
+          idempotencyKey,
+          endpoint,
+          requestHash,
+          principal.ownerId,
+        );
+        if (replay !== undefined) {
+          reply.code(replay.status);
+          return replay.body;
+        }
+        let held: { order: OrderRow; wires: BookingWire[] } | undefined;
+        const result = await confirmCharge<PostBookingsResponse>(
+          {
+            actor: actorOf(principal),
+            ownerId: principal.ownerId,
+            claim: { key: idempotencyKey, ownerId: principal.ownerId, endpoint, requestHash },
+            inTx1: async (tx, order) => {
+              const booked = await book(tx, order.id);
+              if (booked.topUp === undefined) {
+                throw new Error('the core returned no terms for a body that carries a top_up');
+              }
+              // After every refusal: a `top_up` that does not fit never reads its card. A
+              // card that is not a live card of hers is the generic 404.
+              const card = await loadStripePaymentContext(
+                { ownerId: principal.ownerId, paymentMethodId: topUp.payment_method_id },
+                tx,
+              );
+              held = { order, wires: booked.wires };
+              return {
+                ...booked.topUp,
+                purpose: 'package',
+                bookingId: null,
+                cohortId: null,
+                dogId: null,
+                card: { ...card, paymentMethodId: topUp.payment_method_id },
+              };
+            },
+            stripe,
+            log: request.log,
+            now: opts.now,
+          },
+          'cancel-order',
+        );
+
+        // Best effort, whichever way it ended: the rows held seats and spent credits in
+        // tx1, and a decline gave them back.
+        await invalidateAll(cachePatterns, request.log);
+        switch (result.kind) {
+          case 'answered':
+            reply.code(result.status);
+            return result.body;
+          case 'processing': {
+            // Not stored: the claim stays open, and the settle stores the final answer.
+            if (held === undefined) throw new Error('the engine ran no tx1 for this order');
+            reply.code(201);
+            return {
+              order: {
+                id: held.order.id,
+                owner_id: held.order.ownerId,
+                created_at: orderCreatedAtIso(held.order),
+                charge_status: 'requires_payment',
+                client_action: 'processing',
+              },
+              sessions: held.wires,
+            };
+          }
+          case 'open':
+            throw new ApiError(
+              'idempotency_inflight',
+              'this booking has no answer yet: re-send it under the same Idempotency-Key',
+            );
+        }
+      }
 
       const outcome = await withMutation<PostBookingsResponse>(
         {
           principal,
           idempotencyKey,
-          endpoint: 'POST /bookings',
-          requestHash: hashRequestBody(body),
-          patternsToInvalidate: () => [
-            `avail:${parsed.location}:*`,
-            ...[...creditDebitedDogIds].map(creditsInvalidationPattern),
-          ],
+          endpoint,
+          requestHash,
+          patternsToInvalidate: () => cachePatterns,
         },
         async (tx) => {
-          // 1. The roster ceiling, read at runtime (the protocol above).
-          const { max_dogs_per_booking_count: maxDogs } = await settingsRepository.dayGlobal(tx);
-          if (parsed.allDogIds.length > maxDogs) {
-            throw new ApiError(
-              'invalid_payload',
-              `at most ${maxDogs} dogs per booking (got ${parsed.allDogIds.length})`,
-            );
-          }
-
-          // 2. Ownership gate — every dog must belong to the principal.
-          for (const dogId of parsed.allDogIds) {
-            const exists = await dogsRepository.findOwnedExists(dogId, principal.ownerId, tx);
-            if (!exists) {
-              throw new ApiError('not_found', `dog ${dogId} not found`);
-            }
-          }
-
           // 3. One Confirm, one order, credits-only included (PAY-U04). A refusal
           //    below rolls it back with everything else.
           const order = await ordersRepository.create(tx, { ownerId: principal.ownerId });
+          const result = await book(tx, order.id);
 
-          // 4. The shared core. It books every dog or refuses; nothing is parked
-          //    (wire 3.0.0).
-          const result = await createDayProgramBookings(tx, {
-            orderId: order.id,
-            ownerId: principal.ownerId,
-            category: parsed.category,
-            leadDogId: parsed.leadDogId,
-            additionalDogIds: parsed.additionalDogIds,
-            dates: parsed.sortedDates,
-            location: parsed.location,
-            notes: parsed.notes,
-            payment: parsed.payment,
-            now: nowFactory(),
-          });
-          creditDebitedDogIds = result.creditDebitedDogIds;
-
-          // `charge_status` is `'none'` until the top-up is live: a credits-only
-          // Confirm never enters the engine (design §2.7:3829-3831).
+          // A credits-only Confirm never enters the engine (design §2.7:3829-3831).
           return {
             status: 201,
             body: {
@@ -435,9 +525,9 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       let pendingStripeRefund: PendingStripeRefund | undefined;
       // Computed ONCE, here, so the row stores the same string the fire sends.
       const refundIdempotencyKey = `${idempotencyKey}:refund`;
-      // Dogs credited back on this cancel (empty on every non-credit-back
-      // path); post-commit we wipe each dog's `credits:{dogId}:*` display cache.
-      let creditRefundedDogIds: string[] = [];
+      // The owner credited back on this cancel (unset on every non-credit-back
+      // path); post-commit we wipe her `credits:{ownerId}:*` display cache.
+      let creditRefundedOwnerId: string | undefined;
       // A pending row cancels its whole order, and that cancel asks Stripe first,
       // with no transaction open (R5). `undefined` on every other row.
       const whatWon = await askWhatWonForPendingRow({
@@ -461,8 +551,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             if (body.location !== undefined && body.location !== null) {
               patterns.push(`avail:${body.location}:*`);
             }
-            for (const dogId of creditRefundedDogIds) {
-              patterns.push(creditsInvalidationPattern(dogId));
+            if (creditRefundedOwnerId !== undefined) {
+              patterns.push(creditsInvalidationPattern(creditRefundedOwnerId));
             }
             return patterns;
           },
@@ -508,7 +598,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             whatWon,
           });
           pendingStripeRefund = result.pendingStripeRefund;
-          creditRefundedDogIds = result.creditRefundedDogIds;
+          creditRefundedOwnerId = result.creditRefundedOwnerId;
           return { status: 200, body: result.wire };
         },
       );

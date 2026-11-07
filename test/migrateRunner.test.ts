@@ -1302,9 +1302,11 @@ describe('every CREATE TABLE in a step file is followed by its REVOKE (DECISIONS
  * group's LAST step file (DECISIONS 86; LG1's is M1.22): it revokes every
  * table that any step file of its `migrations/lg<n>/` group creates. Read by
  * the parser above, so a REVOKE in a comment, a string or a quoted name does
- * not count here either. "Last" is by step id compared numerically (M1.100
- * follows M1.99), the rehearsal's order. An empty tree, or a group directory
- * with no step file, is refused rather than passed.
+ * not count here either. "Last" is the rehearsal's own order: the group's
+ * APPLIED_ORDER file when it holds one (LG4 does, and its M4.12 runs before M4.07
+ * and M4.09), else the step id compared numerically (M1.100 follows M1.99). A step
+ * the file names and the disk does not hold yet closes nothing. An empty tree, or
+ * a group directory with no step file, is refused rather than passed.
  *
  * The per-step check cannot see this line go missing (each step keeps its own
  * REVOKE), and neither can the rehearsal (M1.00's default-privilege revoke
@@ -1335,6 +1337,25 @@ function rehearsedStepFiles(dir: string): string[] {
 
 const GROUP_DIR = /^lg\d+[a-z]*$/;
 
+/** One group's steps in the order the rehearsal applies them (`scripts/migrate-rehearse.sh`). */
+function inAppliedOrder(group: string, dir: string, files: readonly string[]): string[] {
+  const orderFile = path.join(dir, 'APPLIED_ORDER');
+  if (!fs.existsSync(orderFile)) return [...files].sort(byStepId);
+  const order = fs
+    .readFileSync(orderFile, 'utf8')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('#'));
+  const position = (file: string): number => order.indexOf(file.split('_')[0] ?? file);
+  const unplaced = files.filter((file) => position(file) < 0);
+  if (unplaced.length > 0) {
+    throw new Error(
+      `${unplaced.map((file) => `${group}/${file}`).join(', ')} not named in ${group}/APPLIED_ORDER`,
+    );
+  }
+  return [...files].sort((a, b) => position(a) - position(b));
+}
+
 function groupsMissingTheirClosingRevoke(root: string): string[] {
   // Every step the rehearsal applies must sit directly inside an lg<n> group
   // directory; a step anywhere else is refused, loudly, naming it.
@@ -1364,7 +1385,7 @@ function groupsMissingTheirClosingRevoke(root: string): string[] {
     for (const file of files) {
       if (!STEP_ORDER.test(file)) throw new Error(`${group}/${file} has no step id to order it by`);
     }
-    const last = [...files].sort(byStepId).at(-1);
+    const last = inAppliedOrder(group, dir, files).at(-1);
     if (last === undefined) throw new Error(`${group} holds no step file`);
     const read = (file: string) => readStepTables(fs.readFileSync(path.join(dir, file), 'utf8'));
     const created = new Set(files.flatMap((file) => read(file).creates.map((c) => c.table)));
@@ -1415,6 +1436,50 @@ describe("each landing group's last step revokes every table the group creates (
     assert.deepEqual(missingIn({ 'lg9/M9.99_a.sql': a, 'lg9/M9.100_other.sql': 'SELECT 1;\n' }), [
       'lg9/M9.100_other.sql: a',
     ]);
+  });
+
+  test('"last" follows APPLIED_ORDER: the step applied last closes the group, not the highest id', () => {
+    const a = 'CREATE TABLE a (x int);\nREVOKE ALL ON a FROM anon, authenticated;\n';
+    // LG4's shape: M9.12 creates the table and runs before M9.07 and M9.09.
+    const files = {
+      'lg9/APPLIED_ORDER': 'M9.08\nM9.12\nM9.07\nM9.09\n',
+      'lg9/M9.07_other.sql': 'SELECT 1;\n',
+      'lg9/M9.08_other.sql': 'SELECT 1;\n',
+      'lg9/M9.12_a.sql': a,
+    };
+    assert.deepEqual(missingIn({ ...files, 'lg9/M9.09_other.sql': 'SELECT 1;\n' }), [
+      'lg9/M9.09_other.sql: a',
+    ]);
+    assert.deepEqual(
+      missingIn({
+        ...files,
+        'lg9/M9.09_close.sql': 'REVOKE ALL ON a FROM anon, authenticated;\n',
+      }),
+      [],
+    );
+  });
+
+  test('a step not yet written does not close the group: the last one on disk does', () => {
+    const a = 'CREATE TABLE a (x int);\nREVOKE ALL ON a FROM anon, authenticated;\n';
+    assert.deepEqual(
+      missingIn({
+        'lg9/APPLIED_ORDER': 'M9.12\nM9.09\n',
+        'lg9/M9.12_a.sql': a,
+      }),
+      [],
+    );
+  });
+
+  test('a step APPLIED_ORDER does not name is refused, naming it, as the rehearsal refuses it', () => {
+    assert.throws(
+      () =>
+        missingIn({
+          'lg9/APPLIED_ORDER': 'M9.08\n',
+          'lg9/M9.08_a.sql': 'SELECT 1;\n',
+          'lg9/M9.09_b.sql': 'SELECT 1;\n',
+        }),
+      /lg9\/M9\.09_b\.sql/,
+    );
   });
 
   test('a closing REVOKE in a comment, or one that leaves out authenticated, does not count', () => {
@@ -1531,5 +1596,137 @@ describe("each landing group's last step revokes every table the group creates (
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * The rehearsal's order (build plan P18 `migrations_note`). A group whose steps land
+ * out of step order says so in an APPLIED_ORDER file, and the rehearsal replays that
+ * instead of guessing. Run on a throwaway repository, through the script's own
+ * `--list-steps`, which stops before Docker.
+ */
+describe('the rehearsal replays a group in its applied order', () => {
+  const git = (cwd: string, ...args: string[]): string => {
+    const run = spawnSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@example.com', ...args],
+      { cwd, encoding: 'utf-8' },
+    );
+    assert.equal(run.status, 0, run.stderr);
+    return run.stdout.trim();
+  };
+
+  function withRehearsal<T>(
+    files: Record<string, string>,
+    read: (run: ReturnType<typeof spawnSync>) => T,
+  ): T {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'applied-order-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'scripts'));
+      fs.copyFileSync(
+        path.join(REPO_ROOT, 'scripts', 'migrate-rehearse.sh'),
+        path.join(dir, 'scripts', 'migrate-rehearse.sh'),
+      );
+      git(dir, 'init', '-q');
+      git(dir, 'commit', '-q', '--allow-empty', '-m', 'base');
+      const base = git(dir, 'rev-parse', 'HEAD');
+      for (const [name, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+        fs.writeFileSync(path.join(dir, name), text);
+      }
+      return read(
+        spawnSync('bash', ['scripts/migrate-rehearse.sh', '--base', base, '--list-steps'], {
+          cwd: dir,
+          encoding: 'utf-8',
+        }),
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const STEPS = {
+    'migrations/lg9/M9.07_a.sql': 'SELECT 1;\n',
+    'migrations/lg9/M9.08_b.sql': 'SELECT 1;\n',
+    'migrations/lg9/M9.09_c.sql': 'SELECT 1;\n',
+    'migrations/lg9/M9.10_d.sql': 'SELECT 1;\n',
+  };
+  const listed = (run: ReturnType<typeof spawnSync>): string[] =>
+    String(run.stdout).split('\n').filter(Boolean);
+
+  test('with no APPLIED_ORDER, a group runs in step order, numerically', () => {
+    withRehearsal(STEPS, (run) => {
+      assert.equal(run.status, 0, String(run.stderr));
+      assert.deepEqual(listed(run), [
+        'migrations/lg9/M9.07_a.sql',
+        'migrations/lg9/M9.08_b.sql',
+        'migrations/lg9/M9.09_c.sql',
+        'migrations/lg9/M9.10_d.sql',
+      ]);
+    });
+  });
+
+  test('APPLIED_ORDER replaces it: M9.07 after M9.08, M9.09 after M9.10', () => {
+    const order = '# a comment\nM9.08\n\nM9.10\nM9.07\nM9.09\n';
+    withRehearsal({ ...STEPS, 'migrations/lg9/APPLIED_ORDER': order }, (run) => {
+      assert.equal(run.status, 0, String(run.stderr));
+      assert.deepEqual(listed(run), [
+        'migrations/lg9/M9.08_b.sql',
+        'migrations/lg9/M9.10_d.sql',
+        'migrations/lg9/M9.07_a.sql',
+        'migrations/lg9/M9.09_c.sql',
+      ]);
+    });
+  });
+
+  test('a step APPLIED_ORDER does not name is refused, naming it', () => {
+    const order = 'M9.08\nM9.10\nM9.07\n';
+    withRehearsal({ ...STEPS, 'migrations/lg9/APPLIED_ORDER': order }, (run) => {
+      assert.equal(run.status, 2);
+      assert.match(String(run.stderr), /M9\.09_c\.sql is a step .*APPLIED_ORDER does not name/);
+    });
+  });
+
+  test('a step named twice is refused', () => {
+    const order = 'M9.08\nM9.10\nM9.07\nM9.09\nM9.08\n';
+    withRehearsal({ ...STEPS, 'migrations/lg9/APPLIED_ORDER': order }, (run) => {
+      assert.equal(run.status, 2);
+      assert.match(String(run.stderr), /names M9\.08 more than once/);
+    });
+  });
+
+  test('a step not yet on disk is no refusal: a pass lands only part of a group', () => {
+    const order = 'M9.08\nM9.99\nM9.07\nM9.09\nM9.10\n';
+    withRehearsal({ ...STEPS, 'migrations/lg9/APPLIED_ORDER': order }, (run) => {
+      assert.equal(run.status, 0, String(run.stderr));
+      assert.equal(listed(run).length, 4);
+    });
+  });
+
+  test("LG4's APPLIED_ORDER is the plan's order and names every step on disk", () => {
+    const order = fs
+      .readFileSync(path.join(REPO_ROOT, 'migrations', 'lg4', 'APPLIED_ORDER'), 'utf8')
+      .split('\n')
+      .filter((line) => line !== '' && !line.startsWith('#'));
+    assert.deepEqual(order, [
+      'M4.01',
+      'M4.02',
+      'M4.03',
+      'M4.04',
+      'M4.05',
+      'M4.06',
+      'M4.08',
+      'M4.10',
+      'M4.11',
+      'M4.12',
+      'M4.07',
+      'M4.09',
+    ]);
+    const onDisk = fs
+      .readdirSync(path.join(REPO_ROOT, 'migrations', 'lg4'))
+      .filter((name) => /^M.*\.sql$/.test(name))
+      .map((name) => name.split('_')[0]);
+    assert.ok(onDisk.length > 0);
+    for (const step of onDisk) assert.ok(order.includes(step as string), `${step} is unplaced`);
   });
 });

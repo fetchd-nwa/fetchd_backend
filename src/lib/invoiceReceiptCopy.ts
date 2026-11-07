@@ -16,6 +16,29 @@ export function formatDollars(amountCents: number): string {
 }
 
 /**
+ * The receipt of credits bought, which says what she got and how long she has (design
+ * §2.9:4539): "$456.00 — 8 Bentonville day-school credits, expire 10 Nov." The date is
+ * Chicago's, the campus's.
+ */
+export function creditReceiptBody(args: {
+  amountCents: number;
+  credits: number;
+  location: string;
+  mode: 'school' | 'daycare';
+  expiresAt: Date;
+}): string {
+  const campus = `${args.location.charAt(0).toUpperCase()}${args.location.slice(1)}`;
+  const program = args.mode === 'school' ? 'day-school' : 'daycare';
+  const noun = args.credits === 1 ? 'credit, expires' : 'credits, expire';
+  const when = args.expiresAt.toLocaleDateString('en-GB', {
+    timeZone: 'America/Chicago',
+    day: 'numeric',
+    month: 'short',
+  });
+  return `${formatDollars(args.amountCents)} — ${args.credits} ${campus} ${program} ${noun} ${when}.`;
+}
+
+/**
  * Human label for the thing being charged, varied by `charge_purpose`.
  * `board-train` and `group-class` are the invoice purposes today; `package` is
  * covered for totality (an invoice can carry any purpose).

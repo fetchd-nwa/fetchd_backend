@@ -3,9 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
-import { creditExpirySettingsRepository } from '../../src/db/repositories/creditExpirySettingsRepository.js';
 import {
-  charges,
   creditLedger,
   dogCompletedPrograms,
   notifications,
@@ -13,12 +11,9 @@ import {
 } from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
 import { CURRICULUM_PROGRAMS } from '../../src/lib/alumni.js';
-import { resolvePurchaseExpiry } from '../../src/lib/creditExpiry.js';
 import { returnDebitsToLots } from '../../src/lib/orderRows.js';
-import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { registerDogsRoute } from '../../src/routes/dogs.js';
 import { registerStaffAlumniRoute } from '../../src/routes/staffAlumni.js';
-import { dispatchStripeEvent } from '../../src/webhooks/stripeEventHandlers.js';
 import { runSchedulerTickOnce } from '../../src/workers/scheduler.js';
 import { makeExpoPushStub } from './_expoPushStub.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
@@ -29,7 +24,6 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
-import { makeStripeStub } from './_stripeStub.js';
 import type { Principal } from '../../src/auth/principal.js';
 import type { CompletedProgramsWire } from '../../src/contracts/wire.js';
 
@@ -58,12 +52,6 @@ function staffApp(principal: Principal = FIXTURE_STAFF_PRINCIPAL): {
 function ownerDogsApp(): { app: ReturnType<typeof makeContractApp>['app'] } {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
   registerDogsRoute(app, { authenticate, now: FIXTURE_NOW });
-  return { app };
-}
-
-function purchaseApp(): { app: ReturnType<typeof makeContractApp>['app'] } {
-  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-  registerCreditPackagesRoute(app, { authenticate, stripe: makeStripeStub(), now: FIXTURE_NOW });
   return { app };
 }
 
@@ -140,7 +128,7 @@ test(
     await db.insert(creditLedger).values([
       {
         id: liveLotId,
-        dogId: FIXTURE_IDS.dog1Id,
+        ownerId: FIXTURE_IDS.ownerId,
         mode: 'school',
         location: 'fayetteville',
         delta: 3,
@@ -149,7 +137,7 @@ test(
       },
       {
         id: expiredLotId,
-        dogId: FIXTURE_IDS.dog1Id,
+        ownerId: FIXTURE_IDS.ownerId,
         mode: 'school',
         location: 'fayetteville',
         delta: 3,
@@ -200,110 +188,6 @@ test(
   },
 );
 
-/** dog1's 10-credit purchase lots: what the two grant-site tests below read. */
-async function tenCreditLots(): Promise<Array<{ id: string; expiresAt: string | null }>> {
-  return db
-    .select({ id: creditLedger.id, expiresAt: creditLedger.expiresAt })
-    .from(creditLedger)
-    .where(
-      and(
-        eq(creditLedger.dogId, FIXTURE_IDS.dog1Id),
-        eq(creditLedger.reason, 'purchase'),
-        eq(creditLedger.delta, 10),
-      ),
-    );
-}
-
-async function removeTenCreditLots(): Promise<void> {
-  await db
-    .delete(creditLedger)
-    .where(
-      and(
-        eq(creditLedger.dogId, FIXTURE_IDS.dog1Id),
-        eq(creditLedger.reason, 'purchase'),
-        eq(creditLedger.delta, 10),
-      ),
-    );
-  await db.delete(charges).where(eq(charges.purpose, 'package'));
-}
-
-/** The expiry an ordinary dog's 10-credit Fayetteville purchase stamps at `now`. */
-async function ordinaryTenCreditExpiry(now: Date): Promise<Date | null> {
-  return resolvePurchaseExpiry(
-    10,
-    await creditExpirySettingsRepository.resolveExpiryWindowMonths('fayetteville'),
-    now,
-  );
-}
-
-test("an alumni dog's pack purchase writes a lot with an expiry", SKIP_WHEN_NO_DB, async () => {
-  // dog1 is alumni from the prior test's records (same-file serial order);
-  // re-assert rather than assume.
-  const staffRes = await staffApp().app.inject({ method: 'GET', url: PROGRAMS_URL });
-  assert.equal((staffRes.json() as ProgramsWire).is_alumni, true, 'precondition: alumni');
-
-  const res = await purchaseApp().app.inject({
-    method: 'POST',
-    url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool10Key}/purchase`,
-    headers: { 'idempotency-key': randomUUID() },
-    payload: {
-      dog_id: FIXTURE_IDS.dog1Id,
-      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-      location: 'fayetteville',
-    },
-  });
-  assert.equal(res.statusCode, 201, res.body);
-
-  try {
-    const lots = await tenCreditLots();
-    assert.equal(lots.length, 1, 'exactly one 10-credit lot');
-    const expected = await ordinaryTenCreditExpiry(FIXTURE_NOW());
-    assert.ok(expected !== null, 'precondition: a 10-credit pack has a window');
-    assert.ok(lots[0]!.expiresAt !== null, 'an alumni lot takes the ordinary expiry');
-    assert.equal(new Date(lots[0]!.expiresAt).getTime(), expected.getTime());
-  } finally {
-    // This purchase goes, so later files see the seeded ledger only.
-    await removeTenCreditLots();
-  }
-});
-
-test(
-  "the webhook's catch-up grant gives an alumni dog the ordinary expiry too",
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const staffRes = await staffApp().app.inject({ method: 'GET', url: PROGRAMS_URL });
-    assert.equal((staffRes.json() as ProgramsWire).is_alumni, true, 'precondition: alumni');
-
-    const paymentIntentId = `pi_alumni_${randomUUID()}`;
-    const result = await dispatchStripeEvent(
-      {
-        id: `evt_${randomUUID()}`,
-        type: 'payment_intent.succeeded',
-        paymentIntentId,
-        amountCents: 10_000,
-        metadata: {
-          owner_id: FIXTURE_IDS.ownerId,
-          dog_id: FIXTURE_IDS.dog1Id,
-          package_id: FIXTURE_IDS.creditPackageSchool5Id,
-          credits: '10',
-          mode: 'school',
-          location: 'fayetteville',
-        },
-      },
-      { stripe: makeStripeStub() },
-    );
-    assert.equal(result.outcome, 'reconstructed-package-purchase');
-
-    try {
-      const lots = await tenCreditLots();
-      assert.equal(lots.length, 1, 'exactly one 10-credit lot');
-      assert.ok(lots[0]!.expiresAt !== null, 'an alumni lot takes the ordinary expiry');
-    } finally {
-      await removeTenCreditLots();
-    }
-  },
-);
-
 test(
   "a cancel returning a credit to an alumni dog's dead lot follows the ordinary rule",
   SKIP_WHEN_NO_DB,
@@ -315,7 +199,7 @@ test(
     const deadLotId = randomUUID();
     await db.insert(creditLedger).values({
       id: deadLotId,
-      dogId: FIXTURE_IDS.dog1Id,
+      ownerId: FIXTURE_IDS.ownerId,
       mode: 'school',
       location: 'fayetteville',
       delta: 1,
@@ -323,6 +207,7 @@ test(
       expiresAt: '2026-01-01T00:00:00.000Z',
     });
     await db.insert(creditLedger).values({
+      ownerId: FIXTURE_IDS.ownerId,
       dogId: FIXTURE_IDS.dog1Id,
       mode: 'school',
       location: 'fayetteville',
@@ -334,7 +219,7 @@ test(
 
     try {
       await withActor('test:alumni-cancel', (tx) =>
-        returnDebitsToLots(tx, { bookingId, now: FIXTURE_NOW() }),
+        returnDebitsToLots(tx, { bookingIds: [bookingId], now: FIXTURE_NOW() }),
       );
 
       const [refund] = await db
@@ -353,28 +238,32 @@ test(
   },
 );
 
-test('DELETE un-records — wire flips back, second DELETE 404s', SKIP_WHEN_NO_DB, async () => {
-  const { app } = staffApp();
-  const target = CURRICULUM_PROGRAMS[2];
-  const res = await app.inject({
-    method: 'DELETE',
-    url: `${PROGRAMS_URL}/${target}`,
-    headers: { 'idempotency-key': randomUUID() },
-  });
-  assert.equal(res.statusCode, 200, res.body);
-  const body = res.json() as ProgramsWire;
-  assert.equal(body.is_alumni, false, 'dropping to 4 live rows un-derives alumni');
-  assert.equal(body.completed_programs.length, 4);
+test(
+  'DELETE un-records a level, and the dog stays alumni; second DELETE 404s',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffApp();
+    const target = CURRICULUM_PROGRAMS[2];
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `${PROGRAMS_URL}/${target}`,
+      headers: { 'idempotency-key': randomUUID() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const body = res.json() as ProgramsWire;
+    assert.equal(body.is_alumni, true, 'alumni is stored and never cleared (M4.11)');
+    assert.equal(body.completed_programs.length, 4);
 
-  const again = await app.inject({
-    method: 'DELETE',
-    url: `${PROGRAMS_URL}/${target}`,
-    headers: { 'idempotency-key': randomUUID() },
-  });
-  assert.equal(again.statusCode, 404, 'no live completion left to expire');
+    const again = await app.inject({
+      method: 'DELETE',
+      url: `${PROGRAMS_URL}/${target}`,
+      headers: { 'idempotency-key': randomUUID() },
+    });
+    assert.equal(again.statusCode, 404, 'no live completion left to expire');
 
-  await resetAlumniState();
-});
+    await resetAlumniState();
+  },
+);
 
 test(
   'completed_programs[].program is always a CURRICULUM_PROGRAMS member (wire narrowing pin)',

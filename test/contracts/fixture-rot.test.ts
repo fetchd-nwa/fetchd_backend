@@ -38,15 +38,12 @@ describe('fixture rot tripwire — vaccine expiries vs the real calendar', () =>
 /**
  * Second tripwire — an injected `now` literal in a DB-backed credit-expiry test.
  *
- * Same disease as the vaccine dates above, different organ. The `now` argument
- * of `enqueueCreditExpiryWarnings(tx, now)` builds ONLY the per-location window
- * CEILING (`enqueueCreditExpiryWarnings.ts:47-56`, `now + leadDays`). The
- * live-lot FLOOR is Postgres' own clock — `AND lot.expires_at > now()` in the
- * raw SQL at `creditLedgerRepository.ts:189` — and no injected clock reaches
- * it. So a test that pins `now` to a literal and seeds a lot at `literal + N
- * days` fixes that lot's expiry on the CALENDAR while the floor keeps
- * advancing. The day the real clock passes it, the lot leaves the scan, and the
- * test fails one of two ways:
+ * Same disease as the vaccine dates above, different organ. A credit test's injected
+ * `now` reaches the route; `lot_is_live` and `lot_pays_date` read Postgres' own clock,
+ * and no injected clock reaches them. So a test that pins `now` to a literal and seeds a
+ * lot at `literal + N days` fixes that lot's expiry on the CALENDAR while the floor keeps
+ * advancing. The day the real clock passes it, the lot dies, and the test fails one of
+ * two ways:
  *
  *   - an `enqueued === 1` assertion goes RED and stays red — the 2026-09-28
  *     bomb defused in step 0.2-a;
@@ -54,20 +51,19 @@ describe('fixture rot tripwire — vaccine expiries vs the real calendar', () =>
  *     by the floor, not excluded by the window) and can never go red again.
  *     The second is worse: it is silent.
  *
- * So this reads the two files' SOURCE TEXT and rejects any `const now = new
- * Date('...')`. A literal that genuinely never reaches Postgres — pure window
- * math through `resolvePurchaseExpiry` / `resolveRefundExpiry`, no row, no
- * `now()` — opts out with `// pure-fn: no DB` on the same line, so the
+ * So this reads the file's SOURCE TEXT and rejects any `const now = new
+ * Date('...')`. A literal that genuinely never reaches Postgres — pure date
+ * math, no row, no `now()` — opts out with `// pure-fn: no DB` on the same line, so the
  * exemption is visible where it is claimed instead of in a list up here.
  *
  * Honest limits, so nobody reads more into a green than it carries: the match
  * is TEXTUAL and exact (`const now = new Date('`). A differently-named binding
  * (`const t0 = ...`), a computed literal, or a date built any other way walks
- * straight past it, and it sees only the two files named below. The tree-wide
+ * straight past it, and it sees only the file named below. The tree-wide
  * check is step 0.2-c, which runs the whole suite under a shifted clock and
  * needs no pattern at all.
  */
-const GUARDED_FILES = ['credit-expiry-warnings.test.ts', 'credit-expiry-lots.test.ts'] as const;
+const GUARDED_FILES = ['credit-expiry-lots.test.ts'] as const;
 
 /** A pinned injected clock. Deliberately textual: this guards source, not runtime. */
 const LITERAL_ANCHOR = "const now = new Date('";
@@ -82,7 +78,7 @@ const CONTRACTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 describe(
   'fixture rot tripwire — injected-clock literals in the credit-expiry tests ' +
-    '(guards THESE TWO FILES only, not the tree; the tree-wide check is step 0.2-c, ' +
+    '(guards THIS FILE only, not the tree; the tree-wide check is step 0.2-c, ' +
     'which runs the whole suite under a shifted clock)',
   () => {
     for (const file of GUARDED_FILES) {
@@ -106,12 +102,10 @@ describe(
           [],
           `${file} pins an injected \`now\` to a date literal at:\n` +
             violations.map((v) => `    ${file}:${v.line}  ${v.text.trim()}`).join('\n') +
-            '\n\n  MECHANISM: the injected `now` builds only the window CEILING ' +
-            '(enqueueCreditExpiryWarnings.ts:47-56, now + leadDays). The live-lot FLOOR is ' +
-            "Postgres' own clock — `AND lot.expires_at > now()` at " +
-            'creditLedgerRepository.ts:189 — which no injected clock reaches. Pin `now` and ' +
-            'seed a lot at `now + N days` and that expiry is fixed on the calendar while the ' +
-            'floor advances; the day the real clock passes it the lot drops out of the scan.\n' +
+            '\n\n  MECHANISM: `lot_is_live` and `lot_pays_date` read Postgres\' own clock, ' +
+            'which no injected clock reaches. Pin `now` and seed a lot at `now + N days` and ' +
+            'that expiry is fixed on the calendar while the floor advances; the day the real ' +
+            'clock passes it the lot dies.\n' +
             '  REPAIR: anchor on `const now = new Date();` and keep every offset relative to ' +
             'it — the assertions do not change, only the anchor does.\n' +
             '  EXEMPTION: if the literal never reaches Postgres (pure window math, no row, no ' +

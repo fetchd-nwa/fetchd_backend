@@ -600,12 +600,14 @@ test(
     });
     // Seed the booking-debit the cancel txn's credit-back branch reverses.
     await db.insert(creditLedger).values({
+      ownerId: FIXTURE_IDS.ownerId,
       dogId: FIXTURE_IDS.dog1Id,
       mode: 'school',
       location: 'fayetteville',
       delta: -1,
       reason: 'booking-debit',
       bookingId: id,
+      lotId: FIXTURE_IDS.creditLedgerPurchaseId,
     });
 
     const { app } = staffBookingsApp();

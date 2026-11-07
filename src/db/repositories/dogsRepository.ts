@@ -50,7 +50,7 @@ export interface AssembledDog {
   medications: (typeof dogMedications.$inferSelect)[];
   feeding: typeof dogFeeding.$inferSelect | null;
   completedClasses: (typeof dogCompletedClasses.$inferSelect)[];
-  /** §J.3: live day-school curriculum completions — all 5 present ⇒ alumni. */
+  /** §J.3: live day-school curriculum completions. Alumni status is `dog.isAlumni`. */
   completedPrograms: (typeof dogCompletedPrograms.$inferSelect)[];
 }
 
@@ -338,22 +338,49 @@ async function softExpire(tx: Tx, id: string): Promise<Dog | undefined> {
 }
 
 /**
- * Does this dog exist and live? The staff alumni routes' 404: a staff read crosses
- * owners, so it asks by id alone.
+ * A live dog's stored alumni status, or `undefined` when she is missing or expired: the
+ * staff alumni routes' 404. A staff read crosses owners, so it asks by id alone.
  */
-async function existsLive(dogId: string, runner: Runner = db): Promise<boolean> {
+async function findLiveAlumniStatus(
+  dogId: string,
+  runner: Runner = db,
+): Promise<boolean | undefined> {
   const [row] = await runner
-    .select({ id: dogs.id })
+    .select({ isAlumni: dogs.isAlumni })
     .from(dogs)
     .where(and(eq(dogs.id, dogId), live(dogs)))
     .limit(1);
+  return row?.isAlumni;
+}
+
+/** Is every one of these dogs alumni? An alumni credit pays only for an alumni dog. */
+async function allAlumni(runner: Runner, dogIds: readonly string[]): Promise<boolean> {
+  const rows = await runner
+    .select({ isAlumni: dogs.isAlumni })
+    .from(dogs)
+    .where(inArray(dogs.id, [...dogIds]));
+  return rows.length === dogIds.length && rows.every((row) => row.isAlumni);
+}
+
+/** Does this account hold a live alumni dog, so an alumni credit could pay for something? */
+async function ownerHasAlumniDog(runner: Runner, ownerId: string): Promise<boolean> {
+  const [row] = await runner
+    .select({ id: dogs.id })
+    .from(dogs)
+    .where(and(eq(dogs.ownerId, ownerId), eq(dogs.isAlumni, true), live(dogs)))
+    .limit(1);
   return row !== undefined;
+}
+
+/** The fifth level is recorded. Under `lockForAlumniUpdate`; nothing clears this. */
+async function markAlumni(tx: Tx, dogId: string): Promise<void> {
+  await tx.update(dogs).set({ isAlumni: true }).where(eq(dogs.id, dogId));
 }
 
 /**
  * Serialize §J.3 completed-program writes per dog: two concurrent staff
  * recording programs #4 and #5 would each read 4 live rows under READ COMMITTED
- * and BOTH would answer `is_alumni: false`. Locking the dogs row first makes the
+ * and NEITHER would store `is_alumni`. Locking the dogs row first makes the
  * second tx wait and read 5. `no key update`, because `dogs` is a parent the
  * settle's FK re-check reaches (`db/locks.ts`). Returns false when the dog is
  * missing/expired (the route's 404).
@@ -498,8 +525,11 @@ export const dogsRepository = {
   findOwnerIdInTx,
   findOwnerIdAnyInTx,
   findNameInTx,
-  existsLive,
   lockForAlumniUpdate,
+  findLiveAlumniStatus,
+  allAlumni,
+  ownerHasAlumniDog,
+  markAlumni,
   findAllLiveForStaff,
   create,
   update,

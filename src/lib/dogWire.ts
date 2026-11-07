@@ -1,7 +1,6 @@
 import type { DogWire, FeedingWire, MedicationWire, VaccineWire } from '../contracts/wire.js';
 import type { AssembledDog } from '../db/repositories/dogsRepository.js';
 import { ageInMonths } from './ageMonths.js';
-import { CURRICULUM_PROGRAMS } from './alumni.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { toVetWire } from './vetWire.js';
 
@@ -33,7 +32,7 @@ import { toVetWire } from './vetWire.js';
 export type { DogWire, FeedingWire, MedicationWire, VaccineWire } from '../contracts/wire.js';
 
 export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
-  const { dog, vet, vaccines, medications, feeding, completedClasses, completedPrograms } =
+  const { dog, vet, vaccines, medications, feeding, completedClasses } =
     assembled;
 
   const wire: DogWire = {
@@ -52,7 +51,7 @@ export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
     special_notes: dog.specialNotes,
     evaluation_status: dog.evaluationStatus,
     boarding_enabled: dog.boardingEnabled,
-    is_alumni: completedPrograms.length === CURRICULUM_PROGRAMS.length,
+    is_alumni: dog.isAlumni,
   };
 
   if (dog.evaluationDate !== null) wire.evaluation_date = pgTimestampToIso(dog.evaluationDate);

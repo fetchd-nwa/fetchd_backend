@@ -46,8 +46,7 @@ function parseIdParam(params: unknown): { id: string } {
 
 /**
  * `kind` from what the order holds: rows make it a Confirm with a top-up, and a
- * purchase holds none. `'class'` has no producer before P29, and `'package'` none
- * before P18, so production answers an empty list until then.
+ * purchase holds none. `'class'` has no producer before P29.
  */
 function kindOf(row: PendingOrderRow, sessionCount: number): PendingPaymentWire['kind'] {
   if (sessionCount > 0) return 'booking';
@@ -85,10 +84,14 @@ export function registerStaffOrdersRoute(
         const sessionRows = await bookingsRepository.findByOrderId(db, row.orderId);
         const sessions = await wireManyBookings(sessionRows);
         const minutes = (now.getTime() - pgTimestampToDate(row.createdAt).getTime()) / 60_000;
+        const kind = kindOf(row, sessions.length);
         listed.push({
           order_id: row.orderId,
           owner: { id: row.ownerId, name: row.ownerName ?? row.ownerEmail ?? '' },
-          kind: kindOf(row, sessions.length),
+          kind,
+          ...(kind === 'package' && row.packageLabel !== null
+            ? { package_label: row.packageLabel }
+            : {}),
           amount_cents: row.amountCents,
           created_at: orderCreatedAtIso(row),
           minutes_pending: Math.floor(minutes),
@@ -140,12 +143,16 @@ export function registerStaffOrdersRoute(
           idempotencyKey,
           endpoint,
           requestHash,
-          patternsToInvalidate: () => [
-            ...(result?.cancelled?.location != null
-              ? [`avail:${result.cancelled.location}:*`]
-              : []),
-            ...(result?.cancelled?.creditRefundedDogIds ?? []).map(creditsInvalidationPattern),
-          ],
+          patternsToInvalidate: () => {
+            const creditsOwner =
+              result?.cancelled?.creditRefundedOwnerId ?? result?.act.creditsOwnerId;
+            return [
+              ...(result?.cancelled?.location != null
+                ? [`avail:${result.cancelled.location}:*`]
+                : []),
+              ...(creditsOwner !== undefined ? [creditsInvalidationPattern(creditsOwner)] : []),
+            ];
+          },
           postCommit: async () => {
             await firePendingRefundPostCommit({
               pending: result?.act.pendingStripeRefund,

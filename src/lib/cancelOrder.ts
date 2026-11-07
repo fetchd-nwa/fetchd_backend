@@ -92,9 +92,9 @@ function nothingPending(orderId: string): ApiError {
  *   - `requires_payment`, `no-intent` read before an id landed: 409, nothing written,
  *     because "you weren't charged" is not yet known. A retry cancels the intent.
  *   - `requires_payment`, Stripe `processing`: cancelled anyway, and **nothing tells
- *     the owner it failed, which it may not have**. Its true word is `payment-refunded`'s
- *     `cancel-while-processing` trigger, born with M7.09, so until LG7 no notice goes.
- *     A late success is refunded in full by `settleChargeInTx`.
+ *     the owner it failed, which it may not have**: a pack or a top-up hears the true word,
+ *     `cancel-while-processing`, and an invoice has no copy for it. A late success is
+ *     refunded in full by `settleChargeInTx`.
  */
 export async function cancelOrderInTx(
   tx: Tx,
@@ -173,7 +173,11 @@ export async function cancelOrderInTx(
     chargeId: charge.id,
     blocker: processing ? 'processing' : undefined,
     lastError: null,
-    ...(processing ? {} : { notice: 'order-cancelled' as const }),
+    ...(!processing
+      ? { notice: 'order-cancelled' as const }
+      : charge.packageId !== null
+        ? { notice: 'cancel-while-processing' as const }
+        : {}),
     ...(whatWon.kind === 'canceled' ? { intentDead: true as const } : {}),
     cancelledBy,
     ...(args.cancelReason !== undefined ? { cancelReason: args.cancelReason } : {}),

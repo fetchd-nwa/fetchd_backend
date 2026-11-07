@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { serviceRates } from '../../src/db/schema/schema.js';
 import { registerStaffRatesRoute } from '../../src/routes/staffRates.js';
-import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { FIXTURE_IDS, FIXTURE_NOW, resetServiceRates } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_MANAGER_PRINCIPAL,
@@ -28,16 +28,33 @@ import {
  * inserts); a scheduled future rate never blocks the current one (slot-in, no
  * 409); voiding reopens the predecessor (no trap, no gap); who/when is logged.
  *
- * FIXTURE_TODAY = 2026-05-19. Fixture seeds: day-school @fay $75 (open from
- * 2026-01-01), day-school @null $70, day-care @null $45 (→2026-06-01) then $50,
- * boarding @fay $85, day-care @bentonville $40 (expired 2026-04-01). The staff
- * principal is the manager, `staffAmberId` (P02): the rate editor is owner and
- * manager since STAFF-U07, and the trainer's 403 is pinned at the end.
+ * DAY-U23 narrowed the POST to the evaluation rate at its seed, 0, so every write
+ * here is on that track and the rows are told apart by `note`. FIXTURE_TODAY =
+ * 2026-05-19. The volume holds M3.05's two evaluation rows, open from 2025-01-01,
+ * and nothing else; the fixture's teardown clears what a test adds and reopens what
+ * a test closes. The staff principal is the manager, `staffAmberId` (P02): the rate
+ * editor is owner and manager since STAFF-U07, and the trainer's 403 is pinned at
+ * the end.
  */
 
 registerFixtureHooks();
+afterEach(resetServiceRates);
 
 const STAFF_ID = FIXTURE_IDS.staffAmberId;
+
+/** A POST body on the evaluation track at its seed, the one amount the route takes. */
+function evaluationRate(
+  location: 'fayetteville' | 'bentonville',
+  extra: { note?: string; effective_from?: string } = {},
+) {
+  return {
+    category: 'evaluation',
+    location,
+    amount_cents: 0,
+    unit: 'per-session',
+    ...extra,
+  };
+}
 
 function staffApp(principal = FIXTURE_MANAGER_PRINCIPAL): {
   app: ReturnType<typeof makeContractApp>['app'];
@@ -87,6 +104,7 @@ async function rowsForTrack(category: string, location: string) {
     .select({
       id: serviceRates.id,
       amountCents: serviceRates.amountCents,
+      note: serviceRates.note,
       unit: serviceRates.unit,
       effectiveFrom: serviceRates.effectiveFrom,
       effectiveTo: serviceRates.effectiveTo,
@@ -96,7 +114,7 @@ async function rowsForTrack(category: string, location: string) {
     .from(serviceRates)
     .where(
       and(
-        eq(serviceRates.category, category as 'day-school'),
+        eq(serviceRates.category, category as 'evaluation'),
         eq(serviceRates.location, location as 'fayetteville'),
       ),
     );
@@ -110,6 +128,32 @@ test(
   'GET /staff/rates — active + scheduled rows; expired excluded; carries created_by',
   SKIP_WHEN_NO_DB,
   async () => {
+    await db.insert(serviceRates).values([
+      {
+        category: 'boarding',
+        location: 'bentonville',
+        amountCents: 4000,
+        unit: 'per-night',
+        effectiveFrom: '2025-12-01',
+        effectiveTo: '2026-04-01',
+        note: 'expired',
+      },
+      {
+        category: 'boarding',
+        location: 'bentonville',
+        amountCents: 4500,
+        unit: 'per-night',
+        effectiveFrom: '2026-07-01',
+        note: 'scheduled',
+      },
+      {
+        category: 'boarding',
+        location: null,
+        amountCents: 4200,
+        unit: 'per-night',
+        effectiveFrom: '2026-01-01',
+      },
+    ]);
     const { app } = staffApp();
     const res = await app.inject({ method: 'GET', url: '/staff/rates' });
     assert.equal(res.statusCode, 200, res.body);
@@ -118,22 +162,27 @@ test(
       location: string | null;
       amount_cents: number;
       effective_to: string | null;
+      note: string | null;
       created_by_staff_id: string | null;
     }>;
-    const daySchoolFay = body.find(
-      (r) => r.category === 'day-school' && r.location === 'fayetteville',
+    const evaluationFay = body.find(
+      (r) => r.category === 'evaluation' && r.location === 'fayetteville',
     );
-    assert.ok(daySchoolFay, 'day-school fayetteville present');
-    assert.equal(daySchoolFay.amount_cents, 7500);
-    assert.equal(daySchoolFay.effective_to, null);
-    assert.equal(daySchoolFay.created_by_staff_id, null, 'seed rows have no creator');
+    assert.ok(evaluationFay, 'evaluation fayetteville present');
+    assert.equal(evaluationFay.amount_cents, 0);
+    assert.equal(evaluationFay.effective_to, null);
+    assert.equal(evaluationFay.created_by_staff_id, null, 'seed rows have no creator');
     assert.equal(
-      body.find((r) => r.category === 'day-care' && r.location === 'bentonville'),
+      body.find((r) => r.note === 'expired'),
       undefined,
-      'expired bentonville day-care excluded',
+      'the expired row is excluded',
     );
     assert.ok(
-      body.some((r) => r.category === 'day-school' && r.location === null),
+      body.some((r) => r.note === 'scheduled'),
+      'the scheduled row is present',
+    );
+    assert.ok(
+      body.some((r) => r.category === 'boarding' && r.location === null),
       'null-location row present with explicit null',
     );
   },
@@ -147,12 +196,7 @@ test(
     const res = await postRate({
       app,
       idempotencyKey: `sr-fraction-${randomUUID()}`,
-      payload: {
-        category: 'private-lesson',
-        location: 'fayetteville',
-        amount_cents: 7_550.5,
-        unit: 'flat',
-      },
+      payload: { ...evaluationRate('fayetteville'), amount_cents: 7_550.5 },
     });
     assert.equal(res.statusCode, 400, res.body);
     assert.equal((res.json() as { error: { code: string } }).error.code, 'bad_request');
@@ -170,23 +214,14 @@ test('GET /staff/rates — owner principal → 403', SKIP_WHEN_NO_DB, async () =
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /staff/rates — first rate for a fresh track inserts an open row, stamps created_by',
+  'POST /staff/rates — the seed on a track closes the open row and opens a new one, stamps created_by',
   SKIP_WHEN_NO_DB,
   async () => {
-    // A manager's private-lesson rate (design §2.1:2086-2091): kept green at
-    // 2.0.0 and deleted by DAY-U23 at design 4.0.0. The shared (category,
-    // campus) track is owner/manager — service_rates has no trainer axis; a
-    // trainer's own lesson price is STAFF-U23's per-trainer row, later.
     const { app } = staffApp();
     const res = await postRate({
       app,
       idempotencyKey: `sr-insert-${randomUUID()}`,
-      payload: {
-        category: 'private-lesson',
-        location: 'bentonville',
-        amount_cents: 11000,
-        unit: 'flat',
-      },
+      payload: evaluationRate('bentonville', { note: 'restated' }),
     });
     assert.equal(res.statusCode, 200, res.body);
     const body = res.json() as {
@@ -195,14 +230,65 @@ test(
       effective_to: null;
       created_by_staff_id: string;
     };
-    assert.equal(body.amount_cents, 11000);
+    assert.equal(body.amount_cents, 0);
     assert.equal(body.effective_to, null);
     assert.equal(body.effective_from, '2026-05-19', 'defaults to today (Chicago)');
     assert.equal(body.created_by_staff_id, STAFF_ID, 'stamps the acting staff');
 
-    const rows = await rowsForTrack('private-lesson', 'bentonville');
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0]!.voidedAt, null);
+    const rows = await rowsForTrack('evaluation', 'bentonville');
+    assert.equal(rows.length, 2, 'the seed row and the new row');
+    const seed = rows.find((r) => r.effectiveFrom === '2025-01-01')!;
+    assert.equal(seed.effectiveTo, '2026-05-19', 'the seed row closes where the new row opens');
+  },
+);
+
+for (const category of [
+  'day-school',
+  'day-care',
+  'private-lesson',
+  'group-class',
+  'boarding',
+  'board-and-train',
+]) {
+  test(
+    `DAY-U23: POST /staff/rates narrows to the evaluation, so ${category} is 400 and writes nothing`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const { app } = staffApp();
+      const res = await postRate({
+        app,
+        idempotencyKey: `sr-narrow-${randomUUID()}`,
+        payload: { ...evaluationRate('fayetteville'), category },
+      });
+      assert.equal(res.statusCode, 400, res.body);
+      assert.equal(res.json().error.code, 'bad_request');
+      assert.deepEqual(await rowsForTrack(category, 'fayetteville'), []);
+    },
+  );
+}
+
+test(
+  'DAY-U23: POST /staff/rates takes the seed amount 0, and any other amount is 422 invalid_payload',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app } = staffApp();
+    for (const amount_cents of [1, 5000, -1, 2_000_000]) {
+      const res = await postRate({
+        app,
+        idempotencyKey: `sr-amount-${randomUUID()}`,
+        payload: { ...evaluationRate('fayetteville'), amount_cents },
+      });
+      assert.equal(res.statusCode, 422, `${amount_cents}: ${res.body}`);
+      assert.equal(res.json().error.code, 'invalid_payload');
+    }
+    assert.equal((await rowsForTrack('evaluation', 'fayetteville')).length, 1, 'nothing written');
+
+    const seed = await postRate({
+      app,
+      idempotencyKey: `sr-amount-${randomUUID()}`,
+      payload: evaluationRate('fayetteville'),
+    });
+    assert.equal(seed.statusCode, 200, seed.body);
   },
 );
 
@@ -214,34 +300,26 @@ test(
     await postRate({
       app,
       idempotencyKey: `sr-c1-${randomUUID()}`,
-      payload: {
-        category: 'private-lesson',
-        location: 'fayetteville',
-        amount_cents: 10000,
-        unit: 'flat',
-      },
+      payload: evaluationRate('fayetteville', { note: 'first' }),
     });
     const second = await postRate({
       app,
       idempotencyKey: `sr-c2-${randomUUID()}`,
-      payload: {
-        category: 'private-lesson',
-        location: 'fayetteville',
-        amount_cents: 12000,
-        unit: 'flat',
-      },
+      payload: evaluationRate('fayetteville', { note: 'second' }),
     });
     assert.equal(second.statusCode, 200, second.body);
-    assert.equal((second.json() as { amount_cents: number }).amount_cents, 12000);
+    assert.equal((second.json() as { note: string }).note, 'second');
 
-    const rows = await rowsForTrack('private-lesson', 'fayetteville');
+    const rows = (await rowsForTrack('evaluation', 'fayetteville')).filter(
+      (r) => r.effectiveFrom === '2026-05-19',
+    );
     assert.equal(rows.length, 2, 'append-only: old entry kept (voided), new inserted');
     const voided = rows.filter((r) => r.voidedAt !== null);
     const live = rows.filter((r) => r.voidedAt === null);
-    assert.equal(voided.length, 1, 'the prior $100 entry is voided, not overwritten');
-    assert.equal(voided[0]!.amountCents, 10000, 'old value preserved on the voided row');
+    assert.equal(voided.length, 1, 'the prior entry is voided, not overwritten');
+    assert.equal(voided[0]!.note, 'first', 'old value preserved on the voided row');
     assert.equal(live.length, 1);
-    assert.equal(live[0]!.amountCents, 12000, 'the new value is a fresh row');
+    assert.equal(live[0]!.note, 'second', 'the new value is a fresh row');
   },
 );
 
@@ -253,19 +331,13 @@ test(
     const res = await postRate({
       app,
       idempotencyKey: `sr-sup-${randomUUID()}`,
-      payload: {
-        category: 'day-school',
-        location: 'fayetteville',
-        amount_cents: 8000,
-        unit: 'per-day',
-        effective_from: '2026-07-01',
-      },
+      payload: evaluationRate('fayetteville', { note: 'next', effective_from: '2026-07-01' }),
     });
     assert.equal(res.statusCode, 200, res.body);
-    const rows = await rowsForTrack('day-school', 'fayetteville');
+    const rows = await rowsForTrack('evaluation', 'fayetteville');
     assert.equal(rows.length, 2, 'old window + new window');
-    const old = rows.find((r) => r.amountCents === 7500)!;
-    const next = rows.find((r) => r.amountCents === 8000)!;
+    const old = rows.find((r) => r.note !== 'next')!;
+    const next = rows.find((r) => r.note === 'next')!;
     assert.equal(old.effectiveTo, '2026-07-01', 'prior window closed at the new start');
     assert.equal(next.effectiveFrom, '2026-07-01');
     assert.equal(next.effectiveTo, null);
@@ -281,32 +353,21 @@ test(
     const future = await postRate({
       app,
       idempotencyKey: `sr-slot1-${randomUUID()}`,
-      payload: {
-        category: 'boarding',
-        location: 'bentonville',
-        amount_cents: 9000,
-        unit: 'per-night',
-        effective_from: '2026-09-01',
-      },
+      payload: evaluationRate('bentonville', { note: 'autumn', effective_from: '2026-09-01' }),
     });
     assert.equal(future.statusCode, 200, future.body);
     const current = await postRate({
       app,
       idempotencyKey: `sr-slot2-${randomUUID()}`,
-      payload: {
-        category: 'boarding',
-        location: 'bentonville',
-        amount_cents: 8000,
-        unit: 'per-night',
-      },
+      payload: evaluationRate('bentonville', { note: 'today' }),
     });
     assert.equal(current.statusCode, 200, current.body);
     const body = current.json() as {
-      amount_cents: number;
+      note: string;
       effective_from: string;
       effective_to: string | null;
     };
-    assert.equal(body.amount_cents, 8000);
+    assert.equal(body.note, 'today');
     assert.equal(body.effective_from, '2026-05-19');
     assert.equal(
       body.effective_to,
@@ -314,8 +375,10 @@ test(
       'current window ends where the scheduled one begins',
     );
 
-    const live = (await rowsForTrack('boarding', 'bentonville')).filter((r) => r.voidedAt === null);
-    assert.equal(live.length, 2, 'current + scheduled coexist, no overlap');
+    const live = (await rowsForTrack('evaluation', 'bentonville')).filter(
+      (r) => r.voidedAt === null,
+    );
+    assert.equal(live.length, 3, 'the closed seed, the current and the scheduled, no overlap');
   },
 );
 
@@ -328,28 +391,22 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = staffApp();
-    // Schedule $90 from 2026-07-01 on the seeded boarding @fay ($85 since 2026-01-01).
+    // Schedule a change from 2026-07-01 on the seeded evaluation @fay (since 2025-01-01).
     const scheduled = await postRate({
       app,
       idempotencyKey: `sr-vsched-${randomUUID()}`,
-      payload: {
-        category: 'boarding',
-        location: 'fayetteville',
-        amount_cents: 9000,
-        unit: 'per-night',
-        effective_from: '2026-07-01',
-      },
+      payload: evaluationRate('fayetteville', { effective_from: '2026-07-01' }),
     });
     const scheduledId = (scheduled.json() as { id: string }).id;
 
     const res = await voidRate(app, scheduledId);
     assert.equal(res.statusCode, 200, res.body);
 
-    const live = (await rowsForTrack('boarding', 'fayetteville')).filter(
+    const live = (await rowsForTrack('evaluation', 'fayetteville')).filter(
       (r) => r.voidedAt === null,
     );
     assert.equal(live.length, 1, 'only the original window remains');
-    assert.equal(live[0]!.amountCents, 8500);
+    assert.equal(live[0]!.effectiveFrom, '2025-01-01');
     assert.equal(live[0]!.effectiveTo, null, 'predecessor reopened to open-ended (no pricing gap)');
   },
 );
@@ -480,20 +537,11 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = staffApp();
-    const set = await postRate({
-      app,
-      idempotencyKey: `sr-vonly-${randomUUID()}`,
-      payload: {
-        category: 'group-class',
-        location: 'bentonville',
-        amount_cents: 30000,
-        unit: 'flat',
-      },
-    });
-    const id = (set.json() as { id: string }).id;
-    assert.equal((await voidRate(app, id)).statusCode, 200);
+    const [seed] = await rowsForTrack('evaluation', 'bentonville');
+    assert.ok(seed);
+    assert.equal((await voidRate(app, seed.id)).statusCode, 200);
     assert.equal(
-      (await rowsForTrack('group-class', 'bentonville')).filter((r) => r.voidedAt === null).length,
+      (await rowsForTrack('evaluation', 'bentonville')).filter((r) => r.voidedAt === null).length,
       0,
       'no live rate after voiding the only entry',
     );
@@ -502,19 +550,14 @@ test(
     const again = await postRate({
       app,
       idempotencyKey: `sr-vonly2-${randomUUID()}`,
-      payload: {
-        category: 'group-class',
-        location: 'bentonville',
-        amount_cents: 32000,
-        unit: 'flat',
-      },
+      payload: evaluationRate('bentonville', { note: 'set back' }),
     });
     assert.equal(again.statusCode, 200, again.body);
-    const live = (await rowsForTrack('group-class', 'bentonville')).filter(
+    const live = (await rowsForTrack('evaluation', 'bentonville')).filter(
       (r) => r.voidedAt === null,
     );
     assert.equal(live.length, 1);
-    assert.equal(live[0]!.amountCents, 32000);
+    assert.equal(live[0]!.note, 'set back');
   },
 );
 
@@ -539,47 +582,44 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = staffApp();
-    const track = { category: 'group-class', location: 'fayetteville' } as const;
-    // set $200 today → schedule $220 future → same-day correct to $210 (voids $200).
+    // set today → schedule a future row → same-day correct (voids the first).
     await postRate({
       app,
       idempotencyKey: `sr-h1-${randomUUID()}`,
-      payload: { ...track, amount_cents: 20000, unit: 'flat' },
+      payload: evaluationRate('fayetteville', { note: 'first' }),
     });
     await postRate({
       app,
       idempotencyKey: `sr-h2-${randomUUID()}`,
-      payload: { ...track, amount_cents: 22000, unit: 'flat', effective_from: '2026-08-01' },
+      payload: evaluationRate('fayetteville', { note: 'scheduled', effective_from: '2026-08-01' }),
     });
     await postRate({
       app,
       idempotencyKey: `sr-h3-${randomUUID()}`,
-      payload: { ...track, amount_cents: 21000, unit: 'flat' },
+      payload: evaluationRate('fayetteville', { note: 'corrected' }),
     });
 
-    const res = await getHistory(app, 'group-class', 'fayetteville');
+    const res = await getHistory(app, 'evaluation', 'fayetteville');
     assert.equal(res.statusCode, 200, res.body);
-    const log = res.json() as Array<{
-      amount_cents: number;
-      voided_at: string | null;
-      voided_by_staff_id: string | null;
-      created_by_staff_id: string | null;
-      created_at: string;
-    }>;
-    assert.equal(log.length, 3, 'all three entries present (incl. the voided $200)');
+    const log = (
+      res.json() as Array<{
+        note: string | null;
+        voided_at: string | null;
+        voided_by_staff_id: string | null;
+        created_by_staff_id: string | null;
+        created_at: string;
+      }>
+    ).filter((e) => e.created_by_staff_id !== null);
+    assert.equal(log.length, 3, 'all three entries present (incl. the voided one)');
     for (const entry of log) assert.equal(entry.created_by_staff_id, STAFF_ID, 'who created');
-    const voided = log.find((e) => e.amount_cents === 20000)!;
+    const voided = log.find((e) => e.note === 'first')!;
     assert.ok(voided.voided_at !== null, 'the corrected entry is voided, not gone');
     assert.equal(voided.voided_by_staff_id, STAFF_ID, 'who voided');
     // The catalog (active+scheduled) hides the voided entry.
     const catalog = (await app
       .inject({ method: 'GET', url: '/staff/rates' })
-      .then((r) => r.json())) as Array<{
-      category: string;
-      location: string | null;
-      amount_cents: number;
-    }>;
-    assert.ok(!catalog.some((r) => r.category === 'group-class' && r.amount_cents === 20000));
+      .then((r) => r.json())) as Array<{ note: string | null }>;
+    assert.ok(!catalog.some((r) => r.note === 'first'));
   },
 );
 
@@ -592,73 +632,20 @@ test('POST /staff/rates — back-dated effective_from → 422', SKIP_WHEN_NO_DB,
   const res = await postRate({
     app,
     idempotencyKey: `sr-back-${randomUUID()}`,
-    payload: {
-      category: 'day-care',
-      location: 'fayetteville',
-      amount_cents: 5000,
-      unit: 'per-day',
-      effective_from: '2026-01-01',
-    },
+    payload: evaluationRate('fayetteville', { effective_from: '2026-01-01' }),
   });
   assert.equal(res.statusCode, 422, res.body);
   assert.match((res.json() as { error: { message: string } }).error.message, /back-dated|past/);
 });
 
-test('POST /staff/rates — day-program with a non-per-day unit → 422', SKIP_WHEN_NO_DB, async () => {
-  const { app } = staffApp();
-  const res = await postRate({
-    app,
-    idempotencyKey: `sr-unit-${randomUUID()}`,
-    payload: {
-      category: 'day-school',
-      location: 'bentonville',
-      amount_cents: 6500,
-      unit: 'per-week',
-    },
-  });
-  assert.equal(res.statusCode, 422, res.body);
-  assert.match((res.json() as { error: { message: string } }).error.message, /per-day/);
-});
-
-test('POST /staff/rates — bad enum / amount / missing key', SKIP_WHEN_NO_DB, async () => {
+test('POST /staff/rates — bad enum / missing key', SKIP_WHEN_NO_DB, async () => {
   const { app } = staffApp();
   const bad = async (payload: Record<string, unknown>) =>
     (await postRate({ app, idempotencyKey: `sr-bad-${randomUUID()}`, payload })).statusCode;
-  assert.equal(
-    await bad({
-      category: 'dog-grooming',
-      location: 'fayetteville',
-      amount_cents: 5000,
-      unit: 'per-day',
-    }),
-    400,
-  );
-  assert.equal(
-    await bad({ category: 'day-care', location: 'tulsa', amount_cents: 5000, unit: 'per-day' }),
-    400,
-  );
-  assert.equal(
-    await bad({ category: 'day-care', location: 'fayetteville', amount_cents: 0, unit: 'per-day' }),
-    400,
-  );
-  assert.equal(
-    await bad({
-      category: 'day-care',
-      location: 'fayetteville',
-      amount_cents: 2_000_000,
-      unit: 'per-day',
-    }),
-    400,
-  );
-  const noKey = await postRate({
-    app,
-    payload: {
-      category: 'day-care',
-      location: 'fayetteville',
-      amount_cents: 5000,
-      unit: 'per-day',
-    },
-  });
+  assert.equal(await bad({ ...evaluationRate('fayetteville'), category: 'dog-grooming' }), 400);
+  assert.equal(await bad({ ...evaluationRate('fayetteville'), location: 'tulsa' }), 400);
+  assert.equal(await bad({ ...evaluationRate('fayetteville'), unit: 'per-moon' }), 400);
+  const noKey = await postRate({ app, payload: evaluationRate('fayetteville') });
   assert.equal(noKey.statusCode, 400, 'missing idempotency key');
 });
 
@@ -667,12 +654,7 @@ test('POST /staff/rates — owner principal → 403', SKIP_WHEN_NO_DB, async () 
   const res = await postRate({
     app,
     idempotencyKey: `sr-403-${randomUUID()}`,
-    payload: {
-      category: 'day-care',
-      location: 'fayetteville',
-      amount_cents: 5000,
-      unit: 'per-day',
-    },
+    payload: evaluationRate('fayetteville'),
   });
   assert.equal(res.statusCode, 403, res.body);
 });
@@ -687,21 +669,16 @@ test(
   async () => {
     const { app } = staffApp();
     const key = `sr-idemp-${randomUUID()}`;
-    const payload = {
-      category: 'board-and-train',
-      location: 'fayetteville',
-      amount_cents: 200000,
-      unit: 'flat',
-    };
+    const payload = evaluationRate('fayetteville');
     const a = await postRate({ app, idempotencyKey: key, payload });
     const b = await postRate({ app, idempotencyKey: key, payload });
     assert.equal(a.statusCode, 200, a.body);
     assert.equal(b.statusCode, 200, b.body);
     assert.deepEqual(a.json(), b.json(), 'replay returns identical body');
     assert.equal(
-      (await rowsForTrack('board-and-train', 'fayetteville')).length,
-      1,
-      'no second row',
+      (await rowsForTrack('evaluation', 'fayetteville')).length,
+      2,
+      'the seed and one new row, no second',
     );
   },
 );
@@ -711,15 +688,17 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = staffApp();
-    const payload = (cents: number) => ({
-      category: 'day-care' as const,
-      location: 'fayetteville' as const,
-      amount_cents: cents,
-      unit: 'per-day' as const,
-    });
     const [a, b] = await Promise.all([
-      postRate({ app, idempotencyKey: `sr-race1-${randomUUID()}`, payload: payload(5100) }),
-      postRate({ app, idempotencyKey: `sr-race2-${randomUUID()}`, payload: payload(5200) }),
+      postRate({
+        app,
+        idempotencyKey: `sr-race1-${randomUUID()}`,
+        payload: evaluationRate('fayetteville', { note: 'one' }),
+      }),
+      postRate({
+        app,
+        idempotencyKey: `sr-race2-${randomUUID()}`,
+        payload: evaluationRate('fayetteville', { note: 'two' }),
+      }),
     ]);
     assert.equal(a.statusCode, 200, a.body);
     assert.equal(b.statusCode, 200, b.body);
@@ -730,7 +709,7 @@ test(
       .from(serviceRates)
       .where(
         and(
-          eq(serviceRates.category, 'day-care'),
+          eq(serviceRates.category, 'evaluation'),
           eq(serviceRates.location, 'fayetteville'),
           isNull(serviceRates.voidedAt),
           isNull(serviceRates.effectiveTo),
@@ -745,9 +724,7 @@ test(
 // requireStaffRole('owner', 'manager') whole. The shared (category, campus)
 // track on service_rates is owner/manager because the table has no trainer
 // axis; a trainer's own `pl.lesson_price_cents` (STAFF-30) is STAFF-U23's
-// per-trainer row, later. Until design 4.0.0 (DAY-U23) narrows the route, a
-// manager's rate post is accepted — harmless: no family exists before §2.11,
-// and the preflight catches any rate off its seed.
+// per-trainer row, later.
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
@@ -758,19 +735,15 @@ test(
     const res = await postRate({
       app,
       idempotencyKey: `sr-trainer-${randomUUID()}`,
-      payload: {
-        category: 'boarding',
-        location: 'bentonville',
-        amount_cents: 1,
-        unit: 'per-night',
-      },
+      payload: evaluationRate('bentonville'),
     });
     assert.equal(res.statusCode, 403, res.body);
     assert.equal(res.json().error.code, 'forbidden');
-    const written = (await rowsForTrack('boarding', 'bentonville')).filter(
-      (r) => r.amountCents === 1,
+    assert.equal(
+      (await rowsForTrack('evaluation', 'bentonville')).length,
+      1,
+      'the refused post wrote a row',
     );
-    assert.deepEqual(written, [], 'the refused post wrote a row');
   },
 );
 
@@ -801,13 +774,9 @@ test('STAFF-U07: the manager and the owner role post a rate (200)', SKIP_WHEN_NO
     const res = await postRate({
       app,
       idempotencyKey: `sr-role-${randomUUID()}`,
-      payload: {
-        category: 'boarding',
-        location: 'bentonville',
-        amount_cents: principal === FIXTURE_MANAGER_PRINCIPAL ? 9100 : 9200,
-        unit: 'per-night',
+      payload: evaluationRate('bentonville', {
         effective_from: principal === FIXTURE_MANAGER_PRINCIPAL ? '2026-06-01' : '2026-07-01',
-      },
+      }),
     });
     assert.equal(res.statusCode, 200, res.body);
   }

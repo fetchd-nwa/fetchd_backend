@@ -20,7 +20,7 @@ import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
 
 /**
  * §J.3 staff verbs — the alumni completed-programs record (DATA-CONTRACT §J.3,
- * ruled 2026-07-09). Follows `staffCreditExpiry.ts` conventions: requireStaff,
+ * ruled 2026-07-09). Staff conventions: requireStaff,
  * withMutation + Idempotency-Key on writes, inline wire type (NOT portal-mirrored
  * yet — the portal UI lives in the other repo).
  *
@@ -65,18 +65,19 @@ export type CurriculumProgramConformance = Expect<
 // enforces it.
 
 /**
- * Assemble the wire from the dog's live completions.
+ * Assemble the wire from the dog's stored status and her live completions.
  * `undefined` when the dog is missing/expired — callers map to 404.
  */
 async function loadCompletedProgramsWire(
   dogId: string,
   runner?: Tx,
 ): Promise<CompletedProgramsWire | undefined> {
-  if (!(await dogsRepository.existsLive(dogId, runner))) return undefined;
+  const isAlumni = await dogsRepository.findLiveAlumniStatus(dogId, runner);
+  if (isAlumni === undefined) return undefined;
   const programs = await dogProgramsRepository.findLiveByDog(dogId, runner);
   const wire: CompletedProgramsWire = {
     dog_id: dogId,
-    is_alumni: programs.length === CURRICULUM_PROGRAMS.length,
+    is_alumni: isAlumni,
     completed_programs: programs.map((p) => ({
       program: p.program,
       completed_at: pgTimestampToIso(p.completedAt),
@@ -136,8 +137,8 @@ export function registerStaffAlumniRoute(
           keysToInvalidate: () => [],
         },
         async (tx) => {
-          // Row-lock the dog first: serializes concurrent program records, so
-          // the `is_alumni` this answers counts them all (see lockForAlumniUpdate).
+          // Row-lock the dog first: serializes concurrent program records, so the
+          // count that sets `is_alumni` below sees them all (see lockForAlumniUpdate).
           const dogExists = await dogsRepository.lockForAlumniUpdate(tx, dogId);
           if (!dogExists) {
             throw new ApiError('not_found', `dog ${dogId} not found`);
@@ -148,6 +149,12 @@ export function registerStaffAlumniRoute(
             program: body.program,
             staffId: principal.staffId,
           });
+          // Stored, set here under the dog's lock, and never cleared: a level un-recorded
+          // later does not take it back (M4.11, ALUM-U02).
+          const live = await dogProgramsRepository.findLiveByDog(dogId, tx);
+          if (live.length === CURRICULUM_PROGRAMS.length) {
+            await dogsRepository.markAlumni(tx, dogId);
+          }
           const wire = await loadCompletedProgramsWire(dogId, tx);
           if (wire === undefined) {
             throw new Error(`staffAlumni: dog ${dogId} vanished mid-mutation`);

@@ -79,12 +79,13 @@ export const SETTINGS_TABLES: readonly SettingsTable[] = Object.values(SETTINGS_
 /**
  * Every settings table under the audit trigger (M1.18, STAFF-U22; M1.21): the
  * four that predate LG1 and every settings table LG1 creates, `staff_settings`
- * included (it joins through `SETTINGS_TABLE_BY_DOMAIN`). The audit test is
+ * included (it joins through `SETTINGS_TABLE_BY_DOMAIN`), and `credit_packages`, whose
+ * `expiry_months` is a money-class edit (M4.05, DECISIONS 177(d)). The audit test is
  * generated from this list.
  */
 export const AUDITED_SETTINGS_TABLES: readonly string[] = [
   'cancel_window_settings',
-  'credit_expiry_settings',
+  'credit_packages',
   'intake_field_settings',
   'dog_descriptors',
   ...SETTINGS_TABLES,
@@ -427,15 +428,19 @@ const ENTRIES: readonly Entry[] = [
     class: 'ops',
     store: column('credit_settings', 'expiry_warning_lead_days'),
     // Never empty (an empty list warns no family before credits lapse) and no
-    // repeats (DECISIONS 61); M1.06 CHECKs the non-empty half.
-    value: { type: 'integer-list', min: 0, nonEmpty: true, distinct: true },
+    // repeats (DECISIONS 61); M1.06 CHECKs the non-empty half. `GET /credits` reads the
+    // longest lead for `expiring_lots`, so a fat finger reaches her screen: a year is
+    // past any lot the seeds sell.
+    value: { type: 'integer-list', min: 0, max: 365, nonEmpty: true, distinct: true },
     inert: LIVE,
   },
   {
     key: 'cred.manual_grant_expiry_months',
     class: 'money',
     store: column('credit_settings', 'manual_grant_expiry_months'),
-    value: atLeast(1),
+    // A hand add stamps a lot from this now (CRED-U14): the same ceiling as
+    // `cred.package_expiry_months`, or a fat finger dates a lot centuries out.
+    value: between(1, 120),
     inert: LIVE,
   },
   {
@@ -449,14 +454,18 @@ const ENTRIES: readonly Entry[] = [
     key: 'cred.returned_credit_expiry_months',
     class: 'money',
     store: column('credit_settings', 'returned_credit_expiry_months'),
-    value: atLeast(0),
+    // A return stamps a lot from this now (CRED-U16): the same ceiling as
+    // `cred.package_expiry_months`, or a fat finger dates a lot centuries out.
+    value: between(0, 120),
     inert: LIVE,
   },
   {
     key: 'cred.single_day_purchase_max_count',
     class: 'ops',
     store: column('credit_settings', 'single_day_purchase_max_count'),
-    value: atLeast(1),
+    // The purchase route reads it, so a fat finger reaches a card: the ceiling is the
+    // old custom-quantity bound, with no row a family could need past it.
+    value: between(1, 100),
     inert: LIVE,
   },
   {
@@ -478,6 +487,14 @@ const ENTRIES: readonly Entry[] = [
     key: 'cred.package_credits_count',
     class: null,
     store: { kind: 'catalog', table: 'credit_packages', where: 'credits, per row' },
+    value: { type: 'catalog' },
+    inert: LIVE,
+    scope: 'package',
+  },
+  {
+    key: 'cred.package_expiry_months',
+    class: 'money',
+    store: { kind: 'catalog', table: 'credit_packages', where: 'expiry_months, per row' },
     value: { type: 'catalog' },
     inert: LIVE,
     scope: 'package',

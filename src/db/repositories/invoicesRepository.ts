@@ -167,6 +167,29 @@ export const invoicesRepository = {
    * surface (POST /invoices/:id/pay) is idempotent by idempotency-key,
    * but defense-in-depth.
    */
+  /**
+   * The order's one invoice, written already paid by the settle of a pack or a top-up: the
+   * money is taken, so there is nothing for it to be open for (design §2.7:3869-3879).
+   * `package_id` and `location` arrive in this same INSERT, so M6.03's CHECK validates
+   * against real rows. Written only while the charge reads `succeeded`, and `ON CONFLICT
+   * (order_id)` infers M3.02's plain unique index: a partial one would answer 42P10 after
+   * Stripe has the money. `paid_at` and `due_at` are both the settle time.
+   */
+  async writePaidForCharge(tx: Tx, args: { chargeId: string; settledAt: Date }): Promise<void> {
+    const at = args.settledAt.toISOString();
+    await tx.execute(sql`
+      INSERT INTO invoices
+        (order_id, owner_id, amount_cents, currency, status, purpose, package_id, location,
+         payment_method_id, paid_charge_id, paid_at, due_at)
+      SELECT c.order_id, c.owner_id, c.amount_cents, c.currency, 'paid', 'package', c.package_id,
+             p.location, c.payment_method_id, c.id, ${at}::timestamptz, ${at}::timestamptz
+        FROM charges c
+        JOIN credit_packages p ON p.id = c.package_id
+       WHERE c.id = ${args.chargeId} AND c.status = 'succeeded'
+      ON CONFLICT (order_id) DO NOTHING
+    `);
+  },
+
   async markPaid(tx: Tx, args: { id: string; paidChargeId: string }): Promise<number> {
     const updated = await tx
       .update(invoices)

@@ -297,6 +297,8 @@ test(
       (n) => n.dedupeKey === `order-cancelled:${seeded.chargeId}`,
     );
     assert.equal(notices.length, 1, 'Payment cancelled');
+    assert.equal(notices[0]?.title, 'Payment cancelled', 'an invoice has no booking to name');
+    assert.equal(notices[0]?.body, "Your $85.00 payment was cancelled, so you weren't charged.");
   },
 );
 

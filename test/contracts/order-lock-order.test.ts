@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, afterEach, test } from 'node:test';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { lockCharge } from '../../src/db/locks.js';
 import { pool } from '../../src/db/pool.js';
@@ -10,25 +10,40 @@ import {
   bookings,
   charges,
   cohorts,
+  dogs,
   idempotencyKeys,
   invoices,
+  orders,
   paymentMethods,
   refunds,
   scheduledNotifications,
+  stripeEvents,
 } from '../../src/db/schema/schema.js';
 import type { EnrollmentWithdrawResultWire } from '../../src/contracts/wire.js';
 import { failChargeInTx, settleChargeInTx } from '../../src/lib/confirmCharge.js';
+import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { registerStaffOrdersRoute } from '../../src/routes/staffOrders.js';
+import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
 import { runOrderSweeperOnce } from '../../src/workers/orderSweeper.js';
-import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { createBookableDog, removeDogs } from './_dayFixture.js';
+import {
+  clearInvoiceReferrers,
+  FIXTURE_IDS,
+  FIXTURE_LOT_EXPIRES_AT,
+  FIXTURE_NOW,
+  FIXTURE_TODAY,
+  futureWeekday,
+} from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
+  makeLogCapture,
   registerFixtureHooks,
+  type LogCapture,
 } from './_harness.js';
 import {
   QUIET_LOG,
@@ -37,23 +52,32 @@ import {
   seedInvoiceOrder,
   seedOpenInvoice,
 } from './_orderFixture.js';
+import { clearPlantedPools, plantLot, poolBalance } from './_poolFixture.js';
+import { signedIntentEvent, verifyingSignatures } from './_signedEvents.js';
 import { makeStripeStub, type StripeStub } from './_stripeStub.js';
 
 /**
  * The one lock order on real connections (`db/locks.ts`, design §2.7:3975): charge, then
- * invoice, then bookings. Each transaction here is its own connection running the repo's
- * own code. A test pauses one in only two ways: it takes the charge lock itself and then
- * calls the real function, which re-takes that lock; or a third connection holds a row
- * the real withdraw needs next. Stripe is the stub, so none of this says anything about
- * real Stripe, and it proves orderings, not how often they happen.
+ * invoice, then bookings, then the pools. Each transaction here is its own connection
+ * running the repo's own code. A test pauses one in only two ways: it takes the charge lock
+ * itself and then calls the real function, which re-takes that lock; or a third connection
+ * holds a row or a pool the real code needs next. Stripe is the stub, so none of this says
+ * anything about real Stripe, and it proves orderings, not how often they happen.
  */
 
+const createdDogs: string[] = [];
 after(async () => {
+  await clearPlantedPools();
   await clearOrderRows();
+  await removeDogs(createdDogs);
 });
 registerFixtureHooks();
 afterEach(async () => {
+  await clearPlantedPools();
   await clearOrderRows();
+  await db.delete(orders).where(eq(orders.ownerId, FIXTURE_IDS.ownerId));
+  await db.delete(stripeEvents);
+  await db.update(dogs).set({ isAlumni: false }).where(inArray(dogs.id, createdDogs));
 });
 
 const T0 = new Date('2026-05-19T17:50:00Z');
@@ -886,3 +910,253 @@ test(
     }
   },
 );
+
+// ── Opus L1: a settle takes every pool the order will touch, at once ────────
+
+const POOL_OF = (tier: 'alumni' | 'regular'): string =>
+  `pool:${FIXTURE_IDS.ownerId}:fayetteville:school:${tier}`;
+
+const alumniBody = (dogId: string, dates: readonly string[]) => ({
+  category: 'day-school',
+  lead_dog_id: dogId,
+  dates,
+  location: 'fayetteville',
+  payment: {
+    kind: 'credits',
+    tier: 'alumni',
+    top_up: {
+      count: 1,
+      payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+      expected_total_cents: 6_000,
+    },
+  },
+});
+
+/**
+ * An alumni top-up on one credit, two days: the debit is in the alumni pool and the bought
+ * single day lands in the regular one. Stripe has the money and nothing here knows yet, so
+ * every settler that reaches this order has both pools to take.
+ */
+async function alumniTopUpStripeHasPaid() {
+  const logs = { owner: makeLogCapture(), staff: makeLogCapture() };
+  const stripe = verifyingSignatures(makeStripeStub());
+  const { app: owner, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL, logs.owner);
+  registerBookingsRoute(owner, { authenticate, stripe, now: FIXTURE_NOW });
+  registerStripeWebhookRoute(owner, { stripe });
+  const { app: staff, authenticate: staffAuth } = makeContractApp(
+    FIXTURE_STAFF_PRINCIPAL,
+    logs.staff,
+  );
+  registerStaffOrdersRoute(staff, { authenticate: staffAuth, stripe, now: FIXTURE_NOW });
+
+  const dogId = await createBookableDog(createdDogs);
+  await db.update(dogs).set({ isAlumni: true }).where(eq(dogs.id, dogId));
+  await plantLot({
+    credits: 1,
+    expiresAt: FIXTURE_LOT_EXPIRES_AT,
+    location: 'fayetteville',
+    tier: 'alumni',
+  });
+  stripe.setNextIntentStatus('processing');
+  const res = await owner.inject({
+    method: 'POST',
+    url: '/bookings',
+    headers: { 'idempotency-key': `lock-order-alumni-${randomUUID()}` },
+    payload: alumniBody(dogId, [futureWeekday(0), futureWeekday(1)]),
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  const { order } = res.json() as { order: { id: string } };
+  const [charge] = await db.select().from(charges).where(eq(charges.orderId, order.id));
+  assert.ok(charge?.stripePaymentIntentId, 'a processing top-up holds its intent');
+  stripe.setIntentState(charge.stripePaymentIntentId, 'succeeded');
+  return {
+    owner,
+    staff,
+    stripe,
+    logs,
+    dogId,
+    orderId: order.id,
+    chargeId: charge.id,
+    intentId: charge.stripePaymentIntentId,
+  };
+}
+
+type AlumniWorld = Awaited<ReturnType<typeof alumniTopUpStripeHasPaid>>;
+
+function cancelOrder(world: AlumniWorld) {
+  return world.staff.inject({
+    method: 'POST',
+    url: `/staff/orders/${world.orderId}/cancel`,
+    headers: { 'idempotency-key': `lock-order-cancel-${randomUUID()}` },
+  });
+}
+
+/** Sit on the order's open claim: `completeOrderClaim` is the settle's last write. */
+async function holdClaimOf(orderId: string) {
+  const client = await pool.connect();
+  await client.query('BEGIN');
+  const { rows } = await client.query<{ pid: number }>('select pg_backend_pid() as pid');
+  const held = await client.query(
+    'SELECT 1 FROM idempotency_keys WHERE order_id = $1 FOR NO KEY UPDATE',
+    [orderId],
+  );
+  assert.equal(held.rowCount, 1, 'the claim of a processing order is open');
+  return {
+    pid: rows[0]!.pid,
+    async release(): Promise<void> {
+      await client.query('ROLLBACK');
+      client.release();
+    },
+  };
+}
+
+/** Sit on one pool, as a holder that got there first. */
+async function holdPool(key: string) {
+  const client = await pool.connect();
+  await client.query('BEGIN');
+  const { rows } = await client.query<{ pid: number }>('select pg_backend_pid() as pid');
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]);
+  return {
+    pid: rows[0]!.pid,
+    async release(): Promise<void> {
+      await client.query('ROLLBACK');
+      client.release();
+    },
+  };
+}
+
+/** Is this pool free right now? Never waits, and gives back what it took. */
+async function poolIsFree(key: string): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query<{ free: boolean }>(
+      'SELECT pg_try_advisory_xact_lock(hashtext($1)) AS free',
+      [key],
+    );
+    return rows[0]!.free;
+  } finally {
+    await client.query('ROLLBACK');
+    client.release();
+  }
+}
+
+/** What Postgres itself said: a deadlock victim's error, in the 500's own log line. */
+function deadlocksIn(...captures: LogCapture[]): unknown[] {
+  return captures
+    .flatMap((capture) => capture.lines)
+    .map((line) => line.err as { code?: string; message?: string } | undefined)
+    .filter((err) => err?.code === '40P01' || /deadlock/.test(err?.message ?? ''));
+}
+
+test(
+  "Opus L1: a cancel's settle against a concurrent alumni top-up, forced in the order that crosses: no 40P01",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const world = await alumniTopUpStripeHasPaid();
+
+    // The cancel runs to the settle's last write and stops there, holding what it took.
+    const claim = await holdClaimOf(world.orderId);
+    let released = false;
+    const openGate = async (): Promise<void> => {
+      if (released) return;
+      released = true;
+      await claim.release();
+    };
+    const cancelling = cancelOrder(world);
+    const inFlight: Promise<unknown>[] = [cancelling];
+    try {
+      const parked = await untilBlockedBy(claim.pid);
+      assert.match(parked.query, /"idempotency_keys"/, 'it reached the claim');
+
+      // Now the other side, which wants alumni and then regular. It queues behind the
+      // settle on whichever pool the settle holds, and only then may the settle go on.
+      const booking = world.owner.inject({
+        method: 'POST',
+        url: '/bookings',
+        headers: { 'idempotency-key': `lock-order-alumni-${randomUUID()}` },
+        payload: alumniBody(world.dogId, [futureWeekday(2), futureWeekday(3)]),
+      });
+      inFlight.push(booking);
+      await untilBlockedBy(parked.pid);
+      await openGate();
+
+      const [cancelled, booked] = await Promise.all([cancelling, booking]);
+
+      assert.deepEqual(
+        deadlocksIn(world.logs.owner, world.logs.staff),
+        [],
+        'Postgres killed neither side',
+      );
+      assert.equal(cancelled.statusCode, 200, cancelled.body);
+      assert.equal(cancelled.json().outcome, 'settled_then_cancelled');
+      assert.equal(booked.statusCode, 201, booked.body);
+      assert.equal(await poolBalance({ location: 'fayetteville', tier: 'alumni' }), 0);
+    } finally {
+      await openGate();
+      await Promise.allSettled(inFlight);
+    }
+  },
+);
+
+const SETTLERS: [string, (world: AlumniWorld) => Promise<unknown>][] = [
+  ['Cancel order', cancelOrder],
+  [
+    'the webhook',
+    (world) => {
+      const event = signedIntentEvent({
+        type: 'payment_intent.succeeded',
+        intentId: world.intentId,
+        ...world.stripe.intentSnapshot(world.intentId),
+      });
+      return world.owner.inject({
+        method: 'POST',
+        url: '/webhooks/stripe',
+        headers: { 'content-type': 'application/json', 'stripe-signature': event.signature },
+        payload: event.payload,
+      });
+    },
+  ],
+  [
+    'the sweeper',
+    (world) =>
+      runOrderSweeperOnce({
+        stripe: world.stripe,
+        now: new Date(FIXTURE_TODAY.getTime() + 60 * 60 * 1000),
+        log: QUIET_LOG,
+      }),
+  ],
+];
+
+for (const [settler, settle] of SETTLERS) {
+  test(
+    `Opus L1: ${settler} settling an alumni top-up reaches for the alumni pool first, with the regular pool untouched`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const world = await alumniTopUpStripeHasPaid();
+      const alumni = await holdPool(POOL_OF('alumni'));
+      let released = false;
+      const letGo = async (): Promise<void> => {
+        if (released) return;
+        released = true;
+        await alumni.release();
+      };
+      const settling = settle(world);
+      try {
+        await untilBlockedBy(alumni.pid);
+        assert.equal(
+          await poolIsFree(POOL_OF('regular')),
+          true,
+          'one lockPools call, in its one order: nothing past the alumni pool is held',
+        );
+        await letGo();
+        await settling;
+        const [charge] = await db.select().from(charges).where(eq(charges.id, world.chargeId));
+        assert.equal(charge?.status, 'succeeded');
+      } finally {
+        await letGo();
+        await Promise.allSettled([settling]);
+      }
+    },
+  );
+}

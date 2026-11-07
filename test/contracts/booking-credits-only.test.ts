@@ -33,21 +33,26 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { clearOrderRows } from './_orderFixture.js';
+import { clearPlantedPools } from './_poolFixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 
 /**
  * Credits are the only tender (R1; wire 4.0.0, P16). `POST /bookings` has no
- * pay-as-you-go and no card arm, `top_up` is typed and refused until P18, and a
+ * pay-as-you-go and no card arm, a `top_up` that does not fit charges nothing, and a
  * booking opens no invoice. `design.md:3816`: "`payg` is never written by v1".
  */
 
 const createdDogs: string[] = [];
 after(async () => {
   await clearOrderRows();
+  await clearPlantedPools();
   await removeDogs(createdDogs);
 });
 registerFixtureHooks();
-afterEach(clearOrderRows);
+afterEach(async () => {
+  await clearOrderRows();
+  await clearPlantedPools();
+});
 
 function buildApp() {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
@@ -65,7 +70,8 @@ function bodyFor(dogIds: readonly string[], dates: readonly string[]) {
     lead_dog_id: lead,
     ...(additional.length > 0 ? { additional_dog_ids: additional } : {}),
     dates,
-    location: 'fayetteville',
+    // Credits are the owner's, and the fixture's are Fayetteville's: this pool starts empty.
+    location: 'bentonville',
   };
 }
 
@@ -87,7 +93,7 @@ function insufficient(res: { body: string; statusCode: number }): InsufficientCr
 
 async function fundedDog(credits: number): Promise<string> {
   const dogId = await createBookableDog(createdDogs);
-  if (credits > 0) await topUpCredits(dogId, 'school', credits, 'fayetteville');
+  if (credits > 0) await topUpCredits(dogId, 'school', credits, 'bentonville');
   return dogId;
 }
 
@@ -112,6 +118,7 @@ const TOP_UP = {
   payment_method_id: FIXTURE_IDS.paymentMethod1Id,
   expected_total_cents: 6_000,
 };
+const REGULAR_POOL = { location: 'bentonville', mode: 'school', tier: 'regular' } as const;
 
 // ── The shape of `payment` ──────────────────────────────────────────────────
 
@@ -161,23 +168,25 @@ for (const [name, payment] of REFUSED_SHAPES) {
 }
 
 test(
-  "POST /bookings: `tier` is accepted and read by nothing, so {kind: 'credits', tier} books as credits",
+  'POST /bookings: `tier` names the pool, regular when omitted, and alumni needs an alumni dog',
   SKIP_WHEN_NO_DB,
   async () => {
     const dogId = await fundedDog(3);
     const { app } = buildApp();
 
-    for (const [offset, tier] of [
-      [1, 'regular'],
-      [2, 'alumni'],
-    ] as const) {
-      const res = await post(app, {
-        ...bodyFor([dogId], [futureWeekday(offset)]),
-        payment: { kind: 'credits', tier },
-      });
-      assert.equal(res.statusCode, 201, res.body);
-    }
-    assert.equal(await balanceOf(dogId), 1);
+    const booked = await post(app, {
+      ...bodyFor([dogId], [futureWeekday(1)]),
+      payment: { kind: 'credits', tier: 'regular' },
+    });
+    assert.equal(booked.statusCode, 201, booked.body);
+
+    const refused = await post(app, {
+      ...bodyFor([dogId], [futureWeekday(2)]),
+      payment: { kind: 'credits', tier: 'alumni' },
+    });
+    assert.equal(refused.statusCode, 422, refused.body);
+    assert.equal(refused.json().error.code, 'alumni_tier_requires_alumni_dog');
+    assert.equal(await balanceOf(dogId), 2);
   },
 );
 
@@ -223,7 +232,7 @@ test(
 // ── The refusal ─────────────────────────────────────────────────────────────
 
 test(
-  'Biscuit holds 1, Waffles holds 2, three dates: shortfall 3, short_dates d2, d3, d3',
+  'two dogs, three dates, one pool of 3: shortfall 3, short_dates d2, d3, d3',
   SKIP_WHEN_NO_DB,
   async () => {
     const biscuit = await fundedDog(1);
@@ -243,38 +252,10 @@ test(
       { date: d3, reason: 'no_credit' },
     ]);
     assert.equal(details.short_dates.length, details.shortfall, 'one entry per missing credit');
-    assert.equal(details.top_up_offer, null);
-    assert.equal('alternative_package_key' in details, false, 'omitted until P18');
-    assert.deepEqual(details.gaps, [
-      { dog_id: biscuit, mode: 'school', balance: 1, required: 3 },
-      { dog_id: waffles, mode: 'school', balance: 2, required: 3 },
-    ]);
+    assert.equal(details.top_up_offer?.count, 3);
+    assert.equal('alternative_package_key' in details, false, 'below the smallest pack');
+    assert.deepEqual(details.gaps, [{ ...REGULAR_POOL, balance: 3, required: 6 }]);
     assert.equal(stripe.calls.length, 0);
-  },
-);
-
-test(
-  'a dog owing credits is one per date nothing pays: short_dates never outruns the dates',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const dogId = await fundedDog(0);
-    await db.insert(creditLedger).values({
-      dogId,
-      mode: 'school',
-      location: 'fayetteville',
-      delta: -2,
-      reason: 'adjustment',
-    });
-    const { app } = buildApp();
-    const dates = [futureWeekday(1), futureWeekday(2)];
-
-    const details = insufficient(
-      await post(app, { ...bodyFor([dogId], dates), payment: { kind: 'credits' } }),
-    );
-
-    assert.equal(details.gaps[0]?.balance, -2, 'gaps keeps what the ledger reads');
-    assert.equal(details.shortfall, 2, 'a date nothing pays is one credit, however deep the debt');
-    assert.equal(details.short_dates.length, 2);
   },
 );
 
@@ -317,7 +298,7 @@ test(
 );
 
 test(
-  'a body with top_up and short: 422 with the current shortfall and top_up_offer null, no order',
+  'a top_up whose total is not the sheet the dates need: 422 with the current shortfall and offer, no order',
   SKIP_WHEN_NO_DB,
   async () => {
     const dogId = await fundedDog(1);
@@ -336,7 +317,7 @@ test(
       details.short_dates.map((s) => s.date),
       [d2, d3],
     );
-    assert.equal(details.top_up_offer, null);
+    assert.equal(details.top_up_offer?.count, 2);
     await assertNothingWritten(dogId, 1);
     assert.equal(stripe.calls.length, 0);
   },

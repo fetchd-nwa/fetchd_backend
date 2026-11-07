@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# `scripts/migrate-rehearse.sh [--base <git-ref>] [--leave-out <step_id>] [--plant-staff-row]`
+# `scripts/migrate-rehearse.sh [--base <git-ref>] [--leave-out <step_id>] [--plant-staff-row]
+# [--plant-never-expiring-lot] [--list-steps]`
 # (`npm run migrate:rehearse -- …`) — rehearse a landing group's migration steps
 # on a throwaway database and prove they produce exactly the schema of record.
 # Design §4 preamble ("The rehearsal"), DECISIONS 51 and 52; S01.
@@ -20,9 +21,15 @@
 #      and every group after LG1 would fail the check in 5 for a grant it
 #      never made (P05, X21's neighbour);
 #   3. applies every step file that is new since the base — `migrations/**/
-#      <step_id>_*.sql` in the working tree, absent at the base — in step order,
-#      each through `npm run migrate:apply` (`--project local`), so the bytes the
-#      rehearsal sends are the bytes production will receive;
+#      <step_id>_*.sql` in the working tree, absent at the base — in the order
+#      production receives them, each through `npm run migrate:apply`
+#      (`--project local`), so the bytes the rehearsal sends are the bytes
+#      production will receive. That order is step order (M<major>.<minor>,
+#      compared numerically) unless the group's directory holds an APPLIED_ORDER
+#      file, one step id a line, which replaces it for that group: LG4's steps
+#      land in pass order (build plan P18 `migrations_note`), M4.07 after M4.12
+#      and M4.09 after it. A step the file does not name is refused rather than
+#      guessed at, and so is a name it holds twice;
 #   4. database `reference`: a fresh load of the WORKING TREE's schema.sql;
 #   5. asserts the privileges (DECISIONS 68, 71): after the steps, `anon`,
 #      `authenticated` and PUBLIC hold no privilege on any relation the group
@@ -35,8 +42,12 @@
 #      holds none, so the group must not grant them back;
 #   6. runs `scripts/db/fingerprint.sql` (a copy of
 #      product/rebuild/phase-2/db/fingerprint.sql) against both and requires
-#      0 differences. Any difference, failed assertion or failed step exits
-#      non-zero.
+#      0 differences;
+#   7. compares the reference-data rows of REFERENCE_DATA_TABLES in both, every
+#      column but the ones a load stamps, and requires 0 differences: the
+#      fingerprint reads no rows, so a step that only seeds (M4.06) would
+#      otherwise be left out with nothing going red. Any difference, failed
+#      assertion or failed step exits non-zero.
 #
 # --base defaults to the newest `v1-lg*-close` tag (DECISIONS 52: today
 # `v1-lg1-close`); never `main`, which moves only at milestone ends.
@@ -54,9 +65,18 @@
 # it applied. The rehearsal never passes `--skip-census`: the gate binds here
 # exactly as it binds production.
 #
+# --plant-never-expiring-lot inserts one owner, one dog and one credit grant with no
+# `expires_at`, in the base's dog-keyed shape, right after the base load: a database that
+# still holds the class M4.09 retires. The run must then stop at M4.09's VALIDATE, with
+# 23514 naming `grant_has_expiry`, the step rolled back, and exit 1, because the design
+# validates after the dev cleanup, so an uncleaned ledger cannot take the step.
+#
+# --list-steps prints the steps this run would apply, in order, and exits before
+# Docker: what a test reads to prove the order.
+#
 # Not part of `npm run gate`: it runs per landing group between GATE GREEN and
-# merge. Needs Docker. What it cannot prove: seed rows (the fingerprint reads
-# none); grants on the tables that predate the group (the base load carries
+# merge. Needs Docker. What it cannot prove: rows outside REFERENCE_DATA_TABLES
+# (the fingerprint reads none); grants on the tables that predate the group (the base load carries
 # none — production's 57 wait for its reading, DECISIONS 51/68); or that
 # production's real default privileges match the stock ones replayed here.
 # Removing one step's per-table REVOKE alone does NOT go red here, by design:
@@ -71,11 +91,15 @@ cd "$(dirname "$0")/.." || exit 1
 BASE=""
 LEAVE_OUT=""
 PLANT_STAFF_ROW=""
+PLANT_NEVER_EXPIRING=""
+LIST_STEPS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) BASE="${2:?--base needs a git ref}"; shift 2 ;;
     --leave-out) LEAVE_OUT="${2:?--leave-out needs a step id}"; shift 2 ;;
     --plant-staff-row) PLANT_STAFF_ROW=1; shift ;;
+    --plant-never-expiring-lot) PLANT_NEVER_EXPIRING=1; shift ;;
+    --list-steps) LIST_STEPS=1; shift ;;
     *) echo "migrate-rehearse: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -98,7 +122,8 @@ BASE_SHA=$(git rev-parse --verify --quiet "$BASE^{commit}") || {
 }
 
 # The group's steps: every step file in the working tree that the base lacks,
-# in step order (M<major>.<minor>, compared numerically).
+# in step order (M<major>.<minor>, compared numerically). A group's APPLIED_ORDER
+# reorders it below.
 STEPS=()
 while IFS= read -r file; do
   [ -n "$file" ] && STEPS+=("$file")
@@ -109,6 +134,41 @@ done < <(
     awk -F/ '{ name=$NF; split(substr(name, 2), v, /[._]/); printf "%06d %06d %s\n", v[1], v[2], $0 }' |
     sort -k1,1n -k2,2n | cut -d' ' -f3-
 )
+# The position of one step id in an APPLIED_ORDER file (blank lines and `#`
+# comments skipped), or nothing if the file does not name it.
+applied_position() {
+  grep -v -e '^#' -e '^[[:space:]]*$' "$1" | grep -n -x -F -- "$2" | cut -d: -f1
+}
+if [ ${#STEPS[@]} -gt 0 ]; then
+  KEYED=()
+  for file in "${STEPS[@]}"; do
+    name=$(basename "$file")
+    step_id=${name%%_*}
+    major=${step_id#M}
+    major=${major%%.*}
+    minor=${step_id#*.}
+    order_file="$(dirname "$file")/APPLIED_ORDER"
+    if [ -f "$order_file" ]; then
+      # grep exits 1 on no match, which `set -e` would turn into a silent stop.
+      position=$(applied_position "$order_file" "$step_id" || true)
+      case "$position" in
+        '')
+          echo "migrate-rehearse: $file is a step $order_file does not name: place it there" >&2
+          exit 2 ;;
+        *[!0-9]*)
+          echo "migrate-rehearse: $order_file names $step_id more than once" >&2
+          exit 2 ;;
+      esac
+    else
+      position=$minor
+    fi
+    KEYED+=("$(printf '%06d %06d %s' "$((10#$major))" "$((10#$position))" "$file")")
+  done
+  STEPS=()
+  while IFS= read -r file; do
+    STEPS+=("$file")
+  done < <(printf '%s\n' "${KEYED[@]}" | sort -k1,1n -k2,2n | cut -d' ' -f3-)
+fi
 if [ ${#STEPS[@]} -eq 0 ]; then
   echo "migrate-rehearse: no step files are new since $BASE — nothing to rehearse" >&2
   exit 1
@@ -123,6 +183,11 @@ if [ -n "$LEAVE_OUT" ]; then
     exit 2
   fi
   STEPS=(${KEPT[@]+"${KEPT[@]}"})
+fi
+
+if [ -n "$LIST_STEPS" ]; then
+  printf '%s\n' ${STEPS[@]+"${STEPS[@]}"}
+  exit 0
 fi
 
 CONTAINER="fetchd-rehearse-$$"
@@ -196,6 +261,21 @@ SQL
   echo "migrate-rehearse: planted one staff row in the production-shaped copy — M1.19's census gate must stop the run"
 fi
 
+if [ -n "$PLANT_NEVER_EXPIRING" ]; then
+  psql_in rehearsal <<'SQL'
+WITH owner AS (
+  INSERT INTO owners (supabase_uid, email) VALUES (gen_random_uuid(), 'lot-probe@example.com')
+  RETURNING id
+), dog AS (
+  INSERT INTO dogs (owner_id, name, breed, birthdate)
+  SELECT id, 'Lot Probe', 'Mutt', '2023-01-01' FROM owner RETURNING id
+)
+INSERT INTO credit_ledger (dog_id, mode, location, delta, reason)
+SELECT id, 'school', 'fayetteville', 5, 'purchase' FROM dog;
+SQL
+  echo "migrate-rehearse: planted one never-expiring lot in the production-shaped copy — M4.09's VALIDATE must stop the run"
+fi
+
 psql_value rehearsal <<< "$RELATIONS_SQL" > "$WORK/relations-before.txt"
 psql_value rehearsal <<< "$FUNCTIONS_SQL" | sort > "$WORK/functions-before.txt"
 
@@ -262,4 +342,26 @@ if [ "$COUNT" -ne 0 ]; then
   echo "migrate-rehearse: FAILED — the steps do not produce the schema of record" >&2
   exit 1
 fi
-echo "migrate-rehearse: 0 differences across $OBJECTS fingerprinted objects — the steps produce the schema of record"
+
+# The fingerprint reads no rows (see 7 in the header). A table goes here when a
+# step seeds reference data into it. `id` is left out because M4.06's rows take
+# gen_random_uuid(), and the stamped columns because the two loads ran at
+# different moments.
+REFERENCE_DATA_TABLES="credit_packages service_rates"
+reference_rows() {
+  for table in $REFERENCE_DATA_TABLES; do
+    psql_value "$1" <<< "SELECT '$table', t::text FROM (SELECT to_jsonb(r) - 'id' - 'created_at' - 'updated_at' AS t FROM $table r) s ORDER BY 2"
+  done
+}
+reference_rows rehearsal > "$WORK/rehearsal-rows.txt"
+reference_rows reference > "$WORK/reference-rows.txt"
+ROW_DIFF=$(diff "$WORK/reference-rows.txt" "$WORK/rehearsal-rows.txt" || true)
+ROW_COUNT=$(printf '%s\n' "$ROW_DIFF" | grep -c '^[<>]' || true)
+ROWS=$(wc -l < "$WORK/reference-rows.txt" | tr -d ' ')
+if [ "$ROW_COUNT" -ne 0 ]; then
+  echo "migrate-rehearse: $ROW_COUNT reference-data row(s) differ (< schema.sql of record, > base + steps):" >&2
+  printf '%s\n' "$ROW_DIFF" | grep '^[<>]' >&2
+  echo "migrate-rehearse: FAILED — the steps do not produce the reference data of record" >&2
+  exit 1
+fi
+echo "migrate-rehearse: 0 differences across $OBJECTS fingerprinted objects and $ROWS reference-data rows ($REFERENCE_DATA_TABLES) — the steps produce the schema of record"

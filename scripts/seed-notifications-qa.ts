@@ -34,6 +34,7 @@ import {
   bookingDogs,
   bookings,
   charges,
+  creditLedger,
   idempotencyKeys,
   invoices,
   notificationDogs,
@@ -74,6 +75,7 @@ const BASE = {
   threadAllisonId: '7a700000-0000-4000-8000-000000000001',
   paymentMethodAllisonId: 'b00a0000-0000-4000-8000-000000000001',
   invoiceOpenId: '12005000-0000-4000-8000-000000000001',
+  lotAllisonSchoolId: '10700000-0000-4000-8000-000000000001',
   annYappyHourId: 'a11c0000-0000-4000-8000-000000000002',
 } as const;
 
@@ -251,7 +253,7 @@ const QA_NOTIFICATIONS: readonly QaNotification[] = [
     type: 'credits-expiring',
     title: 'Your credits are expiring soon',
     body: 'You have 4 credits expiring soon — book a session before they’re gone.',
-    deepLinkPath: deepLinkToPath({ kind: 'credits', id: BASE.dogWafflesId }),
+    deepLinkPath: deepLinkToPath({ kind: 'credits' }),
     deepLinkKind: 'credits',
     deepLinkId: BASE.dogWafflesId,
     dogIds: [BASE.dogWafflesId],
@@ -321,6 +323,7 @@ const BORROWED_FROM_SEED_DEV: ReadonlyArray<{ what: string; table: string; id: s
   { what: 'dog Waffles', table: 'dogs', id: BASE.dogWafflesId },
   { what: 'dog Lola', table: 'dogs', id: BASE.dogLolaId },
   { what: "Waffles' day-school booking", table: 'bookings', id: BASE.bookingWafflesSchoolId },
+  { what: "Allison's day-school lot", table: 'credit_ledger', id: BASE.lotAllisonSchoolId },
   { what: "Allison's thread", table: 'threads', id: BASE.threadAllisonId },
   { what: "Allison's card", table: 'payment_methods', id: BASE.paymentMethodAllisonId },
   { what: 'the open invoice', table: 'invoices', id: BASE.invoiceOpenId },
@@ -381,7 +384,9 @@ async function assertEveryTypeCovered(): Promise<void> {
     );
   }
 
-  const staleExemptions = parked.filter((label) => !inDatabase.includes(label) || covered.has(label));
+  const staleExemptions = parked.filter(
+    (label) => !inDatabase.includes(label) || covered.has(label),
+  );
   if (staleExemptions.length > 0) {
     throw new Error(
       `UNSEEDABLE_TYPES is stale for: ${staleExemptions.join(', ')} — ` +
@@ -445,6 +450,18 @@ async function seedNotificationSubjects(): Promise<void> {
     { bookingId: QA.bookingCancelledId, dogId: BASE.dogLolaId, isLead: true },
     { bookingId: QA.bookingTomorrowId, dogId: BASE.dogWafflesId, isLead: true },
   ]);
+  // A day school day spends a credit: this one comes off the lot `seed-dev` bought her.
+  await db.insert(creditLedger).values({
+    ownerId: BASE.ownerAllisonId,
+    dogId: BASE.dogWafflesId,
+    location: 'fayetteville',
+    mode: 'school',
+    tier: 'regular',
+    delta: -1,
+    reason: 'booking-debit',
+    bookingId: QA.bookingTomorrowId,
+    lotId: BASE.lotAllisonSchoolId,
+  });
 
   // "Payment received" needs a PAID invoice and the charge that settled it —
   // the paid-invoice modal derives its card + paid date from that link.
@@ -542,9 +559,7 @@ async function clearPriorQaRows(): Promise<void> {
     `DELETE FROM notification_dogs
       WHERE notification_id::text LIKE '${QA_NOTIFICATION_ID_PREFIX}%'`,
   );
-  await db.execute(
-    `DELETE FROM notifications WHERE id::text LIKE '${QA_NOTIFICATION_ID_PREFIX}%'`,
-  );
+  await db.execute(`DELETE FROM notifications WHERE id::text LIKE '${QA_NOTIFICATION_ID_PREFIX}%'`);
   await db.delete(reports).where(inArray(reports.id, [QA.reportWafflesId]));
   // A QA invoice someone paid in the app has orders pointing at it, and those orders are
   // pointed at in turn (M3.02), so they go first or the delete below raises 23503.
@@ -576,6 +591,9 @@ async function clearPriorQaRows(): Promise<void> {
         inArray(charges.bookingId, [QA.bookingCancelledId, QA.bookingTomorrowId]),
       ),
     );
+  await db
+    .delete(creditLedger)
+    .where(inArray(creditLedger.bookingId, [QA.bookingCancelledId, QA.bookingTomorrowId]));
   await db
     .delete(bookingDogs)
     .where(inArray(bookingDogs.bookingId, [QA.bookingCancelledId, QA.bookingTomorrowId]));

@@ -86,12 +86,13 @@ async function seedLedger(): Promise<void> {
   ]);
   await db.insert(creditLedger).values([
     {
-      dogId: FIXTURE_IDS.dog1Id,
+      ownerId: FIXTURE_IDS.ownerId,
       mode: 'school',
       location: 'fayetteville',
       delta: 10,
       reason: 'purchase',
       chargeId: LEDGER.chargePackageId,
+      expiresAt: '2036-01-01T00:00:00.000Z',
     },
   ]);
   await db.insert(invoices).values([
@@ -148,16 +149,15 @@ test(
     // Pending (requires_payment) charge is not a ledger line.
     assert.equal(entries.has(LEDGER.chargePendingId), false);
 
-    // Package charge → credit-pack with dog + mode from the credit_ledger grant.
-    // A DIRECT paid charge (no invoice link): settled by card, settle time is
-    // the charge's own created_at, and NO card chip is recoverable.
+    // Package charge → credit-pack with mode from the credit_ledger grant, and no dog:
+    // credits are the owner's. A paid charge with no invoice link: settled by card, settle
+    // time is the charge's own created_at, and NO card chip is recoverable.
     assert.deepEqual(entries.get(LEDGER.chargePackageId), {
       id: LEDGER.chargePackageId,
       kind: 'credit-pack',
       status: 'paid',
       amount_cents: 40_500,
       date: '2026-04-01T15:00:00.000Z',
-      dog_id: FIXTURE_IDS.dog1Id,
       mode: 'school',
       settled_method: 'card',
       settled_at: '2026-04-01T15:00:00.000Z',
@@ -285,6 +285,38 @@ async function seedGroupClassLedger(): Promise<void> {
     },
   ]);
 }
+
+test(
+  'a second ledger row carrying the charge leaves one line: only the grant joins',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await cleanupLedger();
+    await seedLedger();
+    try {
+      const [lot] = await db
+        .select({ id: creditLedger.id })
+        .from(creditLedger)
+        .where(eq(creditLedger.chargeId, LEDGER.chargePackageId));
+      await db.insert(creditLedger).values({
+        ownerId: FIXTURE_IDS.ownerId,
+        mode: 'school',
+        location: 'fayetteville',
+        delta: -1,
+        reason: 'adjustment',
+        note: 'a correction naming the charge',
+        chargeId: LEDGER.chargePackageId,
+        lotId: lot?.id,
+      });
+
+      const res = await buildApp().inject({ method: 'GET', url: '/invoices' });
+      assert.equal(res.statusCode, 200, res.body);
+      const rows = res.json() as LedgerEntryWire[];
+      assert.equal(rows.filter((r) => r.id === LEDGER.chargePackageId).length, 1, 'one line');
+    } finally {
+      await cleanupLedger();
+    }
+  },
+);
 
 test(
   'GET /invoices — a group-class row carries its own dog and its class name (Q16)',

@@ -1,38 +1,49 @@
 import { deepLinkToPath } from '../contracts/wire.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import { lockPools } from '../db/locks.js';
+import {
+  creditLedgerRepository,
+  type BookingDebitForRefund,
+} from '../db/repositories/creditLedgerRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import type { Tx } from '../db/tx.js';
 import type { ServiceCategory } from './bookingBucket.js';
 import { noticeInSavepoint, type NoticeLog } from './noticeInSavepoint.js';
 
+/** Every debit on these rows, with the row it paid. Each debit names its own pool. */
+export async function findDebitsOfRows(
+  tx: Tx,
+  bookingIds: readonly string[],
+): Promise<(BookingDebitForRefund & { bookingId: string })[]> {
+  const debits: (BookingDebitForRefund & { bookingId: string })[] = [];
+  // One at a time: a transaction is one connection.
+  for (const bookingId of bookingIds) {
+    const found = await creditLedgerRepository.findDebitsForBooking(tx, bookingId);
+    debits.push(...found.map((debit) => ({ ...debit, bookingId })));
+  }
+  return debits;
+}
+
 /**
- * Return every credit one booking row debited, each to the lot it drew from (or a
- * fresh lot if that lot has since expired). `now` is the caller's cancel instant, so
- * the lot the refund lands in is dated by the same clock as the cancel.
+ * Return every credit these rows debited, each to the lot it drew from, or a fresh lot if
+ * that lot can pay no later date. `now` is the caller's cancel instant, so a fresh lot is
+ * dated by the same clock as the cancel. The caller holds the rows, so this takes the
+ * pools after them, all at once, in `lockPools`' one order (`db/locks.ts`).
  *
- * Returns the distinct dogs credited, or nothing if this row debited nothing.
+ * Returns the owner credited, whose balance cache the caller wipes post-commit, or nothing
+ * if these rows debited nothing.
  */
 export async function returnDebitsToLots(
   tx: Tx,
-  args: { bookingId: string; now: Date },
-): Promise<string[]> {
-  const debits = await creditLedgerRepository.findDebitsForBooking(tx, args.bookingId);
-  const creditedDogIds = new Set<string>();
+  args: { bookingIds: readonly string[]; now: Date },
+): Promise<string | undefined> {
+  const debits = await findDebitsOfRows(tx, args.bookingIds);
+  await lockPools(tx, debits);
   for (const debit of debits) {
-    creditedDogIds.add(debit.dogId);
-    await creditLedgerRepository.refundForBooking(tx, {
-      dogId: debit.dogId,
-      mode: debit.mode,
-      location: debit.location,
-      bookingId: args.bookingId,
-      lotId: debit.lotId,
-      lotExpiresAt: debit.lotExpiresAt,
-      now: args.now,
-    });
+    await creditLedgerRepository.refundForBooking(tx, { ...debit, now: args.now });
   }
-  return [...creditedDogIds];
+  return debits[0]?.ownerId;
 }
 
 /**
@@ -133,8 +144,8 @@ export async function noticeBookingCancelled(
 export interface CancelledOrderRows {
   bookingIds: string[];
   location: string | null;
-  /** Distinct dogs credited back: the caller wipes their balance cache post-commit. */
-  creditRefundedDogIds: string[];
+  /** The owner credited back, if any was: the caller wipes her balance cache post-commit. */
+  creditRefundedOwnerId?: string;
 }
 
 /**
@@ -162,7 +173,6 @@ export async function cancelOrderRowsInTx(
   },
 ): Promise<CancelledOrderRows> {
   const rows = await bookingsRepository.lockCancellableByOrderId(tx, args.orderId);
-  const dogIds = new Set<string>();
   for (const row of rows) {
     await bookingsRepository.markOrderRowCancelled(tx, {
       id: row.id,
@@ -170,9 +180,6 @@ export async function cancelOrderRowsInTx(
       ...(args.cancelReason !== undefined ? { cancelReason: args.cancelReason } : {}),
       now: args.now,
     });
-    for (const dogId of await returnDebitsToLots(tx, { bookingId: row.id, now: args.now })) {
-      dogIds.add(dogId);
-    }
     await tearDownBookingReminders(tx, row.id);
     if (args.notifyEachRow) {
       await noticeBookingCancelled(tx, {
@@ -185,9 +192,13 @@ export async function cancelOrderRowsInTx(
       });
     }
   }
+  const creditRefundedOwnerId = await returnDebitsToLots(tx, {
+    bookingIds: rows.map((r) => r.id),
+    now: args.now,
+  });
   return {
     bookingIds: rows.map((r) => r.id),
     location: rows[0]?.location ?? null,
-    creditRefundedDogIds: [...dogIds],
+    ...(creditRefundedOwnerId !== undefined ? { creditRefundedOwnerId } : {}),
   };
 }

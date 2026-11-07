@@ -82,8 +82,8 @@ function createInvoice(tx: Tx, purpose: string): Promise<unknown> {
 
 function insertLedgerRow(tx: Tx, reason: string): Promise<unknown> {
   return tx.execute(sql`
-    INSERT INTO credit_ledger (dog_id, mode, location, delta, reason)
-    VALUES (${FIXTURE_IDS.dog1Id}, 'school', 'fayetteville', 1, ${reason}::ledger_reason)
+    INSERT INTO credit_ledger (owner_id, mode, location, delta, reason, note, expires_at)
+    VALUES (${FIXTURE_IDS.ownerId}, 'school', 'fayetteville', 1, ${reason}::ledger_reason, 'why', '2036-01-01')
   `);
 }
 

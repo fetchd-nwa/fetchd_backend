@@ -31,7 +31,10 @@
  *
  * Re-runnable: wipes the managed tables in child→parent FK order, then inserts.
  */
-import { and, inArray, isNotNull, like, not } from 'drizzle-orm';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+import { and, eq, inArray, isNotNull, like, ne, not, sql } from 'drizzle-orm';
 
 import { db } from '../src/db/client.js';
 import { env } from '../src/env.js';
@@ -46,6 +49,7 @@ import {
   classResources,
   cohorts,
   creditLedger,
+  creditLotExpiryEdits,
   creditPackages,
   dogCompletedClasses,
   dogCompletedPrograms,
@@ -76,6 +80,7 @@ import {
 } from '../src/db/schema/schema.js';
 import { CURRICULUM_PROGRAMS } from '../src/lib/alumni.js';
 import { computeDayProgramScheduledAt } from '../src/lib/bookingSchedule.js';
+import { addChicagoMonths } from '../src/lib/creditExpiry.js';
 
 function assertLocalDb(): void {
   const url = env.DATABASE_URL;
@@ -97,6 +102,10 @@ function safeHost(rawUrl: string): string {
 }
 
 import { SEED } from './seed-ids.js';
+
+const CATALOG_SEED_STEP = fileURLToPath(
+  new URL('../migrations/lg4/M4.06_seed_ten_credit_packages.sql', import.meta.url),
+);
 
 function daysFromNow(days: number, hour = 14): string {
   const d = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
@@ -174,9 +183,12 @@ async function wipe(): Promise<void> {
   // (invoices.payment_method_id).
   await db.delete(refunds);
   await db.delete(invoices);
+  await db.delete(creditLotExpiryEdits);
   await db.delete(creditLedger);
-  await db.delete(creditPackages);
   await db.delete(charges);
+  await db.delete(creditPackages);
+  // Only the evaluation is a rate now: a day is a credit, and an older seed's rows are not.
+  await db.delete(serviceRates).where(ne(serviceRates.category, 'evaluation'));
   await db.delete(bookingDogs);
   await db.delete(bookings);
   // cohorts are referenced by bookings.cohort_id (deleted above); group_classes
@@ -259,6 +271,66 @@ async function restoreRealStripeRows({ customers, cards }: RealStripeRows): Prom
       );
   }
   await db.insert(paymentMethods).values(cards);
+}
+
+/** One pack bought on the engine: the order, its charge, the paid invoice and the lot. */
+async function seedBoughtPack(args: {
+  key: string;
+  ownerId: string;
+  paymentMethodId: string;
+  orderId: string;
+  chargeId: string;
+  invoiceId: string;
+  lotId: string;
+  boughtAt: string;
+}) {
+  const { key, ownerId, paymentMethodId, orderId, chargeId, invoiceId, lotId, boughtAt } = args;
+  const [pack] = await db.select().from(creditPackages).where(eq(creditPackages.key, key));
+  if (pack === undefined) throw new Error(`the catalog holds no ${key}`);
+
+  await db.insert(orders).values({ id: orderId, ownerId, createdAt: boughtAt });
+  await db.insert(charges).values({
+    id: chargeId,
+    ownerId,
+    orderId,
+    amountCents: pack.priceCents,
+    status: 'succeeded',
+    purpose: 'package',
+    packageId: pack.id,
+    creditsCount: pack.credits,
+    paymentMethodId,
+    stripePaymentIntentId: `pi_seed_${key}`,
+    createdAt: boughtAt,
+  });
+  await db.insert(invoices).values({
+    id: invoiceId,
+    ownerId,
+    orderId,
+    amountCents: pack.priceCents,
+    status: 'paid',
+    purpose: 'package',
+    packageId: pack.id,
+    location: pack.location,
+    paymentMethodId,
+    paidChargeId: chargeId,
+    paidAt: boughtAt,
+    issuedAt: boughtAt,
+    dueAt: boughtAt,
+  });
+  await db.insert(creditLedger).values({
+    id: lotId,
+    ownerId,
+    location: pack.location,
+    mode: pack.mode,
+    tier: pack.tier,
+    delta: pack.credits,
+    reason: 'purchase',
+    packageId: pack.id,
+    chargeId,
+    expiresAt: addChicagoMonths(new Date(boughtAt), pack.expiryMonths).toISOString(),
+    createdAt: boughtAt,
+  });
+  return { lotId, ownerId, location: pack.location, mode: pack.mode, tier: pack.tier };
 }
 
 async function seed(): Promise<void> {
@@ -365,150 +437,9 @@ async function seed(): Promise<void> {
     },
   ]);
 
-  // Credit-package catalog — real NWA pricing from the Gingr portal (Δ
-  // 2026-06-13). Fayetteville + Bentonville carry the identical set; staff will
-  // edit/add/remove packages via the portal post-launch, so this is the launch
-  // catalog, not a fixed source of truth. Multi-credit packs (credits > 1)
-  // expire 1 year after purchase — enforced by the deferred credit-expiry task;
-  // the single-day pack (1 credit) never expires.
-  const creditPackageCatalog = [
-    {
-      key: 'school-2x-weekly',
-      mode: 'school',
-      credits: 8,
-      priceCents: 45600,
-      label: '2x Weekly Package',
-      isPopular: false,
-    },
-    {
-      key: 'school-3x-weekly',
-      mode: 'school',
-      credits: 12,
-      priceCents: 64800,
-      label: '3x Weekly Package',
-      isPopular: true,
-    },
-    {
-      key: 'school-5x-weekly',
-      mode: 'school',
-      credits: 20,
-      priceCents: 102000,
-      label: '5x Weekly Package',
-      isPopular: false,
-    },
-    {
-      key: 'school-alumni-10',
-      mode: 'school',
-      credits: 10,
-      priceCents: 32000,
-      label: 'Alumni — 10 Visits',
-      isPopular: false,
-    },
-    {
-      key: 'daycare-10',
-      mode: 'daycare',
-      credits: 10,
-      priceCents: 35000,
-      label: 'Day Care Package',
-      isPopular: false,
-    },
-    // Day Care tiers mirroring the Day School lineup so over-credits / top-up
-    // works the same for day care (single-day to fill an exact gap, weekly packs).
-    // Priced at the $35/visit rate the 10-pack implies — launch placeholders,
-    // staff adjust via the portal.
-    {
-      key: 'daycare-single-day',
-      mode: 'daycare',
-      credits: 1,
-      priceCents: 3500,
-      label: 'Single Day Care',
-      isPopular: false,
-    },
-    {
-      key: 'daycare-2x-weekly',
-      mode: 'daycare',
-      credits: 8,
-      priceCents: 28000,
-      label: '2x Weekly Day Care',
-      isPopular: false,
-    },
-    {
-      key: 'daycare-3x-weekly',
-      mode: 'daycare',
-      credits: 12,
-      priceCents: 42000,
-      label: '3x Weekly Day Care',
-      isPopular: true,
-    },
-    {
-      key: 'daycare-5x-weekly',
-      mode: 'daycare',
-      credits: 20,
-      priceCents: 70000,
-      label: '5x Weekly Day Care',
-      isPopular: false,
-    },
-    {
-      key: 'school-single-day',
-      mode: 'school',
-      credits: 1,
-      priceCents: 6000,
-      label: 'Single Day School',
-      isPopular: false,
-    },
-  ] as const;
-  await db.insert(creditPackages).values(
-    (['fayetteville', 'bentonville'] as const).flatMap((location) =>
-      creditPackageCatalog.map((pkg) => ({
-        key: pkg.key,
-        location,
-        mode: pkg.mode,
-        credits: pkg.credits,
-        priceCents: pkg.priceCents,
-        label: pkg.label,
-        isPopular: pkg.isPopular,
-      })),
-    ),
-  );
-
-  // Day-program PAYG rates — the per-day price a pay-as-you-go (non-credit)
-  // day-school / day-care booking is charged (DATA-CONTRACT §B rates + the
-  // 2026-06-19 PAYG amendment). Per-location: real NWA pricing is TBD and WILL
-  // differ between locations; until staff set it via the portal (TODO: per-
-  // location service-rate editor), these are launch placeholders — Fayetteville
-  // base + a flat Bentonville premium. Without a row a real-mode PAYG booking
-  // (and `GET /rates`) 404s. School base matches the single-day pack ($60); day
-  // care is a small premium over the 10-pack's per-day rate ($35 → $40).
-  // The evaluation's two rows are schema.sql's own seed (M3.05): this script
-  // leaves them alone. It deletes no `service_rates` row, and the four below
-  // have no fixed ids, so each run appends four more.
-  const BENTONVILLE_PAYG_PREMIUM_CENTS = 500;
-  const dayProgramRateBases = [
-    { category: 'day-school' as const, amountCents: 6000 },
-    { category: 'day-care' as const, amountCents: 4000 },
-  ];
-  await db.insert(serviceRates).values(
-    dayProgramRateBases.flatMap((base) => [
-      {
-        category: base.category,
-        location: 'fayetteville' as const,
-        amountCents: base.amountCents,
-        unit: 'per-day' as const,
-        effectiveFrom: '2025-01-01',
-        effectiveTo: null,
-        note: `PAYG ${base.category} rate, Fayetteville (launch placeholder)`,
-      },
-      {
-        category: base.category,
-        location: 'bentonville' as const,
-        amountCents: base.amountCents + BENTONVILLE_PAYG_PREMIUM_CENTS,
-        unit: 'per-day' as const,
-        effectiveFrom: '2025-01-01',
-        effectiveTo: null,
-        note: `PAYG ${base.category} rate, Bentonville (launch placeholder, +$5)`,
-      },
-    ]),
-  );
+  // The ten rows of the catalog, from M4.06's own statement, so this seed and a migrated
+  // database hold one catalog. Each row names its campus, program and tier.
+  await db.execute(sql.raw(readFileSync(CATALOG_SEED_STEP, 'utf8')));
 
   await db.insert(dogs).values([
     {
@@ -528,6 +459,8 @@ async function seed(): Promise<void> {
       // Shanthi 2026-07-14: all seed dogs are fixed, so the spay/neuter refusal
       // (S11) will not refuse a demo family when it lands.
       spayedNeutered: true,
+      // Stored since M4.11: she holds all five curriculum levels, seeded below.
+      isAlumni: true,
     },
     {
       id: SEED.dogLolaId,
@@ -745,9 +678,9 @@ async function seed(): Promise<void> {
   // hasn't → enrolling Waffles in Manners 2 fires the prereq gate. Demos both
   // sides of the R7 eligibility check for Allison.
   await db.insert(dogCompletedClasses).values([{ dogId: SEED.dogLolaId, classKey: 'manners-1' }]);
-  // §J.3 alumni demo: Waffles has all 5 day-school curriculum programs →
-  // alumni is DERIVED true and the dog-profile hero shows the badge. Her credits
-  // expire like anyone's (ALUM-U16), so her seeded lot carries an expiry.
+  // §J.3 alumni demo: Waffles has all 5 day-school curriculum programs, her row says so
+  // (M4.11), and the dog-profile hero shows the badge. Her credits expire like anyone's
+  // (ALUM-U16).
   await db.insert(dogCompletedPrograms).values(
     CURRICULUM_PROGRAMS.map((program) => ({
       dogId: SEED.dogWafflesId,
@@ -908,14 +841,6 @@ async function seed(): Promise<void> {
   // real mode with one row per FE kind/status. (`GET /invoices`, Day-19d.)
   await db.insert(charges).values([
     {
-      id: SEED.chargePackageId,
-      ownerId: SEED.ownerAllisonId,
-      amountCents: 40500,
-      status: 'succeeded',
-      purpose: 'package',
-      createdAt: daysFromNow(-30, 15),
-    },
-    {
       // Refunded group-class charge — exercises the 'refunded' status + the
       // purpose-derived category for a charge with no booking link.
       id: SEED.chargeRefundedId,
@@ -926,21 +851,55 @@ async function seed(): Promise<void> {
       createdAt: daysFromNow(-25, 15),
     },
   ]);
-  // The credit-pack grant that the package charge funded — gives the ledger
-  // row its dog + mode.
-  await db.insert(creditLedger).values([
-    {
-      dogId: SEED.dogWafflesId,
-      mode: 'school',
-      location: 'fayetteville',
-      delta: 10,
-      reason: 'purchase',
-      chargeId: SEED.chargePackageId,
-      // Bought 30 days ago on the schema's 12-month window.
-      expiresAt: daysFromNow(335, 15),
-      createdAt: daysFromNow(-30, 15),
-    },
-  ]);
+
+  // Each family's credits, bought on the engine 20 days ago, so a day already gone was paid
+  // by a lot that was live then, and each lot holds a month from that purchase.
+  const allisonLot = await seedBoughtPack({
+    key: 'school-2x-weekly-fayetteville',
+    ownerId: SEED.ownerAllisonId,
+    paymentMethodId: SEED.paymentMethodAllisonId,
+    orderId: SEED.orderAllisonPackId,
+    chargeId: SEED.chargePackageId,
+    invoiceId: SEED.invoiceAllisonPackId,
+    lotId: SEED.lotAllisonSchoolId,
+    boughtAt: daysFromNow(-20, 15),
+  });
+  const jordanLot = await seedBoughtPack({
+    key: 'daycare-10-bentonville',
+    ownerId: SEED.ownerJordanId,
+    paymentMethodId: SEED.paymentMethodJordanId,
+    orderId: SEED.orderJordanPackId,
+    chargeId: SEED.chargeJordanPackId,
+    invoiceId: SEED.invoiceJordanPackId,
+    lotId: SEED.lotJordanDaycareId,
+    boughtAt: daysFromNow(-20, 16),
+  });
+
+  // Every seeded credit-paid day spends a credit: one debit a dog, each naming its lot.
+  await db.insert(creditLedger).values(
+    (
+      [
+        [allisonLot, SEED.bookingWafflesPastSchoolId, SEED.dogWafflesId],
+        [allisonLot, SEED.bookingLolaPastSchoolId, SEED.dogLolaId],
+        [allisonLot, SEED.bookingWafflesSchoolId, SEED.dogWafflesId],
+        [jordanLot, SEED.bookingBrodiePastCareId, SEED.dogBrodieId],
+        [jordanLot, SEED.bookingOlliePastCareId, SEED.dogOllieId],
+        [jordanLot, SEED.bookingGroupWalkId, SEED.dogBrodieId],
+        [jordanLot, SEED.bookingGroupWalkId, SEED.dogOllieId],
+      ] as const
+    ).map(([lot, bookingId, dogId]) => ({
+      ownerId: lot.ownerId,
+      location: lot.location,
+      mode: lot.mode,
+      tier: lot.tier,
+      delta: -1,
+      reason: 'booking-debit' as const,
+      lotId: lot.lotId,
+      bookingId,
+      dogId,
+    })),
+  );
+
   // One open (pay-later) invoice — the only tappable, payable ledger row.
   await db.insert(invoices).values([
     {
@@ -1152,9 +1111,9 @@ async function seed(): Promise<void> {
       category: 'promo',
       title: 'Summer Day School packages now available',
       body:
-        `Buy a 10- or 20-day Day School package this summer and save compared to paying per ` +
-        `day. Packages never expire and can be split across all of your dogs, so they're ` +
-        `easy to share between siblings.`,
+        `Buy an 8- or 12-day Day School package this summer and save compared to paying per ` +
+        `day. Credits can be split across all of your dogs, so they're easy to share between ` +
+        `siblings.`,
       publishedAt: daysFromNow(-7, 14),
       targetLocation: 'fayetteville',
     },
@@ -1207,7 +1166,8 @@ async function main(): Promise<void> {
   await restoreRealStripeRows(preserved);
   console.log(
     `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 5 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
-      `2 threads, 4 group classes + 7 cohorts, billing ledger, 6 announcements, 1 event. ` +
+      `2 threads, 10 credit packages, 4 group classes + 7 cohorts, billing ledger, 6 announcements, ` +
+      `1 event. ` +
       `Preserved real Stripe rows: ${preserved.customers.length} customer(s), ${preserved.cards.length} card(s). ` +
       `Portal principal: staff:${SEED.staffShanthiId}:owner`,
   );

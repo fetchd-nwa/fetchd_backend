@@ -522,6 +522,49 @@ describe('PATCH — body shape, tiers and Idempotency-Key', SKIP_WHEN_NO_DB, () 
     assert.equal(noKey.statusCode, 400, noKey.body);
   });
 
+  test('manual_grant_expiry_months has a ceiling now a hand add reads it: 121 is 422', async () => {
+    const app = appAs(SHANTI);
+    const over = await patch(app, '/staff/settings/cred', { manual_grant_expiry_months: 121 });
+    assert.equal(over.statusCode, 422, over.body);
+    const top = await patch(app, '/staff/settings/cred', { manual_grant_expiry_months: 120 });
+    assert.equal(top.statusCode, 200, top.body);
+    const back = await patch(app, '/staff/settings/cred', { manual_grant_expiry_months: 1 });
+    assert.equal(back.statusCode, 200, back.body);
+  });
+
+  test('returned_credit_expiry_months has a ceiling now a return reads it: 121 is 422', async () => {
+    const app = appAs(SHANTI);
+    const over = await patch(app, '/staff/settings/cred', { returned_credit_expiry_months: 121 });
+    assert.equal(over.statusCode, 422, over.body);
+    const top = await patch(app, '/staff/settings/cred', { returned_credit_expiry_months: 120 });
+    assert.equal(top.statusCode, 200, top.body);
+    const back = await patch(app, '/staff/settings/cred', { returned_credit_expiry_months: 1 });
+    assert.equal(back.statusCode, 200, back.body);
+  });
+
+  test('expiry_warning_lead_days has a ceiling now GET /credits reads it: 366 is 422', async () => {
+    const app = appAs(SHANTI);
+    const over = await patch(app, '/staff/settings/cred', { expiry_warning_lead_days: [366] });
+    assert.equal(over.statusCode, 422, over.body);
+    const top = await patch(app, '/staff/settings/cred', { expiry_warning_lead_days: [365] });
+    assert.equal(top.statusCode, 200, top.body);
+    const back = await patch(app, '/staff/settings/cred', { expiry_warning_lead_days: [7] });
+    assert.equal(back.statusCode, 200, back.body);
+  });
+
+  test('single_day_purchase_max_count has a ceiling now the purchase reads it: 101 is 422', async () => {
+    const app = appAs(SHANTI);
+    const over = await patch(app, '/staff/settings/cred', { single_day_purchase_max_count: 101 });
+    assert.equal(over.statusCode, 422, over.body);
+    assert.equal(over.json().error.code, 'invalid_payload');
+    const atCeiling = await patch(app, '/staff/settings/cred', {
+      single_day_purchase_max_count: 100,
+    });
+    assert.equal(atCeiling.statusCode, 200, atCeiling.body);
+    const back = await patch(app, '/staff/settings/cred', { single_day_purchase_max_count: 30 });
+    assert.equal(back.statusCode, 200, back.body);
+  });
+
   test('each tier takes only its own keys: a campus key on the global path is 400, and vice versa', async () => {
     const app = appAs(SHANTI);
     assert.equal(

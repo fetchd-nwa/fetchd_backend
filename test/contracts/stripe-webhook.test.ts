@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, isNotNull, sql } from 'drizzle-orm';
 import Stripe from 'stripe';
 import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
@@ -63,7 +63,7 @@ async function cleanupTestState(): Promise<void> {
   // choosing. Reset to the seeded fixture baseline so order independence
   // holds — drop ledger / refunds / charges, then re-seed the lone
   // payment method.
-  await db.delete(creditLedger).where(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id));
+  await db.delete(creditLedger).where(isNotNull(creditLedger.chargeId));
   await db.delete(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
   await db.delete(paymentMethods).where(eq(paymentMethods.ownerId, FIXTURE_IDS.ownerId));
@@ -157,8 +157,8 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanupTestState();
-    // Seed a requires_payment charge (the async-confirm path Day-14 leaves
-    // pending). The webhook should flip it.
+    // A requires_payment charge with no order: no writer makes one now. The webhook flips
+    // it and grants nothing, because metadata cannot say what was bought.
     const piId = `pi_test_succ_${randomUUID().slice(0, 8)}`;
     const [chargeRow] = await db
       .insert(charges)
@@ -202,13 +202,11 @@ test(
       .where(eq(charges.id, chargeId));
     assert.equal(after?.status, 'succeeded');
 
-    // Purchase ledger row was written (the async-confirm catch-up).
     const ledger = await db
       .select()
       .from(creditLedger)
       .where(and(eq(creditLedger.chargeId, chargeId), eq(creditLedger.reason, 'purchase')));
-    assert.equal(ledger.length, 1);
-    assert.equal(ledger[0]!.delta, 5);
+    assert.deepEqual(ledger, []);
 
     await db.delete(stripeEvents).where(eq(stripeEvents.eventId, eventId));
   },
@@ -232,13 +230,14 @@ test(
       })
       .returning({ id: charges.id });
     await db.insert(creditLedger).values({
-      dogId: FIXTURE_IDS.dog1Id,
+      ownerId: FIXTURE_IDS.ownerId,
       mode: 'school',
       location: 'fayetteville',
       delta: 5,
       reason: 'purchase',
       packageId: FIXTURE_IDS.creditPackageSchool5Id,
       chargeId: chargeRow!.id,
+      expiresAt: '2036-01-01T00:00:00.000Z',
     });
 
     const { app, stripe } = buildApp();
