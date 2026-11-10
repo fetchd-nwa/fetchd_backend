@@ -150,6 +150,11 @@ async function failOnDeadIntent(
       now: opts.now ?? new Date(),
     }),
   );
+  await finishEngineAct(act, {
+    stripe: opts.stripe,
+    log,
+    context: { chargeId: charge.id, orderId: charge.orderId, settlePath: 'order-sweeper' },
+  });
   return act.outcome === 'no-op' ? 'left' : 'failed';
 }
 
@@ -173,6 +178,11 @@ async function sweepPastLease(
         now: opts.now ?? new Date(),
       }),
     );
+    await finishEngineAct(act, {
+      stripe,
+      log,
+      context: { chargeId: charge.id, orderId: charge.orderId, settlePath: 'order-sweeper' },
+    });
     return act.outcome === 'no-op' ? 'left' : 'abandoned';
   }
 

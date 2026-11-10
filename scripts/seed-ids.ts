@@ -60,6 +60,15 @@ export const SEED = {
   chargeRefundedId: 'c0a50000-0000-4000-8000-000000000004',
   invoiceOpenId: '12005000-0000-4000-8000-000000000001',
 
+  // Each family's pack, a real engine row: its order, charge, paid invoice and lot.
+  orderAllisonPackId: '0a0e0000-0000-4000-8000-000000000001',
+  invoiceAllisonPackId: '12005000-0000-4000-8000-000000000002',
+  lotAllisonSchoolId: '10700000-0000-4000-8000-000000000001',
+  orderJordanPackId: '0a0e0000-0000-4000-8000-000000000002',
+  chargeJordanPackId: 'c0a50000-0000-4000-8000-000000000005',
+  invoiceJordanPackId: '12005000-0000-4000-8000-000000000003',
+  lotJordanDaycareId: '10700000-0000-4000-8000-000000000002',
+
   // Group-class cohorts (all 3 class types, both locations, varied fills +
   // one full cohort to demo the cohort-full state).
   cohortPuppyFayId: 'c0407000-0000-4000-8000-000000000001',

@@ -367,6 +367,8 @@ CREATE TABLE dogs (
   -- M2.16: the day the dog was last seen. Sent on DogWire, omitted while NULL.
   -- Nothing stamps it until P20's check-in; no gate, clock or client acts on it.
   last_seen_on       date,
+  -- M4.11: stored, set when the fifth curriculum level is recorded, and never cleared.
+  is_alumni          boolean NOT NULL DEFAULT false,
   CHECK (birthdate IS NOT NULL OR age_months_override IS NOT NULL),
   -- A dog belongs to exactly one of: a client owner, or a staff member.
   CHECK ((owner_id IS NOT NULL) <> (staff_owner_id IS NOT NULL)),
@@ -490,8 +492,9 @@ CREATE UNIQUE INDEX dog_completed_classes_uidx
 -- courses" (foundation / advanced / loose-leash / house-manners / cgc).
 -- Staff-authored (report `results` are per-skill JSONB with no per-course
 -- aggregate, so completion needs its own record — same reasoning as
--- dog_completed_classes above). ALUMNI STATUS IS DERIVED: a dog with all 5
--- live rows is alumni; no separate status row to drift.
+-- dog_completed_classes above). M4.11: ALUMNI STATUS IS STORED, on dogs.is_alumni.
+-- It is set under the dog's row lock when the fifth level is recorded and never
+-- cleared, so a level un-recorded later does not take it back.
 CREATE TABLE dog_completed_programs (
   id                     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   dog_id                 uuid NOT NULL REFERENCES dogs(id) ON DELETE CASCADE,
@@ -994,47 +997,6 @@ INSERT INTO dog_descriptors (key, label, sort_order) VALUES
   ('easily-overstimulated', 'Easily overstimulated',  7),
   ('easy-going',            'Easy-going',             8);
 
--- Credit-expiry settings (added 2026-06-20) — staff-tunable expiry window +
--- warning lead. Same org-config role as cancel_window_settings, but a two-tier
--- shape: ONE org-wide default row (location IS NULL) plus optional per-location
--- override rows (location = a slug). The API resolves a window as
--- per-location override → org-default → code default (lib/creditExpiry.ts
--- DEFAULT_CREDIT_EXPIRY_MONTHS = 12) when neither row exists.
---
--- expiry_window_months feeds the lot-expiry stamp at PURCHASE (non-retroactive,
--- same contract as the credit_ledger lot model: a later staff change affects
--- future grants only — already-stamped lots keep their expires_at).
---
--- warning_lead_days is staff-tunable NOW but has no consumer in P2; its reader
--- is the Phase-3 expiry-warning notification. Storing it here means P3 needs no
--- second migration — the staff editor sets it today.
---
--- A nullable PK is invalid, so exactly-one-default + one-row-per-location is
--- enforced by TWO partial unique indexes (the org-default uniqueness keys on the
--- constant `(location IS NULL)` so a second NULL row can't sneak in).
--- updated_by_staff_id stamps the last editor (NULL = still the seeded default).
-CREATE TABLE credit_expiry_settings (
-  location               text REFERENCES locations(slug),  -- NULL = org-wide default; a slug = per-location override
-  expiry_window_months   integer NOT NULL CHECK (expiry_window_months > 0),
-  warning_lead_days       integer NOT NULL CHECK (warning_lead_days >= 0),
-  updated_at             timestamptz NOT NULL DEFAULT now(),
-  updated_by_staff_id    uuid REFERENCES staff(id) ON DELETE SET NULL
-);
-
--- Exactly one org-default row (location IS NULL): the index keys on a constant
--- expression so any second NULL-location row collides.
-CREATE UNIQUE INDEX credit_expiry_settings_org_default_uniq
-  ON credit_expiry_settings ((location IS NULL)) WHERE location IS NULL;
--- At most one override row per location.
-CREATE UNIQUE INDEX credit_expiry_settings_location_uniq
-  ON credit_expiry_settings (location) WHERE location IS NOT NULL;
-
--- Seed the org-default: 12-month window, 60-day warning lead. Mirrors the
--- code default (DEFAULT_CREDIT_EXPIRY_MONTHS) so the resolve chain is a no-op
--- swap until staff tune it.
-INSERT INTO credit_expiry_settings (location, expiry_window_months, warning_lead_days)
-  VALUES (NULL, 12, 60);
-
 -- ----------------------------------------------------------------------------
 -- Settings — one table per domain (LG1, wire 2.0.0; SET-U01; design §2.1, §3,
 -- §4 M1.01–M1.16). Each is a singleton keyed `id boolean PRIMARY KEY DEFAULT
@@ -1127,8 +1089,7 @@ INSERT INTO cash_settings (
 -- (expiry_enforced_enabled true, answer 3) with one 7-day notice — and at least
 -- one notice, always: the lead list is never empty (DECISIONS 61); no clawback
 -- columns, no hand-grant cap (A3, R6, RULING §5). This is the one store of
--- cred.expiry_warning_lead_days (question 35 → (b)): the legacy
--- credit_expiry_settings is a store of no setting from here on.
+-- cred.expiry_warning_lead_days (question 35 → (b)).
 CREATE TABLE credit_settings (
   id                                        boolean PRIMARY KEY DEFAULT true CHECK (id),
   expiry_enforced_enabled                   boolean NOT NULL,
@@ -1163,7 +1124,7 @@ INSERT INTO credit_settings (
 
 -- M1.07 (S01, SET-U01 ← DAY-U02, STAFF-U42) — the `day` settings domain.
 -- design §4 LG1 (design.md:6141), seeds §3.4, offerings E03 (design §2.6).
--- Two tiers in one table, credit_expiry_settings' pattern: ONE global row
+-- Two tiers in one table: ONE global row
 -- (location NULL) and one row per campus, each tier's columns NOT NULL on its
 -- own rows and NULL on the other's (the tier CHECK). No day-school price column
 -- (the $60 single day is a credit_packages row, R1) and no lookback column.
@@ -1567,38 +1528,38 @@ INSERT INTO staff_settings (
 
 -- ----------------------------------------------------------------------------
 -- Credits — append-only ledger (replaces the mock mutable counter)
--- Δ 2026-06-18 (credit-expiry lot model): credits NOW expire, per Shanthi's
--- business rule — superseding the 2026-05-19 "credits do not expire" decision.
--- Multi-credit packs expire; single-day (1-credit) packs never do. Modeled as
--- LOTS, not a destructive sweep (the ledger stays append-only):
---   • A positive-delta row with lot_id NULL is a credit "lot" (source).
---     expires_at governs it — NULL = never (legacy/Gingr imports, 1-credit
---     packs, the never-expiring "pool"); a timestamp = forfeit once passed.
---   • A debit (delta<0) / refund (delta>0) row sets lot_id to the source lot
---     it draws from / returns to. lot_id NULL on a debit = drawn from the
---     never-expiring pool. Debit priority: lots soonest-expiry first, pool
---     last — see api creditLedgerRepository.findNextDebitLot.
--- NON-RETROACTIVE: expires_at is stamped once at purchase from the then-current
--- window (mirrors cancel_window_settings); a later window change affects future
--- purchases only. Existing + Gingr-imported credits stay NULL (grandfathered,
--- no backfill). Balance counts only live lots (see dog_credit_balance below).
+-- Δ 2026-06-18 (credit-expiry lot model), M4.10 (owner pools): credits are the
+-- owner's, one pool per (owner, location, mode, tier), and they expire. Modeled
+-- as LOTS, not a destructive sweep (the ledger stays append-only):
+--   • A positive-delta row with lot_id NULL is a credit "lot" (source), and
+--     expires_at is when it stops counting.
+--   • A debit (delta<0) or a return (delta>0) names the lot it draws from or
+--     goes back to, together with that lot's pool (the composite FK below), so a
+--     row cannot spend another owner's lot. dog_id on a debit is the dog served;
+--     a grant names no dog.
+-- A lot pays a date only where lot_pays_date holds, and the booking core assigns
+-- dates in two passes: see lib/creditPicker.ts.
+-- NON-RETROACTIVE: expires_at is stamped once at grant from the row's months; a
+-- later edit affects future purchases only. Balance counts only live lots (see
+-- owner_credit_balance below).
 -- Append-only by nature: NO expired_at — corrections are reversing entries.
 -- ----------------------------------------------------------------------------
--- Per-location, effective-dated pricing. Two robustness Δs:
---   Δ 2026-06-04: the same pack `key` carries a different price per location.
---   Δ 2026-06-08: prices are effective-dated, mirroring service_rates — each
---     (key, location) tracks a sequence of rows with non-overlapping
---     [effective_from, effective_to) windows (effective_to NULL = open-ended
---     current). Repricing or retiring is "close the current row's effective_to
---     and (for a reprice) insert a new row" — never edit a priced row, so a
---     past purchase's package_id keeps pointing at the exact price it bought.
--- Hence a surrogate `id` PK (the (key, location) pair is no longer unique) and
--- UNIQUE(key, location, effective_from). Retirement is the effective window, not
--- a separate `active` flag (one mechanism, same as service_rates).
+-- One row is one campus, program and tier; a key names one campus (M4.05), so the
+-- campus copies of one pack carry different keys.
+-- Effective-dated, mirroring service_rates: Δ 2026-06-08, each key tracks a sequence of
+-- rows with non-overlapping [effective_from, effective_to) windows (effective_to NULL =
+-- open-ended current). Repricing or retiring closes the current row's effective_to and
+-- (for a reprice) inserts a new row, so a past purchase's package_id keeps pointing at
+-- the exact price it bought. An expiry_months edit opens a new row the same way, or
+-- corrects a row opened that same Chicago day in place (M4.05; PATCH
+-- /staff/credit-packages/:key). Hence a surrogate `id` PK and UNIQUE(key, effective_from).
+-- Retirement is the effective window, not a separate `active` flag (one mechanism, same
+-- as service_rates). expiry_months is cred.package_expiry_months, and no other table
+-- holds it.
 CREATE TABLE credit_packages (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  key            text NOT NULL,                          -- e.g. 'school-8','school-12'
-  location       text NOT NULL REFERENCES locations(slug),  -- which school this price is for
+  key            text NOT NULL,                          -- e.g. 'school-2x-weekly-fayetteville'
+  location       text NOT NULL REFERENCES locations(slug),  -- the one campus this row sells for
   mode           booking_mode NOT NULL,
   credits        integer NOT NULL CHECK (credits > 0),
   price_cents    integer NOT NULL CHECK (price_cents >= 0),
@@ -1606,12 +1567,31 @@ CREATE TABLE credit_packages (
   is_popular     boolean NOT NULL DEFAULT false,
   effective_from date NOT NULL DEFAULT CURRENT_DATE,      -- when this price takes effect
   effective_to   date,                                    -- NULL = open-ended (current). Close to retire/reprice.
-  UNIQUE (key, location, effective_from)
+  tier           text NOT NULL DEFAULT 'regular' CHECK (tier IN ('regular', 'alumni')),
+  expiry_months  integer NOT NULL DEFAULT 1 CHECK (expiry_months > 0),
+  single_day     boolean NOT NULL DEFAULT false,          -- one credit, sold by `count`
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (key, effective_from)
 );
+-- M4.06: the ten rows of the catalog, the same statement as the step file. Reference
+-- data, so the test volume carries them too; the fingerprint reads no rows, so the
+-- rehearsal's row check and test/contracts/lg4-p18-steps.test.ts prove the two agree.
+INSERT INTO credit_packages (key, location, mode, tier, credits, price_cents, label, is_popular, single_day, expiry_months, effective_from) VALUES
+  ('school-2x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 8, 45600, 'Fayetteville 2x Weekly', false, false, 1, '2026-01-01'),
+  ('school-3x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 12, 64800, 'Fayetteville 3x Weekly', true, false, 1, '2026-01-01'),
+  ('school-alumni-10-fayetteville', 'fayetteville', 'school', 'alumni', 10, 32000, 'Alumni Fayetteville 10 Visits', false, false, 1, '2026-01-01'),
+  ('single-day-school-fayetteville', 'fayetteville', 'school', 'regular', 1, 6000, 'Single Day School Day · Fayetteville', false, true, 1, '2026-01-01'),
+  ('school-2x-weekly-bentonville', 'bentonville', 'school', 'regular', 8, 45600, 'Bentonville 2x Weekly', false, false, 1, '2026-01-01'),
+  ('school-3x-weekly-bentonville', 'bentonville', 'school', 'regular', 12, 64800, 'Bentonville 3x Weekly', true, false, 1, '2026-01-01'),
+  ('school-5x-weekly-bentonville', 'bentonville', 'school', 'regular', 20, 102000, 'Bentonville 5x Weekly', false, false, 1, '2026-01-01'),
+  ('single-day-school-bentonville', 'bentonville', 'school', 'regular', 1, 6000, 'Single Day School Day · Bentonville', false, true, 1, '2026-01-01'),
+  ('daycare-10-bentonville', 'bentonville', 'daycare', 'regular', 10, 35000, 'Bentonville Day Care Package', false, false, 1, '2026-01-01'),
+  ('single-day-daycare-bentonville', 'bentonville', 'daycare', 'regular', 1, 3500, 'Single Day Care Day · Bentonville', false, true, 1, '2026-01-01')
+ON CONFLICT (key, effective_from) DO NOTHING;
 
 CREATE TABLE credit_ledger (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  dog_id      uuid NOT NULL REFERENCES dogs(id) ON DELETE RESTRICT,
+  dog_id      uuid REFERENCES dogs(id) ON DELETE RESTRICT,  -- on a debit, the dog served; a grant names none
   mode        booking_mode NOT NULL,
   location    text NOT NULL REFERENCES locations(slug),  -- Δ 2026-06-04: which school these credits are for (per-location balances)
   delta       integer NOT NULL,                         -- + grant, - debit
@@ -1619,38 +1599,92 @@ CREATE TABLE credit_ledger (
   booking_id  uuid REFERENCES bookings(id),             -- set for booking-debit/refund
   package_id  uuid REFERENCES credit_packages(id),      -- Δ 2026-06-08: set for purchases; the exact priced version bought
   charge_id   uuid,                                     -- FK added after charges
-  expires_at  timestamptz,                              -- Δ 2026-06-18: lot expiry on a source row (delta>0, lot_id NULL). NULL = never (1-credit pack, legacy/import, pool); else purchase + resolved window
-  lot_id      uuid REFERENCES credit_ledger(id),        -- Δ 2026-06-18: on a debit/refund — the source lot it draws from / returns to. NULL on a debit = the never-expiring pool
+  expires_at  timestamptz,                              -- lot expiry on a source row (delta>0, lot_id NULL)
+  lot_id      uuid REFERENCES credit_ledger(id),        -- on a debit or a return, the source lot it draws from or goes back to
   note        text,
-  created_at  timestamptz NOT NULL DEFAULT now()
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  owner_id    uuid NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,  -- M4.10
+  tier        text NOT NULL DEFAULT 'regular' CHECK (tier IN ('regular', 'alumni')),  -- M4.10
+  created_by_staff_id uuid REFERENCES staff(id) ON DELETE SET NULL,  -- M4.12: a hand edit's staffer
+  CONSTRAINT credit_ledger_lot_pool_key UNIQUE (id, owner_id, location, mode, tier),
+  CONSTRAINT credit_ledger_adjustment_note_check CHECK (reason <> 'adjustment' OR note IS NOT NULL),  -- M4.12
+  -- M4.09: the never-expiring class is retired. A grant carries a date, a debit names its
+  -- lot, and a row that names its lot carries no date of its own.
+  CONSTRAINT grant_has_expiry CHECK (delta <= 0 OR lot_id IS NOT NULL OR expires_at IS NOT NULL),
+  CONSTRAINT debit_names_lot CHECK (delta >= 0 OR lot_id IS NOT NULL),
+  CONSTRAINT one_expiry_copy CHECK (lot_id IS NULL OR expires_at IS NULL),
+  -- A row names its lot together with that lot's pool, so it cannot spend another's.
+  -- MATCH SIMPLE: a grant, with no lot_id, is untouched.
+  CONSTRAINT credit_ledger_lot_pool_fkey FOREIGN KEY (lot_id, owner_id, location, mode, tier)
+    REFERENCES credit_ledger (id, owner_id, location, mode, tier)
 );
-CREATE INDEX credit_ledger_dog_mode_idx ON credit_ledger (dog_id, mode, location);
--- FIFO lot selection: live source lots for a (dog,mode,location), ordered by expiry.
+CREATE INDEX credit_ledger_pool_idx ON credit_ledger (owner_id, location, mode, tier);
+-- Lot selection: source lots of one pool, ordered by expiry.
 CREATE INDEX credit_ledger_lot_fifo_idx
-  ON credit_ledger (dog_id, mode, location, expires_at)
+  ON credit_ledger (owner_id, location, mode, tier, expires_at)
   WHERE delta > 0 AND lot_id IS NULL;
 -- Allocation roll-up: debits/refunds grouped by the source lot they touch.
 CREATE INDEX credit_ledger_lot_id_idx ON credit_ledger (lot_id) WHERE lot_id IS NOT NULL;
+-- M4.09: a charge grants once. A writer repeats the predicate in its ON CONFLICT.
+CREATE UNIQUE INDEX credit_ledger_purchase_charge_uidx
+  ON credit_ledger (charge_id) WHERE reason = 'purchase';
 
--- Lot-aware balance. Δ 2026-06-18: a row counts toward balance unless it
--- belongs to an EXPIRED lot. Three row kinds (disambiguated by lot_id + delta
--- sign): an allocation (lot_id set) counts iff its source lot is still live; a
--- source lot (delta>0, lot_id NULL) counts iff its own expires_at is live; a
--- pool debit (delta<0, lot_id NULL) always counts (the pool never expires).
--- Dropping an expired lot whole forfeits only its UNUSED remainder — its
--- already-applied debits drop with it, netting to exactly the unspent credits.
--- `now()` = transaction start; the booking txn reads this under the
--- per-dog advisory lock. Redis caches the per-dog result.
-CREATE VIEW dog_credit_balance AS
-  SELECT cl.dog_id, cl.mode, cl.location, COALESCE(SUM(cl.delta), 0) AS balance
+-- M4.12: every hand move of a lot's date. The date lives on the grant row, so this history
+-- is what makes a move visible; `credit_ledger` does not join the audit list.
+CREATE TABLE credit_lot_expiry_edits (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lot_id          uuid NOT NULL REFERENCES credit_ledger(id),
+  from_expires_at timestamptz NOT NULL,
+  to_expires_at   timestamptz NOT NULL,
+  staff_id        uuid REFERENCES staff(id) ON DELETE SET NULL,
+  note            text NOT NULL,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX credit_lot_expiry_edits_lot_idx ON credit_lot_expiry_edits (lot_id, created_at DESC);
+REVOKE ALL ON credit_lot_expiry_edits FROM anon, authenticated;
+
+-- M4.08: one liveness predicate, and one predicate for a date. lot_is_live answers
+-- "does this lot count now"; lot_pays_date answers "can this lot pay that day", and
+-- the picker and the shortfall count read nothing else. A lot pays a date while it
+-- expires after that date's Chicago midnight, so the expiry day itself still counts.
+-- Switching expiry off makes every stamped lot pay every date. Neither is inlined,
+-- because each body holds a sub-select.
+CREATE FUNCTION lot_is_live(expires_at timestamptz) RETURNS boolean
+  LANGUAGE sql STABLE
+AS $$
+  SELECT (SELECT NOT expiry_enforced_enabled FROM credit_settings) OR expires_at > now()
+$$;
+
+CREATE FUNCTION lot_pays_date(expires_at timestamptz, d date) RETURNS boolean
+  LANGUAGE sql STABLE
+AS $$
+  SELECT (SELECT NOT expiry_enforced_enabled
+                 OR (expires_at > now()
+                     AND (booking_outlives_lot_expiry_enabled
+                          OR expires_at > (d::timestamp AT TIME ZONE 'America/Chicago')))
+            FROM credit_settings)
+$$;
+
+REVOKE ALL ON FUNCTION lot_is_live(timestamptz) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION lot_pays_date(timestamptz, date) FROM PUBLIC, anon, authenticated;
+
+-- Lot-aware balance, one row per pool (M4.10). A row counts unless it belongs to a
+-- dead lot: an allocation (lot_id set) counts while its source lot is live, and a
+-- source lot (delta>0, lot_id NULL) counts while it is. Dropping an expired lot whole
+-- forfeits only its UNUSED remainder: its applied debits drop with it, netting to
+-- exactly the unspent credits. `now()` = transaction start; the booking reads this
+-- under the pool lock. Redis caches the display read.
+CREATE VIEW owner_credit_balance AS
+  SELECT cl.owner_id, cl.location, cl.mode, cl.tier, COALESCE(SUM(cl.delta), 0) AS balance
   FROM credit_ledger cl
   LEFT JOIN credit_ledger lot ON lot.id = cl.lot_id
   WHERE CASE
-          WHEN cl.lot_id IS NOT NULL THEN (lot.expires_at IS NULL OR lot.expires_at > now())
-          WHEN cl.delta > 0          THEN (cl.expires_at IS NULL OR cl.expires_at > now())
+          WHEN cl.lot_id IS NOT NULL THEN lot_is_live(lot.expires_at)
+          WHEN cl.delta > 0          THEN lot_is_live(cl.expires_at)
           ELSE true
         END
-  GROUP BY cl.dog_id, cl.mode, cl.location;
+  GROUP BY cl.owner_id, cl.location, cl.mode, cl.tier;
+REVOKE ALL ON owner_credit_balance FROM anon, authenticated;
 
 -- ----------------------------------------------------------------------------
 -- Payments (built day one; Stripe test keys dev/staging, live keys prod;
@@ -1755,7 +1789,11 @@ CREATE TABLE charges (
   last_stripe_error        text,
   stripe_customer_id       text,
   stripe_payment_method_id text,
-  payment_method_id        uuid REFERENCES payment_methods(id)
+  payment_method_id        uuid REFERENCES payment_methods(id),
+  -- M4.10: a package or top-up charge's frozen purchase, which every settler reads
+  -- to grant exactly what was paid for. The metadata stays {order_id, charge_id}.
+  package_id               uuid REFERENCES credit_packages(id),
+  credits_count            integer
 );
 CREATE INDEX charges_owner_idx ON charges (owner_id);
 CREATE UNIQUE INDEX charges_order_id_uidx ON charges (order_id);
@@ -1822,6 +1860,10 @@ CREATE TABLE invoices (
   -- M3.02: written only by a purchase's settle. An invoice an order PAYS is named
   -- by `orders.invoice_id`, not here.
   order_id       uuid REFERENCES orders(id),
+  -- M4.10: what every `package` invoice carries from the first pack sold, in the same
+  -- INSERT, so M6.03's CHECK validates against real rows.
+  package_id     uuid REFERENCES credit_packages(id),
+  location       text REFERENCES locations(slug),
   UNIQUE (source, external_ref),
   CHECK (status <> 'paid' OR paid_at IS NOT NULL)        -- #7: paid implies paid_at
 );
@@ -2354,7 +2396,7 @@ END $$;
 
 -- Attach audit_capture to every soft-expire entity + join table (AFTER
 -- UPDATE OR DELETE). Append-only/immutable-by-nature tables are intentionally
--- excluded (credit_ledger, charges, invoices, refunds, agreement_signatures,
+-- excluded (credit_ledger, credit_lot_expiry_edits, charges, invoices, refunds, agreement_signatures,
 -- scheduled_notifications, notifications, media_derivative_jobs, audit_log) as
 -- is idempotency_keys (transport dedupe, TTL-pruned). day_capacity is
 -- included — it carries expired_at; its first write is an INSERT, which this
@@ -2385,13 +2427,16 @@ BEGIN
     -- M1.18 (STAFF-U22): every settings edit keeps the value it replaced —
     -- the four settings tables that predate LG1, and every table M1.01–M1.16
     -- creates (src/lib/settingsRegistry.ts AUDITED_SETTINGS_TABLES).
-    'cancel_window_settings','credit_expiry_settings','intake_field_settings',
+    'cancel_window_settings','intake_field_settings',
     'dog_descriptors','account_settings','alumni_settings','cash_settings',
     'credit_settings','day_program_settings','dog_gate_settings',
     'evaluation_settings','migration_settings','messaging_settings',
     'notification_settings','payment_settings','reports_settings','vaccine_settings',
     -- M1.21 (P02): the staff domain's role lists and idle minutes.
-    'staff_settings'
+    'staff_settings',
+    -- M4.05: a money-class edit, and a same-day correction overwrites the only copy
+    -- of the old value (DECISIONS 177(d)).
+    'credit_packages'
   ]) LOOP
     EXECUTE format(
       'CREATE TRIGGER %I_audit AFTER UPDATE OR DELETE ON %I
@@ -2717,7 +2762,6 @@ COMMENT ON TABLE  pending_request_dogs           IS 'Dogs attached to a pending 
 COMMENT ON TABLE  pending_request_preferred_dates IS 'The owner ranked preferred date/time slots for a pending request.';
 COMMENT ON TABLE  day_capacity                   IS 'Sparse per-(location, calendar-day) seat overrides for Day School and Day Care combined; a live row wins over the campus''s day.daily_capacity_dogs and day.open_weekdays_list, which the API applies when no row exists.';
 COMMENT ON TABLE  cancel_window_settings         IS 'Owner-tunable per-category free-cancel hours (Day 13). One row per service_category; seeded 48h flat. API reads at booking creation to stamp bookings.cancel_deadline_at; the resolved deadline travels with the booking.';
-COMMENT ON TABLE  credit_expiry_settings         IS 'Staff-tunable credit-expiry window + warning lead (2026-06-20). One org-default row (location IS NULL) + optional per-location override rows; partial unique indexes enforce exactly-one-default and one-per-location. API resolves per-location → org-default → code default (12mo) to stamp credit_ledger lot expiry at purchase (non-retroactive). warning_lead_days has no P2 consumer (its reader is the Phase-3 expiry-warning notification).';
 COMMENT ON TABLE migrations_applied IS 'One row per migration step applied through npm run migrate:apply: the step id, who ran it, and the sha256 of the exact bytes sent. Written as the step''s last statement, in its transaction.';
 COMMENT ON TABLE account_settings IS 'The acct settings domain (singleton, id = true): account lifecycle switches and the signup field requirement map. Audited (STAFF-74); edited through PATCH /staff/settings/acct.';
 COMMENT ON TABLE alumni_settings IS 'The alum settings domain (singleton, id = true): the alumni re-check clock. Audited (STAFF-74); edited through PATCH /staff/settings/alum.';
@@ -2733,8 +2777,9 @@ COMMENT ON TABLE payment_settings IS 'The pay settings domain: one row per (key,
 COMMENT ON TABLE reports_settings IS 'The rpt settings domain (singleton, id = true): events and gallery switches and limits, the media upload cap. Audited (STAFF-74).';
 COMMENT ON TABLE vaccine_settings IS 'The vax settings domain (singleton, id = true): accepted proof file types and the typical full-vaccination age. Audited (STAFF-74).';
 COMMENT ON TABLE staff_settings IS 'The staff settings domain (singleton, id = true): the five role lists that gate the money verbs (refund, hand credit edits, desk sale, custom invoice, end-of-day totals) and the portal idle sign-out minutes. Every key is roles class (owner only); the owner role passes every list. Audited (STAFF-74).';
-COMMENT ON TABLE  credit_packages                IS 'Effective-dated catalog of purchasable credit packages (mode, credit count, price) per location. Reprice/retire by closing effective_to + inserting a new row — never edit a priced row.';
-COMMENT ON TABLE  credit_ledger                  IS 'Append-only credit transactions (purchase grants, booking debits, refunds) modeled as expiring LOTS (Δ 2026-06-18): a source row (delta>0, lot_id NULL) carries expires_at; debits/refunds carry lot_id. Balance counts only live lots. Corrections are reversing entries.';
+COMMENT ON TABLE  credit_packages                IS 'Effective-dated catalog of purchasable credit packages: each row names one campus, program and tier, and a key names one campus. Repricing or retiring closes effective_to; an expiry_months edit opens a new row, or corrects a row opened that same Chicago day in place. Never edit a price.';
+COMMENT ON TABLE  credit_ledger                  IS 'Append-only credit transactions, the owner''s: one pool per (owner, location, mode, tier), modeled as expiring LOTS. A source row (delta>0, lot_id NULL) carries expires_at; debits and returns name their lot, and dog_id on a debit is the dog served. Balance counts only live lots. Corrections are reversing entries.';
+COMMENT ON TABLE  credit_lot_expiry_edits        IS 'Every hand move of a lot''s expiry (CRED-U15), from the locked read, so a lot''s dates chain. Append-only.';
 COMMENT ON TABLE  stripe_customers               IS 'Maps an owner to their Stripe customer id (1:1).';
 COMMENT ON TABLE  payment_methods                IS 'Owner saved Stripe payment methods (token + displayable brand/last4); raw PAN never stored. Removal = expire (retained for charge history).';
 COMMENT ON TABLE  charges                        IS 'Stripe PaymentIntent records (package purchase, board-and-train, group-class). Retained financial record.';
@@ -2758,4 +2803,4 @@ COMMENT ON TABLE  notification_dogs              IS 'Dogs a notification is abou
 COMMENT ON TABLE  announcements                  IS 'School-wide (optionally city-targeted) home-screen announcements; is_pinned keeps recurring ones (Public Pups) always visible.';
 COMMENT ON TABLE  device_tokens                  IS 'Registered Expo push tokens per owner/device for outbound push; revoked token = expire.';
 COMMENT ON TABLE  audit_log                      IS 'Append-only history: the OLD row (JSONB) of every UPDATE/DELETE on soft-expire tables. Makes "nothing is ever lost, even edits" true. Never edited or pruned.';
-COMMENT ON VIEW   dog_credit_balance             IS 'Derived per-(dog,mode,location) credit balance over the append-only ledger; counts only LIVE lots (excludes expired-lot credits, Δ 2026-06-18). The fast read; Redis-cached.';
+COMMENT ON VIEW   owner_credit_balance           IS 'Derived per-(owner,location,mode,tier) credit balance over the append-only ledger; counts only LIVE lots (lot_is_live, M4.08).';

@@ -47,6 +47,8 @@ const TABLE_BY_KEY_PREFIX: Readonly<Record<string, string>> = {
   ann: 'announcements',
   cohort: 'cohorts',
   charge: 'charges',
+  order: 'orders',
+  lot: 'credit_ledger',
   request: 'pending_requests',
   event: 'events',
   rsvp: 'event_rsvps',
@@ -109,7 +111,22 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  console.log(`✓ fresh — all ${checked} seeded rows present across ${Object.keys(TABLE_BY_KEY_PREFIX).length} tables.`);
+  // A pack with no order sits on the webhook's orderless arm (DECISIONS 179(b)): it flips,
+  // grants nothing and pages. No path writes one, so a row here is a stale database.
+  const orderless = await db.execute(
+    `SELECT count(*)::int AS count FROM charges WHERE purpose = 'package' AND order_id IS NULL`,
+  );
+  const orderlessCount = (orderless.rows[0] as { count: number }).count;
+  if (orderlessCount > 0) {
+    console.error(
+      `\n✗ STALE: ${orderlessCount} package charge(s) with no order. Run: npm run db:dev:seed`,
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `✓ fresh — all ${checked} seeded rows present across ${Object.keys(TABLE_BY_KEY_PREFIX).length} tables.`,
+  );
 }
 
 main()

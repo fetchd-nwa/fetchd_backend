@@ -115,17 +115,17 @@ export function registerStripeWebhookRoute(
           log: request.log,
           context: { stripeEventId: event.id, stripeEventType: event.type },
         });
-        // Post-commit credit-balance cache wipe when the event moved a dog's
-        // balance (async purchase grant / payment_failed reversal). Best-effort:
+        // Post-commit credit-balance cache wipe when the event moved an owner's
+        // balance (a settle's grant). Best-effort:
         // the DB is already committed + marked processed, so a Redis blip here
         // must NOT 500 (that would make Stripe redeliver → dedupe → no re-run,
         // leaving the cache to self-heal via TTL either way). Swallow + log,
         // mirroring `withMutation`'s post-commit invalidation policy.
-        if (result.creditsDogId !== undefined) {
-          await invalidatePattern(creditsInvalidationPattern(result.creditsDogId)).catch(
+        if (result.creditsOwnerId !== undefined) {
+          await invalidatePattern(creditsInvalidationPattern(result.creditsOwnerId)).catch(
             (invErr) => {
               request.log.error(
-                { stripeEventId: event.id, dogId: result.creditsDogId, invErr },
+                { stripeEventId: event.id, ownerId: result.creditsOwnerId, invErr },
                 'stripe webhook post-commit credits invalidation failed',
               );
             },

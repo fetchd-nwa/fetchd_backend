@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm/relations";
-import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditExpirySettings, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs } from "./schema.js";
+import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs } from "./schema.js";
 
 export const ownersRelations = relations(owners, ({one, many}) => ({
 	location: one(locations, {
@@ -30,7 +30,6 @@ export const locationsRelations = relations(locations, ({many}) => ({
 	owners: many(owners),
 	cohorts: many(cohorts),
 	bookings: many(bookings),
-	creditExpirySettings: many(creditExpirySettings),
 	creditPackages: many(creditPackages),
 	creditLedgers: many(creditLedger),
 	serviceRates: many(serviceRates),
@@ -46,7 +45,6 @@ export const staffRelations = relations(staff, ({one, many}) => ({
 	intakeFieldSettings: many(intakeFieldSettings),
 	cancelWindowSettings: many(cancelWindowSettings),
 	dogDescriptors: many(dogDescriptors),
-	creditExpirySettings: many(creditExpirySettings),
 	serviceRates_createdByStaffId: many(serviceRates, {
 		relationName: "serviceRates_createdByStaffId_staff_id"
 	}),
@@ -315,17 +313,6 @@ export const cancelWindowSettingsRelations = relations(cancelWindowSettings, ({o
 export const dogDescriptorsRelations = relations(dogDescriptors, ({one}) => ({
 	staff: one(staff, {
 		fields: [dogDescriptors.updatedByStaffId],
-		references: [staff.id]
-	}),
-}));
-
-export const creditExpirySettingsRelations = relations(creditExpirySettings, ({one}) => ({
-	location: one(locations, {
-		fields: [creditExpirySettings.location],
-		references: [locations.slug]
-	}),
-	staff: one(staff, {
-		fields: [creditExpirySettings.updatedByStaffId],
 		references: [staff.id]
 	}),
 }));

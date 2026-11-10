@@ -17,16 +17,15 @@ import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
  *
  * From 2.0.0 a lot's warning lead is `cred.expiry_warning_lead_days` (`{7}`, on
  * `credit_settings`), and a lot bought today expires one month out
- * (`cred.package_expiry_months` 1). The legacy scan reads the OTHER store —
- * `credit_expiry_settings.warning_lead_days`, seeded 60 — so the moment a
+ * (`cred.package_expiry_months` 1). The legacy scan read another store, seeded 60
+ * and dropped at M4.07, so the moment a
  * family buys a pack, its whole one-month lot already sits inside a 60-day
  * window and the scheduler queues a `credits-expiring` notice for it. That is
  * a notice the 7-day setting governs, sent seven weeks early by a store no
- * registry key names. The scheduler stops calling the scan; CRED-U13 builds the
- * real notice at 7.1.0. The function and its table stay (S25/M4.07 remove them).
+ * registry key names. The scheduler stopped calling the scan, S25 deleted it, and
+ * CRED-U13 builds the real notice at 7.1.0.
  *
- * The test drives the whole tick, not the scan, because the claim is about what
- * the scheduler DOES — the scan itself still works and keeps its own tests.
+ * The test drives the whole tick, because the claim is about what the scheduler DOES.
  */
 
 registerFixtureHooks();
@@ -45,7 +44,7 @@ test(
     try {
       await db.insert(creditLedger).values({
         id: lotId,
-        dogId: FIXTURE_IDS.dog1Id,
+        ownerId: FIXTURE_IDS.ownerId,
         mode: 'school',
         location: 'fayetteville',
         delta: 8,

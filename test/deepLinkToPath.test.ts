@@ -51,24 +51,18 @@ test('deepLinkToPath: dog-manage → /dog-manage/:id', () => {
   assert.equal(deepLinkToPath({ kind: 'dog-manage', id: 'dog-7' }), '/dog-manage/dog-7');
 });
 
-test('deepLinkToPath: credits → /dog-profile/:id?highlight=credits (the credits CARD)', () => {
-  assert.equal(deepLinkToPath({ kind: 'credits', id: 'dog-7' }), '/dog-profile/dog-7?highlight=credits');
+test('deepLinkToPath: credits → /account/credits, the owner\'s screen, with no id', () => {
+  assert.equal(deepLinkToPath({ kind: 'credits' }), '/account/credits');
 });
 
 test('deepLinkToPath: announcement → /announcement/:id', () => {
   assert.equal(deepLinkToPath({ kind: 'announcement', id: 'ann-3' }), '/announcement/ann-3');
 });
 
-// `credits` still routes to the SAME SCREEN as `dog-profile` (decision 4) but is
-// no longer byte-identical to it: since 1.5.0 it carries `?highlight=credits` so
-// the credits card flashes on arrival (Allison 2026-07-29). The distinction the
-// arm exists to make — "this alert is about the credits card", not "go to the
-// dog" — is now visible in the path. Pins both halves: same route, different query.
-test('deepLinkToPath: credits targets the dog-profile route but adds the credits highlight', () => {
-  const credits = deepLinkToPath({ kind: 'credits', id: 'dog-7' });
-  const dogProfile = deepLinkToPath({ kind: 'dog-profile', id: 'dog-7' });
-  assert.equal(credits.split('?')[0], dogProfile);
-  assert.equal(credits, `${dogProfile}?highlight=credits`);
+// Credits are the owner's since 5.0.0-lg4.2, so the arm names no dog: a booking-time
+// dog id cannot reach this path, and it is a route of its own.
+test('deepLinkToPath: credits is no longer a dog-profile route', () => {
+  assert.equal(deepLinkToPath({ kind: 'credits' }).startsWith('/dog-profile/'), false);
 });
 
 // report's params contract: a missing OR empty dogId fails LOUD at emit time

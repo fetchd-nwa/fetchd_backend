@@ -12,6 +12,106 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [5.0.0-lg4.2] — 2026-11-10
+
+BREAKING. LG4's second of three steps toward 5.0.0 (plan unit P18, slices S23, S25,
+S27, S24 in pass order; ledger CRED-U04, CRED-U30, CRED-U10, CRED-U05, CRED-U17,
+CRED-U08, CRED-U12, CRED-U14, CRED-U15, ALUM-U02, DAY-U23, with no wire of their own
+CRED-U07, DAY-U22, CRED-U35, CRED-U01, CRED-U06, CRED-U03, CRED-U26, CRED-U28,
+CRED-U33, CRED-U38, DAY-U15, CRED-U16, CRED-U39, CRED-U42, and PAY-U09's live half;
+migrations M4.05 to M4.12; design §1.1 5.0.0,
+`designs/fetchd-v1-technical-design.md:953-1011`, `:1019-1022`, `:929-935`; §2.3
+`:2613-2719`; §2.4 `:2856-3111`; §2.7 `:4061-4107`; §4 `:6207-6214`). 5.0.0-lg4.2
+lands for clients when P18 is gate-green and pushed on `v1/build`. Contract-first:
+the routes keep today's behaviour until P18's backend lands them. Resync both
+clients (`npm run sync:contracts` in mobile and portal). Against the resynced copy
+(a scratch run at P17's working trees, not their gates) the portal typechecks
+unchanged, mobile fails 2 times in 1 file and the backend 11 times in 7 files.
+Those counts are small because the surface is hand-typed: mobile's
+`CreditPurchaseRequest` and `parseCreditGaps`, the portal's `CreditLot`, every
+raw-SQL lot read and every cache key are outside tsc's reach, so tsc is not the
+work list.
+
+Breaking:
+
+- `PostCreditPackagesPurchaseRequest` is `{payment_method_id, count?}`: `quantity`
+  (CRED-U30), `dog_id` (CRED-U10) and `location` (CRED-U04) removed. The body is
+  strict, so each is 400. `count` is accepted only on a `single_day` row.
+- `POST /credit-packages/:key/purchase` rides the order engine (CRED-U10). A decline
+  is 402 `payment_failed`, committed and replayed, where it was a 201, and a key
+  whose order has not settled answers 409 `idempotency_inflight`.
+- `CreditsWire` and `GET /dogs/:id/credits` removed; `GET /credits?location` answers
+  `OwnerCreditsWire {location, pools: OwnerCreditPoolWire[]}`, each pool `{mode, tier,
+  balance, lots, expiring_lots}` (CRED-U10, CRED-U33). `warning_lead_days` goes: the
+  app reads `cred.expiry_warning_lead_days` from `GET /settings`.
+- `CreditGap` is `{location, mode, tier, balance, required}`, one entry for the pool;
+  `dog_id` removed (CRED-U10). `balance` at `required` can still be short, so
+  `shortfall` is the number to read.
+- `NotificationDeepLink` is a union, and its `credits` arm has no `id`.
+  `deepLinkToPath({kind: 'credits'})` is `/account/credits`, where it was
+  `/dog-profile/<id>?highlight=credits` (CRED-U10). A stored path keeps its old route.
+- `CreditExpirySettingWire`, `PostStaffCreditExpiryRequest` and `GET/POST
+  /staff/credit-expiry-settings` removed (CRED-U05, M4.07, question 35).
+- `CreditLotWire.expires_at` is live on every lot: the never-expiring class is
+  retired (CRED-U05, CRED-U17). No shape change; a client that treated a lot as
+  permanent breaks on behaviour, so it is listed here.
+- `PostStaffRatesRequest.category` is `'evaluation'`, and the route takes only the
+  seed amount, 0 (DAY-U23, moved from design 4.0.0 by §1.3). `GET /rates` holds only
+  the evaluation row of each campus.
+
+Added:
+
+- `CreditTier` and `CREDIT_TIERS` (§2), pinned in §16. No pgEnum backs them.
+- `ApiErrorCode` gains six, the 33rd to the 38th, appended:
+  `alumni_tier_requires_alumni_dog`, `count_not_allowed`, `lot_insufficient`,
+  `expiry_not_in_future`, `pool_not_bookable` (each 422) and
+  `credit_edit_role_required` (403). None carries `details`.
+- `CreditPackageWire.tier`, `.single_day`, `.expiry_months`; `location` and `mode`
+  stay non-null. The catalog lists ten rows (CRED-U04, CRED-U07, M4.05, M4.06).
+- `GET /staff/owners/:ownerId/credits` → `StaffOwnerCreditsWire`, with
+  `StaffCreditPoolWire` and `CreditLotDetailWire` (CRED-U14, CRED-U38, DAY-U15). Any
+  staff role reads it.
+- `POST /staff/owners/:ownerId/credit-adjustments`
+  (`PostStaffOwnersCreditAdjustmentsRequest`) → the changed pool (CRED-U14), and
+  `PATCH /staff/credit-lots/:id` (`PatchStaffCreditLotsRequest`) →
+  `CreditLotDetailWire` (CRED-U15). Each reads `staff.credit_hand_edit_role_list`.
+- `PATCH /staff/credit-packages/:key` (`PatchStaffCreditPackagesRequest`,
+  `{expiry_months}`) → `CreditPackageWire` (CRED-U08 narrowed), on the same list.
+- `PendingPaymentWire.package_label?`: the row bought, on a `'package'` entry (design
+  §2.7:3841, read from `charges.package_id`).
+
+Changed (live, no shape change):
+
+- `POST /bookings`: `payment.tier` is read and `payment.top_up` is honoured (PAY-U09,
+  CRED-U10). `top_up_offer` and `alternative_package_key` are sent, the latter only
+  for a pack that covers the shortfall and whose own lot pays every short date. `short_dates` carries
+  `'credits_expire_first'`, and `credit_expired_before_date` has its predicate
+  (CRED-U12). Rows can be `'payment-pending'`, and `order.charge_status` can be
+  `'succeeded'` or `'requires_payment'`. `PostBookingsErrorDetails`' arms 5 and 9 are
+  reachable. `cred.single_day_purchase_max_count` does not cap `top_up.count`
+  (DECISIONS 151(b), the default).
+- `CreditPurchaseWire`'s JSDoc is rewritten: a 201 is `'succeeded'`, or
+  `charge_status: 'requires_payment'`, `credits_granted: 0` and `charge_blocker:
+  'processing'` on a live intent. It no longer describes a cancelled one.
+- `DogWire.is_alumni`, `CompletedProgramsWire.is_alumni` and `CurriculumProgram`:
+  stored from M4.11, never cleared by un-recording a level (ALUM-U02).
+- `StaffCapabilitiesWire`'s and `StaffSettingsWire`'s credit lines name their verbs,
+  and the legacy-editor lists lose `/staff/credit-expiry-settings`.
+  `InvoicePayWire.client_secret` stops citing `CreditPurchaseWire`.
+  `PendingPaymentWire`, the order-engine banner, `BookingStatus` and the settings
+  block's two `CreditExpirySettingWire` precedents are reworded.
+
+Not typed here: P19's `withheld_reason`, `alumni_package_ineligible` and the shop's
+reads; `pack_requires_evaluated_dog`, typed at P19 and sent from P11.
+
+### Documentation, in place before this version reached the branch
+
+- `StaffOwnerCreditsWire.expiry_enforced`: no screen reads it (§2.10:5001).
+- `LedgerEntryWire.settled_card`: a pack line now carries the card, from its paid invoice (§2.7:3875).
+- `RateWire`: the `location: null` rule is pinned by `test/contracts/rates.test.ts`, since the two snapshots it cited are deleted.
+- `PostBookingsRequest.payment.top_up`: a pack whose own lot would not pay every short date joins the fresh-422 list (`designs/p18-pack-reach-and-moved-dates.md`).
+- `CreditSettingsWire`: the bounds a PATCH already enforces are stated on `expiry_warning_lead_days` (each lead at most 365), `manual_grant_expiry_months` (1 to 120), `returned_credit_expiry_months` (0 to 120) and `single_day_purchase_max_count` (1 to 100).
+
 ## [5.0.0-lg4.1] — 2026-11-06
 
 BREAKING. LG4's first of three steps toward 5.0.0 (plan unit P17, slice S28;

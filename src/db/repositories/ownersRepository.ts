@@ -1,4 +1,4 @@
-import { asc, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, isNull, sql } from 'drizzle-orm';
 import type { LocationKey, StaffOwnerWire } from '../../contracts/wire.js';
 import { db } from '../client.js';
 import { owners } from '../schema/schema.js';
@@ -17,6 +17,16 @@ type Runner = Tx | typeof db;
  * owners table off the route path.
  */
 export const ownersRepository = {
+  /** A live owner row: what a staff route reads before it answers for an account. */
+  async existsLive(runner: Runner, ownerId: string): Promise<boolean> {
+    const [row] = await runner
+      .select({ id: owners.id })
+      .from(owners)
+      .where(and(eq(owners.id, ownerId), isNull(owners.expiredAt)))
+      .limit(1);
+    return row !== undefined;
+  },
+
   /**
    * The owner's push-preference pair, read inside the delivery tx so D3
    * enforcement sees a snapshot consistent with the feed INSERT.

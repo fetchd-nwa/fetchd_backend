@@ -1,15 +1,5 @@
-import { deepLinkToPath } from '../contracts/wire.js';
 import { db } from '../db/client.js';
-import {
-  chargesRepository,
-} from '../db/repositories/chargesRepository.js';
-import { creditLedger, type LocationKey } from '../db/schema/schema.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
-import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
-import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
-import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
-import { formatDollars } from '../lib/invoiceReceiptCopy.js';
+import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { AnchorResolutionLog, PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
 import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
@@ -18,6 +8,7 @@ import { withActor, type Tx } from '../db/tx.js';
 import { assertNever } from '../lib/assertNever.js';
 import {
   blockerOfIntent,
+  creditsOwnerOf,
   failChargeInTx,
   OrderSettleUnreachableError,
   readEngineBudget,
@@ -30,14 +21,8 @@ import {
   type StripeRefundStatus,
   type StripeWebhookEvent,
 } from '../lib/stripe.js';
-import { and, eq } from 'drizzle-orm';
-import type { BookingMode } from '../lib/bookingMode.js';
 import { lockCharge } from '../db/locks.js';
 import type { EngineChargeRow } from '../db/repositories/chargesRepository.js';
-
-function isLocationKey(value: string | undefined): value is LocationKey {
-  return value === 'fayetteville' || value === 'bentonville';
-}
 
 /**
  * The actor string written into `app.actor` for every webhook-driven DB
@@ -62,11 +47,8 @@ export interface WebhookHandlerLog extends AnchorResolutionLog {
 
 export interface WebhookHandlerOpts {
   stripe: StripeClient;
-  /**
-   * Where the handlers' money alarms go. Optional so existing callers compile, but a
-   * caller that omits it makes them silent.
-   */
-  log?: WebhookHandlerLog;
+  /** Where the handlers' money alarms go. Required, so none of them can be silent. */
+  log: WebhookHandlerLog;
 }
 
 export interface WebhookHandlerResult {
@@ -74,7 +56,6 @@ export interface WebhookHandlerResult {
     | 'flipped-charge-succeeded'
     | 'flipped-charge-failed'
     | 'charge-already-terminal'
-    | 'reconstructed-package-purchase'
     // 2026-08-24 (`designs/money-residue.md` §4.4): a refund that exists at
     // Stripe and nowhere here — a staff dashboard refund — now RECORDED instead
     // of retried into the ground. Closes the cumulative cap automatically.
@@ -98,18 +79,17 @@ export interface WebhookHandlerResult {
    * paid this invoice another way, so this PI double-bills and its refund row was
    * written 'pending' inside the handler's tx. The
    * RECEIVER fires the Stripe refund post-commit (no Stripe call inside a tx,
-   * R5). Reported up rather than fired inline for the same reason `creditsDogId`
+   * R5). Reported up rather than fired inline for the same reason `creditsOwnerId`
    * is: handlers stay pure DB.
    */
   pendingStripeRefund?: PendingDuplicateRefund;
   /**
-   * Set when this event moved a dog's credit balance (async purchase grant or
-   * the payment_failed reversal). The receiver wipes the dog's
-   * `credits:{dogId}:*` display cache post-commit — the webhook doesn't run
+   * Set when this event moved an owner's credit balance (a settle's grant). The
+   * receiver wipes her `credits:{ownerId}:*` display cache post-commit — the webhook doesn't run
    * through `withMutation`, so invalidation is reported up rather than fired
    * inline (keeps handlers pure DB).
    */
-  creditsDogId?: string;
+  creditsOwnerId?: string;
 }
 
 /**
@@ -228,6 +208,15 @@ async function findEngineCharge(event: IntentEvent): Promise<EngineChargeRow | u
   return charge !== undefined && charge.orderId === orderId ? charge : undefined;
 }
 
+/**
+ * A non-empty string field off PaymentIntent metadata, which arrives across a
+ * trust boundary (anything can be in there, including nothing).
+ */
+function metadataString(metadata: Record<string, string>, key: string): string | undefined {
+  const value: unknown = metadata[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 function resultOf(act: Awaited<ReturnType<typeof settleChargeInTx>>): WebhookHandlerResult {
   const outcome: WebhookHandlerResult['outcome'] =
     act.outcome === 'settled'
@@ -239,11 +228,13 @@ function resultOf(act: Awaited<ReturnType<typeof settleChargeInTx>>): WebhookHan
           : act.outcome === 'failed'
             ? 'order-failed'
             : 'charge-already-terminal';
+  const creditsOwnerId = creditsOwnerOf(act);
   return {
     outcome,
     ...(act.pendingStripeRefund !== undefined
       ? { pendingStripeRefund: act.pendingStripeRefund }
       : {}),
+    ...(creditsOwnerId !== undefined ? { creditsOwnerId } : {}),
   };
 }
 
@@ -264,9 +255,9 @@ async function handleEngineCharge(
   }
 
   const log: EngineLog = {
-    info: (obj, msg) => opts.log?.info?.(obj, msg),
-    warn: (obj, msg) => opts.log?.warn(obj, msg ?? ''),
-    error: (obj, msg) => opts.log?.error(obj, msg),
+    info: (obj, msg) => opts.log.info?.(obj, msg),
+    warn: (obj, msg) => opts.log.warn(obj, msg ?? ''),
+    error: (obj, msg) => opts.log.error(obj, msg),
   };
   const budget = await readEngineBudget();
   const live = await opts.stripe.retrievePaymentIntent(
@@ -327,15 +318,15 @@ async function handleEngineCharge(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// payment_intent.succeeded
+// payment_intent.succeeded, on a charge the engine does not own
 //
-// Find the `charges` row by stripe_payment_intent_id. Flip status to
-// 'succeeded' if not already there. If the charge purpose was 'package'
-// AND no `credit_ledger` purchase row exists for this charge yet (e.g.
-// the requires_action / async-confirm path that Day-14 left to the
-// webhook), write the ledger row using metadata captured at PI creation
-// (`dog_id`, `package_id`, `credits`).
+// Find the `charges` row by stripe_payment_intent_id and flip it to `succeeded`. Every
+// pack and top-up is the engine's now, so the arm that granted from metadata is gone:
+// metadata is `{order_id, charge_id}`, and what was bought is read off the charge row.
 // ─────────────────────────────────────────────────────────────────────────
+
+const OFF_ENGINE_PACK_ALARM =
+  'a package charge the order engine does not own succeeded: nothing here can say what it bought, so no credits were granted and a person must reconcile it';
 
 async function handlePaymentIntentSucceeded(
   event: StripeWebhookEvent & { type: 'payment_intent.succeeded' },
@@ -344,26 +335,12 @@ async function handlePaymentIntentSucceeded(
   return withActor(WEBHOOK_ACTOR, async (tx) => {
     const charge = await chargesRepository.findByStripePaymentIntentId(tx, event.paymentIntentId);
     if (charge === undefined) {
-      // No charges row for a SUCCEEDED PaymentIntent — Stripe captured money
-      // but nothing here recorded it. One safety net: a credit-package purchase
-      // whose synchronous write failed after Stripe captured, where the PI
-      // metadata carries everything to rebuild the record. Anything else is an
-      // `orphan-event`, a PI naming an invoice included: no path here stamps
-      // `invoice_id` (DECISIONS 167(b)), so that metadata is not ours to believe.
-      // The money is still taken, so a person hears (DECISIONS 169(b)): the route
-      // hands its own logger in, and level 50 pages.
-      const reconstructed = await maybeReconstructOrphanedPackagePurchase(tx, {
-        paymentIntentId: event.paymentIntentId,
-        amountCents: event.amountCents,
-        metadata: event.metadata,
-      });
-      if (reconstructed.reconstructed) {
-        return {
-          outcome: 'reconstructed-package-purchase',
-          creditsDogId: reconstructed.creditsDogId,
-        };
-      }
-      opts.log?.error(
+      // No charges row for a SUCCEEDED PaymentIntent: Stripe captured money and nothing
+      // here recorded it. The engine writes its charge before Stripe, so this is no order
+      // of ours. A PI naming an invoice is here too: no path stamps `invoice_id`
+      // (DECISIONS 167(b)), so that metadata is not ours to believe. The money is still
+      // taken, so a person hears (DECISIONS 169(b)): level 50 pages.
+      opts.log.error(
         {
           stripeEventId: event.id,
           paymentIntentId: event.paymentIntentId,
@@ -373,267 +350,29 @@ async function handlePaymentIntentSucceeded(
       );
       return {
         outcome: 'orphan-event',
-        note: `no charges row for PI ${event.paymentIntentId} (no package metadata to reconstruct)`,
+        note: `no charges row for PI ${event.paymentIntentId}`,
       };
     }
 
     if (charge.status === 'succeeded' || charge.status === 'refunded') {
-      // Day-14's synchronous-confirm path already landed the terminal
-      // status (and ledger row). Nothing to do — return idempotent OK.
       return { outcome: 'charge-already-terminal' };
     }
 
     await chargesRepository.markStatus(tx, { id: charge.id, status: 'succeeded' });
 
-    let creditsDogId: string | undefined;
     if (charge.purpose === 'package') {
-      creditsDogId = await maybeWritePurchaseLedgerRow(tx, {
-        chargeId: charge.id,
-        metadata: event.metadata,
-      });
-      await enqueuePackageFlipPush(tx, {
-        settled: true,
-        ownerId: charge.ownerId,
-        chargeId: charge.id,
-        amountCents: event.amountCents,
-        metadata: event.metadata,
-      });
+      opts.log.error({ chargeId: charge.id, stripeEventId: event.id }, OFF_ENGINE_PACK_ALARM);
     }
 
-    return { outcome: 'flipped-charge-succeeded', creditsDogId };
-  });
-}
-
-/**
- * A non-empty string field off PaymentIntent metadata, which arrives across a
- * trust boundary (anything can be in there, including nothing).
- */
-function metadataString(metadata: Record<string, string>, key: string): string | undefined {
-  const value: unknown = metadata[key];
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
-interface PackagePurchaseMetadata {
-  dogId: string;
-  packageId: string;
-  credits: number;
-  mode: BookingMode;
-  location: LocationKey;
-}
-
-/**
- * Validate the grant-bearing PaymentIntent metadata the credit-purchase route
- * stamps (`routes/creditPackages.ts`). Returns the typed fields, or undefined
- * when the metadata is missing/malformed (a PI minted by something other than
- * a package purchase — e.g. an invoice payment). `owner_id` is NOT here:
- * the ledger grant doesn't need it, and the catch-up consumer reads the owner
- * off the existing charge row. The reconstruct consumer validates `owner_id`
- * separately (it has no charge row to read it from).
- */
-function parsePackagePurchaseMetadata(
-  metadata: Record<string, string>,
-): PackagePurchaseMetadata | undefined {
-  const dogId = metadata.dog_id;
-  const packageId = metadata.package_id;
-  const credits = Number(metadata.credits);
-  const mode = metadata.mode;
-  const location = metadata.location;
-  if (
-    typeof dogId !== 'string' ||
-    dogId.length === 0 ||
-    typeof packageId !== 'string' ||
-    packageId.length === 0 ||
-    !Number.isFinite(credits) ||
-    credits <= 0 ||
-    (mode !== 'school' && mode !== 'daycare') ||
-    !isLocationKey(location)
-  ) {
-    return undefined;
-  }
-  return { dogId, packageId, credits, mode, location };
-}
-
-/**
- * Write a `credit_ledger` purchase row if one doesn't already exist for
- * this charge. The async-confirm path of `POST /credit-packages/:key/purchase`
- * deliberately deferred this write to the webhook (Day-14 known caveat) —
- * here we catch it up using the PI metadata. Idempotent: a duplicate
- * call finds an existing row and is a no-op.
- *
- * Returns the granted dog id when it actually wrote a grant (so the receiver
- * can wipe that dog's credit display cache), or `undefined` on a no-op
- * (grant already present) or non-package metadata (nothing to invalidate).
- */
-async function maybeWritePurchaseLedgerRow(
-  tx: Tx,
-  args: { chargeId: string; metadata: Record<string, string> },
-): Promise<string | undefined> {
-  const existing = await tx
-    .select({ id: creditLedger.id })
-    .from(creditLedger)
-    .where(and(eq(creditLedger.chargeId, args.chargeId), eq(creditLedger.reason, 'purchase')))
-    .limit(1);
-  if (existing.length > 0) return undefined;
-
-  const parsed = parsePackagePurchaseMetadata(args.metadata);
-  if (parsed === undefined) {
-    // Metadata missing/malformed (a charge minted by something other than
-    // the credit-purchase route). Skip the grant; the charge row's status is
-    // the load-bearing fact for the audit + future reconciliation.
-    return undefined;
-  }
-  // Resolve the expiry window from credit_expiry_settings (per-location →
-  // org-default → code default) inside this tx — same as the sync route, so the
-  // webhook catch-up grant stamps the same window a live purchase would have.
-  // This covers the catch-up grant AND the orphan reconstruct (which delegates
-  // here); 1-credit packs never expire (helper returns null).
-  const expiresAt = resolvePurchaseExpiry(
-    parsed.credits,
-    await creditExpirySettingsRepository.resolveExpiryWindowMonths(parsed.location, tx),
-    new Date(),
-  );
-  await creditLedgerRepository.creditPurchase(tx, {
-    dogId: parsed.dogId,
-    mode: parsed.mode,
-    location: parsed.location,
-    delta: parsed.credits,
-    packageId: parsed.packageId,
-    chargeId: args.chargeId,
-    expiresAt,
-  });
-  return parsed.dogId;
-}
-
-/**
- * Rebuild a missing credit-package purchase from the PaymentIntent metadata
- * after a sync-path DB failure left Stripe holding the money with no record.
- * Returns `{ reconstructed: true, creditsDogId }` when it reconstructed (the PI
- * was a package purchase; `creditsDogId` set when the grant actually wrote),
- * or `{ reconstructed: false }` when the metadata isn't a package purchase (a
- * genuine orphan the caller reports as such). Idempotent: the charge insert is
- * `ON CONFLICT DO NOTHING` on the unique PI, and the grant is the same
- * `maybeWritePurchaseLedgerRow` no-op-if-present write — so a concurrent client
- * retry and this path can't double-charge or double-grant.
- */
-async function maybeReconstructOrphanedPackagePurchase(
-  tx: Tx,
-  args: { paymentIntentId: string; amountCents: number; metadata: Record<string, string> },
-): Promise<{ reconstructed: boolean; creditsDogId?: string }> {
-  const parsed = parsePackagePurchaseMetadata(args.metadata);
-  if (parsed === undefined) return { reconstructed: false };
-  // The reconstruct builds the charge from scratch, so it additionally needs
-  // the owner (the grant path above gets it from the existing charge row).
-  const ownerId = args.metadata.owner_id;
-  if (typeof ownerId !== 'string' || ownerId.length === 0) return { reconstructed: false };
-
-  const { charge } = await chargesRepository.insertIfAbsentByPaymentIntent(tx, {
-    ownerId,
-    amountCents: args.amountCents,
-    status: 'succeeded',
-    purpose: 'package',
-    stripePaymentIntentId: args.paymentIntentId,
-  });
-  const creditsDogId = await maybeWritePurchaseLedgerRow(tx, {
-    chargeId: charge.id,
-    metadata: args.metadata,
-  });
-  // Same promise as the flip arm below: the owner was told a `processing`
-  // purchase would be reported when it resolved. A reconstruct means the money
-  // moved and the sync 201 they hold may not even name this charge — so the
-  // push matters MORE here, not less.
-  await enqueuePackageFlipPush(tx, {
-    settled: true,
-    ownerId,
-    chargeId: charge.id,
-    amountCents: args.amountCents,
-    metadata: args.metadata,
-  });
-  return { reconstructed: true, creditsDogId };
-}
-
-/**
- * The late-settle owner push for a credit-package charge (wire 1.9.0, Allison
- * approved 2026-08-04). The credit-purchase route commits its `charges` row
- * BEFORE the 201, and `processing` is the one status the pre-tx cancel can't
- * kill — so the owner's 201 says "your payment is still processing, don't buy
- * again right now; if it goes through your credits will be added and we'll let
- * you know", and THIS is the only place that promise can be kept. Without it
- * that sentence points at nothing and the honest advice becomes "buy again",
- * which is how an owner ends up charged twice and granted twice.
- *
- * Fires only on a FLIP (a charge that was still `requires_payment`) or a
- * reconstruct — never on `charge-already-terminal`, where the sync response
- * already told the owner the outcome. `enqueueIdempotent` on
- * `package-flip[-failed]:<chargeId>` makes a replayed Stripe delivery a no-op
- * on top of the receiver's own `stripe_events` dedupe.
- *
- * Silently skips when the PaymentIntent metadata isn't a package purchase: with
- * no `dog_id` there is no credits surface to open, and a push that lands nowhere
- * is worse than none.
- *
- * Inherits BUG-17 (`DISCREPANCIES.md`): stored notification preferences are the
- * scheduler's to honor, and it does so for both these types via
- * `pushPreferences.ts`. Nothing here widens that gap.
- */
-async function enqueuePackageFlipPush(
-  tx: Tx,
-  args: {
-    /** true = the intent settled and credits landed; false = it failed. */
-    settled: boolean;
-    ownerId: string;
-    chargeId: string;
-    amountCents: number;
-    metadata: Record<string, string>;
-  },
-): Promise<void> {
-  const parsed = parsePackagePurchaseMetadata(args.metadata);
-  if (parsed === undefined) return;
-
-  const now = new Date();
-  if (!args.settled) {
-    await scheduledNotificationsRepository.enqueueIdempotent(tx, {
-      ownerId: args.ownerId,
-      type: 'payment-failed',
-      trigger: 'package-charge-failed',
-      dedupeKey: `package-flip-failed:${args.chargeId}`,
-      scheduledFor: now, // immediate — delivered on the next scheduler tick
-      title: 'Purchase failed',
-      body: "Your credit purchase didn't go through — you weren't charged. No credits were added.",
-      deepLinkPath: deepLinkToPath({ kind: 'credits', id: parsed.dogId }),
-      deepLinkKind: 'credits',
-      deepLinkId: parsed.dogId,
-      dogId: parsed.dogId,
-    });
-    return;
-  }
-
-  // Name the dog the credits actually landed on — the owner may have several,
-  // and "credits were added" without saying whose is the kind of vague that
-  // makes someone open the app to find out.
-  const dogName = (await dogsRepository.findNameInTx(tx, parsed.dogId)) ?? 'your dog';
-  const creditNoun = parsed.credits === 1 ? '1 credit was' : `${parsed.credits} credits were`;
-  await scheduledNotificationsRepository.enqueueIdempotent(tx, {
-    ownerId: args.ownerId,
-    type: 'payment-succeeded',
-    trigger: 'package-charge-settled',
-    dedupeKey: `package-flip:${args.chargeId}`,
-    scheduledFor: now,
-    title: 'Purchase complete',
-    body: `Your ${formatDollars(args.amountCents)} credit purchase went through — ${creditNoun} added for ${dogName}.`,
-    deepLinkPath: deepLinkToPath({ kind: 'credits', id: parsed.dogId }),
-    deepLinkKind: 'credits',
-    deepLinkId: parsed.dogId,
-    dogId: parsed.dogId,
+    return { outcome: 'flipped-charge-succeeded' };
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// payment_intent.payment_failed
+// payment_intent.payment_failed, on a charge the engine does not own
 //
-// Find the charge by PI id. Flip to 'failed'. If a purchase ledger row
-// was provisionally written (defensive — Day-14 only writes on
-// 'succeeded'), emit a reversing entry (-delta) so the balance recomputes
-// to its pre-attempt value.
+// Find the charge by PI id and flip it to 'failed'. No ledger row: nothing is granted
+// before the money, so there is nothing to reverse (design §2.4:2925-2927).
 // ─────────────────────────────────────────────────────────────────────────
 
 async function handlePaymentIntentFailed(
@@ -662,56 +401,7 @@ async function handlePaymentIntentFailed(
     }
 
     await chargesRepository.markStatus(tx, { id: charge.id, status: 'failed' });
-
-    if (charge.purpose === 'package') {
-      // The other half of the `processing` promise (wire 1.9.0): the purchase
-      // resolved, and it resolved badly. Saying so — including "you weren't
-      // charged" — is what makes it safe for the owner to buy again.
-      await enqueuePackageFlipPush(tx, {
-        settled: false,
-        ownerId: charge.ownerId,
-        chargeId: charge.id,
-        amountCents: event.amountCents,
-        metadata: event.metadata,
-      });
-    }
-
-    // Reverse any provisional purchase ledger row. Defensive: Day-14's
-    // sync path only writes the ledger on 'succeeded', so this is rare.
-    let creditsDogId: string | undefined;
-    const existing = await tx
-      .select({ id: creditLedger.id, delta: creditLedger.delta })
-      .from(creditLedger)
-      .where(and(eq(creditLedger.chargeId, charge.id), eq(creditLedger.reason, 'purchase')))
-      .limit(1);
-    if (existing.length > 0 && existing[0]!.delta > 0) {
-      const row = existing[0]!;
-      // Reverse via an explicit row: append-only ledger means we can't
-      // delete or edit the original. Use the same `mode` + `dog_id` —
-      // these are stamped on the original purchase row.
-      const [orig] = await tx
-        .select({
-          dogId: creditLedger.dogId,
-          mode: creditLedger.mode,
-          location: creditLedger.location,
-        })
-        .from(creditLedger)
-        .where(eq(creditLedger.id, row.id));
-      if (orig) {
-        await tx.insert(creditLedger).values({
-          dogId: orig.dogId,
-          mode: orig.mode,
-          location: orig.location,
-          delta: -row.delta,
-          reason: 'adjustment',
-          chargeId: charge.id,
-          note: 'reverse provisional purchase grant on Stripe payment_failed',
-        });
-        creditsDogId = orig.dogId;
-      }
-    }
-
-    return { outcome: 'flipped-charge-failed', creditsDogId };
+    return { outcome: 'flipped-charge-failed' };
   });
 }
 

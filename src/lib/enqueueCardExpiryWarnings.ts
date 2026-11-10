@@ -7,8 +7,7 @@ import { scheduledNotificationsRepository } from '../db/repositories/scheduledNo
 import type { Tx } from '../db/tx.js';
 
 /**
- * Card-expiry warning scan (Allison 2026-07-29). Same scheduled-scan shape as
- * `enqueueCreditExpiryWarnings`. A lapsed default card doesn't degrade gracefully:
+ * Card-expiry warning scan (Allison 2026-07-29). A lapsed default card doesn't degrade gracefully:
  * it turns the next charge to it into a decline. This warns before that happens,
  * and once more after it has, so the failure mode is
  * "you were told twice" rather than "your bookings quietly stopped working".

@@ -201,7 +201,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
         paymentMethodId: chargingPaymentMethodId,
       });
 
-      const result = await confirmCharge(
+      const result = await confirmCharge<InvoicePayWire>(
         {
           actor: actorOf(principal),
           ownerId: principal.ownerId,
@@ -212,12 +212,10 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
             requestHash,
           },
           invoiceId: id,
-          card: {
-            paymentMethodId: chargingPaymentMethodId,
-            stripePaymentMethodId: stripeCtx.stripePaymentMethodId,
-            stripeCustomerId: stripeCtx.stripeCustomerId,
-          },
-          inTx1: (tx) => holdInvoiceForPayment(tx, { id, at: opts.now?.(), log: request.log }),
+          inTx1: async (tx) => ({
+            ...(await holdInvoiceForPayment(tx, { id, at: opts.now?.(), log: request.log })),
+            card: { ...stripeCtx, paymentMethodId: chargingPaymentMethodId },
+          }),
           stripe,
           log: request.log,
           now: opts.now,
@@ -308,7 +306,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
         idempotencyKey,
         endpoint: 'POST /invoices/:id/pay-in-person',
         requestHash,
-        // cache-noop: only the §3 `credits:{dogId}:*` family is read-through
+        // cache-noop: only the §3 `credits:{ownerId}:*` family is read-through
         // cached, and it's keyed off `credit_ledger` writes. This flips
         // `invoices.payment_expected` (invoices aren't cached) and enqueues a
         // `scheduled_notifications` row (not cached) — no credit grant, so
@@ -459,7 +457,7 @@ async function holdInvoiceForPayment(
     at: Date | undefined;
     log: { warn(obj: Record<string, unknown>, msg: string): void };
   },
-): Promise<ChargeTerms> {
+): Promise<Omit<ChargeTerms, 'card'>> {
   const invoice = await invoicesRepository.lockById(tx, args.id);
   if (invoice === undefined) {
     throw new ApiError('not_found', `invoice ${args.id} not found`);

@@ -21,6 +21,7 @@ import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import {
   futureWeekday,
   FIXTURE_IDS,
+  FIXTURE_LOT_EXPIRES_AT,
   FIXTURE_NOW,
   FIXTURE_TODAY,
   topUpCredits,
@@ -32,6 +33,7 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
+import { clearPlantedPools, plantLot } from './_poolFixture.js';
 
 /**
  * Day 10 contract tests for POST /bookings — day-program creation
@@ -78,20 +80,11 @@ function futureDate(daysAhead: number): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-/** Wipe every `credit_ledger` row for a fixture dog so a test starts
- * from a known balance of zero. Append-only-by-design — the route never
- * deletes ledger rows in normal flow — but this hard-DELETE is test-only
- * scaffolding to isolate concurrency tests from credit accumulation
- * across prior tests in the same file. */
-async function clearCreditLedger(dogId: string): Promise<void> {
-  await db.delete(creditLedger).where(eq(creditLedger.dogId, dogId));
-}
-
 /** Hard-delete every booking this dog is on (lead or additional) plus its
  * credit-ledger debits + roster rows. Test-only scaffolding (the route never
  * deletes bookings) so a test that books a given (dog, day) isn't tripped by
  * the Day-19d duplicate guard against a booking an EARLIER test left on the
- * same day. Same isolation rationale as `clearCreditLedger`. */
+ * same day. */
 async function clearDogBookings(dogId: string): Promise<void> {
   await db.transaction(async (tx) => {
     const idRows = await tx
@@ -877,10 +870,10 @@ test(
 );
 
 test(
-  'POST /bookings — insufficient credits → 422 insufficient_credits with per-dog gap',
+  'POST /bookings — insufficient credits → 422 insufficient_credits with the pool gap',
   SKIP_WHEN_NO_DB,
   async () => {
-    // Lola has 0 school credits and we don't top up.
+    // The owner holds no Bentonville day-school credit: the fixture's are Fayetteville's.
     const { app } = bookingApp();
     const res = await postBooking({
       app,
@@ -889,7 +882,7 @@ test(
         category: 'day-school',
         lead_dog_id: FIXTURE_IDS.dog2Id,
         dates: [futureDate(24)],
-        location: 'fayetteville',
+        location: 'bentonville',
       },
     });
     assert.equal(res.statusCode, 422);
@@ -898,10 +891,16 @@ test(
         code: string;
         details: {
           kind: string;
-          gaps: { dog_id: string; mode: string; balance: number; required: number }[];
+          gaps: {
+            location: string;
+            mode: string;
+            tier: string;
+            balance: number;
+            required: number;
+          }[];
           shortfall: number;
           short_dates: { date: string; reason: string }[];
-          top_up_offer: null;
+          top_up_offer: { count: number } | null;
         };
       };
     };
@@ -916,15 +915,16 @@ test(
       `${body.error.details.kind} is not an arm of PostBookingsErrorDetails`,
     );
     assert.equal(body.error.details.gaps.length, 1);
-    assert.equal(body.error.details.gaps[0]!.dog_id, FIXTURE_IDS.dog2Id);
+    assert.equal(body.error.details.gaps[0]!.location, 'bentonville');
     assert.equal(body.error.details.gaps[0]!.mode, 'school');
+    assert.equal(body.error.details.gaps[0]!.tier, 'regular');
     assert.equal(body.error.details.gaps[0]!.required, 1);
     assert.equal(body.error.details.gaps[0]!.balance, 0);
     assert.equal(body.error.details.shortfall, 1);
     assert.deepEqual(body.error.details.short_dates, [
       { date: futureDate(24), reason: 'no_credit' },
     ]);
-    assert.equal(body.error.details.top_up_offer, null);
+    assert.equal(body.error.details.top_up_offer?.count, 1);
   },
 );
 
@@ -1050,14 +1050,10 @@ test(
   'POST /bookings — race on (dog, mode): two concurrent requests for same dog serialize',
   SKIP_WHEN_NO_DB,
   async () => {
-    // Clean Waffles' credit ledger first so the balance is EXACTLY 1 after
-    // top-up — prior tests in this file accumulated debits and purchases
-    // and the assertion needs a known-bounded starting balance to prove
-    // that the second racing request observes the first's debit. Hard-
-    // DELETE is test-only scaffolding (the route never deletes ledger rows
-    // in normal flow).
-    await clearCreditLedger(FIXTURE_IDS.dog1Id);
-    await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
+    // Bentonville day school, which nothing else in this file touches, so the pool holds
+    // EXACTLY 1: the assertion proves the second request observes the first's debit.
+    await clearPlantedPools();
+    await plantLot({ credits: 1, expiresAt: FIXTURE_LOT_EXPIRES_AT });
     const app1 = bookingApp().app;
     const app2 = bookingApp().app;
     const date1 = futureWeekday(20);
@@ -1070,7 +1066,7 @@ test(
           category: 'day-school',
           lead_dog_id: FIXTURE_IDS.dog1Id,
           dates: [date1],
-          location: 'fayetteville',
+          location: 'bentonville',
         },
       }),
       postBooking({
@@ -1080,7 +1076,7 @@ test(
           category: 'day-school',
           lead_dog_id: FIXTURE_IDS.dog1Id,
           dates: [date2],
-          location: 'fayetteville',
+          location: 'bentonville',
         },
       }),
     ]);
@@ -1088,6 +1084,8 @@ test(
     // Exactly one 201, one 422. (Lock makes them serialize; the second sees
     // the first's debit and 422s on insufficient_credits.)
     assert.deepEqual(codes, [201, 422], `expected [201, 422], got ${codes}`);
+    await clearDogBookings(FIXTURE_IDS.dog1Id);
+    await clearPlantedPools();
   },
 );
 

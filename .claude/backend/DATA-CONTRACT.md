@@ -5567,8 +5567,8 @@ they do not say. Code: `src/lib/confirmCharge.ts`, `src/lib/cancelOrder.ts`,
   webhook endpoint in test and live: an ops step no gate sees.**
 - **The sweeper (`workers/orderSweeper.ts`) is forward only and never tries a card.**
   Its verbs are retrieve and cancel. No intent id: the order is abandoned, with the 402
-  `{outcome: 'abandoned', attempts: 0}` and one `Payment failed` notice. An intent id:
-  retrieved, then `succeeded` settles, `processing` and `requires_capture` wait,
+  `{outcome: 'abandoned', attempts: 0}` and one failed-payment notice, which reads
+  `Booking cancelled` when rows came down. An intent id: retrieved, then `succeeded` settles, `processing` and `requires_capture` wait,
   `canceled` takes the failure policy, and the other three are cancelled first. A
   cancel refused with 429 `lock_timeout` is a confirm holding the intent: nothing is
   written, and the next look reads what it did.
@@ -5631,3 +5631,40 @@ stands as the record of what was built, and this says what left. The shapes are 
   everyone's: no grant site branches on it and becoming alumni moves no lot (ALUM-U16).
 - **The tick** has eight phases (`SchedulerTickResult`), pinned by name, with its
   completion log line, in `test/contracts/scheduler-tick-shape.test.ts`.
+
+## R. Credits are the owner's (wire 5.0.0-lg4.2, 2026-11-07)
+
+Δ 2026-11-07 (P18, DECISIONS 174 to 180). Wire is the contract; this records what the
+sections above no longer say. Everything here supersedes §B Credits, §I's 2026-06-20
+amendment, and J.3's "credits never expire".
+
+- **The pool.** `credit_ledger` is keyed by owner: one pool per `(owner, location, mode,
+  tier)`, and a debit's `dog_id` is the dog served, not whose credit it was (M4.10). A row
+  can only name a lot of its own pool. `GET /credits?location=` replaces
+  `GET /dogs/:id/credits`.
+- **Every lot has a date.** `expires_at` = the grant's anchor + the row's `expiry_months`
+  whole America/Chicago months, through `addChicagoMonths`, the one helper. The purchase's
+  anchor is the PaymentIntent's created instant, so a late settle stamps what the route
+  would have. A single-day row and an alumni row are dated like any other. M4.09 retires
+  the never-expiring class: `grant_has_expiry`, `debit_names_lot` and `one_expiry_copy`.
+- **Liveness is computed at read.** `lot_is_live` answers "does it count now", and
+  `lot_pays_date` "can it pay that day" (M4.08). `cred.expiry_enforced_enabled` false makes
+  every stamped lot live.
+- **`credit_expiry_settings` is gone** (M4.07, its rows in `audit_log`), with
+  `/staff/credit-expiry-settings` and its resolvers. The lead is
+  `cred.expiry_warning_lead_days`; a return's fresh month is
+  `cred.returned_credit_expiry_months`; a hand add's is `cred.manual_grant_expiry_months`.
+- **The purchase is on the order engine.** One order, one charge written before Stripe with
+  `package_id` and `credits_count` frozen on it, and metadata `{order_id, charge_id}` only.
+  The route, the webhook and the sweeper share one settle, which writes the paid invoice and
+  the lot. A second purchase lot on a charge is refused by M4.09's partial index, and the
+  grant's `ON CONFLICT (charge_id) WHERE reason = 'purchase' DO NOTHING` keeps the first. A
+  decline is a 402, not a 201.
+- **The top-up is live.** `POST /bookings` with `payment.top_up` is one order and one charge,
+  and a decline books nothing and returns every debit.
+- **Staff hand edits.** `GET /staff/owners/:ownerId/credits` for any role;
+  `POST /staff/owners/:ownerId/credit-adjustments` and `PATCH /staff/credit-lots/:id` on
+  `staff.credit_hand_edit_role_list`. Each change is a ledger row with a staffer and a note,
+  or a `credit_lot_expiry_edits` row for a date. `credit_ledger` stays off the audit list.
+- **Alumni is stored.** `dogs.is_alumni` is set when the fifth level is recorded and never
+  cleared (M4.11).

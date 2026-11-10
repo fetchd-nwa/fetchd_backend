@@ -34,7 +34,7 @@ import { formatZodIssues, parseOrThrow } from '../lib/zodIssues.js';
  *
  *   GET  /staff/rates                       active + scheduled catalog
  *   GET  /staff/rates/history?category&loc  full change log for one track
- *   POST /staff/rates                       set a rate (effective-dated supersede)
+ *   POST /staff/rates                       the evaluation rate, at its seed (DAY-U23)
  *   POST /staff/rates/:id/void              cancel/remove an entry
  *
  * `service_rates` is **append-only**: a price change closes the open window's
@@ -55,27 +55,19 @@ const LOCATION_VALUES = LOCATION_SLUGS;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
- * Amount sanity band. min 1¢ — a rate exists to charge something (a "$0 rate"
- * is a different concept, not a price). max $10,000 — a generous ceiling that
- * still covers a flat board-and-train package, while stopping a fat-finger from
- * setting a $1M/day price that would reach a card before anyone noticed.
+ * The one amount this route takes. In v1 the route holds the evaluation's rate and no
+ * evaluation charge path is designed, and question 27 holds every price at its seed, so
+ * anything but the seed is 422 `invalid_payload` (design §1.1:929-935, DAY-U23). The
+ * day-school and day-care rows went at M4.06: a day's price is a catalog row.
  */
-const MIN_AMOUNT_CENTS = 1;
-const MAX_AMOUNT_CENTS = 1_000_000;
-
-/**
- * A rule from pay-as-you-go, which billed day-school / day-care per booking DATE
- * straight off `amount_cents`. PAYG left at wire 4.0.0, so nothing bills these rows
- * now, and the rule stands until DAY-U23 removes them (P18). Other categories have no
- * live rate-charged money path, so their unit is unconstrained here.
- */
-const PER_DAY_REQUIRED_CATEGORIES = new Set<string>(['day-school', 'day-care']);
+const EVALUATION_SEED_AMOUNT_CENTS = 0;
 
 const postBodySchema = z
   .object({
-    category: z.enum(SERVICE_CATEGORY_VALUES),
+    category: z.literal('evaluation'),
     location: z.enum(LOCATION_VALUES),
-    amount_cents: z.number().int().min(MIN_AMOUNT_CENTS).max(MAX_AMOUNT_CENTS),
+    // A fraction of a cent is a malformed amount (TAX-10). A whole wrong one is the 422.
+    amount_cents: z.number().int(),
     unit: z.enum(RATE_UNIT_VALUES),
     // Omitted = effective today (Chicago). When present it may schedule a
     // future change; the route rejects back-dating (would corrupt as-charged
@@ -173,8 +165,8 @@ export function registerStaffRatesRoute(
   // Set the rate for one (category, location) track, effective-dated. Returns
   // the resulting current/scheduled row. Idempotency-Key required.
   // STAFF-U07 (design §2.1:2080-2091): owner and manager, whole. The shared
-  // (category, campus) track has no trainer axis; DAY-U23 narrows the route at
-  // design 4.0.0. `capabilities.edit_prices` is NOT this route's gate.
+  // (category, campus) track has no trainer axis. DAY-U23 narrowed the route to the
+  // evaluation's seed. `capabilities.edit_prices` is NOT this route's gate.
   const ownerOrManager = requireStaffRole('owner', 'manager');
   app.post(
     '/staff/rates',
@@ -193,10 +185,10 @@ export function registerStaffRatesRoute(
           `effective_from ${effectiveFrom} is in the past (today in America/Chicago is ${today}); rates can't be back-dated`,
         );
       }
-      if (PER_DAY_REQUIRED_CATEGORIES.has(body.category) && body.unit !== 'per-day') {
+      if (body.amount_cents !== EVALUATION_SEED_AMOUNT_CENTS) {
         throw new ApiError(
           'invalid_payload',
-          `${body.category} is billed per booking day; unit must be 'per-day' (got '${body.unit}')`,
+          `the evaluation rate stays at its seed, ${EVALUATION_SEED_AMOUNT_CENTS} (got ${body.amount_cents})`,
         );
       }
 

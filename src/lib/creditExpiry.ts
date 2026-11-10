@@ -1,64 +1,34 @@
+import { chicagoWallPartsAt, chicagoWallTimeToUtc } from './chicagoDate.js';
+
 /**
- * Credit-expiry window math (schema.sql `credit_ledger` lot model,
- * Δ 2026-06-18). A purchased credit lot expires `windowMonths` after purchase —
- * EXCEPT a single-day (1-credit) pack, which never expires. The window is
- * stamped once at purchase (non-retroactive: a later staff change affects
- * future purchases only), mirroring `cancel_window_settings`.
+ * The one month helper every lot's expiry goes through (CRED-U06; design §2.4:2885-2889):
+ * `anchor` plus `months` whole America/Chicago calendar months, the wall clock kept.
+ * 09:10 stays 09:10 across a DST change, where `setUTCMonth` turned a 09:10 CDT buy into
+ * 08:10 CST and rolled 31 Jan + 1 month to 3 Mar.
  *
- * Phase 2 (2026-06-20): the window NUMBER now comes from the staff-tunable
- * `credit_expiry_settings` table — resolved by `creditExpirySettingsRepository`
- * (per-location override → org-default → `DEFAULT_CREDIT_EXPIRY_MONTHS`) and
- * passed in. This module stays PURE (no DB import): callers resolve the number
- * inside their tx and hand it to these functions, so the rules live here and
- * the data access lives in the repository (dependency rule). Location no longer
- * appears in the signatures — it's consumed upstream when resolving the window,
- * and the lot math itself doesn't branch on it.
+ *   - A day the target month lacks clamps to its last day: 31 Jan → 28 Feb. Our mechanic
+ *     for "whole calendar months", not a ruling.
+ *   - A wall time the target day skips moves forward by the gap: 02:30 Sun 14 Feb 2027 →
+ *     03:30 Sun 14 Mar 2027.
+ *   - A wall time the target day repeats takes the earlier offset: 01:30 CDT Thu 7 Oct
+ *     2027 → the first 01:30 on Sun 7 Nov 2027.
+ *
+ * Those last two are `chicagoWallTimeToUtc`'s "compatible" reading. It works to the
+ * minute, and Chicago's offset is a whole number of minutes, so the anchor's seconds and
+ * milliseconds are the wall clock's and carry over unchanged.
  */
-
-/** Code-side fallback expiry window: 1 year. Used by the resolver only when the
- * settings table has neither a per-location override nor the org-default row
- * (unreachable in practice — the schema seeds the org-default — but keeps
- * resolution total). */
-export const DEFAULT_CREDIT_EXPIRY_MONTHS = 12;
-
-/** Code-side fallback warning-lead window: 60 days. The credits-expiring scan
- * (`enqueueCreditExpiryWarnings`) warns an owner this many days before a lot's
- * `expires_at`. Resolved per-location → org-default → this constant by
- * `creditExpirySettingsRepository.resolveWarningLeadDays`, mirroring the
- * months fallback chain. Matches the schema's seeded org-default
- * (`credit_expiry_settings` 60d) so the resolve is a no-op swap until staff tune
- * it; unreachable in practice (the schema seeds the org-default row), but keeps
- * the resolver total under unexpected DB state. */
-export const DEFAULT_WARNING_LEAD_DAYS = 60;
-
-/** `from` advanced by whole months, in UTC. */
-function addMonthsUtc(from: Date, months: number): Date {
-  const next = new Date(from.getTime());
-  next.setUTCMonth(next.getUTCMonth() + months);
-  return next;
-}
-
-/**
- * `expires_at` for a credit-package PURCHASE grant. A single-day pack (exactly
- * 1 credit) never expires (null); a multi-credit pack expires at purchase + the
- * caller-resolved window (`windowMonths`, from `credit_expiry_settings`).
- */
-export function resolvePurchaseExpiry(
-  grantedCount: number,
-  windowMonths: number,
-  now: Date,
-): Date | null {
-  if (grantedCount <= 1) return null;
-  return addMonthsUtc(now, windowMonths);
-}
-
-/**
- * `expires_at` for a freshly-minted REFUND lot — used only when a free-window
- * cancel returns a credit whose source lot has already expired (the common
- * refund returns to the still-alive original lot instead). Always a fresh
- * window: a refund is 1 credit but, unlike a purchased single-day pack, is NOT
- * never-expire (decisions #1 vs #5 — "new expiry" wins for refunds).
- */
-export function resolveRefundExpiry(windowMonths: number, now: Date): Date {
-  return addMonthsUtc(now, windowMonths);
+export function addChicagoMonths(anchor: Date, months: number): Date {
+  const { date, hour, minute } = chicagoWallPartsAt(anchor);
+  const [year, month, day] = date.split('-').map(Number) as [number, number, number];
+  const monthIndex = month - 1 + months;
+  const targetYear = year + Math.floor(monthIndex / 12);
+  const targetMonth = ((monthIndex % 12) + 12) % 12;
+  const lastDay = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const targetDate = [
+    String(targetYear),
+    String(targetMonth + 1).padStart(2, '0'),
+    String(Math.min(day, lastDay)).padStart(2, '0'),
+  ].join('-');
+  const subMinuteMs = ((anchor.getTime() % 60_000) + 60_000) % 60_000;
+  return new Date(chicagoWallTimeToUtc(targetDate, hour, minute).getTime() + subMinuteMs);
 }

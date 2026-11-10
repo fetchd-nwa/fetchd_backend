@@ -1,37 +1,32 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
+import { actorOf } from '../auth/principal.js';
 import type {
+  ApiErrorEnvelope,
   CreditPackageWire,
   CreditPurchaseWire,
   GetCreditPackagesQuery,
   PostCreditPackagesPurchaseRequest,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
-import { db } from '../db/client.js';
-import { chargesRepository } from '../db/repositories/chargesRepository.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
-import { dogsRepository } from '../db/repositories/dogsRepository.js';
-import { bookingMode, LOCATION_SLUGS } from '../db/schema/schema.js';
-import { invalidatePattern } from '../lib/cache.js';
-import { creditExpirySettingsRepository } from '../db/repositories/creditExpirySettingsRepository.js';
-import { resolvePurchaseExpiry } from '../lib/creditExpiry.js';
+import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
+import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
-import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { peekEngineClaim } from '../db/idempotency.js';
+import { hashRequestBody, requireIdempotencyKey } from '../db/mutation.js';
+import type { Tx } from '../db/tx.js';
+import { invalidateAll } from '../lib/cache.js';
+import { confirmCharge } from '../lib/confirmCharge.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
-import {
-  chargeBlockerForConfirm,
-  defaultStripeClient,
-  stripeIntentStatusToChargeStatus,
-  type StripeClient,
-} from '../lib/stripe.js';
+import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
 import { uuidId } from '../lib/uuidId.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 
-type BookingMode = (typeof bookingMode.enumValues)[number];
 const LOCATION_KEYS = LOCATION_SLUGS;
 type LocationKey = (typeof LOCATION_KEYS)[number];
 
@@ -39,18 +34,14 @@ type LocationKey = (typeof LOCATION_KEYS)[number];
  * `GET /credit-packages` `[auth]` — the active catalog of purchasable
  * credit packs (DATA-CONTRACT §B CreditPackage Δ 2026-05-20).
  *
- * `POST /credit-packages/:key/purchase` `[auth, $]` — Day 14. Synchronous
- * confirmation path against Stripe test mode: the route creates +
- * confirms a PaymentIntent off the owner's stored payment_method, writes
- * the `charges` row mirroring Stripe's returned status, and (only on
- * `succeeded`) writes the matching `credit_ledger` purchase grant. A
- * non-succeeded intent is CANCELLED pre-tx (wire 1.7.1) so it can't
- * auto-succeed behind a later attempt; the returned client_secret names
- * that cancelled intent and the owner buys again with a fresh one.
+ * `POST /credit-packages/:key/purchase` `[auth, $]` — on the order engine: one order and
+ * one charge written before Stripe, settled by the route, the webhook or the sweeper
+ * through the one settle statement. The credits land in the owner's pool for the row's
+ * campus, program and tier, and no dog is named.
  *
- * Optional `quantity` (1–100, default 1) buys N units of the package in
- * one charge / one ledger lot — the app's "choose your own amount"
- * option sends N × the single-day pack.
+ * A pack is bought one at a time. A row with `single_day` true is sold by
+ * `count` (1..`cred.single_day_purchase_max_count`), in one charge and one
+ * lot; `count` on any other row is 422 `count_not_allowed` (CRED-U04).
  *
  * Catalog endpoint: both owner and staff principals get the same data
  * (rates + packages are reference data, not user data). Retirement is
@@ -88,8 +79,8 @@ const keyParamSchema = z.object({
     .regex(/^[a-z0-9-]+$/i, 'key must be alphanumeric with dashes'),
 });
 
-// Catalog + purchase are per-location since the Δ 2026-06-04 (pricing varies
-// by school). The owner app passes its selected location.
+// The catalog is per-location since the Δ 2026-06-04 (pricing varies by school).
+// A purchase names only the row, which carries its campus (CRED-U04).
 const packagesQuerySchema = z.object({ location: z.enum(LOCATION_KEYS) });
 
 /** Zod ↔ wire pin for the catalog query (design §5.1.3, `z.input`). */
@@ -97,29 +88,18 @@ export type GetCreditPackagesQueryConformance = Expect<
   Equal<z.input<typeof packagesQuerySchema>, GetCreditPackagesQuery>
 >;
 
-// Upper bound for a single purchase's unit count — matches the app's
-// "choose your own amount" wheel (1–100 of the single-day pack).
-const PURCHASE_QUANTITY_MAX = 100;
-
 const purchaseBodySchema = z
   .object({
-    // Lowercased at the parse: the `credits:{dogId}:*` wipe below builds its pattern
-    // from this string, and the cache is keyed by the lowercase id, so a second
-    // spelling left the balance stale (P13 fix round 1, F4).
-    dog_id: uuidId('dog_id must be a UUID'),
     payment_method_id: uuidId('payment_method_id must be a UUID'),
-    location: z.enum(LOCATION_KEYS),
-    // Buy N units of the package in ONE charge: quantity × price_cents,
-    // quantity × credits granted. Powers the app's custom-amount option
-    // (N × the single-day pack). Absent = 1 = the classic package purchase.
-    quantity: z.number().int().min(1).max(PURCHASE_QUANTITY_MAX).default(1),
+    // Above `cred.single_day_purchase_max_count`, or on a pack, is 422
+    // `count_not_allowed` from the row: only the shape is refused here.
+    count: z.number().int().positive().optional(),
   })
   .strict();
 
 /**
- * Zod ↔ wire pin for the purchase body (design §5.1.3). `z.input`, not
- * `z.infer`: `quantity` is optional to a CLIENT (pre-default) and always
- * present to the handler (post-default) — the wire documents the former.
+ * Zod ↔ wire pin for the purchase body (design §5.1.3). `z.input`: `count` is
+ * optional to a client, and the handler reads it as 1 when it is omitted.
  */
 export type PostCreditPackagesPurchaseBodyConformance = Expect<
   Equal<z.input<typeof purchaseBodySchema>, PostCreditPackagesPurchaseRequest>
@@ -145,238 +125,115 @@ export function registerCreditPackagesRoute(
 
   // --- POST /credit-packages/:key/purchase -----------------------------
   //
-  // Stripe call lives OUTSIDE `withMutation` so the network round-trip
-  // doesn't pin a Postgres tx open. Retry safety: the same Idempotency-
-  // Key flows into BOTH the Stripe `paymentIntents.create` (Stripe-side
-  // dedupe) AND the `withIdempotency` wrapper (DB-side dedupe). A retry
-  // with the same key re-fetches the same PI from Stripe + replays the
-  // stored DB outcome — no double-charge, no double-grant.
-  //
-  // Failure of the Stripe call before the DB tx commits = no rows
-  // written, Stripe-side state may or may not have created an intent
-  // (depends on where the failure lands). The client retries with the
-  // same key; if Stripe DID create one earlier, it returns the cached
-  // PI; the DB tx now runs and writes the rows. Self-healing.
+  // One order, one charge, `cancel-order` (design §2.4:2978-3022; `lib/confirmCharge.ts`
+  // holds the protocol). The charge is written before Stripe with what was bought frozen
+  // on it, so whichever of the route, the webhook or the sweeper settles it grants exactly
+  // that, once. A `processing` intent stays live: the arm is the answer, never a cancel.
   app.post(
     '/credit-packages/:key/purchase',
     { preHandler: [authHook] },
-    async (request, reply): Promise<CreditPurchaseWire> => {
+    async (request, reply): Promise<CreditPurchaseWire | ApiErrorEnvelope> => {
       const principal = requirePrincipal(request);
       requireOwner(principal, 'purchase credits');
       const { key } = parseKeyParam(request.params);
       const body = parsePurchaseBody(request.body);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+      const endpoint = 'POST /credit-packages/:key/purchase';
+      const requestHash = hashRequestBody({ key, ...body });
 
-      // ── Pre-Stripe validation (read-only, before the network call) ──
-      // These checks run twice on retry — that's intentional. If state
-      // changed between attempts (card deleted, dog deleted), the second
-      // call surfaces the new truth as a 404/422 BEFORE re-calling
-      // Stripe with a stale intent.
-      const purchaseContext = await loadPurchaseContext({
-        key,
-        location: body.location,
-        ownerId: principal.ownerId,
-        dogId: body.dog_id,
-        paymentMethodId: body.payment_method_id,
-        today: bucketChicagoToday(nowFactory()),
-      });
-      const pkg = purchaseContext.pkg;
-      // Quantity multiplies the whole purchase: one charge, one ledger lot.
-      // Metadata carries the TOTAL so the Day-15 webhook's reconcile path
-      // (which grants straight from metadata.credits) needs no quantity
-      // awareness at all.
-      const grantCredits = pkg.credits * body.quantity;
-
-      // ── Stripe call (outside the tx; idempotency-keyed) ──
-      const intent = await stripe.createAndConfirmPaymentIntent(
-        {
-          customerId: purchaseContext.stripeCustomerId,
-          paymentMethodId: purchaseContext.stripePaymentMethodId,
-          amountCents: pkg.price_cents * body.quantity,
-          currency: 'usd',
-          metadata: {
-            owner_id: principal.ownerId,
-            dog_id: body.dog_id,
-            // package_id is the load-bearing FK the async webhook stamps onto
-            // the ledger; package_key rides along for human-readable Stripe
-            // dashboard reconciliation.
-            package_id: pkg.id,
-            package_key: pkg.key,
-            credits: String(grantCredits),
-            quantity: String(body.quantity),
-            mode: pkg.mode,
-            location: pkg.location,
-          },
-        },
-        `${idempotencyKey}:payment-intent`,
+      // A stored answer replays, a stored 402 included; an open claim is 409.
+      const replay = await peekEngineClaim<CreditPurchaseWire | ApiErrorEnvelope>(
+        idempotencyKey,
+        endpoint,
+        requestHash,
+        principal.ownerId,
       );
-
-      const chargeStatus = stripeIntentStatusToChargeStatus(intent.status);
-      // Why it stopped, in domain vocabulary — the distinction the line above
-      // destroys by collapsing five Stripe statuses into `requires_payment`,
-      // and the one the copy the owner reads depends on (wire 1.8.0). Derived
-      // in ONE place for all six confirm sites: a thrown card error's `code`
-      // outranks the intent's resting status (which reads the same for a
-      // decline and an authentication failure), except where the status says
-      // money may be in motion. Pre-tx so the warnings inside fire once per
-      // real confirm, not once per replay.
-      const chargeBlocker = chargeBlockerForConfirm(intent, request.log);
-
-      // Non-succeeded confirm: cancel the intent so it can't later auto-succeed
-      // and double-charge against the next attempt's fresh one. The rule applies
-      // to every path that confirms off-session and sees a non-succeeded status,
-      // because no client-side 3DS
-      // completion flow exists anywhere in this system, so the returned
-      // `client_secret` names a cancelled intent and is for support lookup only.
-      //
-      // PRE-TX deliberately: no Stripe call may run inside `withMutation`'s
-      // transaction. Best-effort — a cancel Stripe refuses (a rare `processing`,
-      // or a replay re-cancelling an already-cancelled intent, since this route
-      // re-calls Stripe on the replay path) is logged and does not fail the
-      // purchase; nothing was granted either way.
-      if (chargeStatus !== 'succeeded') {
-        try {
-          await stripe.cancelPaymentIntent(intent.id);
-        } catch (err) {
-          request.log.warn(
-            { err, dogId: body.dog_id, paymentIntentId: intent.id },
-            'credit purchase: could not cancel unsettled PaymentIntent (best-effort)',
-          );
-        }
+      if (replay !== undefined) {
+        reply.code(replay.status);
+        return replay.body;
       }
 
-      // ── DB writes (inside withMutation; idempotency-keyed) ──
-      const outcome = await withMutation<CreditPurchaseWire>(
+      const result = await confirmCharge<CreditPurchaseWire>(
         {
-          principal,
-          idempotencyKey,
-          endpoint: 'POST /credit-packages/:key/purchase',
-          // Hash over client-supplied params only — `intent.id` is
-          // server-generated and differs per Stripe call (under the same
-          // idempotency key Stripe returns the SAME intent.id, but the
-          // replay path skips Stripe entirely, so we never re-read it).
-          requestHash: hashRequestBody({ key, body }),
-          // Drop the per-dog credits cache (§3 invalidation map; Day-8
-          // deferred this key for Day-14). The cache reads
-          // `dog_credit_balance` which is now stale post-purchase.
-          patternsToInvalidate: (wire) =>
-            wire.charge_status === 'succeeded' ? [`credits:${body.dog_id}:*`] : [],
-        },
-        async (tx) => {
-          const charge = await chargesRepository.create(tx, {
-            ownerId: principal.ownerId,
-            amountCents: intent.amountCents,
-            status: chargeStatus,
-            purpose: 'package',
-            stripePaymentIntentId: intent.id,
-          });
-
-          if (chargeStatus === 'succeeded') {
-            // Stamp from credit_expiry_settings (per-location → org-default →
-            // code default), read inside this tx. 1-credit packs never expire
-            // (helper returns null). Expiry keys off the TOTAL granted: 10 × the
-            // never-expiring single-day pack is a bulk buy and gets the
-            // multi-credit window.
-            const expiresAt = resolvePurchaseExpiry(
-              grantCredits,
-              await creditExpirySettingsRepository.resolveExpiryWindowMonths(pkg.location, tx),
-              nowFactory(),
+          actor: actorOf(principal),
+          ownerId: principal.ownerId,
+          claim: { key: idempotencyKey, ownerId: principal.ownerId, endpoint, requestHash },
+          // A refusal here rolls tx1 back: no order, no claim, no Stripe call.
+          inTx1: async (tx) => {
+            const today = bucketChicagoToday(nowFactory());
+            const pkg = await creditPackagesRepository.findByKey(tx, key, today);
+            if (pkg === undefined) {
+              throw new ApiError('not_found', `credit package ${key} not found or retired`);
+            }
+            if (body.count !== undefined) await assertCountAllowed(tx, pkg, body.count);
+            const count = body.count ?? 1;
+            // The ownership check too: a card that is not a live card of hers is the generic 404.
+            const card = await loadStripePaymentContext(
+              { ownerId: principal.ownerId, paymentMethodId: body.payment_method_id },
+              tx,
             );
-            await creditLedgerRepository.creditPurchase(tx, {
-              dogId: body.dog_id,
-              mode: pkg.mode,
-              location: pkg.location,
-              delta: grantCredits,
+            return {
+              amountCents: pkg.price_cents * count,
+              purpose: 'package',
+              bookingId: null,
+              cohortId: null,
+              dogId: null,
               packageId: pkg.id,
-              chargeId: charge.id,
-              // Stamped once at purchase (non-retroactive).
-              expiresAt,
-            });
-          }
-
-          return {
-            status: 201,
-            body: {
-              charge_id: charge.id,
-              charge_status: chargeStatus,
-              stripe_payment_intent_id: intent.id,
-              client_secret: intent.clientSecret,
-              credits_granted: chargeStatus === 'succeeded' ? grantCredits : 0,
-              charge_blocker: chargeBlocker,
-            },
-          };
+              creditsCount: pkg.credits * count,
+              card: { ...card, paymentMethodId: body.payment_method_id },
+            };
+          },
+          stripe,
+          log: request.log,
+          now: opts.now,
         },
+        'cancel-order',
       );
 
-      // Belt-and-suspenders: even when `patternsToInvalidate` is empty
-      // (status != succeeded), make sure stale `credits:*` from a prior
-      // session's cache layer doesn't persist past a retry that goes
-      // from requires_payment → (eventually webhook → succeeded).
-      // Day-15's webhook owns that flip's invalidation; this is a
-      // belt for the Day-14 sync-confirm window.
-      if (!outcome.replayed && outcome.body.charge_status !== 'succeeded') {
-        try {
-          await invalidatePattern(`credits:${body.dog_id}:*`);
-        } catch {
-          // ignore — best-effort cleanup
-        }
+      switch (result.kind) {
+        case 'answered':
+          await invalidateAll([creditsInvalidationPattern(principal.ownerId)], request.log);
+          reply.code(result.status);
+          return result.body;
+        case 'processing':
+          // Not stored: the claim stays open, so a same-key request answers 409 until the
+          // order settles, and the final answer is what it then replays.
+          reply.code(201);
+          return {
+            charge_id: result.chargeId,
+            charge_status: 'requires_payment',
+            stripe_payment_intent_id: result.intent.id,
+            client_secret: result.intent.clientSecret,
+            credits_granted: 0,
+            charge_blocker: 'processing',
+          };
+        case 'open':
+          throw new ApiError(
+            'idempotency_inflight',
+            'this purchase has no answer yet: re-send it under the same Idempotency-Key',
+          );
       }
-
-      reply.code(outcome.status);
-      return outcome.body;
     },
   );
 }
 
 /**
- * Resolve the (package, dog ownership, Stripe pm context) tuple for a
- * purchase. The Stripe pm-context half (payment_method + stripe_customer)
- * is shared with `POST /invoices/:id/pay` + B&T `confirm-payment` and
- * lives in `lib/loadStripePaymentContext.ts` (rule-of-two extract Day-15).
- *
- * 404 collapses for "missing" + "not yours" + "expired" / "retired" — id
- * enumeration is the security concern; the wire response carries the
- * same shape across all four cases.
+ * `count` is the single days of one purchase: a pack is bought one at a time, so any
+ * `count` on one is refused, `count: 1` included. The limit is read here, never a
+ * constant: `cred.single_day_purchase_max_count` is staff-editable (§3.5).
  */
-async function loadPurchaseContext(args: {
-  key: string;
-  location: LocationKey;
-  ownerId: string;
-  dogId: string;
-  paymentMethodId: string;
-  today: string;
-}): Promise<{
-  pkg: {
-    id: string;
-    key: string;
-    location: LocationKey;
-    mode: BookingMode;
-    credits: number;
-    price_cents: number;
-  };
-  stripeCustomerId: string;
-  stripePaymentMethodId: string;
-}> {
-  const pkg = await creditPackagesRepository.findByKey(db, args.key, args.location, args.today);
-  if (pkg === undefined) {
-    throw new ApiError('not_found', `credit package ${args.key} not found or retired`);
+async function assertCountAllowed(
+  tx: Tx,
+  pkg: { single_day: boolean },
+  count: number,
+): Promise<void> {
+  if (!pkg.single_day) {
+    throw new ApiError('count_not_allowed', 'a pack is bought one at a time');
   }
-
-  const dogOwned = await dogsRepository.findOwnedExists(args.dogId, args.ownerId, db);
-  if (!dogOwned) {
-    throw new ApiError('not_found', `dog ${args.dogId} not found`);
+  const { single_day_purchase_max_count: limit } = await settingsRepository.credit(tx);
+  if (count > limit) {
+    throw new ApiError('count_not_allowed', `at most ${limit} single days in one purchase`);
   }
-
-  const stripeCtx = await loadStripePaymentContext({
-    ownerId: args.ownerId,
-    paymentMethodId: args.paymentMethodId,
-  });
-
-  return {
-    pkg,
-    stripeCustomerId: stripeCtx.stripeCustomerId,
-    stripePaymentMethodId: stripeCtx.stripePaymentMethodId,
-  };
 }
 
 function parseKeyParam(params: unknown): { key: string } {

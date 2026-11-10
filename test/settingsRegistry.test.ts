@@ -213,7 +213,6 @@ const DESIGN =
 /** §3 keys whose store has not landed at LG1, so they are not registered (400 unknown key). */
 const NOT_LANDED: Readonly<Record<string, string>> = {
   'dog.evaluation_gated_categories': 'its column lands at M2.04',
-  'cred.package_expiry_months': 'credit_packages.expiry_months lands at M4.05',
   'vax.service_min_age_weeks': 'M1.16 creates no column (DECISIONS 53, D7)',
   'rpt.event_price_per_dog_cents': 'M1.15 creates no column (D8)',
   'rpt.curriculum_levels_list': 'the curriculum_levels table is M9.03',

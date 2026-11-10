@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { test } from 'node:test';
-import { and, eq } from 'drizzle-orm';
+import { afterEach, test } from 'node:test';
+import { and, eq, isNotNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
-import { charges, creditLedger, stripeCustomers } from '../../src/db/schema/schema.js';
+import {
+  charges,
+  creditLedger,
+  creditSettings,
+  orders,
+  stripeCustomers,
+} from '../../src/db/schema/schema.js';
 import { registerCreditPackagesRoute } from '../../src/routes/creditPackages.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
 import {
@@ -14,24 +20,18 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
+import { clearOrderRows } from './_orderFixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 import type { Principal } from '../../src/auth/principal.js';
 import type { StripePaymentIntentStatus } from '../../src/lib/stripe.js';
 
 /**
- * Day-14 contract tests for the credit-purchase write surface (HANDOFF §4.2):
+ * The credit-purchase write surface, `POST /credit-packages/:key/purchase`: the route's own
+ * refusals, `count`, and what each way a card can stop answers. It rides the order engine,
+ * and what the engine owes a pack is `pack-on-engine.test.ts`.
  *
- *   POST /credit-packages/:key/purchase
- *
- * The synchronous-confirm path: the route creates + confirms a
- * PaymentIntent against the owner's stored card, writes a `charges` row
- * mirroring the returned status, and (only on `succeeded`) writes the
- * matching `credit_ledger` purchase grant. Day-15 webhook handles the
- * async settlement / 3DS reconciliation.
- *
- * Stripe is stubbed via `_stripeStub.ts`. The fixture seeds the
- * stripe_customers row + a default payment_methods row — both pre-
- * requisites for `loadPurchaseContext`.
+ * Stripe is stubbed via `_stripeStub.ts`. The fixture seeds the stripe_customers row and a
+ * default payment_methods row, both needed before a card can be tried.
  */
 
 registerFixtureHooks();
@@ -46,12 +46,15 @@ function buildApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL): {
   return { app, stripe };
 }
 
-async function cleanupChargesAndLedger(): Promise<void> {
-  // Keep the fixture state stable across tests in this file — drop any
-  // charges + credit_ledger rows this test inserted. The ON DELETE FK
-  // from credit_ledger→charges is no-action; drop ledger first.
-  await db.delete(creditLedger).where(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id));
-  await db.delete(charges).where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+afterEach(async () => {
+  await db.delete(creditLedger).where(isNotNull(creditLedger.chargeId));
+  await clearOrderRows();
+  await db.delete(orders).where(eq(orders.ownerId, FIXTURE_IDS.ownerId));
+});
+
+/** Every lot a charge bought: the fixture's own lots carry no charge. */
+async function boughtLots() {
+  return db.select().from(creditLedger).where(isNotNull(creditLedger.chargeId));
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -66,9 +69,7 @@ test(
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': `cp-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 201, res.body);
@@ -82,9 +83,9 @@ test(
     assert.ok(body.credits_granted > 0);
     assert.match(body.stripe_payment_intent_id, /^pi_test_[0-9a-f]{8}$/);
 
-    // Stripe was called exactly once.
-    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
-    assert.equal(piCalls.length, 1);
+    // One intent, created and then confirmed.
+    const creates = stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent');
+    assert.equal(creates.length, 1);
 
     // DB writes landed.
     const [charge] = await db.select().from(charges).where(eq(charges.id, body.charge_id));
@@ -97,13 +98,11 @@ test(
       .where(and(eq(creditLedger.chargeId, charge.id), eq(creditLedger.reason, 'purchase')));
     assert.equal(ledger.length, 1);
     assert.equal(ledger[0]!.delta, body.credits_granted);
-
-    await cleanupChargesAndLedger();
   },
 );
 
 test(
-  'POST /credit-packages/:key/purchase — PI requires_action → charges at requires_payment, NO ledger row',
+  'POST /credit-packages/:key/purchase — PI requires_action → a 402, the charge failed, NO ledger row',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, stripe } = buildApp();
@@ -113,138 +112,17 @@ test(
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': `cp-3ds-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
-    assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as {
-      charge_id: string;
-      charge_status: string;
-      client_secret: string | null;
-      credits_granted: number;
-    };
-    assert.equal(body.charge_status, 'requires_payment');
-    assert.equal(body.credits_granted, 0);
-    // Present, but naming a CANCELLED intent since 1.7.1 — support lookup only.
-    assert.ok(body.client_secret !== null, 'the unsettled path still names its intent');
-    // Charges row landed; ledger row did NOT.
-    const [charge] = await db
+    assert.equal(res.statusCode, 402, res.body);
+    assert.equal(res.json().error.code, 'payment_failed');
+    const rows = await db
       .select({ status: charges.status })
       .from(charges)
-      .where(eq(charges.id, body.charge_id));
-    assert.ok(charge);
-    assert.equal(charge.status, 'requires_payment');
-    const ledger = await db
-      .select()
-      .from(creditLedger)
-      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
-    assert.equal(ledger.length, 0, 'no ledger row until Day-15 webhook confirms succeeded');
-    await cleanupChargesAndLedger();
-  },
-);
-
-// ──────────────────────────────────────────────────────────────────────────
-// The abandoned PaymentIntent is cancelled (wire 1.7.1)
-//
-// Same class rule as `POST /invoices/:id/pay`: no
-// client-side 3DS completion flow exists, so an intent left live after a
-// non-succeeded confirm is pure double-charge hazard — it can auto-succeed later
-// while the owner's next purchase captures on a fresh one.
-// ──────────────────────────────────────────────────────────────────────────
-
-/** The PaymentIntent ids this stub was asked to cancel. */
-function cancelledIntents(stripe: ReturnType<typeof makeStripeStub>): string[] {
-  return stripe.calls
-    .filter((c) => c.method === 'cancelPaymentIntent')
-    .map((c) => c.args.paymentIntentId);
-}
-
-test(
-  'POST /credit-packages/:key/purchase — a non-succeeded confirm cancels the PaymentIntent it just created',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { app, stripe } = buildApp();
-    stripe.setNextIntentStatus('requires_action');
-    const res = await app.inject({
-      method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-      headers: { 'idempotency-key': `cp-cancel-${randomUUID()}` },
-      payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
-      },
-    });
-    assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as { stripe_payment_intent_id: string; credits_granted: number };
-    assert.equal(body.credits_granted, 0);
-    assert.deepEqual(
-      cancelledIntents(stripe),
-      [body.stripe_payment_intent_id],
-      'the intent named in the response is the intent that was cancelled',
-    );
-    await cleanupChargesAndLedger();
-  },
-);
-
-test(
-  'POST /credit-packages/:key/purchase — a succeeded confirm cancels nothing',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { app, stripe } = buildApp();
-    const res = await app.inject({
-      method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-      headers: { 'idempotency-key': `cp-nocancel-${randomUUID()}` },
-      payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
-      },
-    });
-    assert.equal(res.statusCode, 201, res.body);
-    assert.deepEqual(cancelledIntents(stripe), [], 'never cancel money that settled');
-    await cleanupChargesAndLedger();
-  },
-);
-
-test(
-  'POST /credit-packages/:key/purchase — a cancel Stripe refuses does not fail the request',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { app, stripe } = buildApp();
-    stripe.setNextIntentStatus('requires_action');
-    stripe.throwOnCancel();
-    const res = await app.inject({
-      method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-      headers: { 'idempotency-key': `cp-cancel-fail-${randomUUID()}` },
-      payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
-      },
-    });
-    // Best-effort: an uncancellable intent must not turn a recorded attempt into
-    // a 500 the owner reads as "nothing happened".
-    assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as { charge_id: string; charge_status: string };
-    assert.equal(body.charge_status, 'requires_payment');
-    assert.equal(cancelledIntents(stripe).length, 1, 'the cancel was attempted');
-
-    const [charge] = await db
-      .select({ status: charges.status })
-      .from(charges)
-      .where(eq(charges.id, body.charge_id));
-    assert.equal(charge?.status, 'requires_payment', 'the audit-trail charge row still landed');
-    const ledger = await db
-      .select()
-      .from(creditLedger)
-      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
-    assert.equal(ledger.length, 0, 'nothing granted, so nothing to unwind');
-    await cleanupChargesAndLedger();
+      .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
+    assert.deepEqual(rows, [{ status: 'failed' }]);
+    assert.deepEqual(await boughtLots(), [], 'nothing is granted before the money');
   },
 );
 
@@ -259,9 +137,7 @@ test(
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': key },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
     assert.equal(first.statusCode, 201);
@@ -271,9 +147,7 @@ test(
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': key },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
     assert.equal(replay.statusCode, 201);
@@ -284,7 +158,6 @@ test(
       .from(charges)
       .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
     assert.equal(chargesRows.length, 1, 'replay did not write a second charges row');
-    await cleanupChargesAndLedger();
   },
 );
 
@@ -298,28 +171,7 @@ test(
       url: '/credit-packages/not-a-real-package/purchase',
       headers: { 'idempotency-key': `cp-404-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
-      },
-    });
-    assert.equal(res.statusCode, 404);
-  },
-);
-
-test(
-  'POST /credit-packages/:key/purchase — dog not owned by principal → 404',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const { app } = buildApp();
-    const res = await app.inject({
-      method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-      headers: { 'idempotency-key': `cp-dog-404-${randomUUID()}` },
-      payload: {
-        dog_id: '00000000-0000-4000-8000-000000000000',
-        payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 404);
@@ -336,9 +188,7 @@ test(
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': `cp-pm-404-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: '00000000-0000-4000-8000-000000000000',
-        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 404);
@@ -357,9 +207,7 @@ test(
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': `cp-422-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 422);
@@ -378,7 +226,6 @@ test('POST /credit-packages/:key/purchase — staff principal → 403', SKIP_WHE
     url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
     headers: { 'idempotency-key': `cp-staff-${randomUUID()}` },
     payload: {
-      dog_id: FIXTURE_IDS.dog1Id,
       payment_method_id: FIXTURE_IDS.paymentMethod1Id,
     },
   });
@@ -440,72 +287,62 @@ test(
   },
 );
 
-// ── quantity (Δ 2026-07-14: N units in one charge / one lot) ──────────────
+// ── count: single days in one charge / one lot (CRED-U04; `quantity` left with
+// CRED-U30) ───────────────────────────────────────────────────────────────
+
+const SINGLE_DAY_KEY = 'single-day-school-fayetteville';
 
 test(
-  'POST /credit-packages/:key/purchase — quantity 3 → 3× charge amount, 3× credits, one ledger lot WITH expiry',
+  'POST /credit-packages/:key/purchase — count 3 on a single-day row → 3× charge amount, 3 credits, one ledger lot WITH expiry',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, stripe } = buildApp();
     const res = await app.inject({
       method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-      headers: { 'idempotency-key': `cp-qty-${randomUUID()}` },
+      url: `/credit-packages/${SINGLE_DAY_KEY}/purchase`,
+      headers: { 'idempotency-key': `cp-count-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
-        quantity: 3,
+        count: 3,
       },
     });
     assert.equal(res.statusCode, 201, res.body);
     const body = res.json() as { charge_status: string; credits_granted: number };
     assert.equal(body.charge_status, 'succeeded');
-    // Fixture school-5 = 5 credits @ 25_000¢ (current window) → ×3.
-    assert.equal(body.credits_granted, 15);
+    assert.equal(body.credits_granted, 3);
 
-    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
-    assert.equal(piCalls.length, 1);
-    const piArgs = piCalls[0]!.args as { amountCents: number; metadata: Record<string, string> };
-    assert.equal(piArgs.amountCents, 75_000, 'charged quantity × price_cents');
-    assert.equal(piArgs.metadata.credits, '15', 'metadata carries the TOTAL for the webhook path');
-    assert.equal(piArgs.metadata.quantity, '3');
+    const creates = stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent');
+    assert.equal(creates.length, 1);
+    assert.equal(creates[0]?.args.amountCents, 18_000, 'charged count × price_cents');
 
-    // ONE ledger lot for the whole quantity, with the multi-credit expiry
-    // window stamped (total > 1 even though the base pack could be 1-credit).
-    const ledger = await db
-      .select()
-      .from(creditLedger)
-      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+    // ONE ledger lot for the whole count.
+    const ledger = await boughtLots();
     assert.equal(ledger.length, 1);
-    assert.equal(ledger[0]!.delta, 15);
-    assert.ok(ledger[0]!.expiresAt !== null, 'bulk lot carries an expiry window');
-
-    await cleanupChargesAndLedger();
+    assert.equal(ledger[0]!.delta, 3);
+    assert.equal(ledger[0]!.location, 'fayetteville');
+    assert.ok(ledger[0]!.expiresAt !== null, 'the lot carries an expiry');
   },
 );
 
 test(
-  'POST /credit-packages/:key/purchase — quantity 0 / 101 / non-integer → 400, no Stripe call',
+  'POST /credit-packages/:key/purchase — count 0 / non-integer → 400, no Stripe call',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, stripe } = buildApp();
-    for (const quantity of [0, 101, 1.5]) {
+    for (const count of [0, 1.5]) {
       const res = await app.inject({
         method: 'POST',
-        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-        headers: { 'idempotency-key': `cp-qty-bad-${randomUUID()}` },
+        url: `/credit-packages/${SINGLE_DAY_KEY}/purchase`,
+        headers: { 'idempotency-key': `cp-count-bad-${randomUUID()}` },
         payload: {
-          dog_id: FIXTURE_IDS.dog1Id,
           payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-          location: 'fayetteville',
-          quantity,
+          count,
         },
       });
-      assert.equal(res.statusCode, 400, `quantity ${quantity} must 400`);
+      assert.equal(res.statusCode, 400, `count ${count} must 400`);
     }
     assert.equal(
-      stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent').length,
+      stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent').length,
       0,
       'validation rejects before Stripe',
     );
@@ -513,107 +350,159 @@ test(
 );
 
 test(
-  'POST /credit-packages/:key/purchase — quantity 3 + declined/unactioned card → 201 requires_payment, ZERO credits, no ledger lot',
+  'POST /credit-packages/:key/purchase — count past cred.single_day_purchase_max_count → 422 count_not_allowed, the limit read at runtime',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    const buy = (count: number) =>
+      app.inject({
+        method: 'POST',
+        url: `/credit-packages/${SINGLE_DAY_KEY}/purchase`,
+        headers: { 'idempotency-key': `cp-count-max-${randomUUID()}` },
+        payload: {
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          count,
+        },
+      });
+
+    const atSeed = await buy(31);
+    assert.equal(atSeed.statusCode, 422, atSeed.body);
+    assert.equal(atSeed.json().error.code, 'count_not_allowed');
+
+    await db.update(creditSettings).set({ singleDayPurchaseMaxCount: 2 });
+    try {
+      const refused = await buy(3);
+      assert.equal(refused.statusCode, 422, refused.body);
+      assert.equal(refused.json().error.code, 'count_not_allowed');
+      assert.equal(
+        stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent').length,
+        0,
+        'refused before Stripe',
+      );
+      const atLimit = await buy(2);
+      assert.equal(atLimit.statusCode, 201, atLimit.body);
+    } finally {
+      await db.update(creditSettings).set({ singleDayPurchaseMaxCount: 30 });
+    }
+  },
+);
+
+test(
+  'POST /credit-packages/:key/purchase — any count on a pack → 422 count_not_allowed, count 1 included, no Stripe call',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe } = buildApp();
+    for (const count of [1, 3]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+        headers: { 'idempotency-key': `cp-count-pack-${randomUUID()}` },
+        payload: {
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          count,
+        },
+      });
+      assert.equal(res.statusCode, 422, res.body);
+      assert.equal(res.json().error.code, 'count_not_allowed');
+    }
+    assert.equal(stripe.calls.length, 0, 'a pack is bought one at a time');
+  },
+);
+
+for (const [field, value] of [
+  ['dog_id', FIXTURE_IDS.dog1Id],
+  ['quantity', 3],
+  ['location', 'fayetteville'],
+] as const) {
+  test(
+    `POST /credit-packages/:key/purchase — a body still sending ${field} → 400, no Stripe call`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const { app, stripe } = buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+        headers: { 'idempotency-key': `cp-strict-${randomUUID()}` },
+        payload: {
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+          [field]: value,
+        },
+      });
+      assert.equal(res.statusCode, 400, res.body);
+      assert.equal(stripe.calls.length, 0);
+    },
+  );
+}
+
+test(
+  'POST /credit-packages/:key/purchase — count 3 + unactioned card → 402, ZERO credits, no ledger lot',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, stripe } = buildApp();
     stripe.setNextIntentStatus('requires_action');
     const res = await app.inject({
       method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
-      headers: { 'idempotency-key': `cp-qty-declined-${randomUUID()}` },
+      url: `/credit-packages/${SINGLE_DAY_KEY}/purchase`,
+      headers: { 'idempotency-key': `cp-count-declined-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
-        quantity: 3,
+        count: 3,
       },
     });
-    assert.equal(res.statusCode, 201, res.body);
-    const body = res.json() as { charge_status: string; credits_granted: number };
-    assert.equal(body.charge_status, 'requires_payment');
-    assert.equal(body.credits_granted, 0, 'no credits on an unsettled quantity charge');
-    const ledger = await db
-      .select()
-      .from(creditLedger)
-      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
-    assert.equal(ledger.length, 0, 'no ledger lot until the charge settles');
-    await cleanupChargesAndLedger();
+    assert.equal(res.statusCode, 402, res.body);
+    assert.deepEqual(await boughtLots(), [], 'no ledger lot until the charge settles');
   },
 );
 
 test(
-  'POST /credit-packages/:key/purchase — quantity replay with same key → identical body, ONE charge, ONE 15-credit lot',
+  'POST /credit-packages/:key/purchase — count replay with same key → identical body, ONE charge, ONE 3-credit lot',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, stripe } = buildApp();
-    const key = `cp-qty-replay-${randomUUID()}`;
+    const key = `cp-count-replay-${randomUUID()}`;
     const payload = {
-      dog_id: FIXTURE_IDS.dog1Id,
       payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-      location: 'fayetteville' as const,
-      quantity: 3,
+      count: 3,
     };
     const first = await app.inject({
       method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      url: `/credit-packages/${SINGLE_DAY_KEY}/purchase`,
       headers: { 'idempotency-key': key },
       payload,
     });
     assert.equal(first.statusCode, 201, first.body);
     const replay = await app.inject({
       method: 'POST',
-      url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+      url: `/credit-packages/${SINGLE_DAY_KEY}/purchase`,
       headers: { 'idempotency-key': key },
       payload,
     });
     assert.equal(replay.statusCode, 201);
     assert.deepEqual(replay.json(), first.json());
-    // The Stripe call sits OUTSIDE withMutation by design, so the retry
-    // re-calls it — but under the SAME `${key}:payment-intent` idempotency
-    // key, so Stripe returns the SAME intent (the deepEqual above proves the
-    // PI id matched). What must never double is the DB half below.
-    const piCalls = stripe.calls.filter((c) => c.method === 'createAndConfirmPaymentIntent');
-    assert.equal(piCalls.length, 2);
-    assert.equal(piCalls[0]!.idempotencyKey, piCalls[1]!.idempotencyKey);
+    // The claim answered, so the second send never reached Stripe.
+    const creates = stripe.calls.filter((c) => c.method === 'createUnconfirmedPaymentIntent');
+    assert.equal(creates.length, 1);
     const chargesRows = await db
       .select()
       .from(charges)
       .where(eq(charges.ownerId, FIXTURE_IDS.ownerId));
     assert.equal(chargesRows.length, 1);
-    const ledger = await db
-      .select()
-      .from(creditLedger)
-      .where(and(eq(creditLedger.dogId, FIXTURE_IDS.dog1Id), eq(creditLedger.reason, 'purchase')));
+    const ledger = await boughtLots();
     assert.equal(ledger.length, 1);
-    assert.equal(ledger[0]!.delta, 15);
-    await cleanupChargesAndLedger();
+    assert.equal(ledger[0]!.delta, 3);
   },
 );
 
 // ──────────────────────────────────────────────────────────────────────────
 // `charge_blocker` — WHY the confirm stopped (wire 1.8.0)
 //
-// Same field, same union, same reason as `POST /invoices/:id/pay`: five Stripe
-// intent states collapse into `requires_payment` on the way into
-// `charge_status`, and the owner-facing sentence depends on exactly that
-// distinction. `CreditPurchaseWire` moved into the contract in the same bump —
-// it had been declared in the route, so no client's `check:contracts` could
-// guard it.
+// Same field, same union, same reason as `POST /invoices/:id/pay`. An intent that can
+// still move answers a 201 and stays live; one that stopped is the committed 402.
 // ──────────────────────────────────────────────────────────────────────────
 
-const BLOCKER_BY_RAW_STATUS: ReadonlyArray<readonly [StripePaymentIntentStatus, string]> = [
-  ['requires_action', 'authentication_required'],
-  ['requires_payment_method', 'declined'],
-  ['processing', 'processing'],
-  ['requires_confirmation', 'authentication_required'],
-  ['requires_capture', 'processing'],
-  ['canceled', 'declined'],
-];
-
-for (const [rawStatus, blocker] of BLOCKER_BY_RAW_STATUS) {
+for (const rawStatus of ['processing', 'requires_capture'] as const) {
   test(
-    `POST /credit-packages/:key/purchase — ${rawStatus} reports charge_blocker '${blocker}'`,
+    `POST /credit-packages/:key/purchase — ${rawStatus} answers 201 with charge_blocker 'processing'`,
     SKIP_WHEN_NO_DB,
     async () => {
       const { app, stripe } = buildApp();
@@ -623,17 +512,49 @@ for (const [rawStatus, blocker] of BLOCKER_BY_RAW_STATUS) {
         url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
         headers: { 'idempotency-key': `cp-blocker-${randomUUID()}` },
         payload: {
-          dog_id: FIXTURE_IDS.dog1Id,
           payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-          location: 'fayetteville',
         },
       });
       assert.equal(res.statusCode, 201, res.body);
-      const body = res.json() as { credits_granted: number; charge_blocker?: string };
+      const body = res.json() as {
+        charge_status: string;
+        credits_granted: number;
+        charge_blocker?: string;
+      };
       // Beside the collapsed status, and beside the un-granted credits.
+      assert.equal(body.charge_status, 'requires_payment');
       assert.equal(body.credits_granted, 0);
-      assert.equal(body.charge_blocker, blocker);
-      await cleanupChargesAndLedger();
+      assert.equal(body.charge_blocker, 'processing');
+    },
+  );
+}
+
+const STOPPED: ReadonlyArray<readonly [StripePaymentIntentStatus, string | undefined]> = [
+  ['requires_action', 'authentication_required'],
+  ['requires_payment_method', undefined],
+  ['requires_confirmation', undefined],
+  ['canceled', undefined],
+];
+
+for (const [rawStatus, blocker] of STOPPED) {
+  test(
+    `POST /credit-packages/:key/purchase — ${rawStatus} is a 402 naming ${blocker ?? 'no blocker'}`,
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const { app, stripe } = buildApp();
+      stripe.setNextIntentStatus(rawStatus);
+      const res = await app.inject({
+        method: 'POST',
+        url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
+        headers: { 'idempotency-key': `cp-blocker-${randomUUID()}` },
+        payload: {
+          payment_method_id: FIXTURE_IDS.paymentMethod1Id,
+        },
+      });
+      assert.equal(res.statusCode, 402, res.body);
+      const details = res.json().error.details as { charge_blocker?: string };
+      assert.equal(details.charge_blocker, blocker);
+      assert.deepEqual(await boughtLots(), []);
     },
   );
 }
@@ -648,9 +569,7 @@ test(
       url: `/credit-packages/${FIXTURE_IDS.creditPackageSchool5Key}/purchase`,
       headers: { 'idempotency-key': `cp-noblocker-${randomUUID()}` },
       payload: {
-        dog_id: FIXTURE_IDS.dog1Id,
         payment_method_id: FIXTURE_IDS.paymentMethod1Id,
-        location: 'fayetteville',
       },
     });
     assert.equal(res.statusCode, 201, res.body);
@@ -662,6 +581,5 @@ test(
       false,
       'a settled purchase must not carry a reason it stopped',
     );
-    await cleanupChargesAndLedger();
   },
 );

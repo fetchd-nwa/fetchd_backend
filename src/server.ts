@@ -32,7 +32,8 @@ import { registerStaffAlumniRoute } from './routes/staffAlumni.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffDayCapacityRoute } from './routes/staffDayCapacity.js';
-import { registerStaffCreditExpiryRoute } from './routes/staffCreditExpiry.js';
+import { registerStaffCreditPackagesRoute } from './routes/staffCreditPackages.js';
+import { registerStaffCreditsRoute } from './routes/staffCredits.js';
 import { registerStaffInvoicesRoute } from './routes/staffInvoices.js';
 import { registerStaffOrdersRoute } from './routes/staffOrders.js';
 import { registerStaffOwnersRoute } from './routes/staffOwners.js';
@@ -135,7 +136,8 @@ export function buildApp(): FastifyInstance {
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
   registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
   registerStaffDayCapacityRoute(app); // [staff] — PUT/DELETE one date's cap (4.0.0-lg3.1)
-  registerStaffCreditExpiryRoute(app); // [staff] — staff-tunable credit-expiry settings (2026-06-20)
+  registerStaffCreditPackagesRoute(app); // [staff] — a catalog row's expiry window (CRED-U08)
+  registerStaffCreditsRoute(app); // [staff] — an owner's pools, hand edits, a lot's date (CRED-U14, CRED-U15)
   registerStaffSettingsRoute(app); // [staff] — GET/PATCH /staff/settings/:domain[/:location] (2.0.0)
   registerStaffAlumniRoute(app); // [staff] — §J.3 completed-programs record + alumni-flag clear
   registerStaffInvoicesRoute(app); // [staff] — GET /staff/invoices/:id (2.0.0)

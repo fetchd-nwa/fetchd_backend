@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
+  creditLedger,
   agreementDocuments,
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
@@ -198,6 +199,29 @@ test(
       assert.equal(b.cohortId, cohort.id);
       assert.equal(b.sessionReportId, null, 'session_report_id is NULL at enrollment time');
     }
+  },
+);
+
+test(
+  'POST /enrollments — a puppy class adds to no credit pool and draws from none (CRED-U26)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const ledger = () =>
+      db
+        .select({ id: creditLedger.id })
+        .from(creditLedger)
+        .where(eq(creditLedger.ownerId, FIXTURE_IDS.ownerId))
+        .orderBy(creditLedger.id);
+    const before = await ledger();
+    const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 4 });
+    const { app } = enrollApp();
+    const res = await postEnrollment({
+      app,
+      idempotencyKey: `enr-credits-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id] },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    assert.deepEqual(await ledger(), before, 'no ledger row moved');
   },
 );
 

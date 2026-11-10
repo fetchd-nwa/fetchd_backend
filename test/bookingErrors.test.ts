@@ -85,57 +85,63 @@ test('agreementUnsignedError throws on empty missing[]', () => {
   assert.throws(() => agreementUnsignedError([]), /missing array must be non-empty/);
 });
 
-const THREE_DATES = ['2026-06-01', '2026-06-02', '2026-06-03'];
+const POOL = { location: 'fayetteville', mode: 'school', tier: 'regular' } as const;
+const OFFER = { count: 2, unit_price_cents: 6000, total_cents: 12000, package_key: 'single' };
 
-test('insufficientCreditsError single-dog gap', () => {
-  const err = insufficientCreditsError(
-    [{ dog_id: 'd1', mode: 'school', balance: 1, required: 3 }],
-    THREE_DATES,
-  );
+test('insufficientCreditsError counts shortfall on the dates, never on balance', () => {
+  // A balance of 9 and two dates short: `required - balance` would answer a negative
+  // number here, which is the arithmetic D22 retired.
+  const err = insufficientCreditsError({
+    gap: { ...POOL, balance: 9, required: 3 },
+    shortDates: [
+      {
+        date: '2026-06-02',
+        reason: 'credits_expire_first',
+        expires_at: '2026-06-01T17:00:00.000Z',
+      },
+      { date: '2026-06-03', reason: 'no_credit' },
+    ],
+    offer: OFFER,
+  });
   assert.equal(err.code, 'insufficient_credits');
   assert.equal(err.status, 422);
-  assert.equal((err.details as { kind: string; gaps: unknown[] }).kind, 'insufficient_credits');
-  assert.equal((err.details as { gaps: unknown[] }).gaps.length, 1);
-  assert.match(err.message, /Insufficient school credits — need 3, have 1\./);
-});
-
-test('insufficientCreditsError multi-dog gap collapses message', () => {
-  const err = insufficientCreditsError(
-    [
-      { dog_id: 'd1', mode: 'school', balance: 1, required: 3 },
-      { dog_id: 'd2', mode: 'school', balance: 0, required: 3 },
-    ],
-    THREE_DATES,
-  );
-  assert.match(err.message, /Insufficient credits across 2 dogs\./);
-});
-
-test('insufficientCreditsError gives each dog its last missing dates, one per credit', () => {
-  const err = insufficientCreditsError(
-    [
-      { dog_id: 'biscuit', mode: 'school', balance: 1, required: 3 },
-      { dog_id: 'waffles', mode: 'school', balance: 2, required: 3 },
-    ],
-    THREE_DATES,
-  );
+  assert.match(err.message, /Insufficient school credits: 2 short\./);
   assert.deepEqual(err.details, {
     kind: 'insufficient_credits',
-    gaps: [
-      { dog_id: 'biscuit', mode: 'school', balance: 1, required: 3 },
-      { dog_id: 'waffles', mode: 'school', balance: 2, required: 3 },
-    ],
-    shortfall: 3,
+    gaps: [{ ...POOL, balance: 9, required: 3 }],
+    shortfall: 2,
     short_dates: [
-      { date: '2026-06-02', reason: 'no_credit' },
-      { date: '2026-06-03', reason: 'no_credit' },
+      {
+        date: '2026-06-02',
+        reason: 'credits_expire_first',
+        expires_at: '2026-06-01T17:00:00.000Z',
+      },
       { date: '2026-06-03', reason: 'no_credit' },
     ],
-    top_up_offer: null,
+    top_up_offer: OFFER,
   });
 });
 
-test('insufficientCreditsError on no gaps is a 422 with shortfall 0, not a 500', () => {
-  const err = insufficientCreditsError([], THREE_DATES);
+test('insufficientCreditsError names the alternative pack only when one is passed', () => {
+  const err = insufficientCreditsError({
+    gap: { ...POOL, balance: 0, required: 1 },
+    shortDates: [{ date: '2026-06-03', reason: 'no_credit' }],
+    offer: null,
+    alternativePackageKey: 'school-2x-weekly-fayetteville',
+  });
+  const details = err.details as { top_up_offer: unknown; alternative_package_key?: string };
+  assert.equal(details.top_up_offer, null);
+  assert.equal(details.alternative_package_key, 'school-2x-weekly-fayetteville');
+});
+
+test('insufficientCreditsError with nothing short is a 422 with shortfall 0, gaps [] and no offer', () => {
+  // A `top_up` that no longer fits: the client re-sends on credits alone (D22).
+  const err = insufficientCreditsError({
+    gap: { ...POOL, balance: 3, required: 3 },
+    shortDates: [],
+    offer: OFFER,
+    alternativePackageKey: 'never-shown',
+  });
   assert.equal(err.status, 422);
   assert.deepEqual(err.details, {
     kind: 'insufficient_credits',

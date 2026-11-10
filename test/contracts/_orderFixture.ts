@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { eq, inArray, isNotNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { bookingsRepository } from '../../src/db/repositories/bookingsRepository.js';
-import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';
+import {
+  creditLedgerRepository,
+  findLiveLots,
+} from '../../src/db/repositories/creditLedgerRepository.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import {
   bookings,
@@ -84,6 +87,8 @@ async function seedChargeAndClaim(
     purpose: 'package' | 'board-train';
     attemptCount: number;
     paymentMethodId?: string;
+    packageId?: string;
+    creditsCount?: number;
   },
 ): Promise<{ chargeId: string; claimKey: string; intentId: string | null }> {
   const chargeId = randomUUID();
@@ -110,6 +115,8 @@ async function seedChargeAndClaim(
     paymentMethodId: args.paymentMethodId ?? FIXTURE_IDS.paymentMethod1Id,
     attemptCount: args.attemptCount,
     attemptingUntil: args.attemptingUntil.toISOString(),
+    ...(args.packageId !== undefined ? { packageId: args.packageId } : {}),
+    ...(args.creditsCount !== undefined ? { creditsCount: args.creditsCount } : {}),
   });
   const claimKey = `seeded-claim-${randomUUID()}`;
   await db.insert(idempotencyKeys).values({
@@ -163,10 +170,18 @@ export async function seedPendingBookingOrder(
         cancelDeadlineAt: new Date(scheduledAt.getTime() - 24 * 60 * A_MINUTE_MS),
         additionalDogIds: [],
       });
-      await creditLedgerRepository.debitForBooking(tx, {
-        dogId: args.dogId,
-        mode: 'school',
+      const pool = {
+        ownerId: FIXTURE_IDS.ownerId,
         location: 'fayetteville',
+        mode: 'school',
+        tier: 'regular',
+      } as const;
+      const [lot] = await findLiveLots(tx, pool);
+      if (lot === undefined) throw new Error('the fixture has no live credit lot to debit');
+      await creditLedgerRepository.debitLot(tx, {
+        ...pool,
+        lotId: lot.id,
+        dogId: args.dogId,
         bookingId: row.id,
       });
       await enqueueBookingReminders(tx, {
@@ -207,6 +222,8 @@ export async function seedPendingPurchaseOrder(
     intentStatus?: StripePaymentIntentStatus | null;
     chargeStatus?: 'requires_payment' | 'succeeded' | 'failed';
     createdAt?: Date;
+    packageId?: string;
+    creditsCount?: number;
   },
 ): Promise<SeededOrder> {
   const orderId = randomUUID();
@@ -217,6 +234,8 @@ export async function seedPendingPurchaseOrder(
   });
   const seeded = await seedChargeAndClaim(stripe, {
     orderId,
+    ...(args.packageId !== undefined ? { packageId: args.packageId } : {}),
+    ...(args.creditsCount !== undefined ? { creditsCount: args.creditsCount } : {}),
     amountCents: args.amountCents ?? 30_000,
     intentStatus: args.intentStatus === undefined ? 'processing' : args.intentStatus,
     chargeStatus: args.chargeStatus ?? 'requires_payment',

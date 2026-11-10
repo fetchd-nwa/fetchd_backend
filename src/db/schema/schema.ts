@@ -1,6 +1,7 @@
 import { pgTable, text, doublePrecision, boolean, timestamp, uniqueIndex, foreignKey, unique, uuid, jsonb, index, check, date, integer, smallint, bigint, primaryKey, pgView, pgEnum, numeric, time } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
 import type { NotificationDeepLinkKind } from "../../lib/notificationWire.js"
+import type { CreditTier } from "../../contracts/wire.js"
 
 export const announcementCategory = pgEnum("announcement_category", ['urgent', 'team', 'class', 'event', 'promo', 'report'])
 export const bookingAttendance = pgEnum("booking_attendance", ['pending', 'attended', 'no-show', 'excused'])
@@ -130,6 +131,8 @@ export const dogs = pgTable("dogs", {
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 	// M2.16: nothing stamps it until P20's check-in; omitted on DogWire while NULL.
 	lastSeenOn: date("last_seen_on"),
+	// M4.11: stored, set when the fifth level is recorded, and never cleared.
+	isAlumni: boolean("is_alumni").default(false).notNull(),
 }, (table) => {
 	return {
 		ownerIdx: index("dogs_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
@@ -721,31 +724,6 @@ export const dogDescriptors = pgTable("dog_descriptors", {
 	}
 });
 
-export const creditExpirySettings = pgTable("credit_expiry_settings", {
-	location: text().$type<LocationKey>(),
-	expiryWindowMonths: integer("expiry_window_months").notNull(),
-	warningLeadDays: integer("warning_lead_days").notNull(),
-	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	updatedByStaffId: uuid("updated_by_staff_id"),
-}, (table) => {
-	return {
-		locationUniq: uniqueIndex("credit_expiry_settings_location_uniq").using("btree", table.location.asc().nullsLast().op("text_ops")).where(sql`(location IS NOT NULL)`),
-		orgDefaultUniq: uniqueIndex("credit_expiry_settings_org_default_uniq").using("btree", sql`(location IS NULL)`).where(sql`(location IS NULL)`),
-		creditExpirySettingsLocationFkey: foreignKey({
-			columns: [table.location],
-			foreignColumns: [locations.slug],
-			name: "credit_expiry_settings_location_fkey"
-		}),
-		creditExpirySettingsUpdatedByStaffIdFkey: foreignKey({
-			columns: [table.updatedByStaffId],
-			foreignColumns: [staff.id],
-			name: "credit_expiry_settings_updated_by_staff_id_fkey"
-		}).onDelete("set null"),
-		creditExpirySettingsExpiryWindowMonthsCheck: check("credit_expiry_settings_expiry_window_months_check", sql`expiry_window_months > 0`),
-		creditExpirySettingsWarningLeadDaysCheck: check("credit_expiry_settings_warning_lead_days_check", sql`warning_lead_days >= 0`),
-	}
-});
-
 // ---- LG1 (wire 2.0.0) — hand-mirrored from schema.sql: M1.00 and the settings
 // tables M1.01–M1.16 (db:introspect is not usable on this tree). Columns, keys,
 // FKs and the tier unique indexes are mirrored; each table's CHECKs live in
@@ -1099,6 +1077,10 @@ export const creditPackages = pgTable("credit_packages", {
 	isPopular: boolean("is_popular").default(false).notNull(),
 	effectiveFrom: date("effective_from").default(sql`CURRENT_DATE`).notNull(),
 	effectiveTo: date("effective_to"),
+	tier: text().$type<CreditTier>().default('regular').notNull(),
+	expiryMonths: integer("expiry_months").default(1).notNull(),
+	singleDay: boolean("single_day").default(false).notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 }, (table) => {
 	return {
 		creditPackagesLocationFkey: foreignKey({
@@ -1106,15 +1088,17 @@ export const creditPackages = pgTable("credit_packages", {
 			foreignColumns: [locations.slug],
 			name: "credit_packages_location_fkey"
 		}),
-		creditPackagesKeyLocationEffectiveFromKey: unique("credit_packages_key_location_effective_from_key").on(table.key, table.location, table.effectiveFrom),
+		creditPackagesKeyEffectiveFromKey: unique("credit_packages_key_effective_from_key").on(table.key, table.effectiveFrom),
 		creditPackagesCreditsCheck: check("credit_packages_credits_check", sql`credits > 0`),
 		creditPackagesPriceCentsCheck: check("credit_packages_price_cents_check", sql`price_cents >= 0`),
+		creditPackagesTierCheck: check("credit_packages_tier_check", sql`tier = ANY (ARRAY['regular'::text, 'alumni'::text])`),
+		creditPackagesExpiryMonthsCheck: check("credit_packages_expiry_months_check", sql`expiry_months > 0`),
 	}
 });
 
 export const creditLedger = pgTable("credit_ledger", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
-	dogId: uuid("dog_id").notNull(),
+	dogId: uuid("dog_id"),
 	mode: bookingMode().notNull(),
 	location: text().$type<LocationKey>().notNull(),
 	delta: integer().notNull(),
@@ -1126,10 +1110,15 @@ export const creditLedger = pgTable("credit_ledger", {
 	lotId: uuid("lot_id"),
 	note: text(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	// M4.10: credits are the owner's, one pool per (owner, location, mode, tier).
+	ownerId: uuid("owner_id").notNull(),
+	tier: text().$type<CreditTier>().default('regular').notNull(),
+	// M4.12: the staffer behind a hand edit.
+	createdByStaffId: uuid("created_by_staff_id"),
 }, (table) => {
 	return {
-		dogModeIdx: index("credit_ledger_dog_mode_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.mode.asc().nullsLast().op("text_ops"), table.location.asc().nullsLast().op("uuid_ops")),
-		lotFifoIdx: index("credit_ledger_lot_fifo_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops"), table.mode.asc().nullsLast().op("timestamptz_ops"), table.location.asc().nullsLast().op("enum_ops"), table.expiresAt.asc().nullsLast().op("uuid_ops")).where(sql`((delta > 0) AND (lot_id IS NULL))`),
+		poolIdx: index("credit_ledger_pool_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops"), table.location.asc().nullsLast().op("text_ops"), table.mode.asc().nullsLast().op("enum_ops"), table.tier.asc().nullsLast().op("text_ops")),
+		lotFifoIdx: index("credit_ledger_lot_fifo_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops"), table.location.asc().nullsLast().op("text_ops"), table.mode.asc().nullsLast().op("enum_ops"), table.tier.asc().nullsLast().op("text_ops"), table.expiresAt.asc().nullsLast().op("timestamptz_ops")).where(sql`((delta > 0) AND (lot_id IS NULL))`),
 		lotIdIdx: index("credit_ledger_lot_id_idx").using("btree", table.lotId.asc().nullsLast().op("uuid_ops")).where(sql`(lot_id IS NOT NULL)`),
 		creditLedgerDogIdFkey: foreignKey({
 			columns: [table.dogId],
@@ -1161,6 +1150,53 @@ export const creditLedger = pgTable("credit_ledger", {
 			foreignColumns: [charges.id],
 			name: "credit_ledger_charge_fk"
 		}),
+		creditLedgerOwnerIdFkey: foreignKey({
+			columns: [table.ownerId],
+			foreignColumns: [owners.id],
+			name: "credit_ledger_owner_id_fkey"
+		}).onDelete("restrict"),
+		creditLedgerLotPoolKey: unique("credit_ledger_lot_pool_key").on(table.id, table.ownerId, table.location, table.mode, table.tier),
+		creditLedgerLotPoolFkey: foreignKey({
+			columns: [table.lotId, table.ownerId, table.location, table.mode, table.tier],
+			foreignColumns: [table.id, table.ownerId, table.location, table.mode, table.tier],
+			name: "credit_ledger_lot_pool_fkey"
+		}),
+		creditLedgerCreatedByStaffIdFkey: foreignKey({
+			columns: [table.createdByStaffId],
+			foreignColumns: [staff.id],
+			name: "credit_ledger_created_by_staff_id_fkey"
+		}).onDelete("set null"),
+		creditLedgerAdjustmentNoteCheck: check("credit_ledger_adjustment_note_check", sql`reason <> 'adjustment'::ledger_reason OR note IS NOT NULL`),
+		grantHasExpiry: check("grant_has_expiry", sql`delta <= 0 OR lot_id IS NOT NULL OR expires_at IS NOT NULL`),
+		debitNamesLot: check("debit_names_lot", sql`delta >= 0 OR lot_id IS NOT NULL`),
+		oneExpiryCopy: check("one_expiry_copy", sql`lot_id IS NULL OR expires_at IS NULL`),
+		purchaseChargeUidx: uniqueIndex("credit_ledger_purchase_charge_uidx").using("btree", table.chargeId.asc().nullsLast().op("uuid_ops")).where(sql`(reason = 'purchase'::ledger_reason)`),
+		creditLedgerTierCheck: check("credit_ledger_tier_check", sql`tier = ANY (ARRAY['regular'::text, 'alumni'::text])`),
+	}
+});
+
+// M4.12: every hand move of a lot's date (CRED-U15).
+export const creditLotExpiryEdits = pgTable("credit_lot_expiry_edits", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	lotId: uuid("lot_id").notNull(),
+	fromExpiresAt: timestamp("from_expires_at", { withTimezone: true, mode: 'string' }).notNull(),
+	toExpiresAt: timestamp("to_expires_at", { withTimezone: true, mode: 'string' }).notNull(),
+	staffId: uuid("staff_id"),
+	note: text().notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		lotIdx: index("credit_lot_expiry_edits_lot_idx").using("btree", table.lotId.asc().nullsLast().op("uuid_ops"), table.createdAt.desc().nullsFirst().op("timestamptz_ops")),
+		creditLotExpiryEditsLotIdFkey: foreignKey({
+			columns: [table.lotId],
+			foreignColumns: [creditLedger.id],
+			name: "credit_lot_expiry_edits_lot_id_fkey"
+		}),
+		creditLotExpiryEditsStaffIdFkey: foreignKey({
+			columns: [table.staffId],
+			foreignColumns: [staff.id],
+			name: "credit_lot_expiry_edits_staff_id_fkey"
+		}).onDelete("set null"),
 	}
 });
 
@@ -1229,6 +1265,9 @@ export const charges = pgTable("charges", {
 	stripeCustomerId: text("stripe_customer_id"),
 	stripePaymentMethodId: text("stripe_payment_method_id"),
 	paymentMethodId: uuid("payment_method_id"),
+	// M4.10: the frozen purchase every settler reads; the metadata stays {order_id, charge_id}.
+	packageId: uuid("package_id"),
+	creditsCount: integer("credits_count"),
 }, (table) => {
 	return {
 		ownerIdx: index("charges_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
@@ -1291,6 +1330,9 @@ export const invoices = pgTable("invoices", {
 	source: recordSource().default('app').notNull(),
 	// M3.02: written only by a purchase's settle. Plain unique, not partial.
 	orderId: uuid("order_id"),
+	// M4.10: what every `package` invoice carries, in the settle's one INSERT.
+	packageId: uuid("package_id"),
+	location: text().$type<LocationKey>(),
 }, (table) => {
 	return {
 		orderIdUidx: uniqueIndex("invoices_order_id_uidx").using("btree", table.orderId.asc().nullsLast().op("uuid_ops")),
@@ -1943,9 +1985,10 @@ export const bookingDogs = pgTable("booking_dogs", {
 		bookingDogsPkey: primaryKey({ columns: [table.bookingId, table.dogId], name: "booking_dogs_pkey"}),
 	}
 });
-export const dogCreditBalance = pgView("dog_credit_balance", {	dogId: uuid("dog_id"),
-	mode: bookingMode(),
+export const ownerCreditBalance = pgView("owner_credit_balance", {	ownerId: uuid("owner_id"),
 	location: text().$type<LocationKey>(),
+	mode: bookingMode(),
+	tier: text().$type<CreditTier>(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	balance: bigint({ mode: "number" }),
-}).as(sql`SELECT cl.dog_id, cl.mode, cl.location, COALESCE(sum(cl.delta), 0::bigint) AS balance FROM credit_ledger cl LEFT JOIN credit_ledger lot ON lot.id = cl.lot_id WHERE CASE WHEN cl.lot_id IS NOT NULL THEN lot.expires_at IS NULL OR lot.expires_at > now() WHEN cl.delta > 0 THEN cl.expires_at IS NULL OR cl.expires_at > now() ELSE true END GROUP BY cl.dog_id, cl.mode, cl.location`);
+}).as(sql`SELECT cl.owner_id, cl.location, cl.mode, cl.tier, COALESCE(sum(cl.delta), 0::bigint) AS balance FROM credit_ledger cl LEFT JOIN credit_ledger lot ON lot.id = cl.lot_id WHERE CASE WHEN cl.lot_id IS NOT NULL THEN lot_is_live(lot.expires_at) WHEN cl.delta > 0 THEN lot_is_live(cl.expires_at) ELSE true END GROUP BY cl.owner_id, cl.location, cl.mode, cl.tier`);

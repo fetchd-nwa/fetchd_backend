@@ -396,16 +396,6 @@ double-charges at Stripe then refunds (the customer may see a transient charge
 reverse). Residual, pre-existing and out of this lane: a refund whose Stripe call
 itself fails has no retry sweeper (flagged for a future pending-refund worker).
 
-### Per-location settings — org-default + override (`credit_expiry_settings`)
-
-One table holds an org-default row (`location IS NULL`) plus per-location override
-rows. Two PARTIAL unique indexes enforce the invariant: one org-default
-(`UNIQUE ((location IS NULL)) WHERE location IS NULL`) and one row per slug
-(`UNIQUE (location) WHERE location IS NOT NULL`). Resolution is total: override >
-org-default > code default (`resolveExpiryWindowMonths` `?? DEFAULT_…`), so a
-missing row can never yield `undefined`/`NaN`. This is the reusable shape for any
-future per-location tunable (cancel window, rates already do similar).
-
 ### `payment-failed` → scheduled-notifications push routing
 
 A `payment-failed` notification routes through `scheduled_notifications` (the

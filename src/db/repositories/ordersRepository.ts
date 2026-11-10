@@ -2,7 +2,7 @@ import { and, asc, eq, lte, sql } from 'drizzle-orm';
 import { pgTimestampToIso } from '../../lib/pgTimestamp.js';
 import { db } from '../client.js';
 import { leaseInstant } from '../locks.js';
-import { charges, orders, owners } from '../schema/schema.js';
+import { charges, creditPackages, orders, owners } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
 
 /** Polymorphic runner — pool for pre/post-tx reads, Tx for in-mutation work. */
@@ -37,6 +37,8 @@ export interface PendingOrderRow {
   createdAt: string;
   amountCents: number;
   purpose: typeof charges.$inferSelect.purpose;
+  /** The row bought, read from `charges.package_id` (design §2.7:3841). */
+  packageLabel: string | null;
 }
 
 export const ordersRepository = {
@@ -98,10 +100,12 @@ export const ordersRepository = {
         createdAt: orders.createdAt,
         amountCents: charges.amountCents,
         purpose: charges.purpose,
+        packageLabel: creditPackages.label,
       })
       .from(orders)
       .innerJoin(charges, eq(charges.orderId, orders.id))
       .innerJoin(owners, eq(owners.id, orders.ownerId))
+      .leftJoin(creditPackages, eq(creditPackages.id, charges.packageId))
       .where(
         and(
           eq(charges.status, 'requires_payment'),

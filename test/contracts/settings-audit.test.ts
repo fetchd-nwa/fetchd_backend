@@ -60,8 +60,10 @@ describe(
     for (const table of AUDITED_SETTINGS_TABLES) {
       test(table, async () => {
         await inRolledBackTx(async (client) => {
+          // `credit_packages` is versioned by `effective_from`, so it stamps no `updated_at`.
+          const touch = table === 'credit_packages' ? 'key = key' : 'updated_at = now()';
           const updated = await client.query(
-            `UPDATE ${table} SET updated_at = now() WHERE ctid = (SELECT ctid FROM ${table} LIMIT 1)`,
+            `UPDATE ${table} SET ${touch} WHERE ctid = (SELECT ctid FROM ${table} LIMIT 1)`,
           );
           assert.equal(updated.rowCount, 1, `${table} has no seeded row to update`);
           const audit = await client.query<{
@@ -102,7 +104,6 @@ describe('row_pk names the row the way each table is keyed', SKIP_WHEN_NO_DB, ()
     { table: 'day_program_settings', where: 'location IS NULL', rowPk: '<global>' },
     { table: 'day_program_settings', where: "location = 'bentonville'", rowPk: 'bentonville' },
     { table: 'evaluation_settings', where: 'location IS NULL', rowPk: '<global>' },
-    { table: 'credit_expiry_settings', where: 'location IS NULL', rowPk: '<global>' },
     { table: 'cancel_window_settings', where: "category = 'day-school'", rowPk: 'day-school' },
     { table: 'intake_field_settings', where: "field_key = 'feeding'", rowPk: 'feeding' },
     { table: 'dog_descriptors', where: "key = 'nervous'", rowPk: 'nervous' },

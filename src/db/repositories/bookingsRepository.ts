@@ -499,6 +499,8 @@ export const bookingsRepository = {
       lessonSetting?: 'home' | 'public' | null;
       // M3.02: only `createDayProgramBookings` passes it. A walk-in opens no order.
       orderId?: string | null;
+      // A top-up's rows wait for Stripe. Every other row is born `upcoming`.
+      status?: 'payment-pending';
     },
   ): Promise<BookingRow> {
     const [bookingRow] = await tx
@@ -515,6 +517,7 @@ export const bookingsRepository = {
         sessionReportId: values.sessionReportId ?? null,
         lessonSetting: values.lessonSetting ?? null,
         orderId: values.orderId ?? null,
+        ...(values.status !== undefined ? { status: values.status } : {}),
         // status defaults to 'upcoming' (schema), durationMinutes/trainer*/
         // report_id/confirmed*/dropoff*/pickup*/cancelled*/source all
         // remain at their schema defaults (NULL / 'app' / false).
@@ -698,6 +701,14 @@ export const bookingsRepository = {
       )
       .orderBy(asc(bookings.id))
       .for('update');
+  },
+
+  /** The settle's flip: a booking reads `upcoming` only once Stripe says the money moved. */
+  async markOrderRowsUpcoming(tx: Tx, orderId: string): Promise<void> {
+    await tx
+      .update(bookings)
+      .set({ status: 'upcoming' })
+      .where(and(eq(bookings.orderId, orderId), eq(bookings.status, 'payment-pending')));
   },
 
   /** One order's sessions, ascending by date. */

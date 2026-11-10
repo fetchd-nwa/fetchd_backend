@@ -65,9 +65,9 @@
  * major up here; 4.0.0, 5.0.0 and 6.0.0 keep theirs (build DECISIONS 6;
  * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close). LG4:
- * 5.0.0-lg4.1 (P17, breaking).
+ * 5.0.0-lg4.1 (P17, breaking), 5.0.0-lg4.2 (P18, breaking).
  */
-export const WIRE_CONTRACT_VERSION = '5.0.0-lg4.1';
+export const WIRE_CONTRACT_VERSION = '5.0.0-lg4.2';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -184,7 +184,15 @@ export const WIRE_CONTRACT_VERSION = '5.0.0-lg4.1';
  * 4.0.0 appends one thrown code, the 32nd, after `'invoice_payment_in_flight'`
  * — appended, never inserted (design §1.1:917-920; CRED-U12):
  * `'credit_expired_before_date'`, 422, with `details`
- * (`CreditExpiredBeforeDateDetails`). No route answers it until P18.
+ * (`CreditExpiredBeforeDateDetails`). Its predicate landed at 5.0.0-lg4.2.
+ *
+ * 5.0.0-lg4.2 appends six thrown codes, the 33rd to the 38th, after
+ * `'credit_expired_before_date'` — appended, never inserted (design
+ * §1.1:986-987, :996-1000; CRED-U10, CRED-U04, CRED-U14, CRED-U15):
+ * `'alumni_tier_requires_alumni_dog'`, `'count_not_allowed'`,
+ * `'lot_insufficient'`, `'expiry_not_in_future'` and `'pool_not_bookable'`, each
+ * 422, and `'credit_edit_role_required'`, 403. None carries `details`: the code
+ * is the whole signal. Each route's doc says which of them it can answer.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -219,7 +227,13 @@ export type ApiErrorCode =
   | 'capacity_below_booked' // cap edit blocked — a booked date would fall below its count (4.0.0-lg3.1)
   | 'service_not_offered' // request blocked — the service is off at the campus (4.0.0-lg3.1)
   | 'invoice_payment_in_flight' // invoice pay blocked — another order's charge on it is in flight (4.0.0-lg3.2)
-  | 'credit_expired_before_date'; // booking blocked — a date no credit she holds or can buy today reaches (4.0.0)
+  | 'credit_expired_before_date' // booking blocked — a date no credit she holds or can buy today reaches (4.0.0)
+  | 'alumni_tier_requires_alumni_dog' // booking blocked — `tier: 'alumni'` names a dog that is not alumni (5.0.0-lg4.2)
+  | 'count_not_allowed' // purchase blocked — `count` on a pack, or past the single-day limit (5.0.0-lg4.2)
+  | 'lot_insufficient' // hand removal blocked — more credits than the lot has unspent (5.0.0-lg4.2)
+  | 'expiry_not_in_future' // hand edit blocked — the date is not later than now (5.0.0-lg4.2)
+  | 'pool_not_bookable' // hand add blocked — no v1 booking can draw from this pool (5.0.0-lg4.2)
+  | 'credit_edit_role_required'; // hand edit blocked — the role is off its list (5.0.0-lg4.2)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -255,6 +269,12 @@ export const API_ERROR_CODES = [
   'service_not_offered',
   'invoice_payment_in_flight',
   'credit_expired_before_date',
+  'alumni_tier_requires_alumni_dog',
+  'count_not_allowed',
+  'lot_insufficient',
+  'expiry_not_in_future',
+  'pool_not_bookable',
+  'credit_edit_role_required',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -334,6 +354,15 @@ export const API_ERROR_STATUS = {
   // booking's dates, the same family as `insufficient_credits` (design
   // §1.1:917-920).
   credit_expired_before_date: 422,
+  // 5.0.0-lg4.2 (new codes, so their statuses are set in the same bump): five
+  // well-formed requests refused by a credit rule, and the role list's refusal,
+  // a 403 like every role refusal (design §1.1:986-987, :996-1000).
+  alumni_tier_requires_alumni_dog: 422,
+  count_not_allowed: 422,
+  lot_insufficient: 422,
+  expiry_not_in_future: 422,
+  pool_not_bookable: 422,
+  credit_edit_role_required: 403,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -380,15 +409,19 @@ export interface AgreementGap {
 }
 
 /**
- * One under-balance dog-mode pair. `required` is the number of credits the
- * booking would consume (debits across all requested dates for this dog ×
- * this mode); `balance` is the dog's current balance before the mutation.
- * `balance < required` ⇒ blocked. Promoted from lib/bookingErrors.ts:53
- * (digest credits item names this shape verbatim).
+ * One short pool (5.0.0-lg4.2; design §1.1:960; CRED-U10): the owner's pool for
+ * the booking's campus, program and tier, never a dog. `required` is the number
+ * of credits the booking would spend from it, one per dog per date; `balance` is
+ * the pool's live balance before the mutation. The pool can be short with
+ * `balance` at `required`, because a lot pays a date only while it reaches that
+ * date: read `InsufficientCreditsDetails.shortfall`, never a subtraction of
+ * these two. Promoted from lib/bookingErrors.ts:53 (digest credits item names
+ * this shape verbatim).
  */
 export interface CreditGap {
-  dog_id: string;
+  location: LocationKey;
   mode: BookingMode;
+  tier: CreditTier;
   balance: number;
   required: number;
 }
@@ -504,7 +537,9 @@ export interface AgreementUnsignedDetails {
  * DAY-U17), so a client does no credit arithmetic of its own.
  *
  * `shortfall` is how many credits are missing: one per dog per date nothing
- * pays. 7 credits for 8 dates is 1. `0` answers only a `top_up` that no longer
+ * pays, counted on the pool's lots by design §2.3's two passes, so a credit
+ * that cannot reach its date is missing like one she does not hold. 7 credits
+ * for 8 dates is 1. `0` answers only a `top_up` that no longer
  * fits (`PostBookingsRequest`): `gaps` and `short_dates` are then `[]`,
  * `top_up_offer` is `null`, and the client re-sends without `top_up`, on credits
  * alone.
@@ -513,24 +548,29 @@ export interface AgreementUnsignedDetails {
  * length is `shortfall` and a date two dogs are short on appears twice. `reason`
  * is `'no_credit'`, or `'credits_expire_first'` when her credits die before the
  * date, and then `expires_at` (ISO-8601, as `CreditLotWire.expires_at`) says
- * when: "Your 3 credits expire Tue 27 Oct, before these days". Expiry binds a
- * date from P18, so until then every entry is `'no_credit'`.
+ * when: "Your 3 credits expire Tue 27 Oct, before these days".
  *
  * `top_up_offer` is the purchase that completes the booking: `count` credits of
  * the single-day row `package_key` of the booking's campus and program, at
  * `unit_price_cents` each, `total_cents` in all. An alumni-tier booking is
- * offered its campus's regular day-school single day. The client shows these
- * numbers and sends them back (`PostBookingsRequest`'s `top_up`). **`null` on
- * every answer until P18**, which lands those rows and the live path (design
- * §1.3).
+ * offered its campus's regular single day of that program, which an alumni dog
+ * may spend (ALUM-25). The client shows these numbers and sends them back
+ * (`PostBookingsRequest`'s `top_up`). `null` at `shortfall: 0`, or when the
+ * campus and program have no live single-day row, which no seed leaves.
  *
  * `alternative_package_key` names a pack as the second choice (the Day Care
  * Package, the Alumni 10 Visits pack, or the pool's smallest pack once the
  * shortfall reaches its credit count), which *Yes* may buy instead through
- * `top_up.package_key`. Omitted until P18: no row it can name is seeded before.
+ * `top_up.package_key`. It only ever names a pack that covers the shortfall, the
+ * smallest that does, and is omitted when none does: a pack is bought whole, and
+ * one too small would answer this same refusal. A pack whose own lot, bought now,
+ * would not pay every short date is left out first, so "smallest" reads among the
+ * packs that reach (designs/p18-pack-reach-and-moved-dates.md; 5.0.0-lg4.2). The
+ * sheet reads its name and price from that key's `GET /credit-packages` row, never
+ * a rate (DAY-U19).
  *
- * `gaps` stays, one entry per dog short, as `CreditGap` reads today. 5.0.0
- * re-keys that shape on the pool.
+ * `gaps` has one entry, the pool short: a request names one campus, one program
+ * and one tier. It is `[]` at `shortfall: 0`.
  */
 export interface InsufficientCreditsDetails {
   kind: 'insufficient_credits';
@@ -552,17 +592,22 @@ export interface InsufficientCreditsDetails {
 
 /**
  * Rides code `credit_expired_before_date` (422) — `kind` equals `code`. New
- * 4.0.0, typed with the booking body (design §1.1:917-920, §2.3:2656-2659,
- * §2.4:2910-2912; CRED-U12). **No route emits it until its predicate lands
- * (P18).**
+ * 4.0.0, typed with the booking body; its predicate landed at 5.0.0-lg4.2
+ * (design §1.1:917-920, :1005-1007, §2.3:2656-2659, §2.4:2910-2912; CRED-U12).
  *
  * `dates` lists EVERY date of the request that no lot of hers can pay and a
- * credit bought today would not reach (`cred.package_expiry_months` from now),
- * `YYYY-MM-DD`, ascending, never empty. A date a bought credit does reach is a
- * shortfall and gets the top-up instead (`InsufficientCreditsDetails`).
+ * credit bought today would not reach (the `expiry_months` of the single-day row
+ * of the booking's campus and program, from now), `YYYY-MM-DD`, ascending, never
+ * empty. A date a bought credit does reach is a shortfall and gets the top-up
+ * instead (`InsufficientCreditsDetails`). A lot pays a date while `expires_at` is
+ * after that date's midnight, America/Chicago, so the expiry day still counts.
  * `expires_at` is ISO-8601: the latest expiry among her live lots or, with no
  * live lot, the reach of a credit bought today. Atomic: a refused request writes
  * nothing.
+ *
+ * Never emitted while `cred.expiry_enforced_enabled` is false or
+ * `cred.booking_outlives_lot_expiry_enabled` is true: a credit bought today then
+ * reaches every date (design §2.4:2904, :2918).
  */
 export interface CreditExpiredBeforeDateDetails {
   kind: 'credit_expired_before_date';
@@ -739,8 +784,8 @@ export interface CapacityBelowBookedDetails {
  * phase B builds `routes/staffSettings.ts`. 3.0.0-lg2.1 appends
  * `ProfileIncompleteDetails` (`PATCH /me`). 4.0.0-lg3.1 appends
  * `CapacityBelowBookedDetails`, contract-first: no route emits it until P13's
- * backend lands. 4.0.0 appends `CreditExpiredBeforeDateDetails`, contract-first:
- * no route emits it until P18.
+ * backend lands. 4.0.0 appends `CreditExpiredBeforeDateDetails`, which no route
+ * emitted until its predicate landed at 5.0.0-lg4.2.
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -788,7 +833,7 @@ export type ServiceCategory =
  * A cancel of any one pending row cancels the whole order
  * (`POST /bookings/:id/cancel`); a per-session cancel exists only once the rows
  * are `'upcoming'`. A class row is refused first, pending or not, as it is
- * today. No row carries this value until the top-up is live (P18).
+ * today.
  */
 export type BookingStatus = 'upcoming' | 'past' | 'cancelled' | 'payment-pending';
 
@@ -938,9 +983,10 @@ export type NotificationType =
   | 'waitlist-spot-open';
 
 /** The deep-link target a notification points at (`NotificationDeepLink.kind`).
- *  `deepLinkToPath` maps each arm to its owner-app route. `credits` is an alias
- *  of `dog-profile` (a credits alert routes to the affected dog); `credits` and
- *  `announcement` are reserved arms with no producer today. */
+ *  `deepLinkToPath` maps each arm to its owner-app route. `credits` opens the
+ *  owner's credits screen and has no id, since credits are the owner's and not
+ *  a dog's (5.0.0-lg4.2; CRED-U10). `announcement` is a reserved arm with no
+ *  producer today. */
 export type NotificationDeepLinkKind =
   | 'booking'
   | 'report'
@@ -962,6 +1008,16 @@ export type NotificationDeepLinkKind =
  * no mode since 4.0.0-lg3.1. Pinned to the pgEnum in `conformance.ts`.
  */
 export type BookingMode = 'school' | 'daycare';
+
+/**
+ * The tier of a credit pool (5.0.0-lg4.2; design §2.4:2856-2857, :2936; CRED-U04,
+ * CRED-U10). A pool is one (owner, campus, program, tier). Regular credits pay
+ * for any dog that passes the gates, and alumni credits only for an alumni dog
+ * (ALUM-25). No pgEnum: `credit_packages.tier` and `credit_ledger.tier` are `text`
+ * with a CHECK, so `conformance.ts` has nothing to pin it to. `CREDIT_TIERS`
+ * carries the guard (§16).
+ */
+export type CreditTier = 'regular' | 'alumni';
 
 /**
  * A dog's evaluation lifecycle state (`schema.sql`: `evaluation_status`).
@@ -1041,6 +1097,13 @@ export const NOTIFICATION_DEEP_LINK_KINDS = [
   'payment-method',
   'waitlist',
 ] as const satisfies readonly [NotificationDeepLinkKind, ...NotificationDeepLinkKind[]];
+
+/** No pgEnum backs the tier, so §16's pin on this tuple is its one guard
+ *  (`CreditTier`; 5.0.0-lg4.2). */
+export const CREDIT_TIERS = ['regular', 'alumni'] as const satisfies readonly [
+  CreditTier,
+  ...CreditTier[],
+];
 
 /** Member order mirrors the `booking_mode` pgEnum declaration order; §16 pins
  *  set equality. New 1.13.0 — clients previously had no value source. */
@@ -1334,9 +1397,9 @@ export interface StaffMeWire {
  * will read its list at the verb.
  *
  * Each flag uses the rule its verb's guard uses, or will use when the verb
- * lands. One designed gap: `edit_prices` is false for every role while
- * `POST /staff/rates` still takes an owner's or manager's rate (§2.1:2087-2091;
- * DAY-U23 narrows that route at P18, not at 4.0.0: design §1.3). A list-backed
+ * lands. `edit_prices` is false for every role, and from 5.0.0-lg4.2
+ * `POST /staff/rates` takes no price but the evaluation's seed, 0
+ * (§2.1:2087-2091; DAY-U23, moved from design 4.0.0 by §1.3). A list-backed
  * flag is true when the caller's role is `owner` OR is on that list: the owner
  * role passes every list whatever the list holds (STAFF-09), so the owner
  * can never be edited out of a verb. Five of the nine are data (owner-edited
@@ -1357,15 +1420,15 @@ export interface StaffCapabilitiesWire {
    *  price is its seed), so the registry refuses every price key with 403
    *  `refused_keys`. True only when PAY-U44 gives prices an editor.
    *  The legacy `POST /staff/rates` and `/staff/rates/:id/void` do NOT read
-   *  this flag: they are owner and manager by role until P18 narrows the
-   *  route (DAY-U23, moved from design 4.0.0 by §1.3; §2.1:2084-2091). */
+   *  this flag: they are owner and manager by role, and the POST takes only
+   *  the evaluation's seed (DAY-U23, moved from design 4.0.0 by §1.3;
+   *  §2.1:2084-2091). */
   edit_prices: boolean;
   /** Edit a `money`-class setting (STAFF-77). Owner and manager; the trainer
    *  never. A fixed role rule with no list or switch (STAFF-U08 folds in;
    *  §3.14:5957-5958). The same two roles pass the legacy editors'
    *  `requireStaffRole('owner', 'manager')`: `POST /staff/rates` and its
-   *  void, `PATCH /staff/cancel-window/:category`, `POST
-   *  /staff/credit-expiry-settings`. */
+   *  void, `PATCH /staff/cancel-window/:category`. */
   edit_money_policy: boolean;
   /** Open the money reports (STAFF-12). Owner and manager; the trainer never.
    *  The end-of-day totals are NOT behind this flag: they follow
@@ -1383,7 +1446,10 @@ export interface StaffCapabilitiesWire {
   refund_money: boolean;
   /** Add or remove credits by hand and move a lot's expiry (A11, R4). True for
    *  the owner and for a role on `StaffSettingsWire.credit_hand_edit_roles`
-   *  (seeded owner, manager). The verbs it gates land at design 5.0.0. */
+   *  (seeded owner, manager). It mirrors the guard on `POST
+   *  /staff/owners/:ownerId/credit-adjustments`, `PATCH /staff/credit-lots/:id`
+   *  and `PATCH /staff/credit-packages/:key`, each 403
+   *  `credit_edit_role_required` for any other role. */
   edit_credits: boolean;
   /** Raise, charge and void a custom invoice: the portal's *New invoice* and
    *  *Charge card on file* (R8; C5). True for the owner and for a role on
@@ -1736,9 +1802,10 @@ export interface PendingRequestWire {
  * included. `sessions` holds one row per date, ascending by `scheduled_at`, each
  * with `order_id` = `order.id`. A same-key replay returns this body as stored.
  *
- * `order.charge_status` is `'none'` unless a top-up was charged. `top_up` is typed
- * at 4.0.0 and refused until P18 (`PostBookingsRequest`), so today it is always
- * `'none'` and every session `'upcoming'`.
+ * `order.charge_status` is `'none'` unless a top-up was charged, and every
+ * session is then `'upcoming'`. With a top-up it is `'succeeded'`, every session
+ * `'upcoming'`, or `'requires_payment'`, every session `'payment-pending'`
+ * (`PostBookingsRequest`).
  */
 export interface PostBookingsResponse {
   order: OrderWire;
@@ -1822,7 +1889,8 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  *   - every date is distinct and today-or-later in America/Chicago
  *     (`invalid_payload`).
  *
- * Three refusals have a code of their own (4.0.0-lg3.1; design §2.3:2325-2328),
+ * Four refusals have a code of their own (4.0.0-lg3.1, the last 5.0.0-lg4.2;
+ * design §2.3:2325-2328, §2.4:2949-2951),
  * each 422 with no `details`, and each refuses the whole request:
  *   - `program_not_offered` — `offerings[category].offered` is false at
  *     `location` (DAY-U04): as seeded, day-care at Fayetteville.
@@ -1833,15 +1901,24 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  *   - `same_day_cutoff_passed` — a date is today in America/Chicago and the
  *     clock has reached the campus's `day.same_day_cutoff_time` (DAY-U10,
  *     DAY-07). This route is owner-only; the cutoff binds owners only (DAY-08).
+ *   - `alumni_tier_requires_alumni_dog` — `payment.tier` is `'alumni'` and a dog
+ *     of the request is not `is_alumni` (CRED-U10). An alumni credit pays only
+ *     for an alumni dog, so one such dog refuses the whole body.
  * A closed date has no refusal of its own: its cap is 0, so the request meets
  * `insufficient_capacity`. `PostBookingsErrorDetails` lists the arms that do
  * carry `details`.
  *
  * Credits are the only tender (4.0.0; design §1.1:864-874; R1). `payment` is
  * required, so every booking says so, and it has no pay-as-you-go and no card
- * arm: a booking is never charged. The strings `'credits'` and `'payg'`, a
+ * arm: a day is never charged, and the one charge a booking can carry buys
+ * credits (`top_up`). The strings `'credits'` and `'payg'`, a
  * missing `payment` and a top-level `payment_method_id` are each 400
  * `bad_request`.
+ *
+ * `payment.tier` names the pool: a booking debits the owner's pool for its
+ * campus, program and tier, `'regular'` when omitted (design §2.4:2949-2953;
+ * CRED-U10). The server picks no pool. When two fit, the app asks her and sends
+ * `tier` (CRED-20).
  *
  * `payment.top_up` buys the missing credits inside this request (design
  * §2.3:2613-2630, §2.7:4061-4092; PAY-U09). The client answers the 422's
@@ -1851,18 +1928,27 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  * `payment_method_id` the card it named. `package_key` defaults to the offer's
  * row and may name any live catalog row of the booking's pool; a pack is bought
  * whole, so its `count` is 1. Under its locks, before it writes anything, the
- * server re-reads the row and recomputes the shortfall. A total that differs,
- * or a `count` the shortfall no longer needs, answers a fresh 422
- * `insufficient_credits`, with nothing written and no Stripe call, so she is
- * never charged a price she did not see or for more days than the dates need.
+ * server re-reads the row and recomputes the shortfall. A total that differs, a
+ * `count` of single days other than the shortfall, a pack with fewer credits
+ * than the shortfall, a pack whose own lot would not pay every short date, or a
+ * key naming neither row answers a fresh 422 `insufficient_credits`, with nothing
+ * written and no Stripe call, so she is never charged a price she did not see,
+ * for more days than the dates need, or for a lot that cannot pay them.
+ * A `payment_method_id` that is not a live card of hers is the generic 404.
+ * `cred.single_day_purchase_max_count` does not cap `count`: the dates do.
  *
- * **Typed here, live at P18.** No offer exists until then, so no `top_up` can
- * be honoured, and every body carrying one gets that same answer: past the
- * gates, at the credit check, 422 `insufficient_credits` with the current
- * `shortfall` and `top_up_offer: null`, nothing written and no order made. The
- * card is not read. With credits enough for the dates that is `shortfall: 0`,
- * and the client re-sends without `top_up`. `tier` is accepted and not read
- * until P18 either: until then a dog has one balance per mode and campus.
+ * A `top_up` that fits rides the order engine, one charge under the
+ * `cancel-order` failure policy (design §2.3:2664-2677, §2.7:4083-4098):
+ *   - 201, `order.charge_status: 'succeeded'`: the bought lot is granted and
+ *     spent on the dates her lots could not pay, and every session is `'upcoming'`.
+ *   - 201, `order.charge_status: 'requires_payment'` and `order.client_action:
+ *     'processing'`: every session is `'payment-pending'` until Stripe answers.
+ *     Do not retry.
+ *   - 402 `payment_failed` (`PaymentFailedDetails`): nothing is booked, every
+ *     debit is returned and nothing is granted. A replay returns the same 402,
+ *     so the next try takes a fresh key.
+ *   - 409 `idempotency_inflight`: no answer exists yet. Re-send under the same
+ *     key; nothing more is charged.
  *
  * `Idempotency-Key` is required on this endpoint (§0 conventions). The
  * response is 201 `PostBookingsResponse`.
@@ -1879,7 +1965,7 @@ export interface PostBookingsRequest {
   /** Credits, the only tender (see above). */
   payment: {
     kind: 'credits';
-    tier?: 'regular' | 'alumni';
+    tier?: CreditTier;
     top_up?: {
       count: number;
       payment_method_id: string;
@@ -2198,14 +2284,14 @@ export interface GetStaffBookingsQuery {
  * window — `missing: []` is a legal emission, see §1.
  *
  * The route's other 422s carry no `details`, so they are not arms here:
- * `invalid_payload`, and 4.0.0-lg3.1's `program_not_offered`,
- * `beyond_booking_horizon` and `same_day_cutoff_passed` (`PostBookingsRequest`).
+ * `invalid_payload`, 4.0.0-lg3.1's `program_not_offered`,
+ * `beyond_booking_horizon` and `same_day_cutoff_passed`, and 5.0.0-lg4.2's
+ * `alumni_tier_requires_alumni_dog` (`PostBookingsRequest`), which runs after the
+ * gates and before arm 5.
  *
- * NOT reachable yet: arms 5 and 9. Arm 5 is typed with the booking body and its
- * predicate lands with the lots (P18). Arm 9 is typed with the rest of the
- * order's shape (design §1.1:885; PAY-U05, DAY-U18), but no card is charged
- * inside `POST /bookings` until the top-up is live (P18), and from 4.0.0 a booking
- * opens no invoice, so no charge can fail inside it today.
+ * Arm 6 runs before arm 7, so a date she already holds is met only once the
+ * credits fit. Arms 1 to 8 all answer inside tx1, before any Stripe call, so a
+ * `top_up` refused by one of them charges nothing.
  */
 export type PostBookingsErrorDetails =
   | PaymentRequiredDetails
@@ -2244,41 +2330,48 @@ export type PostRequestsErrorDetails = EvaluationRequiredDetails | AlreadyReques
 
 // (a) domain-local enums + tuples — NONE. Credits reference only §2 shared
 //     unions: `BookingMode` (the credit axis: one credit = one booked day of
-//     that mode) and `LocationKey` (balances are per-school since Δ 2026-06-04).
-//     Both are already conformance-pinned to their canonical sources
-//     (`contracts/conformance.ts` `ContractEnumConformance`: `BookingMode` ↔ the
-//     `booking_mode` pgEnum; `LocationKey` ↔ `LOCATION_SLUGS`), so a promoted
-//     field typed `BookingMode`/`LocationKey` here is a type IDENTITY with the
-//     route's local alias, NOT a §14.2 narrowing. No credits union is minted.
+//     that mode), `LocationKey` (balances are per-school since Δ 2026-06-04) and
+//     `CreditTier` (5.0.0-lg4.2). The first two are already conformance-pinned
+//     to their canonical sources (`contracts/conformance.ts`
+//     `ContractEnumConformance`: `BookingMode` ↔ the `booking_mode` pgEnum;
+//     `LocationKey` ↔ `LOCATION_SLUGS`), so a promoted field typed
+//     `BookingMode`/`LocationKey` here is a type IDENTITY with the route's local
+//     alias, NOT a §14.2 narrowing. No credits union is minted.
+//
+// The routes (5.0.0-lg4.2; design §1.1:953-1011, §2.4:2856-3111). An owner
+// (family) principal on a `/staff/…` route is 403 `forbidden`, and a staff
+// principal on `GET /credits` or the purchase is the same.
+//   GET   /credits?location=                       → OwnerCreditsWire        owner
+//   GET   /credit-packages?location=               → CreditPackageWire[]     any
+//   POST  /credit-packages/:key/purchase           → CreditPurchaseWire      owner
+//   GET   /staff/owners/:ownerId/credits           → StaffOwnerCreditsWire   any role
+//   POST  /staff/owners/:ownerId/credit-adjustments → StaffCreditPoolWire    role list
+//   PATCH /staff/credit-lots/:id                   → CreditLotDetailWire     role list
+//   PATCH /staff/credit-packages/:key              → CreditPackageWire       role list
 
 // (b) response wires ----------------------------------------------------------
 
 /**
- * A live expiring lot's remaining credits + lapse date (soonest-first list).
+ * A live expiring lot's remaining credits + lapse date (soonest-first list):
+ * `OwnerCreditPoolWire.expiring_lots`.
  *
  * Promoted 1.13.0 from `routes/credits.ts:32-37` (digest credits/M — "Promote
  * the credits READ surface"). Grandfathered name, kept verbatim (§4.4).
  *
- * ⚠️ This is the expiring-lot MINI-row, not the staff full-lot shape. Roll-up 4
- * proposes `{ lot_id, dog_id, mode, location, credits_granted, remaining,
- * purchased_at, expires_at, package_id, charge_id }` for the staff surface and
- * flags the name collision (PORTAL-ENDPOINT-MAP.md:1058, :1914); that shape
- * lands in the PORTAL WAVE under a distinct name (`CreditLotDetailWire`). The
- * collision warning binds THAT promotion, not this one — this name does not
- * move, because renaming a shipped export is a major bump (§4.4).
+ * ⚠️ This is the expiring-lot MINI-row, not the staff full-lot shape, which is
+ * `CreditLotDetailWire`. The name does not move, because renaming a shipped
+ * export is a major bump (§4.4).
  *
  * `remaining` = the lot's grant plus every allocation (debit −/refund +) tagged
- * to it. Exhausted and expired lots are never listed, and never-expiring
- * credits (1-credit packs, legacy/Gingr imports, the pool) are
- * omitted entirely — they are inside `CreditsWire.school`/`.daycare` but have
- * nothing to warn about (BUSINESS-LOGIC/credits-packages.md R30 @ :84, R8 @ :62,
- * R7 @ :61).
+ * to it. Exhausted and expired lots are never listed.
+ *
+ * `expires_at` is always set and live from 5.0.0-lg4.2 (CRED-U05, CRED-U17): the
+ * never-expiring class is retired, so every lot, a 1-credit pack and an import
+ * included, stops paying at its date. It is stamped once, at grant.
  *
  * `expires_at` is wire ISO-8601 (`…THH:MM:SS[.mmm]Z`), converted at the
- * raw-SQL boundary by `creditsRepository.findExpiringLots`
- * (`pgTimestampToIso`) — NOT Postgres's space-separated `+00` form, which
- * Hermes (RN) refuses to parse. Pinned by
- * `test/contracts/credit-expiry-lots.test.ts` @ :294.
+ * raw-SQL boundary by `pgTimestampToIso` — NOT Postgres's space-separated `+00`
+ * form, which Hermes (RN) refuses to parse.
  */
 export interface CreditLotWire {
   mode: BookingMode;
@@ -2287,64 +2380,58 @@ export interface CreditLotWire {
 }
 
 /**
- * `GET /dogs/:id/credits?location=<key>` response `[auth, owner]` — per-dog,
- * per-mode, per-LOCATION credit balance (DATA-CONTRACT §B Credits Δ 2026-06-04;
- * supersedes the Δ 2026-05-20 single-balance shape).
+ * One pool of `OwnerCreditsWire`: the caller's credits for one program and tier
+ * at the campus asked about.
+ */
+export interface OwnerCreditPoolWire {
+  mode: BookingMode;
+  tier: CreditTier;
+  /** The pool's live credits, the sum of `lots[].remaining`. */
+  balance: number;
+  /** Every live lot with credits left, soonest-expiring first, so the app can
+   *  word "1 expires Mon 19 Oct, 8 expire Tue 10 Nov". */
+  lots: { remaining: number; expires_at: string }[];
+  /**
+   * The lots within `cred.expiry_warning_lead_days`, its longest lead, soonest
+   * first. Never `[]` by a switch: it reads the lots' dates, with
+   * `cred.expiry_enforced_enabled` either way, and a lot past its date is never
+   * in it.
+   */
+  expiring_lots: CreditLotWire[];
+}
+
+/**
+ * `GET /credits?location=<key>` response `[auth, owner]` — the caller's credit
+ * pools at one campus (5.0.0-lg4.2; design §1.1:957-961; CRED-U10, CRED-U33). It
+ * replaces `CreditsWire` and `GET /dogs/:id/credits`: credits are the owner's,
+ * one pool per campus, program and tier, and no balance is a dog's.
  *
- * Promoted 1.13.0 from `routes/credits.ts:39-58` (digest credits/M). Query
- * shape: `GetCreditsQuery` below — `location` is REQUIRED (400 `bad_request`
- * without it), because balances are scoped to a school since per-location
- * pricing landed.
- *
- * Owner-scoped: the dog must belong to the authenticated principal owner. A
- * staff principal gets 404 — the same response as "dog doesn't exist", so ids
- * don't enumerate (`credits.ts:70-72`).
+ * Query shape: `GetCreditsQuery` below — `location` is REQUIRED (400
+ * `bad_request` without it), so a family that uses both campuses reads twice.
  *
  * Balances are DERIVED, never stored counters: `SUM(delta)` over the
  * append-only `credit_ledger`, counting only rows attached to live lots
- * (BUSINESS-LOGIC/credits-packages.md R1 @ :55). Expiry is passive — no sweep
- * writes an "expired" row; the view simply stops counting (R2 @ :56).
+ * (`lot_is_live`, M4.08). Expiry is passive — no sweep writes an "expired" row;
+ * the view simply stops counting.
  *
- * ZERO SENTINEL: a freshly-provisioned dog with no `credit_ledger` rows for
- * this location emits `{ dog_id, location, school: 0, daycare: 0,
- * expiring_lots: [], warning_lead_days: <resolved> }` — never a 404 (R29 @ :83;
- * pinned by `test/contracts/snapshots/credits-lola.json`).
+ * ZERO SENTINEL: a pool is listed only while it holds a live credit, so an owner
+ * with none at this campus reads `{ location, pools: [] }`, never a 404. `pools`
+ * is ordered by `mode` (`booking_mode` enum order), then regular before alumni.
  *
- * NON-OMIT: `expiring_lots` and `warning_lead_days` are REQUIRED — the server
- * emits both on every 200, `expiring_lots` as `[]` when there is nothing to
- * warn about (`credits.ts:83-94`; all three snapshots carry both). Mobile's
- * hand mirror types them optional and falls back to a hard-coded 60 — a KNOWN
- * drift, already on the ledger as DRIFT-14
- * (BUSINESS-LOGIC/DISCREPANCIES.md:327-331); the 2.4 repoint to this required
- * shape is what closes it.
+ * No warning lead here: the app reads `cred.expiry_warning_lead_days` from
+ * `GET /settings` (`OwnerCreditSettingsWire`).
  */
-export interface CreditsWire {
-  dog_id: string;
+export interface OwnerCreditsWire {
   location: LocationKey;
-  school: number;
-  daycare: number;
-  /**
-   * Live lots that EXPIRE (count + date), soonest first. Never-expiring credits
-   * are omitted — they're in `school`/`daycare` but have nothing to warn about.
-   * Δ 2026-06-18 (credit-expiry lot model).
-   */
-  expiring_lots: CreditLotWire[];
-  /**
-   * The staff-tuned warning lead for THIS location (per-location override →
-   * org default → server default), in days, from the legacy
-   * `credit_expiry_settings` table. Since 2.0.0-lg1.1 the server's
-   * `credits-expiring` push scan no longer runs (design.md:1845-1848: S01
-   * removed the scheduler call so no family gets a 60-day notice for a lot the
-   * 7-day setting governs); the real notice returns with CRED-U13, and this
-   * field and its table go at design 5.0.0 (S25, M4.07). Δ 2026-07-16.
-   */
-  warning_lead_days: number;
+  pools: OwnerCreditPoolWire[];
 }
 
 /**
  * One row of `GET /credit-packages?location=<key>` `[auth]` — the catalog of
  * purchasable credit packs currently effective at a location (DATA-CONTRACT §B
- * CreditPackage Δ 2026-05-20; effective-dated since Δ 2026-06-08).
+ * CreditPackage Δ 2026-05-20; effective-dated since Δ 2026-06-08). Ten rows are
+ * seeded, every one buyable, each with its one campus, program and tier (design
+ * §2.4:2865-2874; CRED-U04, CRED-U07), so `location` and `mode` are never null.
  *
  * Promoted 1.13.0 from `routes/creditPackages.ts:56-64` (digest credits/M).
  * Query shape: `GetCreditPackagesQuery` below (`location` REQUIRED).
@@ -2356,178 +2443,248 @@ export interface CreditsWire {
  * `test/contracts/snapshots/credit-packages.json`.
  *
  * `key` is the catalog's natural key and stays `string` deliberately: rows are
- * staff/seed data (`credit_packages.key`, `[a-z0-9-]{1,64}` at the path param),
- * not a closed enum — typing it as a union would be a promotion-time tightening
- * of open data (§14.1).
+ * seed data plus `PATCH /staff/credit-packages/:key` (`credit_packages.key`,
+ * `[a-z0-9-]{1,64}` at the path param), not a closed enum — typing it as a union
+ * would be a promotion-time tightening of open data (§14.1). A key names one
+ * row's campus (M4.05): the two campuses' rows have different keys.
  *
- * `price_cents` is integer cents; a purchase charges `price_cents × quantity`
- * and grants `credits × quantity` with no server-side rounding, ever
- * (BUSINESS-LOGIC/credits-packages.md "Units" @ :139, R9 @ :63).
+ * `price_cents` is integer cents; a purchase charges `price_cents × count` and
+ * grants `credits × count` with no server-side rounding, ever, `count` being 1
+ * on every row that is not `single_day` (`PostCreditPackagesPurchaseRequest`).
  *
  * RETIREMENT is the closed `[effective_from, effective_to)` window, NOT an
  * `active` flag — the route's own header comment says otherwise and is stale
  * (already on the ledger as DRIFT-11, BUSINESS-LOGIC/DISCREPANCIES.md:309-313).
  * Neither `effective_from`/`effective_to` nor the surrogate `id` is on the
  * wire: the filter is server-side, so a retired pack never surfaces.
- *
- * ⚠️ FROZEN, NOT RATIFIED. Adjudication 9 (2026-07-27, PORTAL-ENDPOINT-MAP.md
- * § Adjudications) ruled the PORTAL's package model wins and offering config
- * becomes backend-owned; the portal's incompatible `Package` shape is DRIFT-12
- * (DISCREPANCIES.md:315-319) and the unified package/membership model is
- * DRIFT-20. This declaration freezes today's runtime truth so the portal wave
- * has a contract to migrate FROM — it is not the target shape.
  */
 export interface CreditPackageWire {
   key: string;
   location: LocationKey;
   mode: BookingMode;
+  /** The pool a purchase lands in; an `'alumni'` row is the Alumni 10 Visits
+   *  pack. */
+  tier: CreditTier;
   credits: number;
   price_cents: number;
   label: string;
   is_popular: boolean;
+  /** One credit, sold by `count` (`PostCreditPackagesPurchaseRequest`). The row a
+   *  booking's `top_up_offer` names. */
+  single_day: boolean;
+  /** Whole America/Chicago months a lot of this row lasts, stamped once at grant
+   *  (`cred.package_expiry_months`; seed 1). Lots already sold keep their date. */
+  expiry_months: number;
 }
 
 /**
- * One row of `GET`/`POST` `/staff/credit-expiry-settings` `[staff]` — the
- * staff editor for the credit-expiry config (`schema.sql
- * credit_expiry_settings`).
+ * One lot as staff read it: an element of `StaffCreditPoolWire.lots`, and the
+ * response of `PATCH /staff/credit-lots/:id` (5.0.0-lg4.2; design §1.1:990-994,
+ * §2.4:3092-3098; CRED-U14, CRED-U15, CRED-U38). `id` is the grant row's
+ * `credit_ledger.id`.
  *
- * Promoted 1.13.0 from `routes/staffCreditExpiry.ts:67-73` (digest credits/S —
- * "Promote CreditExpirySettingWire + its POST body"). The declaration was
- * module-private there and had no consumer at all (no client, portal UI
- * unbuilt); freezing it is what unblocks the portal wave's staff editor.
- * Grandfathered name kept verbatim (§4.4).
+ * `reason` is the grant row's ledger label: `'purchase'`, `'adjustment'` (a hand
+ * add), or `'cancel-refund'`, a returned credit whose own lot could pay no later
+ * date, written as a fresh one-credit lot (§2.4:2961-2966). `'gingr-import'`
+ * joins at the import (M10.06).
  *
- * TWO-TIER: exactly ONE org-default row (`location: null`) plus at most one
- * override per location, both enforced by partial unique indexes. GET lists the
- * org-default FIRST (NULLS FIRST) then every override; there is always ≥ 1 row
- * given the schema seed (NULL, 12, 60). Bands are `expiry_window_months`
- * ∈ [1, 120] and `warning_lead_days` ∈ [0, 365] at the API, floored by DB
- * CHECKs (> 0, >= 0) — BUSINESS-LOGIC/credits-packages.md R12 @ :66.
+ * `granted` is the grant's credits and `granted_at` its row's time. `remaining`
+ * is the grant plus every allocation tagged to it, read whether or not the lot
+ * is live. `expires_at` is always set. `live` is `lot_is_live` (M4.08), computed
+ * at read: a lot past its date is live again the moment its date is moved later
+ * (CRED-62). All instants are wire ISO-8601.
  *
- * `expiry_window_months` feeds the lot expiry stamp at PURCHASE and is
- * NON-RETROACTIVE: a POST changes future grants only; already-stamped lots keep
- * their `expires_at` (R11 @ :65). `warning_lead_days` had two consumers from
- * Δ 2026-07-16 — the `credits-expiring` push scan and `CreditsWire.
- * warning_lead_days` (R32 @ :86); since 2.0.0-lg1.1 the scan no longer runs
- * (design.md:1845-1848), so `CreditsWire.warning_lead_days` is its one consumer
- * until this route and its table go at design 5.0.0 (S25, M4.07). (Comments
- * in `creditExpirySettingsRepository.ts:20-22` and `schema.sql:923-925` still
- * claim it has no consumer — stale, ledgered as DRIFT-15,
- * DISCREPANCIES.md:333-337.)
+ * `package_id` and `charge_id` are omitted on a lot no purchase made, and `note`
+ * and `created_by_staff_id` on a lot no staffer wrote, or whose staffer's row is
+ * gone (`ON DELETE SET NULL`).
  *
- * NON-OMIT exceptions to the omit-on-null convention, both deliberate and
- * load-bearing: `location` is `null` for the org-default row (null is the KEY,
- * not an absence) and `updated_by_staff_id` is `null` while the row is still
- * the seeded default. Both are emitted explicitly, never omitted
- * (`staffCreditExpiry.ts:75-83`).
+ * NON-OMIT: `last_expiry_edit` is `null` while the date has never been moved,
+ * and otherwise the newest `credit_lot_expiry_edits` row. `staff_id` in it is
+ * `null` once the staffer's row is deleted.
  *
- * `updated_at` is wire ISO-8601 via `pgTimestampToIso`.
+ * `booked_ahead` is the lot's debits on upcoming days, so a screen can name them
+ * ("3 days are booked on this pack"): `dates` has one `YYYY-MM-DD` entry per
+ * debit, ascending, so its length is `count`, and it is `{ count: 0, dates: [] }`
+ * when there are none.
  */
-export interface CreditExpirySettingWire {
-  location: LocationKey | null;
-  expiry_window_months: number;
-  warning_lead_days: number;
-  updated_at: string;
-  updated_by_staff_id: string | null;
+export interface CreditLotDetailWire {
+  id: string;
+  reason: 'purchase' | 'adjustment' | 'cancel-refund';
+  granted: number;
+  remaining: number;
+  granted_at: string;
+  expires_at: string;
+  live: boolean;
+  package_id?: string;
+  charge_id?: string;
+  note?: string;
+  created_by_staff_id?: string;
+  last_expiry_edit: {
+    from: string;
+    to: string;
+    staff_id: string | null;
+    note: string;
+    at: string;
+  } | null;
+  booked_ahead: { count: number; dates: string[] };
+}
+
+/** One pool of `StaffOwnerCreditsWire`, and the response of `POST
+ *  /staff/owners/:ownerId/credit-adjustments`: the changed pool. `balance` is the
+ *  live balance, as the owner reads it. `lots` is every lot of the pool, spent
+ *  and expired included, newest first. */
+export interface StaffCreditPoolWire {
+  location: LocationKey;
+  mode: BookingMode;
+  tier: CreditTier;
+  balance: number;
+  lots: CreditLotDetailWire[];
+}
+
+/**
+ * `GET /staff/owners/:ownerId/credits` response — every pool of one owner, at
+ * both campuses (5.0.0-lg4.2; design §1.1:988-994; CRED-U14, CRED-U38, DAY-U15).
+ * Any staff role reads it; the three hand edits are what the role list gates. An
+ * unknown owner is 404 `not_found`.
+ *
+ * `expiry_enforced` is the live `cred.expiry_enforced_enabled`. No screen reads
+ * it: §2.10:5001 shows the expiry date on every lot, flag on or off (DECISIONS
+ * 177(e); 5.0.0-lg4.2). A pool is listed once it has a lot, whatever is left
+ * in it, ordered by `location`, `mode`, then regular before alumni. `pools` is
+ * `[]` for an owner with none.
+ */
+export interface StaffOwnerCreditsWire {
+  owner_id: string;
+  expiry_enforced: boolean;
+  pools: StaffCreditPoolWire[];
 }
 
 // (c) request bodies + query shapes -------------------------------------------
 
 /**
- * `POST /credit-packages/:key/purchase` body `[auth, owner, $]`.
+ * `POST /credit-packages/:key/purchase` body `[auth, owner, $]`. Since
+ * 5.0.0-lg4.2 it is `{payment_method_id, count?}` (design §1.1:953-956,
+ * §2.4:2879-2882; CRED-U30, CRED-U10, CRED-U04): the row carries its campus, the
+ * credits land in the owner's pool for its campus, program and tier, and no dog
+ * is named.
  *
  * Promoted 1.13.0 from `routes/creditPackages.ts:98-108` `purchaseBodySchema`
  * (digest credits/S — "Contract the credits request bodies"). Pinned to that
  * schema in the route file by `PostCreditPackagesPurchaseBodyConformance`
  * (§5.1.3, `z.input` — what a client may SEND, pre-default).
  *
- * `.strict()`: an unknown key is a 400 `bad_request`, not a silent drop.
- * `Idempotency-Key` is REQUIRED (`creditPackages.ts:150`); the same key flows
- * into BOTH Stripe's `paymentIntents.create` and the DB-side `withIdempotency`
- * wrapper, so a retry re-fetches the same PaymentIntent and replays the stored
- * outcome — no double-charge, no double-grant. Reusing a key with a different
- * body is `idempotency_mismatch` (422, no `details`). Its length bound lives in
- * the §0 conventions block (refunds lane, from `db/idempotency.ts` +
- * `db/mutation.ts:70` truth); this route appends `:payment-intent` to the
- * caller's key.
+ * `.strict()`: an unknown key is a 400 `bad_request`, not a silent drop, so a
+ * client still sending `dog_id`, `location` or `quantity` is refused.
+ * `Idempotency-Key` is REQUIRED. Reusing a key with a different body is
+ * `idempotency_mismatch` (422, no `details`). Its length bound lives in the §0
+ * conventions block.
  *
- * Money path, for readers: the route creates + confirms a PaymentIntent off the
- * owner's stored card OUTSIDE the DB tx, writes the `charges` row mirroring
- * Stripe's status, and grants `credit_ledger` credits ONLY on `succeeded`; a
- * non-succeeded intent is cancelled pre-tx so it cannot auto-succeed behind a
- * later attempt. Response is `CreditPurchaseWire` (§ payments-invoices, already
- * in the contract since 1.8.0).
+ * The route rides the order engine since 5.0.0-lg4.2 (design §2.4:2978-3022,
+ * §2.7; CRED-U10), one order and one charge under the `cancel-order` failure
+ * policy. Nothing is granted before the money:
+ *   - 201 `CreditPurchaseWire` with `charge_status: 'succeeded'`: one charge of
+ *     `price_cents × count`, one lot of `credits × count`, one paid invoice. A
+ *     route that loses the race to the webhook answers the same 201 with the
+ *     webhook's lot.
+ *   - 201 with `charge_status: 'requires_payment'`, `credits_granted: 0` and
+ *     `charge_blocker: 'processing'`: Stripe has not answered, so do not retry.
+ *     The credits are added when it clears.
+ *   - 402 `payment_failed` (`PaymentFailedDetails`): the order ended unpaid and
+ *     nothing is granted; a decline was a 201 until now. A replay returns the
+ *     same 402, so the next try takes a fresh key, with this card or another.
+ *   - 409 `idempotency_inflight`: no answer exists yet. Re-send under the same
+ *     key; the final answer replays once the order has settled. Nothing more is
+ *     charged.
  *
- * 404 collapses for unknown key / retired package / not-your-dog / unknown or
- * soft-expired payment method — id enumeration is the security concern, so all
- * four answer identically (`creditPackages.ts:318-327, 348-355`).
+ * 404 collapses for unknown key / retired package / unknown or soft-expired
+ * payment method — id enumeration is the security concern, so all three answer
+ * identically. 422 `count_not_allowed`: see `count`.
  */
 export interface PostCreditPackagesPurchaseRequest {
-  /** UUID of the dog the credits are granted to; must belong to the caller. */
-  dog_id: string;
   /** UUID of one of the caller's stored payment methods (`payment_methods.id`,
    *  NOT a Stripe id). */
   payment_method_id: string;
-  /** The school the pack is bought at. Catalog + price are per-location. */
-  location: LocationKey;
   /**
-   * Units of the package bought in ONE charge and ONE ledger lot: integer
-   * 1–100. OMITTED = 1 (the server default, `z.number().…default(1)`) = the
-   * classic single-package purchase; the app's "choose your own amount" wheel
-   * sends N × the single-day pack. Quantity multiplies the whole purchase —
-   * `amount = price_cents × N`, `delta = credits × N` — and EXPIRY KEYS OFF THE
-   * TOTAL: 10 × the never-expiring 1-credit pack grants 10 credits, which is a
-   * multi-credit lot and therefore DOES expire
-   * (BUSINESS-LOGIC/credits-packages.md R9 @ :63, R8 @ :62).
+   * Single days bought in ONE charge and ONE lot: a positive integer, OMITTED =
+   * 1. Accepted only on a row with `single_day: true`, up to
+   * `cred.single_day_purchase_max_count` (seed 30), read at runtime. On any other
+   * row, or above that limit, 422 `count_not_allowed`: a pack is bought one at a
+   * time, and `count: 1` on a pack is refused like any other.
    */
-  quantity?: number;
+  count?: number;
 }
 
 /**
- * `POST /staff/credit-expiry-settings` body `[staff]` — upsert ONE row by
- * location (null = the org-default). Returns the upserted
- * `CreditExpirySettingWire` (200, not 201 — upsert, not create).
+ * `POST /staff/owners/:ownerId/credit-adjustments` body: a hand edit of one pool
+ * (5.0.0-lg4.2; design §1.1:994-1001, §2.4:3084-3091; CRED-U14). `.strict()`;
+ * `Idempotency-Key` REQUIRED. Response 201 `StaffCreditPoolWire`, the changed
+ * pool. No count cap: the role list is the limit.
  *
- * Promoted 1.13.0 from `routes/staffCreditExpiry.ts:58-65` `postBodySchema`
- * (digest credits/S). Pinned in the route file by
- * `PostStaffCreditExpiryBodyConformance` (§5.1.3, `z.input`).
+ * 403 `credit_edit_role_required` for a role off
+ * `staff.credit_hand_edit_role_list` (`StaffSettingsWire.credit_hand_edit_roles`;
+ * the owner role always passes). Unknown owner: 404 `not_found`.
  *
- * `.strict()`; `Idempotency-Key` REQUIRED (`staffCreditExpiry.ts:118`). Owner
- * principals get 403 (`requireStaff`). Stamps `updated_at = now()` +
- * `updated_by_staff_id`. NON-RETROACTIVE — future grants at this location stamp
- * the new window; already-stamped lots keep their `expires_at`
- * (BUSINESS-LOGIC/credits-packages.md R11 @ :65). No cache wipe:
- * `credit_expiry_settings` is read direct from pg at each grant.
+ * `credits` is a positive integer. `note` is required, 1..500 characters: every
+ * hand edit is explained (M4.12).
  *
- * Owner and manager only from 2.0.0-lg1.2: a trainer is 403 `forbidden`, no
- * `details`. The route is `requireStaffRole('owner', 'manager')` whole
- * (STAFF-U07; design §1.1:706-709, §2.1:2080-2086), with no per-field
- * exception: a body that changes only `warning_lead_days`, or repeats the
- * stored window, is refused to a trainer all the same.
- * `GET /staff/credit-expiry-settings` stays any staff role. The design
- * removes both verbs at 5.0.0 (§1.1:682-684).
+ * `'add'` writes a grant lot in the pool. `expires_at` is ISO-8601, omitted for
+ * `cred.manual_grant_expiry_months` from now, and any instant later than now
+ * otherwise (422 `expiry_not_in_future`). 422 `pool_not_bookable` for a pool no
+ * v1 booking can draw from: a campus and program with no seeded package row, or
+ * the alumni tier on an account with no alumni dog.
+ *
+ * `'remove'` debits one lot, the pool and owner read from the lot, whether or not
+ * it is live. 422 `lot_insufficient` above the lot's unspent; a lot that is not
+ * this owner's grant row is the generic 404.
  */
-export interface PostStaffCreditExpiryRequest {
-  /**
-   * NON-OMIT, and required: `null` addresses the ONE org-wide default row, a
-   * slug addresses that location's override. The key of the upsert, not an
-   * absence.
-   */
-  location: LocationKey | null;
-  /** Integer months, API band [1, 120]; DB CHECK > 0 floors it. A 0-month
-   *  window would be "expires instantly", which is not a policy; the ceiling
-   *  stops a fat-finger from disabling expiry org-wide (R12 @ :66). */
-  expiry_window_months: number;
-  /** Integer days, API band [0, 365]; DB CHECK >= 0 floors it. 0 = "warn the
-   *  day it expires"; beyond a year the warning would predate the purchase
-   *  (R12 @ :66). */
-  warning_lead_days: number;
+export type PostStaffOwnersCreditAdjustmentsRequest =
+  | {
+      kind: 'add';
+      location: LocationKey;
+      mode: BookingMode;
+      tier: CreditTier;
+      credits: number;
+      expires_at?: string;
+      note: string;
+    }
+  | { kind: 'remove'; lot_id: string; credits: number; note: string };
+
+/**
+ * `PATCH /staff/credit-lots/:id` body: move a lot's expiry (5.0.0-lg4.2; design
+ * §1.1:997-998, §2.4:3092-3098; CRED-U15, Shanthi's condition, 12- #6.11).
+ * `.strict()`; `Idempotency-Key` REQUIRED. Response 200 `CreditLotDetailWire`.
+ *
+ * `expires_at` is ISO-8601 and must be later than now, else 422
+ * `expiry_not_in_future`: taking credits away is the removal's job and leaves a
+ * row. `note` is required, 1..500 characters. Each edit writes one
+ * `credit_lot_expiry_edits` row. 403 `credit_edit_role_required` as above; an id
+ * that is no grant row is the generic 404.
+ */
+export interface PatchStaffCreditLotsRequest {
+  expires_at: string;
+  note: string;
 }
 
 /**
- * `GET /dogs/:id/credits` query string. Promoted 1.13.0 from
- * `routes/credits.ts:30` `creditsQuerySchema` (digest credits/S, §7 Fills).
+ * `PATCH /staff/credit-packages/:key` body: one row's expiry window (5.0.0-lg4.2;
+ * design §1.1:1002-1004, §2.4:3099-3106; CRED-U08 narrowed to this one field).
+ * `.strict()`; `Idempotency-Key` REQUIRED. Response 200 `CreditPackageWire`.
+ *
+ * `expiry_months` is an integer, 1..120. It opens a new effective-dated row from
+ * today in America/Chicago, or corrects today's row in place, so a second edit
+ * the same day answers 200. The next purchase stamps the new months; lots already
+ * sold keep their date. Price and credit count are reference data: no route edits
+ * them. 403 `credit_edit_role_required` as above; a key with no live row is 404
+ * `not_found`.
+ */
+export interface PatchStaffCreditPackagesRequest {
+  expiry_months: number;
+}
+
+/**
+ * `GET /credits` query string. Promoted 1.13.0 from `routes/credits.ts:30`
+ * `creditsQuerySchema` (digest credits/S, §7 Fills) as `GET /dogs/:id/credits`'s;
+ * the route moved at 5.0.0-lg4.2 and kept it.
  * `location` is REQUIRED — omitting it is 400 `bad_request`, not a default —
  * because balances are per-school since Δ 2026-06-04. Pinned in the route file
  * by `GetCreditsQueryConformance`.
@@ -2548,17 +2705,16 @@ export interface GetCreditPackagesQuery {
 }
 
 // (d) per-endpoint 422 detail unions — NONE on this surface, deliberately.
-//     Every error the three credits routes can raise is `not_found` (404),
-//     `bad_request` (400), `forbidden` (403), `unauthenticated` (401), or
-//     `idempotency_mismatch` (422) — and NONE of them carries a `details`
-//     payload, so there is no arm to alias (§3.5). `CreditGap` and
-//     `InsufficientCreditsDetails` (wire.ts §1, skeleton) belong to the
-//     BOOKING/ENROLLMENT surfaces that spend credits; their per-endpoint alias
-//     is `PostBookingsErrorDetails`, owned by the bookings lane.
+//     No 422 a credits route can raise carries a `details` payload, so there is
+//     no arm to alias (§3.5). The one `details`-carrying money arm is the
+//     purchase's 402 `payment_failed` / `PaymentFailedDetails`, which is not a
+//     422. `CreditGap` and `InsufficientCreditsDetails` (wire.ts §1, skeleton)
+//     belong to the BOOKING/ENROLLMENT surfaces that spend credits; their
+//     per-endpoint alias is `PostBookingsErrorDetails`, owned by the bookings
+//     lane.
 
 // (e) domain-owned pure helpers — NONE. Credits emit no derived/display value
-//     the clients must recompute identically; balances are server-derived and
-//     `warning_lead_days` ships resolved.
+//     the clients must recompute identically; balances are server-derived.
 
 // <<< domain:credits ==========================================================
 
@@ -2568,8 +2724,8 @@ export interface GetCreditPackagesQuery {
 
 /**
  * The five day-school curriculum programs — the "5 courses" whose completion
- * makes a dog ALUMNI (BUSINESS-LOGIC/dogs-evaluations.md R20 @ :75; alumni is
- * DERIVED from the rows, never stored). Written as an `Extract` of
+ * makes a dog ALUMNI (BUSINESS-LOGIC/dogs-evaluations.md R20 @ :75; the flag is
+ * stored from 5.0.0-lg4.2, `DogWire.is_alumni`). Written as an `Extract` of
  * `ReportProgram` (§2) so a typo cannot mint a non-program, and so the
  * relationship to the report vocabulary is visible: this set is exactly
  * `ReportProgram` minus `SESSION_PROGRAMS` (§2). Promoted 1.13.0 from
@@ -2670,8 +2826,9 @@ export interface FeedingWire {
  *   - `age_months` is DERIVED per request from `birthdate` or
  *     `age_months_override` (`lib/ageMonths.ts`); neither raw column is on the
  *     wire.
- *   - `is_alumni` is DERIVED — all 5 live `dog_completed_programs` rows, never
- *     a stored flag (BUSINESS-LOGIC/dogs-evaluations.md R20 @ :75).
+ *   - `is_alumni` is STORED from 5.0.0-lg4.2 (`dogs.is_alumni`, M4.11; ALUM-U02):
+ *     set when the fifth live `dog_completed_programs` row is recorded, and never
+ *     cleared by un-recording a level.
  *   - `evaluation_status` is the hard booking gate for the four in-school
  *     categories (R8 @ :54). It is TODAY owner-writable through `POST`/`PATCH
  *     /dogs` — the trust inversion recorded as DISCREPANCIES BUG-11 /
@@ -2696,7 +2853,7 @@ export interface DogWire {
   special_notes: string;
   evaluation_status: EvaluationStatus;
   boarding_enabled: boolean;
-  /** Derived — the dog has all 5 live day-school curriculum completions. */
+  /** Stored — the dog reached all 5 day-school curriculum completions. */
   is_alumni: boolean;
   evaluation_date?: string;
   /** Omit-on-EMPTY (not just null): an empty completion list omits the key
@@ -2781,10 +2938,10 @@ export interface RequiredVaccineWire {
  * (200). Staff-only.
  * Promoted 1.13.0 from `routes/staffAlumni.ts:47` (digest dogs-profile/S).
  *
- * `is_alumni` is DERIVED from the row count, never stored (R20 @ :75), and
- * recording the 5th program is the became-alumni moment (R21 @ :76). It touches
- * no credit lot: from 5.0.0-lg4.1 an alumni lot takes the ordinary expiry
- * (ALUM-U16).
+ * `is_alumni` is `dogs.is_alumni`, STORED from 5.0.0-lg4.2 (M4.11; ALUM-U02):
+ * recording the 5th program is the became-alumni moment (R21 @ :76) and sets it,
+ * and the `DELETE` does not clear it. It touches no credit lot: from 5.0.0-lg4.1
+ * an alumni lot takes the ordinary expiry (ALUM-U16).
  *
  * `completed_programs[].program` is typed `CurriculumProgram` — the DB CHECK
  * (`schema.sql:475-476`) constrains the column to exactly those five, and the
@@ -3890,13 +4047,15 @@ export interface NotificationPushData {
  * A structured deep-link reference a producer stamps on a notification instead
  * of hand-writing a path. `deepLinkToPath` is the single grammar that turns it
  * into the owner-app route; `params` carries kind-specific extras (e.g. `report`
- * needs `dogId`).
+ * needs `dogId`). `credits` alone has no `id` (5.0.0-lg4.2).
  */
-export interface NotificationDeepLink {
-  kind: NotificationDeepLinkKind;
-  id: string;
-  params?: Record<string, string>;
-}
+export type NotificationDeepLink =
+  | {
+      kind: Exclude<NotificationDeepLinkKind, 'credits'>;
+      id: string;
+      params?: Record<string, string>;
+    }
+  | { kind: 'credits'; params?: Record<string, string> };
 
 /**
  * The optional call-to-action on an announcement card. Promoted 1.13.0 from
@@ -4084,13 +4243,11 @@ export function deepLinkToPath(link: NotificationDeepLink): string {
       return `/dog-profile/${link.id}`;
     case 'dog-manage':
       return `/dog-manage/${link.id}`;
-    // `credits` aliases `dog-profile` (decision 4): a credits alert routes to the
-    // dog whose credits are expiring. `?highlight=credits` is a SENTINEL, not an
-    // id — the credits card is a singular surface on that page, not one row among
-    // many — and it makes the card one-shot flash so the alert lands on the thing
-    // it's about rather than on the page it lives on (Allison 2026-07-29).
+    // The owner's credits screen: credits are hers, not a dog's, so the arm has no
+    // id (5.0.0-lg4.2; CRED-U10). A path stored before that keeps its dog-profile
+    // route and its `?highlight=credits`; the clients' parser accepts both.
     case 'credits':
-      return `/dog-profile/${link.id}?highlight=credits`;
+      return '/account/credits';
     case 'announcement':
       return `/announcement/${link.id}`;
     // The expiring card, flashed in the wallet list (`link.id` is the
@@ -4105,8 +4262,10 @@ export function deepLinkToPath(link: NotificationDeepLink): string {
     case 'waitlist':
       return `/waitlist/${link.id}`;
     default: {
-      const unreachable: never = link.kind;
-      throw new Error(`deepLinkToPath: unhandled kind ${String(unreachable)}`);
+      const unreachable: never = link;
+      throw new Error(
+        `deepLinkToPath: unhandled kind ${String((unreachable as NotificationDeepLink).kind)}`,
+      );
     }
   }
 }
@@ -4182,8 +4341,7 @@ export interface InvoicePayWire {
    * The one non-succeeded 201 is a charge Stripe still reports `processing`:
    * that intent is LIVE and the webhook or the sweeper settles it. A final
    * decline is 402 `payment_failed`, which carries no secret; the sweeper then
-   * cancels its intent on a later tick. Routes not on the engine keep the rule
-   * (`CreditPurchaseWire.client_secret`).
+   * cancels its intent on a later tick. A route not on the engine keeps the rule.
    *
    * When a 3DS-completion design lands it must revisit the cancel rule for
    * on-session routes -- completion needs a LIVE intent -- and re-document this
@@ -4232,24 +4390,35 @@ export interface InvoicePayWire {
 }
 
 /**
- * `POST /credit-packages/:key/purchase` response. Declared here since 1.8.0;
+ * `POST /credit-packages/:key/purchase` 201 response. Declared here since 1.8.0;
  * it previously lived in `routes/creditPackages.ts`, which left a second money
  * endpoint outside the versioned contract with nothing for the clients'
  * `check:contracts` to guard -- the same condition that let the invoice card
- * picker drift in the first place. Shape unchanged by the move; `charge_blocker`
- * is the only addition.
+ * picker drift in the first place.
+ *
+ * Since 5.0.0-lg4.2 the route rides the order engine (design §1.1:1008-1011,
+ * §2.4:3008-3011; CRED-U10) and a 201 has two arms. `charge_status: 'succeeded'`
+ * with the credits granted, or a purchase Stripe still reports `processing` after
+ * the tries: `charge_status: 'requires_payment'`, `credits_granted: 0` and
+ * `charge_blocker: 'processing'`, the field the app branches on ("Payment
+ * processing. Your credits are added when it clears."). The intent is LIVE and
+ * the webhook or the sweeper settles it. A decline is no longer a 201: it is 402
+ * `payment_failed` (`PostCreditPackagesPurchaseRequest`).
  */
 export interface CreditPurchaseWire {
   charge_id: string;
   charge_status: ChargeStatus;
   stripe_payment_intent_id: string;
-  /** Same caveat as `InvoicePayWire.client_secret`: on the non-succeeded arm
-   *  this names a CANCELLED intent (1.7.1 cancel rule) and cannot be completed. */
+  /** Same caveat as `InvoicePayWire.client_secret`: for logging and support
+   *  lookup only, never a completable intent. */
   client_secret: string | null;
-  /** Zero on every non-succeeded arm -- the grant is gated on `succeeded`. */
+  /** `credits × count` on `'succeeded'`. Zero on the processing arm -- the grant
+   *  is gated on `succeeded`. */
   credits_granted: number;
-  /** See `InvoicePayWire.charge_blocker`. Same union, same derivation, same
-   *  pessimistic-when-absent rule. */
+  /** `'processing'` on the processing arm, omitted on `'succeeded'`, and absent
+   *  on stored idempotency replays of older responses. See
+   *  `InvoicePayWire.charge_blocker`. Same union, same pessimistic-when-absent
+   *  rule. */
   charge_blocker?: ChargeBlocker;
 }
 
@@ -4324,8 +4493,9 @@ export interface LedgerEntryWire {
   settled_method?: 'card' | 'cash' | 'check';
   /**
    * Paid entries only: the settling card — present ONLY when the paid charge
-   * settled an invoice with a live payment_method. Omitted for direct
-   * package charges and non-paid entries.
+   * settled an invoice with a live payment_method. A pack's settle writes the
+   * card it charged onto its paid invoice (§2.7:3875; 5.0.0-lg4.2), so a pack
+   * line carries it. Omitted on non-paid entries.
    */
   settled_card?: { brand: string; last4: string };
   /**
@@ -4599,9 +4769,9 @@ export type GetStaffOwnersPaymentMethodsResponse = PaymentMethodWire[];
 // New 4.0.0-lg3.2 (plan unit P15, slice S20; design §1.1:857-899, §2.7:3811-4030;
 // PAY-U04, PAY-U05, PAY-U07). An order is one Confirm: one `orders` row (M3.02)
 // holding at most one `charges` row. Automatic capture, two transactions with
-// Stripe between them: no capture-related shape exists. `POST /invoices/:id/pay`
-// is the engine's one caller at this step. The top-up inside `POST /bookings` and
-// the pack purchase join at P18, `POST /staff/invoices/:id/charge` at 7.1.0 and
+// Stripe between them: no capture-related shape exists. `POST /invoices/:id/pay`,
+// the top-up inside `POST /bookings` and the pack purchase are its callers at
+// 5.0.0-lg4.2. `POST /staff/invoices/:id/charge` joins at 7.1.0 and
 // `POST /enrollments` at 8.0.0.
 //   GET  /staff/payments/pending   → GetStaffPaymentsPendingResponse   any role
 //   POST /staff/orders/:id/cancel  → PostStaffOrdersCancelResponse     any role
@@ -4656,8 +4826,8 @@ export interface ChargeAttemptOutcomeWire {
  * a person moves it, staff through `POST /staff/orders/:id/cancel`.
  *
  * `kind`: `'booking'` is a Confirm with a top-up, `'package'` a pack or
- * single-day purchase, `'class'` a class order. Nothing can be listed until one
- * of them can stay processing: the first two at P18, `'class'` at 8.0.0.
+ * single-day purchase, `'class'` a class order. `'class'` is not listed until
+ * 8.0.0, when a class order can stay processing.
  *
  * `owner.name` is the family's name, or its `email` when the name is empty, as
  * on `StaffDogWire.owner_name`, so it is never `null`. `amount_cents` is the
@@ -4669,6 +4839,10 @@ export interface PendingPaymentWire {
   order_id: string;
   owner: { id: string; name: string };
   kind: 'booking' | 'package' | 'class';
+  /** The label of the pack or single-day row bought, on a `'package'` row, read
+   *  from `charges.package_id` (design §2.7:3841; 5.0.0-lg4.2). Omitted on the
+   *  other kinds. */
+  package_label?: string;
   amount_cents: number;
   created_at: string;
   minutes_pending: number;
@@ -4805,7 +4979,8 @@ export interface PatchPaymentMethodsRequest {
 // rides `InvoicePayWire.charge_blocker` in a 201 body. The one `details`-carrying
 // money arm, `payment_failed` / `PaymentFailedDetails`, is a 402 and not a 422,
 // so it is no alias here either: `InvoicePayRequest` documents it for this route,
-// and enrollments and requestConfirmPayment emit it too (wire.ts §1, design §3.3).
+// and enrollments, requestConfirmPayment, the pack purchase and the top-up emit it
+// too (wire.ts §1, design §3.3).
 
 // ---- (e) domain helpers ----------------------------------------------------
 //
@@ -4829,9 +5004,8 @@ export interface PatchPaymentMethodsRequest {
  *     omit-on-null rule: it emits as `null`, never omitted, when the matched
  *     row has `service_rates.location IS NULL`, because null here is
  *     meaningful DATA ("this price applies to all locations"), not absence.
- *     Pinned by the byte-match snapshots `rates-day-school-bentonville.json`
- *     and `rates-day-care-current.json`, both of which carry
- *     `"location": null`.
+ *     Pinned by `GET /rates` falling back to a null-location row in
+ *     `test/contracts/rates.test.ts`.
  *   • `note?` follows the default rule and is omitted when the column is
  *     NULL **or the empty string** (`ratesWire.ts:40`) — note the staff view
  *     below reports the same column as `note: string | null`, always present.
@@ -4841,7 +5015,9 @@ export interface PatchPaymentMethodsRequest {
  * active at today ⇒ 404 `not_found` (`routes/rates.ts:54-60`). Reference
  * data — owner and staff principals get identical bytes
  * (BUSINESS-LOGIC/payments-invoices.md:172). From 4.0.0 no day-program booking
- * reads this catalog: a day is paid in credits (R1).
+ * reads this catalog: a day is paid in credits (R1). From 5.0.0-lg4.2 it holds
+ * only each campus's evaluation row (DAY-U23), so every other category is that
+ * 404. A single day's price is a `CreditPackageWire` row, never a rate.
  */
 export interface RateWire {
   category: ServiceCategory;
@@ -4963,26 +5139,23 @@ export interface CancelWindowSettingWire {
 }
 
 /**
- * `POST /staff/rates` body — set the rate for one (category, location)
- * track, effective-dated. Promoted 1.13.0 from `routes/staffRates.ts:63-79`
+ * `POST /staff/rates` body — set the evaluation rate of one campus,
+ * effective-dated. Promoted 1.13.0 from `routes/staffRates.ts:63-79`
  * (digest rates-availability/M) and pinned to that schema in the route file
- * by `PostStaffRatesBodyConformance` (§5.1.3, `z.input`).
+ * by `PostStaffRatesBodyConformance` (§5.1.3, `z.input`). Since 5.0.0-lg4.2 it
+ * keeps only that row (design §1.1:929-935, §3.2:5729; DAY-U23), moved from design
+ * 4.0.0 by §1.3.
  *
  * Staff-only; `Idempotency-Key` required (`staffRates.ts:159`). The schema is
  * `.strict()` — unknown keys are rejected, not stripped.
- *   • `amount_cents` — integer, 1 … 1_000_000 (`staffRates.ts:51-52`).
+ *   • `amount_cents` — in v1 only the seed, 0: any other integer is 422
+ *     `invalid_payload`. No evaluation charge path is designed, and question 27
+ *     holds every price at its seed.
  *   • `effective_from` — `YYYY-MM-DD`; omitted means today-in-Chicago. The
  *     route (not the schema) rejects any date before today with 422
  *     `invalid_payload`: back-dating would corrupt as-charged history
  *     (`staffRates.ts:163-168`).
  *   • `note` — max 500 chars.
- * Cross-field rule, enforced in the route rather than the schema (§4.6):
- * `day-school` and `day-care` MUST be `unit: 'per-day'`, a rule from PAYG,
- * which billed those per booking DATE straight off `amount_cents`
- * (`staffRates.ts:61, :169-174`;
- * R10 @ BUSINESS-LOGIC/bookings-scheduling.md:64). PAYG left at 4.0.0, so
- * nothing bills these rows now, and the rule stands until DAY-U23 removes them
- * (P18).
  *
  * `location` is non-nullable here while `RateWire.location` is
  * `LocationKey | null`. That asymmetry is transcribed, not fixed: no route
@@ -4999,14 +5172,12 @@ export interface CancelWindowSettingWire {
  * §1.1:706-709, §2.1:2080-2094), so a trainer is 403 `forbidden`, no
  * `details`; an owner principal is 403 as before. The guard is the role, not
  * `StaffCapabilitiesWire.edit_prices`: that flag is false for every role in
- * v1, yet this route accepts an owner's or a manager's rate until P18 narrows
- * it to the evaluation's seed (DAY-U23, moved from design 4.0.0 by §1.3;
- * §2.1:2087-2091). The
+ * v1, and this route's one accepted amount is the seed (§2.1:2087-2091). The
  * (category, campus) track has no trainer axis; a trainer's own lesson price
  * is STAFF-U23's, later.
  */
 export interface PostStaffRatesRequest {
-  category: ServiceCategory;
+  category: 'evaluation';
   location: LocationKey;
   amount_cents: number;
   unit: RateUnit;
@@ -5623,8 +5794,8 @@ export function isSessionProgram(program: ReportProgram): boolean {
 //     and `/staff/settings/eval/:location` that campus's row — the ledger's
 //     `[/:location]` (DAY-U02) on §1.1:636-637's "`day` and `eval` take
 //     `/:location`". The row wire is a union discriminated on `location`
-//     (`null` = the global row's KEY, the `CreditExpirySettingWire`
-//     precedent), and each tier's PATCH takes only that tier's columns.
+//     (`null` = the global row's KEY), and each tier's PATCH takes only that
+//     tier's columns.
 //
 // The staff routes (§1.1:628-649; §2.1:1850-1869), any staff role, owner
 // principals 403 `forbidden`:
@@ -5806,8 +5977,7 @@ export interface SettingsAuditWire {
    *  the first edit. */
   updated_at: string;
   /** NON-OMIT: `null` while the row is still its seed, or after the editing
-   *  staffer's row is deleted (`ON DELETE SET NULL`) — the
-   *  `CreditExpirySettingWire` precedent. */
+   *  staffer's row is deleted (`ON DELETE SET NULL`). */
   updated_by_staff_id: string | null;
 }
 
@@ -5899,16 +6069,21 @@ export interface CreditSettingsWire extends SettingsAuditWire {
   /** Days before a lot's expiry, one notice per lead; seed `[7]`
    *  (§3.5:5791). This table is its one store (q35 → (b)). Never empty and
    *  no repeats: a PATCH of `[]` or `[7, 7]` is 422 `invalid_payload`
-   *  (DECISIONS 61; an empty list would silently warn no family). */
+   *  (DECISIONS 61; an empty list would silently warn no family). Each lead
+   *  at most 365 (5.0.0-lg4.2). */
   expiry_warning_lead_days: number[];
-  /** Months; seed 1 (§3.5:5793). */
+  /** Months, 1 to 120; seed 1 (§3.5:5793; the bounds, 5.0.0-lg4.2). */
   manual_grant_expiry_months: number;
   /** Months of fresh expiry for a returned credit whose lot can pay no later
-   *  date; seed 1; 0 = every return goes into its old lot (§3.5:5804). */
+   *  date, 0 to 120; seed 1; 0 = every return goes into its old lot (§3.5:5804;
+   *  the bounds, 5.0.0-lg4.2). */
   returned_credit_expiry_months: number;
   /** Seed false (§3.5:5788). */
   booking_outlives_lot_expiry_enabled: boolean;
-  /** The `count` a single-day purchase may carry; seed 30 (§3.5:5805). */
+  /** The `count` a single-day purchase may carry, 1 to 100; seed 30 (§3.5:5805;
+   *  the bounds, 5.0.0-lg4.2). It binds
+   *  `POST /credit-packages/:key/purchase` and the desk sale, not a booking's
+   *  `top_up`. */
   single_day_purchase_max_count: number;
   /** Seed true (§3.5:5787). */
   account_deletion_expires_credits_enabled: boolean;
@@ -6345,8 +6520,8 @@ export interface StaffSettingsWire extends SettingsAuditWire {
   refund_roles: StaffRole[];
   /** Who adds or removes credits by hand and moves a lot's expiry. Seed
    *  `['owner', 'manager']`; registry key `staff.credit_hand_edit_role_list`
-   *  (§3.14:5948; A11, R4). Mirrored by `capabilities.edit_credits`. Its
-   *  verbs land at design 5.0.0. */
+   *  (§3.14:5948; A11, R4). Mirrored by `capabilities.edit_credits`. Read at
+   *  the three verbs it names there. */
   credit_hand_edit_roles: StaffRole[];
   /** Who records a cash or check desk sale, and *Mark paid* on an open custom
    *  invoice. Seed `['owner', 'manager', 'trainer']`; registry key
@@ -6928,4 +7103,6 @@ export type WireTupleConformance = [
   Expect<Equal<Extract<SettingsDomain, 'manifest'>, never>>,
   // 3.0.0-lg2.1 (§ settings): the sign-up field order.
   Expect<Equal<(typeof SIGNUP_FIELDS)[number], SignupField>>,
+  // 5.0.0-lg4.2: no pgEnum backs the tier, so this is its one pin.
+  Expect<Equal<(typeof CREDIT_TIERS)[number], CreditTier>>,
 ];
