@@ -7,6 +7,7 @@ import type { PostBookingsResponse } from '../../src/contracts/wire.js';
 import {
   bookingDogs,
   bookings,
+  checkinEvents,
   creditLedger,
   dogCompletedPrograms,
   dogVaccines,
@@ -147,12 +148,14 @@ async function createTestDog(
       durationMinutes: 540,
       location: 'fayetteville',
     });
-    await db.insert(bookingDogs).values({
+    await db.insert(bookingDogs).values({ bookingId, dogId, isLead: true });
+    // Attended on the board's log (M5.12 dropped the `attendance` columns).
+    await db.insert(checkinEvents).values({
       bookingId,
       dogId,
-      isLead: true,
-      attendance: 'attended',
-      checkedInAt: opts.attendedAt,
+      kind: 'check-in',
+      at: opts.attendedAt,
+      byStaffId: FIXTURE_IDS.staffDonavanId,
     });
   }
   return dogId;

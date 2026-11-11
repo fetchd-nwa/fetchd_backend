@@ -7,13 +7,16 @@ import { creditsInvalidationPattern } from '../db/repositories/creditsRepository
 import { LOCATION_SLUGS, serviceCategory } from '../db/schema/schema.js';
 import { type BookingWire } from '../lib/bookingWire.js';
 import type {
-  AttendanceWire,
   GetStaffBookingsQuery,
-  PostStaffBookingsAttendanceRequest,
   PostStaffBookingsCancelRequest,
+  PostStaffBookingsDogsCancelRequest,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
-import { askWhatWonForPendingRow, cancelBookingInTx } from '../lib/cancelBookingService.js';
+import {
+  askWhatWonForPendingRow,
+  cancelBookingInTx,
+  cancelOneDogInTx,
+} from '../lib/cancelBookingService.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
@@ -31,7 +34,7 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *   GET  /staff/bookings              — the live, non-cancelled queue
  *   POST /staff/bookings/:id/confirm  — stamp confirmed_at (drives reminders)
  *   POST /staff/bookings/:id/cancel   — the shared cancel txn, cross-owner
- *   POST /staff/bookings/:id/attendance — per-dog check-in
+ *   POST /staff/bookings/:id/dogs/:dogId/cancel — one dog of several (s11, 6.0.0-lg5.1)
  *
  * Cancel reuses `lib/cancelBookingService.cancelBookingInTx` — the SAME
  * forfeit/refund transaction the owner self-cancel runs (schema.sql
@@ -39,15 +42,13 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  * The only difference is `requireOwnerId: null` (cross-owner) here vs the
  * owner's own id in `routes/bookings.ts`.
  *
- * Attendance response shape (§A Clarification 2026-05-28, additive, no
- * DDL): `{ booking_id, dog_id, attendance, checked_in_at }` — the §B
- * BookingWire carries no per-dog attendance, so the check-in verb returns
- * the row it touched. The booking_attendance value 'pending' is the
- * default/unset state, never a check-in action; the body accepts only
- * 'attended' | 'no-show' | 'excused'.
+ * `POST /staff/bookings/:id/attendance` is gone (6.0.0-lg5.1, M5.12): the board's
+ * append-only log replaces it (`routes/staffCheckin.ts`).
  */
 
 const uuidParamSchema = z.object({ id: uuidId() });
+/** Both path ids lowercased at the parse, before any key, lock or comparison. */
+const shareParamSchema = z.object({ id: uuidId(), dogId: uuidId() });
 
 const SERVICE_CATEGORY_VALUES = pgEnumTuple(serviceCategory);
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -82,13 +83,6 @@ const bookingsQuerySchema = z.object({
   location: z.enum(LOCATION_SLUGS).optional(),
 });
 
-const attendanceBodySchema = z
-  .object({
-    dog_id: uuidId(),
-    status: z.enum(['attended', 'no-show', 'excused']),
-  })
-  .strict();
-
 /**
  * Staff cancel body (R5, Allison sim-QA 2026-07-27). The only field is an
  * OPTIONAL reason the school can attach — surfaced under "The school cancelled
@@ -101,7 +95,16 @@ const cancelBodySchema = z
   })
   .strict();
 
-// AttendanceWire is owned by the single-source contract (contracts/wire.ts).
+/**
+ * The staff one-dog cancel's body (6.0.0-lg5.1; D17): the board's *Cancel* opens a reason
+ * sheet, so `reason` is required, the cancel reason's band. It rides the idempotency hash
+ * and is not stored: NOTIF-U17 (P21) puts it on the owner's notice.
+ */
+const dogCancelBodySchema = z
+  .object({
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
 
 /** §5.1.3 pins — see `PostBookingsBodyConformance` in `routes/bookings.ts`.
  *  The QUERY pin is what stops the four filters drifting from the contract in
@@ -113,12 +116,12 @@ export type GetStaffBookingsQueryConformance = Expect<
 
 /** Unlike the deny verb's `reason`, THIS `reason` is persisted and comes back
  *  as `BookingWire.cancel_reason`. */
-export type PostStaffBookingsAttendanceBodyConformance = Expect<
-  Equal<z.input<typeof attendanceBodySchema>, PostStaffBookingsAttendanceRequest>
->;
-
 export type PostStaffBookingsCancelBodyConformance = Expect<
   Equal<z.input<typeof cancelBodySchema>, PostStaffBookingsCancelRequest>
+>;
+
+export type PostStaffBookingsDogsCancelBodyConformance = Expect<
+  Equal<z.input<typeof dogCancelBodySchema>, PostStaffBookingsDogsCancelRequest>
 >;
 
 export interface StaffBookingsRouteOptions extends AuthRouteOptions {
@@ -163,7 +166,7 @@ export function registerStaffBookingsRoute(
         location: query.location,
       });
       const sorted = sortBookingsByScheduledAt(rows, 'asc');
-      return wireManyBookings(sorted);
+      return wireManyBookings(sorted, { now: nowFactory(), viewer: 'staff' });
     },
   );
 
@@ -207,7 +210,11 @@ export function registerStaffBookingsRoute(
           if (updated === undefined) {
             throw new Error(`confirm ${id}: row vanished before re-fetch`);
           }
-          const [wire] = await wireManyBookings([updated]);
+          const [wire] = await wireManyBookings([updated], {
+            now: nowFactory(),
+            viewer: 'staff',
+            runner: tx,
+          });
           if (wire === undefined) {
             throw new Error(`confirm ${id}: wire assembly returned no row`);
           }
@@ -294,62 +301,52 @@ export function registerStaffBookingsRoute(
     },
   );
 
-  // --- POST /staff/bookings/:id/attendance --------------------------------
+  // --- POST /staff/bookings/:id/dogs/:dogId/cancel ------------------------
   //
-  // Per-dog check-in. Locks the booking (404 missing/expired, 409
-  // cancelled), then sets booking_dogs.attendance + checked_in_at +
-  // checked_in_by_staff_id. The RETURNING folds the roster-membership
-  // check into the write: a dog not on the booking → 404.
+  // One dog of several (s11; CXL-U09), any role, no ladder: her credit back to the
+  // family's pool, her seat free, the session cancelled with its last dog. The
+  // transaction is `cancelOneDogInTx`'s; every refusal with a clock in it runs after the
+  // claim, so an answer replays.
   app.post(
-    '/staff/bookings/:id/attendance',
+    '/staff/bookings/:id/dogs/:dogId/cancel',
     { preHandler: [authHook] },
-    async (request): Promise<AttendanceWire> => {
+    async (request): Promise<BookingWire> => {
       const principal = requirePrincipal(request);
-      requireStaff(principal, 'mark attendance');
-      const { id } = parseUuidParam(request.params);
+      requireStaff(principal, "cancel one dog's day");
+      const { id, dogId } = parseShareParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
-      const body = parseAttendanceBody(request.body);
+      const parsed = dogCancelBodySchema.safeParse(request.body ?? {});
+      if (!parsed.success) {
+        throw new ApiError('invalid_payload', `invalid body: ${formatZodIssues(parsed.error)}`);
+      }
+      const { reason } = parsed.data;
+      let freed: { ownerId: string; location: string | null } | undefined;
 
-      // cache-noop: attendance is a post-session fact write; it touches no
-      // availability or §3-cached read.
-      const outcome = await withMutation<AttendanceWire>(
+      const outcome = await withMutation<BookingWire>(
         {
           principal,
           idempotencyKey,
-          endpoint: 'POST /staff/bookings/:id/attendance',
-          requestHash: hashRequestBody({ id, ...body }),
+          endpoint: 'POST /staff/bookings/:id/dogs/:dogId/cancel',
+          requestHash: hashRequestBody({ id, dogId, reason }),
+          patternsToInvalidate: () =>
+            freed === undefined
+              ? []
+              : [
+                  ...(freed.location !== null ? [`avail:${freed.location}:*`] : []),
+                  creditsInvalidationPattern(freed.ownerId),
+                ],
         },
         async (tx) => {
-          const row = await bookingsRepository.lockById(tx, id);
-          if (row === undefined || row.expiredAt !== null) {
-            throw new ApiError('not_found', `booking ${id} not found`);
-          }
-          if (row.status === 'cancelled') {
-            throw new ApiError(
-              'conflict',
-              `booking ${id} is cancelled — attendance cannot be marked`,
-            );
-          }
-
-          const updated = await bookingsRepository.setAttendance(tx, {
-            bookingId: id,
-            dogId: body.dog_id,
-            status: body.status,
-            staffId: principal.staffId,
+          const result = await cancelOneDogInTx(tx, {
+            id,
+            dogId,
+            requireOwnerId: null,
+            cancelledBy: 'staff',
+            now: nowFactory(),
+            log: request.log,
           });
-          if (updated === undefined) {
-            throw new ApiError('not_found', `dog ${body.dog_id} is not on booking ${id}`);
-          }
-
-          return {
-            status: 200,
-            body: {
-              booking_id: id,
-              dog_id: body.dog_id,
-              attendance: body.status,
-              checked_in_at: updated.checkedInAt,
-            },
-          };
+          freed = { ownerId: result.creditRefundedOwnerId, location: result.location };
+          return { status: 200, body: result.wire };
         },
       );
       return outcome.body;
@@ -378,10 +375,10 @@ function parseBookingsQuery(query: unknown): z.infer<typeof bookingsQuerySchema>
   return parsed.data;
 }
 
-function parseAttendanceBody(body: unknown): z.infer<typeof attendanceBodySchema> {
-  const parsed = attendanceBodySchema.safeParse(body);
+function parseShareParam(params: unknown): { id: string; dogId: string } {
+  const parsed = shareParamSchema.safeParse(params);
   if (!parsed.success) {
-    throw new ApiError('invalid_payload', `invalid body: ${parsed.error.message}`);
+    throw new ApiError('bad_request', `invalid path: ${formatZodIssues(parsed.error)}`);
   }
   return parsed.data;
 }

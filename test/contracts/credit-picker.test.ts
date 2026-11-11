@@ -354,7 +354,9 @@ async function returnRow(bookingId: string) {
   const [row] = await db
     .select({ lotId: creditLedger.lotId, expiresAt: creditLedger.expiresAt })
     .from(creditLedger)
-    .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
+    .where(
+      and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+    );
   assert.ok(row, 'the credit came back');
   return row;
 }

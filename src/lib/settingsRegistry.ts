@@ -82,9 +82,17 @@ export const SETTINGS_TABLES: readonly SettingsTable[] = Object.values(SETTINGS_
  * included (it joins through `SETTINGS_TABLE_BY_DOMAIN`), and `credit_packages`, whose
  * `expiry_months` is a money-class edit (M4.05, DECISIONS 177(d)). The audit test is
  * generated from this list.
+ *
+ * M5.07's two `cxl` tables are named by hand, as `cancel_window_settings` is: `cxl` is
+ * not a settings domain until CXL-U02 (P21) adds it with its shapes and registry rows,
+ * so they are not in `SETTINGS_TABLES`, and without their names here the generated
+ * audit test would stay green over two unaudited tables (P20 notes, D1). P21 drops the
+ * two names when `'cxl'` brings them in through `SETTINGS_TABLES`.
  */
 export const AUDITED_SETTINGS_TABLES: readonly string[] = [
   'cancel_window_settings',
+  'cancellation_policy_settings',
+  'cancellation_global_settings',
   'credit_packages',
   'intake_field_settings',
   'dog_descriptors',
@@ -586,7 +594,11 @@ const ENTRIES: readonly Entry[] = [
     key: 'day.sent_home_before_training_return_fraction',
     class: 'money',
     store: column(DAY, 'sent_home_before_training_return_fraction', 'global'),
-    value: FRACTION,
+    // Read from 6.0.0-lg5.1 by every settle (a turn-away, *Didn't come*, an unmarked
+    // send-home): `round(fraction × 1)` credits, so 0.5 would hand back a whole credit for
+    // a "half" setting. 0 or 1 only, as the next key (design §2.3:2482-2483; question 20
+    // (a); P20 notes D5).
+    value: { type: 'fraction', oneOf: [0, 1] },
     inert: LIVE,
   },
   // … and each campus row

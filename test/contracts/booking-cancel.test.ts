@@ -253,8 +253,10 @@ test(
     const ledgerRows = await db
       .select()
       .from(creditLedger)
-      .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
-    assert.equal(ledgerRows.length, 0, 'no cancel-refund ledger row on forfeit');
+      .where(
+        and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+      );
+    assert.equal(ledgerRows.length, 0, 'no settlement-return ledger row on forfeit');
 
     const refundRows = await db.select().from(refunds).where(eq(refunds.bookingId, bookingId));
     assert.equal(refundRows.length, 0, 'no refunds row on forfeit');
@@ -266,7 +268,7 @@ test(
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /bookings/:id/cancel — credit-back single dog → +1 cancel-refund row, no refund row',
+  'POST /bookings/:id/cancel — credit-back single dog → +1 settlement-return row, no refund row',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = cancelApp();
@@ -282,11 +284,13 @@ test(
     assert.equal(body.status, 'cancelled');
     assert.notEqual(body.cancel_forfeited, true);
 
-    // One cancel-refund row, delta=+1, mode=school, dog=dog1, booking=this one.
+    // One settlement-return row, delta=+1, mode=school, dog=dog1, booking=this one.
     const refunds_ = await db
       .select()
       .from(creditLedger)
-      .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
+      .where(
+        and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+      );
     assert.equal(refunds_.length, 1);
     assert.equal(refunds_[0]!.delta, 1);
     assert.equal(refunds_[0]!.dogId, FIXTURE_IDS.dog1Id);
@@ -318,8 +322,10 @@ test(
     const refundsRows = await db
       .select({ dogId: creditLedger.dogId, delta: creditLedger.delta })
       .from(creditLedger)
-      .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
-    assert.equal(refundsRows.length, 2, 'one cancel-refund row per dog');
+      .where(
+        and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+      );
+    assert.equal(refundsRows.length, 2, 'one settlement-return row per dog');
     const dogIdsRefunded = new Set(refundsRows.map((r) => r.dogId));
     assert.ok(dogIdsRefunded.has(FIXTURE_IDS.dog1Id));
     assert.ok(dogIdsRefunded.has(FIXTURE_IDS.dog2Id));
@@ -369,7 +375,9 @@ test(
     const ledgerRefunds = await db
       .select()
       .from(creditLedger)
-      .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
+      .where(
+        and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+      );
     assert.equal(ledgerRefunds.length, 0, 'no ledger refund for money-paid');
   },
 );
@@ -535,7 +543,9 @@ test(
     const ledgerRefunds = await db
       .select()
       .from(creditLedger)
-      .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
+      .where(
+        and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+      );
     assert.equal(ledgerRefunds.length, 0);
 
     const refundRows = await db.select().from(refunds).where(eq(refunds.bookingId, bookingId));
@@ -588,6 +598,9 @@ test('POST /bookings/:id/cancel — already-cancelled → 409', SKIP_WHEN_NO_DB,
     idempotencyKey: `cn-conflict-2-${randomUUID()}`,
   });
   assert.equal(r2.statusCode, 409, r2.body);
+  // Its own code (P20 notes Part 4 item 2): the whole-session cancel's "already
+  // cancelled" stays `conflict`, so a 6.0.0 409 cannot pass for it.
+  assert.equal(r2.json().error.code, 'conflict', r2.body);
 });
 
 test('POST /bookings/:id/cancel — group-class booking → 422', SKIP_WHEN_NO_DB, async () => {
@@ -664,11 +677,13 @@ test(
     assert.equal(r2.statusCode, 200);
     assert.deepStrictEqual(r2.json(), r1.json(), 'replay returns identical body');
 
-    // Exactly ONE cancel-refund row exists — the replay didn't double-credit.
+    // Exactly ONE settlement-return row exists — the replay didn't double-credit.
     const refundsRows = await db
       .select()
       .from(creditLedger)
-      .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
+      .where(
+        and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+      );
     assert.equal(refundsRows.length, 1, 'replay did not insert a second refund row');
   },
 );

@@ -11,7 +11,7 @@
  *     — the roster of design §2.1:1950-1955 (STAFF-U02, STAFF-U03), with fake
  *     uids; Shanthi's id matches portal `.env.example`
  *   - two owners + dogs (the real cohort: Waffles, Lola, Brodie, Ollie)
- *   - upcoming bookings (confirm / cancel / attendance queue)
+ *   - upcoming bookings (confirm / cancel / the check-in board)
  *   - submitted requests (approve / deny queue)
  *   - threads + messages (conversation + reply)
  *
@@ -45,6 +45,7 @@ import {
   bookingDogs,
   bookings,
   charges,
+  checkinEvents,
   classPrereqOptions,
   classResources,
   cohorts,
@@ -80,6 +81,7 @@ import {
 } from '../src/db/schema/schema.js';
 import { CURRICULUM_PROGRAMS } from '../src/lib/alumni.js';
 import { computeDayProgramScheduledAt } from '../src/lib/bookingSchedule.js';
+import { bucketToChicagoDate } from '../src/lib/chicagoDate.js';
 import { addChicagoMonths } from '../src/lib/creditExpiry.js';
 
 function assertLocalDb(): void {
@@ -733,7 +735,7 @@ async function seed(): Promise<void> {
       location: 'bentonville',
     },
     {
-      // Multi-dog day-care so the attendance verb has a roster to check in.
+      // Multi-dog day-care so the board has a roster to check in.
       id: SEED.bookingGroupWalkId,
       ownerId: SEED.ownerJordanId,
       leadDogId: SEED.dogBrodieId,
@@ -745,7 +747,8 @@ async function seed(): Promise<void> {
       location: 'bentonville',
     },
     // Past ATTENDED day programs: each dog's most recent day, ~2 weeks back,
-    // so a demo dog has a history to show. No booking path reads attendance.
+    // so a demo dog has a history to show, checked in and out on the board's log
+    // below. No booking path reads attendance.
     {
       id: SEED.bookingWafflesPastSchoolId,
       ownerId: SEED.ownerAllisonId,
@@ -802,40 +805,67 @@ async function seed(): Promise<void> {
     { bookingId: SEED.bookingBrodieBoardingId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogBrodieId, isLead: true },
     { bookingId: SEED.bookingGroupWalkId, dogId: SEED.dogOllieId, isLead: false },
-    // The past days above, with per-dog attendance actually marked 'attended'.
+    { bookingId: SEED.bookingWafflesPastSchoolId, dogId: SEED.dogWafflesId, isLead: true },
+    { bookingId: SEED.bookingLolaPastSchoolId, dogId: SEED.dogLolaId, isLead: true },
+    { bookingId: SEED.bookingBrodiePastCareId, dogId: SEED.dogBrodieId, isLead: true },
+    { bookingId: SEED.bookingOlliePastCareId, dogId: SEED.dogOllieId, isLead: true },
+  ]);
+
+  // The past days above, attended (M5.12; design §2.3:2369-2372): each a check-in at
+  // drop-off and a check-out eight hours later on the board's append-only log, by the
+  // staffer who took her, and the dog's `last_seen_on` moved to that day, as a real
+  // check-in moves it. No booking path reads attendance.
+  const attended = [
     {
       bookingId: SEED.bookingWafflesPastSchoolId,
       dogId: SEED.dogWafflesId,
-      isLead: true,
-      attendance: 'attended',
-      checkedInAt: dayProgramStartFromNow(-14),
-      checkedInByStaffId: SEED.staffDonavanId,
+      days: -14,
+      staffId: SEED.staffDonavanId,
     },
     {
       bookingId: SEED.bookingLolaPastSchoolId,
       dogId: SEED.dogLolaId,
-      isLead: true,
-      attendance: 'attended',
-      checkedInAt: dayProgramStartFromNow(-10),
-      checkedInByStaffId: SEED.staffRachelId,
+      days: -10,
+      staffId: SEED.staffRachelId,
     },
     {
       bookingId: SEED.bookingBrodiePastCareId,
       dogId: SEED.dogBrodieId,
-      isLead: true,
-      attendance: 'attended',
-      checkedInAt: dayProgramStartFromNow(-12),
-      checkedInByStaffId: SEED.staffShanthiId,
+      days: -12,
+      staffId: SEED.staffShanthiId,
     },
     {
       bookingId: SEED.bookingOlliePastCareId,
       dogId: SEED.dogOllieId,
-      isLead: true,
-      attendance: 'attended',
-      checkedInAt: dayProgramStartFromNow(-8),
-      checkedInByStaffId: SEED.staffShanthiId,
+      days: -8,
+      staffId: SEED.staffShanthiId,
     },
-  ]);
+  ];
+  for (const day of attended) {
+    const inAt = dayProgramStartFromNow(day.days);
+    const outAt = new Date(new Date(inAt).getTime() + 8 * 60 * 60 * 1000).toISOString();
+    const lastSeenOn = bucketToChicagoDate(inAt);
+    await db.insert(checkinEvents).values([
+      {
+        bookingId: day.bookingId,
+        dogId: day.dogId,
+        kind: 'check-in',
+        at: inAt,
+        byStaffId: day.staffId,
+        lastSeenMoved: true,
+        lastSeenPrior: null,
+      },
+      {
+        bookingId: day.bookingId,
+        dogId: day.dogId,
+        kind: 'check-out',
+        at: outAt,
+        byStaffId: day.staffId,
+        reissueCredit: false,
+      },
+    ]);
+    await db.update(dogs).set({ lastSeenOn }).where(eq(dogs.id, day.dogId));
+  }
 
   // Billing ledger for Allison — populates the owner app's Invoices tab in
   // real mode with one row per FE kind/status. (`GET /invoices`, Day-19d.)

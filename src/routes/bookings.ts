@@ -25,7 +25,11 @@ import { isInView, type PickupCloseByCampus } from '../lib/bookingBucket.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import type { DayProgramCategory } from '../lib/bookingSchedule.js';
 import type { BookingWire } from '../lib/bookingWire.js';
-import { askWhatWonForPendingRow, cancelBookingInTx } from '../lib/cancelBookingService.js';
+import {
+  askWhatWonForPendingRow,
+  cancelBookingInTx,
+  cancelOneDogInTx,
+} from '../lib/cancelBookingService.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from '../lib/pendingRefund.js';
 import { invalidateAll } from '../lib/cache.js';
 import { confirmCharge } from '../lib/confirmCharge.js';
@@ -75,6 +79,9 @@ const viewQuerySchema = z.object({
 const uuidParamSchema = z.object({
   id: uuidId(),
 });
+
+/** Both path ids lowercased at the parse, before any key, lock or comparison. */
+const shareParamSchema = z.object({ id: uuidId(), dogId: uuidId() });
 
 /**
  * `MAX_DATES_PER_REQUEST` — a request-size guard, a semester at a time. 30 days ×
@@ -197,9 +204,10 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       bookingsRepository.findLiveActiveByOwner(principal.ownerId),
       pickupCloseByCampus(),
     ]);
-    const bucketed = rows.filter((row) => isInView(row, view, nowFactory(), pickupClose));
+    const now = nowFactory();
+    const bucketed = rows.filter((row) => isInView(row, view, now, pickupClose));
     const sorted = sortBookingsByScheduledAt(bucketed, view === 'past' ? 'desc' : 'asc');
-    return wireManyBookings(sorted);
+    return wireManyBookings(sorted, { now, viewer: 'owner' });
   });
 
   // --- GET /bookings/up-next ---------------------------------------------
@@ -218,11 +226,12 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
         bookingsRepository.findLiveActiveByOwner(principal.ownerId),
         pickupCloseByCampus(),
       ]);
-      const upcoming = rows.filter((row) => isInView(row, 'upcoming', nowFactory(), pickupClose));
+      const now = nowFactory();
+      const upcoming = rows.filter((row) => isInView(row, 'upcoming', now, pickupClose));
       const sorted = sortBookingsByScheduledAt(upcoming, 'asc');
       const first = sorted[0];
       if (first === undefined) return null;
-      const [wire] = await wireManyBookings([first]);
+      const [wire] = await wireManyBookings([first], { now, viewer: 'owner' });
       return wire ?? null;
     },
   );
@@ -241,7 +250,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
     if (row === undefined) {
       throw new ApiError('not_found', `booking ${id} not found`);
     }
-    const [wire] = await wireManyBookings([row]);
+    const [wire] = await wireManyBookings([row], { now: nowFactory(), viewer: 'owner' });
     if (wire === undefined) {
       // booking_dogs is empty for this booking — structural bug.
       throw new Error(`booking ${id}: failed to resolve lead dog from booking_dogs`);
@@ -266,9 +275,10 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
         bookingsRepository.findLiveActiveForDog(dogId, principal.ownerId),
         pickupCloseByCampus(),
       ]);
-      const bucketed = rows.filter((row) => isInView(row, view, nowFactory(), pickupClose));
+      const now = nowFactory();
+      const bucketed = rows.filter((row) => isInView(row, view, now, pickupClose));
       const sorted = sortBookingsByScheduledAt(bucketed, view === 'past' ? 'desc' : 'asc');
-      return wireManyBookings(sorted);
+      return wireManyBookings(sorted, { now, viewer: 'owner' });
     },
   );
 
@@ -488,7 +498,12 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   //      the status flip.
   //   2. CREDIT-BACK — within window, booking was credit-paid (one or
   //      more `credit_ledger` 'booking-debit' rows exist). One +1
-  //      'cancel-refund' row inserted per debit; balance recomputes.
+  //      'settlement-return' row per live debit, naming it; balance recomputes.
+  //      A day row whose live share holds no live debit is a 500 and an alarm.
+  //
+  // A day-school or day-care row is refused first (6.0.0-lg5.1, CXL-U09): 409
+  // `session_ended` once its day has ended, then 409 `session_checked_in` while any
+  // dog still on it has folded past `expected`.
   //   3. MONEY-BACK — within window, booking was money-paid (succeeded
   //      `charges` row exists). A `refunds` row inserted at 'pending';
   //      the Stripe refund API call is queued post-commit (Day 14
@@ -604,6 +619,58 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       );
 
       reply.code(outcome.status);
+      return outcome.body;
+    },
+  );
+
+  // --- POST /bookings/:id/dogs/:dogId/cancel ------------------------------
+  //
+  // One dog of several (s11; CXL-U09; 6.0.0-lg5.1). No body. Her credit goes back to the
+  // family's pool, always (no window, no forfeit: D21), her seat is free, and the session
+  // goes with its last dog. Refused 409 `per_dog_cancel_off` while
+  // `cxl.per_dog_cancel_enabled` is off. Every refusal with a clock in it runs after the
+  // claim: an answer at 17:29 replays at 17:31 (DECISIONS 128(a)).
+  app.post(
+    '/bookings/:id/dogs/:dogId/cancel',
+    { preHandler: [authHook] },
+    async (request): Promise<BookingWire> => {
+      const principal = requirePrincipal(request);
+      requireOwner(principal, "cancel one dog's day");
+      const params = shareParamSchema.safeParse(request.params);
+      if (!params.success) {
+        throw new ApiError('bad_request', `invalid path: ${formatZodIssues(params.error)}`);
+      }
+      const { id, dogId } = params.data;
+      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+      let freed: { ownerId: string; location: string | null } | undefined;
+
+      const outcome = await withMutation<BookingWire>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /bookings/:id/dogs/:dogId/cancel',
+          requestHash: hashRequestBody({ id, dogId }),
+          patternsToInvalidate: () =>
+            freed === undefined
+              ? []
+              : [
+                  ...(freed.location !== null ? [`avail:${freed.location}:*`] : []),
+                  creditsInvalidationPattern(freed.ownerId),
+                ],
+        },
+        async (tx) => {
+          const result = await cancelOneDogInTx(tx, {
+            id,
+            dogId,
+            requireOwnerId: principal.ownerId,
+            cancelledBy: 'owner',
+            now: nowFactory(),
+            log: request.log,
+          });
+          freed = { ownerId: result.creditRefundedOwnerId, location: result.location };
+          return { status: 200, body: result.wire };
+        },
+      );
       return outcome.body;
     },
   );

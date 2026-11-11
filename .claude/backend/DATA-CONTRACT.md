@@ -2940,7 +2940,7 @@ invisible to the repository layer.
 
 - `POST /device-tokens` · `DELETE /device-tokens/:token` — Expo push registration
 - `GET /staff/bookings` [staff] · `POST /staff/bookings/:id/confirm` [staff] · `POST /staff/bookings/:id/cancel` [staff] — **portal verb 4**
-- `POST /staff/bookings/:id/attendance` [staff] — per-dog check-in `{ dog_id, status: attended|no-show|excused }` → sets `booking_dogs.attendance` + `checked_in_at`/`checked_in_by_staff_id`. Booking-_outcome_ action in the verb-4 family (recording a fact); the **stats** over it are the deferred admin dashboard, not the portal.
+- ~~`POST /staff/bookings/:id/attendance` [staff]~~ — **removed at 6.0.0-lg5.1** (M5.12): the board's append-only log replaces it (§S). Presence is `checkin_events`, folded; the **stats** over it are still the deferred admin dashboard.
 
 ## C.1 Booking creation flows (all six categories)
 
@@ -5668,3 +5668,49 @@ amendment, and J.3's "credits never expire".
   or a `credit_lot_expiry_edits` row for a date. `credit_ledger` stays off the audit list.
 - **Alumni is stored.** `dogs.is_alumni` is set when the fifth level is recorded and never
   cleared (M4.11).
+
+## S. The check-in log and one dog of several (wire 6.0.0-lg5.1, 2026-11-10)
+
+Δ 2026-11-10 (P20 backend pass 1; DECISIONS 235, 237, 239; S29: DAY-U29, DAY-U40, CXL-U09).
+Wire is the contract; this records what the sections above no longer say. It supersedes
+§C's `POST /staff/bookings/:id/attendance` line, §C.1's and §I's `cancel-refund`, and
+§D.1's "`booking_dogs.attendance` is captured".
+
+- **Attendance is a log, not a column** (Adjudication 3, "Full event log wins"; M5.01,
+  M5.12). `checkin_events` is append-only (a row trigger refuses UPDATE and DELETE except
+  from the `booking_dogs` cascade, a statement trigger refuses TRUNCATE). A dog's state on a
+  booking is folded from her live events in `seq` order (`src/lib/checkinFold.ts`):
+  `expected`, `in`, `out`, `turned-away`, `sent-home`, `no-show`. `booking_dogs.attendance`,
+  `checked_in_at`, `checked_in_by_staff_id` and the `booking_attendance` type are dropped,
+  and `POST /staff/bookings/:id/attendance` is a 404.
+- **The board.** `GET /staff/checkin-board?location&date` (any staff role; date today or
+  earlier) and `POST /staff/bookings/:id/dogs/:dogId/{check-in | check-out | undo}`, each
+  with an `Idempotency-Key`, answering `AttendanceWire {status, events}`. A check-in moves
+  `dogs.last_seen_on`; its undo recomputes it from the log. A check-out's *Re-issue the
+  credit* box returns the credit and a later same-day re-check-in takes it back.
+- **The settling verbs** (S30; DAY-U33, DAY-U34; M5.02). `turn-away` (no body) and
+  `send-home {training_completed?}` take today's session, `no-show` (*Didn't come*) today's or
+  an earlier one from `day.pickup_close_time` on its date (409 `no_show_too_early
+  {recordable_from}` before). One settling event per share (a partial unique index); none can
+  be undone. Each returns `round(day.sent_home_{before,after}_training_return_fraction × 1)`
+  credits (both 0 or 1 by the PATCH) through the one return writer, to the live debit's lot or
+  a fresh lot, and queues the owner's notice; a finished send-home returns and sends nothing.
+  Always a credit, never money. A sent-home dog is on site until her check-out; a turned-away
+  share frees its seat for the day.
+- **The cancels' new refusals** (CXL-U09). A day-school or day-care session's whole-session
+  cancel, owner or staff, is 409 `session_ended` once Chicago now reaches the campus's
+  `day.pickup_close_time` on its date, and 409 `session_checked_in` while any dog still on
+  it is past `expected`. `BookingWire.can_cancel` and `dog_shares[]` read the same fold and
+  clock. The 48-hour forfeit stays on the whole-session cancel until P21 (D21).
+- **One dog of several** (s11). `POST /bookings/:id/dogs/:dogId/cancel` (owner, refused 409
+  `per_dog_cancel_off` while `cxl.per_dog_cancel_enabled` is off) and
+  `POST /staff/bookings/:id/dogs/:dogId/cancel {reason}` (any role): her share's
+  `expired_at` is stamped, her one live debit comes back, the session is cancelled with its
+  last dog. Always the credit, never money, no window.
+- **One return label** (M5.03, M5.10). Every return writes `settlement-return` with
+  `reverses_entry_id` naming the one debit it reverses (a CHECK enforces it); a share's live
+  debit is the newest no return names. `cancel-refund` stays in the type, is no longer
+  written, and reads as `settlement-return` on `CreditLotDetailWire`.
+- **M5.07's tables are stored only.** `cancellation_policy_settings` (one row per service
+  category) and `cancellation_global_settings`, audited, no settings route until P21; the
+  owner's one-dog cancel reads `per_dog_cancel_enabled`.

@@ -4,15 +4,16 @@ import type { NotificationDeepLinkKind } from "../../lib/notificationWire.js"
 import type { CreditTier } from "../../contracts/wire.js"
 
 export const announcementCategory = pgEnum("announcement_category", ['urgent', 'team', 'class', 'event', 'promo', 'report'])
-export const bookingAttendance = pgEnum("booking_attendance", ['pending', 'attended', 'no-show', 'excused'])
 export const bookingMode = pgEnum("booking_mode", ['school', 'daycare'])
 export const bookingStatus = pgEnum("booking_status", ['upcoming', 'past', 'cancelled', 'payment-pending'])
 export const chargePurpose = pgEnum("charge_purpose", ['package', 'board-train', 'group-class'])
 export const chargeStatus = pgEnum("charge_status", ['requires_payment', 'succeeded', 'failed', 'refunded'])
+// M5.01 (DAY-U29, DAY-U33): the six kinds of the check-in log.
+export const checkinEventKind = pgEnum("checkin_event_kind", ['check-in', 'check-out', 'undo', 'turn-away', 'sent-home', 'no-show'])
 export const evaluationStatus = pgEnum("evaluation_status", ['not-evaluated', 'pending', 'passed', 'failed'])
 export const groupClassKey = pgEnum("group_class_key", ['puppy', 'manners-1', 'manners-2', 'public-pups'])
 export const invoiceStatus = pgEnum("invoice_status", ['open', 'paid', 'void'])
-export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment'])
+export const ledgerReason = pgEnum("ledger_reason", ['purchase', 'booking-debit', 'cancel-refund', 'adjustment', 'settlement-return'])
 // Locations are a table since the Δ 2026-06-08 (was the `location_key`/`app_location`
 // enums). `slug` is the natural key + the wire value; `LOCATION_SLUGS` is the TS
 // tuple for z.enum validation (replaces the old LOCATION_SLUGS).
@@ -707,6 +708,55 @@ export const cancelWindowSettings = pgTable("cancel_window_settings", {
 	}
 });
 
+// M5.07 (CXL-U02's tables): seeded and stored only, except `per_dog_cancel_enabled`.
+export const cancellationPolicySettings = pgTable("cancellation_policy_settings", {
+	category: text().primaryKey().notNull(),
+	windowState: text("window_state").notNull(),
+	windowHours: integer("window_hours"),
+	forfeitFraction: numeric("forfeit_fraction"),
+	noShowForfeitFraction: numeric("no_show_forfeit_fraction"),
+	flatFeeCents: integer("flat_fee_cents"),
+	unpaidNoShowCloseAfterHours: integer("unpaid_no_show_close_after_hours").notNull(),
+	noShowDeclareMode: text("no_show_declare_mode"),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		cancellationPolicySettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "cancellation_policy_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+		cancellationPolicySettingsWindowStateCheck: check("cancellation_policy_settings_window_state_check", sql`window_state = ANY (ARRAY['unset'::text, 'none'::text, 'hours'::text])`),
+		cancellationPolicySettingsWindowHoursCheck: check("cancellation_policy_settings_window_hours_check", sql`window_hours > 0`),
+		cancellationPolicySettingsForfeitFractionCheck: check("cancellation_policy_settings_forfeit_fraction_check", sql`(forfeit_fraction >= (0)::numeric) AND (forfeit_fraction <= (1)::numeric)`),
+		cancellationPolicySettingsNoShowForfeitFractionCheck: check("cancellation_policy_settings_no_show_forfeit_fraction_check", sql`(no_show_forfeit_fraction >= (0)::numeric) AND (no_show_forfeit_fraction <= (1)::numeric)`),
+		cancellationPolicySettingsFlatFeeCentsCheck: check("cancellation_policy_settings_flat_fee_cents_check", sql`flat_fee_cents >= 0`),
+		cancellationPolicySettingsUnpaidNoShowCloseAfterHoursCheck: check("cancellation_policy_settings_unpaid_no_show_close_after_hours_check", sql`unpaid_no_show_close_after_hours > 0`),
+		cancellationPolicySettingsNoShowDeclareModeCheck: check("cancellation_policy_settings_no_show_declare_mode_check", sql`no_show_declare_mode = ANY (ARRAY['staff_only'::text, 'auto_after_hours'::text])`),
+	}
+});
+
+export const cancellationGlobalSettings = pgTable("cancellation_global_settings", {
+	id: boolean().default(true).primaryKey().notNull(),
+	perDogCancelEnabled: boolean("per_dog_cancel_enabled").notNull(),
+	staffEnteredClientCancelFollowsOwnerRulesEnabled: boolean("staff_entered_client_cancel_follows_owner_rules_enabled").notNull(),
+	staffInitiatedCancelFullReturnEnabled: boolean("staff_initiated_cancel_full_return_enabled").notNull(),
+	classMissedMeetingMoneyReturnMode: text("class_missed_meeting_money_return_mode"),
+	startedRunCancelReturnMode: text("started_run_cancel_return_mode"),
+	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	updatedByStaffId: uuid("updated_by_staff_id"),
+}, (table) => {
+	return {
+		cancellationGlobalSettingsUpdatedByStaffIdFkey: foreignKey({
+			columns: [table.updatedByStaffId],
+			foreignColumns: [staff.id],
+			name: "cancellation_global_settings_updated_by_staff_id_fkey"
+		}).onDelete("set null"),
+		cancellationGlobalSettingsIdCheck: check("cancellation_global_settings_id_check", sql`id`),
+	}
+});
+
 export const dogDescriptors = pgTable("dog_descriptors", {
 	key: text().primaryKey().notNull(),
 	label: text().notNull(),
@@ -1115,6 +1165,11 @@ export const creditLedger = pgTable("credit_ledger", {
 	tier: text().$type<CreditTier>().default('regular').notNull(),
 	// M4.12: the staffer behind a hand edit.
 	createdByStaffId: uuid("created_by_staff_id"),
+	// M5.10: the refund a removal answers (P22), and the debit a return reverses.
+	refundId: uuid("refund_id"),
+	reversesEntryId: uuid("reverses_entry_id"),
+	// M5.10 (P20 fix 1): the check-in event whose transaction wrote this row.
+	checkinEventId: uuid("checkin_event_id"),
 }, (table) => {
 	return {
 		poolIdx: index("credit_ledger_pool_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops"), table.location.asc().nullsLast().op("text_ops"), table.mode.asc().nullsLast().op("enum_ops"), table.tier.asc().nullsLast().op("text_ops")),
@@ -1155,7 +1210,26 @@ export const creditLedger = pgTable("credit_ledger", {
 			foreignColumns: [owners.id],
 			name: "credit_ledger_owner_id_fkey"
 		}).onDelete("restrict"),
+		creditLedgerRefundIdFkey: foreignKey({
+			columns: [table.refundId],
+			foreignColumns: [refunds.id],
+			name: "credit_ledger_refund_id_fkey"
+		}),
+		creditLedgerReversesEntryIdFkey: foreignKey({
+			columns: [table.reversesEntryId],
+			foreignColumns: [table.id],
+			name: "credit_ledger_reverses_entry_id_fkey"
+		}),
 		creditLedgerLotPoolKey: unique("credit_ledger_lot_pool_key").on(table.id, table.ownerId, table.location, table.mode, table.tier),
+		creditLedgerReturnReversesDebitCheck: check("credit_ledger_return_reverses_debit_check", sql`(reason <> 'settlement-return'::ledger_reason) OR (reverses_entry_id IS NOT NULL)`),
+		// M5.10 (P20 fix 1): the event's own booking and dog; NO ACTION (schema.sql).
+		creditLedgerCheckinEventFkey: foreignKey({
+			columns: [table.checkinEventId, table.bookingId, table.dogId],
+			foreignColumns: [checkinEvents.id, checkinEvents.bookingId, checkinEvents.dogId],
+			name: "credit_ledger_checkin_event_fkey"
+		}),
+		creditLedgerCheckinEventCheck: check("credit_ledger_checkin_event_check", sql`(checkin_event_id IS NULL) OR ((reason = ANY (ARRAY['booking-debit'::ledger_reason, 'settlement-return'::ledger_reason])) AND (booking_id IS NOT NULL) AND (dog_id IS NOT NULL))`),
+		checkinEventUidx: uniqueIndex("credit_ledger_checkin_event_uidx").using("btree", table.checkinEventId.asc().nullsLast().op("uuid_ops")).where(sql`(checkin_event_id IS NOT NULL)`),
 		creditLedgerLotPoolFkey: foreignKey({
 			columns: [table.lotId, table.ownerId, table.location, table.mode, table.tier],
 			foreignColumns: [table.id, table.ownerId, table.location, table.mode, table.tier],
@@ -1399,8 +1473,35 @@ export const refunds = pgTable("refunds", {
 	resolvedAt: timestamp("resolved_at", { withTimezone: true, mode: 'string' }),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	// M5.10: read and written by nothing until P22.
+	instrument: text().default('original_card').notNull(),
+	returnedInstrument: text("returned_instrument"),
+	issuedByStaffId: uuid("issued_by_staff_id"),
+	retryOfRefundId: uuid("retry_of_refund_id"),
+	resolvedOutcome: text("resolved_outcome"),
+	creditsSettledByStaffId: uuid("credits_settled_by_staff_id"),
+	creditsSettledAt: timestamp("credits_settled_at", { withTimezone: true, mode: 'string' }),
+	enrollmentId: uuid("enrollment_id"),
 }, (table) => {
 	return {
+		refundsIssuedByStaffIdFkey: foreignKey({
+			columns: [table.issuedByStaffId],
+			foreignColumns: [staff.id],
+			name: "refunds_issued_by_staff_id_fkey"
+		}),
+		refundsRetryOfRefundIdFkey: foreignKey({
+			columns: [table.retryOfRefundId],
+			foreignColumns: [table.id],
+			name: "refunds_retry_of_refund_id_fkey"
+		}),
+		refundsCreditsSettledByStaffIdFkey: foreignKey({
+			columns: [table.creditsSettledByStaffId],
+			foreignColumns: [staff.id],
+			name: "refunds_credits_settled_by_staff_id_fkey"
+		}),
+		refundsInstrumentCheck: check("refunds_instrument_check", sql`instrument = ANY (ARRAY['original_card'::text, 'cash'::text, 'check'::text])`),
+		refundsReturnedInstrumentCheck: check("refunds_returned_instrument_check", sql`returned_instrument = ANY (ARRAY['cash'::text, 'check'::text])`),
+		refundsResolvedOutcomeCheck: check("refunds_resolved_outcome_check", sql`resolved_outcome = ANY (ARRAY['returned'::text, 'withdrawn'::text])`),
 		refundsResolvedByStaffIdFkey: foreignKey({
 			columns: [table.resolvedByStaffId],
 			foreignColumns: [staff.id],
@@ -1960,9 +2061,6 @@ export const bookingDogs = pgTable("booking_dogs", {
 	bookingId: uuid("booking_id").notNull(),
 	dogId: uuid("dog_id").notNull(),
 	isLead: boolean("is_lead").default(false).notNull(),
-	attendance: bookingAttendance().default('pending').notNull(),
-	checkedInAt: timestamp("checked_in_at", { withTimezone: true, mode: 'string' }),
-	checkedInByStaffId: uuid("checked_in_by_staff_id"),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
@@ -1977,12 +2075,51 @@ export const bookingDogs = pgTable("booking_dogs", {
 			foreignColumns: [dogs.id],
 			name: "booking_dogs_dog_id_fkey"
 		}).onDelete("cascade"),
-		bookingDogsCheckedInByStaffIdFkey: foreignKey({
-			columns: [table.checkedInByStaffId],
-			foreignColumns: [staff.id],
-			name: "booking_dogs_checked_in_by_staff_id_fkey"
-		}),
 		bookingDogsPkey: primaryKey({ columns: [table.bookingId, table.dogId], name: "booking_dogs_pkey"}),
+	}
+});
+
+// M5.01 (DAY-U29, DAY-U33): the append-only check-in log. Fold by `seq`, never
+// `created_at` (the transaction's start) or `id` (random).
+export const checkinEvents = pgTable("checkin_events", {
+	id: uuid().defaultRandom().primaryKey().notNull(),
+	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
+	seq: bigint({ mode: "number" }).generatedAlwaysAsIdentity({ name: "checkin_events_seq_seq", startWith: 1, increment: 1, minValue: 1, maxValue: 9223372036854775807, cache: 1 }),
+	bookingId: uuid("booking_id").notNull(),
+	dogId: uuid("dog_id").notNull(),
+	kind: checkinEventKind().notNull(),
+	at: timestamp({ withTimezone: true, mode: 'string' }).notNull(),
+	byStaffId: uuid("by_staff_id").notNull(),
+	undoesEventId: uuid("undoes_event_id"),
+	trainingCompleted: boolean("training_completed"),
+	reissueCredit: boolean("reissue_credit"),
+	note: text(),
+	lastSeenMoved: boolean("last_seen_moved").default(false).notNull(),
+	lastSeenPrior: date("last_seen_prior"),
+	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		shareSeqIdx: index("checkin_events_share_seq_idx").using("btree", table.bookingId.asc().nullsLast().op("uuid_ops"), table.dogId.asc().nullsLast().op("uuid_ops"), table.seq.asc().nullsLast().op("int8_ops")),
+		dogIdx: index("checkin_events_dog_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops")),
+		// M5.02: one settling event per share.
+		oneSettlingUidx: uniqueIndex("checkin_events_one_settling_uidx").using("btree", table.bookingId.asc().nullsLast().op("uuid_ops"), table.dogId.asc().nullsLast().op("uuid_ops")).where(sql`(kind = ANY (ARRAY['turn-away'::checkin_event_kind, 'sent-home'::checkin_event_kind, 'no-show'::checkin_event_kind]))`),
+		checkinEventsByStaffIdFkey: foreignKey({
+			columns: [table.byStaffId],
+			foreignColumns: [staff.id],
+			name: "checkin_events_by_staff_id_fkey"
+		}),
+		checkinEventsUndoesEventIdFkey: foreignKey({
+			columns: [table.undoesEventId],
+			foreignColumns: [table.id],
+			name: "checkin_events_undoes_event_id_fkey"
+		}),
+		checkinEventsBookingIdDogIdFkey: foreignKey({
+			columns: [table.bookingId, table.dogId],
+			foreignColumns: [bookingDogs.bookingId, bookingDogs.dogId],
+			name: "checkin_events_booking_id_dog_id_fkey"
+		}).onDelete("cascade"),
+		// M5.10 (P20 fix 1): the target of `credit_ledger_checkin_event_fkey`.
+		checkinEventsShareKey: unique("checkin_events_share_key").on(table.id, table.bookingId, table.dogId),
 	}
 });
 export const ownerCreditBalance = pgView("owner_credit_balance", {	ownerId: uuid("owner_id"),

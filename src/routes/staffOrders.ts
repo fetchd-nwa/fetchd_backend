@@ -82,7 +82,7 @@ export function registerStaffOrdersRoute(
       const listed: PendingPaymentWire[] = [];
       for (const row of rows) {
         const sessionRows = await bookingsRepository.findByOrderId(db, row.orderId);
-        const sessions = await wireManyBookings(sessionRows);
+        const sessions = await wireManyBookings(sessionRows, { now, viewer: 'staff' });
         const minutes = (now.getTime() - pgTimestampToDate(row.createdAt).getTime()) / 60_000;
         const kind = kindOf(row, sessions.length);
         listed.push({

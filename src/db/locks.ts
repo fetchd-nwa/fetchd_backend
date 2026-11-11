@@ -12,9 +12,11 @@ import type { Tx } from './tx.js';
  *           → charge (the order's)
  *             → the invoice the charge settles
  *               → bookings, in id order
- *                 → pool `(owner, location, mode, tier)`, the credit-lot slot, the alumni
- *                   pool before the regular one (`lockPools`)
- *                   → refunds
+ *                 → dog row, `FOR NO KEY UPDATE` (the check-in's `last_seen_on` and its
+ *                   undo's recompute, `checkinEventsRepository.lockDogClock`)
+ *                   → pool `(owner, location, mode, tier)`, the credit-lot slot, the alumni
+ *                     pool before the regular one (`lockPools`)
+ *                     → refunds
  *
  * Take each family once for the whole order. A transaction that needs a later lock
  * and then finds it needs an earlier one has a deadlock waiting for it, so anything
@@ -23,10 +25,22 @@ import type { Tx } from './tx.js';
  * into with the pools its order debited, because a cancel's return follows it in the same
  * transaction, and an alumni top-up's tx1 holds alumni on its way to regular.
  *
+ * The board's verbs (P20, `lib/checkinVerbs.ts`) and the one-dog cancel take claim →
+ * (the order's charge, on a top-up day: the cancel only) → the booking row (`lockById`,
+ * `FOR UPDATE`) → the dog row → the pool. The dog row is the one new edge: a check-in moves
+ * the dog's clock after locking her booking, and an undo recomputes it there. It is safe
+ * for the reason the alumni record's lock is (below): `no key update` conflicts with no
+ * FK re-check's `KEY SHARE`, and no holder of a dog row lock reaches for a booking row
+ * after it (`staffAlumni` takes the dog and wants nothing after). Pinned on real
+ * connections by `checkin-lock-order.test.ts`.
+ *
  * What P15 uses is claim → charge → bookings: a pending row cancels through
  * {@link lockCharge} before it locks any row, which is what stops two cancels of one order
  * from crossing, and the same order holds on the settle, the webhook, the sweeper and
- * *Cancel order*.
+ * *Cancel order*. P20's settled arm of *Cancel order* (§M2) takes no new edge: it locks the
+ * order's rows in this order before it reads their check-in log, so a board verb holding
+ * one of them (booking row, then dog row) finishes first and the cancel reads its event.
+ * Pinned on real connections by `settled-share-cancels.test.ts` (F9).
  *
  * tx1 of an invoice payment locks the invoice with no charge lock held and takes no
  * existing charge's lock after it (its in-flight check is a plain read, and the charge

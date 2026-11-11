@@ -157,7 +157,7 @@ The mission's domain list maps as: auth/session + media + settings → §1; eval
 | 29 | `classes.list` | B | `GET /group-classes` | VERIFIED |
 | 30 | `classes.termsFor` | B | `GET /group-classes/:key/cohorts` | VERIFIED |
 | 31 | `classes.sessionsFor` | C | NEW: `GET /staff/cohorts/:cohortId/sessions` | VERIFIED |
-| 32 | `classes.setAttendance` | A | `POST /staff/bookings/:id/attendance` | VERIFIED |
+| 32 | `classes.setAttendance` | A | `POST /staff/bookings/:id/attendance` — removed at 6.0.0-lg5.1 (M5.12; the board's log replaces it) | VERIFIED |
 | 33 | `classes.checkInWeek` | C | no endpoint — client-side "held" state (do not build) | VERIFIED |
 | 34 | `classes.createTerm` | C | NEW: `POST /staff/cohorts` | VERIFIED |
 | 35 | `classes.updateDefaults` | C | NEW: `PATCH /staff/group-classes/:key` | VERIFIED |
@@ -439,6 +439,22 @@ The Dogs & Owners domain surfaces exactly 4 portal demand ops — DogsApi.list/g
 ---
 
 ## Bookings (day-program), Check-in board, Capacity, Dashboard snapshot <a id="bookings"></a>
+
+> **Δ 2026-11-10 — P20 backend pass 1 (wire 6.0.0-lg5.1; Adjudication 3 built).** The
+> check-in entries below are a 2026-07 analysis of a backend that no longer exists. Built:
+> the append-only `checkin_events` log (M5.01) folded in `src/lib/checkinFold.ts`;
+> `GET /staff/checkin-board?location&date` (`CheckinBoardWire`); `POST
+> /staff/bookings/:id/dogs/:dogId/{check-in | check-out | undo}` (`AttendanceWire`), routes in
+> `src/routes/staffCheckin.ts`, transactions in `src/lib/checkinVerbs.ts`; and the three
+> settling verbs (`turn-away`, `send-home`, `no-show`, P20 pass 2, M5.02), each returning a
+> credit through `src/lib/settleDayShare.ts`, never money. `POST
+> /staff/bookings/:id/attendance` and the `booking_dogs.attendance` columns are gone (M5.12).
+> CXL-U09: both whole-session cancels now refuse 409 `session_ended` once the day has ended and
+> 409 `session_checked_in` while any dog still on it is past `expected`, and one dog of several
+> cancels through `POST /bookings/:id/dogs/:dogId/cancel` (owner) and `POST
+> /staff/bookings/:id/dogs/:dogId/cancel {reason}` (staff), credits only. Every return is one
+> `settlement-return` naming the debit it reverses (M5.03, M5.10); `cancel-refund` is no longer
+> written. The wire's doc comments are the contract; this section is history.
 _Demand: BookingsApi (client.ts:203-211), CheckInApi (client.ts:218-222), DashboardApi (client.ts:317-319), BookingListParams @ client.ts:75-81 · Supply: bookings.ts, staffBookings.ts, availability.ts · Logic: capacity.ts, checkinFold.ts · Business logic: bookings-scheduling.md, portal-dashboard-analytics.md_
 
 Portal demand here is three interfaces — BookingsApi's staff cross-owner list plus capacity outlook, the CheckInApi board/checkIn/checkOut/undo/cancelSession family, and DashboardApi's operational snapshot — against backend supply in bookings.ts, staffBookings.ts, and availability.ts. Only three ops map cleanly onto existing routes with additive changes (bucket B: bookings.list -> GET /staff/bookings, capacityOutlook -> GET /availability, cancelSession -> POST /staff/bookings/:id/cancel); five are net-new (bucket C: board, checkIn, checkOut, undo, dashboard), and eight backend routes are supply-only owner/staff surfaces the portal never calls. The headline mismatch is the check-in reconciliation (LOAD-BEARING OQ #7): the portal's event-sourced fold (expected->in|eval->out, stepwise undo, cancel-session, stay-derived lodger rows) has no backend substrate — the backend has a single terminal booking_dogs.attendance write with no in/out state, no event log, no eval-start, no undo, and no departure stamp — already adjudicated as parallel-universe drift D7 @ bookings-scheduling.md:233 / DRIFT-4 @ DISCREPANCIES.md:265. Capacity numbers disagreed at the data layer until P13 (portal 24/12/15/8=59 vs a backend 3/3); since wire 4.0.0-lg3.1 there is one combined `day.daily_capacity_dogs` per campus, seeded 15, and `GET /availability` serves `capacity_dogs` and `remaining_dogs`; the one materially-corrected prior claim is that location columns DO exist across owners/staff/cohorts/bookings/pending_requests/day_capacity — the genuine per-campus gaps are threads (no location) and shifts (no table).
@@ -523,6 +539,12 @@ Portal demand here is three interfaces — BookingsApi's staff cross-owner list 
   - _Open question:_ Wire AttendanceStatus can't represent 'expected'/un-checked-in, so undo to the initial state is inexpressible today.
 
 ### `checkin.cancelSession` — end the dog's day + cancel the booking
+
+> **Δ 2026-11-10 (P20, CXL-U09):** the staff cancel is no longer "any non-cancelled booking":
+> on a day row it refuses 409 `session_ended` at pickup close and 409 `session_checked_in`
+> after a check-in, and the board's per-dog *Cancel* is `POST
+> /staff/bookings/:id/dogs/:dogId/cancel {reason}` (one dog, her credit back, the session
+> cancelled with its last dog).
 - **Portal:** `cancelSession(dogId: DogId, date: ISODate): Promise<CheckInEvent> @ src/api/client.ts:222` · mock logic: mock/index.ts:455-463; assertCancelable @ mock/logic/checkinFold.ts:100-107
 - **Behavior:** Board action: end the dog's day (append 'cancel-session') AND cancel the underlying booking row (CI-7 -> status 'canceled'); the canceled row stays visible on the board. Today-only, blocked after check-out. mock/index.ts:455-463, assertCancelable @ checkinFold.ts:100-107.
 - **Bucket:** B
@@ -809,6 +831,9 @@ The backend group-class surface is entirely owner-facing (browse/enroll/withdraw
     - Should the session roster include withdrawn dogs? Backend tracks only live bookings; a withdrawn dog vanishes from the week grid.
 
 ### `classes.setAttendance` — set one dog's attendance for a session
+
+> **Δ 2026-11-10 (P20, wire 6.0.0-lg5.1):** `POST /staff/bookings/:id/attendance` is removed
+> (404) with the `booking_dogs.attendance` columns (M5.12). Presence is the check-in log's.
 - **Portal:** `setAttendance(sessionId, dogId, mark: AttendanceMark): Promise<ClassSession> @ client.ts:238` · mock logic: mock/index.ts:583-596 (held-gate guard GC-3, enrollment-membership check, writes session.attendance[dogId])
 - **Behavior:** Set one dog's attendance for one weekly session and return the updated session.
 - **Bucket:** A

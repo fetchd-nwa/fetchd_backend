@@ -116,8 +116,12 @@ CREATE TYPE service_category AS ENUM (
   'board-and-train', 'boarding', 'evaluation'
 );
 CREATE TYPE booking_status     AS ENUM ('upcoming', 'past', 'cancelled', 'payment-pending');
-CREATE TYPE booking_attendance AS ENUM ('pending', 'attended', 'no-show', 'excused');
-CREATE TYPE request_status     AS ENUM ('submitted', 'approved', 'approved-awaiting-payment', 'converted', 'cancelled');
+-- M5.01 (S29, DAY-U29, DAY-U33): the six kinds of the check-in log. No `attended`
+-- kind and no `hand-off` kind: a hand-off is a `check-out` whose note says so.
+-- `no-show` is the board's *Didn't come*. The three settling kinds are
+-- turn-away, sent-home and no-show.
+CREATE TYPE checkin_event_kind AS ENUM ('check-in', 'check-out', 'undo', 'turn-away', 'sent-home', 'no-show');
+CREATE TYPE request_status    AS ENUM ('submitted', 'approved', 'approved-awaiting-payment', 'converted', 'cancelled');
 CREATE TYPE scheduled_status   AS ENUM ('pending', 'sent', 'cancelled');
 CREATE TYPE invoice_status     AS ENUM ('open', 'paid', 'void');
 CREATE TYPE evaluation_status  AS ENUM ('not-evaluated', 'pending', 'passed', 'failed');
@@ -184,7 +188,12 @@ CREATE TYPE sender_kind        AS ENUM ('owner', 'staff');
 CREATE TYPE group_class_key    AS ENUM ('puppy', 'manners-1', 'manners-2', 'public-pups');
 CREATE TYPE charge_purpose     AS ENUM ('package','board-train','group-class');
 CREATE TYPE charge_status      AS ENUM ('requires_payment','succeeded','failed','refunded');
-CREATE TYPE ledger_reason      AS ENUM ('purchase','booking-debit','cancel-refund','adjustment');
+-- M5.03 (S29/S30, DAY-U34): 'settlement-return' is the one return label from LG5
+-- (a cancel of the session or of one dog, a ticked check-out, *Didn't come*, a
+-- turn-away, an unfinished send-home). Listed LAST, the position `ALTER TYPE ...
+-- ADD VALUE` gives it. 'cancel-refund' stays in the type (Postgres has no DROP
+-- VALUE) and is no longer written.
+CREATE TYPE ledger_reason      AS ENUM ('purchase','booking-debit','cancel-refund','adjustment','settlement-return');
 -- 2026-08-19 (`designs/client-keyed-refund-recovery.md` §4): 'unroutable' is a
 -- TERMINAL fourth state, not a variant of 'pending'. It means "money is owed
 -- back and no automatic path can ever send it" — the charge behind the refund
@@ -365,7 +374,8 @@ CREATE TABLE dogs (
   updated_at         timestamptz NOT NULL DEFAULT now(),
   expired_at         timestamptz,                     -- NULL = live; soft-delete only
   -- M2.16: the day the dog was last seen. Sent on DogWire, omitted while NULL.
-  -- Nothing stamps it until P20's check-in; no gate, clock or client acts on it.
+  -- A board check-in moves it (P20, 6.0.0-lg5.1) and its undo puts it back; no gate,
+  -- clock or client acts on it yet (S14's).
   last_seen_on       date,
   -- M4.11: stored, set when the fifth curriculum level is recorded, and never cleared.
   is_alumni          boolean NOT NULL DEFAULT false,
@@ -779,22 +789,90 @@ CREATE UNIQUE INDEX bookings_source_ref_uidx
   ON bookings (source, external_ref) WHERE expired_at IS NULL;
 
 -- All dogs on a booking (lead + additional). is_lead mirrors bookings.lead_dog_id
--- so single-dog and multi-dog queries are uniform.
+-- so single-dog and multi-dog queries are uniform. Each row is one dog's SHARE of the
+-- session. `expired_at` is the soft unlink: the one-dog cancel (s11, 6.0.0-lg5.1)
+-- stamps it, so the seat count and the overlap guard, which read live shares, free her
+-- seat. A dog's presence is the check-in log's (`checkin_events`, M5.01): M5.12 dropped
+-- the overwritable `attendance`, `checked_in_at` and `checked_in_by_staff_id` columns.
 CREATE TABLE booking_dogs (
   booking_id uuid NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
   dog_id     uuid NOT NULL REFERENCES dogs(id) ON DELETE CASCADE,
   is_lead    boolean NOT NULL DEFAULT false,
-  -- Real attendance/check-in (locked 2026-05-19), per-dog because group +
-  -- multi-dog sessions have independent presence. 'pending' until staff marks
-  -- it at/after the session. Powers true attendance + no-show stats — which
-  -- are consumed by the DEFERRED admin dashboard, NOT the 4-verb portal.
-  attendance             booking_attendance NOT NULL DEFAULT 'pending',
-  checked_in_at          timestamptz,
-  checked_in_by_staff_id uuid REFERENCES staff(id),
   expired_at             timestamptz,                 -- NULL = live; unlinking a dog expires the row
   PRIMARY KEY (booking_id, dog_id)
 );
 CREATE INDEX booking_dogs_dog_idx ON booking_dogs (dog_id);
+
+-- M5.01 (S29, DAY-U29, DAY-U33; design §2.3:2354-2370, §4 M5.01): the check-in log,
+-- one append-only row per board verb on one dog's share of one session. A dog's
+-- state is FOLDED from her live events (`src/lib/checkinFold.ts`), never stored.
+-- The fold orders by `seq`, which is assigned at INSERT, after the booking row
+-- lock every verb takes first, and so is append order: `created_at` is the
+-- transaction's start and `id` is random, so neither is (a check-out whose
+-- transaction began first but locked second would fold before the check-in it
+-- follows). `at` and `created_at` are display only. An `undo` names the event it
+-- removes. `last_seen_moved` / `last_seen_prior` record what a check-in did to
+-- `dogs.last_seen_on`, so its undo can put the clock back (question 44).
+-- `training_completed` is the send-home's box, `reissue_credit` the check-out's.
+-- A mistake is corrected by an `undo`, never by an edit: a row trigger refuses
+-- UPDATE and DELETE unless a cascade from `booking_dogs` is deleting the row,
+-- and a statement trigger refuses TRUNCATE.
+CREATE TABLE checkin_events (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  seq                 bigint GENERATED ALWAYS AS IDENTITY,
+  booking_id          uuid NOT NULL,
+  dog_id              uuid NOT NULL,
+  kind                checkin_event_kind NOT NULL,
+  at                  timestamptz NOT NULL,
+  by_staff_id         uuid NOT NULL REFERENCES staff(id),
+  undoes_event_id     uuid REFERENCES checkin_events(id),
+  training_completed  boolean,
+  reissue_credit      boolean,
+  note                text,
+  last_seen_moved     boolean NOT NULL DEFAULT false,
+  last_seen_prior     date,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (booking_id, dog_id) REFERENCES booking_dogs (booking_id, dog_id) ON DELETE CASCADE,
+  -- M5.10 (P20 fix 1): the target of `credit_ledger_checkin_event_fkey`, so a ledger row
+  -- naming an event names that event's own booking and dog.
+  CONSTRAINT checkin_events_share_key UNIQUE (id, booking_id, dog_id)
+);
+-- The fold reads one share's log in append order; the undo's clock recompute reads
+-- one dog's check-ins across her sessions.
+CREATE INDEX checkin_events_share_seq_idx ON checkin_events (booking_id, dog_id, seq);
+CREATE INDEX checkin_events_dog_idx ON checkin_events (dog_id);
+-- M5.02 (S30, DAY-U33): one settling event per dog per session. No settling event can be
+-- undone (design §2.3:2387-2390), so the index never needs to read the undos.
+CREATE UNIQUE INDEX checkin_events_one_settling_uidx ON checkin_events (booking_id, dog_id)
+  WHERE kind IN ('turn-away', 'sent-home', 'no-show');
+REVOKE ALL ON checkin_events FROM anon, authenticated;
+
+-- Append-only. A row reached at trigger depth 1 is a statement aimed at the log
+-- itself and is refused; deeper, it is the FK cascade from `booking_dogs` (a
+-- booking or a dog hard-deleted), which passes.
+CREATE FUNCTION checkin_events_append_only() RETURNS trigger
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    RAISE EXCEPTION 'checkin_events is append-only: TRUNCATE is refused'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF pg_trigger_depth() > 1 THEN
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    END IF;
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'checkin_events is append-only: % of event % is refused; correct it with an undo', TG_OP, OLD.id
+    USING ERRCODE = 'restrict_violation';
+END;
+$$;
+CREATE TRIGGER checkin_events_append_only_row BEFORE UPDATE OR DELETE ON checkin_events
+  FOR EACH ROW EXECUTE FUNCTION checkin_events_append_only();
+CREATE TRIGGER checkin_events_append_only_truncate BEFORE TRUNCATE ON checkin_events
+  FOR EACH STATEMENT EXECUTE FUNCTION checkin_events_append_only();
+REVOKE ALL ON FUNCTION checkin_events_append_only() FROM PUBLIC, anon, authenticated;
 
 -- ----------------------------------------------------------------------------
 -- After School Coaching opt-in (locked 2026-05-19) — a per-dog add-on that is
@@ -1526,6 +1604,57 @@ INSERT INTO staff_settings (
   '{owner,manager,trainer}', 30
 );
 
+-- M5.07 (CXL-U02's two tables, landed at LG5 with CXL-U09; design §4 M5.07, §3.8).
+-- Every cxl.* key is SEEDED AND STORED ONLY (money cut 3): no v1 reader, no
+-- settings route over either table until CXL-U02 (P21) adds the `cxl` domain, its
+-- shapes and its registry rows together. The one exception is
+-- `per_dog_cancel_enabled`, seeded on and read by the owner's one-dog cancel
+-- (s11). One row per service category on the first table; the boarding row is
+-- `unset`, its fractions NOT SEEDED. NOT SEEDED keys are NULL. Both tables are
+-- audited (below) and revoked here, as they are created.
+CREATE TABLE cancellation_policy_settings (
+  category                          text PRIMARY KEY,
+  window_state                      text NOT NULL CHECK (window_state IN ('unset', 'none', 'hours')),
+  window_hours                      integer CHECK (window_hours > 0),
+  forfeit_fraction                  numeric CHECK (forfeit_fraction BETWEEN 0 AND 1),
+  no_show_forfeit_fraction          numeric CHECK (no_show_forfeit_fraction BETWEEN 0 AND 1),
+  flat_fee_cents                    integer CHECK (flat_fee_cents >= 0),
+  unpaid_no_show_close_after_hours  integer NOT NULL CHECK (unpaid_no_show_close_after_hours > 0),
+  no_show_declare_mode              text CHECK (no_show_declare_mode IN ('staff_only', 'auto_after_hours')),
+  updated_at                        timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id               uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON cancellation_policy_settings FROM anon, authenticated;
+
+INSERT INTO cancellation_policy_settings (
+  category, window_state, window_hours, forfeit_fraction, no_show_forfeit_fraction,
+  flat_fee_cents, unpaid_no_show_close_after_hours, no_show_declare_mode
+) VALUES
+  ('day-school',      'none',  NULL, 0,    0,    0,    24, 'staff_only'),
+  ('day-care',        'none',  NULL, 0,    0,    0,    24, 'staff_only'),
+  ('group-class',     'none',  NULL, 0,    0,    0,    24, 'staff_only'),
+  ('private-lesson',  'none',  NULL, 0,    0,    0,    24, 'staff_only'),
+  ('board-and-train', 'none',  NULL, 0,    0,    0,    24, 'staff_only'),
+  ('boarding',        'unset', NULL, NULL, NULL, NULL, 24, NULL),
+  ('evaluation',      'none',  NULL, 0,    0,    0,    24, 'staff_only');
+
+CREATE TABLE cancellation_global_settings (
+  id                                                       boolean PRIMARY KEY DEFAULT true CHECK (id),
+  per_dog_cancel_enabled                                   boolean NOT NULL,
+  staff_entered_client_cancel_follows_owner_rules_enabled  boolean NOT NULL,
+  staff_initiated_cancel_full_return_enabled               boolean NOT NULL,
+  class_missed_meeting_money_return_mode                   text,
+  started_run_cancel_return_mode                           text,
+  updated_at                                               timestamptz NOT NULL DEFAULT now(),
+  updated_by_staff_id                                      uuid REFERENCES staff(id) ON DELETE SET NULL
+);
+REVOKE ALL ON cancellation_global_settings FROM anon, authenticated;
+
+INSERT INTO cancellation_global_settings (
+  per_dog_cancel_enabled, staff_entered_client_cancel_follows_owner_rules_enabled,
+  staff_initiated_cancel_full_return_enabled
+) VALUES (true, true, true);
+
 -- ----------------------------------------------------------------------------
 -- Credits — append-only ledger (replaces the mock mutable counter)
 -- Δ 2026-06-18 (credit-expiry lot model), M4.10 (owner pools): credits are the
@@ -1606,6 +1735,14 @@ CREATE TABLE credit_ledger (
   owner_id    uuid NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,  -- M4.10
   tier        text NOT NULL DEFAULT 'regular' CHECK (tier IN ('regular', 'alumni')),  -- M4.10
   created_by_staff_id uuid REFERENCES staff(id) ON DELETE SET NULL,  -- M4.12: a hand edit's staffer
+  -- M5.10: the refund a removal answers (its FK is added after `refunds`, below; P22
+  -- writes it), and the one `booking-debit` a `settlement-return` reverses.
+  refund_id           uuid,
+  reverses_entry_id   uuid REFERENCES credit_ledger(id),
+  -- M5.10 (P20 fix 1, designs/p20-event-ledger-link.md): the check-in event whose
+  -- transaction wrote this row, a re-check-in's debit or a ticked check-out's or settling
+  -- verb's return. NULL on every other row: a cancel's return, a booking-time debit.
+  checkin_event_id    uuid,
   CONSTRAINT credit_ledger_lot_pool_key UNIQUE (id, owner_id, location, mode, tier),
   CONSTRAINT credit_ledger_adjustment_note_check CHECK (reason <> 'adjustment' OR note IS NOT NULL),  -- M4.12
   -- M4.09: the never-expiring class is retired. A grant carries a date, a debit names its
@@ -1613,6 +1750,18 @@ CREATE TABLE credit_ledger (
   CONSTRAINT grant_has_expiry CHECK (delta <= 0 OR lot_id IS NOT NULL OR expires_at IS NOT NULL),
   CONSTRAINT debit_names_lot CHECK (delta >= 0 OR lot_id IS NOT NULL),
   CONSTRAINT one_expiry_copy CHECK (lot_id IS NULL OR expires_at IS NULL),
+  -- M5.10: every return names the one debit it reverses (§2.4:2957-2960).
+  CONSTRAINT credit_ledger_return_reverses_debit_check
+    CHECK (reason <> 'settlement-return' OR reverses_entry_id IS NOT NULL),
+  -- M5.10 (P20 fix 1): a row names its event together with that event's booking and dog,
+  -- so it cannot name another dog's tap. NO ACTION: a CASCADE would pass M5.01's
+  -- append-only trigger and delete a credit with its event, and SET NULL would unlink it
+  -- unseen. A linked row is a debit or a return on a share, and the CHECK's IS NOT NULL is
+  -- load-bearing: MATCH SIMPLE skips the FK when any of its columns is NULL.
+  CONSTRAINT credit_ledger_checkin_event_fkey FOREIGN KEY (checkin_event_id, booking_id, dog_id)
+    REFERENCES checkin_events (id, booking_id, dog_id),
+  CONSTRAINT credit_ledger_checkin_event_check CHECK (checkin_event_id IS NULL OR
+    (reason IN ('booking-debit', 'settlement-return') AND booking_id IS NOT NULL AND dog_id IS NOT NULL)),
   -- A row names its lot together with that lot's pool, so it cannot spend another's.
   -- MATCH SIMPLE: a grant, with no lot_id, is untouched.
   CONSTRAINT credit_ledger_lot_pool_fkey FOREIGN KEY (lot_id, owner_id, location, mode, tier)
@@ -1628,6 +1777,9 @@ CREATE INDEX credit_ledger_lot_id_idx ON credit_ledger (lot_id) WHERE lot_id IS 
 -- M4.09: a charge grants once. A writer repeats the predicate in its ON CONFLICT.
 CREATE UNIQUE INDEX credit_ledger_purchase_charge_uidx
   ON credit_ledger (charge_id) WHERE reason = 'purchase';
+-- M5.10 (P20 fix 1): each board verb writes at most one ledger row, so one row per event.
+CREATE UNIQUE INDEX credit_ledger_checkin_event_uidx ON credit_ledger (checkin_event_id)
+  WHERE checkin_event_id IS NOT NULL;
 
 -- M4.12: every hand move of a lot's date. The date lives on the grant row, so this history
 -- is what makes a move visible; `credit_ledger` does not join the audit list.
@@ -1883,8 +2035,9 @@ ALTER TABLE orders
 -- refunds allowed (amount_cents <= the charge); the API, not the schema,
 -- decides when cumulative refunds flip charges.status to 'refunded'. Append-
 -- only / retained financial record (no expired_at), status transitions only,
--- mirroring charges. Refunding CREDITS instead of money is a credit_ledger
--- 'cancel-refund' entry — money-back vs credits-back are deliberately distinct.
+-- mirroring charges. Returning CREDITS instead of money is a credit_ledger
+-- 'settlement-return' entry (M5.03; 'cancel-refund' before LG5) — money-back vs
+-- credits-back are deliberately distinct.
 -- ----------------------------------------------------------------------------
 CREATE TABLE refunds (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1931,10 +2084,28 @@ CREATE TABLE refunds (
   resolved_by_staff_id uuid REFERENCES staff(id),
   resolved_at      timestamptz,
   created_at       timestamptz NOT NULL DEFAULT now(),
-  updated_at       timestamptz NOT NULL DEFAULT now()
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  -- M5.10 (S35's columns, landed with DAY-U34 at LG5; design §4 M5.10). Read and
+  -- written by nothing until the refund unit (P22): how the money went back, who
+  -- issued it, the retry it repeats, a resolve-external's outcome, a dashboard
+  -- refund's credits removed by hand, and the enrolment it answers (its FK at
+  -- M7.08, when `enrollments` exists). No `account_credit`, no `issued_over_limit`.
+  instrument       text NOT NULL DEFAULT 'original_card' CHECK (instrument IN ('original_card', 'cash', 'check')),
+  returned_instrument text CHECK (returned_instrument IN ('cash', 'check')),
+  issued_by_staff_id uuid REFERENCES staff(id),
+  retry_of_refund_id uuid REFERENCES refunds(id),
+  resolved_outcome text CHECK (resolved_outcome IN ('returned', 'withdrawn')),
+  credits_settled_by_staff_id uuid REFERENCES staff(id),
+  credits_settled_at timestamptz,
+  enrollment_id    uuid
 );
 CREATE INDEX refunds_owner_idx  ON refunds (owner_id);
 CREATE INDEX refunds_charge_idx ON refunds (charge_id);
+
+-- M5.10: the removal at the mint, the withdrawn put-back and a hand removal that
+-- answers a refund name it (P22).
+ALTER TABLE credit_ledger
+  ADD CONSTRAINT credit_ledger_refund_id_fkey FOREIGN KEY (refund_id) REFERENCES refunds(id);
 
 -- ----------------------------------------------------------------------------
 -- Stripe webhook event ledger (locked Day 15 2026-05-26). Dedupe key for
@@ -2436,7 +2607,9 @@ BEGIN
     'staff_settings',
     -- M4.05: a money-class edit, and a same-day correction overwrites the only copy
     -- of the old value (DECISIONS 177(d)).
-    'credit_packages'
+    'credit_packages',
+    -- M5.07: the cxl tables, stored only but audited (design §3.8).
+    'cancellation_policy_settings','cancellation_global_settings'
   ]) LOOP
     EXECUTE format(
       'CREATE TRIGGER %I_audit AFTER UPDATE OR DELETE ON %I
@@ -2697,18 +2870,27 @@ CREATE TRIGGER bookings_eval_gate_check
 --
 --  cancelBooking(bookingId): ONE transaction (Day 13) —
 --    1. lockById(tx, bookings) — row lock, serialize concurrent cancel
---       attempts on the same booking. 404 if not found, 409 if already
---       cancelled, 403 if principal is neither owner nor staff.
+--       attempts on the same booking (a top-up day's charge lock first).
+--       404 if not found, 409 `conflict` if already cancelled, 403 if
+--       principal is neither owner nor staff. A pending row cancels its whole
+--       order. A day-school or day-care row is then refused (CXL-U09,
+--       6.0.0-lg5.1): 409 `session_ended` once Chicago now has reached the
+--       campus's day.pickup_close_time on its date, then 409
+--       `session_checked_in` while any dog still on it has folded past
+--       `expected` on the check-in log (an undone check-in does not count).
 --    2. UPDATE bookings SET status='cancelled', cancelled_at=now(),
 --       cancel_forfeited = (now() > cancel_deadline_at). The deadline was
 --       stamped at creation from cancel_window_settings (live policy at
 --       book time) — changing the policy later doesn't retroactively re-
 --       stamp existing rows.
 --    3. IF NOT forfeited: credit booking back —
---         For credit-funded bookings: SELECT credit_ledger rows with
---           reason='booking-debit' AND booking_id=$id → INSERT one
---           +1 'cancel-refund' row per (dog, mode) debit. Append-only;
---           balance recomputes to its pre-booking value.
+--         For credit-funded bookings: each live booking-debit (one no
+--           return names yet) → INSERT one +1 'settlement-return' naming it
+--           in reverses_entry_id (M5.03, M5.10), to the lot it drew from, or
+--           a fresh lot when that lot can pay no later date. Append-only;
+--           balance recomputes to its pre-booking value. A day row's live
+--           share with no live debit is a 500 and one alarm, never a cancel
+--           that moves nothing (design §2.3:2502-2505).
 --         For money-funded bookings: SELECT charges WHERE booking_id=$id
 --           AND status='succeeded' → INSERT refunds row (status='pending',
 --           amount_cents <= the charge minus any prior succeeded refunds
@@ -2731,6 +2913,36 @@ CREATE TRIGGER bookings_eval_gate_check
 --       /bookings/:id so the owner sees it in the bell popover).
 --    Post-commit: invalidate caches for the booking list, dog credit
 --    balance, capacity (avail:{location}:*), and dog profile.
+--
+--  cancelOneDog(bookingId, dogId): ONE transaction (6.0.0-lg5.1, s11, CXL-U09) —
+--    the owner's POST /bookings/:id/dogs/:dogId/cancel and the staff's POST
+--    /staff/bookings/:id/dogs/:dogId/cancel. The same locks in the same order as
+--    cancelBooking. 404 → 422 (not a day program) → 409 per_dog_cancel_off (the
+--    owner's, cancellation_global_settings.per_dog_cancel_enabled) → 409
+--    session_cancelled (the session or her share) → 409 payment_pending → 409
+--    session_ended → 409 session_checked_in (HER folded state). Then her share's
+--    expired_at is stamped (her seat is free), her one live debit comes back as a
+--    'settlement-return' naming it, and when she was the last dog still on it the
+--    session flips 'cancelled' with its reminders torn down, her share kept. When
+--    another dog stays and she was the one the queued booking-reminder names, the
+--    reminder is re-pointed to the dog who now leads (P20 fix 1, Opus L1).
+--    Always the credit: no window, no forfeit.
+--
+--  The board's verbs (6.0.0-lg5.1, DAY-U29, DAY-U33, DAY-U34): each one transaction —
+--    lockById(bookings) FOR UPDATE → the dog row (no key update) for the
+--    check-in's last_seen_on → the pool for a ledger write. Each appends one
+--    checkin_events row; a ticked check-out writes one 'settlement-return' and a
+--    re-check-in after it one 'booking-debit' back, in the event's transaction,
+--    each naming its event in credit_ledger.checkin_event_id (M5.10, P20 fix 1):
+--    what an event wrote is read by that link, never by equal created_at stamps.
+--    The re-debit reverses its return: into the lot the return went to while that
+--    lot still holds the credit, whatever its date (P20 fix 2, §10), else the
+--    soonest-expiring lot live now that pays the session's date; with none, 422.
+--    The settling verbs (turn-away, send-home, no-show) append the share's one
+--    settling event (M5.02's index) and, in the same transaction, settleDayShare:
+--    round(day.sent_home_{before,after}_training_return_fraction × 1) credits back
+--    as one 'settlement-return' naming the share's live debit and the event; never
+--    money. A turned-away share holds no seat (both capacity counts drop it).
 -- =============================================================================
 
 -- =============================================================================
@@ -2755,13 +2967,16 @@ COMMENT ON TABLE  reports                        IS 'Trainer report cards. Base 
 COMMENT ON TABLE  media_assets                   IS 'Metadata + Cloudflare-R2 object key for every photo/video (dog, owner, report). Never stores the bytes themselves.';
 COMMENT ON TABLE  media_derivative_jobs          IS 'Worker queue: one row per media_assets row needing derivative processing (sharp images / ffmpeg video). Append-only by nature; status flips pending → processing → done | failed.';
 COMMENT ON TABLE  bookings                       IS 'A confirmed scheduled session of any service category; the unified booking record (all six categories read back here).';
-COMMENT ON TABLE  booking_dogs                   IS 'Dogs on a booking (lead + additional) plus per-dog real attendance / check-in.';
+COMMENT ON TABLE  booking_dogs                   IS 'Dogs on a booking (lead + additional), one share each; a share cancelled alone carries expired_at. A dog''s presence is the check-in log''s (checkin_events).';
+COMMENT ON TABLE  checkin_events                 IS 'The append-only check-in log: one row per board verb on one dog''s share of one session (M5.01). A dog''s state is folded from her live events in seq order; an undo names the event it removes. Never edited or deleted, except by a cascade from booking_dogs.';
 COMMENT ON TABLE  after_school_optins            IS 'Per-dog After School Coaching opt-in; DDL-gated so it can only attach to a day-school booking.';
 COMMENT ON TABLE  pending_requests               IS 'Owner-submitted requests awaiting staff approval (private lesson, boarding, board-and-train) before they convert to bookings.';
 COMMENT ON TABLE  pending_request_dogs           IS 'Dogs attached to a pending request (lead + additional), mirroring booking_dogs.';
 COMMENT ON TABLE  pending_request_preferred_dates IS 'The owner ranked preferred date/time slots for a pending request.';
 COMMENT ON TABLE  day_capacity                   IS 'Sparse per-(location, calendar-day) seat overrides for Day School and Day Care combined; a live row wins over the campus''s day.daily_capacity_dogs and day.open_weekdays_list, which the API applies when no row exists.';
 COMMENT ON TABLE  cancel_window_settings         IS 'Owner-tunable per-category free-cancel hours (Day 13). One row per service_category; seeded 48h flat. API reads at booking creation to stamp bookings.cancel_deadline_at; the resolved deadline travels with the booking.';
+COMMENT ON TABLE cancellation_policy_settings IS 'The cxl per-service cancellation policy (M5.07): one row per service category, every key seeded and stored only, read by nothing in v1 (money cut 3). Audited.';
+COMMENT ON TABLE cancellation_global_settings IS 'The cxl global switches (M5.07; singleton, id = true): stored only, except per_dog_cancel_enabled, which the owner''s one-dog cancel reads (s11). Audited.';
 COMMENT ON TABLE migrations_applied IS 'One row per migration step applied through npm run migrate:apply: the step id, who ran it, and the sha256 of the exact bytes sent. Written as the step''s last statement, in its transaction.';
 COMMENT ON TABLE account_settings IS 'The acct settings domain (singleton, id = true): account lifecycle switches and the signup field requirement map. Audited (STAFF-74); edited through PATCH /staff/settings/acct.';
 COMMENT ON TABLE alumni_settings IS 'The alum settings domain (singleton, id = true): the alumni re-check clock. Audited (STAFF-74); edited through PATCH /staff/settings/alum.';
@@ -2784,7 +2999,7 @@ COMMENT ON TABLE  stripe_customers               IS 'Maps an owner to their Stri
 COMMENT ON TABLE  payment_methods                IS 'Owner saved Stripe payment methods (token + displayable brand/last4); raw PAN never stored. Removal = expire (retained for charge history).';
 COMMENT ON TABLE  charges                        IS 'Stripe PaymentIntent records (package purchase, board-and-train, group-class). Retained financial record.';
 COMMENT ON TABLE  invoices                       IS 'Money owed and unpaid: the pay-later twin of a charge, with a due_at. No worker bills an invoice on its own: it stays open until a person settles it, and it flips to paid when settled.';
-COMMENT ON TABLE  refunds                        IS 'Refunds against a prior Stripe charge (partial allowed). Append-only retained financial record; money-back, distinct from a credit_ledger cancel-refund.';
+COMMENT ON TABLE  refunds                        IS 'Refunds against a prior Stripe charge (partial allowed). Append-only retained financial record; money-back, distinct from a credit_ledger settlement-return.';
 COMMENT ON TABLE  agreement_documents            IS 'Catalog of liability waivers / policy docs that gate bookings; applies_to empty = all categories. current_version drives the signature gate.';
 COMMENT ON TABLE  agreement_signatures           IS 'Append-only legal fact: an owner signed document_key at version. Immutable — a new version is a new row, never edited/deleted.';
 COMMENT ON TABLE  service_rates                  IS 'Effective-dated price catalog per (category, location). Append-only: never value-overwritten — a change closes the open row (effective_to) + inserts a new one; a mistake/cancel sets voided_at (soft-void, excluded from active, predecessor reopens). created_by/voided_by stamp the actor; the rows + audit_log are the change history.';

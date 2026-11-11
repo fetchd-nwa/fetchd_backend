@@ -226,7 +226,7 @@ test(
         .select({ lotId: creditLedger.lotId, expiresAt: creditLedger.expiresAt })
         .from(creditLedger)
         .where(
-          and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')),
+          and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
         );
       assert.ok(refund !== undefined, 'the credit came back');
       assert.equal(refund.lotId, null, 'a fresh lot, the source being dead');

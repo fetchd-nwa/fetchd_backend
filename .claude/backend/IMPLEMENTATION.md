@@ -1414,7 +1414,8 @@ observable behavior, not "looks right."
     outcome branches:
     - FORFEIT: `now > cancel_deadline_at`. `cancel_forfeited=true`;
       no ledger, no refund; capacity flips via status='cancelled'.
-    - CREDIT-BACK: one +1 `cancel-refund` ledger row per original
+    - CREDIT-BACK *(from 6.0.0-lg5.1 the row is `settlement-return`, naming the debit it
+      reverses — M5.03, M5.10; DATA-CONTRACT §S)*: one +1 `cancel-refund` ledger row per original
       `booking-debit` (multi-dog → N rows).
     - MONEY-BACK: `refunds` row at 'pending' with `amount = charge
       - sumNonFailedForCharge` (cumulative-cap rule honored). Stripe
@@ -2025,6 +2026,11 @@ real-sized chunks:
   - **Verb 1** — `GET /staff/requests?status=` cross-owner queue (approve/deny
     already shipped Day-12). `requestsRepository.findLive`.
   - **Verb 4** — `GET /staff/bookings` + `POST /staff/bookings/:id/{confirm,cancel,attendance}`.
+    *(Δ 2026-11-10, P20 / wire 6.0.0-lg5.1: `attendance` is removed with its columns (M5.12);
+    the check-in board's append-only log replaces it — `GET /staff/checkin-board` and
+    `POST /staff/bookings/:id/dogs/:dogId/{check-in,check-out,undo}`, `src/routes/staffCheckin.ts`
+    — and one dog of several cancels through `POST /staff/bookings/:id/dogs/:dogId/cancel`.
+    DATA-CONTRACT §S.)*
     New `routes/staffBookings.ts`. Cancel reuses the SHARED
     `lib/cancelBookingService.cancelBookingInTx` (extracted from the owner
     cancel route — schema `cancelBooking` is owner-OR-staff authorized, one

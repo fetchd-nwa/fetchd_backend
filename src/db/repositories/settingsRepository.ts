@@ -4,6 +4,7 @@ import { db } from '../client.js';
 import {
   accountSettings,
   alumniSettings,
+  cancellationGlobalSettings,
   cashSettings,
   creditSettings,
   dayProgramSettings,
@@ -380,6 +381,20 @@ export const settingsRepository = {
       portal_idle_signout_minutes: r.portalIdleSignoutMinutes,
       ...audit(r),
     };
+  },
+
+  /**
+   * `cxl.per_dog_cancel_enabled` (M5.07; §3.8), the one `cxl` key with a v1 reader: off,
+   * the owner's one-dog cancel answers 409 `per_dog_cancel_off` and her
+   * `dog_shares[].can_cancel` reads false (s11; P20 notes D14). Staff are unaffected. No
+   * `cxl` settings route exists until P21, so its only writer is the seed.
+   */
+  async perDogCancelEnabled(runner: Runner = db): Promise<boolean> {
+    const [row] = await runner
+      .select({ enabled: cancellationGlobalSettings.perDogCancelEnabled })
+      .from(cancellationGlobalSettings)
+      .limit(1);
+    return seeded(row, 'cancellation_global_settings', 'M5.07').enabled;
   },
 
   /**

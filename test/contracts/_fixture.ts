@@ -43,6 +43,7 @@ import {
   threads,
   vets,
   charges,
+  checkinEvents,
   idempotencyKeys,
   invoices,
   orders,
@@ -124,9 +125,9 @@ export const FIXTURE_IDS = {
   booking8Id: '77777777-7777-4777-8777-777777777778',
   booking9Id: '77777777-7777-4777-8777-777777777779',
   bookingDstId: '77777777-7777-4777-8777-77777777777a',
-  // Ordinary past bookings: booking6 (dog1 past day-school) is marked ATTENDED
-  // on its roster row, and this past day-care gives dog2 the same. No booking
-  // path reads attendance since wire 3.0.0; the rows stay because the read
+  // Ordinary past bookings: booking6 (dog1 past day-school) was ATTENDED, checked
+  // in and out on the board's log, and this past day-care gives dog2 the same. No
+  // booking path reads attendance since wire 3.0.0; the rows stay because the read
   // suites count them (DECISIONS 118(d)).
   bookingDog2PastCareId: '77777777-7777-4777-8777-77777777777b',
   // Day-5b: credit_packages catalog keys + credit_ledger ids. Packages use
@@ -900,27 +901,46 @@ export async function seedFixture(): Promise<void> {
     { bookingId: FIXTURE_IDS.booking3Id, dogId: FIXTURE_IDS.dog2Id, isLead: false },
     { bookingId: FIXTURE_IDS.booking4Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking5Id, dogId: FIXTURE_IDS.dog2Id, isLead: true },
-    // dog1's past day-school and dog2's past day-care are ATTENDED, ordinary
-    // past bookings (DECISIONS 118(d)).
-    {
-      bookingId: FIXTURE_IDS.booking6Id,
-      dogId: FIXTURE_IDS.dog1Id,
-      isLead: true,
-      attendance: 'attended' as const,
-      checkedInAt: '2026-05-12T13:05:00Z',
-      checkedInByStaffId: FIXTURE_IDS.staffDonavanId,
-    },
+    { bookingId: FIXTURE_IDS.booking6Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking7Id, dogId: FIXTURE_IDS.dog2Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking8Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.booking9Id, dogId: FIXTURE_IDS.dog1Id, isLead: true },
     { bookingId: FIXTURE_IDS.bookingDstId, dogId: FIXTURE_IDS.dog1Id, isLead: true },
+    { bookingId: FIXTURE_IDS.bookingDog2PastCareId, dogId: FIXTURE_IDS.dog2Id, isLead: true },
+  ]);
+  // dog1's past day-school and dog2's past day-care were ATTENDED, ordinary past
+  // bookings (DECISIONS 118(d)): checked in and out on the board's log (M5.12 dropped
+  // the overwritable `attendance` columns). The bookings delete in teardown cascades them.
+  await db.insert(checkinEvents).values([
+    {
+      bookingId: FIXTURE_IDS.booking6Id,
+      dogId: FIXTURE_IDS.dog1Id,
+      kind: 'check-in' as const,
+      at: '2026-05-12T13:05:00Z',
+      byStaffId: FIXTURE_IDS.staffDonavanId,
+    },
+    {
+      bookingId: FIXTURE_IDS.booking6Id,
+      dogId: FIXTURE_IDS.dog1Id,
+      kind: 'check-out' as const,
+      at: '2026-05-12T22:15:00Z',
+      byStaffId: FIXTURE_IDS.staffDonavanId,
+      reissueCredit: false,
+    },
     {
       bookingId: FIXTURE_IDS.bookingDog2PastCareId,
       dogId: FIXTURE_IDS.dog2Id,
-      isLead: true,
-      attendance: 'attended' as const,
-      checkedInAt: '2026-05-11T13:05:00Z',
-      checkedInByStaffId: FIXTURE_IDS.staffDonavanId,
+      kind: 'check-in' as const,
+      at: '2026-05-11T13:05:00Z',
+      byStaffId: FIXTURE_IDS.staffDonavanId,
+    },
+    {
+      bookingId: FIXTURE_IDS.bookingDog2PastCareId,
+      dogId: FIXTURE_IDS.dog2Id,
+      kind: 'check-out' as const,
+      at: '2026-05-11T22:15:00Z',
+      byStaffId: FIXTURE_IDS.staffDonavanId,
+      reissueCredit: false,
     },
   ]);
 

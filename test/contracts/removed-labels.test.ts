@@ -156,7 +156,13 @@ test(
   async () => {
     const expected = {
       charge_purpose: ['package', 'board-train', 'group-class'],
-      ledger_reason: ['purchase', 'booking-debit', 'cancel-refund', 'adjustment'],
+      ledger_reason: [
+        'purchase',
+        'booking-debit',
+        'cancel-refund',
+        'adjustment',
+        'settlement-return',
+      ],
       notification_type: [
         'booking-confirmed',
         'report-published',

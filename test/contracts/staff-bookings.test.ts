@@ -460,6 +460,7 @@ test('POST /staff/bookings/:id/cancel — already cancelled → 409', SKIP_WHEN_
     idempotencyKey: `cx-409-${randomUUID()}`,
   });
   assert.equal(res.statusCode, 409, res.body);
+  assert.equal(res.json().error.code, 'conflict', res.body);
 });
 
 test('POST /staff/bookings/:id/cancel — unknown id → 404', SKIP_WHEN_NO_DB, async () => {
@@ -483,105 +484,10 @@ test('POST /staff/bookings/:id/cancel — owner principal → 403', SKIP_WHEN_NO
   assert.equal(res.statusCode, 403, res.body);
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// POST /staff/bookings/:id/attendance
-// ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'POST /staff/bookings/:id/attendance — marks check-in + stamps acting staff',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const id = await seedBooking({});
-    const { app } = staffBookingsApp();
-    const res = await post({
-      app,
-      url: `/staff/bookings/${id}/attendance`,
-      idempotencyKey: `at-${randomUUID()}`,
-      payload: { dog_id: FIXTURE_IDS.dog1Id, status: 'attended' },
-    });
-    assert.equal(res.statusCode, 200, res.body);
-    const body = res.json() as {
-      booking_id: string;
-      dog_id: string;
-      attendance: string;
-      checked_in_at: string;
-    };
-    assert.equal(body.booking_id, id);
-    assert.equal(body.dog_id, FIXTURE_IDS.dog1Id);
-    assert.equal(body.attendance, 'attended');
-    assert.ok(body.checked_in_at, 'checked_in_at returned');
-
-    const [row] = await db
-      .select({
-        attendance: bookingDogsTable.attendance,
-        checkedInByStaffId: bookingDogsTable.checkedInByStaffId,
-        checkedInAt: bookingDogsTable.checkedInAt,
-      })
-      .from(bookingDogsTable)
-      .where(
-        and(eq(bookingDogsTable.bookingId, id), eq(bookingDogsTable.dogId, FIXTURE_IDS.dog1Id)),
-      );
-    assert.equal(row?.attendance, 'attended');
-    assert.equal(row?.checkedInByStaffId, FIXTURE_IDS.staffDonavanId, 'acting staff stamped');
-    assert.ok(row?.checkedInAt !== null, 'checked_in_at persisted');
-  },
-);
-
-test(
-  'POST /staff/bookings/:id/attendance — dog not on the booking → 404',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const id = await seedBooking({}); // roster = dog1 only
-    const { app } = staffBookingsApp();
-    const res = await post({
-      app,
-      url: `/staff/bookings/${id}/attendance`,
-      idempotencyKey: `at-404dog-${randomUUID()}`,
-      payload: { dog_id: FIXTURE_IDS.dog2Id, status: 'attended' },
-    });
-    assert.equal(res.statusCode, 404, res.body);
-  },
-);
-
-test('POST /staff/bookings/:id/attendance — cancelled booking → 409', SKIP_WHEN_NO_DB, async () => {
-  const id = await seedBooking({ status: 'cancelled' });
-  const { app } = staffBookingsApp();
-  const res = await post({
-    app,
-    url: `/staff/bookings/${id}/attendance`,
-    idempotencyKey: `at-409-${randomUUID()}`,
-    payload: { dog_id: FIXTURE_IDS.dog1Id, status: 'no-show' },
-  });
-  assert.equal(res.statusCode, 409, res.body);
-});
-
-test(
-  'POST /staff/bookings/:id/attendance — pending status rejected (not a check-in action)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const id = await seedBooking({});
-    const { app } = staffBookingsApp();
-    const res = await post({
-      app,
-      url: `/staff/bookings/${id}/attendance`,
-      idempotencyKey: `at-bad-${randomUUID()}`,
-      payload: { dog_id: FIXTURE_IDS.dog1Id, status: 'pending' },
-    });
-    assert.equal(res.statusCode, 422, res.body);
-  },
-);
-
-test('POST /staff/bookings/:id/attendance — owner principal → 403', SKIP_WHEN_NO_DB, async () => {
-  const id = await seedBooking({});
-  const { app } = staffBookingsApp(FIXTURE_OWNER_PRINCIPAL);
-  const res = await post({
-    app,
-    url: `/staff/bookings/${id}/attendance`,
-    idempotencyKey: `at-owner-${randomUUID()}`,
-    payload: { dog_id: FIXTURE_IDS.dog1Id, status: 'attended' },
-  });
-  assert.equal(res.statusCode, 403, res.body);
-});
+// POST /staff/bookings/:id/attendance left at 6.0.0-lg5.1 (M5.12): its five tests went
+// with it ("marks check-in + stamps acting staff", "dog not on the booking → 404",
+// "cancelled booking → 409", "pending status rejected", "owner principal → 403"), and
+// `removed-routes.test.ts` holds its 404. The board's verbs are `checkin-verbs.test.ts`'s.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Cancel — the credit-back refund branch NOT covered above, plus idempotency
@@ -590,7 +496,7 @@ test('POST /staff/bookings/:id/attendance — owner principal → 403', SKIP_WHE
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /staff/bookings/:id/cancel — credit-paid within window → cancel-refund ledger row',
+  'POST /staff/bookings/:id/cancel — credit-paid within window → settlement-return ledger row',
   SKIP_WHEN_NO_DB,
   async () => {
     const id = await seedBooking({
@@ -621,8 +527,8 @@ test(
     const refundLedger = await db
       .select({ delta: creditLedger.delta, dogId: creditLedger.dogId })
       .from(creditLedger)
-      .where(and(eq(creditLedger.bookingId, id), eq(creditLedger.reason, 'cancel-refund')));
-    assert.equal(refundLedger.length, 1, 'one cancel-refund row for the credit-paid booking');
+      .where(and(eq(creditLedger.bookingId, id), eq(creditLedger.reason, 'settlement-return')));
+    assert.equal(refundLedger.length, 1, 'one settlement-return row for the credit-paid booking');
     assert.equal(refundLedger[0]!.delta, 1);
     assert.equal(refundLedger[0]!.dogId, FIXTURE_IDS.dog1Id);
   },
@@ -647,28 +553,5 @@ test(
   },
 );
 
-test(
-  'POST /staff/bookings/:id/attendance — idempotency replay returns stored body',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const id = await seedBooking({});
-    const { app } = staffBookingsApp();
-    const key = `at-idem-${randomUUID()}`;
-    const payload = { dog_id: FIXTURE_IDS.dog1Id, status: 'attended' };
-    const first = await post({
-      app,
-      url: `/staff/bookings/${id}/attendance`,
-      idempotencyKey: key,
-      payload,
-    });
-    assert.equal(first.statusCode, 200, first.body);
-    const replay = await post({
-      app,
-      url: `/staff/bookings/${id}/attendance`,
-      idempotencyKey: key,
-      payload,
-    });
-    assert.equal(replay.statusCode, 200, replay.body);
-    assert.deepEqual(replay.json(), first.json(), 'replay byte-identical');
-  },
-);
+// The attendance verb's idempotency replay test left with the verb (M5.12); each board
+// verb's replay is in `checkin-verbs.test.ts`.

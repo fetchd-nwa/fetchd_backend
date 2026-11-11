@@ -24,8 +24,10 @@ import type { Tx } from '../tx.js';
  *   - A `booking-debit` (delta=-1) names the lot that paid it, and `dog_id` on it is the
  *     dog served. M4.10's composite FK ties a row to its lot's pool, so a debit cannot
  *     spend another owner's lot.
- *   - A `cancel-refund` (+1) goes back to the lot it came from while that lot can pay a
- *     later date, and is otherwise a fresh lot (§2.4:2961-2966).
+ *   - A `settlement-return` (+1) reverses one debit, which it names (`reverses_entry_id`,
+ *     M5.10), and goes back to the lot that debit drew from while that lot can pay a later
+ *     date, and is otherwise a fresh lot (§2.4:2957-2973). It is the one return label from
+ *     LG5 (M5.03); `cancel-refund` is no longer written.
  *   - Balance counts only live lots: `owner_credit_balance`, which is `lot_is_live`.
  *     A lot pays a date only where `lot_pays_date` holds.
  *
@@ -129,10 +131,20 @@ export const creditLedgerRepository = {
   /**
    * INSERT one `booking-debit` for the dog served, from the lot the picker chose. M4.10's
    * composite FK refuses a lot of any other pool. Under the pool lock.
+   *
+   * `checkinEventId` is required so the compiler lists every writer: the re-check-in's
+   * re-debit names its own check-in event (M5.10's link), and every booking-time debit
+   * passes `null`. `null` type-checks at a verb too, so the tests that each verb's row
+   * names its event are what hold the value (designs/p20-event-ledger-link.md §9 (d)).
    */
   async debitLot(
     tx: Tx,
-    args: CreditPool & { lotId: string; dogId: string; bookingId: string },
+    args: CreditPool & {
+      lotId: string;
+      dogId: string;
+      bookingId: string;
+      checkinEventId: string | null;
+    },
   ): Promise<void> {
     await tx.insert(creditLedger).values({
       ownerId: args.ownerId,
@@ -144,6 +156,7 @@ export const creditLedgerRepository = {
       reason: 'booking-debit',
       bookingId: args.bookingId,
       lotId: args.lotId,
+      checkinEventId: args.checkinEventId,
     });
   },
 
@@ -164,17 +177,29 @@ export const creditLedgerRepository = {
   },
 
   /**
-   * Every `booking-debit` of one booking, with the lot it drew from. Append-only: no
-   * `live()` filter.
+   * The LIVE debits of one booking, or of one dog on it: each `booking-debit` no
+   * `settlement-return` names yet (design §2.3:2486-2488), newest first, with the lot it
+   * drew from. A share holds at most one: a return reverses its live debit, and only a
+   * re-check-in after a ticked check-out debits it again. Append-only: no `live()` filter.
    */
-  async findDebitsForBooking(tx: Tx, bookingId: string): Promise<BookingDebitForRefund[]> {
+  async findLiveDebits(
+    tx: Tx,
+    args: { bookingId: string; dogId?: string },
+  ): Promise<BookingDebitForRefund[]> {
+    const dogClause = args.dogId !== undefined ? sql`AND d.dog_id = ${args.dogId}` : sql``;
     const result = await tx.execute(sql`
-      SELECT d.owner_id, d.dog_id, d.mode, d.location, d.tier, d.lot_id
-      FROM credit_ledger d
-      WHERE d.booking_id = ${bookingId} AND d.reason = 'booking-debit'
+      SELECT d.id, d.booking_id, d.owner_id, d.dog_id, d.mode, d.location, d.tier, d.lot_id
+        FROM credit_ledger d
+       WHERE d.booking_id = ${args.bookingId} AND d.reason = 'booking-debit' ${dogClause}
+         AND NOT EXISTS (
+           SELECT 1 FROM credit_ledger r
+            WHERE r.reverses_entry_id = d.id AND r.reason = 'settlement-return')
+       ORDER BY d.created_at DESC, d.id DESC
     `);
     return (
       result.rows as {
+        id: string;
+        booking_id: string;
         owner_id: string;
         dog_id: string | null;
         mode: BookingMode;
@@ -183,6 +208,8 @@ export const creditLedgerRepository = {
         lot_id: string;
       }[]
     ).map((r) => ({
+      id: r.id,
+      bookingId: r.booking_id,
       ownerId: r.owner_id,
       dogId: r.dog_id,
       mode: r.mode,
@@ -193,32 +220,46 @@ export const creditLedgerRepository = {
   },
 
   /**
-   * INSERT one +1 `cancel-refund` reversing a `booking-debit` (CRED-U16; design
-   * §2.4:2955-2966). It goes back to its lot, keeping that lot's date, while the lot can
-   * still pay a date after today. A lot that cannot, already past its date or passing it
-   * before midnight since a lot pays its own last day and dies that day, takes it instead
-   * as a fresh one-credit lot, `cred.returned_credit_expiry_months` from the return. At 0
-   * it goes into the old lot, its date passed, and §2.9's copy says so. Append-only: the
-   * debit stays, and this row counterbalances it. Under the pool lock.
+   * THE ONE RETURN WRITER (CRED-U16; design §2.4:2955-2973): one +1 `settlement-return`
+   * reversing one `booking-debit`, which it names in `reverses_entry_id` (M5.10's CHECK).
+   * Every return goes through here: a cancel of the session or of one dog, a ticked
+   * check-out, and the settling verbs. It goes back to the debit's lot, keeping that lot's
+   * date, while the lot can still pay a date after today. A lot that cannot, already past
+   * its date or passing it before midnight since a lot pays its own last day and dies that
+   * day, takes it instead as a fresh one-credit lot, `cred.returned_credit_expiry_months`
+   * from the return. At 0 it goes into the old lot, its date passed, and §2.9's copy says
+   * so. Append-only: the debit stays, and this row counterbalances it. Under the pool
+   * lock. Answers the return's id: where it landed is {@link findReturnLanding}'s.
+   *
+   * `checkinEventId` names the board verb whose transaction writes the return (a ticked
+   * check-out, a settling verb: M5.10's link); every cancel passes `null`. Required, like
+   * {@link debitLot}'s, so the compiler lists every caller.
    */
   async refundForBooking(
     tx: Tx,
-    args: BookingDebitForRefund & { bookingId: string; now: Date },
-  ): Promise<void> {
+    args: BookingDebitForRefund & { now: Date; checkinEventId: string | null },
+  ): Promise<{ id: string }> {
     const { returned_credit_expiry_months: months } = await settingsRepository.credit(tx);
     const back = months === 0 || (await lotPaysAfterToday(tx, args.lotId, args.now));
-    await tx.insert(creditLedger).values({
-      ownerId: args.ownerId,
-      dogId: args.dogId,
-      mode: args.mode,
-      location: args.location,
-      tier: args.tier,
-      delta: 1,
-      reason: 'cancel-refund',
-      bookingId: args.bookingId,
-      lotId: back ? args.lotId : null,
-      expiresAt: back ? null : addChicagoMonths(args.now, months).toISOString(),
-    });
+    const [row] = await tx
+      .insert(creditLedger)
+      .values({
+        ownerId: args.ownerId,
+        dogId: args.dogId,
+        mode: args.mode,
+        location: args.location,
+        tier: args.tier,
+        delta: 1,
+        reason: 'settlement-return',
+        bookingId: args.bookingId,
+        lotId: back ? args.lotId : null,
+        expiresAt: back ? null : addChicagoMonths(args.now, months).toISOString(),
+        reversesEntryId: args.id,
+        checkinEventId: args.checkinEventId,
+      })
+      .returning({ id: creditLedger.id });
+    if (row === undefined) throw new Error(`the return of debit ${args.id} wrote no row`);
+    return row;
   },
 
   /**
@@ -340,12 +381,17 @@ export const creditLedgerRepository = {
     }
     const to = args.to.toISOString();
     await tx.update(creditLedger).set({ expiresAt: to }).where(eq(creditLedger.id, args.lotId));
+    // Stamped with the clock at the write, after the pool lock, never `now()`: that is the
+    // transaction's start, so of two racing edits the one that began first and committed
+    // last would read as the older (P18 Opus r1 N1; P20 B1-9). `last_expiry_edit` orders
+    // by this stamp.
     await tx.insert(creditLotExpiryEdits).values({
       lotId: args.lotId,
       fromExpiresAt: locked.expiresAt,
       toExpiresAt: to,
       staffId: args.staffId,
       note: args.note,
+      createdAt: sql`clock_timestamp()`,
     });
   },
 
@@ -397,10 +443,12 @@ export async function findGrantLot(tx: Tx, lotId: string): Promise<GrantLot | un
   return row;
 }
 
-/** One lot as staff read it: the row behind `CreditLotDetailWire`, and its pool. */
+/** One lot as staff read it: the row behind `CreditLotDetailWire`, and its pool. A
+ *  `cancel-refund` lot is one written before P20 (M5.03); the route reads it as the one
+ *  return label (D2). */
 export interface LotDetailRow extends CreditPool {
   id: string;
-  reason: 'purchase' | 'adjustment' | 'cancel-refund';
+  reason: 'purchase' | 'adjustment' | 'cancel-refund' | 'settlement-return';
   granted: number;
   remaining: number;
   created_at: string;
@@ -495,8 +543,89 @@ async function lotPaysAfterToday(tx: Tx, lotId: string, now: Date): Promise<bool
   return (result.rows[0] as { pays: boolean | null } | undefined)?.pays === true;
 }
 
-/** One `booking-debit` and the lot it drew from, for the return. */
+/** The ledger row one check-in event's transaction wrote for its share. */
+export interface EventLedgerRow {
+  id: string;
+  reason: 'booking-debit' | 'settlement-return';
+  lotId: string | null;
+  ownerId: string;
+  location: LocationKey;
+  mode: BookingMode;
+  tier: CreditTier;
+}
+
+/**
+ * What one check-in event's transaction wrote to the ledger: the row that names it in
+ * `checkin_event_id` (M5.10's link; a re-check-in's re-debit, a ticked check-out's or a
+ * settling verb's return). At most one, by `credit_ledger_checkin_event_uidx`. Never
+ * inferred from `created_at`, which is the transaction's start and display only
+ * (designs/p20-event-ledger-link.md §1, Fable L1).
+ */
+export async function findWrittenByEvent(tx: Tx, eventId: string): Promise<EventLedgerRow[]> {
+  const result = await tx.execute(sql`
+    SELECT id, reason::text AS reason, lot_id AS "lotId", owner_id AS "ownerId", location,
+           mode, tier
+      FROM credit_ledger
+     WHERE checkin_event_id = ${eventId}
+  `);
+  return result.rows as unknown as EventLedgerRow[];
+}
+
+/**
+ * The credits each event's own transaction returned, on these bookings: every return
+ * that names its event, summed by that event. What `CheckinEventWire.settlement
+ * .returned_credits` reports (D15), never a recomputation from today's fractions.
+ */
+export async function findReturnsByEvent(
+  runner: Tx | typeof db,
+  bookingIds: readonly string[],
+): Promise<{ eventId: string; credits: number }[]> {
+  if (bookingIds.length === 0) return [];
+  const result = await runner.execute(sql`
+    SELECT checkin_event_id AS "eventId", sum(delta)::int AS credits
+      FROM credit_ledger
+     WHERE booking_id IN (SELECT unnest(string_to_array(${bookingIds.join(',')}, ',')::uuid[]))
+       AND reason = 'settlement-return' AND checkin_event_id IS NOT NULL
+     GROUP BY checkin_event_id
+  `);
+  return result.rows as { eventId: string; credits: number }[];
+}
+
+/**
+ * Where a return landed, read after the write, for the owner's notice (§2.9's credit
+ * line): its own lot (the debit's, or the fresh one-credit lot it is), that lot's date,
+ * and whether that lot counts now. `live` false is the one case a credit lands dead:
+ * `cred.returned_credit_expiry_months` 0 and a lot already past its date.
+ */
+export interface ReturnLanding {
+  lotId: string;
+  location: LocationKey;
+  mode: BookingMode;
+  expiresAt: string;
+  live: boolean;
+}
+
+export async function findReturnLanding(
+  runner: Tx | typeof db,
+  returnId: string,
+): Promise<ReturnLanding> {
+  const result = await runner.execute(sql`
+    SELECT lot.id AS "lotId", lot.location, lot.mode, lot.expires_at AS "expiresAt",
+           lot_is_live(lot.expires_at) AS live
+      FROM credit_ledger r
+      JOIN credit_ledger lot ON lot.id = COALESCE(r.lot_id, r.id)
+     WHERE r.id = ${returnId}
+  `);
+  const row = result.rows[0] as ReturnLanding | undefined;
+  if (row === undefined) throw new Error(`return ${returnId} has no lot to land in`);
+  return row;
+}
+
+/** One live `booking-debit` and the lot it drew from, for the return. */
 export interface BookingDebitForRefund {
+  /** The debit's own id: what the return names in `reverses_entry_id`. */
+  id: string;
+  bookingId: string;
   ownerId: string;
   /** The dog served. */
   dogId: string | null;

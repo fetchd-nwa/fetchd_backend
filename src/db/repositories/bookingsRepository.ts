@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { bookingAttendance, bookingDogs, bookings } from '../schema/schema.js';
+import { bookingDogs, bookings } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { BookingStatus, LocationKey } from '../../lib/bookingWire.js';
@@ -81,6 +81,11 @@ export interface BookingDogJoinRow {
   bookingId: string;
   dogId: string;
   isLead: boolean;
+}
+
+/** A share, live or cancelled alone: `expiredAt` is the one-dog cancel's stamp. */
+export interface BookingShareRow extends BookingDogJoinRow {
+  expiredAt: string | null;
 }
 
 /**
@@ -427,9 +432,106 @@ export const bookingsRepository = {
   },
 
   /**
+   * Every share of a batch of bookings, the ones cancelled alone included (their
+   * `expiredAt` set): what `BookingWire.dog_shares` lists and what
+   * `lib/bookingWire.groupBookingDogs` groups (P20 D3). Through the caller's transaction
+   * when it wrote them.
+   */
+  async findSharesByBookingIds(
+    runner: Tx | typeof db,
+    bookingIds: string[],
+  ): Promise<BookingShareRow[]> {
+    if (bookingIds.length === 0) return [];
+    return runner
+      .select({
+        bookingId: bookingDogs.bookingId,
+        dogId: bookingDogs.dogId,
+        isLead: bookingDogs.isLead,
+        expiredAt: bookingDogs.expiredAt,
+      })
+      .from(bookingDogs)
+      .where(inArray(bookingDogs.bookingId, bookingIds));
+  },
+
+  /** One share, live or cancelled alone, in the transaction. `undefined`: never on it. */
+  async findShareInTx(
+    tx: Tx,
+    bookingId: string,
+    dogId: string,
+  ): Promise<BookingShareRow | undefined> {
+    const [row] = await tx
+      .select({
+        bookingId: bookingDogs.bookingId,
+        dogId: bookingDogs.dogId,
+        isLead: bookingDogs.isLead,
+        expiredAt: bookingDogs.expiredAt,
+      })
+      .from(bookingDogs)
+      .where(and(eq(bookingDogs.bookingId, bookingId), eq(bookingDogs.dogId, dogId)));
+    return row;
+  },
+
+  /**
+   * The one-dog cancel's soft unlink (s11; the existing `expired_at`, which the seat count
+   * and the overlap guard already read as `live`): her share leaves the session, so her
+   * seat is free. Under the booking row lock.
+   */
+  async stampShareCancelled(
+    tx: Tx,
+    args: { bookingId: string; dogId: string; now: Date },
+  ): Promise<void> {
+    await tx
+      .update(bookingDogs)
+      .set({ expiredAt: args.now.toISOString() })
+      .where(and(eq(bookingDogs.bookingId, args.bookingId), eq(bookingDogs.dogId, args.dogId)));
+  },
+
+  /**
+   * The session goes with its last live dog (s11): cancelled, nothing forfeited (a one-dog
+   * cancel always returns the credit, D21), by whoever cancelled her. No reason: a share's
+   * reason is not stored (`PostStaffBookingsDogsCancelRequest`).
+   */
+  async markCancelledWithLastDog(
+    tx: Tx,
+    args: { id: string; cancelledBy: 'owner' | 'staff'; now: Date },
+  ): Promise<void> {
+    await tx
+      .update(bookings)
+      .set({
+        status: 'cancelled',
+        cancelledAt: args.now.toISOString(),
+        cancelForfeited: false,
+        cancelledBy: args.cancelledBy,
+        cancelReason: null,
+      })
+      .where(eq(bookings.id, args.id));
+  },
+
+  /**
+   * The board's rows (DAY-U29): every live day-school and day-care session at one campus
+   * on one Chicago date that is not cancelled, `upcoming` or a top-up's
+   * `payment-pending` (P20 D18). Its live shares are the board's rows.
+   */
+  async findBoardSessions(location: LocationKey, chicagoDate: string): Promise<BookingFullRow[]> {
+    return db
+      .select(BOOKING_FULL_PROJECTION)
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.location, location),
+          inArray(bookings.category, ['day-school', 'day-care']),
+          inArray(bookings.status, ['upcoming', 'payment-pending']),
+          live(bookings),
+          sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date = ${chicagoDate}::date`,
+        ),
+      );
+  },
+
+  /**
    * Resolve booking_dogs rows for a batch of booking ids — lead +
-   * additional per booking. Caller groups via
-   * `lib/bookingWire.groupBookingDogs` for snapshot-stable ordering.
+   * additional per booking, LIVE shares only: the dogs still coming, what a notice's
+   * dog chips and a reminder name. The wire reads every share
+   * ({@link findSharesByBookingIds}).
    */
   async findDogsByBookingIds(bookingIds: string[]): Promise<BookingDogJoinRow[]> {
     if (bookingIds.length === 0) return [];
@@ -721,8 +823,9 @@ export const bookingsRepository = {
   },
 
   // -------------------------------------------------------------------
-  // Day 19 — staff portal verb 4 (confirm + per-dog attendance). The
-  // shared cancel txn lives in `lib/cancelBookingService.ts`.
+  // Day 19 — staff portal verb 4 (confirm). The shared cancel txn lives in
+  // `lib/cancelBookingService.ts`; the board's verbs write `checkin_events`
+  // (`checkinEventsRepository`), never this table (M5.12).
   // -------------------------------------------------------------------
 
   /**
@@ -781,41 +884,5 @@ export const bookingsRepository = {
         );
     }
     return row.id;
-  },
-
-  /**
-   * Record a per-dog check-in (Day-19 attendance). Sets `attendance`,
-   * `checked_in_at = now()`, and the acting `checked_in_by_staff_id` on
-   * the `booking_dogs` row, returning the resolved `attendance` +
-   * `checkedInAt` for the wire. `undefined` when the (booking, dog) pair
-   * isn't on the roster — the route 404s on that (the `RETURNING` folds
-   * the existence check into the write). The route validates `status` to
-   * the non-'pending' subset before calling.
-   */
-  async setAttendance(
-    tx: Tx,
-    args: {
-      bookingId: string;
-      dogId: string;
-      status: (typeof bookingAttendance.enumValues)[number];
-      staffId: string;
-    },
-  ): Promise<
-    { attendance: (typeof bookingAttendance.enumValues)[number]; checkedInAt: string } | undefined
-  > {
-    const [row] = await tx
-      .update(bookingDogs)
-      .set({
-        attendance: args.status,
-        checkedInAt: sql`now()`,
-        checkedInByStaffId: args.staffId,
-      })
-      .where(and(eq(bookingDogs.bookingId, args.bookingId), eq(bookingDogs.dogId, args.dogId)))
-      .returning({
-        attendance: bookingDogs.attendance,
-        checkedInAt: bookingDogs.checkedInAt,
-      });
-    if (row === undefined || row.checkedInAt === null) return undefined;
-    return { attendance: row.attendance, checkedInAt: row.checkedInAt };
   },
 };

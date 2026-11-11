@@ -51,19 +51,49 @@ async function debit(lotId: string, bookingId: string): Promise<void> {
       lotId,
       dogId: FIXTURE_IDS.dog1Id,
       bookingId,
+      checkinEventId: null,
     }),
   );
 }
 
-/** The single cancel-refund row for `bookingId`. */
+/** The single settlement-return row for `bookingId`. */
 async function refundRow(
   bookingId: string,
 ): Promise<{ lotId: string | null; expiresAt: string | null } | undefined> {
   const [row] = await db
     .select({ lotId: creditLedger.lotId, expiresAt: creditLedger.expiresAt })
     .from(creditLedger)
-    .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'cancel-refund')));
+    .where(
+      and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+    );
   return row;
+}
+
+/**
+ * dog1's live debit on `bookingId`, back through the one return writer, which names it
+ * (M5.10's `reverses_entry_id`). Asserts the return names exactly that debit.
+ */
+async function returnTheDebit(bookingId: string): Promise<void> {
+  const debitId = await db.transaction(async (tx) => {
+    const [live] = await creditLedgerRepository.findLiveDebits(tx, {
+      bookingId,
+      dogId: FIXTURE_IDS.dog1Id,
+    });
+    assert.ok(live !== undefined, 'the debit is live');
+    await creditLedgerRepository.refundForBooking(tx, {
+      ...live,
+      now: new Date(),
+      checkinEventId: null,
+    });
+    return live.id;
+  });
+  const [ret] = await db
+    .select({ reversesEntryId: creditLedger.reversesEntryId })
+    .from(creditLedger)
+    .where(
+      and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
+    );
+  assert.equal(ret?.reversesEntryId, debitId);
 }
 
 async function liveRemaining(): Promise<[string, number][]> {
@@ -105,15 +135,7 @@ test(
     await debit(lot, FIXTURE_IDS.booking1Id);
     assert.equal(await poolBalance(), 1);
 
-    await db.transaction((tx) =>
-      creditLedgerRepository.refundForBooking(tx, {
-        ...POOL,
-        dogId: FIXTURE_IDS.dog1Id,
-        lotId: lot,
-        bookingId: FIXTURE_IDS.booking1Id,
-        now: new Date(),
-      }),
-    );
+    await returnTheDebit(FIXTURE_IDS.booking1Id);
 
     const row = await refundRow(FIXTURE_IDS.booking1Id);
     assert.equal(row?.lotId, lot, 'refund is tagged back to the original lot');
@@ -130,15 +152,7 @@ test(
     await debit(expiredLot, FIXTURE_IDS.booking1Id);
     assert.equal(await poolBalance(), 0, 'expired lot and its debit both excluded');
 
-    await db.transaction((tx) =>
-      creditLedgerRepository.refundForBooking(tx, {
-        ...POOL,
-        dogId: FIXTURE_IDS.dog1Id,
-        lotId: expiredLot,
-        bookingId: FIXTURE_IDS.booking1Id,
-        now: new Date(),
-      }),
-    );
+    await returnTheDebit(FIXTURE_IDS.booking1Id);
 
     const row = await refundRow(FIXTURE_IDS.booking1Id);
     assert.equal(row?.lotId, null, 'expired-lot refund mints a fresh source (lot_id null)');
@@ -185,7 +199,13 @@ test(
         await lockPools(tx, [POOL]);
         const [lot] = await findLiveLots(tx, POOL);
         if (lot === undefined) throw new Error('the pool read empty under its lock');
-        await creditLedgerRepository.debitLot(tx, { ...POOL, lotId: lot.id, dogId, bookingId });
+        await creditLedgerRepository.debitLot(tx, {
+          ...POOL,
+          lotId: lot.id,
+          dogId,
+          bookingId,
+          checkinEventId: null,
+        });
       });
     await Promise.all([
       debitOnce(FIXTURE_IDS.dog1Id, FIXTURE_IDS.booking1Id),

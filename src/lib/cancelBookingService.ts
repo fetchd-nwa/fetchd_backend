@@ -1,15 +1,31 @@
 import { db } from '../db/client.js';
-import { lockCharge } from '../db/locks.js';
-import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
+import { lockCharge, lockPools } from '../db/locks.js';
+import { bookingsRepository, type BookingFullRow } from '../db/repositories/bookingsRepository.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
+import { checkinEventsRepository } from '../db/repositories/checkinEventsRepository.js';
+import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
 import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import type { Tx } from '../db/tx.js';
-import type { BookingWire } from './bookingWire.js';
+import { groupBookingDogs, type BookingWire } from './bookingWire.js';
 import { askWhatWon, cancelOrderInTx, type WhatWon } from './cancelOrder.js';
 import { readEngineBudget, type EngineLog } from './confirmCharge.js';
+import {
+  dayHasEnded,
+  isDayProgram,
+  pickupCloseByCampus,
+  refuseDayCancel,
+  sessionCheckedInError,
+  sessionDate,
+  sessionEndedError,
+  statesByDog,
+} from './dayCancel.js';
 import { ApiError } from './errors.js';
 import {
+  noLiveDebit,
   noticeBookingCancelled,
+  noticeCreditReturned,
   returnDebitsToLots,
   tearDownBookingReminders,
 } from './orderRows.js';
@@ -18,6 +34,7 @@ import {
   type PendingStripeRefund,
   type UnroutableRefundMint,
 } from './pendingRefund.js';
+import { pgTimestampToIso } from './pgTimestamp.js';
 import type { StripeClient } from './stripe.js';
 import { wireManyBookings } from './wireManyBookings.js';
 
@@ -151,13 +168,18 @@ export async function cancelBookingInTx(
       now,
     });
     return {
-      wire: await wireOne(tx, id),
+      wire: await wireOne(tx, id, { now, viewer: viewerOf(requireOwnerId) }),
       pendingStripeRefund: cancelled.act.pendingStripeRefund,
       ...(cancelled.cancelled?.creditRefundedOwnerId !== undefined
         ? { creditRefundedOwnerId: cancelled.cancelled.creditRefundedOwnerId }
         : {}),
     };
   }
+
+  // 3b. A day session (CXL-U09, D12): once its day has ended it is settled only by
+  //     *Didn't come* or a hand credit, and while any dog still on it has folded past
+  //     `expected` it is the board's (an undone check-in does not count).
+  const liveDogIds = isDayProgram(row.category) ? await refuseDayCancel(tx, row, now) : [];
 
   // 4. Soft-cancel. `cancelForfeited` is computed in SQL against the
   //    stamped `cancel_deadline_at` and the caller's `now`; the resolved
@@ -177,10 +199,13 @@ export async function cancelBookingInTx(
   let unroutableRefund: UnroutableRefundMint | undefined;
   let creditRefundedOwnerId: string | undefined;
   if (!updated.cancelForfeited) {
-    // CREDIT-BACK: one +1 refund row per original debit, routed back to the lot it
+    // CREDIT-BACK: one +1 `settlement-return` per live debit, routed back to the lot it
     // drew from. `now` is the caller's cancel instant, so the lot the refund lands in
-    // is dated by the same clock the forfeit check used.
-    creditRefundedOwnerId = await returnDebitsToLots(tx, { bookingIds: [id], now });
+    // is dated by the same clock the forfeit check used. A day session's every live
+    // share must hold one (design §2.3:2502-2505), or the cancel is a 500 and an alarm.
+    creditRefundedOwnerId = isDayProgram(row.category)
+      ? await returnDayShares(tx, { bookingId: id, liveDogIds, now, log })
+      : await returnDebitsToLots(tx, { bookingIds: [id], now });
     if (creditRefundedOwnerId === undefined) {
       const charge = await chargesRepository.findSucceededForBooking(tx, id);
       if (charge !== undefined) {
@@ -279,7 +304,7 @@ export async function cancelBookingInTx(
 
   // 8. Wire the updated row for the response.
   return {
-    wire: await wireOne(tx, id),
+    wire: await wireOne(tx, id, { now, viewer: viewerOf(requireOwnerId) }),
     pendingStripeRefund,
     unroutableRefund,
     ...(creditRefundedOwnerId !== undefined ? { creditRefundedOwnerId } : {}),
@@ -305,12 +330,47 @@ function assertCancellable<
   }
 }
 
-async function wireOne(tx: Tx, id: string): Promise<BookingWire> {
+function viewerOf(requireOwnerId: string | null): 'owner' | 'staff' {
+  return requireOwnerId === null ? 'staff' : 'owner';
+}
+
+/**
+ * A day session's credits back, one per dog still on it, each through the one return
+ * writer to the lot its live debit drew from. A live share with no live debit is the
+ * alarm (design §2.3:2502-2505), never "moves nothing". Answers the owner credited.
+ */
+async function returnDayShares(
+  tx: Tx,
+  args: { bookingId: string; liveDogIds: readonly string[]; now: Date; log: EngineLog },
+): Promise<string | undefined> {
+  const debits = await creditLedgerRepository.findLiveDebits(tx, { bookingId: args.bookingId });
+  const owed = args.liveDogIds.map((dogId) => {
+    const debit = debits.find((d) => d.dogId === dogId);
+    if (debit === undefined) throw noLiveDebit(args.log, { bookingId: args.bookingId, dogId });
+    return debit;
+  });
+  await lockPools(tx, owed);
+  for (const debit of owed) {
+    // A cancel's return names no check-in event (M5.10's link is the board verbs').
+    await creditLedgerRepository.refundForBooking(tx, {
+      ...debit,
+      now: args.now,
+      checkinEventId: null,
+    });
+  }
+  return owed[0]?.ownerId;
+}
+
+async function wireOne(
+  tx: Tx,
+  id: string,
+  context: { now: Date; viewer: 'owner' | 'staff' },
+): Promise<BookingWire> {
   const updated = await bookingsRepository.findFullByIdInTx(tx, id);
   if (updated === undefined) {
     throw new Error(`cancelBooking ${id}: row vanished after mark-cancelled`);
   }
-  const [wire] = await wireManyBookings([updated]);
+  const [wire] = await wireManyBookings([updated], { ...context, runner: tx });
   if (wire === undefined) {
     throw new Error(`cancelBooking ${id}: wire assembly returned no row`);
   }
@@ -336,4 +396,164 @@ export async function askWhatWonForPendingRow(args: {
   const charge = await chargesRepository.findEngineByOrderId(db, row.orderId);
   if (charge === undefined) return undefined;
   return askWhatWon({ charge, stripe: args.stripe, budget: await readEngineBudget() });
+}
+
+export interface CancelOneDogResult {
+  wire: BookingWire;
+  /** The owner credited back: the route wipes her balance cache post-commit. */
+  creditRefundedOwnerId: string;
+  /** The session's campus: her seat is free, so the route wipes `avail:{location}:*`. */
+  location: string | null;
+}
+
+/**
+ * One dog of several (s11; CXL-U09; design §1.1:1068-1075, §2.3:2429-2447; P20 notes D3,
+ * D12-D14, D21): the owner's `POST /bookings/:id/dogs/:dogId/cancel` and the staff's
+ * `POST /staff/bookings/:id/dogs/:dogId/cancel`, one transaction. It takes the same locks
+ * in the same order as {@link cancelBookingInTx} (the order's charge on a top-up day,
+ * then the row, then the pool), refuses in D12's order, then stamps her share cancelled
+ * (her seat is free), returns her one live debit through the one return writer to the lot
+ * it drew from (into the owner's pool, the family's, never the dog's), and queues the
+ * owner's notice naming her alone. When she is the last dog still on it the session goes
+ * with her, `cancelled` in this transaction with its reminders torn down, and she keeps
+ * her share, so a cancelled session always has a dog (D3); while another dog stays, a
+ * queued reminder that named her names the dog who leads now. It always returns the
+ * credit: no window and no forfeit (D21).
+ */
+export async function cancelOneDogInTx(
+  tx: Tx,
+  args: {
+    id: string;
+    dogId: string;
+    requireOwnerId: string | null;
+    cancelledBy: 'owner' | 'staff';
+    now: Date;
+    log: EngineLog;
+  },
+): Promise<CancelOneDogResult> {
+  const { id, dogId, requireOwnerId, now, log } = args;
+
+  // 1. On a plain read: the 404s (not found, expired, not hers, a dog never on it), the
+  //    day-program refusal, and the owner's switch.
+  const seen = await bookingsRepository.findFullByIdInTx(tx, id);
+  assertOneDogCancellable(seen, id, requireOwnerId);
+  if ((await bookingsRepository.findShareInTx(tx, id, dogId)) === undefined) {
+    throw new ApiError('not_found', `dog ${dogId} is not on booking ${id}`);
+  }
+  if (requireOwnerId !== null && !(await settingsRepository.perDogCancelEnabled(tx))) {
+    throw new ApiError('per_dog_cancel_off', 'cancelling one dog of a day is switched off');
+  }
+
+  // 2. The lock order: charge, then the row, then the pool (`db/locks.ts`).
+  if (seen.orderId !== null) {
+    const charge = await chargesRepository.findEngineByOrderId(tx, seen.orderId);
+    if (charge !== undefined) await lockCharge(tx, charge.id);
+  }
+  const row = await bookingsRepository.lockById(tx, id);
+  assertOneDogCancellable(row, id, requireOwnerId);
+  const share = await bookingsRepository.findShareInTx(tx, id, dogId);
+  if (share === undefined) throw new ApiError('not_found', `dog ${dogId} is not on booking ${id}`);
+
+  // 3. Under the lock, in D12's order.
+  if (row.status === 'cancelled' || share.expiredAt !== null) {
+    throw new ApiError('session_cancelled', `dog ${dogId}'s session ${id} is already cancelled`);
+  }
+  if (row.status === 'payment-pending') {
+    throw new ApiError(
+      'payment_pending',
+      `booking ${id} waits on its top-up's charge: cancel the whole order instead`,
+    );
+  }
+  if (dayHasEnded(row, await pickupCloseByCampus(tx), now)) {
+    throw sessionEndedError(id, sessionDate(row.scheduledAt));
+  }
+  const states = statesByDog(await checkinEventsRepository.findForBookings(tx, [id]));
+  if ((states.get(dogId) ?? 'expected') !== 'expected') throw sessionCheckedInError(id, dogId);
+
+  // 4. Her share leaves, or the session goes with its last dog.
+  const shares = await bookingsRepository.findSharesByBookingIds(tx, [id]);
+  const othersStaying = shares.some((s) => s.dogId !== dogId && s.expiredAt === null);
+  if (othersStaying) {
+    await bookingsRepository.stampShareCancelled(tx, { bookingId: id, dogId, now });
+    await repointDayReminder(tx, id, dogId);
+  } else {
+    await bookingsRepository.markCancelledWithLastDog(tx, {
+      id,
+      cancelledBy: args.cancelledBy,
+      now,
+    });
+    await tearDownBookingReminders(tx, id);
+  }
+
+  // 5. Her credit back: her live debit, never another dog's.
+  const [debit] = await creditLedgerRepository.findLiveDebits(tx, { bookingId: id, dogId });
+  if (debit === undefined) throw noLiveDebit(log, { bookingId: id, dogId });
+  await lockPools(tx, [debit]);
+  const returned = await creditLedgerRepository.refundForBooking(tx, {
+    ...debit,
+    now,
+    checkinEventId: null,
+  });
+
+  // 6. The owner's notice, naming her alone, in its own savepoint.
+  await noticeCreditReturned(tx, {
+    bookingId: id,
+    ownerId: row.ownerId,
+    dogId,
+    returnId: returned.id,
+    who: {
+      kind: 'one-dog',
+      by: args.cancelledBy,
+      category: row.category as 'day-school' | 'day-care',
+      scheduledAtIso: pgTimestampToIso(row.scheduledAt),
+    },
+    log,
+  });
+
+  return {
+    wire: await wireOne(tx, id, { now, viewer: viewerOf(requireOwnerId) }),
+    creditRefundedOwnerId: debit.ownerId,
+    location: row.location,
+  };
+}
+
+/**
+ * D3 for the queue (P20 fix 1, Opus L1): when the dog cancelled alone is the one the day's
+ * queued reminder names (booking creation queues it with the lead,
+ * `enqueueBookingReminders`), it names the dog who leads now, D3's first remaining dog,
+ * so the feed row it becomes never shows a dog who is not coming. A reminder naming
+ * another dog, or already sent, is left alone. In the cancel's transaction, after her
+ * share is stamped.
+ */
+async function repointDayReminder(
+  tx: Tx,
+  bookingId: string,
+  cancelledDogId: string,
+): Promise<void> {
+  const shares = await bookingsRepository.findSharesByBookingIds(tx, [bookingId]);
+  const lead = groupBookingDogs(shares).get(bookingId)?.lead;
+  if (lead === undefined) throw new Error(`booking ${bookingId} has no dog left to lead`);
+  await scheduledNotificationsRepository.repointPendingDog(tx, {
+    dedupeKey: `booking-reminder:${bookingId}`,
+    fromDogId: cancelledDogId,
+    toDogId: lead,
+  });
+}
+
+/** The one-dog cancel's 404 collapse, then its day-program refusal (D12). */
+function assertOneDogCancellable(
+  row: BookingFullRow | undefined,
+  id: string,
+  requireOwnerId: string | null,
+): asserts row is BookingFullRow {
+  if (
+    row === undefined ||
+    row.expiredAt !== null ||
+    (requireOwnerId !== null && row.ownerId !== requireOwnerId)
+  ) {
+    throw new ApiError('not_found', `booking ${id} not found`);
+  }
+  if (!isDayProgram(row.category)) {
+    throw new ApiError('invalid_payload', `booking ${id} is not a day-school or day-care session`);
+  }
 }

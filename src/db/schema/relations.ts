@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm/relations";
-import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs } from "./schema.js";
+import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs, checkinEvents } from "./schema.js";
 
 export const ownersRelations = relations(owners, ({one, many}) => ({
 	location: one(locations, {
@@ -54,7 +54,7 @@ export const staffRelations = relations(staff, ({one, many}) => ({
 	threads: many(threads),
 	messages: many(messages),
 	notifications: many(notifications),
-	bookingDogs: many(bookingDogs),
+	checkinEvents: many(checkinEvents),
 }));
 
 export const dogsRelations = relations(dogs, ({one, many}) => ({
@@ -650,7 +650,7 @@ export const dayCapacityRelations = relations(dayCapacity, ({one}) => ({
 	}),
 }));
 
-export const bookingDogsRelations = relations(bookingDogs, ({one}) => ({
+export const bookingDogsRelations = relations(bookingDogs, ({one, many}) => ({
 	booking: one(bookings, {
 		fields: [bookingDogs.bookingId],
 		references: [bookings.id]
@@ -659,8 +659,16 @@ export const bookingDogsRelations = relations(bookingDogs, ({one}) => ({
 		fields: [bookingDogs.dogId],
 		references: [dogs.id]
 	}),
+	checkinEvents: many(checkinEvents),
+}));
+// M5.01: one dog's share of one session, and the staffer who tapped.
+export const checkinEventsRelations = relations(checkinEvents, ({one}) => ({
+	bookingDog: one(bookingDogs, {
+		fields: [checkinEvents.bookingId, checkinEvents.dogId],
+		references: [bookingDogs.bookingId, bookingDogs.dogId]
+	}),
 	staff: one(staff, {
-		fields: [bookingDogs.checkedInByStaffId],
+		fields: [checkinEvents.byStaffId],
 		references: [staff.id]
 	}),
 }));

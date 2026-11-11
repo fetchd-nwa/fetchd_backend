@@ -12,6 +12,101 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [6.0.0-lg5.1] — 2026-11-11
+
+BREAKING. LG5's first of three steps toward 6.0.0 (plan unit P20, slices S29 then
+S30; ledger DAY-U29, DAY-U33, DAY-U40, CXL-U09, with no wire of their own DAY-U30,
+DAY-U34, DAY-U36, DAY-U57, DOG-U40, CXL-U10, CXL-U11; migrations M5.01, M5.02, M5.03,
+M5.07, M5.10, M5.12; design §1.1 6.0.0, `designs/fetchd-v1-technical-design.md:1027-1049`,
+`:1064-1082`; §2.3 `:2354-2550`; §2.4 `:2953-2977`; §2.10 `:5051-5069`). 6.0.0-lg5.1
+lands for clients when P20 is gate-green and pushed on `v1/build`. Contract-first: the
+routes keep today's behaviour until P20's backend lands them. Resync both clients
+(`npm run sync:contracts` in mobile and portal). Against the resynced copy (a scratch
+run at P19's working trees, not their gates) the backend fails 5 times in 3 files,
+the portal 2 times in 2 files, and mobile typechecks unchanged. Mobile is 0 because
+nothing there types the attendance surface or the new cancel answers: its cancel
+callers treat every refusal as a lost connection, which only a test reaches.
+
+Breaking:
+
+- `POST /staff/bookings/:id/attendance` and `PostStaffBookingsAttendanceRequest`
+  removed. Check-in is an append-only log written by six verbs, `POST
+  /staff/bookings/:id/dogs/:dogId/{check-in | check-out | undo | turn-away | send-home
+  | no-show}`, each with an `Idempotency-Key`, each answering 200 `AttendanceWire`
+  (DAY-U29, DAY-U33). `no-show` is the board's *Didn't come*, recordable from
+  `day.pickup_close_time` on the session's date.
+- `AttendanceWire` is `{status, events: CheckinEventWire[]}`; `booking_id`, `dog_id`,
+  `attendance` and `checked_in_at` removed.
+- `AttendanceStatus` is the folded state `'expected' | 'in' | 'out' | 'turned-away' |
+  'sent-home' | 'no-show'`; `'attended'` and `'excused'` removed. No pgEnum backs it
+  any more (M5.12 drops `booking_attendance`).
+- `CreditLotDetailWire.reason` is `'purchase' | 'adjustment' | 'settlement-return'`;
+  `'cancel-refund'` removed (M5.03). Every return writes `'settlement-return'` from
+  this version, and a lot written as `'cancel-refund'` before it reads
+  `'settlement-return'`.
+
+Added:
+
+- `CheckinEventKind` (the `checkin_event_kind` pgEnum, M5.01: six kinds, no
+  `attended`, no `hand-off`) and `CheckinEventWire {id, booking_id, dog_id, kind, at,
+  by_staff_id, undoes_event_id?, training_completed?, reissue_credit?, note?,
+  settlement?: {returned_credits}}`.
+- `PostStaffBookingsDogsCheckOutRequest {note?, reissue_credit?}` (s09, s10) and
+  `PostStaffBookingsDogsSendHomeRequest {training_completed?}`, each box omitted =
+  unticked.
+- `GET /staff/checkin-board?location&date` (`GetStaffCheckinBoardQuery`) →
+  `GetStaffCheckinBoardResponse = CheckinBoardWire[]`, one row per share: `booking_id`,
+  `dog_id`, `state`, `events`, `booking_status`, `late_pickup_due`, `settled`,
+  `can_cancel`, `payment_pending`, `gate_warnings` (DAY-U29, DAY-U33, DAY-U40).
+  `gate_warnings` sends `'vaccine_lapsed'` from this version; `'spay_neuter_overdue'`
+  is typed and sent from P09, and `'reevaluation_due'` typed and sent once S14 lands.
+- One dog of several (CXL-U09, s11): `POST /bookings/:id/dogs/:dogId/cancel` (owner, no
+  body) and `POST /staff/bookings/:id/dogs/:dogId/cancel`
+  (`PostStaffBookingsDogsCancelRequest {reason}`, any role), each → 200 `BookingWire`.
+- `BookingWire.can_cancel?` and `BookingWire.dog_shares?: {dog_id, can_cancel,
+  cancelled_at?}[]` on day-school and day-care rows (CXL-U09, CXL-U10).
+- `ApiErrorCode` gains eight, the 41st to the 48th, appended, each 409:
+  `session_checked_in`, `session_ended`, `session_cancelled`, `payment_pending`,
+  `per_dog_cancel_off`, `attendance_state_conflict`, `session_not_today`,
+  `no_show_too_early`. Four carry `details`, appended to `ApiErrorDetailWire`:
+  `SessionEndedDetails {date}`, `AttendanceStateConflictDetails {state}`,
+  `SessionNotTodayDetails {date}`, `NoShowTooEarlyDetails {recordable_from}`.
+
+Changed (live, no shape change):
+
+- `POST /bookings/:id/cancel` and `POST /staff/bookings/:id/cancel` refuse an
+  `'upcoming'` day-school or day-care session with 409 `session_ended` once its day
+  has ended, then 409 `session_checked_in` while any dog still on it is past
+  `'expected'` (CXL-U09). A pending row still cancels its whole order.
+- `BookingWire.dog_id` and `additional_dog_ids` list only the dogs whose shares were
+  not cancelled alone; when the lead is cancelled alone, the first remaining dog is
+  `dog_id`.
+- `DogWire.last_seen_on` is stamped by a board check-in and restored by its undo.
+
+Not typed here: P21's `after_school` (on the board row and on `dog_shares`), the
+`cxl` settings domain and `CancellationPolicyWire` (CXL-U02; M5.07's tables land here
+with no settings route over them), `GET /staff/owners/:ownerId/bookings` (CXL-U04) and
+the removal of the cancel window; P22's refunds; P26's walk-in; design 8.0.0's
+`draft_report_id?`; P09's evaluation-row arms.
+
+### Documentation
+
+- `DayProgramGlobalSettingsWire.sent_home_before_training_return_fraction`: a PATCH
+  refuses any value but 0 or 1, as on the after-training key (design §2.3:2482-2483,
+  question 20 (a)). Both fractions name their readers.
+- `BookingStatus`: a one-dog cancel and every board verb answer 409 `payment_pending`
+  on a pending row.
+- The settings block says where M5.07's two tables stand until `cxl` joins.
+- The landing-group note names 6.0.0-lg5.1.
+
+- `POST /staff/orders/:id/cancel` on a settled top-up refuses a day the desk checked in (409
+  `session_checked_in`) or a day already over (409 `session_ended {kind, date}`), earliest day first, writing
+  nothing: the day cancels' own rule on the third cancel path (doc only; both codes were already typed).
+- Doc only: `BookingWire.date` is documented as the session's scheduled start, an ISO instant (it always
+  was; the portal had read it as a calendar day). The order cancel's `session_checked_in` names every day
+  the desk recorded, a turn-away and a *Didn't come* included.
+
+
 ## [5.0.0] — 2026-11-10
 
 ADDITIVE. LG4's close (plan unit P19, slice S26: CRED-U32, ALUM-U11, ALUM-U13;

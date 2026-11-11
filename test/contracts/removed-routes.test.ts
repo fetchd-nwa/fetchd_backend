@@ -45,6 +45,9 @@ const REMOVED: ReadonlyArray<{ method: 'GET' | 'POST' | 'DELETE'; url: string }>
   { method: 'POST', url: `/staff/memberships/${ANY_ID}/resume` },
   { method: 'GET', url: '/staff/invoices?parked' },
   { method: 'POST', url: `/staff/dogs/${ANY_ID}/clear-alumni-flag` },
+  // 6.0.0-lg5.1 (P20; DAY-U29, M5.12): the overwritable attendance verb, replaced by the
+  // board's append-only log.
+  { method: 'POST', url: `/staff/bookings/${ANY_ID}/attendance` },
 ];
 
 for (const { method, url } of REMOVED) {
@@ -60,6 +63,8 @@ for (const { method, url } of [
   { method: 'GET', url: `/staff/invoices/${ANY_ID}` },
   { method: 'POST', url: `/invoices/${ANY_ID}/pay` },
   { method: 'GET', url: `/staff/dogs/${ANY_ID}/completed-programs` },
+  { method: 'POST', url: `/staff/bookings/${ANY_ID}/dogs/${ANY_ID}/check-in` },
+  { method: 'GET', url: '/staff/checkin-board?location=bentonville&date=2026-10-13' },
 ] as const) {
   test(`${method} ${url} is still registered`, async () => {
     const res = await app.inject({ method, url });

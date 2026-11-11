@@ -1,0 +1,13 @@
+-- migrate: no-transaction
+-- M5.03 (S29/S30, DAY-U34, CXL-U04) — `ledger_reason` gains 'settlement-return', the one return label.
+-- design §4 LG5 (design.md:6223), §2.3:2483-2486, §2.4:2957-2960. Rev.: no (Postgres has no
+-- DROP VALUE). Empty prod: nothing to move.
+--
+-- From LG5 every return writes this label: a cancel of the session or of one dog, a
+-- ticked check-out, *Didn't come*, a turn-away and an unfinished send-home. 'cancel-refund'
+-- stays in the type and is no longer written; a lot written under it reads as
+-- 'settlement-return' on the wire (P20 notes D2). The value's own committed statement:
+-- Postgres refuses a new enum value's use in the transaction that added it (55P04), and
+-- M5.10's CHECK names it, so this step runs alone and before it. `ADD VALUE` appends, so
+-- `schema.sql` lists the value last (`scripts/db/fingerprint.sql` hashes the order).
+ALTER TYPE ledger_reason ADD VALUE 'settlement-return';

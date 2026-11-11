@@ -10,5 +10,12 @@
   "location": "fayetteville",
   "cancel_deadline_at": "2026-05-21T13:00:00.000Z",
   "cancelled_at": "2026-05-18T20:00:00.000Z",
-  "cancel_forfeited": false
+  "cancel_forfeited": false,
+  "can_cancel": false,
+  "dog_shares": [
+    {
+      "dog_id": "33333333-3333-4333-8333-333333333331",
+      "can_cancel": false
+    }
+  ]
 }

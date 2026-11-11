@@ -381,6 +381,31 @@ export const scheduledNotificationsRepository = {
   },
 
   /**
+   * Re-point a still-PENDING row (a parked one included: it stays `pending`) from one dog
+   * to another, when the dog it names is no longer coming: a one-dog cancel of a session's
+   * lead (P20 fix 1, Opus L1; D3). `deliverOne` draws the feed row's dog from `dog_id`, so
+   * this is what keeps her phone from showing a dog who is not coming. Sent rows are
+   * history and stay untouched. Answers the number of rows moved.
+   */
+  async repointPendingDog(
+    tx: Tx,
+    args: { dedupeKey: string; fromDogId: string; toDogId: string },
+  ): Promise<number> {
+    const updated = await tx
+      .update(scheduledNotifications)
+      .set({ dogId: args.toDogId })
+      .where(
+        and(
+          eq(scheduledNotifications.dedupeKey, args.dedupeKey),
+          eq(scheduledNotifications.status, 'pending'),
+          eq(scheduledNotifications.dogId, args.fromDogId),
+        ),
+      )
+      .returning({ id: scheduledNotifications.id });
+    return updated.length;
+  },
+
+  /**
    * Revive a previously-CANCELLED row under the same dedupe_key — the
    * "set date A → change to B → back to A" case, where `enqueueIdempotent`
    * hits the unique dedupe_key and DO-NOTHINGs. Sent rows stay sent (a

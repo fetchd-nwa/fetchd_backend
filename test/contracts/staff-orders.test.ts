@@ -26,6 +26,7 @@ import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
 import { registerStaffOrdersRoute } from '../../src/routes/staffOrders.js';
 import { registerStripeWebhookRoute } from '../../src/routes/stripeWebhook.js';
+import { chicagoTimeOnDate } from '../../src/lib/chicagoDate.js';
 import { createFundedDog, removeDogs } from './_dayFixture.js';
 import { FIXTURE_IDS, FIXTURE_NOW, futureWeekday } from './_fixture.js';
 import {
@@ -64,15 +65,18 @@ afterEach(clearOrderRows);
 const T0 = FIXTURE_NOW();
 const LEASE_END = new Date(T0.getTime() + 150_000);
 
-function buildApp(principal: Principal = FIXTURE_STAFF_PRINCIPAL): {
+function buildApp(
+  principal: Principal = FIXTURE_STAFF_PRINCIPAL,
+  now: Date = T0,
+): {
   app: ReturnType<typeof makeContractApp>['app'];
   stripe: StripeStub;
 } {
   const { app, authenticate } = makeContractApp(principal);
   const stripe = makeStripeStub();
-  registerStaffOrdersRoute(app, { authenticate, stripe, now: () => T0 });
-  registerStaffBookingsRoute(app, { authenticate, stripe, now: () => T0 });
-  registerBookingsRoute(app, { authenticate, stripe, now: () => T0 });
+  registerStaffOrdersRoute(app, { authenticate, stripe, now: () => now });
+  registerStaffBookingsRoute(app, { authenticate, stripe, now: () => now });
+  registerBookingsRoute(app, { authenticate, stripe, now: () => now });
   registerStripeWebhookRoute(app, { stripe });
   return { app, stripe };
 }
@@ -306,6 +310,32 @@ test(
         );
       assert.equal(rowNotices.length, 1, 'one ordinary notice per row');
     }
+  },
+);
+
+test(
+  "P20 fix 1, §M2's placement (TM5): a top-up whose charge fails after its day's pickup closed still cancels its row and returns its debit",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The failure arm (no intent: failChargeInTx), which shares cancelOrderRowsInTx with
+    // the decline: the refusal lives in the settled arm only, so this must still cancel.
+    const dogId = await createFundedDog(createdDogs, 3);
+    const before = await balance(dogId);
+    const day = futureWeekday(1);
+    const { app, stripe } = buildApp(FIXTURE_STAFF_PRINCIPAL, chicagoTimeOnDate(day, '18:00'));
+    const seeded = await seedPendingBookingOrder(stripe, {
+      dogId,
+      dates: [day],
+      now: T0,
+      intentStatus: null,
+      attemptCount: 0,
+    });
+    assert.equal(await balance(dogId), before - 1);
+    const res = await cancelOrder(app, seeded.orderId);
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as PostStaffOrdersCancelResponse).outcome, 'cancelled');
+    assert.deepEqual(await statuses(seeded), ['cancelled']);
+    assert.equal(await balance(dogId), before, 'its debit back');
   },
 );
 

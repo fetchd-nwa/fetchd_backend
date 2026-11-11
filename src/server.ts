@@ -31,6 +31,7 @@ import { registerSettingsRoute } from './routes/settings.js';
 import { registerStaffAlumniRoute } from './routes/staffAlumni.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
+import { registerStaffCheckinRoute } from './routes/staffCheckin.js';
 import { registerStaffDayCapacityRoute } from './routes/staffDayCapacity.js';
 import { registerStaffCreditPackagesRoute } from './routes/staffCreditPackages.js';
 import { registerStaffCreditsRoute } from './routes/staffCredits.js';
@@ -145,7 +146,8 @@ export function buildApp(): FastifyInstance {
   registerStaffOwnersRoute(app); // [staff] — owner picker + STAFF-U13 billing reads (2.0.0)
   registerStaffRatesRoute(app); // [staff] — per-location service-rate editor (2026-06-20)
   registerStaffDogsRoute(app); // [staff] — Day-19b portal dog directory (name resolution)
-  registerStaffBookingsRoute(app); // [staff] — Day-19 portal verb 4 (confirm / cancel / attendance)
+  registerStaffBookingsRoute(app); // [staff] — Day-19 portal verb 4 (confirm / cancel / one dog)
+  registerStaffCheckinRoute(app); // [staff] — the check-in board and its verbs (6.0.0-lg5.1)
   registerStaffThreadsRoute(app); // [staff] — Day-19 portal verb 3 (thread queue + staff reply)
   registerStaffReportsRoute(app); // [staff] — Day-19 portal verb 2 (report authoring)
   registerGroupClassesRoute(app); // [auth] — catalogs (owner+staff); eligibility owner-only

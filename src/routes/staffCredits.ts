@@ -109,10 +109,19 @@ function lotNotFound(lotId: string): ApiError {
   return new ApiError('not_found', `lot ${lotId} not found`);
 }
 
+/**
+ * The lot's label on the wire (6.0.0-lg5.1, D2): `settlement-return` is every return's one
+ * label from M5.03, and a lot written as `cancel-refund` before it, on a dev volume, is the
+ * same thing, a returned credit landed as a fresh lot, so it reads as the label writers use.
+ */
+function lotReasonOnWire(reason: LotDetailRow['reason']): CreditLotDetailWire['reason'] {
+  return reason === 'cancel-refund' ? 'settlement-return' : reason;
+}
+
 function toLotWire(row: LotDetailRow): CreditLotDetailWire {
   return {
     id: row.id,
-    reason: row.reason,
+    reason: lotReasonOnWire(row.reason),
     granted: row.granted,
     remaining: row.remaining,
     granted_at: pgTimestampToIso(row.created_at),

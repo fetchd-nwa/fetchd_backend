@@ -2,6 +2,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { dogVaccines, requiredVaccines } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
+import type { db } from '../client.js';
 import type { Tx } from '../tx.js';
 
 /**
@@ -118,13 +119,16 @@ async function softExpire(tx: Tx, vid: string): Promise<DogVaccine | undefined> 
  * so this repo doesn't need to re-check.
  */
 async function findMissingForCategory(
-  tx: Tx,
+  tx: Tx | typeof db,
   dogId: string,
   category: ServiceCategory,
   /** Group-class only: the cohort's class key — requirements listing it in
    * `exempt_class_keys` are skipped (Shanthi 2026-07-14: puppy classes don't
    * require rabies). Mirrors the trigger's exemption clause exactly. */
   groupClassKey?: string,
+  /** The Chicago day the shots must cover, `YYYY-MM-DD`; today's when omitted. The board
+   *  reads its own date through this same query (P20, `gate_warnings`). */
+  onDate?: string,
 ): Promise<{ requirement_key: string; label: string }[]> {
   // Live required_vaccines whose gates_categories includes this category
   // AND for which no live, in-date dog_vaccines row exists on this dog.
@@ -144,7 +148,7 @@ async function findMissingForCategory(
         WHERE dv.dog_id = ${dogId}
           AND dv.requirement_key = rv.key
           AND dv.expired_at IS NULL
-          AND dv.expires_at >= (now() AT TIME ZONE 'America/Chicago')::date
+          AND dv.expires_at >= ${onDate !== undefined ? sql`${onDate}::date` : sql`(now() AT TIME ZONE 'America/Chicago')::date`}
       )
     ORDER BY rv.key ASC
   `);

@@ -1,4 +1,4 @@
-import { and, between, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, between, eq, inArray, ne, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import { readThrough } from '../../lib/cache.js';
 import { dayCapacityFor, type DayCapacityRule } from '../../lib/availability.js';
@@ -75,6 +75,21 @@ const DAY_CAPACITY_ROWS_SCHEMA = DAY_CAPACITY_ROW_SCHEMA.array();
  */
 export function dayCapacityCacheKey(location: LocationKey, from: string, to: string): string {
   return `avail:${location}:${from}:${to}`;
+}
+
+/**
+ * A share turned away at the door holds no seat for the rest of her day (design
+ * §2.3:2312-2313; P20 B2-4): both counts below drop a share whose log holds a `turn-away`.
+ * A turn-away cannot be undone, so its presence is the whole test. A share cancelled alone
+ * is already out of both (`live(bookingDogs)`); every other settled share (sent home, a
+ * *Didn't come*) keeps its seat, since the dog was in the building or the day is over.
+ */
+function notTurnedAway(): SQL {
+  return sql`NOT EXISTS (
+    SELECT 1 FROM checkin_events turned
+     WHERE turned.booking_id = ${bookingDogs.bookingId}
+       AND turned.dog_id = ${bookingDogs.dogId}
+       AND turned.kind = 'turn-away')`;
 }
 
 export const dayCapacityRepository = {
@@ -285,6 +300,7 @@ export const dayCapacityRepository = {
           ne(bookings.status, 'cancelled'),
           live(bookings),
           live(bookingDogs),
+          notTurnedAway(),
           // Staff dogs are capacity-exempt — same exclusion, same reason as
           // `assertCapacityWithinLock` (schema.sql lines 1192-1198).
           sql`${dogs.staffOwnerId} IS NULL`,
@@ -304,7 +320,9 @@ export const dayCapacityRepository = {
    *               (location, date))
    *   used      = count of live, non-cancelled booking_dogs for non-staff
    *               dogs on day-school and day-care bookings whose scheduled_at
-   *               bucket-to-Chicago-date equals `date` at the same location
+   *               bucket-to-Chicago-date equals `date` at the same location,
+   *               less any share turned away at the door (6.0.0-lg5.1, B2-4;
+   *               `notTurnedAway`, in BOTH counts)
    *   remaining = capacity − used
    *   if remaining < requestedCount → insufficient_capacity 422
    *
@@ -371,6 +389,7 @@ export const dayCapacityRepository = {
           ne(bookings.status, 'cancelled'),
           live(bookings),
           live(bookingDogs),
+          notTurnedAway(),
           // Staff dogs are capacity-exempt — see `dogs.capacity_exempt`
           // generated column + the three booking-gate triggers' parallel
           // exemption (schema.sql lines 1192-1198).

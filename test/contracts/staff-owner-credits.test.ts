@@ -843,7 +843,9 @@ test(
     assert.equal(purchase?.charge_id, chargeId);
     assert.equal('note' in (purchase ?? {}), false, 'omitted on a lot no staffer wrote');
     assert.equal('created_by_staff_id' in (purchase ?? {}), false);
-    assert.equal(byId.get(returned[0]?.id as string)?.reason, 'cancel-refund');
+    // D2 (6.0.0-lg5.1): a lot written as `cancel-refund` before P20 reads as the one
+    // return label every writer now uses.
+    assert.equal(byId.get(returned[0]?.id as string)?.reason, 'settlement-return');
     await db.delete(creditLedger).where(eq(creditLedger.chargeId, chargeId));
   },
 );

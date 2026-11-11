@@ -31,7 +31,8 @@ export const SEED = {
   bookingBrodieBoardingId: 'b0070000-0000-4000-8000-000000000003',
   bookingGroupWalkId: 'b0070000-0000-4000-8000-000000000004',
   // Past ATTENDED day programs — one per dog, ~2 weeks back, ordinary past
-  // bookings. No booking path reads attendance.
+  // bookings, checked in and out on the board's log (`checkin_events`, M5.12).
+  // No booking path reads attendance.
   bookingWafflesPastSchoolId: 'b0070000-0000-4000-8000-000000000005',
   bookingLolaPastSchoolId: 'b0070000-0000-4000-8000-000000000006',
   bookingBrodiePastCareId: 'b0070000-0000-4000-8000-000000000007',

@@ -75,7 +75,8 @@ async function mintIntent(
   return intent.id;
 }
 
-async function seedChargeAndClaim(
+/** An order's charge and the claim that made it (exported for P20 fix 1's order cancels). */
+export async function seedChargeAndClaim(
   stripe: StripeStub,
   args: {
     orderId: string;
@@ -183,6 +184,7 @@ export async function seedPendingBookingOrder(
         lotId: lot.id,
         dogId: args.dogId,
         bookingId: row.id,
+        checkinEventId: null,
       });
       await enqueueBookingReminders(tx, {
         bookingId: row.id,

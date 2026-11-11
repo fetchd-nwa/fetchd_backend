@@ -1,4 +1,4 @@
-import { pgTimestampToIso } from './pgTimestamp.js';
+import { pgTimestampToDate, pgTimestampToIso } from './pgTimestamp.js';
 import type { ServiceCategory } from './bookingBucket.js';
 import { bookingStatus, type LocationKey } from '../db/schema/schema.js';
 import type { BookingWire } from '../contracts/wire.js';
@@ -49,12 +49,31 @@ export interface BookingDogRow {
   bookingId: string;
   dogId: string;
   isLead: boolean;
+  /** Set on a share cancelled alone (the one-dog cancel's stamp); absent on a live read. */
+  expiredAt?: string | null;
 }
 
-/** Lead + additional dog ids for one booking, sorted for snapshot stability. */
+/**
+ * The dogs of one booking, as the wire names them: `lead` and `additional` are the dogs
+ * still coming (`BookingWire.dog_id`, `additional_dog_ids`), and `cancelled` the shares
+ * cancelled alone, earliest first.
+ */
 export interface BookingDogIds {
   lead: string;
   additional: string[];
+  cancelled?: { dogId: string; cancelledAt: string }[];
+}
+
+/**
+ * Whether a cancel would be accepted now (6.0.0-lg5.1, CXL-U09): `BookingWire.can_cancel`
+ * for the whole session and `dog_shares[].can_cancel` per dog, computed by
+ * `lib/dayCancel.ts` from the same fold and clock the cancels refuse on. Day-school and
+ * day-care rows only; every other category omits both.
+ */
+export interface CancelFacts {
+  canCancel: boolean;
+  /** By dog: whether a one-dog cancel of her would be accepted now. */
+  shareCanCancel: ReadonlyMap<string, boolean>;
 }
 
 /**
@@ -68,6 +87,7 @@ export function toBookingWire(
   dogIds: BookingDogIds,
   trainerName: string | null,
   groupClassName?: string,
+  cancel?: CancelFacts,
 ): BookingWire {
   const wire: BookingWire = {
     id: row.id,
@@ -101,33 +121,70 @@ export function toBookingWire(
       wire.cancel_reason = row.cancelReason;
     }
   }
+  if (cancel !== undefined) {
+    wire.can_cancel = cancel.canCancel;
+    // `dog_id`, then `additional_dog_ids` in their order, then the shares cancelled
+    // alone by `cancelled_at` (the wire's order).
+    wire.dog_shares = [
+      ...[dogIds.lead, ...dogIds.additional].map((dogId) => ({
+        dog_id: dogId,
+        can_cancel: cancel.shareCanCancel.get(dogId) ?? false,
+      })),
+      ...(dogIds.cancelled ?? []).map((share) => ({
+        dog_id: share.dogId,
+        can_cancel: false,
+        cancelled_at: pgTimestampToIso(share.cancelledAt),
+      })),
+    ];
+  }
   return wire;
 }
 
 /**
- * Group `booking_dogs` rows into a per-booking `{ lead, additional[] }`.
- * Throws on a structural invariant violation (a booking with no lead) —
- * that's a bug in the seed/migration, not a runtime condition the read
- * layer should silently paper over. Additional ids sorted ascending so
+ * Group `booking_dogs` rows into a per-booking `{ lead, additional[], cancelled[] }`
+ * (P20 notes D3). `lead` and `additional` are the shares still live, so a card never
+ * names a dog who is not coming: the stored lead while she is, else the first remaining
+ * dog in `additional`'s order, who then leaves that list. `cancelled` holds the shares
+ * cancelled alone, earliest first. The last dog of a session cancelled one dog at a time
+ * keeps her share (cancelling her cancels the session), so a booking always has a live
+ * share; one with none is a broken database and throws. Additional ids sorted ascending so
  * snapshot tests don't flap on insert order.
  */
 export function groupBookingDogs(rows: BookingDogRow[]): Map<string, BookingDogIds> {
-  const accumulator = new Map<string, { lead: string | null; additional: string[] }>();
+  const accumulator = new Map<
+    string,
+    {
+      lead: string | null;
+      additional: string[];
+      cancelled: { dogId: string; cancelledAt: string }[];
+    }
+  >();
   for (const row of rows) {
     let entry = accumulator.get(row.bookingId);
     if (entry === undefined) {
-      entry = { lead: null, additional: [] };
+      entry = { lead: null, additional: [], cancelled: [] };
       accumulator.set(row.bookingId, entry);
     }
-    if (row.isLead) entry.lead = row.dogId;
+    if (row.expiredAt != null)
+      entry.cancelled.push({ dogId: row.dogId, cancelledAt: row.expiredAt });
+    else if (row.isLead) entry.lead = row.dogId;
     else entry.additional.push(row.dogId);
   }
   const result = new Map<string, BookingDogIds>();
-  for (const [bookingId, { lead, additional }] of accumulator) {
-    if (lead === null) {
-      throw new Error(`booking ${bookingId}: no booking_dogs row marked is_lead`);
+  for (const [bookingId, { lead, additional, cancelled }] of accumulator) {
+    const remaining = [...additional].sort();
+    const first = lead ?? remaining.shift();
+    if (first === undefined) {
+      throw new Error(`booking ${bookingId}: no live booking_dogs row`);
     }
-    result.set(bookingId, { lead, additional: [...additional].sort() });
+    const ids: BookingDogIds = { lead: first, additional: remaining };
+    if (cancelled.length > 0) {
+      ids.cancelled = [...cancelled].sort(
+        (a, b) =>
+          pgTimestampToDate(a.cancelledAt).getTime() - pgTimestampToDate(b.cancelledAt).getTime(),
+      );
+    }
+    result.set(bookingId, ids);
   }
   return result;
 }

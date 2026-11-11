@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { and, eq, like, sql } from 'drizzle-orm';
+import { like, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { creditLedger, creditLotExpiryEdits } from '../../src/db/schema/schema.js';
 import type { ApiErrorEnvelope, InsufficientCreditsDetails } from '../../src/contracts/wire.js';
@@ -38,37 +38,29 @@ export async function plantLot(args: {
   return id;
 }
 
-/** Every ledger row of the pools these tests use: a lot, then what spent it. */
+/**
+ * Every ledger row of the pools these tests use: a lot, what spent it, and what returned
+ * it, in ONE statement. A return names the debit it reverses (M5.10's
+ * `reverses_entry_id`) and a fresh-lot return is itself a lot a re-debit can spend, so the
+ * rows reference each other both ways; one DELETE of the closure is checked at its end,
+ * where none of them is left to dangle.
+ */
 export async function clearPlantedPools(): Promise<void> {
-  // The history and what spent a lot go first: each holds its lot.
+  // The date history goes first: each row holds its lot.
   await db.delete(creditLotExpiryEdits);
   await db.execute(sql`
-    DELETE FROM credit_ledger spent
-     USING credit_ledger lot
-     WHERE spent.lot_id = lot.id
-       AND lot.owner_id = ${FIXTURE_IDS.ownerId}
-       AND (lot.charge_id IS NOT NULL
-         OR lot.tier = 'alumni'
-         OR lot.note LIKE ${`${PLANTED}%`}
-         OR (lot.location = 'bentonville' AND lot.mode = 'school'))`);
-  await db
-    .delete(creditLedger)
-    .where(
-      and(
-        eq(creditLedger.ownerId, FIXTURE_IDS.ownerId),
-        eq(creditLedger.location, 'bentonville'),
-        eq(creditLedger.mode, 'school'),
-      ),
-    );
+    WITH RECURSIVE doomed(id) AS (
+      SELECT row.id FROM credit_ledger row
+       WHERE row.owner_id = ${FIXTURE_IDS.ownerId}
+         AND (row.charge_id IS NOT NULL
+           OR row.tier = 'alumni'
+           OR row.note LIKE ${`${PLANTED}%`}
+           OR (row.location = 'bentonville' AND row.mode = 'school'))
+      UNION
+      SELECT r.id FROM credit_ledger r JOIN doomed d ON r.lot_id = d.id OR r.reverses_entry_id = d.id
+    )
+    DELETE FROM credit_ledger WHERE id IN (SELECT id FROM doomed)`);
   await db.delete(creditLedger).where(like(creditLedger.note, `${PLANTED}%`));
-  await db
-    .delete(creditLedger)
-    .where(
-      and(eq(creditLedger.ownerId, FIXTURE_IDS.ownerId), sql`${creditLedger.chargeId} IS NOT NULL`),
-    );
-  await db
-    .delete(creditLedger)
-    .where(and(eq(creditLedger.ownerId, FIXTURE_IDS.ownerId), eq(creditLedger.tier, 'alumni')));
 }
 
 export async function poolBalance(

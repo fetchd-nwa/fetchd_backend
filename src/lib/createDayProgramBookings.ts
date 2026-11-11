@@ -1,5 +1,5 @@
 import { lockPools, withCapacityLocks, withDogLocks } from '../db/locks.js';
-import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
+import { bookingsRepository, type BookingRow } from '../db/repositories/bookingsRepository.js';
 import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import {
   creditLedgerRepository,
@@ -26,7 +26,7 @@ import { checkBookingGates } from './bookingGatePreCheck.js';
 import { assertDatesBookable } from './bookingHorizon.js';
 import { dayProgramCategoryToMode } from './bookingMode.js';
 import { computeDayProgramScheduledAt, type DayProgramCategory } from './bookingSchedule.js';
-import { toBookingWire, type BookingWire, type LocationKey } from './bookingWire.js';
+import type { BookingWire, LocationKey } from './bookingWire.js';
 import { bucketChicagoToday, chicagoTimeOnDate } from './chicagoDate.js';
 import { computeCancelDeadlineFromHours } from './cancelWindow.js';
 import { addChicagoMonths } from './creditExpiry.js';
@@ -42,6 +42,7 @@ import { enqueueBookingReminders } from './enqueueBookingReminders.js';
 import { ApiError } from './errors.js';
 import { insertBookingWithGateMapping } from './insertBookingWithGateMapping.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
+import { wireManyBookings } from './wireManyBookings.js';
 
 /**
  * The day-program (day-school / day-care) booking-creation core — locks →
@@ -372,7 +373,7 @@ export async function createDayProgramBookings(
 
       // Per-session: capacity → INSERT booking + booking_dogs → credit-ledger
       // debits → reminders.
-      const created: BookingWire[] = [];
+      const created: BookingRow[] = [];
       for (const session of sessions) {
         await dayCapacityRepository.assertCapacityWithinLock(tx, {
           location: args.location,
@@ -406,6 +407,9 @@ export async function createDayProgramBookings(
             lotId: slot.lotId,
             dogId: slot.dogId,
             bookingId: inserted.id,
+            // The creation debit names no check-in event, so a later check-in stays
+            // undoable (designs/p20-event-ledger-link.md §9 (d): P26's walk-in too).
+            checkinEventId: null,
           });
         }
 
@@ -423,18 +427,11 @@ export async function createDayProgramBookings(
           });
         }
 
-        created.push(
-          toBookingWire(
-            inserted,
-            {
-              lead: args.leadDogId,
-              additional: [...args.additionalDogIds].sort(),
-            },
-            null /* day programs carry no trainer */,
-          ),
-        );
+        created.push(inserted);
       }
-      return created;
+      // Read back through the one wire assembly, in this transaction, so a new day carries
+      // `can_cancel` and `dog_shares` from the same rules as every later read (6.0.0-lg5.1).
+      return wireManyBookings(created, { now: args.now, viewer: 'owner', runner: tx });
     }),
   );
 

@@ -66,9 +66,9 @@
  * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close). LG4:
  * 5.0.0-lg4.1 (P17, breaking), 5.0.0-lg4.2 (P18, breaking), 5.0.0 (P19,
- * additive, its close).
+ * additive, its close). LG5: 6.0.0-lg5.1 (P20, breaking).
  */
-export const WIRE_CONTRACT_VERSION = '5.0.0';
+export const WIRE_CONTRACT_VERSION = '6.0.0-lg5.1';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -201,6 +201,18 @@ export const WIRE_CONTRACT_VERSION = '5.0.0';
  * 422, with `details` (`AlumniPackageIneligibleDetails`), and
  * `'pack_requires_evaluated_dog'`, 422, no `details`. The second is typed here
  * and thrown by no route until EVAL-U20 lands (plan unit P11).
+ *
+ * 6.0.0-lg5.1 appends eight thrown codes, the 41st to the 48th, after
+ * `'pack_requires_evaluated_dog'` — appended, never inserted (design
+ * §1.1:1064-1082, §2.3:2371-2398, :2418-2447; DAY-U29, DAY-U33, CXL-U09), each
+ * 409: the request is well-formed and the booking's state refuses it. The
+ * cancels answer `'session_checked_in'`, `'session_ended'`,
+ * `'session_cancelled'`, `'payment_pending'` and `'per_dog_cancel_off'`; the
+ * board's six verbs answer `'attendance_state_conflict'`, `'session_not_today'`
+ * and `'no_show_too_early'`, and `'session_cancelled'` and `'payment_pending'`
+ * too. Four carry `details` (`SessionEndedDetails`,
+ * `AttendanceStateConflictDetails`, `SessionNotTodayDetails`,
+ * `NoShowTooEarlyDetails`); on the other four the code is the whole signal.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -243,7 +255,15 @@ export type ApiErrorCode =
   | 'pool_not_bookable' // hand add blocked — no v1 booking can draw from this pool (5.0.0-lg4.2)
   | 'credit_edit_role_required' // hand edit blocked — the role is off its list (5.0.0-lg4.2)
   | 'alumni_package_ineligible' // purchase blocked — an alumni-tier row, and no dog on the account is alumni (5.0.0)
-  | 'pack_requires_evaluated_dog'; // purchase blocked — no dog on the account holds a passed evaluation (5.0.0; thrown from P11)
+  | 'pack_requires_evaluated_dog' // purchase blocked — no dog on the account holds a passed evaluation (5.0.0; thrown from P11)
+  | 'session_checked_in' // cancel blocked — a dog of the session, or the dog named, is past `expected` (6.0.0-lg5.1)
+  | 'session_ended' // cancel blocked — Chicago now has reached the session's `day.pickup_close_time` (6.0.0-lg5.1)
+  | 'session_cancelled' // board verb or one-dog cancel blocked — the session or that dog's share is cancelled (6.0.0-lg5.1)
+  | 'payment_pending' // board verb or one-dog cancel blocked — the row's top-up charge has not settled (6.0.0-lg5.1)
+  | 'per_dog_cancel_off' // owner one-dog cancel blocked — `cxl.per_dog_cancel_enabled` is off (6.0.0-lg5.1)
+  | 'attendance_state_conflict' // board verb blocked — the dog's folded state does not allow it (6.0.0-lg5.1)
+  | 'session_not_today' // board verb blocked — the session's date is not one this verb takes (6.0.0-lg5.1)
+  | 'no_show_too_early'; // *Didn't come* blocked — before `day.pickup_close_time` on the date (6.0.0-lg5.1)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -287,6 +307,14 @@ export const API_ERROR_CODES = [
   'credit_edit_role_required',
   'alumni_package_ineligible',
   'pack_requires_evaluated_dog',
+  'session_checked_in',
+  'session_ended',
+  'session_cancelled',
+  'payment_pending',
+  'per_dog_cancel_off',
+  'attendance_state_conflict',
+  'session_not_today',
+  'no_show_too_early',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -380,6 +408,17 @@ export const API_ERROR_STATUS = {
   // §1.1:984-986).
   alumni_package_ineligible: 422,
   pack_requires_evaluated_dog: 422,
+  // 6.0.0-lg5.1 (new codes, so their statuses are set in the same bump): each
+  // request conflicts with the booking's current state, the family of
+  // `conflict` (design §1.1:1064-1082).
+  session_checked_in: 409,
+  session_ended: 409,
+  session_cancelled: 409,
+  payment_pending: 409,
+  per_dog_cancel_off: 409,
+  attendance_state_conflict: 409,
+  session_not_today: 409,
+  no_show_too_early: 409,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -806,6 +845,59 @@ export interface CapacityBelowBookedDetails {
 }
 
 /**
+ * Rides code `session_ended` (409) — `kind` equals `code`. New 6.0.0-lg5.1
+ * (design §1.1:1064-1067, §2.3:2420-2427; CXL-U09). Answered by every cancel of
+ * a day-school or day-care session — the owner's and the staff's, of the whole
+ * session or of one dog — once Chicago now has reached the campus's
+ * `day.pickup_close_time` on the session's date: the minute the owner's list
+ * moves the day to Past and *Didn't come* opens. A day that has ended is settled
+ * only by *Didn't come* or a hand credit, never by a cancel. `date` is the
+ * session's Chicago date, `YYYY-MM-DD`. Atomic: a refused cancel writes nothing.
+ */
+export interface SessionEndedDetails {
+  kind: 'session_ended';
+  date: string;
+}
+
+/**
+ * Rides code `attendance_state_conflict` (409) — `kind` equals `code`. New
+ * 6.0.0-lg5.1 (design §1.1:1079, §2.3:2377-2392; DAY-U29, DAY-U33). A board verb
+ * whose required folded state the dog is not in, or an `undo` whose target
+ * cannot be undone (the verbs' doc above `PostStaffBookingsDogsCheckOutRequest`
+ * lists both). `state`
+ * is the dog's folded state on this booking when the verb ran. Atomic: nothing
+ * is appended and no credit moves.
+ */
+export interface AttendanceStateConflictDetails {
+  kind: 'attendance_state_conflict';
+  state: AttendanceStatus;
+}
+
+/**
+ * Rides code `session_not_today` (409) — `kind` equals `code`. New 6.0.0-lg5.1
+ * (design §1.1:1080, §2.3:2374-2377; DAY-U29). `check-in`, `turn-away` and
+ * `send-home` need the session's Chicago date to be today; `check-out`, `undo`
+ * and `no-show` need it to be today or earlier. `date` is the session's date,
+ * `YYYY-MM-DD`. Atomic.
+ */
+export interface SessionNotTodayDetails {
+  kind: 'session_not_today';
+  date: string;
+}
+
+/**
+ * Rides code `no_show_too_early` (409) — `kind` equals `code`. New 6.0.0-lg5.1
+ * (design §1.1:1034-1035, :1080, §2.3:2375-2377; question 48; DAY-U33).
+ * *Didn't come* (`POST …/no-show`) on a session dated today, before the campus's
+ * `day.pickup_close_time`. `recordable_from` is that instant, ISO-8601: 17:30
+ * America/Chicago on the session's date as seeded. Atomic.
+ */
+export interface NoShowTooEarlyDetails {
+  kind: 'no_show_too_early';
+  recordable_from: string;
+}
+
+/**
  * Every `details` payload the API can emit, closed. Provably complete at
  * 1.13.0 by full construction-site sweep, and kept complete by the fold-in:
  * `ApiError`'s constructor takes exactly this union, so a future route
@@ -817,7 +909,8 @@ export interface CapacityBelowBookedDetails {
  * `CapacityBelowBookedDetails`, contract-first: no route emits it until P13's
  * backend lands. 4.0.0 appends `CreditExpiredBeforeDateDetails`, which no route
  * emitted until its predicate landed at 5.0.0-lg4.2. 5.0.0 appends
- * `AlumniPackageIneligibleDetails` (ALUM-U11).
+ * `AlumniPackageIneligibleDetails` (ALUM-U11). 6.0.0-lg5.1 appends the four
+ * board and cancel arms (DAY-U29, DAY-U33, CXL-U09).
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -838,7 +931,11 @@ export type ApiErrorDetailWire =
   | ProfileIncompleteDetails
   | CapacityBelowBookedDetails
   | CreditExpiredBeforeDateDetails
-  | AlumniPackageIneligibleDetails;
+  | AlumniPackageIneligibleDetails
+  | SessionEndedDetails
+  | AttendanceStateConflictDetails
+  | SessionNotTodayDetails
+  | NoShowTooEarlyDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -866,7 +963,8 @@ export type ServiceCategory =
  * A cancel of any one pending row cancels the whole order
  * (`POST /bookings/:id/cancel`); a per-session cancel exists only once the rows
  * are `'upcoming'`. A class row is refused first, pending or not, as it is
- * today.
+ * today. From 6.0.0-lg5.1 a one-dog cancel and every board verb answer 409
+ * `payment_pending` on a pending row (design §2.3:2392-2397, :2431-2432).
  */
 export type BookingStatus = 'upcoming' | 'past' | 'cancelled' | 'payment-pending';
 
@@ -962,10 +1060,22 @@ export type RateUnit = 'per-day' | 'per-night' | 'per-session' | 'per-week' | 'f
  *  the server validates against the Drizzle enum. */
 export type StaffRole = 'owner' | 'manager' | 'trainer';
 
-/** Attendance values a staff check-in can set. The DB `booking_attendance` enum
- *  also carries `'pending'` (the never-an-action default); the wire excludes it.
- *  `conformance.ts` asserts this is exactly `Exclude<booking_attendance, 'pending'>`. */
-export type AttendanceStatus = 'attended' | 'no-show' | 'excused';
+/**
+ * One dog's state on one booking, FOLDED from its check-in log, never stored
+ * (6.0.0-lg5.1, BREAKING; design §1.1:1042-1043, §2.3:2354-2370; DAY-U29,
+ * DAY-U33). Was the overwritable `'attended' | 'no-show' | 'excused'` mirror of
+ * the `booking_attendance` enum, which M5.12 drops. No pgEnum backs it, so it
+ * has no conformance pin; `CheckinEventKind` has one.
+ *
+ * The fold reads the dog's live events in append order (`CheckinEventWire`): no
+ * live event is `'expected'`; a live `check-in` makes `'in'`, a `check-out`
+ * `'out'`, and the three settling kinds `'turned-away'`, `'sent-home'` and
+ * `'no-show'`. An `undo` removes exactly the event it names. A sent-home dog is
+ * still in the building: *on site* is `'in'` or `'sent-home'`, and she leaves by
+ * `check-out`, which folds `'out'` (her share stays settled:
+ * `CheckinBoardWire.settled`).
+ */
+export type AttendanceStatus = 'expected' | 'in' | 'out' | 'turned-away' | 'sent-home' | 'no-show';
 
 export type MediaPurpose =
   | 'dog-profile'
@@ -1745,6 +1855,9 @@ export interface BookingWire {
   additional_dog_ids?: string[];
   category: ServiceCategory;
   status: BookingStatus;
+  /** The session's scheduled start as an ISO instant (UTC, e.g.
+   *  `2026-11-11T13:30:00.000Z`), never a bare calendar day: a client takes the
+   *  day it shows from this instant in America/Chicago (P20 round 2, M1). */
   date: string;
   trainer?: string;
   duration_minutes?: number;
@@ -1777,18 +1890,168 @@ export interface BookingWire {
   // session of one `POST /bookings` carries the same id. Omit-on-null: a row
   // made any other way has no order, and neither does an older one.
   order_id?: string;
+  // Whether a cancel of the WHOLE session would be accepted now (6.0.0-lg5.1;
+  // design §1.1:1064-1067, §2.3:2418-2428; CXL-U09, CXL-U10). Present on every
+  // day-school and day-care row and omitted on every other category (the
+  // evaluation row joins with P09, plan `deferred_arms`). `false` once the
+  // session is cancelled, once any dog still on it has folded past `expected`
+  // (`AttendanceStatus`; an undone check-in does not count), and once Chicago
+  // now reaches the campus's `day.pickup_close_time` on its date. It reads the
+  // same fold and clock as the cancel's 409s, so a `true` can still meet one if
+  // a check-in or the clock lands between the read and the tap: show that 409
+  // as a refusal, never as a connection error. A pending row is cancellable (it
+  // cancels its whole order, `BookingStatus`).
+  can_cancel?: boolean;
+  // One entry per dog the session was booked for, the shares cancelled alone
+  // included (6.0.0-lg5.1; design §1.1:1068-1075, §2.3:2429-2447; CXL-U09, s11).
+  // Present on every day-school and day-care row, a one-dog session included,
+  // and omitted on every other category. Order: `dog_id`, then
+  // `additional_dog_ids` in their order, then the shares cancelled alone,
+  // ascending by `cancelled_at`.
+  //   `can_cancel`: whether `POST /bookings/:id/dogs/:dogId/cancel` (an owner's
+  //   read) or `POST /staff/bookings/:id/dogs/:dogId/cancel` (a staff read) would
+  //   accept this dog now: her share and the session not cancelled, the row not
+  //   `payment-pending`, the clock before `day.pickup_close_time`, and HER folded
+  //   state `expected`. On an owner's read it is also `false` while
+  //   `cxl.per_dog_cancel_enabled` is off, which a staff cancel ignores.
+  //   `cancelled_at`: ISO-8601, on a share cancelled alone, before its session.
+  //   A share that went with its session carries none (read `cancelled_at`
+  //   above), and that includes the last dog of a session cancelled one dog at a
+  //   time: cancelling her cancels the session.
+  // `dog_id` and `additional_dog_ids` list only the dogs whose shares were not
+  // cancelled alone, so a card never names a dog who is not coming. When the
+  // lead's share is cancelled alone, `dog_id` is the first remaining dog in
+  // `additional_dog_ids`' order and she leaves that list. `after_school` joins
+  // each entry at 6.0.0-lg5.2 (DAY-U43).
+  dog_shares?: {
+    dog_id: string;
+    can_cancel: boolean;
+    cancelled_at?: string;
+  }[];
 }
 
 /** Δ 2026-07-14 — where a private lesson happens. */
 export type LessonSetting = 'home' | 'public';
 
-/** POST /staff/bookings/:id/attendance response (§A clarification 2026-05-28). */
-export interface AttendanceWire {
+/**
+ * The six kinds of the check-in log, the `checkin_event_kind` pgEnum (M5.01;
+ * 6.0.0-lg5.1; design §1.1:1027-1031, conflict 20; DAY-U29, DAY-U33), which
+ * `conformance.ts` pins. `'no-show'` is the board's *Didn't come*. There is no
+ * `attended` kind and no `hand-off` kind: a hand-off to Shanthi is a
+ * `check-out` whose `note` says so (DAY-51), and settles nothing. The three
+ * settling kinds are `'turn-away'`, `'sent-home'` and `'no-show'`: a share holds
+ * at most one (M5.02's partial unique index), and none can be undone.
+ */
+export type CheckinEventKind =
+  | 'check-in'
+  | 'check-out'
+  | 'undo'
+  | 'turn-away'
+  | 'sent-home'
+  | 'no-show';
+
+/**
+ * One appended event of one dog on one booking (6.0.0-lg5.1; design
+ * §1.1:1027-1041, §2.3:2354-2405; DAY-U29, DAY-U33). The log is append-only: no
+ * event is ever edited or deleted, and a mistake is corrected by an `undo` that
+ * names it (`undoes_event_id`).
+ *
+ * `at` is the server's clock when the verb ran, ISO-8601; no body sets it, and
+ * it is display only. `by_staff_id` is the staffer who tapped. Optional keys are
+ * omitted where the column is null:
+ *   - `undoes_event_id` on an `undo`: the event it removed.
+ *   - `training_completed` on a `sent-home`: the *Finished training day* box.
+ *   - `reissue_credit` on a `check-out`: the *Re-issue the credit* box.
+ *   - `note` on a `check-out` that carried one.
+ *   - `settlement` on an event that decided a credit: each settling kind, and a
+ *     `check-out` with `reissue_credit: true`. `returned_credits` is the credits
+ *     that event's own transaction returned to the owner's pool, `1` or `0` (a
+ *     send-home marked finished): what was written then, not a recomputation
+ *     from today's fractions.
+ */
+export interface CheckinEventWire {
+  id: string;
   booking_id: string;
   dog_id: string;
-  attendance: AttendanceStatus;
-  checked_in_at: string;
+  kind: CheckinEventKind;
+  at: string;
+  by_staff_id: string;
+  undoes_event_id?: string;
+  training_completed?: boolean;
+  reissue_credit?: boolean;
+  note?: string;
+  settlement?: { returned_credits: number };
 }
+
+/**
+ * The response of each of the six board verbs, `POST
+ * /staff/bookings/:id/dogs/:dogId/{check-in | check-out | undo | turn-away |
+ * send-home | no-show}`: that dog's folded state on that booking after the
+ * verb, and her whole log on it, in append order, undone events and the `undo`s
+ * included (6.0.0-lg5.1, BREAKING; design §1.1:1042-1044; DAY-U29). Was the
+ * response of `POST /staff/bookings/:id/attendance`, `{booking_id, dog_id,
+ * attendance, checked_in_at}`, removed.
+ */
+export interface AttendanceWire {
+  status: AttendanceStatus;
+  events: CheckinEventWire[];
+}
+
+/**
+ * One row of `GET /staff/checkin-board?location&date`: one dog's share of one
+ * session at that campus on that date (6.0.0-lg5.1; design §1.1:1044-1049,
+ * §2.3:2406-2428, §2.10:5051-5069; DAY-U29, DAY-U30, DAY-U33, DAY-U40, CXL-U09,
+ * CXL-U11). The board lists every share still on a day-school or day-care
+ * session that is not cancelled; a share or session cancelled leaves it. The
+ * evaluation row joins with P09 (plan `deferred_arms`).
+ *
+ * `booking_id`, `dog_id` and `events` are the row's address and its log: the
+ * six verbs and the one-dog cancel take the first two in their path, and the
+ * stamped times and the undo target are read from `events` (as `AttendanceWire`).
+ * The session's own facts — category, the other dogs, the order — are
+ * `BookingWire`'s, read from `GET /staff/bookings` with `from` and `to` the
+ * board's date and the same `location`.
+ *
+ *   - `state`: the folded state (`AttendanceStatus`).
+ *   - `booking_status`: the session's, `'upcoming'` or `'payment-pending'`
+ *     (never `'cancelled'`, which leaves the board). `payment_pending` is `true`
+ *     exactly when it is `'payment-pending'`: a top-up order still processing,
+ *     on which every verb answers 409 `payment_pending` until Stripe answers.
+ *   - `late_pickup_due`: on site (`'in'` or `'sent-home'`) and Chicago now at or
+ *     past the campus's `day.late_pickup_call_time` on the board's date: the
+ *     courtesy call. Never `true` in any other state. Nothing checks a dog out
+ *     on its own (DAY-68).
+ *   - `settled`: the share holds a settling event (`CheckinEventKind`), so no
+ *     cancel, second settling event or `undo` of it is accepted. A sent-home dog
+ *     checked out folds `'out'` and stays settled.
+ *   - `can_cancel`: as `BookingWire.dog_shares[].can_cancel` on a staff read,
+ *     for this dog.
+ *   - `gate_warnings`: a gate this dog fails on the board's date that her
+ *     booking passed, read with the booking gate's own reads, `[]` when none.
+ *     Check-in still lands (the door decides, DAY-05); the row offers *Turn
+ *     away*. `'vaccine_lapsed'` is sent from 6.0.0-lg5.1. `'spay_neuter_overdue'`
+ *     is typed and sent from P09 (S11), and `'reevaluation_due'` typed and sent
+ *     once S14 lands (dated): no route sends either before then.
+ * `after_school` joins at 6.0.0-lg5.2 (DAY-U43), `draft_report_id?` at design
+ * 8.0.0 (RPT-U07). There is no `unrecorded_earlier`: a day nobody recorded is
+ * fixed on that date's board (question 50 → (c)).
+ */
+export interface CheckinBoardWire {
+  booking_id: string;
+  dog_id: string;
+  state: AttendanceStatus;
+  events: CheckinEventWire[];
+  booking_status: BookingStatus;
+  late_pickup_due: boolean;
+  settled: boolean;
+  can_cancel: boolean;
+  payment_pending: boolean;
+  gate_warnings: ('vaccine_lapsed' | 'spay_neuter_overdue' | 'reevaluation_due')[];
+}
+
+/** `GET /staff/checkin-board` response: the board's rows. No order is promised;
+ *  the portal sorts. `[]` for a day with no share. */
+export type GetStaffCheckinBoardResponse = CheckinBoardWire[];
 
 export interface PendingRequestNotesWire {
   per_dog?: string;
@@ -2212,21 +2475,93 @@ export interface PostStaffRequestsDenyRequest {
 }
 
 /**
- * `POST /staff/bookings/:id/attendance` body `[staff]` — per-dog check-in.
- * Promoted 1.13.0 from `attendanceBodySchema` in `routes/staffBookings.ts`
- * (digest bookings/M); pinned by
- * `PostStaffBookingsAttendanceBodyConformance`. Response is `AttendanceWire`.
+ * The board's six verbs `[staff]`, any role, at either campus (6.0.0-lg5.1,
+ * BREAKING; design §1.1:1027-1041, :1079-1082, §2.3:2371-2405, :2477-2550;
+ * DAY-U29, DAY-U33, DAY-U34, s09, s10). They replace `POST
+ * /staff/bookings/:id/attendance` and its body `PostStaffBookingsAttendanceRequest`,
+ * both removed.
  *
- * `status` is `AttendanceStatus` — the DB `booking_attendance` enum also
- * carries `'pending'` (the never-an-action default) and the body deliberately
- * excludes it. Attendance is a TERMINAL fact, overwritable, with no undo verb
- * and no stored event history (BUSINESS-LOGIC/bookings-scheduling.md:128).
- * A dog not on this booking's roster is 404; a cancelled booking is 409.
- * `Idempotency-Key` required.
+ *   POST /staff/bookings/:id/dogs/:dogId/check-in    no body
+ *   POST /staff/bookings/:id/dogs/:dogId/check-out   PostStaffBookingsDogsCheckOutRequest
+ *   POST /staff/bookings/:id/dogs/:dogId/undo        no body
+ *   POST /staff/bookings/:id/dogs/:dogId/turn-away   no body
+ *   POST /staff/bookings/:id/dogs/:dogId/send-home   PostStaffBookingsDogsSendHomeRequest
+ *   POST /staff/bookings/:id/dogs/:dogId/no-show     no body (*Didn't come*)
+ *
+ * Each requires an `Idempotency-Key`, appends at most one event, and answers 200
+ * `AttendanceWire`; the no-body verbs read no body. Day-school and day-care
+ * sessions; the evaluation row's arms are P09's (plan `deferred_arms`).
+ *
+ * Each verb's date (the session's, America/Chicago) and the state it needs:
+ *   - `check-in`: date today; `'expected'` at any hour, before drop-off too and
+ *     with a `gate_warnings` entry on the row; or `'out'` with no settling event
+ *     on the share — a dog collected for the vet and brought back (s10). That
+ *     re-check-in spends nothing, unless the check-out it reopens re-issued the
+ *     credit: then it takes one credit back (to the lot that return went to, else
+ *     the soonest-expiring lot live today), so a day spends one credit, or none
+ *     when the box was ticked at her last departure. With no live credit it is 422
+ *     `insufficient_credits` with no `details` (the board sells nothing: sell a
+ *     single day first). A check-in moves `DogWire.last_seen_on`.
+ *   - `check-out`: date today or earlier; `'in'` or `'sent-home'`.
+ *     `reissue_credit: true` needs `'in'`: a sent-home dog's credit was decided
+ *     at the send-home.
+ *   - `undo`: date today or earlier; removes the newest live event that is not
+ *     an `undo` and not already undone. Refused when there is none, when it is a
+ *     settling event, and when it moved a credit (a check-out that re-issued it,
+ *     a re-check-in that took it back): that is corrected by a hand edit on
+ *     the role list (CRED-U14). Check in, check out, undo, undo ends at
+ *     `'expected'` with `last_seen_on` restored.
+ *   - `turn-away`: date today; `'expected'`. Not a check-in: it never moves
+ *     `last_seen_on`, and her seat is free for the rest of the day.
+ *   - `send-home`: date today; `'in'`.
+ *   - `no-show`: date today or earlier, and Chicago now at or past the campus's
+ *     `day.pickup_close_time` on that date; `'expected'`.
+ *
+ * What comes back, always a credit and never money (the refund ruling): a
+ * `turn-away`, a `no-show` and a `send-home` not marked finished return
+ * `day.sent_home_before_training_return_fraction` (seeded 1) credits, a
+ * `send-home` marked finished `day.sent_home_after_training_return_fraction`
+ * (seeded 0), and a `check-out` with `reissue_credit: true` one. The return goes
+ * to the lot the share's live debit came from, keeping that lot's expiry while it
+ * can pay a later date, and otherwise lands as a fresh one-credit lot of
+ * `cred.returned_credit_expiry_months` (`CreditLotDetailWire.reason`). A plain
+ * check-out returns nothing. `CheckinEventWire.settlement` reports it.
+ *
+ * Refusals, in this order: 404 `not_found` (no live booking, or the dog was never
+ * on it); 409 `session_cancelled` (the session, or this dog's share, is
+ * cancelled); 409 `payment_pending` (`BookingStatus`); 409 `session_not_today`
+ * (`SessionNotTodayDetails`); 409 `no_show_too_early` (`NoShowTooEarlyDetails`);
+ * 409 `attendance_state_conflict` (`AttendanceStateConflictDetails`): the state
+ * above is not met, a second settling event is attempted, or the undo is
+ * refused; then the re-check-in's 422. No verb reads `status = 'upcoming'`. A
+ * refused verb appends nothing and moves no credit.
  */
-export interface PostStaffBookingsAttendanceRequest {
-  dog_id: string;
-  status: AttendanceStatus;
+
+/**
+ * `POST /staff/bookings/:id/dogs/:dogId/check-out` body `[staff]` (6.0.0-lg5.1;
+ * design §1.1:1035-1041, §2.3:2532-2550; s09, s10, answer 12). The whole body may
+ * be absent. `note` is trimmed, 1..500 characters, the rule of
+ * `PostStaffBookingsCancelRequest.reason`: "went home with Shanthi" is the
+ * hand-off (DAY-51). `reissue_credit` is the *Re-issue the credit* box, omitted =
+ * `false`, unticked: the credit stays used. Ticked, the check-out returns it (see
+ * the verbs above) and queues the owner's "was picked up early" notice. Any staff
+ * role may tick it: a call at the door, not a hand credit. `Idempotency-Key`
+ * required.
+ */
+export interface PostStaffBookingsDogsCheckOutRequest {
+  note?: string;
+  reissue_credit?: boolean;
+}
+
+/**
+ * `POST /staff/bookings/:id/dogs/:dogId/send-home` body `[staff]` (6.0.0-lg5.1;
+ * design §1.1:1036-1037, §2.3:2477-2490, :2528-2550; s09, DAY-44). The whole body
+ * may be absent. `training_completed` is the *Finished training day* box, omitted
+ * = `false`, unticked: the credit comes back. Ticked, it stays spent. Either way
+ * she stays on site until her `check-out`. `Idempotency-Key` required.
+ */
+export interface PostStaffBookingsDogsSendHomeRequest {
+  training_completed?: boolean;
 }
 
 /**
@@ -2243,9 +2578,45 @@ export interface PostStaffBookingsAttendanceRequest {
  * request hash, so a same-key replay with a different reason is 422
  * `idempotency_mismatch`. The owner-side `POST /bookings/:id/cancel` takes NO
  * body at all — deliberately asymmetric. `Idempotency-Key` required.
+ *
+ * From 6.0.0-lg5.1 both whole-session cancels, the owner's and this one, refuse
+ * an `'upcoming'` day-school or day-care session with 409 `session_ended`
+ * (`SessionEndedDetails`) once its day has ended, then 409 `session_checked_in`
+ * while any dog still on it has folded past `'expected'` (design §1.1:1064-1067,
+ * §2.3:2418-2428; CXL-U09). A pending row still cancels its whole order, as
+ * before. `BookingWire.can_cancel` reads the same two checks.
  */
 export interface PostStaffBookingsCancelRequest {
   reason?: string;
+}
+
+/**
+ * One dog of several (6.0.0-lg5.1; design §1.1:1068-1075, §2.3:2429-2447,
+ * §2.10:5065-5069; CXL-U09, s11):
+ *   POST /bookings/:id/dogs/:dogId/cancel          owner, no body
+ *   POST /staff/bookings/:id/dogs/:dogId/cancel    staff, any role, this body
+ * Each requires an `Idempotency-Key` and answers 200 `BookingWire`, the session
+ * after the cancel (`dog_shares` names the dog's `cancelled_at`). That dog's share
+ * leaves the session: her seat is free and one credit goes back to the owner's
+ * pool (the family's, not the dog's), to the lot her debit named while it can pay
+ * a later date, else as a fresh lot (`CreditLotDetailWire.reason`). Cancelling
+ * the last dog still on the session cancels the session.
+ *
+ * Refusals, in this order: 404 `not_found` (no live booking, not hers on the owner
+ * route, or the dog was never on it); 422 `invalid_payload` (not a day-school or
+ * day-care session); on the owner route, 409 `per_dog_cancel_off` while
+ * `cxl.per_dog_cancel_enabled` is off (seeded on; staff are unaffected); 409
+ * `session_cancelled` (the session, or this dog's share, is cancelled); 409
+ * `payment_pending` (cancel the whole order instead); 409 `session_ended`; 409
+ * `session_checked_in` while THIS dog's folded state is not `'expected'`.
+ *
+ * `reason` is trimmed, 1..500 characters, and required: the board's *Cancel*
+ * opens a reason sheet. It rides the idempotency hash, and NOTIF-U17
+ * (6.0.0-lg5.2) puts it on the owner's notice. No column stores a share's
+ * reason, so `BookingWire.cancel_reason` stays the session's.
+ */
+export interface PostStaffBookingsDogsCancelRequest {
+  reason: string;
 }
 
 /**
@@ -2288,6 +2659,20 @@ export interface GetStaffBookingsQuery {
   to?: string;
   category?: ServiceCategory;
   location?: LocationKey;
+}
+
+/**
+ * `GET /staff/checkin-board` query `[staff]`, any role, either campus
+ * (6.0.0-lg5.1; design §1.1:1044, §2.3:2417; DAY-U29). Both keys are required.
+ * `date` is a Chicago calendar day, today or any earlier day, so a day nobody
+ * recorded is fixed on its own board; a later date, a malformed value or a
+ * missing key is 400 `bad_request`, the query convention. An owner principal is
+ * 403 `forbidden`. Response `GetStaffCheckinBoardResponse`.
+ */
+export interface GetStaffCheckinBoardQuery {
+  location: LocationKey;
+  /** `YYYY-MM-DD`, Chicago, today or earlier. */
+  date: string;
 }
 
 // ---- (d) per-endpoint 422 detail unions (§3.5) -----------------------------
@@ -2539,9 +2924,14 @@ export type CreditPackageWithheldReason = 'no-evaluated-dog' | 'alumni-only';
  * `credit_ledger.id`.
  *
  * `reason` is the grant row's ledger label: `'purchase'`, `'adjustment'` (a hand
- * add), or `'cancel-refund'`, a returned credit whose own lot could pay no later
- * date, written as a fresh one-credit lot (§2.4:2961-2966). `'gingr-import'`
- * joins at the import (M10.06).
+ * add), or `'settlement-return'`, a returned credit whose own lot could pay no
+ * later date, written as a fresh one-credit lot of
+ * `cred.returned_credit_expiry_months` (§2.4:2957-2973). 6.0.0-lg5.1 (M5.03,
+ * BREAKING) makes `'settlement-return'` the one label of every return — a cancel
+ * of the session or of one dog, a turn-away, *Didn't come*, an unmarked
+ * send-home, a check-out that re-issued the credit — and `'cancel-refund'` leaves
+ * this union: no writer writes it, and a lot written under it before reads
+ * `'settlement-return'`. `'gingr-import'` joins at the import (M10.06).
  *
  * `granted` is the grant's credits and `granted_at` its row's time. `remaining`
  * is the grant plus every allocation tagged to it, read whether or not the lot
@@ -2564,7 +2954,7 @@ export type CreditPackageWithheldReason = 'no-evaluated-dog' | 'alumni-only';
  */
 export interface CreditLotDetailWire {
   id: string;
-  reason: 'purchase' | 'adjustment' | 'cancel-refund';
+  reason: 'purchase' | 'adjustment' | 'settlement-return';
   granted: number;
   remaining: number;
   granted_at: string;
@@ -2936,10 +3326,12 @@ export interface DogWire {
    *  reminder to update the profile fires that morning. */
   spay_neuter_planned_on?: string;
   /** `YYYY-MM-DD` (omit-on-null): `dogs.last_seen_on` (M2.16), the last day the
-   *  school saw this dog. New 3.0.0. Nothing stamps the column until the
-   *  check-in unit lands (P20), so the key is absent until then. No gate, clock
-   *  or client acts on it in v1 yet: its reader is S14's, dated (design §1.1:806,
-   *  M2.16). */
+   *  school saw this dog. New 3.0.0. From 6.0.0-lg5.1 a board `check-in` moves it
+   *  to the later of its value and the session's date, and the `undo` of that
+   *  check-in moves it back; a turn-away never does (design §2.3:2398-2405,
+   *  :2530-2531). The verdict and the import stamp it when they land. No gate,
+   *  clock or client acts on it in v1 yet: its reader is S14's, dated (design
+   *  §1.1:806, M2.16). */
   last_seen_on?: string;
 }
 
@@ -4943,6 +5335,15 @@ export type GetStaffPaymentsPendingResponse = PendingPaymentWire[];
  * nothing pending: no charge, or a charge already `failed` or `refunded`; or
  * when the order changed under the cancel, an intent id landing after its read.
  * Either way nothing is written, and a person may look again.
+ *
+ * 6.0.0-lg5.1 (P20): on a top-up whose charge had succeeded, the cancel first
+ * applies the day cancels' own rule to every day row it would cancel, earliest
+ * date first, and refuses the whole order at the first that refuses: 409
+ * `session_checked_in` (no `details`) for a day the desk recorded (checked in,
+ * turned away, or marked as not coming), 409
+ * `session_ended {kind, date}` for a day already over. Nothing is written; the
+ * other days stay booked, and the family can cancel them in the app
+ * (`designs/p20-event-ledger-link.md` §M2).
  */
 export interface PostStaffOrdersCancelResponse {
   order_id: string;
@@ -5832,7 +6233,10 @@ export function isSessionProgram(program: ReportProgram): boolean {
 // `staff` (M1.21, `StaffSettingsWire`), appended at 2.0.0-lg1.2 by P02, which
 // owns the rebuilt `staff_role` enum it needs (DECISIONS 47;
 // design.md:6153). `cxl` joins at design 6.0.0 over
-// M5.07's two tables. `brd`, `bt`, `pl` have no table in v1 (§3.18-3.20), and
+// M5.07's two tables, with CXL-U02 (plan unit P21). The tables land at
+// 6.0.0-lg5.1 (P20) with no settings route over them: the owner's one-dog
+// cancel reads `cxl.per_dog_cancel_enabled` directly, and nothing else reads
+// either table. `brd`, `bt`, `pl` have no table in v1 (§3.18-3.20), and
 // `cls` is no settings domain: its keys are `group_classes` columns
 // (§1.1:633-635).
 //
@@ -6219,9 +6623,12 @@ export interface DayProgramGlobalSettingsWire extends SettingsAuditWire {
   occupied_block_end_time: string;
   /** Fraction; seed 1 (§3.4:5774). */
   midstay_day_charge_fraction: number;
-  /** Fraction; seed 1 (§3.4:5781). */
+  /** Fraction; seed 1 (§3.4:5781). The credits a turn-away, *Didn't come* and
+   *  an unmarked send-home return, read from 6.0.0-lg5.1. A PATCH refuses any
+   *  value but 0 or 1, as on the next key (§2.3:2482-2483; question 20 (a)). */
   sent_home_before_training_return_fraction: number;
-  /** Fraction; seed 0; a PATCH refuses any value but 0 or 1 (§3.4:5780). */
+  /** Fraction; seed 0; a PATCH refuses any value but 0 or 1 (§3.4:5780). The
+   *  credits a send-home marked finished returns, read from 6.0.0-lg5.1. */
   sent_home_after_training_return_fraction: number;
   /** Fraction; seed 1 (§3.4:5762). */
   closure_return_fraction: number;

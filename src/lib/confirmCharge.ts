@@ -461,7 +461,13 @@ async function settlePurchase(
   }
   const paying = unpaid.slice(0, lot.credits);
   for (const slot of paying) {
-    await creditLedgerRepository.debitLot(tx, { ...lot, lotId: lot.id, ...slot });
+    // A booking-time debit: it names no check-in event (M5.10's link).
+    await creditLedgerRepository.debitLot(tx, {
+      ...lot,
+      lotId: lot.id,
+      ...slot,
+      checkinEventId: null,
+    });
   }
   await alarmOnDaysPastTheLot(tx, {
     chargeId: charge.id,
@@ -512,7 +518,11 @@ async function settlePurchase(
             created_at: orderCreatedAtIso(order),
             charge_status: 'succeeded',
           },
-          sessions: await wireManyBookings(await bookingsRepository.findByOrderId(tx, order.id)),
+          sessions: await wireManyBookings(await bookingsRepository.findByOrderId(tx, order.id), {
+            now,
+            viewer: 'owner',
+            runner: tx,
+          }),
         }
       : {
           charge_id: charge.id,

@@ -20,7 +20,7 @@ import {
   reportProgram,
   rateUnit,
   staffRole,
-  bookingAttendance,
+  checkinEventKind,
   mediaPurpose,
   mediaKind,
   notificationType,
@@ -43,7 +43,7 @@ import type {
   ReportProgram,
   RateUnit,
   StaffRole,
-  AttendanceStatus,
+  CheckinEventKind,
   MediaPurpose,
   MediaKind,
   NotificationType,
@@ -69,8 +69,9 @@ type DrizzleEnum<E extends { enumValues: readonly string[] }> = E['enumValues'][
 /**
  * One entry per shared enum. A `false` anywhere fails this type, which fails the
  * build. Exported so it counts as used (and so the failing member is named in
- * the error). `AttendanceStatus` excludes the never-an-action `'pending'`
- * default; `LocationKey` is backed by the `LOCATION_SLUGS` text tuple, not a
+ * the error). `CheckinEventKind` is the check-in log's `checkin_event_kind`
+ * (M5.12, 6.0.0-lg5.1): the folded `AttendanceStatus` has no pgEnum, so nothing
+ * pins it; `LocationKey` is backed by the `LOCATION_SLUGS` text tuple, not a
  * `pgEnum`; `ComfortLevel` is intentionally absent (no DB enum — it was retired
  * in favour of `descriptor_keys`).
  */
@@ -86,7 +87,8 @@ export type ContractEnumConformance = [
   Expect<Equal<MediaPurpose, DrizzleEnum<typeof mediaPurpose>>>,
   Expect<Equal<MediaKind, DrizzleEnum<typeof mediaKind>>>,
   Expect<Equal<NotificationType, DrizzleEnum<typeof notificationType>>>,
-  Expect<Equal<AttendanceStatus, Exclude<DrizzleEnum<typeof bookingAttendance>, 'pending'>>>,
+  // M5.12 (6.0.0-lg5.1): the log's six kinds replace the `booking_attendance` pin.
+  Expect<Equal<CheckinEventKind, DrizzleEnum<typeof checkinEventKind>>>,
   Expect<Equal<LocationKey, (typeof LOCATION_SLUGS)[number]>>,
   // 1.13.0 skeleton (§5.3): the three shared unions promoted into wire.ts §2.
   Expect<Equal<BookingMode, DrizzleEnum<typeof bookingMode>>>,
