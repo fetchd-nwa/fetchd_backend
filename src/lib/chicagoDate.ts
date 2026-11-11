@@ -80,6 +80,24 @@ export function isValidCalendarDate(s: string): boolean {
 }
 
 /**
+ * Add `days` calendar days to a YYYY-MM-DD string. UTC arithmetic is
+ * timezone-safe because we're treating the input as a calendar label,
+ * not an instant — Date.UTC's overflow handling rolls month boundaries
+ * correctly (2026-02-28 + 2 → 2026-03-02). A cohort's weekly sessions and the credit
+ * warning lead (`expiring_lots`, CRED-U13's Chicago calendar days) both count with it.
+ */
+export function addCalendarDays(yyyymmdd: string, days: number): string {
+  const parts = yyyymmdd.split('-').map(Number);
+  const [y, m, d] = parts;
+  if (y === undefined || m === undefined || d === undefined) {
+    throw new Error(`addCalendarDays: invalid date string ${yyyymmdd}`);
+  }
+  const ms = Date.UTC(y, m - 1, d + days);
+  const out = new Date(ms);
+  return `${out.getUTCFullYear()}-${String(out.getUTCMonth() + 1).padStart(2, '0')}-${String(out.getUTCDate()).padStart(2, '0')}`;
+}
+
+/**
  * The wall-clock formatter we use to read back an instant in Chicago time.
  * `hourCycle: 'h23'` pins the hour to 0..23 (midnight = 00, not 24) so the
  * round-trip arithmetic in `chicagoOffsetMinutesAt` is unambiguous.

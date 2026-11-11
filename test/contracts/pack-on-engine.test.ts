@@ -36,6 +36,7 @@ import {
   makeLogCapture,
   registerFixtureHooks,
 } from './_harness.js';
+import { createAlumniDog, removeDogs } from './_dayFixture.js';
 import { QUIET_LOG, clearOrderRows, receiptsFor } from './_orderFixture.js';
 import { waitForBlockedBackends } from './_poolFixture.js';
 import { signedIntentEvent, verifyingSignatures } from './_signedEvents.js';
@@ -505,7 +506,11 @@ test(
   },
 );
 
-test('the alumni row lands in the alumni pool', SKIP_WHEN_NO_DB, async () => {
+test('the alumni row lands in the alumni pool', SKIP_WHEN_NO_DB, async (t) => {
+  // An alumni dog on the account is what lets the household buy it (ALUM-U11).
+  const alumniDogs: string[] = [];
+  await createAlumniDog(alumniDogs);
+  t.after(() => removeDogs(alumniDogs));
   const { app } = buildApp();
   const res = await buy(app, 'school-alumni-10-fayetteville');
   assert.equal(res.statusCode, 201, res.body);

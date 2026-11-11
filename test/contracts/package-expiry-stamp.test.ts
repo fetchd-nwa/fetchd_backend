@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { afterEach, test } from 'node:test';
+import { afterEach, beforeEach, test } from 'node:test';
 import { eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { creditLedger, orders } from '../../src/db/schema/schema.js';
@@ -14,6 +14,7 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
+import { createAlumniDog, removeDogs } from './_dayFixture.js';
 import { clearOrderRows } from './_orderFixture.js';
 import { makeStripeStub } from './_stripeStub.js';
 
@@ -24,10 +25,17 @@ import { makeStripeStub } from './_stripeStub.js';
  *
  * The stub's intents are created at FIXTURE_NOW, so the anchor is one instant whether
  * the route's clock or Stripe's `created` (design §2.4:3003) stamps the lot.
+ *
+ * The household holds an alumni dog, so the alumni row sells to it (ALUM-U11).
  */
 
 registerFixtureHooks();
 afterEach(resetCatalogSeed);
+// Per test, not a root `before`: root `before` hooks do not wait for each other, so one
+// registered here can run before the fixture's seed has written the owner.
+const alumniHousehold: string[] = [];
+beforeEach(() => createAlumniDog(alumniHousehold));
+afterEach(() => removeDogs(alumniHousehold.splice(0)));
 
 // 12:00 CDT Tue 19 May 2026, and the same wall clock one and three months on.
 const ONE_MONTH_ON = '2026-06-19T17:00:00.000Z';

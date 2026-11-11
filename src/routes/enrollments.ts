@@ -313,6 +313,7 @@ export function registerEnrollmentsRoute(
         idempotencyKey,
         'POST /enrollments',
         requestHash,
+        principal.ownerId,
       );
       if (peeked !== undefined) {
         reply.code(peeked.status);
@@ -400,6 +401,7 @@ export function registerEnrollmentsRoute(
         idempotencyKey,
         WITHDRAW_ENDPOINT,
         requestHash,
+        principal.ownerId,
       );
       if (peeked !== undefined) {
         reply.code(peeked.status);

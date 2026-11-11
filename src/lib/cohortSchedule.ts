@@ -1,4 +1,4 @@
-import { chicagoWallPartsAt, chicagoWallTimeToUtc } from './chicagoDate.js';
+import { addCalendarDays, chicagoWallPartsAt, chicagoWallTimeToUtc } from './chicagoDate.js';
 
 /**
  * Group-class weekly cadence — the Day-11 enrollment counterpart to
@@ -41,24 +41,7 @@ export function computeCohortSessionDates(startInstant: Date, weeks: number): Da
       sessions.push(new Date(startInstant.getTime()));
       continue;
     }
-    sessions.push(chicagoWallTimeToUtc(addDays(date, k * 7), hour, minute));
+    sessions.push(chicagoWallTimeToUtc(addCalendarDays(date, k * 7), hour, minute));
   }
   return sessions;
-}
-
-/**
- * Add `days` calendar days to a YYYY-MM-DD string. UTC arithmetic is
- * timezone-safe because we're treating the input as a calendar label,
- * not an instant — Date.UTC's overflow handling rolls month boundaries
- * correctly (2026-02-28 + 2 → 2026-03-02).
- */
-function addDays(yyyymmdd: string, days: number): string {
-  const parts = yyyymmdd.split('-').map(Number);
-  const [y, m, d] = parts;
-  if (y === undefined || m === undefined || d === undefined) {
-    throw new Error(`addDays: invalid date string ${yyyymmdd}`);
-  }
-  const ms = Date.UTC(y, m - 1, d + days);
-  const out = new Date(ms);
-  return `${out.getUTCFullYear()}-${String(out.getUTCMonth() + 1).padStart(2, '0')}-${String(out.getUTCDate()).padStart(2, '0')}`;
 }

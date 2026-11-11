@@ -150,6 +150,11 @@ export async function buildOwnerSettings(today: string): Promise<GetSettingsResp
     cred: {
       expiry_enforced_enabled: credit.expiry_enforced_enabled,
       expiry_warning_lead_days: credit.expiry_warning_lead_days,
+      // 5.0.0 (P18 mobile G5, G6): the calendar's "no credit reaches this date" is true
+      // only while the outliving switch is off, and the shop's stepper stops at the cap
+      // the purchase route enforces rather than meeting 422 `count_not_allowed`.
+      booking_outlives_lot_expiry_enabled: credit.booking_outlives_lot_expiry_enabled,
+      single_day_purchase_max_count: credit.single_day_purchase_max_count,
     },
     cls: classes,
     msg: {

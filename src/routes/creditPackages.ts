@@ -10,6 +10,7 @@ import type {
   PostCreditPackagesPurchaseRequest,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
+import { db } from '../db/client.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
@@ -21,6 +22,11 @@ import { hashRequestBody, requireIdempotencyKey } from '../db/mutation.js';
 import type { Tx } from '../db/tx.js';
 import { invalidateAll } from '../lib/cache.js';
 import { confirmCharge } from '../lib/confirmCharge.js';
+import {
+  assertHouseholdMayBuy,
+  readHouseholdGates,
+  withWithheldReasons,
+} from '../lib/creditPackageGates.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultStripeClient, type StripeClient } from '../lib/stripe.js';
@@ -43,11 +49,17 @@ type LocationKey = (typeof LOCATION_KEYS)[number];
  * `count` (1..`cred.single_day_purchase_max_count`), in one charge and one
  * lot; `count` on any other row is 422 `count_not_allowed` (CRED-U04).
  *
- * Catalog endpoint: both owner and staff principals get the same data
- * (rates + packages are reference data, not user data). Retirement is
- * `active = false` on the row — never DELETE; the wire filter is
- * server-side so retired packs never surface even if a stale client
- * caches one.
+ * Catalog endpoint: the rows are reference data, one shared cache per campus and
+ * Chicago day, read the same by owner and staff. Since 5.0.0 an owner's read adds
+ * `withheld_reason` per row her household cannot buy, computed after the cache read and
+ * never written into it; a staff read carries none (`lib/creditPackageGates.ts`).
+ * Retirement closes the row's window — never DELETE; the filter is server-side so
+ * retired packs never surface even if a stale client caches one.
+ *
+ * The purchase refuses the same rows with the matching 422 (`alumni_package_ineligible`)
+ * inside tx1, beside `count_not_allowed`: after the claim, so a stored answer replays
+ * whatever the household holds now (DECISIONS 128(a)), and as a throw that rolls tx1
+ * back, so a refusal stores nothing and the same key re-asks once a dog is alumni.
  */
 
 // `CreditPackageWire` used to be declared right here. Since 1.13.0 it lives in
@@ -117,9 +129,14 @@ export function registerCreditPackagesRoute(
     '/credit-packages',
     { preHandler: [authHook] },
     async (request): Promise<CreditPackageWire[]> => {
-      requirePrincipal(request); // any authenticated principal; catalog is shared
+      const principal = requirePrincipal(request); // any authenticated principal
       const { location } = parsePackagesQuery(request.query);
-      return creditPackagesRepository.findActive(location, bucketChicagoToday(nowFactory()));
+      const rows = await creditPackagesRepository.findActive(
+        location,
+        bucketChicagoToday(nowFactory()),
+      );
+      if (principal.kind !== 'owner') return rows;
+      return withWithheldReasons(rows, await readHouseholdGates(db, principal.ownerId));
     },
   );
 
@@ -166,6 +183,9 @@ export function registerCreditPackagesRoute(
               throw new ApiError('not_found', `credit package ${key} not found or retired`);
             }
             if (body.count !== undefined) await assertCountAllowed(tx, pkg, body.count);
+            // The household's gate, read in tx1 and never cached: 422 before any order
+            // commits, and nothing is stored, so the same key asks again (ALUM-U11).
+            assertHouseholdMayBuy(pkg, await readHouseholdGates(tx, principal.ownerId));
             const count = body.count ?? 1;
             // The ownership check too: a card that is not a live card of hers is the generic 404.
             const card = await loadStripePaymentContext(

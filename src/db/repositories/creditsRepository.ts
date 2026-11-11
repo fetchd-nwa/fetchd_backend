@@ -3,6 +3,7 @@ import type { CreditLotWire, CreditTier, OwnerCreditPoolWire } from '../../contr
 import { CREDIT_TIERS } from '../../contracts/wire.js';
 import { readThrough } from '../../lib/cache.js';
 import { bookingMode, type LocationKey } from '../schema/schema.js';
+import { addCalendarDays, bucketChicagoToday, bucketToChicagoDate } from '../../lib/chicagoDate.js';
 import { pgTimestampToDate, pgTimestampToIso } from '../../lib/pgTimestamp.js';
 import { db } from '../client.js';
 import { findLiveLots } from './creditLedgerRepository.js';
@@ -36,8 +37,6 @@ const POOL_SCHEMA: z.ZodType<OwnerCreditPoolWire> = z.object({
 });
 const POOLS_SCHEMA = POOL_SCHEMA.array();
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
 /** The pools at one campus. The owner leads the key, so one glob wipes both campuses. */
 export function creditsPoolsCacheKey(ownerId: string, location: LocationKey): string {
   return `credits:${ownerId}:pools:${location}`;
@@ -51,7 +50,11 @@ export function creditsInvalidationPattern(ownerId: string): string {
 const TIER_ORDER: Readonly<Record<CreditTier, number>> = { regular: 0, alumni: 1 };
 
 export const creditsRepository = {
-  async findPools(ownerId: string, location: LocationKey): Promise<OwnerCreditPoolWire[]> {
+  async findPools(
+    ownerId: string,
+    location: LocationKey,
+    now: Date = new Date(),
+  ): Promise<OwnerCreditPoolWire[]> {
     return readThrough(
       creditsPoolsCacheKey(ownerId, location),
       CREDITS_TTL_SEC,
@@ -59,7 +62,10 @@ export const creditsRepository = {
       async () => {
         const lots = await findLiveLots(db, { ownerId, location });
         const { expiry_warning_lead_days: leads } = await settingsRepository.credit();
-        const horizon = Date.now() + Math.max(0, ...leads) * DAY_MS;
+        // The lead counts Chicago calendar days, as the expiry scan does (design §S42,
+        // CRED-U13: "Chicago expiry date minus today's Chicago date"). 24-hour days were an
+        // hour short of the wall clock across fall-back and lost a lot due that morning.
+        const lastWarnedDate = addCalendarDays(bucketChicagoToday(now), Math.max(0, ...leads));
         const pools = new Map<string, OwnerCreditPoolWire>();
         for (const lot of lots) {
           const key = `${lot.mode}:${lot.tier}`;
@@ -77,7 +83,7 @@ export const creditsRepository = {
           pool.lots.push({ remaining: lot.remaining, expires_at: expiresAt });
           // "Never `[]` by a switch": this reads the date, whatever the switch says, and
           // a lot past its date, live only because expiry is off, is not about to expire.
-          if (expires.getTime() > Date.now() && expires.getTime() <= horizon) {
+          if (expires.getTime() > now.getTime() && bucketToChicagoDate(expires) <= lastWarnedDate) {
             const expiring: CreditLotWire = {
               mode: lot.mode,
               remaining: lot.remaining,

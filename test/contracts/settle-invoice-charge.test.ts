@@ -6,7 +6,6 @@ import {
   invoicesRepository,
   type InvoiceRow,
 } from '../../src/db/repositories/invoicesRepository.js';
-import { refundsRepository } from '../../src/db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import {
   charges,
@@ -16,8 +15,9 @@ import {
   scheduledNotifications,
 } from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
-import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
+import { settleChargeAgainstInvoice } from '../../src/lib/settleInvoiceCharge.js';
 import { clearInvoiceReferrers, FIXTURE_IDS } from './_fixture.js';
+import { settleWithNewCharge } from './_invoiceSettle.js';
 import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
 
 registerFixtureHooks();
@@ -54,13 +54,14 @@ async function cleanup(): Promise<void> {
     );
 }
 
+/** A succeeded tender of its own, settled through the production entry (`_invoiceSettle.ts`). */
 async function settle(
   invoice: InvoiceRow,
   paymentIntentId: string,
   notifyOwner: boolean,
-): ReturnType<typeof settleInvoiceCharge> {
+): ReturnType<typeof settleWithNewCharge> {
   return withActor(ACTOR, (tx) =>
-    settleInvoiceCharge(tx, {
+    settleWithNewCharge(tx, {
       invoice,
       paymentIntentId,
       amountCents: invoice.amountCents,
@@ -91,7 +92,7 @@ async function countPaymentSucceeded(): Promise<number> {
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'settleInvoiceCharge — concurrent settle: one wins, the loser charge is refunded (no double-charge)',
+  'settleChargeAgainstInvoice — concurrent settle: one wins, the loser charge is refunded (no double-charge)',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -157,60 +158,56 @@ test(
 );
 
 test(
-  'settleInvoiceCharge — refund idempotency: re-running the lost-race path does not double-refund the SAME charge',
+  'settleChargeAgainstInvoice — refund idempotency: settling the SAME lost charge again mints no second refund',
   SKIP_WHEN_NO_DB,
   async () => {
-    // The lost-race branch is idempotency-guarded via sumNonFailedForCharge.
-    // A fresh duplicate charge (distinct PI) always refunds in full; but if the
-    // SAME charge row is re-processed (the guard's job), no second refund row
-    // is written. We exercise the guard directly: settle the same invoice with
-    // the same PI twice — the second create hits the unique-PI path and the
-    // guard ensures the refund total never exceeds the charge amount.
+    // The lost-race arm mints through the one capped helper (`mintCappedPendingRefund`):
+    // it sums the charge's non-failed refunds and mints at most the remainder. A fresh
+    // duplicate (a distinct PI) refunds in full; the SAME charge settled again, as a
+    // redelivered event or a second settler would, finds it already refunded in full.
     await cleanup();
     const invoice = await seedOpenInvoice();
     await settle(invoice, 'pi_test_winner_idem', true); // wins, paid
 
-    // First lost-race duplicate: a refund row is written for its full amount.
     const firstLoser = await settle(invoice, 'pi_test_loser_idem', true);
     assert.equal(firstLoser.outcome, 'refunded');
+    assert.ok(
+      firstLoser.outcome === 'refunded' && firstLoser.pendingStripeRefund !== undefined,
+      'the first loss mints a refund to send',
+    );
 
-    const afterFirst = await db
-      .select({ chargeId: refunds.chargeId, amountCents: refunds.amountCents })
+    const again = await withActor(ACTOR, (tx) =>
+      settleChargeAgainstInvoice(tx, {
+        invoice,
+        chargeId: firstLoser.chargeId,
+        paymentIntentId: 'pi_test_loser_idem',
+        amountCents: invoice.amountCents,
+        purpose: invoice.purpose,
+        notifyOwner: true,
+      }),
+    );
+    assert.equal(again.outcome, 'refunded', 'still a lost race');
+    assert.equal(
+      again.outcome === 'refunded' ? again.pendingStripeRefund : 'settled',
+      undefined,
+      'nothing more to send back',
+    );
+    const rows = await db
+      .select({ amountCents: refunds.amountCents })
       .from(refunds)
-      .where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
-    assert.equal(afterFirst.length, 1, 'one refund after the first lost-race');
-
-    // Re-run the lost-race settle for the SAME loser charge inside one tx: the
-    // guard sums the existing pending refund and computes maxRefund <= 0, so no
-    // second refund row is created for that charge.
-    const loserChargeId = firstLoser.outcome === 'refunded' ? firstLoser.chargeId : '';
-    const secondRefundCount = await withActor(ACTOR, async (tx) => {
-      const already = await refundsRepository.sumNonFailedForCharge(tx, loserChargeId);
-      const maxRefund = invoice.amountCents - already;
-      if (maxRefund > 0) {
-        await refundsRepository.createPending(tx, {
-          ownerId: FIXTURE_IDS.ownerId,
-          chargeId: loserChargeId,
-          bookingId: null,
-          amountCents: maxRefund,
-          reason: 'duplicate-invoice-settle',
-          stripeIdempotencyKey: null,
-        });
-      }
-      const rows = await tx
-        .select({ id: refunds.id })
-        .from(refunds)
-        .where(eq(refunds.chargeId, loserChargeId));
-      return rows.length;
-    });
-    assert.equal(secondRefundCount, 1, 'no second refund row for an already-fully-refunded charge');
+      .where(eq(refunds.chargeId, firstLoser.chargeId));
+    assert.deepEqual(
+      rows.map((r) => r.amountCents),
+      [invoice.amountCents],
+      'one refund row for the charge, in full',
+    );
 
     await cleanup();
   },
 );
 
 test(
-  'settleInvoiceCharge — clean win with notifyOwner=false emits no receipt (no caller passes false today)',
+  'settleChargeAgainstInvoice — clean win with notifyOwner=false emits no receipt (no caller passes false today)',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -230,7 +227,7 @@ test(
 );
 
 test(
-  'settleInvoiceCharge — settling an in-person invoice cancels its pending payment-due reminder (R3)',
+  'settleChargeAgainstInvoice — settling an in-person invoice cancels its pending payment-due reminder (R3)',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();

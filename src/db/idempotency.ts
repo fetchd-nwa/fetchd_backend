@@ -49,12 +49,12 @@ export interface IdempotencyOutcome<T> extends MutationResponse<T> {
  *     loser sees no RETURNING row.
  *
  *  2. **Completed already.** Existing row, `completed_at IS NOT NULL`. If the
- *     `(endpoint, request_hash)` match, replay the stored `response_status` /
- *     `response_body` without re-executing. If they don't match the client
- *     reused the key for a different request — `idempotency_mismatch` (422).
+ *     `(owner_id, endpoint, request_hash)` match, replay the stored `response_status` /
+ *     `response_body` without re-executing. If they don't match the key was reused
+ *     for a different request, or by another principal — `idempotency_mismatch` (422).
  *
- *  3. **Still in flight.** Existing row, `completed_at IS NULL` — another
- *     request with this key is mid-execution. `idempotency_inflight` (409).
+ *  3. **Still in flight.** Existing row, `completed_at IS NULL`, the same request —
+ *     another request with this key is mid-execution. `idempotency_inflight` (409).
  *     Returns to the client; the in-flight call will complete or roll back on
  *     its own.
  *
@@ -135,9 +135,7 @@ export async function claimIdempotencyKey<T>(
         'idempotency row vanished mid-resolve (retry the request)',
       );
     }
-    if (existing.endpoint !== claim.endpoint || existing.requestHash !== claim.requestHash) {
-      throw new ApiError('idempotency_mismatch', 'Idempotency-Key reused with a different request');
-    }
+    if (!sameRequest(existing, claim)) throw mismatch();
     if (existing.completedAt === null) throw inflight();
     return {
       won: false,
@@ -159,6 +157,29 @@ function inflight(): ApiError {
   return new ApiError(
     'idempotency_inflight',
     'a request with this Idempotency-Key is still in progress',
+  );
+}
+
+function mismatch(): ApiError {
+  return new ApiError('idempotency_mismatch', 'Idempotency-Key reused with a different request');
+}
+
+/**
+ * Is this the request the key was claimed for? The same principal first: a key is the
+ * owner's who made it (`owner_id`, NULL for every staff principal, so a staff route's
+ * keys answer staff), and another household presenting it, even with the very body the
+ * first sent, learns nothing of the first answer, not even that it is still running (P19
+ * fix 1, F1; P15 Opus L7's class, which `/invoices/:id/pay` closed with its own ownership
+ * 404). Then the same route and the same body, as always.
+ */
+function sameRequest(
+  existing: { ownerId: string | null; endpoint: string; requestHash: string },
+  request: { ownerId: string | null; endpoint: string; requestHash: string },
+): boolean {
+  return (
+    existing.ownerId === request.ownerId &&
+    existing.endpoint === request.endpoint &&
+    existing.requestHash === request.requestHash
   );
 }
 
@@ -238,14 +259,17 @@ export async function readCompletedClaim<T>(key: string): Promise<MutationRespon
  *     this attempt; the peek just defers to the claim).
  *
  * Throws `idempotency_mismatch` when the key matches but `endpoint` /
- * `requestHash` differ — same semantic as `withIdempotency`'s mismatch
+ * `requestHash` differ, or another principal made it (`ownerId`: the caller's
+ * owner id, `null` for staff) — same semantic as `withIdempotency`'s mismatch
  * path; surfaces a client bug at the boundary rather than letting the
- * route proceed against stale state.
+ * route proceed against stale state, and runs before any of a route's
+ * pre-transaction money work.
  */
 export async function peekCompletedIdempotency<T>(
   key: string,
   endpoint: string,
   requestHash: string,
+  ownerId: string | null,
 ): Promise<IdempotencyOutcome<T> | undefined> {
   const [existing] = await db
     .select()
@@ -253,9 +277,7 @@ export async function peekCompletedIdempotency<T>(
     .where(eq(idempotencyKeys.key, key))
     .limit(1);
   if (!existing) return undefined;
-  if (existing.endpoint !== endpoint || existing.requestHash !== requestHash) {
-    throw new ApiError('idempotency_mismatch', 'Idempotency-Key reused with a different request');
-  }
+  if (!sameRequest(existing, { ownerId, endpoint, requestHash })) throw mismatch();
   if (existing.completedAt === null) return undefined;
   return {
     status: existing.responseStatus ?? 200,
@@ -283,7 +305,7 @@ export async function peekEngineClaim<T>(
     .where(eq(idempotencyKeys.key, key))
     .limit(1);
   if (claim?.ownerId !== ownerId) return undefined;
-  const stored = await peekCompletedIdempotency<T>(key, endpoint, requestHash);
+  const stored = await peekCompletedIdempotency<T>(key, endpoint, requestHash, ownerId);
   if (stored !== undefined) return stored;
   const [open] = await db
     .select({ key: idempotencyKeys.key })

@@ -178,8 +178,16 @@ async function planCredits(
 
   // The date a lot of this row bought now would carry. With expiry off, or outliving on, a
   // bought credit reaches every date, so no stamp binds it.
+  //
+  // The settle stamps that lot from the PaymentIntent's `created` (design §2.4:3003), which
+  // Stripe gives in whole seconds and which comes after this transaction, so this judges on
+  // the whole second it runs in: on clocks that agree, the stamp's anchor is that second or
+  // later, and the lot pays every date this says it reaches (Fable r2 N2). Judged on `now`
+  // itself, a top-up in the first second after a Chicago midnight, for the date a month
+  // out, fit here and then paged a person when its lot ended at that midnight.
+  const stampAnchor = new Date(Math.floor(now.getTime() / 1000) * 1000);
   const stampOf = (row: CreditPackageWithId): Date | undefined =>
-    lotDatesBind(settings) ? addChicagoMonths(now, row.expiry_months) : undefined;
+    lotDatesBind(settings) ? addChicagoMonths(stampAnchor, row.expiry_months) : undefined;
 
   // A date past the reach of a credit bought today can only be paid by a lot she holds.
   const reach = single !== undefined ? stampOf(single) : undefined;

@@ -12,6 +12,41 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [5.0.0] — 2026-11-10
+
+ADDITIVE. LG4's close (plan unit P19, slice S26: CRED-U32, ALUM-U11, ALUM-U13;
+design §1.1 5.0.0 `:980-986`, §2.4 `:2875-2877`, `:3060-3069`, `:3189-3190`). No
+migration. Every field is optional or new, and every code is appended, so a
+client built against 5.0.0-lg4.2 reads 5.0.0 unchanged.
+
+### Added
+
+- `CreditPackageWire.withheld_reason?: CreditPackageWithheldReason`
+  (`'no-evaluated-dog' | 'alumni-only'`): why this owner cannot buy the row,
+  computed per owner after the catalog cache read, omitted when she can and on
+  every staff read. The row stays listed, greyed with the reason's copy.
+  `'alumni-only'` is sent from this version (ALUM-U11); `'no-evaluated-dog'` is
+  typed and sent by no route until EVAL-U20 (P11). `GET /credit-packages`'s doc
+  says an owner's read is owner-aware.
+- Two thrown codes, the 39th and 40th, appended: 422 `alumni_package_ineligible`
+  with `AlumniPackageIneligibleDetails {kind, reason: 'no-alumni-dog'}`
+  (ALUM-U11), and 422 `pack_requires_evaluated_dog`, no `details`, typed and
+  thrown from P11 (EVAL-U20). Both run before any order commits, so a refused
+  purchase charges nothing. `ApiErrorDetailWire` gains the details arm.
+- `OwnerCreditSettingsWire` (the owner document's `cred`) gains
+  `booking_outlives_lot_expiry_enabled` and `single_day_purchase_max_count`,
+  read from the same `credit_settings` row (build DECISIONS 216; P18 mobile G5,
+  G6): the calendar stops greying dates while the first is true, and the shop's
+  stepper stops at the second.
+
+### Documentation
+
+- `PostCreditPackagesPurchaseRequest`: the two refusals, and why no total rides
+  the body (no v1 route writes a price or a credit count; DECISIONS 216, P18
+  Opus r4 N6 ruled out).
+- `CreditSettingsWire`: the owner document carries four of its keys, not two.
+- The landing-group note names 5.0.0 as LG4's close.
+
 ## [5.0.0-lg4.2] — 2026-11-10
 
 BREAKING. LG4's second of three steps toward 5.0.0 (plan unit P18, slices S23, S25,

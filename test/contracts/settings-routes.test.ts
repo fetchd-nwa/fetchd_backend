@@ -103,6 +103,32 @@ describe(
       }
     });
 
+    test('cred.booking_outlives_lot_expiry_enabled and cred.single_day_purchase_max_count, edited by staff, are what the owner document says next (5.0.0, G5 and G6)', async () => {
+      const staffApp = appAs(SHANTI); // the outliving switch is money: owner or manager
+      const ownerApp = appAs(FIXTURE_OWNER_PRINCIPAL);
+      const ownerCred = async () =>
+        (await ownerApp.inject({ method: 'GET', url: '/settings' })).json<OwnerSettingsWire>().cred;
+      try {
+        const outliving = await patch(staffApp, '/staff/settings/cred', {
+          booking_outlives_lot_expiry_enabled: true,
+        });
+        assert.equal(outliving.statusCode, 200, outliving.body);
+        assert.equal((await ownerCred()).booking_outlives_lot_expiry_enabled, true);
+
+        const cap = await patch(staffApp, '/staff/settings/cred', {
+          single_day_purchase_max_count: 12,
+        });
+        assert.equal(cap.statusCode, 200, cap.body);
+        const after = await ownerCred();
+        assert.equal(after.single_day_purchase_max_count, 12);
+        assert.equal(after.booking_outlives_lot_expiry_enabled, true, 'the first edit stands');
+      } finally {
+        await setRaw(
+          sql`UPDATE credit_settings SET booking_outlives_lot_expiry_enabled = false, single_day_purchase_max_count = 30`,
+        );
+      }
+    });
+
     test("a campus cap edit is the very next read of that campus's row, by any role (Amber's 08:45)", async () => {
       // The owner document carries no cap (the app reads seats from availability),
       // so the next read here is the staff row's.
@@ -135,11 +161,18 @@ describe(
 // ── the owner document ───────────────────────────────────────────────────────
 
 describe('GET /settings — the owner document', SKIP_WHEN_NO_DB, () => {
-  test('carries the expiry switch (true) and the 7-day lead, and no cxl or mig section', async () => {
+  test('carries the expiry switch (true), the 7-day lead, the outliving switch (false) and the single-day cap (30), and no cxl or mig section', async () => {
     const res = await appAs(FIXTURE_OWNER_PRINCIPAL).inject({ method: 'GET', url: '/settings' });
     assert.equal(res.statusCode, 200, res.body);
     const doc = res.json<OwnerSettingsWire & Record<string, unknown>>();
-    assert.deepEqual(doc.cred, { expiry_enforced_enabled: true, expiry_warning_lead_days: [7] });
+    // The four `cred` keys of `OwnerCreditSettingsWire`, at their M1.06 seeds (5.0.0 adds
+    // the last two, P18 mobile G5 and G6; build DECISIONS 216(d)).
+    assert.deepEqual(doc.cred, {
+      expiry_enforced_enabled: true,
+      expiry_warning_lead_days: [7],
+      booking_outlives_lot_expiry_enabled: false,
+      single_day_purchase_max_count: 30,
+    });
     assert.equal('cxl' in doc, false);
     assert.equal('mig' in doc, false);
     assert.deepEqual(Object.keys(doc).sort(), [

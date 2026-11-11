@@ -160,6 +160,64 @@ test(
 );
 
 test(
+  'expiring_lots counts the lead in Chicago calendar days, across fall-back (Sun 1 Nov 2026, 02:00 CDT → 01:00 CST)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // `lot_is_live` reads Postgres's clock, and these dates are behind it, so expiry is off:
+    // the lots stay live, and expiring_lots reads their dates on the injected clock.
+    await db.update(creditSettings).set({ expiryEnforcedEnabled: false });
+    // 10:00 CDT Sat 31 Oct. The seed's lead is 7 days, so the window is every lot whose
+    // Chicago date is 31 Oct to Sat 7 Nov, as P31's scan counts it (design §S42, CRED-U13):
+    // "Chicago expiry date minus today's Chicago date". 7 × 24 h from now is 09:00 CST on the
+    // 7th, an hour short of the wall clock, because the 1st has 25 hours.
+    const now = new Date('2026-10-31T15:00:00.000Z');
+    const morning = '2026-11-07T15:30:00.000Z'; // 09:30 CST Sat 7 Nov: day 7, inside
+    const night = '2026-11-08T05:30:00.000Z'; // 23:30 CST Sat 7 Nov: day 7, inside
+    const sunday = '2026-11-08T06:30:00.000Z'; // 00:30 CST Sun 8 Nov: day 8, outside
+    await plantLot({ location: 'bentonville', credits: 1, expiresAt: morning });
+    await plantLot({ location: 'bentonville', credits: 2, expiresAt: night });
+    await plantLot({ location: 'bentonville', credits: 4, expiresAt: sunday });
+
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditsRoute(app, { authenticate, now: () => now });
+    const res = await app.inject({ method: 'GET', url: '/credits?location=bentonville' });
+    assert.equal(res.statusCode, 200, res.body);
+    const school = (res.json() as OwnerCreditsWire).pools.find((p) => p.mode === 'school');
+    assert.deepEqual(school?.expiring_lots, [
+      { mode: 'school', remaining: 1, expires_at: morning },
+      { mode: 'school', remaining: 2, expires_at: night },
+    ]);
+  },
+);
+
+test(
+  "expiring_lots reads today in Chicago, not UTC: at 23:30 CDT Sat 31 Oct, already 1 Nov in UTC, the window still ends Sat 7 Nov (Opus L3)",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // The same three lots as above, at an hour where the two calendars disagree. Read in
+    // UTC, today would be 1 Nov and the window would reach Sun 8 Nov, listing the 00:30 lot.
+    await db.update(creditSettings).set({ expiryEnforcedEnabled: false });
+    const now = new Date('2026-11-01T04:30:00.000Z'); // 23:30 CDT Sat 31 Oct
+    const morning = '2026-11-07T15:30:00.000Z'; // 09:30 CST Sat 7 Nov: day 7, inside
+    const night = '2026-11-08T05:30:00.000Z'; // 23:30 CST Sat 7 Nov: day 7, inside
+    const sunday = '2026-11-08T06:30:00.000Z'; // 00:30 CST Sun 8 Nov: day 8, outside
+    await plantLot({ location: 'bentonville', credits: 1, expiresAt: morning });
+    await plantLot({ location: 'bentonville', credits: 2, expiresAt: night });
+    await plantLot({ location: 'bentonville', credits: 4, expiresAt: sunday });
+
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerCreditsRoute(app, { authenticate, now: () => now });
+    const res = await app.inject({ method: 'GET', url: '/credits?location=bentonville' });
+    assert.equal(res.statusCode, 200, res.body);
+    const school = (res.json() as OwnerCreditsWire).pools.find((p) => p.mode === 'school');
+    assert.deepEqual(school?.expiring_lots, [
+      { mode: 'school', remaining: 1, expires_at: morning },
+      { mode: 'school', remaining: 2, expires_at: night },
+    ]);
+  },
+);
+
+test(
   'with expiry off a lot past its date is live and in `lots`, and is never in expiring_lots',
   SKIP_WHEN_NO_DB,
   async () => {

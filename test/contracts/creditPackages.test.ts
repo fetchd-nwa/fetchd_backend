@@ -15,7 +15,7 @@ import {
 registerFixtureHooks();
 
 test(
-  'GET /credit-packages byte-matches the §B CreditPackage wire shape (effective-window filter, enum-order school before daycare)',
+  'GET /credit-packages byte-matches the §B CreditPackage wire shape (effective-window filter, enum-order school before daycare); the fixture household has no alumni dog, so its alumni row reads withheld (5.0.0)',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
@@ -25,7 +25,13 @@ test(
     if (res.statusCode !== 200) {
       throw new Error(`/credit-packages returned ${res.statusCode}: ${res.body}`);
     }
-    assert.deepStrictEqual(res.json(), loadSnapshot('credit-packages'));
+    // The snapshot is the shared rows, which staff read bare (below); an owner's read adds
+    // `withheld_reason` per row (ALUM-U11), and nothing else moves.
+    const bare = loadSnapshot('credit-packages') as CreditPackageWire[];
+    assert.deepStrictEqual(
+      res.json(),
+      bare.map((row) => (row.tier === 'alumni' ? { ...row, withheld_reason: 'alumni-only' } : row)),
+    );
   },
 );
 

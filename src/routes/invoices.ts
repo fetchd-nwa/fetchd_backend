@@ -280,6 +280,7 @@ export function registerInvoicesRoute(app: FastifyInstance, opts: InvoicesRouteO
       idempotencyKey,
       'POST /invoices/:id/pay-in-person',
       requestHash,
+      principal.ownerId,
     );
     if (replay !== undefined) {
       reply.code(replay.status);

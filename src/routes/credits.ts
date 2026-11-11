@@ -22,13 +22,22 @@ export type GetCreditsQueryConformance = Expect<
   Equal<z.input<typeof creditsQuerySchema>, GetCreditsQuery>
 >;
 
-export function registerCreditsRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {
+export interface CreditsRouteOptions extends AuthRouteOptions {
+  /** A test's clock for `expiring_lots`. A factory, so a captured clock can't freeze production. */
+  now?: () => Date;
+}
+
+export function registerCreditsRoute(app: FastifyInstance, opts: CreditsRouteOptions = {}): void {
   const authHook = resolveAuthHook(opts);
+  const nowFactory = opts.now ?? ((): Date => new Date());
 
   app.get('/credits', { preHandler: [authHook] }, async (request): Promise<OwnerCreditsWire> => {
     const principal = requirePrincipal(request);
     requireOwner(principal, 'read credits');
     const { location } = parseOrThrow(creditsQuerySchema, request.query, 'query');
-    return { location, pools: await creditsRepository.findPools(principal.ownerId, location) };
+    return {
+      location,
+      pools: await creditsRepository.findPools(principal.ownerId, location, nowFactory()),
+    };
   });
 }

@@ -46,6 +46,16 @@ export async function createBookableDog(ledger: string[]): Promise<string> {
   return dogId;
 }
 
+/**
+ * The same dog, alumni: one live alumni dog opens the Alumni 10 to the whole household
+ * (ALUM-U11; the purchase names no dog). Pushes her id onto `ledger`.
+ */
+export async function createAlumniDog(ledger: string[]): Promise<string> {
+  const dogId = await createBookableDog(ledger);
+  await db.update(dogs).set({ isAlumni: true }).where(eq(dogs.id, dogId));
+  return dogId;
+}
+
 /** The same dog with credits in both modes at both campuses. */
 export async function createFundedDog(ledger: string[], credits = 5): Promise<string> {
   const dogId = await createBookableDog(ledger);

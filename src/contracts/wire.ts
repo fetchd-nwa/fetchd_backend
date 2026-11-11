@@ -65,9 +65,10 @@
  * major up here; 4.0.0, 5.0.0 and 6.0.0 keep theirs (build DECISIONS 6;
  * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close). LG4:
- * 5.0.0-lg4.1 (P17, breaking), 5.0.0-lg4.2 (P18, breaking).
+ * 5.0.0-lg4.1 (P17, breaking), 5.0.0-lg4.2 (P18, breaking), 5.0.0 (P19,
+ * additive, its close).
  */
-export const WIRE_CONTRACT_VERSION = '5.0.0-lg4.2';
+export const WIRE_CONTRACT_VERSION = '5.0.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -193,6 +194,13 @@ export const WIRE_CONTRACT_VERSION = '5.0.0-lg4.2';
  * `'lot_insufficient'`, `'expiry_not_in_future'` and `'pool_not_bookable'`, each
  * 422, and `'credit_edit_role_required'`, 403. None carries `details`: the code
  * is the whole signal. Each route's doc says which of them it can answer.
+ *
+ * 5.0.0 appends two thrown codes, the 39th and 40th, after
+ * `'credit_edit_role_required'` — appended, never inserted (design
+ * §1.1:984-986, §2.4:3060-3068; ALUM-U11, EVAL-U20): `'alumni_package_ineligible'`,
+ * 422, with `details` (`AlumniPackageIneligibleDetails`), and
+ * `'pack_requires_evaluated_dog'`, 422, no `details`. The second is typed here
+ * and thrown by no route until EVAL-U20 lands (plan unit P11).
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -233,7 +241,9 @@ export type ApiErrorCode =
   | 'lot_insufficient' // hand removal blocked — more credits than the lot has unspent (5.0.0-lg4.2)
   | 'expiry_not_in_future' // hand edit blocked — the date is not later than now (5.0.0-lg4.2)
   | 'pool_not_bookable' // hand add blocked — no v1 booking can draw from this pool (5.0.0-lg4.2)
-  | 'credit_edit_role_required'; // hand edit blocked — the role is off its list (5.0.0-lg4.2)
+  | 'credit_edit_role_required' // hand edit blocked — the role is off its list (5.0.0-lg4.2)
+  | 'alumni_package_ineligible' // purchase blocked — an alumni-tier row, and no dog on the account is alumni (5.0.0)
+  | 'pack_requires_evaluated_dog'; // purchase blocked — no dog on the account holds a passed evaluation (5.0.0; thrown from P11)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -275,6 +285,8 @@ export const API_ERROR_CODES = [
   'expiry_not_in_future',
   'pool_not_bookable',
   'credit_edit_role_required',
+  'alumni_package_ineligible',
+  'pack_requires_evaluated_dog',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -363,6 +375,11 @@ export const API_ERROR_STATUS = {
   expiry_not_in_future: 422,
   pool_not_bookable: 422,
   credit_edit_role_required: 403,
+  // 5.0.0 (new codes, so their statuses are set in the same bump): two
+  // well-formed purchases refused by the shop's household gates (design
+  // §1.1:984-986).
+  alumni_package_ineligible: 422,
+  pack_requires_evaluated_dog: 422,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -615,6 +632,20 @@ export interface CreditExpiredBeforeDateDetails {
   dates: string[];
 }
 
+/**
+ * 422 `alumni_package_ineligible` on `POST /credit-packages/:key/purchase`
+ * (5.0.0; design §1.1:984-986, §2.4:3065-3068; ALUM-U11): the row is
+ * `tier: 'alumni'` and no live dog on the caller's account is `is_alumni`. The
+ * gate is the household's, read per owner before any order commits, so a refused
+ * purchase charges nothing and writes nothing. `reason` is the one v1 reason;
+ * the catalog row carries the same refusal ahead of time as
+ * `withheld_reason: 'alumni-only'`.
+ */
+export interface AlumniPackageIneligibleDetails {
+  kind: 'alumni_package_ineligible';
+  reason: 'no-alumni-dog';
+}
+
 /** FLAT grammar: the `CapacityGap` fields spread beside `kind`, not nested. */
 export interface InsufficientCapacityDetails extends CapacityGap {
   kind: 'insufficient_capacity';
@@ -785,7 +816,8 @@ export interface CapacityBelowBookedDetails {
  * `ProfileIncompleteDetails` (`PATCH /me`). 4.0.0-lg3.1 appends
  * `CapacityBelowBookedDetails`, contract-first: no route emits it until P13's
  * backend lands. 4.0.0 appends `CreditExpiredBeforeDateDetails`, which no route
- * emitted until its predicate landed at 5.0.0-lg4.2.
+ * emitted until its predicate landed at 5.0.0-lg4.2. 5.0.0 appends
+ * `AlumniPackageIneligibleDetails` (ALUM-U11).
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -805,7 +837,8 @@ export type ApiErrorDetailWire =
   | SettingInertDetails
   | ProfileIncompleteDetails
   | CapacityBelowBookedDetails
-  | CreditExpiredBeforeDateDetails;
+  | CreditExpiredBeforeDateDetails
+  | AlumniPackageIneligibleDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -2436,8 +2469,11 @@ export interface OwnerCreditsWire {
  * Promoted 1.13.0 from `routes/creditPackages.ts:56-64` (digest credits/M).
  * Query shape: `GetCreditPackagesQuery` below (`location` REQUIRED).
  *
- * Reference data, not user data: owner and staff principals get identical
- * bytes (`creditPackages.ts:122`). Ordering is `mode ASC, credits ASC` with
+ * Reference data, not user data: the rows come from one shared per-(campus,
+ * Chicago day) cache (`creditPackages.ts:134`), and owner and staff principals
+ * read the same rows. Since 5.0.0 an owner's read adds `withheld_reason` per
+ * owner, computed after the cache read and never inside it (design
+ * §2.4:2875-2877); a staff read never carries it. Ordering is `mode ASC, credits ASC` with
  * Postgres enum sort order (`booking_mode` is declared `('school','daycare')`),
  * so school packs precede daycare packs — pinned by
  * `test/contracts/snapshots/credit-packages.json`.
@@ -2475,7 +2511,26 @@ export interface CreditPackageWire {
   /** Whole America/Chicago months a lot of this row lasts, stamped once at grant
    *  (`cred.package_expiry_months`; seed 1). Lots already sold keep their date. */
   expiry_months: number;
+  /**
+   * Why THIS owner cannot buy the row (5.0.0; design §1.1:980-983,
+   * §2.4:3060-3069; ALUM-U11, EVAL-U20). OMITTED when she can, and on every
+   * staff read. The row is still listed: the app greys it with the reason's
+   * copy ("For alumni dogs", "Pass an evaluation first"; ALUM-U13, EVAL-U21)
+   * and never offers its purchase. The purchase route refuses the same row
+   * with the matching 422, so the field is advice and the route is the rule:
+   *   - `'alumni-only'`: a `tier: 'alumni'` row, and no live dog on the account
+   *     is `is_alumni` → `alumni_package_ineligible`.
+   *   - `'no-evaluated-dog'`: no dog on the account holds `passed` →
+   *     `pack_requires_evaluated_dog`. Typed here; sent by no route until
+   *     EVAL-U20 lands (plan unit P11).
+   * When both hold, `'no-evaluated-dog'` is sent (the household's first gate).
+   */
+  withheld_reason?: CreditPackageWithheldReason;
 }
+
+/** `CreditPackageWire.withheld_reason` (5.0.0). Computed per owner at read,
+ *  never stored. */
+export type CreditPackageWithheldReason = 'no-evaluated-dog' | 'alumni-only';
 
 /**
  * One lot as staff read it: an element of `StaffCreditPoolWire.lots`, and the
@@ -2599,6 +2654,19 @@ export interface StaffOwnerCreditsWire {
  * 404 collapses for unknown key / retired package / unknown or soft-expired
  * payment method — id enumeration is the security concern, so all three answer
  * identically. 422 `count_not_allowed`: see `count`.
+ *
+ * Since 5.0.0 the household's gates run before any order commits, so a refusal
+ * charges nothing and writes nothing (design §2.4:3060-3069):
+ *   - 422 `alumni_package_ineligible` (`AlumniPackageIneligibleDetails`): an
+ *     alumni-tier row, and no live dog on the account is `is_alumni` (ALUM-U11).
+ *   - 422 `pack_requires_evaluated_dog`: no dog on the account holds `passed`
+ *     (EVAL-U20). Typed at 5.0.0; thrown by no route until plan unit P11.
+ * The row's `withheld_reason` names the same refusal ahead of time.
+ *
+ * No total rides the body, unlike a booking's `top_up.expected_total_cents`:
+ * no v1 route writes `price_cents` or `credits` (`PatchStaffCreditPackagesRequest`
+ * writes `expiry_months` only), so the price on the row she read is the price
+ * charged (build DECISIONS 216).
  */
 export interface PostCreditPackagesPurchaseRequest {
   /** UUID of one of the caller's stored payment methods (`payment_methods.id`,
@@ -6060,7 +6128,7 @@ export interface CashSettingsWire extends SettingsAuditWire {
 /**
  * `GET/PATCH /staff/settings/cred` — the `credit_settings` singleton (M1.06,
  * design.md:6140), exactly §1.1:663-667's ten keys in its order; no clawback
- * column, no hand-grant cap (R3, A11). The owner document carries two of
+ * column, no hand-grant cap (R3, A11). The owner document carries four of
  * them (`OwnerCreditSettingsWire`).
  */
 export interface CreditSettingsWire extends SettingsAuditWire {
@@ -6637,11 +6705,26 @@ export type OwnerEvaluationSettingsWire = Pick<
   by_location: Record<LocationKey, OwnerEvaluationCampusSettingsWire>;
 };
 
-/** The owner document's `cred` section (§1.1:617-619; §2.1:1883-1884: the app
- *  words "1 credit, expires 19 Oct" and the 7-day notice from these two). */
+/**
+ * The owner document's `cred` section (§1.1:617-619; §2.1:1883-1884: the app
+ * words "1 credit, expires 19 Oct" and the 7-day notice from the first two).
+ *
+ * 5.0.0 adds two more, read from the same `credit_settings` row (build
+ * DECISIONS 216; P18 mobile G5, G6):
+ *   - `booking_outlives_lot_expiry_enabled`: while true, a credit pays a date
+ *     past its lot's expiry, so the calendar greys no date as "no credit
+ *     reaches this date" (design §2.4:3184-3187) and the server sends no
+ *     `credit_expired_before_date`.
+ *   - `single_day_purchase_max_count`: the most single days one purchase's
+ *     `count` may carry (`PostCreditPackagesPurchaseRequest`), so the shop's
+ *     stepper stops there rather than meeting 422 `count_not_allowed`.
+ */
 export type OwnerCreditSettingsWire = Pick<
   CreditSettingsWire,
-  'expiry_enforced_enabled' | 'expiry_warning_lead_days'
+  | 'expiry_enforced_enabled'
+  | 'expiry_warning_lead_days'
+  | 'booking_outlives_lot_expiry_enabled'
+  | 'single_day_purchase_max_count'
 >;
 
 /** One class on the owner document's `cls` section (§1.1:619-620: per class,

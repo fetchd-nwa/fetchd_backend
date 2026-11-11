@@ -116,10 +116,12 @@ export function registerStaffOrdersRoute(
       const endpoint = 'POST /staff/orders/:id/cancel';
       const requestHash = hashRequestBody({ id });
 
+      // A staff claim names no owner (`withMutation`), so a staff key answers staff.
       const replay = await peekCompletedIdempotency<PostStaffOrdersCancelResponse>(
         idempotencyKey,
         endpoint,
         requestHash,
+        null,
       );
       if (replay !== undefined) return replay.body;
 

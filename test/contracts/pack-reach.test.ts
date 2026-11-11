@@ -635,3 +635,104 @@ test(
     assert.deepEqual(alarms[0]?.dates, LATE_DECEMBER);
   },
 );
+
+// ── the whole-second floor, both sides (Fable r2 N2; P19 fix 1 F2) ───────────
+
+test(
+  'a top-up in the first second after a Chicago midnight is refused for the date a month out: the lot it would buy is stamped at 00:00:00 and dies at that midnight (Fable r2 N2)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // 00:00:00.400 CST Sat 7 Nov 2037. Stripe's `created` is whole seconds, so an intent
+    // created in this second says 00:00:00, and the settle stamps the lot from it (design
+    // §2.4:3003): a single day's month then ends at 00:00:00 CST Mon 7 Dec, the Chicago
+    // midnight of the date she asks for, which it therefore cannot pay. Before the floor
+    // this sold and paged a person (`redfirst-B3b.log`); the sale through a real webhook is
+    // the next test's, one second later.
+    const at = new Date('2037-11-07T06:00:00.400Z');
+    const world = buildApp(undefined, at);
+    const dogId = await createBookableDog(createdDogs);
+
+    const res = await book(world, dogId, ['2037-12-07'], topUp(1, 6_000));
+
+    const details = refusalOf<{ dates: string[] }>(res, 'credit_expired_before_date');
+    assert.deepEqual(details.dates, ['2037-12-07']);
+    await assertNothingWritten(world, dogId);
+  },
+);
+
+test(
+  'buildApp(), a real signed event: a top-up at 00:00:01.000 CST for the date a month out sells, its lot pays that date, and no one is paged (the floor is one second wide, not wider)',
+  SKIP_WHEN_NO_DB,
+  async (t) => {
+    // Fable's probe (P19 review L1). The bound the refusal above needs: a floor any wider
+    // than the whole second would refuse this sale too.
+    const at = new Date('2037-11-07T06:00:01.000Z');
+    const world = buildApp(undefined, at);
+    const dogId = await createBookableDog(createdDogs);
+    const transport = recordingTransport();
+    initObservability({ transport, installProcessHandlers: false });
+
+    world.stripe.setNextIntentStatus('processing');
+    const res = await book(world, dogId, ['2037-12-07'], topUp(1, 6_000));
+    assert.equal(res.statusCode, 201, res.body);
+
+    const [charge] = await chargesOfOwner();
+    assert.ok(charge?.stripePaymentIntentId);
+    const intentId = charge.stripePaymentIntentId;
+    world.stripe.setIntentState(intentId, 'succeeded');
+    t.mock.method(defaultStripeClient, 'retrievePaymentIntent', world.stripe.retrievePaymentIntent);
+    const app = buildProductionApp();
+    const event = signedIntentEvent({
+      type: 'payment_intent.succeeded',
+      intentId,
+      ...world.stripe.intentSnapshot(intentId),
+    });
+    const hook = await app.inject({
+      method: 'POST',
+      url: '/webhooks/stripe',
+      headers: { 'content-type': 'application/json', 'stripe-signature': event.signature },
+      payload: event.payload,
+    });
+    await app.close();
+    assert.equal(hook.statusCode, 200, hook.body);
+
+    const lot = await lotOf(charge.id);
+    assert.equal(
+      new Date(lot.expiresAt as string).toISOString(),
+      '2037-12-07T06:00:01.000Z',
+      'stamped from the whole second',
+    );
+    assert.equal((await debitsOn(lot.id)).length, 1, 'the lot paid 7 Dec');
+    assert.equal((await rowsOf(dogId)).length, 1, 'one row booked');
+    assert.deepEqual(
+      transport.events.map((e) => [e.level, e.extra]),
+      [],
+      'nothing tx1 sold dies before a date it was sold for, so the pager is silent',
+    );
+  },
+);
+
+test(
+  "with no credits, a booking in the first second after a Chicago midnight is told no credit reaches the date a month out, which is true: a lot bought in that second is stamped at the second, and a lot pays a date only while it expires after that date's midnight (Opus L2)",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // A credits-only booking, no top-up: what an M1 family sees, since she buys in the
+    // shop and then books. HEAD answered `insufficient_credits` here, which offered a
+    // single day that, bought in this second, would not reach 7 Dec.
+    const dogId = await createBookableDog(createdDogs);
+
+    const inTheFirstSecond = buildApp(undefined, new Date('2037-11-07T06:00:00.100Z'));
+    const refused = refusalOf<{ dates: string[] }>(
+      await book(inTheFirstSecond, dogId, ['2037-12-07']),
+      'credit_expired_before_date',
+    );
+    assert.deepEqual(refused.dates, ['2037-12-07']);
+    await assertNothingWritten(inTheFirstSecond, dogId);
+
+    // One second later a credit bought now does reach it, so she is told what is short.
+    const aSecondLater = buildApp(undefined, new Date('2037-11-07T06:00:01.000Z'));
+    const short = insufficient(await book(aSecondLater, dogId, ['2037-12-07']));
+    assert.equal(short.shortfall, 1);
+    await assertNothingWritten(aSecondLater, dogId);
+  },
+);

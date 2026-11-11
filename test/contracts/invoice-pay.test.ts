@@ -13,11 +13,11 @@ import {
   refunds,
 } from '../../src/db/schema/schema.js';
 import { withActor } from '../../src/db/tx.js';
-import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerInvoicesRoute } from '../../src/routes/invoices.js';
 import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
+import { settleWithNewCharge } from './_invoiceSettle.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
@@ -332,7 +332,7 @@ test(
         });
         if (invoiceRow === undefined) throw new Error('test setup: invoice vanished mid-flight');
         const winner = await withActor('system:test-race', (tx) =>
-          settleInvoiceCharge(tx, {
+          settleWithNewCharge(tx, {
             invoice: invoiceRow,
             paymentIntentId: winnerPaymentIntentId,
             amountCents: invoiceRow.amountCents,
@@ -426,10 +426,11 @@ test(
 /**
  * `holdInvoiceForPayment` (`routes/invoices.ts`) is the live write of a charge's
  * `booking_id`: tx1 of every real `/pay`. The §A3.18 and §A3.19 tests in
- * `enrollment-partial.test.ts` and `enrollment-dead-money.test.ts` hold the same rule
- * through `settleInvoiceCharge()`'s first half, which no production path calls
- * (DECISIONS 168(a), 169(a)), so these are the tests of the write itself. The stake is
- * the board-train cancel below, which finds the charge it refunds by this column alone.
+ * `enrollment-dead-money.test.ts` hold the same rule on a charge their test writes as a
+ * given (`_invoiceSettle.ts`; `settleInvoiceCharge()`'s first half, which no production
+ * path called, left at P19: DECISIONS 168(a), 169(a)), so these are the tests of the write
+ * itself. The stake is the board-train cancel below, which finds the charge it refunds by
+ * this column alone.
  */
 const ANCHOR_COHORT_START = '2026-07-06T23:00:00Z';
 const ANCHOR_DAY_MS = 24 * 60 * 60 * 1000;

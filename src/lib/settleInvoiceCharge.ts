@@ -1,6 +1,5 @@
 import { deepLinkToPath } from '../contracts/wire.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
-import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { ChargePurpose } from '../db/repositories/chargesRepository.js';
 import type { InvoiceRow } from '../db/repositories/invoicesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
@@ -86,27 +85,22 @@ export interface ReceiptPush {
 }
 
 /**
- * The post-Stripe invoice settlement for a PaymentIntent with no `charges` row yet:
- * it writes the row, then runs {@link settleChargeAgainstInvoice}, the half the order
- * engine enters at (the capture reconciler enters a level further in, at
- * {@link claimInvoiceWithCharge}). No production path calls this first half today.
- * The webhook's orphan arm was the last, and it left at P17 (DECISIONS 167(b)); the order engine
- * (so `POST /invoices/:id/pay`) writes its charge in tx1 and enters at the second
- * half. It runs AFTER a path's own Stripe PaymentIntent has already SUCCEEDED,
- * inside one short tx, and resolves the double-charge race between the paths:
+ * The invoice settlement for a charge row that already exists, after its PaymentIntent
+ * succeeded: the order engine writes its charge in tx1, so its settle arrives here with
+ * the row in hand (`confirmCharge.ts`; the capture reconciler enters a level further in,
+ * at {@link claimInvoiceWithCharge}). Everything the invoice owes the money happens in
+ * this one place, so PAY-35 is one arm whoever settles, inside one short tx:
  *
- *   1. INSERT the succeeded `charges` row for this PI.
- *   2. CONDITIONAL `markPaid` -- `invoicesRepository.markPaid` filters
+ *   1. CONDITIONAL `markPaid` -- `invoicesRepository.markPaid` filters
  *      `WHERE id = ? AND status = 'open'`, so the UPDATE row count IS the
  *      atomic claim: whoever flips open->paid first wins (Postgres serializes
  *      the two UPDATEs on the row lock; the loser sees `flipped === 0`).
- *   3a. flipped > 0  -> THIS path settled. Optionally emit the
+ *   2a. flipped > 0  -> THIS path settled. Optionally emit the
  *       `payment-succeeded` receipt (only when `notifyOwner`).
- *   3b. flipped === 0 -> THIS path LOST: the other path already settled the
+ *   2b. flipped === 0 -> THIS path LOST: the other path already settled the
  *       invoice, so this charge double-bills the same money. Write a 'pending'
- *       refund row for the full charge (idempotency-guarded via
- *       `sumNonFailedForCharge`, mirroring cancelBookingService) and emit NO
- *       notification -- the customer is net-charged exactly once, so a
+ *       refund row for the full charge, capped by what is already refunded, and
+ *       emit NO notification -- the customer is net-charged exactly once, so a
  *       "payment failed" would be a lie.
  *
  * The actual Stripe `createRefund` is NOT fired here (no Stripe call inside a
@@ -115,35 +109,11 @@ export interface ReceiptPush {
  * money-back branch does. A refund-API failure leaves the 'pending' row for the
  * webhook's race-recovery / admin retry -- never silently swallowed past the
  * caller's logged post-commit seam.
- */
-export async function settleInvoiceCharge(
-  tx: Tx,
-  args: SettleInvoiceChargeArgs,
-): Promise<SettleInvoiceChargeResult> {
-  const { invoice, paymentIntentId, amountCents, purpose } = args;
-
-  const charge = await chargesRepository.create(tx, {
-    ownerId: invoice.ownerId,
-    amountCents,
-    status: 'succeeded',
-    purpose,
-    stripePaymentIntentId: paymentIntentId,
-    // The invoice's OWN enrollment anchor (§A3.18 D1), with the §A3.19 F2
-    // fallback behind it for invoices that carry none.
-    bookingId: await resolveInvoiceAnchorBookingId(tx, invoice, args.log),
-    // Carry the enrollment identity so a later group-class withdraw can find +
-    // refund this dog's payment (mirrors both prior settle paths).
-    cohortId: invoice.cohortId,
-    dogId: invoice.dogId,
-  });
-  return settleChargeAgainstInvoice(tx, { ...args, chargeId: charge.id });
-}
-
-/**
- * The second half of {@link settleInvoiceCharge}, for a charge row that already
- * exists: the order engine writes its charge in tx1, so its settle arrives here with
- * the row in hand. Everything the invoice owes the money happens in this one place,
- * so PAY-35 is one arm whoever settles: the claim, or on a lost race the refund.
+ *
+ * `settleInvoiceCharge()`, the first half that wrote a succeeded charge with no order and
+ * then came here, had no production caller from P17 (DECISIONS 168(a)) and was the one
+ * remaining latent road to 179(b)'s arm (183(e)). It left at P19; the module keeps its
+ * name, which the design uses for this path (design §2.4:2850, §2.7:3888).
  */
 export async function settleChargeAgainstInvoice(
   tx: Tx,
@@ -176,10 +146,12 @@ export async function settleChargeAgainstInvoice(
   // it locks the charge row, sums the non-failed refunds and mints at most the
   // remainder, so a re-run that finds the full amount already pending-refunded
   // creates no second row — exactly as cancelBookingService's money-back branch
-  // does, through the same function. The charge was INSERTed by this same
-  // transaction, so the lock is already ours and costs nothing here; the
-  // uniformity is the point, because open-coding lock-sum-cap-mint at each of
-  // six legs is how the seventh forgets the lock.
+  // does, through the same function. The one production caller, the order
+  // engine's settle (`settleChargeInTx`), took this charge's row lock
+  // (`lockCharge`, `FOR UPDATE`) before it came here, so the helper's lock is
+  // already this transaction's and costs nothing; the uniformity is the point,
+  // because open-coding lock-sum-cap-mint at each of six legs is how the
+  // seventh forgets the lock.
   //
   // The row's uuid is minted app-side inside the helper, because this lane's
   // Stripe key is derived from it — the key has to exist before the INSERT that

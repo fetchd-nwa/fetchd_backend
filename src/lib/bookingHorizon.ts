@@ -10,8 +10,9 @@ import { ApiError } from './errors.js';
  *
  * One helper, used by every create that takes a date: `POST /bookings`, `POST
  * /requests`, `PATCH /requests/:id`, `POST /enrollments`, and the cap-lowering
- * check's window. **`addMonthsUtc` (`creditExpiry.ts`) is not this:** it overflows,
- * so 30 Nov + 3 months is 2 Mar, which is a different rule for a different purpose.
+ * check's window. `addChicagoMonths` (`creditExpiry.ts`, a lot's expiry) clamps a
+ * missing day the same way, but it moves an instant and keeps its Chicago wall clock;
+ * this moves today's Chicago date and reads no time of day.
  */
 export function lastBookableDate(now: Date, horizonMonths: number): string {
   const [year, month, day] = bucketChicagoToday(now).split('-').map(Number) as [

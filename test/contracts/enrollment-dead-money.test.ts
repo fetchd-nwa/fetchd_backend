@@ -17,13 +17,13 @@ import { invoicesRepository } from '../../src/db/repositories/invoicesRepository
 import { refundsRepository } from '../../src/db/repositories/refundsRepository.js';
 import { withActor } from '../../src/db/tx.js';
 import type { EnrollmentWithdrawResultWire } from '../../src/contracts/wire.js';
-import { settleInvoiceCharge } from '../../src/lib/settleInvoiceCharge.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import {
   runCaptureReconcilerOnce,
   CAPTURE_GRACE_MINUTES,
 } from '../../src/workers/captureReconciler.js';
 import { FIXTURE_IDS, FIXTURE_NOW } from './_fixture.js';
+import { settleWithNewCharge } from './_invoiceSettle.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
   SKIP_WHEN_NO_DB,
@@ -232,9 +232,10 @@ interface LateSettleWorld {
 /**
  * The D1 world: pay-later enroll, withdraw (voids the invoice) and re-enroll pay-now
  * with a failing capture, all production verbs, then a late settle of the VOIDED
- * invoice, which is not one. That last step calls `settleInvoiceCharge()`'s first half
- * by hand. No production path calls it since P17 (DECISIONS 168(a), 169(a)), and on a
- * real signed event this world answers `orphan-event`. So this holds the anchor rule
+ * invoice, which is not one. That last step writes the late charge as a given and
+ * settles it through the production entry (`_invoiceSettle.ts`); the first half that did
+ * this had no production caller from P17 and left at P19 (DECISIONS 168(a), 169(a)), and
+ * on a real signed event this world answers `orphan-event`. So this holds the anchor rule
  * and the money reads behind it, never a live writer. The live write is `/pay`'s tx1:
  * the anchor tests in `invoice-pay.test.ts` hold that.
  *
@@ -274,8 +275,8 @@ async function buildLateSettleWorld(opts: {
   );
   assert.ok(hold, 'E2 rests on a live hold');
 
-  // ── The first half, by hand: E1's voided invoice is given a PI that succeeded. No
-  //    webhook does this any more. It drives the anchor rule into
+  // ── The given: E1's voided invoice is handed a PI that succeeded. No webhook does this
+  //    any more. It drives the anchor rule into
   //    `settleChargeAgainstInvoice`'s lost-race arm. `markPaid` filters
   //    `status='open'`, so the void invoice yields flipped=0 → the lost-race arm mints
   //    the charge AND the full duplicate refund that returns the money.
@@ -283,7 +284,7 @@ async function buildLateSettleWorld(opts: {
     const invoice = await invoicesRepository.findById(tx, invoiceRow.id);
     assert.ok(invoice, 'invoice row exists');
     assert.equal(invoice.status, 'void', 'the withdraw voided it');
-    return settleInvoiceCharge(tx, {
+    return settleWithNewCharge(tx, {
       invoice,
       paymentIntentId: `pi_late_${randomUUID().slice(0, 16)}`,
       amountCents: PRICE,
@@ -842,9 +843,9 @@ test(
         const inv = await invoicesRepository.findById(tx, invoice.id);
         assert.ok(inv);
         assert.equal(inv.bookingId, null, 'the legacy invoice really has no anchor');
-        // The anchor rule through the first half, which no production path calls. The
+        // The anchor rule on a charge written as a given (`_invoiceSettle.ts`). The
         // live write is `/pay`'s: the witness test in `invoice-pay.test.ts`.
-        return settleInvoiceCharge(tx, {
+        return settleWithNewCharge(tx, {
           invoice: inv,
           paymentIntentId: `pi_late_${randomUUID().slice(0, 12)}`,
           amountCents: PRICE,
@@ -928,9 +929,9 @@ test(
       const settle = await withActor(`owner:${FIXTURE_IDS.ownerId}`, async (tx) => {
         const inv = await invoicesRepository.findById(tx, invoice.id);
         assert.ok(inv);
-        // The anchor rule through the first half, which no production path calls. The
+        // The anchor rule on a charge written as a given (`_invoiceSettle.ts`). The
         // live write is `/pay`'s: the witness test in `invoice-pay.test.ts`.
-        return settleInvoiceCharge(tx, {
+        return settleWithNewCharge(tx, {
           invoice: inv,
           paymentIntentId: `pi_orphan_${randomUUID().slice(0, 12)}`,
           amountCents: PRICE,
@@ -984,9 +985,9 @@ test(
       const settle = await withActor(`owner:${FIXTURE_IDS.ownerId}`, async (tx) => {
         const inv = await invoicesRepository.findById(tx, invoice.id);
         assert.ok(inv);
-        // The anchor rule through the first half, which no production path calls. The
+        // The anchor rule on a charge written as a given (`_invoiceSettle.ts`). The
         // live write is `/pay`'s: the no-witness test in `invoice-pay.test.ts`.
-        return settleInvoiceCharge(tx, {
+        return settleWithNewCharge(tx, {
           invoice: inv,
           paymentIntentId: `pi_nowitness_${randomUUID().slice(0, 12)}`,
           amountCents: PRICE,
