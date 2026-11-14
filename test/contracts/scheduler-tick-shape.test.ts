@@ -28,6 +28,7 @@ const SURVIVING_PHASES = [
   'mediaDerivatives',
   'orderSweeper',
   'scheduledNotifications',
+  'unfinishedStripeEvents',
 ];
 
 const LOG_KEYS = [
@@ -46,12 +47,18 @@ const LOG_KEYS = [
   'creditExpiryWarningsEnqueued',
   'creditExpiryWarningsScanned',
   'duplicateRefundRetryAbandoned',
+  'duplicateRefundRetryAbandonedAwaitingStripe',
   'duplicateRefundRetryAbandonedClientKeyed',
   'duplicateRefundRetryAbandonedCovered',
+  'duplicateRefundRetryAbandonedFailedExceedsOwed',
   'duplicateRefundRetryAbandonedNeverSent',
   'duplicateRefundRetryAbandonedRowKeyed',
   'duplicateRefundRetryAbandonedStripeFailed',
   'duplicateRefundRetryAbandonedTruncated',
+  'duplicateRefundRetryEndedFailed',
+  'duplicateRefundRetryLookedUp',
+  'duplicateRefundRetryPolled',
+  'duplicateRefundRetryRefused',
   'duplicateRefundRetryScanned',
   'duplicateRefundRetrySent',
   'idempotencyKeysSwept',
@@ -70,6 +77,7 @@ const LOG_KEYS = [
   'scheduledQueueOk',
   'scheduledScanned',
   'scheduledSent',
+  'stripeEventsUnfinished',
 ];
 
 /** What every pino line carries, and what this line carries to name itself. */

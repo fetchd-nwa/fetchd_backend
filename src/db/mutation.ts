@@ -44,7 +44,13 @@ export const STRIPE_IDEMPOTENCY_KEY_MAX_LEN = 255;
  * the old hint grepped the one spelling (2026-08-20).
  */
 export const STRIPE_DERIVED_KEY_SUFFIXES = [
-  ':refund', // enrollments withdraw money-back (the booking cancels' left in P21)
+  // The staff refund and its *Retry to card* (P22: POST /staff/refunds and
+  // POST /staff/refunds/:id/retry, each from its own request's key) and the
+  // enrollments withdraw money-back (the booking cancels' left in P21). The refund
+  // sweep's re-key after a stored server error (`refund-rekey:<row id>:<epoch
+  // seconds>`, refundsRepository) is built from no client key, so it is no suffix:
+  // a fixed 60 characters.
+  ':refund',
   ':payment-intent', // requestConfirmPayment, creditPackages
   ':customer', // paymentMethods
   ':setup-intent', // paymentMethods

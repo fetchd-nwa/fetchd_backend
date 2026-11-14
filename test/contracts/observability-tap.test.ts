@@ -103,17 +103,24 @@ const TICK_RESULT: SchedulerTickResult = {
   duplicateRefundRetry: {
     scanned: 0,
     sent: 0,
+    polled: 0,
+    lookedUp: 0,
+    refused: 0,
+    endedFailed: 0,
     abandoned: 0,
     abandonedTruncated: false,
     abandonedByClass: {
       'row-keyed': 0,
       'client-keyed': 0,
       'never-sent': 0,
+      'awaiting-stripe': 0,
       'stripe-failed': 0,
+      'failed-exceeds-owed': 0,
       covered: 0,
     },
     results: [],
   },
+  unfinishedStripeEvents: { count: 0, named: 0 },
   mediaDerivatives: { scanned: 0, results: [] },
   creditExpiryWarnings: { scanned: 0, enqueued: 0 },
   idempotencyKeysSwept: 0,
@@ -704,17 +711,24 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
         abandonedUncollected: 59,
         abandonedTruncated: true,
       },
+      unfinishedStripeEvents: { count: 91, named: 1 },
       duplicateRefundRetry: {
         ...TICK_RESULT.duplicateRefundRetry,
         scanned: 61,
         sent: 62,
+        polled: 64,
+        lookedUp: 65,
+        refused: 66,
+        endedFailed: 67,
         abandoned: 63,
         abandonedTruncated: true,
         abandonedByClass: {
           'row-keyed': 81,
           'client-keyed': 82,
           'never-sent': 83,
+          'awaiting-stripe': 86,
           'stripe-failed': 84,
+          'failed-exceeds-owed': 87,
           covered: 85,
         },
       },
@@ -747,6 +761,11 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
   assert.equal(complete['duplicateRefundRetryScanned'], 61);
   assert.equal(complete['duplicateRefundRetrySent'], 62);
   assert.equal(complete['duplicateRefundRetryAbandoned'], 63);
+  // P22 B-7: the refund sweep's carries, each a leaf of its own.
+  assert.equal(complete['duplicateRefundRetryPolled'], 64);
+  assert.equal(complete['duplicateRefundRetryLookedUp'], 65);
+  assert.equal(complete['duplicateRefundRetryRefused'], 66);
+  assert.equal(complete['duplicateRefundRetryEndedFailed'], 67);
 
   // D20-A7.2: "EVERY phase's counters" means every LEAF. All 11 phases were
   // present while these 7 were not — the truncation flags say whether the alarm
@@ -761,6 +780,10 @@ test('POST /workers/tick: the completion log line carries every phase counter', 
   assert.equal(complete['duplicateRefundRetryAbandonedNeverSent'], 83);
   assert.equal(complete['duplicateRefundRetryAbandonedStripeFailed'], 84);
   assert.equal(complete['duplicateRefundRetryAbandonedCovered'], 85);
+  assert.equal(complete['duplicateRefundRetryAbandonedAwaitingStripe'], 86);
+  assert.equal(complete['duplicateRefundRetryAbandonedFailedExceedsOwed'], 87);
+  // P22 B-8: the unfinished-claim count.
+  assert.equal(complete['stripeEventsUnfinished'], 91);
 
   // Phase 1's poison-row leaves (2026-09-03). `scanned - sent` stopped meaning
   // "still due" the moment a row could fail alone or park, so the two counters

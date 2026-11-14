@@ -2,16 +2,22 @@ import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import {
   refundsRepository,
+  rekeyedAt,
+  rekeyedRefundKey,
   type AbandonedRefundClass,
   type AbandonedRefundRow,
   type RefundRow,
 } from '../db/repositories/refundsRepository.js';
 import { withActor } from '../db/tx.js';
-import { refundCreateParams } from '../lib/pendingRefund.js';
+import { refundCreateParams, refuseRefundAtCreate } from '../lib/pendingRefund.js';
+import { applyLiveRefund, mapStripeRefundStatus, type LiveRefundResult } from '../lib/refundApply.js';
 import { duplicateRefundIdempotencyKey } from '../lib/settleInvoiceCharge.js';
 import {
   defaultStripeClient,
+  isStripeServerError,
+  stripeErrorReplayed,
   stripeIdempotencyErrorKind,
+  stripeRefundRefusal,
   type StripeClient,
 } from '../lib/stripe.js';
 import type { WorkerLogger } from './workerLogger.js';
@@ -80,6 +86,30 @@ export const DUPLICATE_REFUND_RETRY_GRACE_MINUTES = 5;
  *  Stripe** — documented and stub-modelled, never measured here. */
 export const DUPLICATE_REFUND_ABANDON_AFTER_HOURS = 24;
 
+/**
+ * P22 B-7(a): how long a `pending` refund Stripe holds rests between looks, and the
+ * re-keyed rows' look-up cadence (B-7(b)). A worker cadence beside
+ * {@link DUPLICATE_REFUND_RETRY_GRACE_MINUTES}, not a §3 setting (the brief's call): it
+ * moves nothing by itself, it only decides how often Stripe is asked.
+ */
+export const REFUND_STATUS_POLL_MINUTES = 60;
+
+/**
+ * P22 B-7(b): Stripe keeps a key's answer at least this long after the create sent under
+ * it, so a row with no refund at Stripe is moved `failed` only once this has passed since
+ * its last send. The same 24 hours as {@link DUPLICATE_REFUND_ABANDON_AFTER_HOURS}, for the
+ * same reason. **UNVERIFIED against live Stripe**, as that constant is.
+ */
+export const REFUND_KEY_WINDOW_HOURS = DUPLICATE_REFUND_ABANDON_AFTER_HOURS;
+
+/** P22 B-7(b) 1: a key whose answer is a stored server error, said once per process. */
+export const REFUND_KEY_STORED_ERROR_ALARM =
+  "refund sweep: Stripe answers this refund's key with a stored server error (marked idempotent-replayed), so re-sending under it can never complete the refund and the sweep sends nothing more under it. The sweep looks the refund up in Stripe by its refund_id metadata; if Stripe holds none it sends it once under a fresh key; if that answers no refund either, the row waits on Stripe's answer in the refund report. Send nothing for it by hand. This line repeats once after each restart";
+
+/** P22 B-7(b) 4: the end state's line. */
+export const REFUND_UNSENT_PAST_WINDOW_ALARM =
+  "refund sweep: Stripe holds no refund for this row 24 hours after its last send (a complete list of the PaymentIntent's refunds carries none naming it), so it is marked failed: no money went back to the family. Retry to card (POST /staff/refunds/:id/retry) and Returned (POST /staff/refunds/:id/resolve-external) are now open for it, and the payment's other refunds are no longer held behind it";
+
 export interface DuplicateRefundRetryOpts {
   stripe?: StripeClient;
   /** Per-tick batch size. Default 25; tests pin small for determinism. */
@@ -98,12 +128,26 @@ export interface DuplicateRefundRetryResult {
     | 'still-failing'
     /** The refund's charge is missing or carries no PaymentIntent id, so there
      *  is nothing to refund AGAINST. Nothing sent; logged for a human. */
-    | 'skipped-unreadable';
+    | 'skipped-unreadable'
+    /** P22 B-7(c): Stripe refused the create; the row is `failed`, never re-fired. */
+    | 'refused'
+    /** P22 B-7(b): the look-up found Stripe's refund by its `metadata.refund_id`. */
+    | 'looked-up'
+    /** P22 B-7(b): no refund at Stripe yet, and no further send: the row waits on Stripe. */
+    | 'awaiting-stripe';
 }
 
 export interface DuplicateRefundRetryTickResult {
   scanned: number;
   sent: number;
+  /** P22 B-7(a): `pending` refunds Stripe holds, retrieved this tick. */
+  polled: number;
+  /** P22 B-7(b): rows looked up in Stripe by their `metadata.refund_id`. */
+  lookedUp: number;
+  /** P22 B-7(c): creates Stripe refused this tick, each row now `failed`. */
+  refused: number;
+  /** P22 B-7(b): rows moved `failed` because Stripe holds no refund for them past the window. */
+  endedFailed: number;
   /** Rows past the retry window — owed money now waiting on a human. The TRUE
    *  count from an unbounded query, not the report page's length. */
   abandoned: number;
@@ -178,7 +222,7 @@ export async function runDuplicateRefundRetryOnce(
     // Per-row boundary: one refund's failure is one refund's failure, and this claim already spent
     // its interval.
     try {
-      results.push(await retryOne(refund, stripe, log));
+      results.push(await retryOne(refund, stripe, log, now));
     } catch (err) {
       log.error(
         { refundId: refund.id, chargeId: refund.chargeId, err: errMsg(err) },
@@ -186,6 +230,27 @@ export async function runDuplicateRefundRetryOnce(
       );
       results.push({ refundId: refund.id, outcome: 'still-failing' });
     }
+  }
+
+  // P22 B-7(a), the P15 note's row 15: refunds Stripe holds and no event has finished.
+  let polled = 0;
+  try {
+    polled = await pollPendingWithStripeId(stripe, log, now, opts.limit);
+  } catch (err) {
+    log.error(
+      { workerTick: 'duplicate-refund-retry', phase: 'poll', err: errMsg(err) },
+      'refund sweep: the poll of pending refunds Stripe holds threw; the passes below still run',
+    );
+  }
+  // P22 B-7(b): rows the sweep must ask Stripe about by `metadata.refund_id`.
+  let lookUp = { lookedUp: 0, endedFailed: 0 };
+  try {
+    lookUp = await lookUpUnsent(stripe, log, now, opts.limit);
+  } catch (err) {
+    log.error(
+      { workerTick: 'duplicate-refund-retry', phase: 'look-up', err: errMsg(err) },
+      'refund sweep: the look-up of unsent refunds threw; the report below still runs',
+    );
   }
 
   const { rows: abandoned, totalByClass } = await refundsRepository.findAbandonedPending(db, {
@@ -205,11 +270,18 @@ export async function runDuplicateRefundRetryOnce(
   reportAbandoned(abandoned, totalByClass, log);
 
   const sent = results.filter((r) => r.outcome === 'sent').length;
+  const refused = results.filter((r) => r.outcome === 'refused').length;
+  const lookedUp =
+    lookUp.lookedUp + results.filter((r) => r.outcome === 'looked-up').length;
   log.info(
     {
       workerTick: 'duplicate-refund-retry',
       batchSize: claimed.length,
       sent,
+      polled,
+      lookedUp,
+      refused,
+      endedFailed: lookUp.endedFailed,
       // The TRUE count, not the page length — the page caps at 20 oldest-first
       // and can be saturated by never-sent seed rows, which is exactly when the
       // number must not flatter.
@@ -221,6 +293,10 @@ export async function runDuplicateRefundRetryOnce(
   return {
     scanned: results.length,
     sent,
+    polled,
+    lookedUp,
+    refused,
+    endedFailed: lookUp.endedFailed,
     abandoned: abandonedTotal,
     abandonedByClass: totalByClass,
     abandonedTruncated,
@@ -232,6 +308,7 @@ async function retryOne(
   refund: RefundRow,
   stripe: StripeClient,
   log: WorkerLogger,
+  now: Date,
 ): Promise<DuplicateRefundRetryResult> {
   // The refund row names the CHARGE; Stripe refunds against the PaymentIntent.
   const charge = await withActor(WORKER_ACTOR, (tx) =>
@@ -254,14 +331,22 @@ async function retryOne(
   // reaches here with a NULL key is provably a legacy row-keyed one.
   const idempotencyKey = refund.stripeIdempotencyKey ?? duplicateRefundIdempotencyKey(refund.id);
 
+  // P22 B-7(b) 1: this process already knows the key's answer is a stored server error, and
+  // the look-up could not settle it then: no re-send under it, only the look-up again.
+  if (STORED_ERROR_KEYS.has(idempotencyKey)) {
+    return storedServerError(refund, charge.stripePaymentIntentId, idempotencyKey, stripe, log, now);
+  }
+
   let stripeRefundId: string;
+  let created: Awaited<ReturnType<StripeClient['createRefund']>>;
   try {
-    const created = await stripe.createRefund(
+    created = await stripe.createRefund(
       // Built by the SAME constructor the post-commit fire uses. Same key with
       // drifted params is Stripe's `idempotency_error` — no money moves, but
       // the refund never lands either, so the two call sites cannot be allowed
       // to build this object independently.
       refundCreateParams({
+        refundId: refund.id,
         paymentIntentId: charge.stripePaymentIntentId,
         amountCents: refund.amountCents,
       }),
@@ -303,6 +388,21 @@ async function retryOne(
         { ...context, idempotencyKind },
         'duplicate refund retry: the original refund call is still in flight under this key (Stripe 409) — no second refund was created, and the next tick resolves it',
       );
+    } else if (stripeRefundRefusal(err) !== undefined) {
+      // P22 B-7(c): Stripe's definitive no (by status and type, never by code or text).
+      await refuseRefundAtCreate({
+        refundId: refund.id,
+        paymentIntentId: charge.stripePaymentIntentId,
+        stripeIdempotencyKey: idempotencyKey,
+        refusal: stripeRefundRefusal(err)!,
+        log,
+        context: { workerTick: 'duplicate-refund-retry' },
+        actor: WORKER_ACTOR,
+      });
+      return { refundId: refund.id, outcome: 'refused' };
+    } else if (isStripeServerError(err) && stripeErrorReplayed(err) === true) {
+      // P22 B-7(b): a 5xx Stripe REPLAYED is that key's permanent answer.
+      return storedServerError(refund, charge.stripePaymentIntentId, idempotencyKey, stripe, log, now);
     } else {
       log.error(
         context,
@@ -316,6 +416,7 @@ async function retryOne(
   // the same closing step the post-commit fire owes, and the thing that takes
   // this row off the worklist.
   await refundsRepository.markStripeId({ id: refund.id, stripeRefundId });
+  await applyReply(refund, charge.stripePaymentIntentId, created, log);
   log.info(
     {
       refundId: refund.id,
@@ -326,6 +427,268 @@ async function retryOne(
     'duplicate refund retry: a duplicate charge that would have stayed double-billed is on its way back',
   );
   return { refundId: refund.id, outcome: 'sent' };
+}
+
+/**
+ * A create's reply status through the one apply function (P22, design.md:4215-4217), as
+ * the post-commit fire does: a `pending` reply waits for the events and the poll.
+ */
+async function applyReply(
+  refund: RefundRow,
+  paymentIntentId: string,
+  reply: Awaited<ReturnType<StripeClient['createRefund']>>,
+  log: WorkerLogger,
+): Promise<void> {
+  if (mapStripeRefundStatus(reply.status) === undefined) return;
+  await withActor(WORKER_ACTOR, (tx) =>
+    applyLiveRefund(tx, {
+      chargeId: refund.chargeId,
+      live: {
+        id: reply.id,
+        status: reply.status,
+        amountCents: reply.amountCents,
+        paymentIntentId,
+        metadataRefundId: refund.id,
+      },
+      log,
+    }),
+  );
+}
+
+/**
+ * Keys this PROCESS has seen answer a stored server error (P22 B-7(b) 1; `ALARMED_REFUND_IDS`'
+ * shape). Nothing is re-sent under one: its row goes to the look-up. Per-process, as that
+ * set is, so a restart sends one more replay to learn the answer again (it moves no money:
+ * the key replays its stored 500) and says the line once more.
+ */
+const STORED_ERROR_KEYS = new Set<string>();
+
+/**
+ * P22 B-7(b), 145(d), r2 N4: a create whose answer is a 5xx Stripe marks replayed. One
+ * line the first time this process sees the key; then **the look-up first**: a refund at
+ * Stripe carrying this row's id is this row's, its `re_` stored and its live status
+ * applied, and nothing is created. With none, in a COMPLETE list, one create under a fresh
+ * key derived from the row, written onto the row in a committed UPDATE before it is sent,
+ * with the same params and metadata. A re-keyed row is never sent again: its row waits on
+ * Stripe in the report and the hourly look-up ({@link lookUpUnsent}).
+ */
+async function storedServerError(
+  refund: RefundRow,
+  paymentIntentId: string,
+  key: string,
+  stripe: StripeClient,
+  log: WorkerLogger,
+  now: Date,
+): Promise<DuplicateRefundRetryResult> {
+  const context = {
+    workerTick: 'duplicate-refund-retry',
+    refundId: refund.id,
+    chargeId: refund.chargeId,
+    paymentIntentId,
+    amountCents: refund.amountCents,
+    stripeIdempotencyKey: key,
+  };
+  if (!STORED_ERROR_KEYS.has(key)) {
+    STORED_ERROR_KEYS.add(key);
+    log.error({ ...context, moneyEvent: 'refund-key-stored-error' }, REFUND_KEY_STORED_ERROR_ALARM);
+  } else {
+    log.info(
+      { ...context, storedErrorKeys: STORED_ERROR_KEYS.size },
+      'refund sweep: a refund whose key answers a stored server error is looked up again, not re-sent',
+    );
+  }
+  const found = await lookUpByRefundId(refund, paymentIntentId, stripe, log);
+  if (found === 'found') return { refundId: refund.id, outcome: 'looked-up' };
+  if (found === 'unknown') return { refundId: refund.id, outcome: 'still-failing' };
+  if (rekeyedAt(key) !== undefined) return { refundId: refund.id, outcome: 'awaiting-stripe' };
+
+  const fresh = rekeyedRefundKey(refund.id, now);
+  const written = await withActor(WORKER_ACTOR, (tx) =>
+    refundsRepository.rekeyUnsentPending(tx, { id: refund.id, fromKey: key, toKey: fresh }),
+  );
+  if (!written) return { refundId: refund.id, outcome: 'still-failing' };
+  let reply: Awaited<ReturnType<StripeClient['createRefund']>>;
+  try {
+    reply = await stripe.createRefund(
+      refundCreateParams({ refundId: refund.id, paymentIntentId, amountCents: refund.amountCents }),
+      fresh,
+    );
+  } catch (err) {
+    const refusal =
+      stripeIdempotencyErrorKind(err) === undefined ? stripeRefundRefusal(err) : undefined;
+    if (refusal !== undefined) {
+      await refuseRefundAtCreate({
+        refundId: refund.id,
+        paymentIntentId,
+        stripeIdempotencyKey: fresh,
+        refusal,
+        log,
+        context: { workerTick: 'duplicate-refund-retry' },
+        actor: WORKER_ACTOR,
+      });
+      return { refundId: refund.id, outcome: 'refused' };
+    }
+    if (isStripeServerError(err) && stripeErrorReplayed(err) === true) STORED_ERROR_KEYS.add(fresh);
+    log.warn(
+      { ...context, freshKey: fresh, err: errMsg(err) },
+      'refund sweep: the one send under the fresh key answered no refund; nothing more is sent, and the row waits on Stripe in the refund report',
+    );
+    return { refundId: refund.id, outcome: 'awaiting-stripe' };
+  }
+  await refundsRepository.markStripeId({ id: refund.id, stripeRefundId: reply.id });
+  await applyReply(refund, paymentIntentId, reply, log);
+  log.info(
+    { ...context, freshKey: fresh, stripeRefundId: reply.id },
+    'refund sweep: a refund whose first key answered a stored server error was sent once under a fresh key and Stripe holds it',
+  );
+  return { refundId: refund.id, outcome: 'sent' };
+}
+
+/**
+ * The look-up by `metadata.refund_id` (P22 B-7(b) 2), with no transaction open. `found`:
+ * Stripe's refund carrying this row's id at this row's amount, applied through the one
+ * apply function (match step 2 stores its `re_`). `none`: a complete list holds none that
+ * is this row's (one carrying its id at another amount is applied too, and recorded as a
+ * refund of its own). `unknown`: the list errored or came back partial, which moves
+ * nothing.
+ */
+async function lookUpByRefundId(
+  refund: RefundRow,
+  paymentIntentId: string,
+  stripe: StripeClient,
+  log: WorkerLogger,
+): Promise<'found' | 'none' | 'unknown'> {
+  let listed: Awaited<ReturnType<StripeClient['listRefundsForPaymentIntent']>>;
+  try {
+    listed = await stripe.listRefundsForPaymentIntent(paymentIntentId);
+  } catch (err) {
+    log.warn(
+      { workerTick: 'duplicate-refund-retry', refundId: refund.id, paymentIntentId, err: errMsg(err) },
+      'refund sweep: listing the PaymentIntent\'s refunds failed; nothing moves, and the next look asks again',
+    );
+    return 'unknown';
+  }
+  // Every refund carrying this row's id goes through the one apply function, and the row is
+  // `found` only when the apply took one AS this row's: one at another amount is recorded
+  // as a refund of its own (Opus r2 L2), and the row is still owed its own, so it goes on to
+  // the fresh-key send or the end state as if that refund were not there.
+  const carrying = listed.refunds.filter((r) => r.metadataRefundId === refund.id);
+  if (carrying.length > 0) {
+    const applied = await withActor(WORKER_ACTOR, async (tx) => {
+      const each: LiveRefundResult[] = [];
+      for (const live of carrying) {
+        each.push(await applyLiveRefund(tx, { chargeId: refund.chargeId, live, log }));
+      }
+      return each;
+    });
+    if (applied.some((a) => a.refundId === refund.id)) return 'found';
+  }
+  return listed.complete ? 'none' : 'unknown';
+}
+
+/**
+ * P22 B-7(a): retrieve each `pending` refund Stripe holds that no event has finished and
+ * that nobody looked at for {@link REFUND_STATUS_POLL_MINUTES}, with no transaction open,
+ * and apply its live status. **Never by the clock**: a refund Stripe still holds `pending`
+ * stays `pending`, looked at again an hour on.
+ */
+async function pollPendingWithStripeId(
+  stripe: StripeClient,
+  log: WorkerLogger,
+  now: Date,
+  limit: number | undefined,
+): Promise<number> {
+  const lookedBefore = new Date(now.getTime() - REFUND_STATUS_POLL_MINUTES * 60 * 1000);
+  const due = await withActor(WORKER_ACTOR, (tx) =>
+    refundsRepository.claimPendingWithStripeIdForPoll(tx, {
+      lookedBefore,
+      ...(limit !== undefined ? { limit } : {}),
+    }),
+  );
+  for (const row of due) {
+    try {
+      const live = await stripe.retrieveRefund(row.stripeRefundId!);
+      await withActor(WORKER_ACTOR, (tx) =>
+        applyLiveRefund(tx, { chargeId: row.chargeId, live, log }),
+      );
+    } catch (err) {
+      log.warn(
+        { workerTick: 'duplicate-refund-retry', refundId: row.id, err: errMsg(err) },
+        'refund sweep: polling a pending refund failed; it is looked at again an hour on',
+      );
+    }
+  }
+  return due.length;
+}
+
+/**
+ * P22 B-7(b) 4, the end state, with no new state. Two kinds of row are asked about by
+ * `metadata.refund_id`: a re-keyed row (hourly; its key holds the instant of its one send)
+ * and a staff row Stripe could not be reached for, past the retry window (once its last
+ * send, its `updated_at`, is a key window old). A refund carrying the row's id is applied;
+ * once the key window has passed and a COMPLETE list holds none, the row moves `pending →
+ * failed` under the charge lock with one level-50 line, because Stripe holds nothing for
+ * it. A look-up that errors or comes back partial moves nothing. This is not a move by the
+ * clock: 146(c) protects a refund Stripe holds (a `re_`), and this row has none.
+ */
+async function lookUpUnsent(
+  stripe: StripeClient,
+  log: WorkerLogger,
+  now: Date,
+  limit: number | undefined,
+): Promise<{ lookedUp: number; endedFailed: number }> {
+  const windowMs = REFUND_KEY_WINDOW_HOURS * 60 * 60 * 1000;
+  const rekeyed = await withActor(WORKER_ACTOR, (tx) =>
+    refundsRepository.claimRekeyedForLookUp(tx, {
+      lookedBefore: new Date(now.getTime() - REFUND_STATUS_POLL_MINUTES * 60 * 1000),
+      ...(limit !== undefined ? { limit } : {}),
+    }),
+  );
+  const unreached = await refundsRepository.findUnsentStaffPastWindow(db, {
+    mintedBefore: new Date(now.getTime() - DUPLICATE_REFUND_ABANDON_AFTER_HOURS * 60 * 60 * 1000),
+    sentBefore: new Date(now.getTime() - windowMs),
+    ...(limit !== undefined ? { limit } : {}),
+  });
+  let lookedUp = 0;
+  let endedFailed = 0;
+  for (const row of [...rekeyed, ...unreached]) {
+    try {
+      const charge = await withActor(WORKER_ACTOR, (tx) => chargesRepository.findById(tx, row.chargeId));
+      if (charge?.stripePaymentIntentId == null || row.stripeIdempotencyKey === null) continue;
+      lookedUp += 1;
+      const found = await lookUpByRefundId(row, charge.stripePaymentIntentId, stripe, log);
+      if (found !== 'none') continue;
+      const sentAt = rekeyedAt(row.stripeIdempotencyKey);
+      const windowPassed =
+        sentAt === undefined || now.getTime() >= sentAt.getTime() + windowMs;
+      if (!windowPassed) continue;
+      const key = row.stripeIdempotencyKey;
+      const failed = await withActor(WORKER_ACTOR, async (tx) => {
+        await chargesRepository.findByIdForUpdate(tx, row.chargeId);
+        return refundsRepository.failUnsentPending(tx, { id: row.id, stripeIdempotencyKey: key });
+      });
+      if (!failed) continue;
+      endedFailed += 1;
+      log.error(
+        {
+          workerTick: 'duplicate-refund-retry',
+          moneyEvent: 'refund-unsent-past-key-window',
+          refundId: row.id,
+          chargeId: row.chargeId,
+          paymentIntentId: charge.stripePaymentIntentId,
+          amountCents: row.amountCents,
+          stripeIdempotencyKey: key,
+        },
+        REFUND_UNSENT_PAST_WINDOW_ALARM,
+      );
+    } catch (err) {
+      log.error(
+        { workerTick: 'duplicate-refund-retry', refundId: row.id, err: errMsg(err) },
+        'refund sweep: looking up an unsent refund threw; it is looked at again on a later tick',
+      );
+    }
+  }
+  return { lookedUp, endedFailed };
 }
 
 /**
@@ -345,8 +708,14 @@ async function retryOne(
  *
  * Bounded by the number of distinct refunds that ever go abandoned in one
  * process lifetime — a set the whole point of this worker is to keep near zero.
+ *
+ * **Keyed by class and row** (P22 B-7(e)): a row whose class changes is named again under
+ * its new class, because the advice changed. A failed refund first told as "Retry to card
+ * or Returned" becomes, once a dashboard refund lands, one whose exits both refuse it; the
+ * row's earlier sentence is then false, and only its new one is true.
  */
 const ALARMED_REFUND_IDS = new Set<string>();
+const alarmKey = (row: AbandonedRefundRow): string => `${row.refundClass}:${row.id}`;
 
 /**
  * Per class, the largest abandoned count this PROCESS has already announced.
@@ -386,8 +755,12 @@ const ABANDONED_CLASS_MESSAGE: Record<AbandonedRefundClass, string> = {
     'duplicate refund retry: refunds no sweep will ever retry are still unsent — their original Stripe key was the CLIENT request key and nothing durable can reproduce it; an owner is owed this money, so refund by hand against the listed PaymentIntent, but CHECK it for an existing refund first (a lost response rather than a lost request means the money already went back)',
   'never-sent':
     'duplicate refund retry: refund rows with no Stripe charge behind them are still pending — the charge carries no PaymentIntent (pre-Stripe-wire seed money), so there is nothing to refund in the dashboard and no automatic path applies; these record an intent to return money that never moved through Stripe and must be resolved out of band',
+  'awaiting-stripe':
+    "refund sweep: refunds waiting on Stripe's answer — each was sent and Stripe shows no refund for it yet, because its key answered a stored server error or Stripe could not be reached. The sweep looks each up in Stripe every hour by its refund_id metadata and records it the moment Stripe shows one; if Stripe still shows none 24 hours after the last send, the row is marked failed and Retry to card and Returned open for it. Send nothing for these by hand: a refund sent now could be a second one. This alarm repeats once per process restart",
   'stripe-failed':
-    'duplicate refund retry: Stripe reported these refunds FAILED after creating them — the money did NOT return to the owner and nothing retries them (the refund identity is spent); CHECK the listed PaymentIntent for an existing manual refund first (this alarm repeats per process restart, so a colleague may already have re-sent it), then follow each row\'s `instruction` EXACTLY — it names the one figure to return on that row, and rows sharing a charge have already had the charge\'s capacity divided between them oldest-first, so obeying every row on this page is safe both individually and in total. A row reading "return NOTHING" means exactly that. **The bound is OURS to compute, not Stripe\'s**: Stripe limits only refunds that pass through Stripe, and `resolved-external` money (a check, an account credit) is invisible to it — an earlier version of this sentence claimed "Stripe refuses over-refunding" as the safety net, which is false for exactly the returns this class attracts',
+    "refund sweep: refunds that did not reach the family — Stripe failed each after creating it, or refused it at create (a row with no stripeRefundId) — so no money went back on any of them. Each is the newest of its retry chain and fits what its payment still owes, so an owner or manager closes it with one of two exits: Retry to card (POST /staff/refunds/:id/retry) sends the row's amount to the card again under a fresh key, and Returned (POST /staff/refunds/:id/resolve-external) records money handed back outside the app, or, as withdrawn, that the family keeps the purchase. Each row's `seenOn` says where staff find it. CHECK the listed PaymentIntent for a refund someone already made by hand first (this alarm repeats once per process restart, so a colleague may already have acted), then follow each row's `instruction`: rows sharing a charge have had its capacity divided between them oldest-first, so obeying every row is safe individually and in total, and a row reading \"return NOTHING\" means exactly that",
+  'failed-exceeds-owed':
+    "refund sweep: failed refunds LARGER than what their payment still owes — other refunds on the payment (a dashboard refund, most often) have returned part of the money since, so Retry to card and Returned would each refuse the full row as over the cap. Each row's `instruction` names the figure the payment still owes (its `actionableCents`): send that as a new refund through Refund (POST /staff/refunds) with credits_to_remove 0 (the failed row's own credit removal, if any, stands). Once the payment owes nothing the failed row reads covered and needs nothing more. CHECK the listed PaymentIntent for a refund someone already made by hand first (this alarm repeats once per process restart)",
   // MR-A2.5(a): the previous text ended "resolve each with a note if you want
   // it off the books explicitly", which a human CANNOT obey — guard (b)
   // correctly refuses resolving any row on a fully-covered charge (its amount
@@ -431,6 +804,9 @@ const ABANDONED_CLASS_MESSAGE: Record<AbandonedRefundClass, string> = {
  * then handing over a query that cannot find it.
  */
 const ABANDONED_CLASS_QUERY: Record<AbandonedRefundClass, string> = {
+  'awaiting-stripe':
+    "SELECT * FROM refunds WHERE status='pending' AND stripe_refund_id IS NULL AND (stripe_idempotency_key LIKE 'refund-rekey:%' OR issued_by_staff_id IS NOT NULL) ORDER BY created_at DESC",
+  'failed-exceeds-owed': "SELECT * FROM refunds WHERE status='failed' ORDER BY created_at DESC",
   'row-keyed':
     "SELECT * FROM refunds WHERE status='pending' AND stripe_refund_id IS NULL ORDER BY created_at DESC",
   'client-keyed':
@@ -445,7 +821,9 @@ const ABANDONED_CLASSES: readonly AbandonedRefundClass[] = [
   'row-keyed',
   'client-keyed',
   'never-sent',
+  'awaiting-stripe',
   'stripe-failed',
+  'failed-exceeds-owed',
   // MR-A1.5. Counted in the summary and INFO-logged, NEVER alarmed: see
   // `QUIET_CLASSES`.
   'covered',
@@ -482,6 +860,13 @@ function dollars(cents: number): string {
  * rather than having to trust it.
  */
 function actionableInstruction(row: AbandonedRefundRow): string {
+  if (row.refundClass === 'awaiting-stripe') {
+    return "send nothing: the sweep is waiting on Stripe's answer for this refund";
+  }
+  if (row.refundClass === 'failed-exceeds-owed' && row.actionableCents > 0) {
+    // Both figures in words (MR-A3.2), and the road that pays the smaller one (Fable M1).
+    return `return ${dollars(row.actionableCents)} of this row's ${dollars(row.amountCents)} as a new refund through Refund, with no credits to remove — the payment owes no more than that, so Retry to card and Returned would refuse the row; this failed row then needs nothing more`;
+  }
   const because =
     row.clipReason === 'allocated-to-older'
       ? 'it is allocated to an older row on the same charge'
@@ -515,7 +900,7 @@ function reportUnroutable(flipped: AbandonedRefundRow[], log: WorkerLogger): voi
         amountCents: r.amountCents,
       })),
     },
-    'duplicate refund retry: refunds with no Stripe route are now TERMINAL at "unroutable" — the charge behind each carries no PaymentIntent (pre-Stripe-wire money), so nothing here can ever send them; this is the one and only time each will be announced, and the money must be returned out of band',
+    'duplicate refund retry: refunds with no Stripe route are now TERMINAL at "unroutable" — the charge behind each carries no PaymentIntent (pre-Stripe-wire money), so nothing here can ever send them; this is the one and only time each will be announced: a person hands the money back for each and records it with Returned (POST /staff/refunds/:id/resolve-external)',
   );
 }
 
@@ -542,7 +927,7 @@ function reportAbandoned(
       );
       continue;
     }
-    const unreported = inClass.filter((r) => !ALARMED_REFUND_IDS.has(r.id));
+    const unreported = inClass.filter((r) => !ALARMED_REFUND_IDS.has(alarmKey(r)));
     if (unreported.length === 0) {
       // Nothing NEW to name by row. Two very different situations reach here and
       // the difference is money (adversary round 3, 2026-08-20):
@@ -585,7 +970,7 @@ function reportAbandoned(
       );
       continue;
     }
-    for (const row of unreported) ALARMED_REFUND_IDS.add(row.id);
+    for (const row of unreported) ALARMED_REFUND_IDS.add(alarmKey(row));
     // Naming rows by id also settles the count question for this class, so a
     // later pure-growth alarm measures from here rather than re-reporting these.
     ALARMED_BURIED_HIGH_WATER.set(refundClass, total);
@@ -609,6 +994,7 @@ function reportAbandoned(
           clipReason: r.clipReason,
           instruction: actionableInstruction(r),
           remainingCents: r.remainingCents,
+          seenOn: r.seenOn,
           paymentIntentId: r.stripePaymentIntentId,
           // The key the human is being told to search for. Stored on the row
           // for everything minted since 2026-08-19; derived for the legacy
@@ -619,7 +1005,9 @@ function reportAbandoned(
             : {}),
           // A failed refund's identity IS the thing to look up: the dashboard
           // shows why it failed next to the charge it belongs to.
-          ...(refundClass === 'stripe-failed' ? { stripeRefundId: r.stripeRefundId } : {}),
+          ...(refundClass === 'stripe-failed' || refundClass === 'failed-exceeds-owed'
+            ? { stripeRefundId: r.stripeRefundId }
+            : {}),
         })),
       },
       ABANDONED_CLASS_MESSAGE[refundClass],

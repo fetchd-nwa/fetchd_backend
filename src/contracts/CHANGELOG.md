@@ -12,6 +12,84 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [6.0.0] — 2026-11-14
+
+ADDITIVE. LG5's close (plan unit P22, slice S35; ledger PAY-U24, PAY-U25, PAY-U27,
+PAY-U28, CRED-U18; migration M5.11 a pointer, done at M1.21; M5.10's columns landed in
+P20; design §1.1 6.0.0, `designs/fetchd-v1-technical-design.md:1094-1133`; §2.7
+`:4163-4334`; §2.4 `:3112-3159`; §2.10 `:5002-5021`). 6.0.0 lands for clients when P22
+is gate-green and pushed on `v1/build`. Every field is optional or new, and every code
+is appended, so a client built against 6.0.0-lg5.2 reads 6.0.0 unchanged.
+Contract-first: the routes do not exist until P22's backend lands them. Resync both
+clients (`npm run sync:contracts` in mobile and portal). Against the resynced copy (a
+scratch run at the P21 working trees, not their gates) the backend fails once, its
+credit-adjustment body pin; mobile and the portal compile clean.
+
+### Added
+
+- The staff refund, owner and manager, any amount up to what was paid, case by case
+  (the 10-12 money ruling and follow-up 2, `SIGNOFF.md:252-254`; answer 11). Four
+  routes, each 403 `refund_role_required` for a role its rule refuses:
+  - `GET /staff/payments/:id/refund-proposal` →
+    `GetStaffPaymentsRefundProposalResponse {proposed_cents, basis,
+    unbooked_unspent_credits?, expired_unspent_credits?, booked_ahead?,
+    per_credit_cents?, method, recorded_by?}` (PAY-U28, CRED-U18): on a package
+    charge, the purchase lot's live unbooked, unspent credits × the per-credit price;
+    expired ones counted apart, removed but never proposed as money. Read by
+    `capabilities.refund_money`'s rule.
+  - `POST /staff/refunds` (`PostStaffRefundsRequest {payment_id, amount_cents,
+    instrument, reason, credits_to_remove?, enrollment_id?}`) → 201 `RefundWire`
+    (PAY-U24, PAY-U25, CRED-U18). The list (`staff.refund_role_list`), or any role up
+    to `pay.refund_any_role_limit_cents` (seeded 0). The credits staff choose leave
+    the purchase lot at the mint, one `adjustment` row naming the refund.
+  - `POST /staff/refunds/:id/retry`, bodyless → 201 `RefundWire`: *Retry to card*,
+    money only, on the failed head of a retry chain.
+  - `POST /staff/refunds/:id/resolve-external`
+    (`PostStaffRefundsResolveExternalRequest {note, outcome?, instrument?}`) → 200
+    `RefundWire`: *Returned*, on a failed or unroutable head; `withdrawn` moves no
+    money and puts the first refund's removed credits back (question 41, (a) with
+    both riders; PAY-U27's closing verb).
+- `RefundWire {id, charge_id, owner, item, amount_cents, instrument,
+  returned_instrument?, status, reason?, issued_by?, retry_of_refund_id?,
+  enrollment_id?, resolved_by?, resolved_at?, resolution_note?, resolved_outcome?,
+  created_at}`, with `RefundInstrument` (`'original_card' | 'cash' | 'check'`) and
+  `RefundResolvedOutcome` (`'returned' | 'withdrawn'`). No `account_credit`.
+- Six thrown codes, the 50th to the 55th, appended: 403 `refund_role_required`; 422
+  `over_cap`, `instrument_unavailable` and `instrument_mismatch`; 409
+  `refund_superseded` and `refund_in_flight`. None carries `details`.
+  `instrument_mismatch` is typed now and thrown from build 11.1.0 (design 6.1.0),
+  when a charge can be paid by hand; until then `cash` and `check` answer 422
+  `instrument_unavailable` (PAY-U27).
+- `StaffPaymentWire.stripe_payment_intent_id?` on `GET /staff/owners/:id/payments`
+  (owner and manager), for the portal's Stripe-dashboard link; never on
+  `StaffInvoiceWire` (question 58).
+- `StaffPaymentRefundWire.retry_of_refund_id?` on the same read: the earlier row of
+  the payment that a refund retries. A row another row of the payment names is not
+  its retry chain's head, so the portal draws *Retry to card* and *Returned* on the
+  head alone, and an older link reads as retried rather than as money still owed.
+- `PostStaffOwnersCreditAdjustmentsRequest`'s `'remove'` arm takes `refund_id?`, the
+  refund a hand removal answers (a refund adopted from the Stripe dashboard).
+
+### Changed (live, no shape change)
+
+- `StaffInvoicePaymentWire.refundable_cents` stops counting a refund closed
+  `withdrawn`, so the cap reopens by its amount. A `resolved-external` row closed
+  before 6.0.0 has no outcome stored and still counts.
+- `RefundStatus`'s state machine gains its one backwards edge, `succeeded → failed`,
+  at most once: the cap reopens, a `'refunded'` charge is recomputed, and the
+  removed credits stay removed. Every refund event reads the refund's live status
+  back from Stripe. A retry is a new row; the failed row it names stays `'failed'`.
+
+### Documentation
+
+- `StaffCapabilitiesWire.refund_money`, `StaffSettingsWire.refund_roles` and
+  `PaymentSettingValueByKey.refund_any_role_limit_cents` name the routes that read
+  them. `StaffInvoicePaymentWire.payment_id` and `StaffPaymentRefundWire` name the
+  routes that take their ids.
+- The landing-group note names 6.0.0 as LG5's close, and its label sentence follows
+  the 11-10 `wire_label_map` (design 6.1.0 is build 11.1.0, 7.0.0 is 12.0.0); it says
+  that some older sentences still use the 11-02 map.
+
 ## [6.0.0-lg5.2] — 2026-11-13
 
 BREAKING. LG5's second of three steps toward 6.0.0 (plan unit P21, slices S31 and

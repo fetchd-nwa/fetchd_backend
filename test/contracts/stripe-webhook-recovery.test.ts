@@ -23,9 +23,12 @@ import { makeStripeStub } from './_stripeStub.js';
  *   #1 — a SUCCEEDED PaymentIntent with no `charges` row is no order of ours: the
  *        engine writes its charge before Stripe. Metadata grants nothing, and a person
  *        hears.
- *   #3 — a `charge.refund.updated` whose `refunds` row isn't found throws
- *        (releases the claim → Stripe redelivers) instead of being marked
- *        processed and stranding the refund at 'pending'.
+ *   #3 — a `charge.refund.updated` whose `refunds` row isn't found threw (released the
+ *        claim → Stripe redelivered) instead of being marked processed and stranding the
+ *        refund at 'pending'. Reversed in P22 fix 1 (Opus r1 L3) for a refund that names
+ *        no row of ours on a PaymentIntent no charge records: it is answered 200. Our own
+ *        refunds name their row in `metadata.refund_id` since P22, and that case still
+ *        throws (`refund-events.test.ts`, "a refund naming one of OUR rows").
  */
 
 registerFixtureHooks();
@@ -139,10 +142,10 @@ test(
   },
 );
 
-// ── #3: refund webhook forces redelivery instead of stranding ─────────────
+// ── #3: a refund naming no row of ours, on no charge's PaymentIntent ──────
 
 test(
-  'charge.refund.updated with no matching refunds row → 500 + claim released (redelivery)',
+  'charge.refund.updated with no matching refunds row, no PaymentIntent and no metadata.refund_id → 200 orphan-event + claim finished (reversed in P22 fix 1: no redelivery could ever find it)',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, stripe } = buildApp();
@@ -161,14 +164,17 @@ test(
       headers: { 'stripe-signature': 't=1,v1=fake' },
       payload: { id: eventId, type: 'charge.refund.updated' },
     });
-    assert.equal(res.statusCode, 500);
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as { outcome: string }).outcome, 'orphan-event');
 
-    // The claim must be RELEASED (row deleted) so Stripe's redelivery re-enters
-    // dispatch rather than short-circuiting as a duplicate.
+    // The claim is FINISHED, not released: a redelivery answers `duplicate`, and the
+    // unfinished-claim alarm never names it.
     const rows = await db
-      .select({ eventId: stripeEvents.eventId })
+      .select({ eventId: stripeEvents.eventId, processedAt: stripeEvents.processedAt })
       .from(stripeEvents)
       .where(eq(stripeEvents.eventId, eventId));
-    assert.equal(rows.length, 0, 'stripe_events claim released after retryable throw');
+    assert.equal(rows.length, 1, 'stripe_events claim kept');
+    assert.ok(rows[0]!.processedAt, 'and marked processed');
+    await db.delete(stripeEvents).where(eq(stripeEvents.eventId, eventId));
   },
 );

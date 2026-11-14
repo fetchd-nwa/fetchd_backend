@@ -39,6 +39,9 @@ export async function settleDayShare(
     event: { id: string; kind: 'turn-away' | 'sent-home' | 'no-show'; trainingCompleted: boolean };
     now: Date;
     log: NoticeLog;
+    /** The session's instant when it was for an earlier Chicago day than `now`'s: the
+     *  notice names that day (P21's carry 0a). */
+    pastSessionAtIso?: string;
   },
 ): Promise<{ creditsOwnerId?: string }> {
   const [debit] = await creditLedgerRepository.findLiveDebits(tx, {
@@ -69,6 +72,7 @@ export async function settleDayShare(
       kind: 'staff-return',
       event: WHO[args.event.kind],
       eventId: args.event.id,
+      ...(args.pastSessionAtIso !== undefined ? { pastSessionAtIso: args.pastSessionAtIso } : {}),
     },
     log: args.log,
   });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, afterEach, describe, test } from 'node:test';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type {
   AttendanceWire,
   CheckinBoardWire,
@@ -10,15 +10,25 @@ import type {
 import { db } from '../../src/db/client.js';
 import { pool } from '../../src/db/pool.js';
 import { creditsInvalidationPattern } from '../../src/db/repositories/creditsRepository.js';
-import { dogVaccines, dogs } from '../../src/db/schema/schema.js';
+import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';
+import {
+  charges,
+  creditLedger,
+  creditPackages,
+  dogVaccines,
+  dogs,
+  refunds,
+} from '../../src/db/schema/schema.js';
 import { invalidatePattern } from '../../src/lib/cache.js';
 import { addChicagoMonths } from '../../src/lib/creditExpiry.js';
 import { pgTimestampToDate } from '../../src/lib/pgTimestamp.js';
 import { registerCreditsRoute } from '../../src/routes/credits.js';
+import { registerStaffRefundsRoute } from '../../src/routes/staffRefunds.js';
 import { createBookableDog, removeDogs } from './_dayFixture.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
+  FIXTURE_OWNER_ROLE_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
@@ -39,6 +49,7 @@ import {
   removeSessions,
   verb,
 } from './_checkinFixture.js';
+import { makeStripeStub } from './_stripeStub.js';
 
 /**
  * S29's board verbs, check-in, check-out and undo, and the board read (B1-2, B1-3;
@@ -49,9 +60,16 @@ import {
 registerFixtureHooks();
 const createdDogs: string[] = [];
 const sessions: string[] = [];
+/** Charges a test planted to refund (P22 B-9): their refunds go after the ledger rows naming them. */
+const plantedCharges: string[] = [];
 afterEach(async () => {
   await removeSessions(sessions.splice(0));
   await clearPlantedPools();
+  const chargeIds = plantedCharges.splice(0);
+  if (chargeIds.length > 0) {
+    await db.delete(refunds).where(inArray(refunds.chargeId, chargeIds));
+    await db.delete(charges).where(inArray(charges.id, chargeIds));
+  }
 });
 after(async () => {
   await removeDogs(createdDogs);
@@ -912,6 +930,160 @@ describe("P20 F2 and F8 (§M1, §10): the re-check-in's re-debit reverses its ch
       } finally {
         await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 1`);
       }
+    },
+  );
+});
+
+describe('P22 B-9 (brief_must_say 5; P20 §10 as adopted (a), DECISIONS 256(b), 258(a)): a refunded lot is emptied, never re-dated', () => {
+  // §10's own case, Wed 11 Nov at key 1: lot I is a *2x Weekly*, 8 credits for $456.00, $57.00
+  // a credit, 4 left after today's debit; lot J holds 3 and is the one other live lot that
+  // pays the date. Both are live by the database's clock (they expire after today).
+  const WED = '2026-11-11';
+
+  async function lotIOfAPack(dogId: string): Promise<{ chargeId: string; lotI: string }> {
+    const [pack] = await db
+      .select({ id: creditPackages.id })
+      .from(creditPackages)
+      .where(
+        and(
+          eq(creditPackages.key, 'school-2x-weekly-bentonville'),
+          eq(creditPackages.effectiveFrom, '2026-01-01'),
+        ),
+      );
+    const [charge] = await db
+      .insert(charges)
+      .values({
+        ownerId: FIXTURE_IDS.ownerId,
+        amountCents: 45600,
+        status: 'succeeded',
+        purpose: 'package',
+        packageId: pack!.id,
+        stripePaymentIntentId: `pi_test_p22_b9_${randomUUID()}`,
+      })
+      .returning({ id: charges.id });
+    plantedCharges.push(charge!.id);
+    const lotI = randomUUID();
+    await db.insert(creditLedger).values({
+      id: lotI,
+      ownerId: FIXTURE_IDS.ownerId,
+      location: 'bentonville',
+      mode: 'school',
+      tier: 'regular',
+      delta: 8,
+      reason: 'purchase',
+      chargeId: charge!.id,
+      packageId: pack!.id,
+      expiresAt: LOT_EXPIRES.toISOString(),
+    });
+    for (const date of ['2026-11-02', '2026-11-03', '2026-11-09']) {
+      await createSession({ dogIds: [dogId], date, lotId: lotI, ledger: sessions });
+    }
+    return { chargeId: charge!.id, lotI };
+  }
+
+  async function lotUnspent(lotId: string): Promise<number> {
+    return db.transaction((tx) => creditLedgerRepository.lotUnspentInTx(tx, lotId));
+  }
+
+  /** In at 07:30, out at 11:00 with *Re-issue the credit* ticked, Shanthi's refund at 12:00,
+   *  back at 14:30. Answers the re-check-in's response and I's unspent after each step. */
+  async function refundBetweenTheVisits(args: {
+    dogId: string;
+    bookingId: string;
+    chargeId: string;
+    lotI: string;
+  }): Promise<{ recheck: { statusCode: number; body: string }; iUnspent: number[] }> {
+    const clock = makeClock(at(WED, '07:30'));
+    const app = boardApp(FIXTURE_STAFF_PRINCIPAL, clock);
+    const { bookingId, dogId } = args;
+    const iUnspent: number[] = [];
+    attendance(await verb(app, { bookingId, dogId, verb: 'check-in' }));
+    iUnspent.push(await lotUnspent(args.lotI));
+    clock.set(at(WED, '11:00'));
+    attendance(
+      await verb(app, { bookingId, dogId, verb: 'check-out', body: { reissue_credit: true } }),
+    );
+    iUnspent.push(await lotUnspent(args.lotI));
+    clock.set(at(WED, '12:00'));
+    const { app: desk, authenticate } = makeContractApp(FIXTURE_OWNER_ROLE_PRINCIPAL);
+    registerStaffRefundsRoute(desk, { authenticate, stripe: makeStripeStub(), now: clock.now });
+    const refund = await desk.inject({
+      method: 'POST',
+      url: '/staff/refunds',
+      headers: { 'idempotency-key': `p22-b9-${randomUUID()}` },
+      payload: {
+        payment_id: args.chargeId,
+        amount_cents: 28500,
+        instrument: 'original_card',
+        reason: 'the five credits left on the pack',
+        credits_to_remove: 5,
+      },
+    });
+    assert.equal(refund.statusCode, 201, refund.body);
+    iUnspent.push(await lotUnspent(args.lotI));
+    clock.set(at(WED, '14:30'));
+    const recheck = await verb(app, { bookingId, dogId, verb: 'check-in' });
+    iUnspent.push(await lotUnspent(args.lotI));
+    return { recheck, iUnspent };
+  }
+
+  test(
+    "§10's case: 12:00 Shanthi refunds $285.00 with 5 credits removed → I reads 0; the 14:30 re-check-in re-debits J, the live lot that pays the date, and I never goes below 0",
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const dogId = await pepper();
+      const { chargeId, lotI } = await lotIOfAPack(dogId);
+      const lotJ = await plantLot({ credits: 3, expiresAt: LOT_EXPIRES });
+      const { bookingId } = await createSession({
+        dogIds: [dogId],
+        date: WED,
+        lotId: lotI,
+        ledger: sessions,
+      });
+      const { recheck, iUnspent } = await refundBetweenTheVisits({
+        dogId,
+        bookingId,
+        chargeId,
+        lotI,
+      });
+      assert.equal(attendance(recheck).status, 'in');
+      assert.deepEqual(
+        iUnspent,
+        [4, 5, 0, 0],
+        'I: 4 after today, 5 after the return, 0 after the refund, never below',
+      );
+      assert.equal(await lotUnspent(lotJ), 2, 'J −1');
+      assert.deepEqual(
+        (await ledgerOf(bookingId)).map((r) => [r.reason, r.lotId]),
+        [
+          ['booking-debit', lotI],
+          ['settlement-return', lotI],
+          ['booking-debit', lotJ],
+        ],
+      );
+    },
+  );
+
+  test(
+    "§10's case with no J: the refund empties I, so the re-check-in is 422 insufficient_credits and I stays at 0",
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const dogId = await pepper();
+      const { chargeId, lotI } = await lotIOfAPack(dogId);
+      const { bookingId } = await createSession({
+        dogIds: [dogId],
+        date: WED,
+        lotId: lotI,
+        ledger: sessions,
+      });
+      const { recheck, iUnspent } = await refundBetweenTheVisits({
+        dogId,
+        bookingId,
+        chargeId,
+        lotI,
+      });
+      refusal(recheck, 422, 'insufficient_credits');
+      assert.deepEqual(iUnspent, [4, 5, 0, 0]);
     },
   );
 });

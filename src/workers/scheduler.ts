@@ -29,6 +29,10 @@ import {
 } from './duplicateRefundRetry.js';
 import { runOrderSweeperOnce, type OrderSweeperTickResult } from './orderSweeper.js';
 import { runMediaDerivativesOnce, type MediaDerivativesTickResult } from './mediaDerivatives.js';
+import {
+  runUnfinishedStripeEventsOnce,
+  type UnfinishedStripeEventsTickResult,
+} from './unfinishedStripeEvents.js';
 import type { WorkerLogger } from './workerLogger.js';
 
 /**
@@ -60,7 +64,14 @@ import type { WorkerLogger } from './workerLogger.js';
  *
  *   4. **Duplicate-refund retry** (2026-08-12). Re-fire lost-race refund rows
  *      still `pending` with no `stripe_refund_id`, under the SAME idempotency
- *      key the first attempt used.
+ *      key the first attempt used. Since P22 (B-7) it is the whole refund sweep:
+ *      it polls `pending` refunds Stripe holds (hourly, never by the clock), stops
+ *      at a key whose answer is a stored server error and looks the refund up by
+ *      `metadata.refund_id`, marks a create Stripe refused `failed`, and ends an
+ *      unsent row `failed` only once Stripe's key window has passed with no refund.
+ *
+ *   4b. **The unfinished-claim alarm** (P22 B-8). Name each Stripe event received
+ *      and never finished past 15 minutes, once per process; count it after.
  *
  *   5. **Media derivatives** (Day 17). Claim → sharp → settle per job.
  *
@@ -181,6 +192,7 @@ export interface SchedulerTickResult {
   captureReconciler: CaptureReconcilerTickResult;
   orderSweeper: OrderSweeperTickResult;
   duplicateRefundRetry: DuplicateRefundRetryTickResult;
+  unfinishedStripeEvents: UnfinishedStripeEventsTickResult;
   mediaDerivatives: MediaDerivativesTickResult;
   creditExpiryWarnings: { scanned: number; enqueued: number };
   idempotencyKeysSwept: number;
@@ -317,13 +329,19 @@ export async function runSchedulerTickOnce(
   let duplicateRefundRetryResult: DuplicateRefundRetryTickResult = {
     scanned: 0,
     sent: 0,
+    polled: 0,
+    lookedUp: 0,
+    refused: 0,
+    endedFailed: 0,
     abandoned: 0,
     abandonedTruncated: false,
     abandonedByClass: {
       'row-keyed': 0,
       'client-keyed': 0,
       'never-sent': 0,
+      'awaiting-stripe': 0,
       'stripe-failed': 0,
+      'failed-exceeds-owed': 0,
       covered: 0,
     },
     results: [],
@@ -342,6 +360,26 @@ export async function runSchedulerTickOnce(
         err: err instanceof Error ? err.message : String(err),
       },
       'duplicate-refund-retry phase threw at the worker boundary; will retry next tick',
+    );
+  }
+
+  // Phase 4b — the unfinished-claim alarm (P22 B-8). It reads only `stripe_events`.
+  // `opts.now`, not the resolved `now`: in production nothing is injected and the bound is
+  // judged on Postgres's clock, so a process clock can never call a live delivery dead.
+  let unfinishedStripeEventsResult: UnfinishedStripeEventsTickResult = { count: null, named: 0 };
+  try {
+    unfinishedStripeEventsResult = await runUnfinishedStripeEventsOnce({
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+      log,
+    });
+  } catch (err) {
+    log.error(
+      {
+        workerTick: 'scheduler',
+        phase: 'stripe-events-unfinished',
+        err: err instanceof Error ? err.message : String(err),
+      },
+      'stripe-events-unfinished phase threw at the worker boundary; will retry next tick',
     );
   }
 
@@ -429,6 +467,7 @@ export async function runSchedulerTickOnce(
     captureReconciler: captureReconcilerResult,
     orderSweeper: orderSweeperResult,
     duplicateRefundRetry: duplicateRefundRetryResult,
+    unfinishedStripeEvents: unfinishedStripeEventsResult,
     mediaDerivatives: mediaDerivativesResult,
     creditExpiryWarnings: creditExpiryWarningsResult,
     cardExpiry: cardExpiryResult,

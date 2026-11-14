@@ -547,6 +547,126 @@ describe("M1: with the outlives switch on, a credit returned on its lot's last d
   );
 });
 
+/**
+ * P21's carry 0b (Opus r2 N2; DECISIONS 295(a)(ii); P22 brief `brief_must_say` 0b), a pin:
+ * the return rule (`planReturns`) reads TODAY in Chicago. From 18:00 CST (19:00 CDT) to
+ * midnight the UTC date is already tomorrow, so a rule that read the UTC date would take
+ * tomorrow for today and send a credit whose lot pays tomorrow to a fresh month (mutant MZ,
+ * `now.toISOString().slice(0, 10)` for `bucketChicagoToday(now)`: it survived P21's suite,
+ * whose clocks put Chicago's date and UTC's on the same day). Driven through the real
+ * routes at two evening clocks where the UTC date is tomorrow, a lot that dies at noon
+ * tomorrow takes its credit back, keeping its date.
+ *
+ * Mon 15 / Tue 16 Nov 2027, a year on like the rest of this file and after that year's
+ * fall-back (Sun 7 Nov 2027), so Chicago is on CST (UTC-6), and every lot here is alive at
+ * the database's own `now()`.
+ */
+describe("P21's carry 0b: the return rule reads Chicago's today, not the UTC date (mutant MZ)", () => {
+  const MON = '2027-11-15';
+  const TUE = '2027-11-16';
+  /** Noon tomorrow: the lot pays Tue 16 and dies that day, after the next Chicago midnight. */
+  const DIES_TUE_NOON = at(TUE, '12:00');
+
+  async function sheetDateOf(app: FastifyInstance, bookingId: string, dogId: string) {
+    const share = wire(
+      await app.inject({ method: 'GET', url: `/bookings/${bookingId}` }),
+    ).dog_shares?.find((s) => s.dog_id === dogId);
+    assert.ok(share, `${dogId} has no share`);
+    return share.return_expires_at;
+  }
+
+  /** Each return a session wrote, as [dog, the lot it went into, its own date]. */
+  async function returnsOfRow(bookingId: string) {
+    return (await ledgerOf(bookingId))
+      .filter((r) => r.reason === 'settlement-return')
+      .map((r) => [
+        r.dogId,
+        r.lotId,
+        r.expiresAt === null ? null : pgTimestampToDate(r.expiresAt).toISOString(),
+      ]);
+  }
+
+  test(
+    "Mon 18:00 CST (00:00 UTC Tue), the owner cancels Tue 16's day, its lot dying Tue 12:00 → the sheet names the lot's date; the credit goes back into the lot; the notice names 16 Nov",
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const now = at(MON, '18:00');
+      assert.equal(now.toISOString().slice(0, 10), TUE, 'the UTC date is already tomorrow');
+      assert.equal(bucketChicagoToday(now), MON, "Chicago's date is still today");
+      const pepper = await named('Pepper');
+      const lot = await plantLot({ credits: 1, expiresAt: DIES_TUE_NOON });
+      const { bookingId } = await createSession({
+        dogIds: [pepper],
+        date: TUE,
+        lotId: lot,
+        ledger: sessions,
+      });
+      const { app, stripe } = appOf(FIXTURE_OWNER_PRINCIPAL, makeClock(now));
+      const sheet = await sheetDateOf(app, bookingId, pepper);
+      wire(await ownerCancel(app, { bookingId }));
+      assert.deepEqual(
+        {
+          sheet,
+          returns: await returnsOfRow(bookingId),
+          notices: (await cancelNotices([bookingId])).map((n) => n.body),
+        },
+        {
+          sheet: DIES_TUE_NOON.toISOString(),
+          returns: [[pepper, lot, null]],
+          notices: [
+            `You cancelled Pepper's day school, Tue 16 Nov. +1 credit, back to your Bentonville day-school credits (expires 16 Nov).`,
+          ],
+        },
+        'the lot pays a date after today (Tue 16), so the credit keeps its date: never a fresh month',
+      );
+      assert.equal(await lotExpiry(lot), DIES_TUE_NOON.toISOString());
+      assert.deepEqual(stripe.calls, []);
+    },
+  );
+
+  test(
+    "Mon 23:59 CST (05:59 UTC Tue), Didn't come on Mon's board: a lot dying Tue 12:00 takes the credit back; a lot dying 23:59:30 tonight gives a fresh lot (the control)",
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const now = at(MON, '23:59');
+      assert.equal(now.toISOString().slice(0, 10), TUE, 'the UTC date is already tomorrow');
+      assert.equal(bucketChicagoToday(now), MON, "Chicago's date is still today");
+      const pepper = await named('Pepper');
+      const bao = await named('Bao');
+      const tuesday = await plantLot({ credits: 1, expiresAt: DIES_TUE_NOON });
+      const tonight = await plantLot({ credits: 1, expiresAt: new Date(now.getTime() + 30_000) });
+      const kept = await createSession({
+        dogIds: [pepper],
+        date: MON,
+        lotId: tuesday,
+        ledger: sessions,
+      });
+      const fresh = await createSession({
+        dogIds: [bao],
+        date: MON,
+        lotId: tonight,
+        ledger: sessions,
+      });
+      const { app } = appOf(FIXTURE_STAFF_PRINCIPAL, makeClock(now));
+      for (const [session, dogId] of [
+        [kept, pepper],
+        [fresh, bao],
+      ] as const) {
+        const res = await verb(app, { bookingId: session.bookingId, dogId, verb: 'no-show' });
+        assert.equal(res.statusCode, 200, res.body);
+      }
+      assert.deepEqual(
+        { kept: await returnsOfRow(kept.bookingId), fresh: await returnsOfRow(fresh.bookingId) },
+        {
+          kept: [[pepper, tuesday, null]],
+          fresh: [[bao, null, addChicagoMonths(now, 1).toISOString()]],
+        },
+        "Tuesday's lot keeps the credit; tonight's lot, dying before midnight, cannot",
+      );
+    },
+  );
+});
+
 describe('the alarm, through the route, inside 48 hours (design §2.3:2502-2505)', () => {
   test(
     "the whole-session cancel Thu 21:15 of a Fri day whose live share holds no live debit → 500 and one alarm naming the booking and the dog; nothing moves",

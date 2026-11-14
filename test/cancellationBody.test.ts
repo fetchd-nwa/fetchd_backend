@@ -13,7 +13,8 @@ import {
  * Pepper's day school, Fri 16 Oct" (the owner, the whole session or one dog); "The school
  * cancelled Pepper's day school on Wed 21 Oct: "<reason>"" (a staff cancel, the reason
  * verbatim; with no reason, the same sentence without the quote); "Pepper was sent home
- * early / was picked up early / was turned away / didn't come today". And the credit line,
+ * early / was picked up early / was turned away / didn't come today" ("didn't come on Tue
+ * 13 Oct" from a past day's board, P21's carry 0a). And the credit line,
  * one per landing (two dogs, two lots, two dates: two lines, each true), read from where
  * each credit landed, §2.9's dead-lot line for a dead one, and none when nothing came
  * back. It never names money (P21, NOTIF-U17; brief B-5).
@@ -221,6 +222,17 @@ const TABLE: [string, CancellationNotice, string][] = [
     "Didn't come into a dead lot (cred.returned_credit_expiry_months 0)",
     { kind: 'staff-return', event: 'didnt-come', dogName: 'Pepper', credit: DEAD_19_OCT },
     "Pepper didn't come today. 1 credit came back, but its date, 19 Oct, has passed. Message us if you'd like it extended.",
+  ],
+  [
+    "Didn't come recorded on a past day's board (P21's carry 0a, Opus r2 L3): the session's day, never 'today'",
+    {
+      kind: 'staff-return',
+      event: 'didnt-come',
+      dogName: 'Pepper',
+      credit: LOT_1_JUN,
+      pastSessionAtIso: '2026-10-13T12:30:00.000Z',
+    },
+    "Pepper didn't come on Tue 13 Oct. +1 credit, back to your Bentonville day-school credits (expires 1 Jun).",
   ],
 ];
 

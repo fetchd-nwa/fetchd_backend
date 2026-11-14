@@ -66,7 +66,7 @@ observable behavior, not "looks right."
 | 12b2 | FE: EvaluationGateModal extraction + program-tile gate + picker parity | Claude | ☐ |
 | 13 | Txn: cancelBooking + refunds + cancel window + staff-tunable policy (window, forfeit and money-back gone at 6.0.0-lg5.2, P21) | Allison | ☑ |
 | 14 | Stripe test-mode core (intents/cards/charges) | Allison | ☑ |
-| 15 | Stripe webhooks + invoices + dunning worker | Allison | ☑ |
+| 15 | Stripe webhooks + invoices + dunning worker (refund events live-applied, staff refunds at 6.0.0, P22) | Allison | ☑ |
 | 16 | Scheduler worker (scheduled_notifications) | Allison | ☑ |
 | 17 | Media / Cloudflare R2 | Allison | ☑ |
 | 18a | FE foundations: Supabase Auth + apiClient + TanStack QueryClient | Claude | ☑ |
@@ -1572,6 +1572,21 @@ observable behavior, not "looks right."
 ### Day 15 — Stripe webhooks + invoices + dunning worker
 > Dated log. The invoice auto-charge worker, its dunning ladder and `recordFailedAttempt`
 > left at wire 5.0.0-lg4.1 (P17, PAY-U15): no worker bills a card on its own today.
+>
+> A refund's status is no longer the event's (wire 6.0.0, P22; DATA-CONTRACT §U). The
+> receiver parses `refund.updated`, `refund.failed` and `charge.refunded` beside
+> `charge.refund.updated`; each arm retrieves the refund (or lists the PaymentIntent's)
+> with no transaction open and hands it to `applyLiveRefund` (`lib/refundApply.ts`), the one
+> apply function the create's reply and the refund sweep also call. Under the charge lock
+> it matches the row by `stripe_refund_id`, then `metadata.refund_id` (every create carries
+> it from P22), then the old amount fallback (automatic rows only), else adopts a dashboard
+> refund whatever else is pending. The machine gains one backwards edge, `succeeded →
+> failed` (the cap reopens; a `refunded` charge is recomputed, to `failed` on a late-success
+> charge). The staff refund itself (`routes/staffRefunds.ts`: the proposal, the refund,
+> *Retry to card*, *Returned*) is §U's; `handleChargeRefundUpdated` and
+> `maybeAdoptOutOfBandRefund` are replaced by `handleRefundObjectEvent` and
+> `handleChargeRefunded`, and the race-fallback described below is step 3 of that match,
+> never applied to a staff row.
 - **Owner:** Allison
 - **Depends on:** Day 14
 - **Governing contract:** DATA-CONTRACT payments; schema.sql invoices/refunds
@@ -1680,6 +1695,19 @@ observable behavior, not "looks right."
   enumify if it grows. Confidence scores **95 / 96 / 95**.
 
 ### Day 16 — Scheduler worker ☑
+
+> The duplicate-refund retry phase is the whole refund sweep since wire 6.0.0 (P22;
+> DATA-CONTRACT §U): it polls `pending` refunds Stripe holds every
+> `REFUND_STATUS_POLL_MINUTES` (60), never by the clock; stops at a key whose answer is a
+> stored server error, looks the refund up by `metadata.refund_id` and sends at most once
+> more under `refund-rekey:<row id>:<epoch seconds>`; marks a create Stripe refused (HTTP
+> 400 `invalid_request_error`) `failed`; and ends an unsent row `failed` only after
+> `REFUND_KEY_WINDOW_HOURS` (24) with Stripe holding no refund for it. Its abandon report
+> gains `awaiting-stripe` and `failed-exceeds-owed`. Phase 4b, `stripe-events-unfinished`
+> (`workers/unfinishedStripeEvents.ts`), names each Stripe event received and never
+> finished past 15 minutes, once per process. The tick's completion line gains
+> `duplicateRefundRetryPolled`, `…LookedUp`, `…Refused`, `…EndedFailed`,
+> `…AbandonedAwaitingStripe`, `…AbandonedFailedExceedsOwed` and `stripeEventsUnfinished`.
 - **Owner:** Allison
 - **Depends on:** Day 15
 - **Governing contract:** schema.sql `scheduled_notifications` notes

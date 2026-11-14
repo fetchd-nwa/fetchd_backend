@@ -541,13 +541,16 @@ test(
 );
 
 test(
-  'charge.refund.updated with no matching refunds row → 500 + claim released (forces redelivery)',
+  'charge.refund.updated with no matching refunds row, on a PaymentIntent no charge records and naming no row of ours → 200 orphan-event + claim finished (reversed in P22 fix 1)',
   SKIP_WHEN_NO_DB,
   async () => {
     // Behavior change (booking/refund review 2026-06-18): a refund event whose
-    // DB row isn't found is a delivery race (the refunds row commits before the
-    // Stripe call), so we throw → release the claim → 500 → Stripe redelivers,
-    // rather than mark it processed and strand the refund at 'pending'.
+    // DB row isn't found was taken for a delivery race (the refunds row commits before
+    // the Stripe call), so it threw → released the claim → 500 → Stripe redelivered.
+    // Reversed in P22 fix 1 (Opus r1 L3): since P22 every refund the app creates names
+    // its row in `metadata.refund_id`, so a refund that names none, on a PaymentIntent no
+    // charge records, is a payment taken elsewhere, and no redelivery would ever find it.
+    // A refund that does name one of our rows keeps the 500 (`refund-events.test.ts`).
     await cleanupTestState();
     const { app, stripe } = buildApp();
     const eventId = evtId();
@@ -565,13 +568,16 @@ test(
       headers: { 'stripe-signature': 't=1,v1=fake' },
       payload: { id: eventId },
     });
-    assert.equal(res.statusCode, 500);
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as { outcome: string }).outcome, 'orphan-event');
 
     const rows = await db
-      .select({ eventId: stripeEvents.eventId })
+      .select({ eventId: stripeEvents.eventId, processedAt: stripeEvents.processedAt })
       .from(stripeEvents)
       .where(eq(stripeEvents.eventId, eventId));
-    assert.equal(rows.length, 0, 'claim released so Stripe redelivers');
+    assert.equal(rows.length, 1, 'claim kept');
+    assert.ok(rows[0]!.processedAt, 'and finished: a redelivery answers duplicate');
+    await db.delete(stripeEvents).where(eq(stripeEvents.eventId, eventId));
   },
 );
 

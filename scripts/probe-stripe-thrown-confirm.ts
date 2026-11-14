@@ -89,6 +89,15 @@
  * the saved-card path. The exit code is non-zero if a blocker differs from the expected
  * one.
  *
+ * WHAT `--refunds` RUNS INSTEAD, SINCE P22 (brief B-1, DECISIONS 279(e))
+ *
+ * Which refund events the account generates, the one backwards edge (`succeeded → failed`)
+ * on Stripe's refund-failure card, what an over-refund answers, whether a same-key refund
+ * create exposes the replay header, and whether `metadata.refund_id` comes back on
+ * `refunds.list`. `--record` writes `test/fixtures/stripe-refunds.json`; without it the run
+ * compares to that file. `--dry-run` prints the plan and makes no call. Everything it creates
+ * in the test account is listed in `scripts/probe-stripe-refunds.ts`'s header.
+ *
  * SAFETY
  *
  *   · Aborts unless STRIPE_SECRET_KEY starts with `sk_test_`.
@@ -119,6 +128,7 @@ import {
   stripeErrorCode,
   type StripePaymentIntentResult,
 } from '../src/lib/stripe.js';
+import { printRefundsDryRun, runRefundsProbe } from './probe-stripe-refunds.js';
 
 const TEST_KEY_PREFIX = 'sk_test_';
 const PROBE_AMOUNT_CENTS = 4500;
@@ -710,6 +720,15 @@ async function probeEngineSplit(stripe: Stripe): Promise<void> {
 
 async function main(): Promise<void> {
   const key = env.STRIPE_SECRET_KEY;
+  const refunds = process.argv.includes('--refunds');
+  if (refunds && process.argv.includes('--engine-split')) {
+    throw new Error('--refunds and --engine-split are two runs: pick one.');
+  }
+  if (refunds && process.argv.includes('--dry-run')) {
+    // No Stripe client, no call: the plan, and what the gate below would do with the key.
+    printRefundsDryRun({ keyPassesTestModeGate: key.startsWith(TEST_KEY_PREFIX) });
+    return;
+  }
   if (!key.startsWith(TEST_KEY_PREFIX)) {
     // Never echo the key. The prefix is the only thing worth saying out loud.
     throw new Error(
@@ -720,6 +739,11 @@ async function main(): Promise<void> {
 
   if (process.argv.includes('--engine-split')) {
     await probeEngineSplit(new Stripe(key));
+    return;
+  }
+
+  if (refunds) {
+    await runRefundsProbe(new Stripe(key), { record: process.argv.includes('--record') });
     return;
   }
 

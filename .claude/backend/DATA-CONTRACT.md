@@ -2931,12 +2931,12 @@ invisible to the repository layer.
   `POST /staff/dogs/:dogId/clear-alumni-flag` [staff] — §J.3. Recording the
   5th program = became-alumni ⇒ `clearExpiryForDog` (live lots → NULL).
   The DELETE does NOT re-stamp lot expiries (documented in the route).
-- `POST /webhooks/stripe` [public, signed] — **Day 15** — receives `payment_intent.succeeded`/`.payment_failed`/`setup_intent.succeeded`/`charge.refund.updated`. Dedupes via `stripe_events` table; runs under `system:stripe-webhook` actor. Other event types collapse to `unhandled`+200 (future-proof).
+- `POST /webhooks/stripe` [public, signed] — **Day 15** — receives `payment_intent.succeeded`/`.payment_failed`/`setup_intent.succeeded`/`charge.refund.updated`. Dedupes via `stripe_events` table; runs under `system:stripe-webhook` actor. Other event types collapse to `unhandled`+200 (future-proof). *Δ 6.0.0 (P22; §U): it also receives `refund.updated`, `refund.failed` and `charge.refunded`; each refund arm retrieves the refund live (`charge.refunded` lists the PaymentIntent's refunds) and applies Stripe's live status, never the event's, through the one apply function under the charge lock. `refund.created` is still `unhandled`.*
 - `GET /invoices` · `POST /invoices/:id/pay` [$] — **Day 15** for `POST /pay` (pay-later settlement; rides the order engine since 4.0.0-lg3.2, §P). `GET /invoices` deferred to Day-19 staff portal (no current FE consumer; `invoicesRepository.findOpenByOwner` is ready when needed).
 - `POST /invoices/:id/pay-in-person` — **Notifications Phase 4c (2026-07-27, R3)**: owner elects cash/check at drop-off. Charges nothing — flips `invoices.payment_expected` → 'in-person' + enqueues the `payment-due` reminder (~1h before the linked booking's drop-off, else the invoice's `due_at`; past → now) in one tx. Bodyless 204; repeat under a new key → 409. See §A Amendment 2026-07-27 (Phase 4c).
 - `POST /requests/:id/confirm-payment` — **Day 15** — B&T `approved-awaiting-payment` → `converted`. Server-authoritative pricing via `lib/boardTrainPricing.ts`. Pay-now (charges row + booking) or pay-later (open invoice + booking).
-- `GET /refunds` — refund history; refunds are created by the cancel txn (`POST /bookings/:id/cancel`), not a direct client endpoint. Past the `cancel_deadline_at` window the booking is `cancel_forfeited` (no refund); within it → credit `cancel-refund` (credit bookings) or a `refunds` row + Stripe refund (money bookings). **Day 14**: cancel route's money-back branch now fires `stripe.createRefund` post-commit (Day-13 stubbed the seam). *Δ 6.0.0-lg5.2 (P21; §T): superseded. No booking cancel forfeits, writes a `refunds` row or calls Stripe; every credit comes back as a `settlement-return` (§S). The one refund a cancel still causes is a pending row's whole-order cancel, where the engine refunds a top-up that won no seat (F4, §P).*
-- `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**13 phases, one result field each on `SchedulerTickResult`** — corrected 2026-08-25, D20-A3 §L5; this line said 7, frozen at §J 2026-07-14, and the Day-20 design said 9; P15 added the order sweeper): `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice-attempt verify / capture reconciler / order sweeper / duplicate-refund retry / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / invoice-overdue scan / card-expiry scan / `idempotency_keys` TTL sweep. The tick's Railway completion log line carries every phase's counters as of the same date (it carried five, omitting both money phases — DISCREPANCIES NOTE-39). Worker runs under `system:scheduler` actor.
+- `GET /refunds` — refund history; refunds are created by the cancel txn (`POST /bookings/:id/cancel`), not a direct client endpoint. Past the `cancel_deadline_at` window the booking is `cancel_forfeited` (no refund); within it → credit `cancel-refund` (credit bookings) or a `refunds` row + Stripe refund (money bookings). **Day 14**: cancel route's money-back branch now fires `stripe.createRefund` post-commit (Day-13 stubbed the seam). *Δ 6.0.0-lg5.2 (P21; §T): superseded. No booking cancel forfeits, writes a `refunds` row or calls Stripe; every credit comes back as a `settlement-return` (§S). The one refund a cancel still causes is a pending row's whole-order cancel, where the engine refunds a top-up that won no seat (F4, §P).* *Δ 6.0.0 (P22; §U; DECISIONS 274(d)): `GET /refunds` does not exist. Run on 2026-11-13 against a real server instance (the production entry `src/index.ts` on the test database) with an owner principal, it answered 404 `Route GET:/refunds not found`, Fastify's own not-found answer. Money goes back only when a staff member chooses it, through `POST /staff/refunds` (§U); the owner app reads a refund only as its invoices and balance show it.*
+- `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**13 phases, one result field each on `SchedulerTickResult`** — corrected 2026-08-25, D20-A3 §L5; this line said 7, frozen at §J 2026-07-14, and the Day-20 design said 9; P15 added the order sweeper): `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice-attempt verify / capture reconciler / order sweeper / duplicate-refund retry / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / invoice-overdue scan / card-expiry scan / `idempotency_keys` TTL sweep. The tick's Railway completion log line carries every phase's counters as of the same date (it carried five, omitting both money phases — DISCREPANCIES NOTE-39). Worker runs under `system:scheduler` actor. *Δ 6.0.0 (P22; §U): the duplicate-refund retry phase is the whole refund sweep now, and phase 4b, the unfinished-claim alarm (`unfinishedStripeEvents`), is new; the completion line gains `duplicateRefundRetryPolled`, `duplicateRefundRetryLookedUp`, `duplicateRefundRetryRefused`, `duplicateRefundRetryEndedFailed`, `duplicateRefundRetryAbandonedAwaitingStripe`, `duplicateRefundRetryAbandonedFailedExceedsOwed` and `stripeEventsUnfinished`. The count above was already stale: `SchedulerTickResult` holds nine phase fields today (`scheduledNotifications`, `cardExpiry`, `captureReconciler`, `orderSweeper`, `duplicateRefundRetry`, `unfinishedStripeEvents`, `mediaDerivatives`, `creditExpiryWarnings`, `idempotencyKeysSwept`).*
 
 > `scheduled_notifications` + `media_derivative_jobs` are server-internal
 > worker queues — no client endpoints; the worker emits pushes /
@@ -5169,6 +5169,13 @@ outside our Stripe machinery, attested by a named human.**
   stays unadopted (retried until Stripe's redelivery window expires, then
   unrecorded). The guard is deliberately conservative; the resolve verb still
   records the return.
+  *Δ 6.0.0 (P22; §U; Fable H2): superseded, with the any-`pending` guard above. From P22 a
+  staff card refund can sit `pending` for days, so the guard would refuse Shanthi's
+  dashboard refund on every delivery and the cap would never learn of that money. A
+  refund nothing here minted is adopted whatever else is pending on the charge, at its
+  live status (a `pending` one counts in the cap at once), money only; over the cap it is
+  recorded and alarmed, never refused. `maybeAdoptOutOfBandRefund` is gone: every arm
+  decides whose refund it is in one function (§U).*
 - **The dangerous verb is a WRONG resolution** — staff attesting a return that
   did not happen closes the remainder and strands the owner's money. Mitigated by
   staff-only + required note + **the attribution columns** (§N.5 — *not* audit
@@ -5184,6 +5191,12 @@ write a note. The portal-surface contract is DEFINED in `designs/money-residue.m
 §4.6 (`GET /staff/refunds?status=failed,unroutable`,
 `POST /staff/refunds/:id/resolve`, additive minor when it lands, NOT in 1.13.0)
 so that build is a transcription rather than a design.
+*Δ 6.0.0 (P22; §U): built, not as §4.6 drew it. The verb is
+`POST /staff/refunds/:id/resolve-external` (a role on `staff.refund_role_list`, seeded owner and manager),
+with `markResolvedExternal` rebuilt to a result decided under the charge lock and
+`staffId` required; `GET /staff/refunds?status=` and `POST /staff/refunds/:id/resolve`
+are never built (End of day, P25, is the worklist's surface). Until then a failed refund
+is on the family's payment history, and the abandon report names the route.*
 
 ### N.4 What no gate can prove here
 
@@ -5875,3 +5888,158 @@ comparison describe deleted code (the withdraw itself is unchanged).
   that seeds it, so the request is 500 `internal` and the error log names the row; it was
   404 `not_found`. No reader falls back to a number in code. A `PATCH /staff/settings/...`
   whose UPDATE finds no row is still 404 `not_found`.
+
+## U. Staff refunds by Shanthi and Amber only; LG5 closes (wire 6.0.0, 2026-11-13)
+
+Δ 2026-11-13 (P22 backend; DECISIONS 279, 283, 303; PAY-U24, PAY-U25, PAY-U27, PAY-U28,
+CRED-U18; s17, s18). Wire is the contract; this records what the code does now and what the
+sections above no longer say. It supersedes §N.3's "NO HTTP ROUTE this phase" and its §4.6
+surface (`GET /staff/refunds?status=` and `POST /staff/refunds/:id/resolve` are never built),
+§N.3's any-`pending` adoption guard and its named residual, and §C's `GET /refunds` line.
+Money goes back only when Shanthi or Amber refund it, case by case, at any amount up to what
+was paid (`product/rebuild/SIGNOFF.md:252-255`); the one automatic refund is still a charge
+that won no seat (§P).
+
+- **Who may refund** (PAY-U25; D6; s18). One gate (`auth/requireRefundRole.ts`), run inside
+  `withMutation` after the claim, so a replay returns its stored answer whatever the lists
+  say now. `POST /staff/refunds` passes a role on `staff.refund_role_list` (seeded owner and
+  manager; bound `ROLE_LIST`: non-empty, the owner always passes) or any role whose
+  `amount_cents` ≤ `pay.refund_any_role_limit_cents` (seeded 0, `atLeast(0)`, no ceiling,
+  class `money`: the owner and a manager edit it), else 403 `refund_role_required`. Retry
+  and resolve-external pass the list alone; the proposal passes `capabilities.refund_money`'s
+  rule. Both settings are read per request. An owner principal is 403 `forbidden`, and a 403
+  never says whether the payment exists. Each POST takes a REQUIRED `Idempotency-Key` whose
+  claim hashes `{staff_id, id, ...body}`, so another staffer sending Amber's key and body is
+  422 `idempotency_mismatch`, never her stored `RefundWire`.
+- **The proposal**, `GET /staff/payments/:id/refund-proposal` (PAY-U28, CRED-U18; D7),
+  computed on each read under the charge lock and storing nothing:
+  `{proposed_cents, basis: 'unbooked_credits', unbooked_unspent_credits,
+  expired_unspent_credits, booked_ahead: {count, dates}, per_credit_cents, method: 'card'}`.
+  `per_credit_cents` is the charge's amount over the lot's grant, rounded down; an expired
+  lot's unspent is counted and never proposed as money; `proposed_cents` never exceeds what
+  the payment can still return. 404 for an unknown id or a charge that took no money; 422
+  `invalid_payload` for a charge that bought no credits (a class or board-and-train
+  payment), on which the refund itself stays open at any amount up to the cap.
+- **The refund**, `POST /staff/refunds` (PAY-U24, CRED-U18; D1, D3, D4, D8, D9, D11). After
+  the claim and the gate, in one transaction: the charge lock; the charge took money
+  (`succeeded` or `refunded`), else 404; `enrollment_id` → 422 `invalid_payload` (until
+  build 12.0.0); `cash` or `check` → 422 `instrument_unavailable` (until P24); above the cap
+  → 422 `over_cap` (a `pending` refund counts); the purchase lot and its pool lock;
+  `credits_to_remove` (omitted: the lot's unbooked, unspent count, expired included) above
+  that count, or any above 0 on a charge with no purchase lot → 422 `lot_insufficient`. Then
+  the `refunds` row (`issued_by_staff_id`, `reason`, `instrument`, the stored Stripe key
+  `<request key>:refund`) and, when the count is above 0, ONE `adjustment` row of minus the
+  count on that lot naming the refund, `checkin_event_id` NULL. The create fires after
+  commit with `metadata.refund_id`, and its reply goes through the one apply function. 201
+  is the row as committed, `pending`. A charge with no PaymentIntent mints the row
+  `unroutable`, calls no Stripe and logs one level-50 line. A refund removes only unbooked,
+  unspent credits (RULING R3), so booked days stand and nothing is paid back twice.
+- **Retry to card**, `POST /staff/refunds/:id/retry` (bodyless; D2, D5). Decided from the
+  row re-read under the charge lock: 404; not a `failed` `original_card` row → 409
+  `conflict`; a row any later retry names → 409 `refund_superseded`, whatever that retry's
+  state (only a chain's newest row may be retried or resolved: DECISIONS 279(b)); any
+  refund on the payment `pending` → 409 `refund_in_flight`; above the cap → 422 `over_cap`.
+  It writes a NEW row for the same payment, amount and instrument, `retry_of_refund_id` the
+  row it repeats, issued by the retrier, its `reason` copied, keyed from the retry's own
+  key, and no credit row. It takes a row on a charge in any status (a late-success refund's
+  row sits on a charge held `failed`).
+- **Returned**, `POST /staff/refunds/:id/resolve-external {note, outcome?, instrument?}`
+  (PAY-U27's closing verb). `markResolvedExternal` answers a result decided under the
+  charge lock: 404; not `failed` or `unroutable` → 409 `conflict`; superseded → 409
+  `refund_superseded`; a refund `pending` on the payment → 409 `refund_in_flight`;
+  `returned` above what the payment still owes → 422 `over_cap`; a card row closed
+  `returned` without `instrument`, `instrument` beside `withdrawn`, or a blank note → 400.
+  It writes `resolved_outcome`, `resolved_by_staff_id` (required), `resolved_at`,
+  `resolution_note` and, on `returned`, `returned_instrument`. **`withdrawn`** (the family
+  keeps the purchase) counts in no sum (`REFUNDABLE_CENTS`, the cap, the returned coverage
+  and its rows, the abandon remainder) and puts back what the chain removed, by arithmetic:
+  for each lot, the sum of every `credit_ledger` row naming any row of the chain, read after
+  ONE `lockPools` over every such lot's pool; where it is below 0, one `adjustment` row of
+  its negation naming the chain's first refund, so a second put-back finds 0. It answers
+  422 `over_cap` when the payment has nothing left to return and the put-back would write a
+  row: that money went back another way, so the credits stay removed.
+- **A refund's live status: four events and one backwards edge** (`brief_must_say` 2).
+  `charge.refund.updated`, `refund.updated`, `refund.failed` and `charge.refunded` are
+  parsed whether or not the account sends them. Each arm retrieves with no transaction
+  open (`charge.refunded` lists the PaymentIntent's refunds) and hands the LIVE refund to
+  `applyLiveRefund` (`lib/refundApply.ts`), the one apply function the create's reply and
+  the sweep also use. Under the charge lock it decides whose refund it is: the row its
+  `stripe_refund_id` names; else the row of this charge its `metadata.refund_id` names (its
+  `re_` stored); else, with no metadata, the amount fallback onto a `pending` row with no
+  `re_` and no `issued_by_staff_id` (rows minted before P22; its residue: a dashboard refund
+  of the same amount as an automatic row still waiting for its `re_` is written onto that
+  row); else a refund made outside the app, adopted whatever else is pending, at its live
+  status (a `pending` one counts in the cap at once), money only, removing no credits, and
+  over the cap recorded with a `refund-coverage-surplus` or `refund-adopted-over-cap`
+  line, never refused. The machine is `schema.sql`'s `refund_status` block: `pending →
+  succeeded | failed` and `succeeded → failed`, which reopens the cap and recomputes a
+  `refunded` charge (to `failed` on a late-success charge, to `succeeded` otherwise) while
+  the removed credits stay removed. A live `succeeded` on a row held `failed` writes
+  nothing and, if one more retrieve still reads `succeeded`, logs "Stripe reports this
+  refund succeeded and the app holds it failed; do not retry it." at level 50. In
+  production the endpoint needs `refund.failed`, `refund.updated` and `charge.refunded`
+  enabled beside `charge.refund.updated` (without `refund.failed` a refund that fails after
+  succeeding stays `succeeded` here, and no sweep looks at a `succeeded` row).
+- **The refund sweep** (the duplicate-refund retry phase; `brief_must_say` 1, 2; DECISIONS
+  145(d), 146(c), 158(b)). (a) A `pending` row holding a `re_` and not looked at for
+  `REFUND_STATUS_POLL_MINUTES` (60) is claimed by an `updated_at` lease, retrieved with no
+  transaction open and applied; nothing moves a row by the clock. (b) A re-fire Stripe
+  answers with a replayed 5xx is that key's permanent answer: nothing more is sent under
+  it, one level-50 line the first time a process sees it, and the sweep lists the
+  PaymentIntent's refunds for one carrying the row's `metadata.refund_id` (found: stored and
+  applied, no create); none: ONE create under the fresh key `refund-rekey:<row id>:<epoch
+  seconds>`, written onto the row in a committed UPDATE before it is sent; that answering a
+  replayed 5xx too, the row waits in the report. When `REFUND_KEY_WINDOW_HOURS` (24) have
+  passed since the last send under the row's key and a complete list holds none carrying
+  its id, the row moves `pending → failed` under the charge lock with one level-50 line
+  (Retry to card and Returned open); a list that errors or comes back partial moves nothing.
+  A staff row Stripe could not be reached for ends the same way, its window from
+  `updated_at`. (c) A create answered HTTP 400 `invalid_request_error`, with or without a
+  `code` (decided by status and type, never by code or message), created no refund: the
+  row is `failed` at once under the charge lock, never re-fired, with one level-50 line
+  carrying Stripe's code and message. (d) `refundLateSuccess` mints nothing when its charge
+  already carries a `late-success-refund` row in any status. (e) The abandon report follows
+  D2: a row a later retry names, or a resolved one, is `covered`; `awaiting-stripe` (sent,
+  and Stripe shows no refund yet: send nothing by hand) and `failed-exceeds-owed` (a failed
+  head larger than what its payment still owes: refund the figure owed through *Refund*
+  with no credits to remove) are new classes; `stripe-failed` names the two exits by route;
+  each row carries `seenOn` (the family's payment history, or no portal screen until End
+  of day, P25, when its charge is held `failed`).
+- **The unfinished-claim alarm** (tick phase 4b, `stripe-events-unfinished`;
+  `brief_must_say` 3; DECISIONS 174(b)). Each `stripe_events` row with `processed_at IS
+  NULL` received at least 15 minutes earlier on Postgres's clock
+  (`UNFINISHED_EVENT_BOUND_MINUTES`) is named at level 50 (id, type, `received_at`) the
+  first time a process sees it, then counted at info; a restart names each once more. It
+  never names a delivery still running, a released claim or a processed row. The
+  sentence: "a Stripe event was received and never finished, so the work it carries may not
+  have happened: check the charge or refund it names in Stripe before acting on it. This
+  line repeats once after each restart, so a colleague may already have checked".
+- **The small wire sites** (D5, D16). The remove arm of
+  `POST /staff/owners/:id/credit-adjustments` takes `refund_id?` (normalised; it must name a
+  refund of this owner, else the generic 404) and writes it as `credit_ledger.refund_id`.
+  `GET /staff/owners/:id/payments` emits `StaffPaymentRefundWire.retry_of_refund_id` and
+  `StaffPaymentWire.stripe_payment_intent_id` when non-null; neither is on `StaffInvoiceWire`.
+- **The races** (RF3; design.md:3975-3990; `test/contracts/refund-races.test.ts`). One lock
+  order: the claim, the charge row, the pool, then `refunds` rows. Pinned on two
+  connections, both orders, natural timing and 6 ms jitter, 40 rounds each, and by
+  held-lock proofs on real connections: a staff cancel of a top-up day against a refund of
+  that top-up's charge (serialised on the charge lock; cancel first → 201 with the credit
+  removed, refund first → 422 `lot_insufficient` and the credit back in its lot; no 40P01);
+  two refunds on one cap (one 201, one 422 `over_cap`); a refund against a booking on the
+  same pool (never both: a credit is never both refunded and booked); a refund against a
+  dashboard refund's delivery (both recorded, the dashboard refund once, the cap counting
+  both); and every refund status change waits on the charge lock.
+- **`GET /refunds` does not exist** (DECISIONS 274(d)). Run 2026-11-13 22:05 CST against a
+  real server instance (the production entry `src/index.ts`, `buildApp()`'s whole route
+  table, on the test database) with Tomi's owner principal: 404
+  `{"message":"Route GET:/refunds not found","error":"Not Found","statusCode":404}`; the
+  same with no principal; `GET /staff/refunds` is 404 too (its verb is POST). The same
+  principal on `GET /credits?location=bentonville` answered 200, and that route answered
+  401 without one (`units/P22/evidence/backend/get-refunds-run-2.log`).
+- **No staff refund tells the family** (design.md:4324-4325, §2.9): no refund, retry or
+  resolve enqueues a `notifications` row or a push. Staff tell the family; the owner app
+  shows the balance and the invoice as the server holds them.
+- **Not built here:** End of day and `CashDayWire` (P25); *No credits to remove* and the
+  writer of `credits_settled_by_staff_id` / `credits_settled_at` (no route named); cash and
+  check refunds (P24, M6.01); a `custom_invoice` or `class_seat` basis and `enrollment_id`;
+  chargebacks and lost disputes (design.md:4487-4490).

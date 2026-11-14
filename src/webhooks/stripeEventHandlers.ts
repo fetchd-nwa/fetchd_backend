@@ -2,9 +2,9 @@ import { db } from '../db/client.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import type { AnchorResolutionLog, PendingDuplicateRefund } from '../lib/settleInvoiceCharge.js';
 import { materializePaymentMethod } from '../lib/materializePaymentMethod.js';
-import { refundsRepository, type RefundStatus } from '../db/repositories/refundsRepository.js';
+import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { stripeCustomersRepository } from '../db/repositories/stripeCustomersRepository.js';
-import { withActor, type Tx } from '../db/tx.js';
+import { withActor } from '../db/tx.js';
 import { assertNever } from '../lib/assertNever.js';
 import {
   blockerOfIntent,
@@ -18,10 +18,11 @@ import {
 import {
   stripeIntentStatusToChargeStatus,
   type StripeClient,
-  type StripeRefundStatus,
+  type StripeRefundSnapshot,
   type StripeWebhookEvent,
 } from '../lib/stripe.js';
 import { lockCharge } from '../db/locks.js';
+import { applyLiveRefund, type LiveRefundResult } from '../lib/refundApply.js';
 import type { EngineChargeRow } from '../db/repositories/chargesRepository.js';
 
 /**
@@ -98,7 +99,10 @@ export interface WebhookHandlerResult {
  * updated` that beats the cancel route's `refunds` insert+commit. The
  * receiver catches it, releases the `stripe_events` claim, and re-throws →
  * 500 → Stripe redelivers. Distinct from a genuine `orphan-event` (which is
- * marked processed and dropped) precisely because we WANT the retry.
+ * marked processed and dropped) precisely because we WANT the retry. The refund
+ * arms throw it for a refund naming one of our rows on a PaymentIntent no charge
+ * records (P22 fix 1): an inconsistency, which pages on every delivery until a
+ * person reconciles it.
  */
 export class WebhookRetryError extends Error {}
 
@@ -134,7 +138,11 @@ export async function dispatchStripeEvent(
     case 'setup_intent.succeeded':
       return handleSetupIntentSucceeded(event, opts);
     case 'charge.refund.updated':
-      return handleChargeRefundUpdated(event, opts);
+    case 'refund.updated':
+    case 'refund.failed':
+      return handleRefundObjectEvent(event, opts);
+    case 'charge.refunded':
+      return handleChargeRefunded(event, opts);
     case 'unhandled':
       return { outcome: 'noop', note: `event type ${event.rawType} has no handler wired` };
     default:
@@ -146,8 +154,10 @@ export async function dispatchStripeEvent(
  * Re-run an event whose claim is unfinished: its first delivery died, or is still
  * running, and `processed_at IS NULL` cannot tell which. So only an arm safe against a
  * first delivery still alive runs here, and each of those is under a lock and a guard:
- * the engine's arms (charge lock, status guard, the refund cap) and
- * `charge.refund.updated` (charge lock, a re-read, no-op at the target status).
+ * the engine's arms (charge lock, status guard, the refund cap) and the four refund events
+ * (P22: retrieve with no transaction open, then the one apply function under the charge
+ * lock, a no-op at the status the row already holds; `stripe_refund_id` UNIQUE behind an
+ * adoption, so a racing first delivery gets 23505, a 500 and a redelivery).
  * `undefined` keeps the receiver's 200 `duplicate`: the older arms read then write with
  * no lock, so a slow first delivery could grant twice
  * (`designs/p15-engine-recovery.md`, decision 1).
@@ -162,7 +172,11 @@ export async function redispatchUnfinishedEvent(
     case 'payment_intent.canceled':
       return handleEngineCharge(event, opts);
     case 'charge.refund.updated':
-      return handleChargeRefundUpdated(event, opts);
+    case 'refund.updated':
+    case 'refund.failed':
+      return handleRefundObjectEvent(event, opts);
+    case 'charge.refunded':
+      return handleChargeRefunded(event, opts);
     case 'setup_intent.succeeded':
     case 'unhandled':
       return undefined;
@@ -454,325 +468,196 @@ async function handleSetupIntentSucceeded(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// charge.refund.updated
+// The refund events (P22, design §2.7:4215-4228)
 //
-// Find the refunds row by stripe_refund_id (set by the cancel route's
-// post-commit `markStripeId` call). Race fallback: if the webhook beat
-// the post-commit id-write, find by (charge_id via PI, amount, status
-// = 'pending', stripe_refund_id IS NULL). Lock the CHARGE, re-read the refund
-// row under that lock, flip status. On 'succeeded', recompute the charge's
-// RETURNED COVERAGE — if it meets the charge amount, flip charges.status to
-// 'refunded'.
-//
-// **CONVERTED to charges → refunds (MR-A1.2(ii), 2026-08-24.)** This handler
-// used to write refunds-then-charges, which was the reason
-// `markResolvedExternal` could not simply take a charge lock: the two orders
-// together are an AB-BA deadlock pair. One global order removes the question.
+// `charge.refund.updated`, `refund.updated` and `refund.failed` carry the refund; each
+// retrieves it with NO transaction open and hands its LIVE status to the one apply
+// function, under the charge lock (`refundApply.ts`). `charge.refunded` carries the
+// charge, which lists no refunds, so it lists the PaymentIntent's refunds and applies each.
+// Nothing is ever marked from an event's own status: the recording shows `charge.refunded`
+// firing while its refund is still `pending`, and a `succeeded` update created four
+// seconds before the `refund.failed` that overturns it.
 // ─────────────────────────────────────────────────────────────────────────
 
-async function handleChargeRefundUpdated(
-  event: StripeWebhookEvent & { type: 'charge.refund.updated' },
-  opts: WebhookHandlerOpts,
-): Promise<WebhookHandlerResult> {
-  const mappedStatus = mapStripeRefundStatus(event.status);
-  if (mappedStatus === undefined) {
-    // Non-terminal Stripe refund status (e.g. 'requires_action',
-    // 'canceled') — no DB change. Logged via the outcome string.
-    return {
-      outcome: 'noop',
-      note: `refund ${event.refundId} non-terminal status ${event.status}`,
-    };
-  }
+type RefundObjectEvent = Extract<
+  StripeWebhookEvent,
+  { type: 'charge.refund.updated' | 'refund.updated' | 'refund.failed' }
+>;
 
-  return withActor(WEBHOOK_ACTOR, async (tx) => {
-    // ── Phase 1: MATCH, unlocked ────────────────────────────────────────
-    // Both reads this handler already performed, unchanged. Reading the refund
-    // row unlocked is safe because every write below re-asserts its own status
-    // guard under the charge lock — the `markUnroutable` pattern. What the
-    // match is FOR is the charge id.
-    let matched = await refundsRepository.findByStripeRefundId(tx, event.refundId);
-    let backfillStripeId: string | undefined;
+/** Fable M6's line: money has gone back on a row that still offers *Retry to card*. */
+export const REFUND_SUCCEEDED_ON_FAILED_ROW_ALARM =
+  'Stripe reports this refund succeeded and the app holds it failed; do not retry it.';
 
-    if (matched === undefined && event.paymentIntentId !== null) {
-      // Race: the cancel-route postCommit hasn't written stripe_refund_id
-      // yet. Match by (charge_id, amount, pending, no stripe id).
-      const charge = await chargesRepository.findByStripePaymentIntentId(tx, event.paymentIntentId);
-      if (charge !== undefined) {
-        matched = await refundsRepository.findUnmatchedPendingForCharge(tx, {
-          chargeId: charge.id,
-          amountCents: event.amountCents,
-        });
-        if (matched !== undefined) {
-          backfillStripeId = event.refundId;
-        }
-      }
-    }
-
-    if (matched === undefined) {
-      // A refund NOBODY here minted — most likely a staff member refunding from
-      // the Stripe dashboard. Record it (money-residue §4.4) rather than
-      // retrying forever, when and only when doing so cannot double-record one
-      // movement of money. The arm takes the charge lock itself.
-      const adopted = await maybeAdoptOutOfBandRefund(tx, {
-        event,
-        mappedStatus,
-        ...(opts.log !== undefined ? { log: opts.log } : {}),
-      });
-      if (adopted !== undefined) return adopted;
-
-      // The `refunds` row is committed BEFORE the cancel route's post-commit
-      // Stripe call, so "not found" here is a delivery race that resolves on
-      // the next redelivery — NOT a terminal orphan. Throw so the receiver
-      // releases the claim and Stripe redelivers; marking it processed (the
-      // old behavior) would strand the refund at 'pending' forever and never
-      // flip the charge to 'refunded'.
-      throw new WebhookRetryError(
-        `no refunds row yet for ${event.refundId}; forcing Stripe redelivery`,
-      );
-    }
-
-    // ── Phase 2: LOCK THE CHARGE, then RE-READ the refund row ───────────
-    // Charges first, always. The re-read is not ceremony: between the match
-    // above and this point a concurrent `markResolvedExternal` or a sibling
-    // delivery can have moved the row, and every decision below — including the
-    // resolved-external refusal — has to be made on what is true now.
-    const charge = await chargesRepository.findByIdForUpdate(tx, matched.chargeId);
-    if (charge === undefined) {
-      throw new Error(
-        `handleChargeRefundUpdated: refund ${matched.id} names charge ${matched.chargeId}, which does not exist`,
-      );
-    }
-    const refund = await refundsRepository.findById(tx, matched.id);
-    if (refund === undefined) {
-      throw new Error(`handleChargeRefundUpdated: refund ${matched.id} vanished under the lock`);
-    }
-
-    if (refund.status === 'resolved-external') {
-      // A human ATTESTED that this money went back out of band (money-residue
-      // §4.3). A redelivered stale terminal event must never overwrite that:
-      // the attestation is what closed the cumulative cap, and flipping the row
-      // back to `'failed'` would silently REOPEN the remainder for an automatic
-      // leg to re-mint — refunding the owner a second time for one debt.
-      return {
-        outcome: 'noop',
-        note: `refund ${refund.id} was resolved out of band by a human; a stale ${event.status} event does not overwrite that`,
-      };
-    }
-
-    // ── MR-A3.4: BOTH no-op conditions come from the LOCKED re-read ──────
-    // The backfill decision was made from the UNLOCKED match, so a delivery
-    // that entered via race-recovery carried `backfillStripeId` all the way
-    // through and skipped the early return — even when the locked row was
-    // already at the target status with its `re_*` backfilled by a concurrent
-    // delivery. It then re-ran the flip AND the surplus check: the Opus lane
-    // executed two identical ERRORs for ONE movement of money.
-    //
-    // A backfill is needed only while the LOCKED row's id is still NULL, and a
-    // locked row already at `mappedStatus` with an id present is simply a
-    // no-op. Chosen over an idempotent-alarm key because the second delivery
-    // genuinely IS a no-op — making it one is smaller and truer than
-    // deduplicating its noise.
-    const needsBackfill = backfillStripeId !== undefined && refund.stripeRefundId === null;
-    if (refund.status === mappedStatus && !needsBackfill) {
-      // Already at the target status (a re-deliver after the first
-      // success) — no-op write. The outcome string still classifies it
-      // as the relevant flip for logging.
-      return mappedStatus === 'succeeded'
-        ? { outcome: 'flipped-refund-succeeded', note: 'already at succeeded; no-op' }
-        : { outcome: 'flipped-refund-failed', note: 'already at failed; no-op' };
-    }
-
-    await refundsRepository.markStatus(tx, {
-      id: refund.id,
-      status: mappedStatus,
-      ...(needsBackfill ? { stripeRefundId: backfillStripeId as string } : {}),
-    });
-
-    if (mappedStatus === 'succeeded') {
-      // Cumulative rule → flip charge to 'refunded', under the SAME held lock.
-      // Through the shared RETURNED COVERAGE helper (MR-A1.6.3): this tail used
-      // to count `sumSucceededForCharge` while the resolve rider counted
-      // succeeded + resolved-external, so a resolve-then-flip order left a
-      // fully-returned charge reading `'succeeded'` in the owner ledger. The
-      // `>=` (rather than `==`) is defensive — partial refunds add up to the
-      // total exactly in theory; an over-refund would be an anomaly and we
-      // still want the charge flagged.
-      const returned = await settleReturnedCoverage(tx, {
-        charge,
-        stripeRefundId: event.refundId,
-        ...(opts.log !== undefined ? { log: opts.log } : {}),
-      });
-      if (returned >= charge.amountCents) {
-        await chargesRepository.markStatus(tx, { id: charge.id, status: 'refunded' });
-      }
-      return { outcome: 'flipped-refund-succeeded' };
-    }
-    return { outcome: 'flipped-refund-failed' };
-  });
+/**
+ * The charge a refund belongs to, read with no transaction open (a charge id never
+ * changes): our row's, when its `re_` is stored; else the charge of its PaymentIntent.
+ */
+async function chargeIdOfRefund(
+  live: StripeRefundSnapshot,
+  eventPaymentIntentId: string | null,
+): Promise<string | undefined> {
+  const ours = await refundsRepository.findByStripeRefundId(db, live.id);
+  if (ours !== undefined) return ours.chargeId;
+  const pi = live.paymentIntentId ?? eventPaymentIntentId;
+  if (pi === null) return undefined;
+  return (await chargesRepository.findByStripePaymentIntentId(db, pi))?.id;
 }
 
 /**
- * **THE returned-coverage read, with its surplus alarm attached** (MR-A3.3,
- * 2026-08-24). Returns the charge's returned coverage so the caller can apply
- * the cumulative `'refunded'` rule; raises the surplus ERROR when that coverage
- * has passed the charge total.
- *
- * **Why it is one helper and not two copies.** MR-A2.4 added the check to the
- * ordinary flip tail only. The adoption tail computed the same coverage and
- * flipped the same charge — and stayed SILENT past the total. The Fable lane
- * executed it with no Stripe anomaly at all (resolve 6000c by hand, then adopt
- * a dashboard refund for the full charge): 20000c returned on a 10000c charge,
- * ZERO alarm lines, the resolved row already off the abandon report, and the
- * charge reading a truthful `'refunded'` — no worklist, no report, and no
- * reconciliation would ever surface it. Two call sites that must agree about a
- * money alarm are two call sites that drift; the threshold, the fields and the
- * sentence now live in one place.
- *
- * **It records and alarms; it never refuses.** A signature-verified Stripe
- * event saying a refund succeeded means the money LEFT, and writing "10000c
- * returned" while 20000c left is exactly the false ledger this design exists to
- * kill. Refusing protects nothing either: in every arc that reaches here the
- * cap is already fully covered, so no further automatic mint is possible. The
- * surplus sits with the OWNER, so there is nothing to self-correct server-side
- * — **the alarm IS the remedy**, and the school chases it out of band (the F′
- * Option 1 record-and-page family).
- *
- * Must be called with the charge row's lock already held: it reads coverage and
- * the caller writes the charge status from it.
+ * Fable M6: the machine refused a live `succeeded` on a row held `failed`. Before saying
+ * so, read once more with no transaction open: a delivery that retrieved `succeeded` and
+ * then waited on the charge lock while `refund.failed` applied holds a stale read (the
+ * recording's (b): the `succeeded` updates were created four seconds before the failure).
+ * Only a second `succeeded` is said, at level 50, through the receiver's own logger.
  */
-async function settleReturnedCoverage(
-  tx: Tx,
-  args: {
-    charge: { id: string; ownerId: string; amountCents: number };
-    /** The `re_*` whose delivery is being processed — names the movement that
-     *  crossed the line, which is where a human starts reading. */
-    stripeRefundId: string;
-    log?: WebhookHandlerLog;
-  },
-): Promise<number> {
-  const returned = await refundsRepository.sumReturnedCoverageForCharge(tx, args.charge.id);
-  if (returned > args.charge.amountCents) {
-    // Per-row `status` on the named rows (MR-A3.5(b)) so the ERROR says HOW the
-    // money left — a Stripe refund, an adopted dashboard refund and a
-    // hand-attested return are three different reconciliations.
-    const contributing = await refundsRepository.findReturnedRowsForCharge(tx, args.charge.id);
-    args.log?.error(
+async function sayHeldFailedReadsSucceeded(
+  applied: readonly LiveRefundResult[],
+  opts: WebhookHandlerOpts,
+): Promise<void> {
+  for (const r of applied) {
+    if (r.outcome !== 'held-failed-reads-succeeded') continue;
+    const again = await opts.stripe.retrieveRefund(r.stripeRefundId);
+    if (again.status !== 'succeeded') continue;
+    opts.log.error(
       {
-        moneyEvent: 'refund-coverage-surplus',
-        chargeId: args.charge.id,
-        ownerId: args.charge.ownerId,
-        chargeAmountCents: args.charge.amountCents,
-        returnedCents: returned,
-        surplusCents: returned - args.charge.amountCents,
-        stripeRefundId: args.stripeRefundId,
-        refunds: contributing,
+        moneyEvent: 'refund-succeeded-on-failed-row',
+        refundId: r.refundId,
+        stripeRefundId: r.stripeRefundId,
+        chargeId: r.chargeId,
       },
-      'refund coverage EXCEEDS the charge: more money has gone back to this owner than the charge ever took. Each contributing row is named with its status — a Stripe refund, an adopted dashboard refund, or a hand-attested out-of-band return. Nothing here can reverse it (the surplus is with the owner), so this must be reconciled out of band',
+      REFUND_SUCCEEDED_ON_FAILED_ROW_ALARM,
     );
   }
-  return returned;
+}
+
+function outcomeOfApply(applied: LiveRefundResult): WebhookHandlerResult {
+  const note = `refund ${applied.stripeRefundId} → row ${applied.refundId}: ${applied.outcome}`;
+  switch (applied.outcome) {
+    case 'applied-succeeded':
+      return { outcome: 'flipped-refund-succeeded', note };
+    case 'applied-failed':
+    case 'reopened':
+      return { outcome: 'flipped-refund-failed', note };
+    case 'adopted':
+      return { outcome: 'adopted-out-of-band-refund', note };
+    case 'stored-id':
+    case 'held-failed-reads-succeeded':
+    case 'unchanged':
+      return { outcome: 'noop', note };
+  }
 }
 
 /**
- * Record a refund that exists at Stripe and nowhere here — the ADOPTION arm
- * (`designs/money-residue.md` §4.4). Returns `undefined` to leave the caller's
- * `WebhookRetryError` behavior exactly as it was.
- *
- * **This is the money-correctness half of out-of-band resolution.** The moment
- * Stripe confirms a staff member's dashboard refund, the cumulative cap closes
- * AUTOMATICALLY — independent of whether the human ever remembers to flip the
- * failed row. (If they do both, the sums can exceed the charge; the cap's
- * direction is refuse-further-refunds, which is the safe one.)
- *
- * Three refusals, each unchanged from today's behavior and each deliberate:
- *
- *   - **no PaymentIntent on the event** — nothing to look a charge up by.
- *   - **no charge for the PaymentIntent** — our own refund rows always commit
- *     before our own fires, so an unknown PI is more likely an orphan-arm
- *     insert racing this delivery than a genuine stranger. Retry is correct.
- *   - **any `'pending'` refund on the charge, at ANY amount** — never adopt
- *     over an in-flight automatic refund. An amount-matched delivery race
- *     against our own refund could double-record one movement. That guard now
- *     lives INSIDE `adoptExternalRefundCapped`, evaluated under the charge lock
- *     (MR-A1.2 / Fable F2), because the INSERT it protects is a cap-ENTERING
- *     write and an unlocked guard can be raced by a concurrent minter. The
- *     named residual (design §4.4) is unchanged: a dashboard refund issued
- *     while an automatic refund of a different amount is in flight stays
- *     unadopted, retried until Stripe's redelivery window expires, then
- *     unrecorded — and the staff resolve verb still records the return.
- *
- * A FAILED dashboard refund adopts as `'failed'`. It joins the `stripe-failed`
- * abandon class only if the charge still OWES something — a human tried, Stripe
- * failed it again, the owner is still owed. If the charge is already covered
- * the row reports under the quiet `covered` class instead (MR-A1.5).
+ * Opus r1 L3: a refund event about a payment no charge here records, whose refund names
+ * none of our rows. At warn, not 50: no money of ours moved, and it is no inconsistency.
  */
-async function maybeAdoptOutOfBandRefund(
-  tx: Tx,
-  args: {
-    event: StripeWebhookEvent & { type: 'charge.refund.updated' };
-    mappedStatus: RefundStatus;
-    log?: WebhookHandlerLog;
-  },
-): Promise<WebhookHandlerResult | undefined> {
-  const { event, mappedStatus } = args;
-  if (event.paymentIntentId === null) return undefined;
-  const charge = await chargesRepository.findByStripePaymentIntentId(tx, event.paymentIntentId);
-  if (charge === undefined) return undefined;
+export const REFUND_ON_PAYMENT_NOT_RECORDED_WARNING =
+  "REFUND ON A PAYMENT NOT RECORDED HERE — no charge names this PaymentIntent and no refund in stripeRefundIds names a refund here by metadata.refund_id, so no charge or refund row was written and the event is answered 200, not retried. It can be a refund on a payment taken in Stripe itself (a payment link or invoice), by another environment on the same Stripe account, or by a B&T confirm-payment whose charge row was never written (its unwind refund). If this PaymentIntent should be one of this app's charges, look it up in charges and in Stripe before recording anything";
 
-  // Lock + guard + insert, together, in the repository — see its doc for why
-  // the lock cannot live at this call site.
-  const adopted = await refundsRepository.adoptExternalRefundCapped(tx, {
-    ownerId: charge.ownerId,
-    chargeId: charge.id,
-    // A dashboard refund names a Stripe charge, not one of our bookings. NULL
-    // is the honest anchor; the charge is the join everything downstream uses.
-    bookingId: null,
-    amountCents: event.amountCents,
-    status: mappedStatus,
-    stripeRefundId: event.refundId,
-    reason: 'out-of-band',
-  });
-  if (adopted.kind === 'refused-in-flight') return undefined;
+/**
+ * The row of ours a refund names by `metadata.refund_id`, on any charge, or `undefined`.
+ * Metadata crosses a trust boundary, so a value that is not a uuid names nothing.
+ */
+async function rowNamedByRefund(live: StripeRefundSnapshot): Promise<string | undefined> {
+  const id = live.metadataRefundId;
+  if (id === undefined || !UUID_SHAPE.test(id)) return undefined;
+  return (await refundsRepository.findById(db, id))?.id;
+}
 
-  if (mappedStatus === 'succeeded') {
-    // The same cumulative tail the ordinary flip runs, under the SAME held
-    // lock, through the SAME shared helper — coverage AND its surplus alarm
-    // (MR-A1.6.3 for the coverage; MR-A3.3 for the alarm, which existed only in
-    // the flip tail until an executed resolve-then-adopt put 20000c on a 10000c
-    // charge in total silence).
-    const returned = await settleReturnedCoverage(tx, {
-      charge,
-      stripeRefundId: event.refundId,
-      ...(args.log !== undefined ? { log: args.log } : {}),
-    });
-    if (returned >= charge.amountCents) {
-      await chargesRepository.markStatus(tx, { id: charge.id, status: 'refunded' });
-    }
-  }
-
+/**
+ * Opus r1 L3, the orphan-payment path's shape (`handlePaymentIntentSucceeded`): an event
+ * whose PaymentIntent no charge here records, and whose refunds name none of our rows, is
+ * not ours. Answered 200 so Stripe stops sending it, with nothing written and one warn line.
+ * A redelivery would not find it ours: the engine stores the PaymentIntent id on its charge
+ * between its unconfirmed create and its confirm (`confirmCharge.ts`), and a class hold is
+ * captured after its row commits, so money moves only on a PaymentIntent a charge already
+ * records; every refund the app creates names its row (`refundCreateParams`). The one road
+ * that captures first is B&T confirm-payment (`routes/requestConfirmPayment.ts`), whose row
+ * commits in the transaction after the capture, and whose unwind refund, when that
+ * transaction fails, lands here by design: the sentence names it.
+ */
+function refundOnPaymentNotOurs(
+  event: StripeWebhookEvent,
+  paymentIntentId: string | null,
+  stripeRefundIds: readonly string[],
+  opts: WebhookHandlerOpts,
+): WebhookHandlerResult {
+  opts.log.warn(
+    { stripeEventId: event.id, stripeEventType: event.type, paymentIntentId, stripeRefundIds },
+    REFUND_ON_PAYMENT_NOT_RECORDED_WARNING,
+  );
   return {
-    outcome: 'adopted-out-of-band-refund',
-    note: `refund ${event.refundId} was issued outside this system against charge ${charge.id}; recorded as ${adopted.refund.id} at '${mappedStatus}'`,
+    outcome: 'orphan-event',
+    note: `${event.type}: no charge for PaymentIntent ${paymentIntentId ?? '(none)'} and no refund naming one of ours`,
   };
 }
 
-/**
- * Project Stripe's wide refund-status onto our terminal-state enum.
- * Non-terminal states return undefined → handler no-ops + waits for the
- * next webhook delivery. (`canceled` collapses to 'failed' for our
- * purposes — the money didn't return to the customer.)
- */
-function mapStripeRefundStatus(status: StripeRefundStatus): RefundStatus | undefined {
-  switch (status) {
-    case 'succeeded':
-      return 'succeeded';
-    case 'failed':
-    case 'canceled':
-      return 'failed';
-    case 'pending':
-    case 'requires_action':
-      return undefined;
+async function handleRefundObjectEvent(
+  event: RefundObjectEvent,
+  opts: WebhookHandlerOpts,
+): Promise<WebhookHandlerResult> {
+  const live = await opts.stripe.retrieveRefund(event.refundId);
+  const chargeId = await chargeIdOfRefund(live, event.paymentIntentId);
+  if (chargeId === undefined) {
+    const paymentIntentId = live.paymentIntentId ?? event.paymentIntentId;
+    const ours = await rowNamedByRefund(live);
+    if (ours === undefined) return refundOnPaymentNotOurs(event, paymentIntentId, [live.id], opts);
+    // A refund whose metadata names one of our rows, on a PaymentIntent no charge records:
+    // an inconsistency, not a stranger, though the metadata may be forged (Opus r2 N2), so
+    // the sentence says what the metadata names, never that the refund is ours. Release the
+    // claim (500, the route's level-50 line) so Stripe redelivers it while a person looks.
+    const pi = paymentIntentId ?? '(none)';
+    throw new WebhookRetryError(
+      `${event.type} for ${live.id} names refund ${ours} here by metadata.refund_id, but no charge here records PaymentIntent ${pi}: a refund whose metadata names a row here, on a payment no charge here records, is an inconsistency, so the event is refused and Stripe will redeliver it. Look ${pi} up in Stripe and in charges, and compare it with refund ${ours}'s own charge, before recording anything`,
+    );
   }
+  const applied = await withActor(WEBHOOK_ACTOR, (tx) =>
+    applyLiveRefund(tx, { chargeId, live, log: opts.log }),
+  );
+  await sayHeldFailedReadsSucceeded([applied], opts);
+  return outcomeOfApply(applied);
+}
+
+async function handleChargeRefunded(
+  event: Extract<StripeWebhookEvent, { type: 'charge.refunded' }>,
+  opts: WebhookHandlerOpts,
+): Promise<WebhookHandlerResult> {
+  if (event.paymentIntentId === null) {
+    return { outcome: 'noop', note: `charge.refunded on ${event.chargeId}, which names no PaymentIntent` };
+  }
+  const listed = await opts.stripe.listRefundsForPaymentIntent(event.paymentIntentId);
+  const charge = await chargesRepository.findByStripePaymentIntentId(db, event.paymentIntentId);
+  if (charge === undefined) {
+    const pi = event.paymentIntentId;
+    for (const live of listed.refunds) {
+      const ours = await rowNamedByRefund(live);
+      if (ours === undefined) continue;
+      throw new WebhookRetryError(
+        `charge.refunded for ${pi}: Stripe lists ${live.id}, which names refund ${ours} here by metadata.refund_id, but no charge here records this PaymentIntent: a refund whose metadata names a row here, on a payment no charge here records, is an inconsistency, so the event is refused and Stripe will redeliver it. Look ${pi} up in Stripe and in charges, and compare it with refund ${ours}'s own charge, before recording anything`,
+      );
+    }
+    if (!listed.complete) {
+      // The refunds the list did not reach could name one of ours, so it is not called a
+      // stranger.
+      throw new WebhookRetryError(
+        `charge.refunded for ${pi}: no charge here records this PaymentIntent and Stripe's list of its refunds came back incomplete, so whether one of them names a refund here is unknown; the event is refused and Stripe redelivers it`,
+      );
+    }
+    return refundOnPaymentNotOurs(event, pi, listed.refunds.map((r) => r.id), opts);
+  }
+  const applied = await withActor(WEBHOOK_ACTOR, async (tx) => {
+    const each: LiveRefundResult[] = [];
+    for (const live of listed.refunds) {
+      each.push(await applyLiveRefund(tx, { chargeId: charge.id, live, log: opts.log }));
+    }
+    return each;
+  });
+  await sayHeldFailedReadsSucceeded(applied, opts);
+  const moved = applied.filter((a) => a.outcome !== 'unchanged');
+  return {
+    outcome: moved.some((a) => a.outcome === 'adopted') ? 'adopted-out-of-band-refund' : 'noop',
+    note: `charge.refunded on ${event.chargeId}: ${listed.refunds.length} refund(s) listed${listed.complete ? '' : ' (incomplete)'}; ${moved.map((a) => `${a.stripeRefundId} ${a.outcome}`).join(', ') || 'nothing moved'}`,
+  };
 }
 
 /**

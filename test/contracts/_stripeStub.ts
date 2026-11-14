@@ -12,7 +12,10 @@ import type {
   StripePaymentIntentResult,
   StripePaymentIntentStatus,
   StripePaymentMethodSnapshot,
+  StripeRefundList,
   StripeRefundResult,
+  StripeRefundSnapshot,
+  StripeRefundStatus,
   StripeSetupIntentSnapshot,
   StripeWebhookEvent,
 } from '../../src/lib/stripe.js';
@@ -141,6 +144,16 @@ export type StripeStubCall =
   | {
       method: 'retrievePaymentMethod';
       args: { paymentMethodId: string };
+      idempotencyKey: null;
+    }
+  | {
+      method: 'retrieveRefund';
+      args: { refundId: string };
+      idempotencyKey: null;
+    }
+  | {
+      method: 'listRefundsForPaymentIntent';
+      args: { paymentIntentId: string };
       idempotencyKey: null;
     }
   | {
@@ -390,6 +403,15 @@ export interface StripeStub extends StripeClient {
    */
   setRefundableBalance(paymentIntentId: string, amountCents: number): void;
   /**
+   * The status every later `createRefund` REPLIES with (default `'pending'`),
+   * until set again. P22's recording (`test/fixtures/stripe-refunds.json`, case
+   * (a)) shows a test-mode refund on `pm_card_visa` replying `'succeeded'` at
+   * create, and case (f)'s `pm_card_pendingRefund` replying `'pending'`; both
+   * are real answers, so a test chooses the one its arc needs. A replay returns
+   * the reply recorded under its key, whatever this says now.
+   */
+  setRefundReplyStatus(status: StripeRefundResult['status']): void;
+  /**
    * Every refund Stripe actually EXECUTED, in order. A replay is not an
    * execution and does not appear twice — which is what makes "exactly one
    * refund exists for this money" an assertion rather than a hope. Compare with
@@ -451,6 +473,41 @@ export interface StripeStub extends StripeClient {
    * a `bad_request` ApiError (simulating a bogus signature).
    */
   setNextEvent(event: StripeWebhookEvent | null): void;
+  /**
+   * P22 (the recording's (b) and (f)): Stripe's later word on a refund it holds. `failed`
+   * (or `canceled`) gives its amount back to the PaymentIntent's refundable balance, as the
+   * recording's (b) shows (`amount_refunded` 0 after the failure). Throws for an id the
+   * stub does not hold.
+   */
+  setRefundState(refundId: string, status: StripeRefundStatus): void;
+  /**
+   * A refund made OUTSIDE the app (the Stripe dashboard): it exists at Stripe, carries no
+   * `refund_id` unless one is given, and takes its amount from the PaymentIntent's
+   * refundable balance unless it is `failed`. Returns its `re_`.
+   */
+  plantRefund(args: {
+    paymentIntentId: string;
+    amountCents: number;
+    status: StripeRefundStatus;
+    metadata?: Record<string, string>;
+  }): string;
+  /**
+   * The next `n` creates under a fresh key answer HTTP 500 and Stripe STORES that answer
+   * under the key: every later same-key call replays it, marked `idempotent-replayed:
+   * true` (145(d)'s stored 500; B-1(d) recorded the header on a replayed error). No refund
+   * exists for any of them.
+   */
+  refundStoresServerError(times?: number): void;
+  /** The next `listRefundsForPaymentIntent` throws a 500 (nothing stored: a GET). */
+  throwOnNextRefundList(): void;
+  /** The next `listRefundsForPaymentIntent` stops before Stripe's last page. */
+  nextRefundListIncomplete(): void;
+  /** Runs once, before the next `createRefund` executes: what the caller wrote before the call. */
+  beforeNextRefundCreate(fn: (args: Parameters<StripeClient['createRefund']>[0], key: string) => Promise<void>): void;
+  /** Runs once, after the next `retrieveRefund` has read its answer and before it returns. */
+  afterNextRefundRetrieve(fn: (answer: StripeRefundSnapshot) => Promise<void>): void;
+  /** Every refund Stripe holds, as a retrieve would read it. */
+  refundObjects(): readonly StripeRefundSnapshot[];
 }
 
 /**
@@ -484,8 +541,21 @@ function paramsFingerprint(
  * the post-commit fire is exactly the regression the byte-equality pin watches.
  */
 function refundParamsFingerprint(args: Parameters<StripeClient['createRefund']>[0]): string {
-  return JSON.stringify([args.paymentIntentId, args.amountCents, args.reason ?? null]);
+  // Metadata is part of the body Stripe hashes, so it is part of the fingerprint (P22: every
+  // create carries `metadata.refund_id` from `refundCreateParams`).
+  const metadata = Object.keys(args.metadata ?? {})
+    .sort()
+    .map((k) => [k, args.metadata![k]] as const);
+  return JSON.stringify([args.paymentIntentId, args.amountCents, args.reason ?? null, metadata]);
 }
+
+/** Dollars as Stripe's refund refusals print them: `$30.00`. */
+function stripeDollars(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+/** The header Stripe puts on a replayed answer, measured (`idempotent-replayed`). */
+const REPLAYED_HEADERS = { 'idempotent-replayed': 'true' } as const;
 
 /**
  * The statuses Stripe will cancel a PaymentIntent FROM, spelled out here
@@ -663,7 +733,44 @@ export function makeStripeStub(): StripeStub {
   // re-EXECUTED a refund instead of replaying it passed the suite identically
   // to a correct one — a counterfeit for the one mechanism that keeps a retry
   // from becoming a second refund of somebody's money.
-  const refundReplays = new Map<string, { fingerprint: string; result: StripeRefundResult }>();
+  // P22: a key's stored answer can be an ERROR too (the recording's (c): a refused create
+  // re-sent under its key replays the same 400, marked). `error` builds that answer again,
+  // with or without the replay header.
+  const refundReplays = new Map<
+    string,
+    { fingerprint: string; result?: StripeRefundResult; error?: (replayed: boolean) => Error }
+  >();
+  /** Every refund Stripe holds, by `re_`, in creation order (P22: retrieve and list). */
+  const refundStore = new Map<
+    string,
+    {
+      id: string;
+      status: StripeRefundStatus;
+      amountCents: number;
+      paymentIntentId: string | null;
+      metadata: Record<string, string>;
+    }
+  >();
+  let refundServerErrors = 0;
+  let refundListThrows = false;
+  let refundListIncomplete = false;
+  let beforeRefundCreate:
+    | ((args: Parameters<StripeClient['createRefund']>[0], key: string) => Promise<void>)
+    | undefined;
+  let afterRefundRetrieve: ((answer: StripeRefundSnapshot) => Promise<void>) | undefined;
+  const snapshotOf = (id: string): StripeRefundSnapshot => {
+    const held = refundStore.get(id)!;
+    const refundId = held.metadata.refund_id;
+    return {
+      id: held.id,
+      status: held.status,
+      amountCents: held.amountCents,
+      paymentIntentId: held.paymentIntentId,
+      metadataRefundId: typeof refundId === 'string' && refundId.length > 0 ? refundId : undefined,
+    };
+  };
+  /** Stripe gives a failed refund's amount back to its charge (the recording's (b)). */
+  const givesBack = (status: StripeRefundStatus): boolean => status === 'failed' || status === 'canceled';
   /**
    * Stripe's idempotency layer for CAPTURES. Same shape as the confirm and
    * refund stores and there for the same reason: a same-key capture must
@@ -712,6 +819,7 @@ export function makeStripeStub(): StripeStub {
   let refundShouldThrow = false;
   let refundLandsThenThrowsErr: Error | undefined;
   let refundKeyInUse = false;
+  let refundReplyStatus: StripeRefundResult['status'] = 'pending';
   let cancelShouldThrow = false;
   let captureBeforeCancelPending = false;
   let captureThrowsRemaining = 0;
@@ -960,6 +1068,9 @@ export function makeStripeStub(): StripeStub {
     setRefundableBalance(paymentIntentId, amountCents) {
       declaredRefundable.set(paymentIntentId, amountCents);
     },
+    setRefundReplyStatus(status) {
+      refundReplyStatus = status;
+    },
     executedRefunds() {
       return executedRefundLog;
     },
@@ -979,7 +1090,119 @@ export function makeStripeStub(): StripeStub {
       setupIntentOverride = snapshot;
     },
     setNextEvent(event) {
+      // A refund event is Stripe telling us its state moved: the stub's Stripe holds that
+      // refund at that status from now on, so the arm's retrieve reads what the event
+      // reported (P22: every arm retrieves). Signed payloads bypass this queue and leave
+      // the store as the test set it.
+      if (
+        event !== null &&
+        (event.type === 'charge.refund.updated' ||
+          event.type === 'refund.updated' ||
+          event.type === 'refund.failed')
+      ) {
+        const held = refundStore.get(event.refundId);
+        const pi = event.paymentIntentId ?? held?.paymentIntentId ?? null;
+        if (held !== undefined && pi !== null && givesBack(event.status) && !givesBack(held.status)) {
+          refundedByPi.set(pi, (refundedByPi.get(pi) ?? 0) - held.amountCents);
+        }
+        refundStore.set(event.refundId, {
+          id: event.refundId,
+          status: event.status,
+          amountCents: event.amountCents,
+          paymentIntentId: pi,
+          metadata: held?.metadata ?? {},
+        });
+      }
       nextEvents.push(event);
+    },
+    setRefundState(refundId, status) {
+      const held = refundStore.get(refundId);
+      if (held === undefined) throw new Error(`stub: no refund ${refundId} to move`);
+      if (held.paymentIntentId !== null && givesBack(status) && !givesBack(held.status)) {
+        refundedByPi.set(
+          held.paymentIntentId,
+          (refundedByPi.get(held.paymentIntentId) ?? 0) - held.amountCents,
+        );
+      }
+      held.status = status;
+    },
+    plantRefund(args) {
+      const id = testIdPrefix('re');
+      refundStore.set(id, {
+        id,
+        status: args.status,
+        amountCents: args.amountCents,
+        paymentIntentId: args.paymentIntentId,
+        metadata: args.metadata ?? {},
+      });
+      if (!givesBack(args.status)) {
+        refundedByPi.set(
+          args.paymentIntentId,
+          (refundedByPi.get(args.paymentIntentId) ?? 0) + args.amountCents,
+        );
+      }
+      return id;
+    },
+    refundStoresServerError(times = 1) {
+      refundServerErrors = times;
+    },
+    throwOnNextRefundList() {
+      refundListThrows = true;
+    },
+    nextRefundListIncomplete() {
+      refundListIncomplete = true;
+    },
+    beforeNextRefundCreate(fn) {
+      beforeRefundCreate = fn;
+    },
+    afterNextRefundRetrieve(fn) {
+      afterRefundRetrieve = fn;
+    },
+    refundObjects() {
+      return [...refundStore.keys()].map(snapshotOf);
+    },
+
+    async retrieveRefund(refundId): Promise<StripeRefundSnapshot> {
+      calls.push({ method: 'retrieveRefund', args: { refundId }, idempotencyKey: null });
+      if (!refundStore.has(refundId)) {
+        throw new Stripe.errors.StripeInvalidRequestError({
+          type: 'invalid_request_error',
+          code: 'resource_missing',
+          message: `No such refund: '${refundId}'`,
+          statusCode: 404,
+        } as never);
+      }
+      const answer = snapshotOf(refundId);
+      const hook = afterRefundRetrieve;
+      afterRefundRetrieve = undefined;
+      if (hook !== undefined) await hook(answer);
+      return answer;
+    },
+
+    async listRefundsForPaymentIntent(paymentIntentId): Promise<StripeRefundList> {
+      calls.push({
+        method: 'listRefundsForPaymentIntent',
+        args: { paymentIntentId },
+        idempotencyKey: null,
+      });
+      if (refundListThrows) {
+        refundListThrows = false;
+        throw new Stripe.errors.StripeAPIError({
+          type: 'api_error',
+          message: 'stub: refunds.list failed',
+          statusCode: 500,
+        } as never);
+      }
+      // Newest first, as Stripe lists.
+      const refunds = [...refundStore.values()]
+        .filter((r) => r.paymentIntentId === paymentIntentId)
+        .reverse()
+        .map((r) => snapshotOf(r.id));
+      if (refundListIncomplete) {
+        refundListIncomplete = false;
+        return { refunds: refunds.slice(0, Math.max(refunds.length - 1, 0)), complete: false };
+      }
+      return { refunds, complete: true };
     },
 
     async createCustomer(args, idempotencyKey) {
@@ -1527,9 +1750,33 @@ export function makeStripeStub(): StripeStub {
             statusCode: 400,
           } as never);
         }
-        // The ORIGINAL refund object — same `re_*`. Exactly one refund exists
-        // for this money no matter how many times the sweep re-fires.
-        return recorded.result;
+        // The key's STORED answer, marked replayed (the recording's (c) and (d)): an
+        // error replays as that error, a refund as the ORIGINAL refund object, same `re_*`.
+        // Exactly one refund exists for this money no matter how many times the sweep
+        // re-fires.
+        if (recorded.error !== undefined) throw recorded.error(true);
+        return { ...recorded.result!, replayed: true };
+      }
+
+      const hook = beforeRefundCreate;
+      beforeRefundCreate = undefined;
+      if (hook !== undefined) await hook(args, idempotencyKey);
+
+      if (refundServerErrors > 0) {
+        // Stripe failed this request and STORED the failure under the key (145(d)).
+        refundServerErrors -= 1;
+        const serverError = (replayed: boolean): Error =>
+          new Stripe.errors.StripeAPIError({
+            type: 'api_error',
+            message: 'stub: An unknown error occurred',
+            statusCode: 500,
+            ...(replayed ? { headers: { ...REPLAYED_HEADERS } } : { headers: {} }),
+          } as never);
+        refundReplays.set(idempotencyKey, {
+          fingerprint: refundParamsFingerprint(args),
+          error: serverError,
+        });
+        throw serverError(false);
       }
 
       if (refundShouldThrow) {
@@ -1556,22 +1803,40 @@ export function makeStripeStub(): StripeStub {
         intents.get(args.paymentIntentId)?.amountCents;
       const already = refundedByPi.get(args.paymentIntentId) ?? 0;
       if (cap !== undefined && already + args.amountCents > cap) {
-        throw new Stripe.errors.StripeInvalidRequestError({
-          type: 'invalid_request_error',
-          code: already >= cap ? 'charge_already_refunded' : 'amount_too_large',
-          message:
-            already >= cap
-              ? 'Charge has already been refunded.'
-              : `Refund amount ($${args.amountCents / 100}) is greater than the remaining unrefunded amount.`,
-          statusCode: 400,
-        } as never);
+        // As the recording's (c) has them: over what the charge still holds is a 400
+        // `invalid_request_error` with NO `code`; a fully refunded charge carries
+        // `charge_already_refunded`. Either is the key's stored answer, replayed marked.
+        const fullyRefunded = already >= cap;
+        const held = cap - already;
+        const refusal = (replayed: boolean): Error =>
+          new Stripe.errors.StripeInvalidRequestError({
+            type: 'invalid_request_error',
+            ...(fullyRefunded ? { code: 'charge_already_refunded' } : {}),
+            message: fullyRefunded
+              ? `Charge ch_${args.paymentIntentId.replace(/^pi_/, '')} has already been refunded.`
+              : `Refund amount (${stripeDollars(args.amountCents)}) is greater than unrefunded amount on charge (${stripeDollars(held)})`,
+            statusCode: 400,
+            headers: replayed ? { ...REPLAYED_HEADERS } : {},
+          } as never);
+        refundReplays.set(idempotencyKey, {
+          fingerprint: refundParamsFingerprint(args),
+          error: refusal,
+        });
+        throw refusal(false);
       }
 
       const executed: StripeRefundResult = {
         id: testIdPrefix('re'),
-        status: 'pending',
+        status: refundReplyStatus,
         amountCents: args.amountCents,
       };
+      refundStore.set(executed.id, {
+        id: executed.id,
+        status: executed.status,
+        amountCents: executed.amountCents,
+        paymentIntentId: args.paymentIntentId,
+        metadata: { ...(args.metadata ?? {}) },
+      });
       refundReplays.set(idempotencyKey, {
         fingerprint: refundParamsFingerprint(args),
         result: executed,
@@ -1588,7 +1853,7 @@ export function makeStripeStub(): StripeStub {
         refundLandsThenThrowsErr = undefined;
         throw err;
       }
-      return executed;
+      return { ...executed, replayed: false };
     },
 
     async retrievePaymentMethod(paymentMethodId): Promise<StripePaymentMethodSnapshot> {

@@ -1,5 +1,6 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, isNull, lte, sql } from 'drizzle-orm';
 import { db } from '../client.js';
+import { leaseInstant } from '../locks.js';
 import { stripeEvents } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
 
@@ -24,6 +25,33 @@ import type { Tx } from '../tx.js';
  */
 
 export type ClaimOutcome = 'claimed' | 'duplicate';
+
+/**
+ * **The unfinished-claim bound** (P22 B-8; `brief_must_say` 3; 174(b)): a claim with
+ * `processed_at IS NULL` this long after `received_at` is a delivery that died between its
+ * claim and its handler, never one still running. Fifteen minutes is above any handler's
+ * ceiling: per-call Stripe timeouts of 30 s at the seeds, and `EngineBudget.sweepClaimMs`,
+ * four of them (the brief's call).
+ */
+export const UNFINISHED_EVENT_BOUND_MINUTES = 15;
+
+/** An event received and never finished, as the alarm names it. */
+export interface UnfinishedStripeEvent {
+  eventId: string;
+  eventType: string;
+  receivedAt: string;
+}
+
+/** `processed_at IS NULL` and received at least the bound before the instant. */
+function unfinishedPast(at: Date | undefined) {
+  return and(
+    isNull(stripeEvents.processedAt),
+    lte(
+      stripeEvents.receivedAt,
+      sql`${leaseInstant(at)} - make_interval(mins => ${UNFINISHED_EVENT_BOUND_MINUTES})`,
+    ),
+  );
+}
 
 export const stripeEventsRepository = {
   /**
@@ -88,16 +116,37 @@ export const stripeEventsRepository = {
   },
 
   /**
-   * Admin-only count of unprocessed events — useful for the eventual
-   * Day-20 observability surface (a high count means dispatcher is stuck
-   * or a handler is panicking). Polymorphic-runner so a future staff-
-   * portal endpoint can read it inside a request tx.
+   * The count of events received and never finished, past
+   * {@link UNFINISHED_EVENT_BOUND_MINUTES} (P22 B-8: the tick's unfinished-claim alarm is
+   * its first caller). On Postgres's clock, `now()`, unless a test passes an instant
+   * (`leaseInstant`'s pattern), so a process clock can never call a live delivery dead;
+   * `stripe_events_unprocessed_idx` serves it.
    */
-  async countUnprocessed(runner: Tx | typeof db = db): Promise<number> {
+  async countUnprocessed(
+    runner: Tx | typeof db = db,
+    args: { at?: Date } = {},
+  ): Promise<number> {
     const [row] = await runner
       .select({ count: sql<number>`COUNT(*)::int` })
       .from(stripeEvents)
-      .where(and(isNull(stripeEvents.processedAt)));
+      .where(unfinishedPast(args.at));
     return row?.count ?? 0;
+  },
+
+  /** The same rows, oldest first, for the alarm to name (at most `limit`). */
+  async findUnprocessed(
+    runner: Tx | typeof db = db,
+    args: { at?: Date; limit?: number } = {},
+  ): Promise<UnfinishedStripeEvent[]> {
+    return runner
+      .select({
+        eventId: stripeEvents.eventId,
+        eventType: stripeEvents.eventType,
+        receivedAt: stripeEvents.receivedAt,
+      })
+      .from(stripeEvents)
+      .where(unfinishedPast(args.at))
+      .orderBy(asc(stripeEvents.receivedAt))
+      .limit(args.limit ?? 100);
   },
 };

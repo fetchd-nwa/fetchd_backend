@@ -98,6 +98,9 @@ export async function staffPaymentHistory(ownerId: string): Promise<StaffPayment
     };
     if (row.dogId !== null) wire.dog_id = row.dogId;
     if (row.invoiceId !== null) wire.invoice_id = row.invoiceId;
+    if (row.stripePaymentIntentId !== null) {
+      wire.stripe_payment_intent_id = row.stripePaymentIntentId;
+    }
     return wire;
   });
 }
@@ -110,5 +113,6 @@ function refundWire(row: PaymentRefundRow): StaffPaymentRefundWire {
     created_at: pgTimestampToIso(row.createdAt),
   };
   if (row.reason !== null) wire.reason = row.reason;
+  if (row.retryOfRefundId !== null) wire.retry_of_refund_id = row.retryOfRefundId;
   return wire;
 }
