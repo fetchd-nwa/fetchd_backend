@@ -345,10 +345,16 @@ export const creditLedgerRepository = {
     });
   },
 
-  /** A hand remove: one row against the lot. The caller holds the pool and checked the unspent. */
+  /**
+   * A removal: one `adjustment` row against the lot. The caller holds the pool and checked
+   * the unspent. THE one removal writer: a hand remove (CRED-U14) and, since P22, a staff
+   * refund's removal at its mint, which names the refund (`refund_id`, M5.10). Never a
+   * `checkin_event_id`: no refund path writes beside a board verb (P20's link, DECISIONS
+   * 253(a)), so the row is the CHECK's NULL case.
+   */
   async removeFromLot(
     tx: Tx,
-    args: { lot: GrantLot; credits: number; note: string; staffId: string },
+    args: { lot: GrantLot; credits: number; note: string; staffId: string; refundId?: string },
   ): Promise<void> {
     const { lot } = args;
     await tx.insert(creditLedger).values({
@@ -361,6 +367,7 @@ export const creditLedgerRepository = {
       lotId: lot.id,
       note: args.note,
       createdByStaffId: args.staffId,
+      ...(args.refundId !== undefined ? { refundId: args.refundId } : {}),
     });
   },
 
@@ -443,6 +450,29 @@ export async function findGrantLot(tx: Tx, lotId: string): Promise<GrantLot | un
     })
     .from(creditLedger)
     .where(and(eq(creditLedger.id, lotId), gt(creditLedger.delta, 0), isNull(creditLedger.lotId)))
+    .limit(1);
+  return row;
+}
+
+/**
+ * The one purchase lot a charge granted (`credit_ledger_purchase_charge_uidx`), or nothing
+ * for a charge that granted none: a class or board-and-train charge, or a pack charge that
+ * never settled. What a refund's removal and its proposal read (P22).
+ */
+export async function findPurchaseLotOfCharge(
+  runner: Tx | typeof db,
+  chargeId: string,
+): Promise<GrantLot | undefined> {
+  const [row] = await runner
+    .select({
+      id: creditLedger.id,
+      ownerId: creditLedger.ownerId,
+      location: creditLedger.location,
+      mode: creditLedger.mode,
+      tier: creditLedger.tier,
+    })
+    .from(creditLedger)
+    .where(and(eq(creditLedger.chargeId, chargeId), eq(creditLedger.reason, 'purchase')))
     .limit(1);
   return row;
 }

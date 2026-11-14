@@ -159,6 +159,11 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
         captureReconcilerAbandonedTruncated: result.captureReconciler.abandonedTruncated,
         duplicateRefundRetryScanned: result.duplicateRefundRetry.scanned,
         duplicateRefundRetrySent: result.duplicateRefundRetry.sent,
+        // P22 B-7: the refund sweep's carries.
+        duplicateRefundRetryPolled: result.duplicateRefundRetry.polled,
+        duplicateRefundRetryLookedUp: result.duplicateRefundRetry.lookedUp,
+        duplicateRefundRetryRefused: result.duplicateRefundRetry.refused,
+        duplicateRefundRetryEndedFailed: result.duplicateRefundRetry.endedFailed,
         duplicateRefundRetryAbandoned: result.duplicateRefundRetry.abandoned,
         duplicateRefundRetryAbandonedTruncated: result.duplicateRefundRetry.abandonedTruncated,
         // The abandoned rows split by what a human can DO about each. `abandoned`
@@ -173,8 +178,15 @@ export function registerWorkersTickRoute(app: FastifyInstance, opts: WorkersTick
           result.duplicateRefundRetry.abandonedByClass['never-sent'],
         duplicateRefundRetryAbandonedStripeFailed:
           result.duplicateRefundRetry.abandonedByClass['stripe-failed'],
+        duplicateRefundRetryAbandonedAwaitingStripe:
+          result.duplicateRefundRetry.abandonedByClass['awaiting-stripe'],
+        duplicateRefundRetryAbandonedFailedExceedsOwed:
+          result.duplicateRefundRetry.abandonedByClass['failed-exceeds-owed'],
         duplicateRefundRetryAbandonedCovered:
           result.duplicateRefundRetry.abandonedByClass.covered,
+        // P22 B-8: Stripe events received and never finished past 15 minutes (`null`
+        // when the phase could not count them).
+        stripeEventsUnfinished: result.unfinishedStripeEvents.count,
         mediaDerivativesScanned: result.mediaDerivatives.scanned,
         creditExpiryWarningsScanned: result.creditExpiryWarnings.scanned,
         creditExpiryWarningsEnqueued: result.creditExpiryWarnings.enqueued,

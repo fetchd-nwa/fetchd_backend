@@ -215,6 +215,18 @@ CREATE TYPE ledger_reason      AS ENUM ('purchase','booking-debit','cancel-refun
 -- only by `refundsRepository.markResolvedExternal`, only from 'failed' or
 -- 'unroutable', and only with a non-empty `resolution_note`. It counts in
 -- `sumNonFailedForCharge`, so an attested return CLOSES the cap.
+-- Δ 6.0.0 (P22): the machine is `pending → succeeded | failed` and ONE backwards edge,
+-- `succeeded → failed` (Stripe fails a refund after it succeeded): the cap reopens, a
+-- `refunded` charge is recomputed under the charge lock (to `failed` when the charge
+-- carries a `late-success-refund` row, a charge the app never accepted; to `succeeded`
+-- otherwise), and the credits the refund removed stay removed, since the money is still
+-- owed. `failed`, `unroutable` and `resolved-external` take no event, so the edge happens
+-- at most once and a `failed` row never reads `succeeded` again. Every status change goes
+-- through `applyLiveRefund` (`lib/refundApply.ts`) under the charge lock;
+-- `refundsRepository.markStatus` refuses every other move. 'resolved-external' is written
+-- by `POST /staff/refunds/:id/resolve-external` with `resolved_outcome`: one closed
+-- 'returned' (or with no outcome, a row closed before P22) still closes the cap; one closed
+-- 'withdrawn' (the family keeps the purchase) counts in NO sum, so it reopens it.
 CREATE TYPE refund_status      AS ENUM ('pending','succeeded','failed','unroutable','resolved-external');
 CREATE TYPE rate_unit          AS ENUM ('per-day','per-night','per-session','per-week','flat');
 CREATE TYPE media_kind         AS ENUM ('image', 'video');
@@ -1676,8 +1688,14 @@ CREATE TABLE credit_ledger (
   owner_id    uuid NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,  -- M4.10
   tier        text NOT NULL DEFAULT 'regular' CHECK (tier IN ('regular', 'alumni')),  -- M4.10
   created_by_staff_id uuid REFERENCES staff(id) ON DELETE SET NULL,  -- M4.12: a hand edit's staffer
-  -- M5.10: the refund a removal answers (its FK is added after `refunds`, below; P22
-  -- writes it), and the one `booking-debit` a `settlement-return` reverses.
+  -- M5.10: the refund a removal answers (its FK is added after `refunds`, below), and the
+  -- one `booking-debit` a `settlement-return` reverses. `refund_id` has three writers, each
+  -- an `adjustment` row naming its staffer (P22): the staff refund's removal at the mint
+  -- (`POST /staff/refunds`, minus the count, on the charge's purchase lot), the withdrawn
+  -- put-back (`POST /staff/refunds/:id/resolve-external`, outcome `withdrawn`: plus what the
+  -- chain's rows still hold removed on each lot, naming the chain's first refund), and a
+  -- hand removal that answers a refund (`POST /staff/owners/:id/credit-adjustments`, the
+  -- remove arm's `refund_id`, any refund of the owner). None names a check-in event.
   refund_id           uuid,
   reverses_entry_id   uuid REFERENCES credit_ledger(id),
   -- M5.10 (P20 fix 1, designs/p20-event-ledger-link.md): the check-in event whose
@@ -2026,11 +2044,22 @@ CREATE TABLE refunds (
   resolved_at      timestamptz,
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now(),
-  -- M5.10 (S35's columns, landed with DAY-U34 at LG5; design §4 M5.10). Read and
-  -- written by nothing until the refund unit (P22): how the money went back, who
-  -- issued it, the retry it repeats, a resolve-external's outcome, a dashboard
-  -- refund's credits removed by hand, and the enrolment it answers (its FK at
-  -- M7.08, when `enrollments` exists). No `account_credit`, no `issued_over_limit`.
+  -- M5.10 (S35's columns, landed with DAY-U34 at LG5; design §4 M5.10), written since the
+  -- refund unit (P22, wire 6.0.0). `instrument`: how the money goes back, stated at every
+  -- staff mint (`POST /staff/refunds`; `original_card` only until P24: cash and check are
+  -- 422 `instrument_unavailable`), copied by a retry, and the default on every automatic
+  -- row. `returned_instrument`: cash or check, written by resolve-external on `returned`.
+  -- `issued_by_staff_id`: the staffer on every staff mint and every retry; NULL on an
+  -- automatic row and an adopted dashboard refund. `retry_of_refund_id`: the row a
+  -- `POST /staff/refunds/:id/retry` repeats; a row any later retry names is superseded
+  -- (409 `refund_superseded` on both verbs). `resolved_outcome`: `returned` or `withdrawn`,
+  -- written by `POST /staff/refunds/:id/resolve-external`, which also writes
+  -- `resolved_by_staff_id` (the principal's, now required). Still written by nothing:
+  -- `credits_settled_by_staff_id` and `credits_settled_at` (a dashboard refund's credits
+  -- removed by hand: no route until End of day, P25) and `enrollment_id` (the enrolment it
+  -- answers; `POST /staff/refunds` answers 422 `invalid_payload` for it until build 12.0.0,
+  -- its FK at M7.08, when `enrollments` exists). No `account_credit`, no
+  -- `issued_over_limit`.
   instrument       text NOT NULL DEFAULT 'original_card' CHECK (instrument IN ('original_card', 'cash', 'check')),
   returned_instrument text CHECK (returned_instrument IN ('cash', 'check')),
   issued_by_staff_id uuid REFERENCES staff(id),
@@ -2044,7 +2073,7 @@ CREATE INDEX refunds_owner_idx  ON refunds (owner_id);
 CREATE INDEX refunds_charge_idx ON refunds (charge_id);
 
 -- M5.10: the removal at the mint, the withdrawn put-back and a hand removal that
--- answers a refund name it (P22).
+-- answers a refund name it (P22; the writers are named at `credit_ledger.refund_id`).
 ALTER TABLE credit_ledger
   ADD CONSTRAINT credit_ledger_refund_id_fkey FOREIGN KEY (refund_id) REFERENCES refunds(id);
 

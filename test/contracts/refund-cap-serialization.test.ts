@@ -99,9 +99,9 @@ async function enroll(opts: { app: App; cohortId: string }): Promise<{
   });
 }
 
-async function chargeRows(cohortId: string): Promise<
-  { id: string; status: string; amountCents: number; pi: string | null }[]
-> {
+async function chargeRows(
+  cohortId: string,
+): Promise<{ id: string; status: string; amountCents: number; pi: string | null }[]> {
   return db
     .select({
       id: chargesTable.id,
@@ -452,10 +452,13 @@ test(
       const resolveTx = withActor('staff:probe-resolver', async (tx) => {
         await tx.execute(sql`SELECT 1`);
         await barrier.arrive('resolve');
-        return refundsRepository.markResolvedExternal(tx, {
+        const result = await refundsRepository.markResolvedExternal(tx, {
           id: failedId,
           note: 'returned by check #1042',
+          staffId: FIXTURE_IDS.staffShanthiId,
+          instrument: 'check',
         });
+        return result.kind === 'resolved' ? 1 : 0;
       });
 
       const [mint, resolvedCount] = await Promise.all([mintTx, resolveTx]);
@@ -481,7 +484,11 @@ test(
         );
       } else {
         assert.equal(mint.kind, 'minted', 'the mint won, so the resolve must be the refuser');
-        assert.equal(resolvedCount, 0, 'and it refuses rather than stacking on an in-flight refund');
+        assert.equal(
+          resolvedCount,
+          0,
+          'and it refuses rather than stacking on an in-flight refund',
+        );
       }
 
       // The over-minted row is what the sweep would have fired.
@@ -514,9 +521,15 @@ test(
       );
       assert.equal(minted.kind, 'minted', 'staged: a pending refund is in flight');
 
-      const count = await withActor('staff:resolver', (tx) =>
-        refundsRepository.markResolvedExternal(tx, { id: failedId, note: 'check #1042' }),
-      );
+      const count = await withActor('staff:resolver', async (tx) => {
+        const result = await refundsRepository.markResolvedExternal(tx, {
+          id: failedId,
+          note: 'check #1042',
+          staffId: FIXTURE_IDS.staffShanthiId,
+          instrument: 'check',
+        });
+        return result.kind === 'resolved' ? 1 : 0;
+      });
       assert.equal(
         count,
         0,
@@ -552,12 +565,15 @@ test(
     });
     const oversizedFailed = await seedFailedRefund(charge.id, 6_000);
     try {
-      const count = await withActor('staff:resolver', (tx) =>
-        refundsRepository.markResolvedExternal(tx, {
+      const count = await withActor('staff:resolver', async (tx) => {
+        const result = await refundsRepository.markResolvedExternal(tx, {
           id: oversizedFailed,
           note: 'attesting 6000c against a 4000c remainder',
-        }),
-      );
+          staffId: FIXTURE_IDS.staffShanthiId,
+          instrument: 'check',
+        });
+        return result.kind === 'resolved' ? 1 : 0;
+      });
       assert.equal(count, 0, 'RED today: 1 — non-failed would sum to 12000c on a 10000c charge');
       assert.equal(
         (await refundsFor(charge.id)).find((r) => r.id === oversizedFailed)?.status,
@@ -571,7 +587,7 @@ test(
 );
 
 test(
-  '§MR-A1.2d the ADOPTION insert is a cap-entering write and takes the charge lock too',
+  '§MR-A1.2d the ADOPTION insert is a cap-entering write and takes the charge lock too (P22: recorded either way; the lock orders it)',
   SKIP_WHEN_NO_DB,
   async () => {
     const charge = await seedPlainCharge(10_000);
@@ -609,22 +625,21 @@ test(
       const mint = mintOutcome.value;
       const adopted = adoptOutcome.value;
       assert.equal(barrier.arrived(), 2, 'the two transactions genuinely overlapped');
-      const rows = await refundsFor(charge.id);
-      const nonFailed = rows
-        .filter((r) => r.status !== 'failed')
-        .reduce((sum, r) => sum + r.amountCents, 0);
-      assert.ok(
-        nonFailed <= 10_000,
-        `non-failed summed ${nonFailed} on a 10000c charge (mint=${mint.kind}, adopt=${adopted.kind})`,
-      );
-      // Exactly one of the two writers may commit a cap-entering row here: the
-      // adoption records money that ALREADY moved at Stripe, so if it wins the
-      // mint must cap to 0; if the mint wins the adoption refuses in-flight.
-      assert.equal(
-        [mint.kind === 'minted', adopted.kind === 'adopted'].filter(Boolean).length,
-        1,
-        'exactly one cap-entering writer commits',
-      );
+      // Since P22 (Fable H2) the adoption is never refused: it records money that ALREADY
+      // moved at Stripe, whatever is pending, and over the cap the caller says so
+      // (`refundApply.ts`). What the lock still decides is the ORDER, and each order
+      // reads the other's committed row:
+      //   - the adoption first → the mint caps to 0 (`nothing-to-refund`);
+      //   - the mint first → the adoption reads a remainder of 0, so its caller's
+      //     over-cap line is true. Without the lock it could read 10000c while the mint
+      //     was still uncommitted, and stay silent about the second 10000c.
+      assert.equal(adopted.kind, 'adopted', 'the money moved, so it is recorded');
+      if (mint.kind === 'minted') {
+        assert.equal(adopted.remainingBeforeCents, 0, 'the adoption read the cap after the mint');
+      } else {
+        assert.equal(mint.kind, 'nothing-to-refund', 'the mint read the cap after the adoption');
+        assert.equal(adopted.remainingBeforeCents, 10_000);
+      }
     } finally {
       await dropCharge(charge.id);
     }

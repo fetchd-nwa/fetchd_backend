@@ -1,10 +1,19 @@
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, like, lte, notLike, or, sql } from 'drizzle-orm';
 import { ne } from 'drizzle-orm';
-import type { RefundStatus } from '../../contracts/wire.js';
+import { alias } from 'drizzle-orm/pg-core';
+import type {
+  ChargePurpose,
+  RefundInstrument,
+  RefundResolvedOutcome,
+  RefundStatus,
+} from '../../contracts/wire.js';
 import { db } from '../client.js';
 import { pgTimestampToDate } from '../../lib/pgTimestamp.js';
-import { charges, refunds } from '../schema/schema.js';
+import { lockPools } from '../locks.js';
+import type { GrantLot } from './creditLedgerRepository.js';
+import { charges, creditLedger, creditPackages, owners, refunds, staff } from '../schema/schema.js';
+import { visibleOrNull } from '../visibleText.js';
 import type { Tx } from '../tx.js';
 
 /** Polymorphic runner — pool for pre/post-tx ops, Tx for in-mutation work. */
@@ -19,9 +28,40 @@ type Runner = Tx | typeof db;
  * charge row's lock (MR-A1.2 — the adoption INSERT is a cap-entering write and
  * obeys the same rule every mint does).
  */
-export type AdoptedExternalRefund =
-  | { kind: 'adopted'; refund: RefundRow }
-  | { kind: 'refused-in-flight' };
+export type AdoptedExternalRefund = {
+  kind: 'adopted';
+  refund: RefundRow;
+  /** What the charge could still return BEFORE this row counted: below the adopted amount,
+   *  the dashboard refund went past the cap, and the caller says so (design.md:4270-4272). */
+  remainingBeforeCents: number;
+};
+
+/**
+ * The `refunds.reason` of the order engine's automatic refund of a late success (follow-up
+ * 4, SIGNOFF.md:208-209). Kept here, beside the query that reads it, so the money module
+ * that writes it (`confirmCharge.ts`) and the apply function that recomputes its charge
+ * (`refundApply.ts`) import one string without a cycle.
+ */
+export const LATE_SUCCESS_REFUND_REASON = 'late-success-refund';
+
+/**
+ * Thrown by {@link refundsRepository.markStatus} for a write the state machine does not
+ * have. Every caller decides under the charge lock first, so this is a defect, and loud.
+ */
+export class RefundStatusTransitionError extends Error {}
+
+/**
+ * The refund state machine's moves through `markStatus` (6.0.0, design §2.7:4220-4228): the
+ * target, and the statuses it may be written FROM. `pending → succeeded | failed`, and the
+ * ONE backwards edge, `succeeded → failed`, which a refund arm takes once, when the
+ * retrieved refund reads `failed`. `unroutable` and `resolved-external` have their own
+ * writers ({@link refundsRepository.markUnroutable},
+ * {@link refundsRepository.markResolvedExternal}) and take no event.
+ */
+const REFUND_STATUS_FROM: Partial<Record<RefundStatus, readonly RefundStatus[]>> = {
+  succeeded: ['pending'],
+  failed: ['pending', 'succeeded'],
+};
 
 export type CappedRefundMint =
   | { kind: 'nothing-to-refund' }
@@ -51,7 +91,12 @@ export type CappedRefundMint =
  * from exactly those two statuses. Nothing automatic produces it and nothing
  * leaves it: the complete state machine is
  *
- *   pending → succeeded | failed      (Stripe webhook)
+ *   pending → succeeded | failed      (the one apply function, `refundApply.ts`: a
+ *                                      create's reply, a refund event, the poll, the look-up)
+ *   succeeded → failed                (P22: the ONE backwards edge, once, from any refund
+ *                                      arm whose retrieved refund reads `failed`)
+ *   pending → failed                  (P22: Stripe refused the create, B-7(c); or no refund
+ *                                      exists for it past the key window, B-7(b))
  *   pending → unroutable              (born terminal, or the sweep's flip)
  *   failed | unroutable → resolved-external   (STAFF, note required)
  *   resolved-external → ∅             (terminal; webhook events on it no-op)
@@ -105,6 +150,59 @@ export interface RefundRow {
    */
   stripeIdempotencyKey: string | null;
 }
+
+/**
+ * What {@link refundsRepository.markResolvedExternal} decided, under the charge lock
+ * (P22; design §2.7:4310-4322): `resolved` → 200, `not_found` → 404, `wrong_status` → 409
+ * `conflict`, `superseded` → 409 `refund_superseded`, `in_flight` → 409 `refund_in_flight`,
+ * `instrument_required` → 400 `bad_request`, `over_remainder` → 422 `over_cap`. Never a
+ * `resolved` on a write that changed no row.
+ */
+export type ResolveExternalResult =
+  | { kind: 'resolved'; ownerId: string; creditsReturned: number }
+  | { kind: 'not_found' }
+  | { kind: 'wrong_status' }
+  | { kind: 'superseded' }
+  | { kind: 'in_flight' }
+  | { kind: 'instrument_required' }
+  | { kind: 'over_remainder' };
+
+/** A lot a `withdrawn` put-back writes to, with its pool. */
+export type PutBackLot = GrantLot;
+
+/** The row behind `RefundWire`, names joined ({@link refundsRepository.findWireRow}). */
+export interface RefundWireRow {
+  id: string;
+  chargeId: string;
+  ownerId: string;
+  ownerName: string;
+  purpose: ChargePurpose;
+  packageLabel: string | null;
+  amountCents: number;
+  instrument: RefundInstrument;
+  returnedInstrument: 'cash' | 'check' | null;
+  status: RefundStatus;
+  reason: string | null;
+  issuedByStaffId: string | null;
+  issuedByName: string | null;
+  retryOfRefundId: string | null;
+  enrollmentId: string | null;
+  resolvedByStaffId: string | null;
+  resolvedByName: string | null;
+  resolvedAt: string | null;
+  resolutionNote: string | null;
+  resolvedOutcome: RefundResolvedOutcome | null;
+  createdAt: string;
+}
+
+/**
+ * A refund *Returned* closed `withdrawn` moved no money (6.0.0; design §2.7:4242-4251):
+ * it counts nowhere money is summed — the cap ({@link refundsRepository.sumNonFailedForCharge}),
+ * the returned coverage and the rows behind it. A `resolved-external` row with no outcome
+ * was closed before 6.0.0, was money returned, and still counts (D5). `IS DISTINCT FROM`,
+ * so every row with no outcome passes.
+ */
+const NOT_WITHDRAWN = sql`${refunds.resolvedOutcome} IS DISTINCT FROM 'withdrawn'`;
 
 const REFUND_PROJECTION = {
   id: refunds.id,
@@ -189,6 +287,30 @@ export const ROW_KEYED_REFUND_REASON = 'duplicate-invoice-settle';
 export const REFUND_SWEEP_FLOOR = new Date('2026-08-14T00:00:00.000Z');
 
 /**
+ * **The fresh key of a refund whose key holds a stored server error** (P22 B-7(b), 145(d)):
+ * `refund-rekey:<row id>:<epoch seconds>`. Derived from the row's id, so it is ours alone,
+ * and stamped with the instant it was written onto the row, which is the instant of its one
+ * send (it is written in a committed UPDATE immediately before the call). No column holds
+ * that instant, and the end state needs it: "24 hours after the last create sent under the
+ * row's current key". A fresh key is sent exactly once, so its own text is that record; no
+ * new state. It is not derived from a client key, so it puts nothing on
+ * `STRIPE_DERIVED_KEY_SUFFIXES` (`mutation.ts`) and does not tighten
+ * `IDEMPOTENCY_KEY_MAX_LEN` (60 characters, well under Stripe's 255).
+ */
+export const REKEYED_REFUND_KEY_PREFIX = 'refund-rekey:';
+
+export function rekeyedRefundKey(refundId: string, at: Date): string {
+  return `${REKEYED_REFUND_KEY_PREFIX}${refundId}:${Math.floor(at.getTime() / 1000)}`;
+}
+
+/** The instant a fresh key was written and sent, or `undefined` for any other key. */
+export function rekeyedAt(key: string | null): Date | undefined {
+  if (key === null || !key.startsWith(REKEYED_REFUND_KEY_PREFIX)) return undefined;
+  const seconds = Number(key.slice(key.lastIndexOf(':') + 1));
+  return Number.isFinite(seconds) ? new Date(seconds * 1000) : undefined;
+}
+
+/**
  * What an unreturned refund IS, from the row's own durable facts — the
  * discriminator {@link findAbandonedPending} returns so the caller's alarm can
  * say something TRUE about each one instead of one sentence that is false for
@@ -250,11 +372,33 @@ export type AbandonedRefundClass =
   | 'never-sent'
   | 'client-keyed'
   | 'row-keyed'
+  /**
+   * P22 B-7(b): a `pending` row with no `re_` that the sweep is still asking Stripe about,
+   * by its `metadata.refund_id`: its key answered a stored server error and it was sent
+   * once under a fresh key, or it is a staff refund Stripe could not be reached for past
+   * the retry window. Nothing should be sent for it by hand; the sweep ends it `failed` once
+   * Stripe's key window has passed and Stripe holds no refund for it.
+   */
+  | 'awaiting-stripe'
+  /** A failed HEAD of its chain that fits what its payment still owes: the two exits pay it. */
   | 'stripe-failed'
+  /**
+   * P22 B-7(c), Fable M1: a failed head LARGER than what its payment still owes (a
+   * dashboard refund came first). *Retry to card* and *Returned* would each answer 422
+   * `over_cap`, so the report names the figure owed and the road that pays it: a new
+   * refund of that figure through *Refund*, with no credits to remove.
+   */
+  | 'failed-exceeds-owed'
   | 'covered';
 
 export interface AbandonedRefundRow extends RefundRow {
   refundClass: AbandonedRefundClass;
+  /**
+   * Where a person can see this row (P22 B-7(e)): on the family's payment history when its
+   * charge took money for the app (`succeeded` or `refunded`), and on no portal screen when
+   * the charge is held `failed` (the late-success lane), until End of day (P25).
+   */
+  seenOn: string;
   /** The PI the refund reverses — `null` is what makes a row `never-sent`. */
   stripePaymentIntentId: string | null;
   /**
@@ -331,9 +475,20 @@ function classifyAbandoned(args: {
   /** The charge's live remainder. A failed row against a fully-covered charge
    *  is owed NOTHING and must leave the shouting class (MR-A1.5). */
   remainingCents: number;
+  amountCents: number;
+  /** A later retry names this row (D2, 279(b)): it is not its chain's head. */
+  superseded: boolean;
+  issuedByStaff: boolean;
 }): AbandonedRefundClass {
   if (args.status === 'failed') {
-    return args.remainingCents <= 0 ? 'covered' : 'stripe-failed';
+    // D2 (design.md:4258-4259): a row a later retry names is covered whatever that retry's
+    // state, because only the head may be retried or resolved; the head is owed, computed
+    // for itself.
+    if (args.superseded || args.remainingCents <= 0) return 'covered';
+    return args.amountCents > args.remainingCents ? 'failed-exceeds-owed' : 'stripe-failed';
+  }
+  if (rekeyedAt(args.stripeIdempotencyKey) !== undefined || args.issuedByStaff) {
+    return 'awaiting-stripe';
   }
   if (args.piId === null) return 'never-sent';
   // The stored key is the whole design: a row that carries one is retryable and
@@ -433,6 +588,9 @@ export const refundsRepository = {
    * money is recorded, a human will honor it, and nothing may mint a second
    * refund row against the same charge in the meantime.
    *
+   * Since 6.0.0 a row *Returned* closed `withdrawn` leaves it too: no money
+   * moved, so the cap reopens by its amount ({@link NOT_WITHDRAWN}).
+   *
    * Returns 0 if no prior refunds exist (the common case — first
    * cancel of a money-paid booking).
    */
@@ -442,8 +600,69 @@ export const refundsRepository = {
         total: sql<number | null>`COALESCE(SUM(${refunds.amountCents})::int, 0)`.as('total'),
       })
       .from(refunds)
-      .where(and(eq(refunds.chargeId, chargeId), ne(refunds.status, 'failed')));
+      .where(and(eq(refunds.chargeId, chargeId), ne(refunds.status, 'failed'), NOT_WITHDRAWN));
     return row?.total ?? 0;
+  },
+
+  /**
+   * **THE cap** (P22; design §2.7:4182-4186, §2.10:4682-4697): what this charge can
+   * still return, `amount_cents` minus every refund that counts
+   * ({@link sumNonFailedForCharge}), floored at 0. One helper for the staff mint,
+   * the retry, resolve-external and the proposal, each calling it with the charge
+   * row's lock held, so what it reads stays true until the caller commits.
+   * `staffBillingRepository`'s `REFUNDABLE_CENTS` is its SQL twin, and a table test
+   * holds the two equal on every status and outcome.
+   */
+  async capRemainingForCharge(
+    tx: Tx,
+    charge: { id: string; amountCents: number },
+  ): Promise<number> {
+    return Math.max(charge.amountCents - (await this.sumNonFailedForCharge(tx, charge.id)), 0);
+  },
+
+  /**
+   * One refund as the refund verbs answer it (`RefundWire`, wire 6.0.0): the row
+   * with the names joined, so a screen composes its line from facts. The family's
+   * name falls back to the email when it has no visible character, as
+   * `PendingPaymentWire.owner` does; `packageLabel` is the label of the row the
+   * charge bought, when it stored one.
+   */
+  async findWireRow(runner: Runner, id: string): Promise<RefundWireRow | undefined> {
+    const issuer = alias(staff, 'refund_issuer');
+    const resolver = alias(staff, 'refund_resolver');
+    const [row] = await runner
+      .select({
+        id: refunds.id,
+        chargeId: refunds.chargeId,
+        ownerId: refunds.ownerId,
+        ownerName: sql<string>`coalesce(${visibleOrNull(owners.name)}, ${owners.email})`,
+        purpose: charges.purpose,
+        packageLabel: creditPackages.label,
+        amountCents: refunds.amountCents,
+        instrument: refunds.instrument,
+        returnedInstrument: refunds.returnedInstrument,
+        status: refunds.status,
+        reason: refunds.reason,
+        issuedByStaffId: refunds.issuedByStaffId,
+        issuedByName: issuer.name,
+        retryOfRefundId: refunds.retryOfRefundId,
+        enrollmentId: refunds.enrollmentId,
+        resolvedByStaffId: refunds.resolvedByStaffId,
+        resolvedByName: resolver.name,
+        resolvedAt: refunds.resolvedAt,
+        resolutionNote: refunds.resolutionNote,
+        resolvedOutcome: refunds.resolvedOutcome,
+        createdAt: refunds.createdAt,
+      })
+      .from(refunds)
+      .innerJoin(owners, eq(owners.id, refunds.ownerId))
+      .innerJoin(charges, eq(charges.id, refunds.chargeId))
+      .leftJoin(creditPackages, eq(creditPackages.id, charges.packageId))
+      .leftJoin(issuer, eq(issuer.id, refunds.issuedByStaffId))
+      .leftJoin(resolver, eq(resolver.id, refunds.resolvedByStaffId))
+      .where(eq(refunds.id, id))
+      .limit(1);
+    return row as RefundWireRow | undefined;
   },
 
   /**
@@ -494,6 +713,7 @@ export const refundsRepository = {
         and(
           eq(refunds.chargeId, chargeId),
           inArray(refunds.status, ['succeeded', 'resolved-external']),
+          NOT_WITHDRAWN,
         ),
       );
     return row?.total ?? 0;
@@ -534,6 +754,12 @@ export const refundsRepository = {
        * break that circle. Everyone else lets the DB default it.
        */
       id?: string;
+      /** M5.10 (P22): a staff refund writes how the money goes back, who issued it and,
+       *  on a retry, the failed row it repeats. Omitted by every automatic lane, which
+       *  keeps the column defaults (`'original_card'`, NULL, NULL). */
+      instrument?: RefundInstrument;
+      issuedByStaffId?: string;
+      retryOfRefundId?: string;
     },
   ): Promise<RefundRow> {
     const [row] = await tx
@@ -546,6 +772,9 @@ export const refundsRepository = {
         amountCents: args.amountCents,
         reason: args.reason ?? null,
         stripeIdempotencyKey: args.stripeIdempotencyKey,
+        ...(args.instrument !== undefined ? { instrument: args.instrument } : {}),
+        ...(args.issuedByStaffId !== undefined ? { issuedByStaffId: args.issuedByStaffId } : {}),
+        ...(args.retryOfRefundId !== undefined ? { retryOfRefundId: args.retryOfRefundId } : {}),
       })
       .returning(REFUND_PROJECTION);
     if (!row) {
@@ -596,9 +825,11 @@ export const refundsRepository = {
    *     refunds;
    *   · {@link adoptExternalRefundCapped} — charge `FOR UPDATE`, guard + INSERT
    *     refunds;
-   *   · `handleChargeRefundUpdated` — CONVERTED: match unlocked, charge
-   *     `FOR UPDATE`, re-read refunds under the lock, guarded write, cumulative
-   *     tail under the same lock.
+   *   · `applyLiveRefund` (`lib/refundApply.ts`, since P22 the one apply function
+   *     for the four refund events, the create's reply and the refund sweep's poll
+   *     and look-up) — charge `FOR UPDATE` first, then every refunds read and
+   *     write under it: the match, the guarded status write, an adoption's INSERT,
+   *     the cumulative tail.
    * No cycle is constructible among charges-first writers. The refunds-ONLY
    * writers — {@link claimStalePendingForRetry} (`FOR UPDATE SKIP LOCKED`),
    * {@link markStripeId}, {@link markUnroutable} — hold refunds row locks and
@@ -650,6 +881,12 @@ export const refundsRepository = {
        * client's request key and ignore the argument.
        */
       stripeIdempotencyKey: (refundId: string) => string;
+      /**
+       * P22 B-7(d): mint nothing when the charge already carries a refund of `reason`, in
+       * any status, decided under this lock. The late-success lane's one-row-per-obligation
+       * rule: a refund Stripe failed goes to a person, who has *Retry to card*.
+       */
+      oncePerReason?: true;
     },
   ): Promise<CappedRefundMint> {
     // The lock. FIRST, before `refunds` is read or written, so the legs cannot
@@ -664,6 +901,13 @@ export const refundsRepository = {
       .for('update');
     if (charge === undefined) {
       throw new Error(`mintCappedPendingRefund: charge ${args.chargeId} not found`);
+    }
+    if (
+      args.oncePerReason === true &&
+      args.reason != null &&
+      (await this.hasRefundWithReason(tx, args.chargeId, args.reason))
+    ) {
+      return { kind: 'nothing-to-refund' };
     }
 
     const alreadyRefunded = await this.sumNonFailedForCharge(tx, args.chargeId);
@@ -720,11 +964,17 @@ export const refundsRepository = {
       bookingId: string | null;
       amountCents: number;
       reason?: string | null;
+      /** P22: a staff refund on a charge with no PaymentIntent is born here, with its
+       *  chosen instrument and its issuer (design §2.7:4299-4300). */
+      id?: string;
+      instrument?: RefundInstrument;
+      issuedByStaffId?: string;
     },
   ): Promise<RefundRow> {
     const [row] = await tx
       .insert(refunds)
       .values({
+        ...(args.id !== undefined ? { id: args.id } : {}),
         ownerId: args.ownerId,
         chargeId: args.chargeId,
         bookingId: args.bookingId,
@@ -732,6 +982,8 @@ export const refundsRepository = {
         reason: args.reason ?? null,
         status: 'unroutable',
         stripeIdempotencyKey: null,
+        ...(args.instrument !== undefined ? { instrument: args.instrument } : {}),
+        ...(args.issuedByStaffId !== undefined ? { issuedByStaffId: args.issuedByStaffId } : {}),
       })
       .returning(REFUND_PROJECTION);
     if (!row) {
@@ -767,10 +1019,14 @@ export const refundsRepository = {
    * {@link mintCappedPendingRefund} follows, and for the same reason: a lock
    * the caller is trusted to take is a lock the next caller forgets.
    *
-   * `'refused-in-flight'` means an automatic refund is still pending on this
-   * charge. The handler turns that into a `WebhookRetryError` — never adopt over
-   * an in-flight refund, because an amount-matched delivery race against our own
-   * would double-RECORD one movement of money.
+   * **No in-flight refusal since P22** (Fable H2). It refused any adoption while a
+   * refund on the charge was `pending`, for fear of double-recording our own refund
+   * matched by amount. From P22 every create carries `metadata.refund_id` and the apply
+   * function matches by it first (`refundApply.ts`), so a refund that reaches here is
+   * nobody's row. And a staff card refund can now sit `pending` for days, so the old
+   * guard refused Shanthi's dashboard refund on every delivery until Stripe gave up,
+   * and the cap never learned of that money. The money moved: it is recorded, and over
+   * the cap the caller says so rather than refusing (design.md:4270-4272).
    */
   async adoptExternalRefundCapped(
     tx: Tx,
@@ -794,12 +1050,14 @@ export const refundsRepository = {
     if (charge === undefined) {
       throw new Error(`adoptExternalRefundCapped: charge ${args.chargeId} not found`);
     }
-
-    // The refusal, now evaluated under the lock so it cannot be raced: never
-    // adopt over an automatic refund that is still in flight.
-    if ((await this.countPendingForCharge(tx, args.chargeId)) > 0) {
-      return { kind: 'refused-in-flight' };
-    }
+    const [amount] = await tx
+      .select({ amountCents: charges.amountCents })
+      .from(charges)
+      .where(eq(charges.id, args.chargeId));
+    const remainingBeforeCents = await this.capRemainingForCharge(tx, {
+      id: args.chargeId,
+      amountCents: amount!.amountCents,
+    });
 
     const [row] = await tx
       .insert(refunds)
@@ -819,7 +1077,42 @@ export const refundsRepository = {
         'refundsRepository.adoptExternalRefundCapped: refunds INSERT returned no row',
       );
     }
-    return { kind: 'adopted', refund: row };
+    return { kind: 'adopted', refund: row, remainingBeforeCents };
+  },
+
+  /**
+   * Does this charge carry a refund with this `reason`, in ANY status? The late-success
+   * mint's question (P22 B-7(d)): one automatic refund per late success, whatever Stripe did
+   * to it. The backwards edge asks {@link hasAutomaticRefundWithReason} instead.
+   */
+  async hasRefundWithReason(tx: Tx, chargeId: string, reason: string): Promise<boolean> {
+    const [row] = await tx
+      .select({ id: refunds.id })
+      .from(refunds)
+      .where(and(eq(refunds.chargeId, chargeId), eq(refunds.reason, reason)))
+      .limit(1);
+    return row !== undefined;
+  },
+
+  /**
+   * Does this charge carry a refund with this `reason` that no staff member issued, in ANY
+   * status? The backwards edge's recompute (P22 fix 1, Fable r1 N2): a charge carrying the
+   * engine's late-success refund goes back to `failed`, the status it held before its
+   * refund covered it, since the app never accepted that payment. `reason` is free text on a
+   * staff refund (`lib/staffRefunds.ts` stores what she typed, with `issued_by_staff_id`),
+   * and the payment history shows `late-success-refund` on the engine's own row, so a staff
+   * refund typed with that word must not make a payment the app accepted read as failed.
+   * Only the engine mints this reason with no issuer (`confirmCharge.ts`, `refundLateSuccess`).
+   */
+  async hasAutomaticRefundWithReason(tx: Tx, chargeId: string, reason: string): Promise<boolean> {
+    const [row] = await tx
+      .select({ id: refunds.id })
+      .from(refunds)
+      .where(
+        and(eq(refunds.chargeId, chargeId), eq(refunds.reason, reason), isNull(refunds.issuedByStaffId)),
+      )
+      .limit(1);
+    return row !== undefined;
   },
 
   /**
@@ -882,6 +1175,7 @@ export const refundsRepository = {
         and(
           eq(refunds.chargeId, chargeId),
           inArray(refunds.status, ['succeeded', 'resolved-external']),
+          NOT_WITHDRAWN,
         ),
       )
       .orderBy(asc(refunds.createdAt));
@@ -930,8 +1224,16 @@ export const refundsRepository = {
    * before `refunds` is read or written, and the refund row is RE-READ under
    * that held lock.
    *
-   * **Two refusals, both under the held lock** (count 0 here; **409** on the
-   * future §4.6 route, and the interim-ops rider mirrors both):
+   * **Since P22 (wire 6.0.0) it is `POST /staff/refunds/:id/resolve-external`'s verb**
+   * (design §2.7:4235-4262, :4310-4322; question 41 (a) with both riders): it answers a
+   * {@link ResolveExternalResult} decided under the lock, `staffId` is required, and it
+   * writes `resolved_outcome` and, on `returned` only, `returned_instrument`. `withdrawn`
+   * puts back the chain's removed credits ({@link withdrawnPutBacks}) and moves no money.
+   * Only a chain's head closes (D2). The refusals, in order: not found, a status other than
+   * `failed` / `unroutable`, superseded, a refund in flight, a card row `returned` with no
+   * instrument, and the money guards below.
+   *
+   * **Two money refusals, both under the held lock:**
    *
    *   (a) `countPendingForCharge > 0` — an automatic refund is in flight. Let
    *       it settle first; resolving under it IS the executed interleave, made
@@ -963,27 +1265,30 @@ export const refundsRepository = {
     args: {
       id: string;
       note: string;
-      /** The attesting staff principal. Optional ONLY for the interim-ops era
-       *  (§4.3): no route exists yet, so a maintenance script has no principal
-       *  and the note names the human. The §4.6 route makes it required. */
-      staffId?: string;
+      /** The attesting staffer: required since P22's route (design §2.7:4310-4322). */
+      staffId: string;
+      /** `'returned'` when omitted: the money went back outside the app. */
+      outcome?: RefundResolvedOutcome;
+      /** What crossed the desk, on `'returned'` only. */
+      instrument?: 'cash' | 'check';
     },
-  ): Promise<number> {
+  ): Promise<ResolveExternalResult> {
     const note = args.note.trim();
     if (note.length === 0) {
       throw new Error(
         'markResolvedExternal: a resolution note is REQUIRED — it is the only evidence that this money actually went back, and a resolution without it is an unattested cap closure',
       );
     }
+    const outcome = args.outcome ?? 'returned';
 
-    // Read the row UNLOCKED first, only to learn which charge to lock. Every
-    // decision below is re-derived after the lock is held.
+    // Read the row UNLOCKED first, only to learn which charge to lock (it never changes).
+    // Every decision below, the 404 included, is taken from the re-read after the lock.
     const [target] = await tx
       .select({ chargeId: refunds.chargeId })
       .from(refunds)
       .where(eq(refunds.id, args.id))
       .limit(1);
-    if (target === undefined) return 0;
+    if (target === undefined) return { kind: 'not_found' };
 
     // ── charges → refunds, the one global lock order ────────────────────
     const [charge] = await tx
@@ -991,67 +1296,202 @@ export const refundsRepository = {
       .from(charges)
       .where(eq(charges.id, target.chargeId))
       .for('update');
-    if (charge === undefined) return 0;
+    if (charge === undefined) return { kind: 'not_found' };
 
-    // Re-read the refund row under the held lock: between the unlocked read
-    // above and here, a webhook could have moved it.
-    const [row] = await tx
-      .select({ status: refunds.status, amountCents: refunds.amountCents })
-      .from(refunds)
-      .where(eq(refunds.id, args.id))
-      .limit(1);
-    if (row === undefined) return 0;
-    if (row.status !== 'failed' && row.status !== 'unroutable') return 0;
+    const row = await this.findHeadFacts(tx, args.id);
+    if (row === undefined) return { kind: 'not_found' };
+    if (row.status !== 'failed' && row.status !== 'unroutable') return { kind: 'wrong_status' };
+    // D2 (DECISIONS 279(b)): only a chain's head is closed; a row any later retry names is
+    // superseded, whatever that retry's state.
+    if (row.superseded) return { kind: 'superseded' };
+    // Guard (a) — never resolve under an in-flight refund on the same payment.
+    if ((await this.countPendingForCharge(tx, charge.id)) > 0) return { kind: 'in_flight' };
 
-    // Guard (a) — never resolve under an in-flight automatic refund.
-    if ((await this.countPendingForCharge(tx, charge.id)) > 0) return 0;
+    const returnedInstrument =
+      args.instrument ?? (row.instrument === 'original_card' ? undefined : row.instrument);
+    if (outcome === 'returned' && returnedInstrument === undefined) {
+      return { kind: 'instrument_required' };
+    }
 
-    // Guard (b) — never attest more money than the charge is still owed.
-    //
-    // The comparison is against the remainder **ignoring THIS row's own
-    // contribution**, because the two source statuses sit on opposite sides of
-    // the cap and the naive `amount − sumNonFailed` is wrong for one of them:
-    //
-    //   · `'failed'` is OUTSIDE `sumNonFailedForCharge`, so resolving it MOVES
-    //     it in — a genuine cap-entering write, and the one this guard exists
-    //     for. `sumNonFailed` already excludes it, so the subtraction is a
-    //     no-op and the comparison is the plain live remainder.
-    //   · `'unroutable'` is ALREADY inside the non-failed set (it is a recorded
-    //     obligation). Resolving it is a RELABEL — "the promise was kept" — and
-    //     changes the cap by exactly nothing. Comparing it against a remainder
-    //     that already subtracts itself would refuse every single one, which is
-    //     not a stricter guard, it is a broken verb.
-    const nonFailed = await this.sumNonFailedForCharge(tx, charge.id);
+    // The remainder **ignoring THIS row's own contribution**, because the two source
+    // statuses sit on opposite sides of the cap: `'failed'` is outside the counting sum, so
+    // resolving it `returned` MOVES it in; `'unroutable'` is already inside it, so resolving
+    // it is a relabel. Comparing an unroutable row against a remainder that already
+    // subtracts itself would refuse every one.
+    const counting = await this.sumNonFailedForCharge(tx, charge.id);
     const alreadyCounted = row.status === 'unroutable' ? row.amountCents : 0;
-    const remainderIgnoringThisRow = charge.amountCents - (nonFailed - alreadyCounted);
-    if (row.amountCents > remainderIgnoringThisRow) return 0;
+    const remainderIgnoringThisRow = charge.amountCents - (counting - alreadyCounted);
+
+    let putBacks: { lot: PutBackLot; credits: number; firstRefundId: string }[] = [];
+    if (outcome === 'returned') {
+      // Guard (b) — never attest more money than the payment still owes.
+      if (row.amountCents > remainderIgnoringThisRow) return { kind: 'over_remainder' };
+    } else {
+      putBacks = await this.withdrawnPutBacks(tx, args.id);
+      // Amendment A1 (DECISIONS 303): with nothing left to return, the money this refund
+      // stood for has gone back another way, so "the family keeps the purchase" is false and
+      // the credits stay removed. A chain that removed nothing still closes withdrawn.
+      if (putBacks.length > 0 && remainderIgnoringThisRow <= 0) return { kind: 'over_remainder' };
+    }
 
     const updated = await tx
       .update(refunds)
       .set({
         status: 'resolved-external',
         resolutionNote: note,
-        resolvedByStaffId: args.staffId ?? null,
+        resolvedByStaffId: args.staffId,
         resolvedAt: sql`now()`,
+        resolvedOutcome: outcome,
+        ...(outcome === 'returned' ? { returnedInstrument } : {}),
         updatedAt: sql`now()`,
       })
-      // The guard is RE-ASSERTED at write time, `markUnroutable`'s discipline:
-      // the reads above are under the charge lock, but the status predicate is
-      // what makes the write itself unambiguous.
+      // The guard is RE-ASSERTED at write time, `markUnroutable`'s discipline.
       .where(and(eq(refunds.id, args.id), inArray(refunds.status, ['failed', 'unroutable'])))
       .returning({ id: refunds.id });
-    if (updated.length === 0) return 0;
+    if (updated.length === 0) return { kind: 'wrong_status' };
 
-    // Rider 2 — the ledger. Money that came back counts whether Stripe returned
-    // it or a human did. One helper, three tails (MR-A1.6.3).
-    const returned = await this.sumReturnedCoverageForCharge(tx, charge.id);
-    if (returned >= charge.amountCents) {
-      await tx
-        .update(charges)
-        .set({ status: 'refunded', updatedAt: sql`now()` })
-        .where(eq(charges.id, charge.id));
+    let creditsReturned = 0;
+    for (const back of putBacks) {
+      await tx.insert(creditLedger).values({
+        ownerId: back.lot.ownerId,
+        location: back.lot.location,
+        mode: back.lot.mode,
+        tier: back.lot.tier,
+        delta: back.credits,
+        reason: 'adjustment',
+        lotId: back.lot.id,
+        refundId: back.firstRefundId,
+        note: `refund ${back.firstRefundId} withdrawn: ${note}`,
+        createdByStaffId: args.staffId,
+      });
+      creditsReturned += back.credits;
     }
-    return updated.length;
+
+    if (outcome === 'returned') {
+      // Rider 2 — the ledger. Money that came back counts whether Stripe returned it or a
+      // human did. One helper, three tails (MR-A1.6.3). A `withdrawn` close moved no money,
+      // so it never flips the charge.
+      const returned = await this.sumReturnedCoverageForCharge(tx, charge.id);
+      if (returned >= charge.amountCents) {
+        await tx
+          .update(charges)
+          .set({ status: 'refunded', updatedAt: sql`now()` })
+          .where(eq(charges.id, charge.id));
+      }
+    }
+    return { kind: 'resolved', ownerId: row.ownerId, creditsReturned };
+  },
+
+  /**
+   * What *Retry to card* and *Returned* decide on, read under the charge lock: the row's
+   * status, amount, instrument and reason, and whether a later retry names it (D2).
+   */
+  async findHeadFacts(
+    tx: Tx,
+    id: string,
+  ): Promise<
+    | {
+        id: string;
+        ownerId: string;
+        chargeId: string;
+        status: RefundStatus;
+        amountCents: number;
+        instrument: RefundInstrument;
+        reason: string | null;
+        superseded: boolean;
+      }
+    | undefined
+  > {
+    const [row] = await tx
+      .select({
+        id: refunds.id,
+        ownerId: refunds.ownerId,
+        chargeId: refunds.chargeId,
+        status: refunds.status,
+        amountCents: refunds.amountCents,
+        instrument: refunds.instrument,
+        reason: refunds.reason,
+        // Spelled `refunds.id`, never `${refunds.id}`: in a one-table select drizzle renders
+        // a column bare (`"id"`), which inside the subquery binds to its own row.
+        superseded: sql<boolean>`EXISTS (SELECT 1 FROM refunds later WHERE later.retry_of_refund_id = refunds.id)`,
+      })
+      .from(refunds)
+      .where(eq(refunds.id, id))
+      .limit(1);
+    return row as
+      | {
+          id: string;
+          ownerId: string;
+          chargeId: string;
+          status: RefundStatus;
+          amountCents: number;
+          instrument: RefundInstrument;
+          reason: string | null;
+          superseded: boolean;
+        }
+      | undefined;
+  },
+
+  /**
+   * The `withdrawn` put-back, **defined by arithmetic** (P22 brief B-5, Fable M3; amendment
+   * A2, DECISIONS 303), never by note text. The chain is the head and every row it retries,
+   * back to the first refund. For each lot, the sum of every `credit_ledger` row on it that
+   * carries the `refund_id` of ANY row of the chain — the mint's removal, a hand removal
+   * that named one of them, an earlier put-back — and, where that sum is below 0, its
+   * negation goes back on that lot, naming the chain's FIRST refund. A put-back carries that
+   * id, so a second one finds a sum of 0: exactly once, by arithmetic.
+   *
+   * The pools are locked in ONE `lockPools` call (it sorts its keys; two calls could
+   * deadlock), and every sum is read after it. The lots are learned first, unlocked; a row
+   * naming the chain that lands on a lot of an unlocked pool in between makes this throw,
+   * writing nothing, rather than miss it.
+   */
+  async withdrawnPutBacks(
+    tx: Tx,
+    headId: string,
+  ): Promise<{ lot: PutBackLot; credits: number; firstRefundId: string }[]> {
+    const chain = await tx.execute(sql`
+      WITH RECURSIVE chain(id, retry_of) AS (
+        SELECT id, retry_of_refund_id FROM refunds WHERE id = ${headId}
+        UNION ALL
+        SELECT r.id, r.retry_of_refund_id FROM refunds r JOIN chain c ON r.id = c.retry_of
+      )
+      SELECT id, retry_of AS "retryOf" FROM chain`);
+    const links = chain.rows as { id: string; retryOf: string | null }[];
+    const first = links.find((link) => link.retryOf === null);
+    if (first === undefined)
+      throw new Error(`refund ${headId}: its retry chain has no first refund`);
+    const ids = sql.join(
+      links.map((link) => sql`${link.id}::uuid`),
+      sql`, `,
+    );
+    const lotsOf = async (): Promise<PutBackLot[]> => {
+      const res = await tx.execute(sql`
+        SELECT DISTINCT lot.id, lot.owner_id AS "ownerId", lot.location, lot.mode, lot.tier
+          FROM credit_ledger x JOIN credit_ledger lot ON lot.id = x.lot_id
+         WHERE x.refund_id IN (${ids})`);
+      return res.rows as unknown as PutBackLot[];
+    };
+    const lots = await lotsOf();
+    if (lots.length === 0) return [];
+    await lockPools(tx, lots);
+    const locked = new Set(lots.map((lot) => lot.id));
+    const after = await lotsOf();
+    if (after.some((lot) => !locked.has(lot.id))) {
+      throw new Error(
+        `refund ${headId}: a credit row naming its chain landed while it was being closed; nothing was written, so close it again`,
+      );
+    }
+    const sums = await tx.execute(sql`
+      SELECT x.lot_id AS "lotId", SUM(x.delta)::int AS total
+        FROM credit_ledger x
+       WHERE x.refund_id IN (${ids}) AND x.lot_id IS NOT NULL
+       GROUP BY x.lot_id`);
+    const byLot = new Map(lots.map((lot) => [lot.id, lot]));
+    return (sums.rows as { lotId: string; total: number }[])
+      .filter((sum) => sum.total < 0)
+      .map((sum) => ({ lot: byLot.get(sum.lotId)!, credits: -sum.total, firstRefundId: first.id }))
+      .sort((a, b) => (a.lot.id < b.lot.id ? -1 : 1));
   },
 
   /**
@@ -1079,6 +1519,153 @@ export const refundsRepository = {
       .where(and(eq(refunds.id, args.id), isNull(refunds.stripeRefundId)))
       .returning({ id: refunds.id });
     return updated.length;
+  },
+
+  /**
+   * P22 B-7(a), the P15 note's row 15: a `pending` refund Stripe holds (a stored `re_`) and
+   * no terminal event has reached. The poll's CLAIM: rows not looked at since `lookedBefore`
+   * (an hour, `REFUND_STATUS_POLL_MINUTES`), leased by moving `updated_at`, as
+   * {@link claimStalePendingForRetry} does. The poll only retrieves and applies: it **never
+   * moves a row by the clock** (146(c): a card refund can sit `pending` on a thin balance,
+   * and a failure can take 30 days).
+   */
+  async claimPendingWithStripeIdForPoll(
+    tx: Tx,
+    args: { lookedBefore: Date; limit?: number },
+  ): Promise<RefundRow[]> {
+    const due = await tx
+      .select({ id: refunds.id })
+      .from(refunds)
+      .where(
+        and(
+          eq(refunds.status, 'pending'),
+          isNotNull(refunds.stripeRefundId),
+          lte(refunds.updatedAt, args.lookedBefore.toISOString()),
+        ),
+      )
+      .orderBy(asc(refunds.updatedAt))
+      .limit(args.limit ?? 25)
+      .for('update', { skipLocked: true });
+    if (due.length === 0) return [];
+    return tx
+      .update(refunds)
+      .set({ updatedAt: sql`now()` })
+      .where(inArray(refunds.id, due.map((r) => r.id)))
+      .returning(REFUND_PROJECTION);
+  },
+
+  /**
+   * P22 B-7(b): the hourly look-up's CLAIM for re-keyed rows (pending, no `re_`, a fresh
+   * key: {@link rekeyedRefundKey}). Leased on `updated_at`, because a re-keyed row's send
+   * instant is in its key, not its touch column.
+   */
+  async claimRekeyedForLookUp(
+    tx: Tx,
+    args: { lookedBefore: Date; limit?: number },
+  ): Promise<RefundRow[]> {
+    const due = await tx
+      .select({ id: refunds.id })
+      .from(refunds)
+      .where(
+        and(
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          like(refunds.stripeIdempotencyKey, `${REKEYED_REFUND_KEY_PREFIX}%`),
+          lte(refunds.updatedAt, args.lookedBefore.toISOString()),
+        ),
+      )
+      .orderBy(asc(refunds.updatedAt))
+      .limit(args.limit ?? 25)
+      .for('update', { skipLocked: true });
+    if (due.length === 0) return [];
+    return tx
+      .update(refunds)
+      .set({ updatedAt: sql`now()` })
+      .where(inArray(refunds.id, due.map((r) => r.id)))
+      .returning(REFUND_PROJECTION);
+  },
+
+  /**
+   * P22 B-7(b)'s end state for a STAFF refund Stripe could not be reached for: pending, no
+   * `re_`, its original key, out of the retry window (`mintedBefore`), and its last send
+   * (`updated_at`, which only the mint and the retry claim move on such a row) before
+   * `sentBefore`, so Stripe's key window has passed. Read only: it is acted on once, and a
+   * concurrent tick's second act is refused by {@link failUnsentPending}'s guard. Automatic
+   * rows outside B-7(b) keep today's abandon classes.
+   */
+  async findUnsentStaffPastWindow(
+    runner: Runner,
+    args: { mintedBefore: Date; sentBefore: Date; limit?: number },
+  ): Promise<RefundRow[]> {
+    return runner
+      .select(REFUND_PROJECTION)
+      .from(refunds)
+      .where(
+        and(
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          isNotNull(refunds.issuedByStaffId),
+          isNotNull(refunds.stripeIdempotencyKey),
+          notLike(refunds.stripeIdempotencyKey, `${REKEYED_REFUND_KEY_PREFIX}%`),
+          lte(refunds.createdAt, args.mintedBefore.toISOString()),
+          lte(refunds.updatedAt, args.sentBefore.toISOString()),
+        ),
+      )
+      .orderBy(asc(refunds.createdAt))
+      .limit(args.limit ?? 25);
+  },
+
+  /**
+   * P22 B-7(b) 3: write the fresh key onto the row, in its own committed transaction,
+   * BEFORE it is sent: so a process killed between the two leaves the row holding the key
+   * Stripe may have seen, and the look-up and every later read agree with Stripe. Guarded
+   * on `pending`, the old key and `stripe_refund_id IS NULL`; `false` means the row moved,
+   * and nothing is sent.
+   */
+  async rekeyUnsentPending(
+    tx: Tx,
+    args: { id: string; fromKey: string; toKey: string },
+  ): Promise<boolean> {
+    const updated = await tx
+      .update(refunds)
+      .set({ stripeIdempotencyKey: args.toKey, updatedAt: sql`now()` })
+      .where(
+        and(
+          eq(refunds.id, args.id),
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          eq(refunds.stripeIdempotencyKey, args.fromKey),
+        ),
+      )
+      .returning({ id: refunds.id });
+    return updated.length > 0;
+  },
+
+  /**
+   * `pending → failed` for a row Stripe holds NO refund for (P22): a create Stripe refused
+   * (B-7(c)), or a row whose key window has passed with no refund at Stripe carrying its id
+   * (B-7(b)'s end state). One guarded UPDATE, so a `re_` stored by a late reply, or a key
+   * rewritten, between the caller's look and this write is never overwritten. The caller
+   * holds the charge lock. Opens *Retry to card* and *Returned*, and lifts the
+   * `refund_in_flight` the row held over its payment.
+   */
+  async failUnsentPending(
+    tx: Tx,
+    args: { id: string; stripeIdempotencyKey: string },
+  ): Promise<boolean> {
+    const updated = await tx
+      .update(refunds)
+      .set({ status: 'failed', updatedAt: sql`now()` })
+      .where(
+        and(
+          eq(refunds.id, args.id),
+          eq(refunds.status, 'pending'),
+          isNull(refunds.stripeRefundId),
+          eq(refunds.stripeIdempotencyKey, args.stripeIdempotencyKey),
+        ),
+      )
+      .returning({ id: refunds.id });
+    return updated.length > 0;
   },
 
   /**
@@ -1168,6 +1755,12 @@ export const refundsRepository = {
           isNull(refunds.stripeRefundId),
           lte(refunds.updatedAt, args.staleBefore.toISOString()),
           gt(refunds.createdAt, args.mintedAfter.toISOString()),
+          // P22 B-7(b): a re-keyed row had its one send under its fresh key; no re-fire,
+          // ever (the look-up lane asks Stripe about it instead).
+          or(
+            isNull(refunds.stripeIdempotencyKey),
+            notLike(refunds.stripeIdempotencyKey, `${REKEYED_REFUND_KEY_PREFIX}%`),
+          ),
           or(
             // Lane 1 — the row carries the exact key its first attempt used.
             isNotNull(refunds.stripeIdempotencyKey),
@@ -1253,11 +1846,15 @@ export const refundsRepository = {
     // cannot disagree about what a row is — and the caller alarms on counts, not
     // on page presence.
     const abandonedWhere = or(
-      // Unsent and past the key window: nothing automatic will send it now.
+      // Unsent and past the key window: nothing automatic will send it now. A re-keyed row
+      // (B-7(b)) joins at once, whatever its age: its fresh key has had its one send.
       and(
         eq(refunds.status, 'pending'),
         isNull(refunds.stripeRefundId),
-        lte(refunds.createdAt, args.mintedBefore.toISOString()),
+        or(
+          lte(refunds.createdAt, args.mintedBefore.toISOString()),
+          like(refunds.stripeIdempotencyKey, `${REKEYED_REFUND_KEY_PREFIX}%`),
+        ),
       ),
       // Sent, then failed AT Stripe. Terminal, unbounded by age (see the doc).
       eq(refunds.status, 'failed'),
@@ -1271,10 +1868,16 @@ export const refundsRepository = {
      * pass stays ONE query and cannot disagree with the page about what a row
      * is (the round-4 lesson that produced the companion-query design).
      */
+    // A row closed `withdrawn` moved no money and counts nowhere money is summed (6.0.0;
+    // design §2.7:4242-4248), here too: counted, it would hide what the charge still owes.
     const remainderRawExpr = sql<number>`COALESCE(${charges.amountCents}, 0) - COALESCE((
         SELECT SUM(r2.amount_cents)::int FROM refunds r2
         WHERE r2.charge_id = ${refunds.chargeId} AND r2.status <> 'failed'
+          AND r2.resolved_outcome IS DISTINCT FROM 'withdrawn'
       ), 0)`;
+    const supersededExpr = sql<boolean>`EXISTS (
+        SELECT 1 FROM refunds r3 WHERE r3.retry_of_refund_id = ${refunds.id}
+      )`;
     const remainingCents = sql<number>`GREATEST(${remainderRawExpr}, 0)`;
     // The UNFLOORED value, for the MR-A3.2 assembly only. The floor is right
     // for the published `remainingCents` (a negative remainder is not a
@@ -1291,6 +1894,9 @@ export const refundsRepository = {
         stripePaymentIntentId: charges.stripePaymentIntentId,
         remainingCents,
         remainderRawCents,
+        amountCents: refunds.amountCents,
+        superseded: supersededExpr,
+        issuedByStaffId: refunds.issuedByStaffId,
       })
       .from(refunds)
       .leftJoin(charges, eq(refunds.chargeId, charges.id))
@@ -1299,7 +1905,9 @@ export const refundsRepository = {
       'row-keyed': 0,
       'client-keyed': 0,
       'never-sent': 0,
+      'awaiting-stripe': 0,
       'stripe-failed': 0,
+      'failed-exceeds-owed': 0,
       covered: 0,
     };
     for (const input of classInputs) {
@@ -1311,6 +1919,9 @@ export const refundsRepository = {
           piId: input.stripePaymentIntentId,
           stripeIdempotencyKey: input.stripeIdempotencyKey,
           remainingCents: input.remainingCents,
+          amountCents: input.amountCents,
+          superseded: input.superseded,
+          issuedByStaff: input.issuedByStaffId !== null,
         })
       ] += 1;
     }
@@ -1322,6 +1933,9 @@ export const refundsRepository = {
         stripePaymentIntentId: charges.stripePaymentIntentId,
         remainingCents,
         remainderRawCents,
+        superseded: supersededExpr,
+        issuedByStaffId: refunds.issuedByStaffId,
+        chargeStatus: charges.status,
       })
       .from(refunds)
       .leftJoin(charges, eq(refunds.chargeId, charges.id))
@@ -1351,19 +1965,36 @@ export const refundsRepository = {
       // shouting set the allocation below divides the cap among.
       rows: allocateActionableFigures(
         rows
-          .map(({ reason, createdAt, remainderRawCents: remainderRaw, ...row }) => ({
-            ...row,
-            createdAt,
-            remainderRawCents: remainderRaw,
-            refundClass: classifyAbandoned({
-              status: row.status,
+          .map(
+            ({
               reason,
               createdAt,
-              piId: row.stripePaymentIntentId,
-              stripeIdempotencyKey: row.stripeIdempotencyKey,
-              remainingCents: row.remainingCents,
+              remainderRawCents: remainderRaw,
+              superseded,
+              issuedByStaffId,
+              chargeStatus,
+              ...row
+            }) => ({
+              ...row,
+              createdAt,
+              remainderRawCents: remainderRaw,
+              seenOn:
+                chargeStatus === 'succeeded' || chargeStatus === 'refunded'
+                  ? "the family's payment history (Owner → Invoices and Payments)"
+                  : 'no portal screen until End of day (P25): its charge is held failed, so the payment history does not list it',
+              refundClass: classifyAbandoned({
+                status: row.status,
+                reason,
+                createdAt,
+                piId: row.stripePaymentIntentId,
+                stripeIdempotencyKey: row.stripeIdempotencyKey,
+                remainingCents: row.remainingCents,
+                amountCents: row.amountCents,
+                superseded,
+                issuedByStaff: issuedByStaffId !== null,
+              }),
             }),
-          }))
+          )
           .filter((row) => row.refundClass !== 'covered'),
       ),
       totalByClass,
@@ -1443,6 +2074,7 @@ export const refundsRepository = {
       // Known by the predicate that selected it — the charge has no PI.
       stripePaymentIntentId: null,
       refundClass: 'never-sent' as const,
+      seenOn: "the family's payment history, or no screen when its charge took no money",
       // 0 because THIS ROW now covers the charge's remainder — the flip just
       // moved it into the non-failed set — NOT because nothing is owed
       // (corrected MR-A2.5(d)3). The obligation is real and is the row's own
@@ -1470,7 +2102,7 @@ export const refundsRepository = {
    * moved it in between, and every decision after the lock must be made on what
    * is true now.
    */
-  async findById(tx: Tx, id: string): Promise<RefundRow | undefined> {
+  async findById(tx: Runner, id: string): Promise<RefundRow | undefined> {
     const [row] = await tx
       .select(REFUND_PROJECTION)
       .from(refunds)
@@ -1479,7 +2111,10 @@ export const refundsRepository = {
     return row;
   },
 
-  async findByStripeRefundId(tx: Tx, stripeRefundId: string): Promise<RefundRow | undefined> {
+  async findByStripeRefundId(
+    tx: Runner,
+    stripeRefundId: string,
+  ): Promise<RefundRow | undefined> {
     const [row] = await tx
       .select(REFUND_PROJECTION)
       .from(refunds)
@@ -1489,12 +2124,14 @@ export const refundsRepository = {
   },
 
   /**
-   * Fallback lookup for the race case (`charge.refund.updated` arrived
-   * before the cancel-route postCommit persisted `stripe_refund_id`).
-   * Matches on (charge_id, amount_cents, status='pending',
-   * stripe_refund_id IS NULL). In practice the cancel route emits one
-   * 'pending' row per refund — multi-row collisions on the same
-   * (charge, amount) shouldn't happen, but the most recent wins.
+   * The AMOUNT FALLBACK, step 3 of the apply function's match order (P22, Fable H3): a
+   * refund carrying no `metadata.refund_id` is matched onto a `pending` row of this charge
+   * with no `re_`, of the same amount, and **no `issued_by_staff_id`**. It stays for rows
+   * minted before P22, whose creates carried no metadata. A staff row is P22's, so its
+   * refund always carries the metadata and is never matched by amount: two of Shanthi's
+   * $57.00 refunds waiting on their replies must never trade events. The residue, named:
+   * a dashboard refund of the same amount as an automatic row still waiting for its `re_`
+   * is written onto that row. The most recent wins.
    */
   async findUnmatchedPendingForCharge(
     tx: Tx,
@@ -1509,6 +2146,7 @@ export const refundsRepository = {
           eq(refunds.amountCents, args.amountCents),
           eq(refunds.status, 'pending'),
           isNull(refunds.stripeRefundId),
+          isNull(refunds.issuedByStaffId),
         ),
       )
       .orderBy(sql`created_at DESC`)
@@ -1517,22 +2155,33 @@ export const refundsRepository = {
   },
 
   /**
-   * Flip refund status (Day-15 webhook). Stamps `updated_at = now()`.
-   * Optionally also writes `stripe_refund_id` so the race-recovery path
-   * (matched via `findUnmatchedPendingForCharge`) can backfill the id
-   * in the same write.
+   * Move a refund along its state machine ({@link REFUND_STATUS_FROM}): `pending →
+   * succeeded | failed`, and the one backwards edge `succeeded → failed`. **Every other
+   * write is refused** (6.0.0, design §2.7:4227-4228), by throwing
+   * {@link RefundStatusTransitionError}: a stale `succeeded` over a `failed` row would
+   * close the cap on money that never went back, and the row would still offer *Retry to
+   * card*. Its callers are the one apply function (`refundApply.ts`), which decides under
+   * the charge lock, and the refused-at-create arm, so a throw here is a defect. Stamps
+   * `updated_at = now()`.
    */
-  async markStatus(
-    tx: Tx,
-    args: { id: string; status: RefundStatus; stripeRefundId?: string },
-  ): Promise<void> {
-    const set: Record<string, unknown> = {
-      status: args.status,
-      updatedAt: sql`now()`,
-    };
-    if (args.stripeRefundId !== undefined) {
-      set.stripeRefundId = args.stripeRefundId;
+  async markStatus(tx: Tx, args: { id: string; status: RefundStatus }): Promise<void> {
+    const from = REFUND_STATUS_FROM[args.status] ?? [];
+    const updated =
+      from.length === 0
+        ? []
+        : await tx
+            .update(refunds)
+            .set({ status: args.status, updatedAt: sql`now()` })
+            .where(and(eq(refunds.id, args.id), inArray(refunds.status, [...from])))
+            .returning({ id: refunds.id });
+    if (updated.length === 0) {
+      const [row] = await tx
+        .select({ status: refunds.status })
+        .from(refunds)
+        .where(eq(refunds.id, args.id));
+      throw new RefundStatusTransitionError(
+        `refund ${args.id}: ${row?.status ?? 'no such row'} → ${args.status} is not a move the refund state machine has`,
+      );
     }
-    await tx.update(refunds).set(set).where(eq(refunds.id, args.id));
   },
 };

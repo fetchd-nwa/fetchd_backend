@@ -39,6 +39,7 @@ import { registerStaffOrdersRoute } from './routes/staffOrders.js';
 import { registerStaffOwnersRoute } from './routes/staffOwners.js';
 import { registerStaffDogsRoute } from './routes/staffDogs.js';
 import { registerStaffRatesRoute } from './routes/staffRates.js';
+import { registerStaffRefundsRoute } from './routes/staffRefunds.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
 import { registerStaffSettingsRoute } from './routes/staffSettings.js';
@@ -137,6 +138,7 @@ export function buildApp(): FastifyInstance {
   registerStaffDayCapacityRoute(app); // [staff] — PUT/DELETE one date's cap (4.0.0-lg3.1)
   registerStaffCreditPackagesRoute(app); // [staff] — a catalog row's expiry window (CRED-U08)
   registerStaffCreditsRoute(app); // [staff] — an owner's pools, hand edits, a lot's date (CRED-U14, CRED-U15)
+  registerStaffRefundsRoute(app); // [staff] — the refund proposal, the refund, Retry to card, Returned (S35, wire 6.0.0)
   registerStaffSettingsRoute(app); // [staff] — GET/PATCH /staff/settings/:domain[/:location] (2.0.0)
   registerStaffAlumniRoute(app); // [staff] — §J.3 completed-programs record + alumni-flag clear
   registerStaffInvoicesRoute(app); // [staff] — GET /staff/invoices/:id (2.0.0)

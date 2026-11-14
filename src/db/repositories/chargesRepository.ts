@@ -197,6 +197,17 @@ function watchDue(at: Date | undefined): SQL | undefined {
   return and(eq(charges.status, 'failed'), sql`${charges.nextSweepAt} <= ${leaseInstant(at)}`);
 }
 
+/** Thrown by {@link chargesRepository.markStatus} for a backwards write. */
+export class ChargeStatusTransitionError extends Error {}
+
+/** `markStatus`'s moves: the target, and the statuses it may be written from. */
+const CHARGE_STATUS_FROM: Record<ChargeStatus, readonly ChargeStatus[]> = {
+  requires_payment: ['requires_payment'],
+  succeeded: ['requires_payment', 'failed', 'succeeded'],
+  failed: ['requires_payment', 'failed'],
+  refunded: ['succeeded', 'failed', 'refunded'],
+};
+
 export const chargesRepository = {
 
   /**
@@ -509,7 +520,7 @@ export const chargesRepository = {
    * inside the contract tests to assert the post-purchase write landed.
    */
   async findByStripePaymentIntentId(
-    tx: Tx,
+    tx: Tx | typeof db,
     stripePaymentIntentId: string,
   ): Promise<ChargeRow | undefined> {
     const [row] = await tx
@@ -521,17 +532,51 @@ export const chargesRepository = {
   },
 
   /**
-   * Flip a charge's status (`requires_payment` → `succeeded` / `failed`).
-   * Stamps `updated_at = now()`. Idempotent — calling with the same target
-   * status is a no-op write. Used by Day-15 webhook on terminal Stripe
-   * events; surfaced here so the test-mode synchronous confirm path can
-   * write a definitive status without round-tripping through the webhook.
+   * Move a charge's status forward (6.0.0, design §2.7:4227-4228: this writer refuses every
+   * backwards write). The moves, by target and the statuses it may be written FROM
+   * ({@link CHARGE_STATUS_FROM}): `requires_payment → succeeded | failed`; `failed →
+   * succeeded` (Stripe succeeds a PaymentIntent after an attempt failed, the off-engine
+   * `payment_intent.succeeded` arm); `succeeded | failed → refunded` (returned money covers
+   * it; a late success is held `failed` and refunded in full). A write at the status the row
+   * already holds stays a harmless no-op, as it always was. `refunded → succeeded | failed`
+   * is the backwards edge's recompute and has its own writer, {@link reopenRefunded}.
+   * Anything else throws {@link ChargeStatusTransitionError}. Stamps `updated_at = now()`.
+   * A missing row writes nothing, as before.
    */
   async markStatus(tx: Tx, args: { id: string; status: ChargeStatus }): Promise<void> {
+    const updated = await tx
+      .update(charges)
+      .set({ status: args.status, updatedAt: sql`now()` })
+      .where(
+        and(eq(charges.id, args.id), inArray(charges.status, [...CHARGE_STATUS_FROM[args.status]])),
+      )
+      .returning({ id: charges.id });
+    if (updated.length > 0) return;
+    const [row] = await tx
+      .select({ status: charges.status })
+      .from(charges)
+      .where(eq(charges.id, args.id));
+    if (row === undefined) return;
+    throw new ChargeStatusTransitionError(
+      `charge ${args.id}: ${row.status} → ${args.status} is a backwards write the charge state machine refuses`,
+    );
+  },
+
+  /**
+   * **The backwards edge's recompute** (P22, design §2.7:4220-4224): a refund that
+   * succeeded and then failed reopens the cap, and a charge it had flipped `refunded` goes
+   * back to the status it held before returned money covered it: `succeeded`, or `failed`
+   * for a late success (P15's state table, row 16: a failed late-success refund sits on a
+   * `failed` charge). Guarded on `refunded`, under the charge lock the caller holds.
+   */
+  async reopenRefunded(
+    tx: Tx,
+    args: { id: string; status: 'succeeded' | 'failed' },
+  ): Promise<void> {
     await tx
       .update(charges)
       .set({ status: args.status, updatedAt: sql`now()` })
-      .where(eq(charges.id, args.id));
+      .where(and(eq(charges.id, args.id), eq(charges.status, 'refunded')));
   },
 
   /**
@@ -671,13 +716,13 @@ export const chargesRepository = {
    * for the **one global lock order, charges → refunds** (MR-A1.2(ii)).
    *
    * Every transaction that locks rows in BOTH tables takes the charge first.
-   * `handleChargeRefundUpdated` uses this: it matches the refund row unlocked
-   * (its write-time status guards are what make that safe, the `markUnroutable`
-   * pattern), resolves the charge id, locks HERE, then re-reads the refund row
-   * under the held lock before writing. Before the conversion that handler wrote
-   * refunds-then-charges, which made a charge-first lock inside
-   * `markResolvedExternal` an AB-BA deadlock pair — so the fix for one had to be
-   * the fix for both.
+   * `applyLiveRefund` (`lib/refundApply.ts`) uses this: its callers resolve the
+   * charge id with no transaction open (the four refund events, the create's
+   * reply, the refund sweep's poll and look-up), it locks HERE first, and it reads
+   * and writes the refund rows only under the held lock. Before the conversion the
+   * webhook's refund handler wrote refunds-then-charges, which made a charge-first
+   * lock inside `markResolvedExternal` an AB-BA deadlock pair — so the fix for one
+   * had to be the fix for both.
    *
    * The refunds-ONLY writers are outside this order by construction and must
    * stay that way: `claimStalePendingForRetry` (`FOR UPDATE SKIP LOCKED` on

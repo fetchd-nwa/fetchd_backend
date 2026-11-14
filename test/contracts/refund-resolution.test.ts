@@ -149,19 +149,30 @@ async function chargeStatus(chargeId: string): Promise<string> {
   return row.status;
 }
 
-const resolve = (id: string, note: string, staffId?: string): Promise<number> =>
-  withActor(`staff:${staffId ?? 'interim-ops'}`, (tx) =>
+/**
+ * The verb as these money-residue tests drive it, read back as the count they assert (1 when
+ * the row changed, 0 for any refusal). Since P22 the verb answers a result, `staffId` is
+ * required and a card row closed `returned` names what crossed the desk, so the helper
+ * attests as Shanthi with a check unless a test names the staffer.
+ */
+const resolve = async (id: string, note: string, staffId?: string): Promise<number> => {
+  const result = await withActor(`staff:${staffId ?? FIXTURE_IDS.staffShanthiId}`, (tx) =>
     refundsRepository.markResolvedExternal(tx, {
       id,
       note,
-      ...(staffId !== undefined ? { staffId } : {}),
+      staffId: staffId ?? FIXTURE_IDS.staffShanthiId,
+      instrument: 'check',
     }),
   );
+  return result.kind === 'resolved' ? 1 : 0;
+};
 
 const nonFailedSum = (chargeId: string): Promise<number> =>
   withActor(WORKER_ACTOR, (tx) => refundsRepository.sumNonFailedForCharge(tx, chargeId));
 
-const mintProbe = (chargeId: string): ReturnType<typeof refundsRepository.mintCappedPendingRefund> =>
+const mintProbe = (
+  chargeId: string,
+): ReturnType<typeof refundsRepository.mintCappedPendingRefund> =>
   withActor(WORKER_ACTOR, (tx) =>
     refundsRepository.mintCappedPendingRefund(tx, {
       chargeId,
@@ -395,7 +406,10 @@ test(
       mintedBefore: new Date(Date.now() + 60 * 60 * 1000),
     });
     assert.equal(before.totalByClass['stripe-failed'], 1);
-    assert.ok(before.rows.some((r) => r.id === refundId), 'on the page today, forever');
+    assert.ok(
+      before.rows.some((r) => r.id === refundId),
+      'on the page today, forever',
+    );
 
     assert.equal(await resolve(refundId, 'returned by check #1042'), 1);
 
@@ -498,7 +512,7 @@ test(
 // ── 8. the adoption refusals (keep-pins) ──────────────────────────────────
 
 test(
-  '1.3 adoption refusals — never adopt over an in-flight refund, or onto an unknown charge',
+  '1.3 adoption — P22 (Fable H2): adopted over an in-flight refund of another amount; still never onto an unknown charge',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -523,26 +537,42 @@ test(
         status: 'succeeded',
       }),
     );
-    assert.equal(blocked.statusCode, 500, 'conservative: retry, never double-record one movement');
+    // Reversed at P22 (Fable H2): a staff card refund can sit `pending` for days, and the
+    // refusal sent Shanthi's dashboard refund back to Stripe on every delivery until Stripe
+    // gave up, so the cap never learned of that money. Every create now names its row in
+    // `metadata.refund_id`, so a refund matching no row is nobody's: it is recorded.
+    assert.equal(blocked.statusCode, 200, blocked.outcome);
+    assert.equal(blocked.outcome, 'adopted-out-of-band-refund');
     assert.equal(
       (await db.select().from(refunds).where(eq(refunds.chargeId, chargeId))).length,
-      1,
-      'no row was adopted over the in-flight one',
+      2,
+      'the dashboard refund is recorded beside the in-flight one',
     );
 
-    // No charge behind the PaymentIntent at all → unchanged retry behavior (an
-    // unknown PI may be an orphan-arm insert racing this delivery).
+    // No charge behind the PaymentIntent at all, and the refund names no row of ours.
+    // Reversed in P22 fix 1 (Opus r1 L3): this was a 500 on every delivery ("an unknown PI
+    // may be an orphan-arm insert racing this delivery"), but every payment the app takes
+    // has its charge row before money moves and every refund it creates names its row in
+    // `metadata.refund_id`, so no redelivery ever finds one. It is a payment taken
+    // elsewhere: answered 200, nothing written.
+    const unknownRe = `re_test_dash_${randomUUID().slice(0, 8)}`;
     const unknown = await postEvent(
       app,
       stripe,
       refundEvent({
-        refundId: `re_test_dash_${randomUUID().slice(0, 8)}`,
+        refundId: unknownRe,
         paymentIntentId: `pi_test_nobody_${randomUUID().slice(0, 8)}`,
         amountCents: 500,
         status: 'succeeded',
       }),
     );
-    assert.equal(unknown.statusCode, 500);
+    assert.equal(unknown.statusCode, 200);
+    assert.equal(unknown.outcome, 'orphan-event');
+    assert.equal(
+      (await db.select().from(refunds).where(eq(refunds.stripeRefundId, unknownRe))).length,
+      0,
+      'still never onto an unknown charge: recorded nowhere',
+    );
 
     // A FAILED dashboard refund adopts honestly and joins the report class: a
     // human tried, Stripe failed it again, the owner is still owed.
@@ -660,63 +690,38 @@ test(
 // attester. Two nullable columns now carry it.
 // ──────────────────────────────────────────────────────────────────────────
 
-test(
-  'MR-A1.1 — resolving stamps WHO and WHEN on the row itself',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { chargeId, amountCents } = await seedCharge({});
-    const refundId = await seedRefund({
-      chargeId,
-      amountCents,
-      status: 'failed',
-      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
-    });
+test('MR-A1.1 — resolving stamps WHO and WHEN on the row itself', SKIP_WHEN_NO_DB, async () => {
+  await cleanup();
+  const { chargeId, amountCents } = await seedCharge({});
+  const refundId = await seedRefund({
+    chargeId,
+    amountCents,
+    status: 'failed',
+    stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
+  });
 
-    const before = new Date(Date.now() - 1000);
-    assert.equal(
-      await resolve(refundId, 'dashboard re_1abc', FIXTURE_IDS.staffDonavanId),
-      1,
-    );
+  const before = new Date(Date.now() - 1000);
+  assert.equal(await resolve(refundId, 'dashboard re_1abc', FIXTURE_IDS.staffDonavanId), 1);
 
-    const row = await readRefund(refundId);
-    assert.equal(
-      row.resolvedByStaffId,
-      FIXTURE_IDS.staffDonavanId,
-      'RED before MR-A1.1: the column does not exist and NOTHING anywhere records WHO',
-    );
-    assert.ok(row.resolvedAt, 'and WHEN is a first-class fact, not a touch column');
-    assert.ok(
-      new Date(row.resolvedAt!).getTime() >= before.getTime(),
-      '`resolved_at` is stamped at the resolution, not inherited',
-    );
-    assert.equal(row.resolutionNote, 'dashboard re_1abc');
+  const row = await readRefund(refundId);
+  assert.equal(
+    row.resolvedByStaffId,
+    FIXTURE_IDS.staffDonavanId,
+    'RED before MR-A1.1: the column does not exist and NOTHING anywhere records WHO',
+  );
+  assert.ok(row.resolvedAt, 'and WHEN is a first-class fact, not a touch column');
+  assert.ok(
+    new Date(row.resolvedAt!).getTime() >= before.getTime(),
+    '`resolved_at` is stamped at the resolution, not inherited',
+  );
+  assert.equal(row.resolutionNote, 'dashboard re_1abc');
 
-    await cleanup();
-  },
-);
+  await cleanup();
+});
 
-test(
-  'MR-A1.1 — the interim-ops arc (no staff principal yet) leaves the FK NULL but still stamps WHEN + the note',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { chargeId, amountCents } = await seedCharge({});
-    const refundId = await seedRefund({ chargeId, amountCents, status: 'unroutable' });
-
-    assert.equal(await resolve(refundId, 'check #1042 — mailed by Shanthi 2026-08-24'), 1);
-    const row = await readRefund(refundId);
-    assert.equal(
-      row.resolvedByStaffId,
-      null,
-      'NULL means "resolved before the portal route existed" — the note names the human by convention',
-    );
-    assert.ok(row.resolvedAt, 'WHEN is stamped regardless');
-    assert.match(row.resolutionNote ?? '', /Shanthi/);
-
-    await cleanup();
-  },
-);
+// Deleted in P22 (wire 6.0.0): 'MR-A1.1 — the interim-ops arc (no staff principal yet) leaves
+// the FK NULL but still stamps WHEN + the note'. The arc is gone: the resolve-external route
+// makes `staffId` required (brief B-5), so no close can leave `resolved_by_staff_id` NULL.
 
 // ──────────────────────────────────────────────────────────────────────────
 // MR-A1.5 — the alarm nets against RETURNED COVERAGE
@@ -797,7 +802,8 @@ test(
     const report = await refundsRepository.findAbandonedPending(db, {
       mintedBefore: new Date(Date.now() + 60 * 60 * 1000),
     });
-    assert.equal(report.totalByClass['stripe-failed'], 1, 'still owed');
+    // P22 B-7(c), Fable M1: larger than the 6000c still owed, so its own class.
+    assert.equal(report.totalByClass['failed-exceeds-owed'], 1, 'still owed');
     const row = report.rows.find((r) => r.id === failedId);
     assert.ok(row);
     assert.equal(
@@ -868,7 +874,7 @@ test(
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'MR-A2.4 — a late failed→succeeded flip over a fully-covered charge is RECORDED and pages loudly',
+  'MR-A2.4, reversed at P22 by Fable M6 — a late succeeded on a row held failed is REFUSED and pages loudly: do not retry it',
   SKIP_WHEN_NO_DB,
   async () => {
     await cleanup();
@@ -911,30 +917,22 @@ test(
         status: 'succeeded',
       }),
     );
+    // P22 B-6 (Fable M6): the refund state machine has no `failed → succeeded`, and this
+    // row still offers *Retry to card*. The write is refused, and the page is one line
+    // through the receiver's logger saying so; the money question goes to a person.
     assert.equal(result.statusCode, 200);
-    assert.equal(result.outcome, 'flipped-refund-succeeded');
+    assert.equal(result.outcome, 'noop');
 
-    const flipped = await readRefund(failedId);
-    assert.equal(flipped.status, 'succeeded', 'Stripe truth is RECORDED — a false ledger is worse');
+    const held = await readRefund(failedId);
+    assert.equal(held.status, 'failed', 'the machine refuses the write');
 
     const alarm = capture.lines.find(
-      (line) => line.level === 50 && line.moneyEvent === 'refund-coverage-surplus',
+      (line) => line.level === 50 && line.moneyEvent === 'refund-succeeded-on-failed-row',
     );
-    assert.ok(
-      alarm,
-      'RED today: 20000c returned on a 10000c charge and NOBODY is told — the alarm IS the remedy here',
-    );
+    assert.ok(alarm, '20000c returned on a 10000c charge, and a person is told: do not retry it');
     assert.equal(alarm!.chargeId, chargeId);
-    assert.equal(alarm!.chargeAmountCents, 10_000);
-    assert.equal(alarm!.returnedCents, 20_000);
-    assert.equal(alarm!.surplusCents, 10_000, 'the delta a human has to chase');
-    assert.ok(Array.isArray(alarm!.refunds), 'the contributing rows are named');
-
-    assert.equal(
-      await chargeStatus(chargeId),
-      'refunded',
-      'the charge still flips — the >= rule anticipated exactly this',
-    );
+    assert.equal(alarm!.refundId, failedId);
+    assert.equal(alarm!.msg, 'Stripe reports this refund succeeded and the app holds it failed; do not retry it.');
     assert.equal(
       (await mintProbe(chargeId)).kind,
       'nothing-to-refund',
@@ -1099,6 +1097,11 @@ test(
         capture.lines.push({ ...obj, msg, level: 50 }),
     };
     const stripe = makeStripeStub();
+    // P22 B-6: every arm retrieves the refund, so Stripe holds the ONE refund both
+    // deliveries carry (it was two `re_` ids here, which since B-6 are two refunds: the
+    // second is recorded as the money it is).
+    assert.ok(paymentIntentId, 'the seeded charge carries a PaymentIntent');
+    const theRefund = stripe.plantRefund({ paymentIntentId, amountCents: 10_000, status: 'succeeded' });
     const deliver = (re: string): Promise<{ outcome: string }> =>
       dispatchStripeEvent(
         refundEvent({
@@ -1110,9 +1113,9 @@ test(
         { stripe, log },
       );
 
-    const first = deliver(`re_test_a_${randomUUID().slice(0, 8)}`);
+    const first = deliver(theRefund);
     await new Promise((r) => setTimeout(r, 40));
-    const second = deliver(`re_test_b_${randomUUID().slice(0, 8)}`);
+    const second = deliver(theRefund);
     await new Promise((r) => setTimeout(r, 250));
     releaseLock();
     await holder;

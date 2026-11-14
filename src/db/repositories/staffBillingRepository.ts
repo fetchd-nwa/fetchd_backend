@@ -44,6 +44,8 @@ export interface PaymentCapRow {
 
 export interface PaymentHistoryRow extends PaymentCapRow {
   status: ChargeStatus;
+  /** `StaffPaymentWire.stripe_payment_intent_id` (6.0.0): never on an invoice read. */
+  stripePaymentIntentId: string | null;
   purpose: ChargePurpose;
   createdAt: string;
   dogId: string | null;
@@ -56,6 +58,8 @@ export interface PaymentRefundRow {
   amountCents: number;
   status: RefundStatus;
   reason: string | null;
+  /** `StaffPaymentRefundWire.retry_of_refund_id` (6.0.0, D16). */
+  retryOfRefundId: string | null;
   createdAt: string;
 }
 
@@ -76,9 +80,11 @@ const INVOICE_PROJECTION = {
  * The refund cap, correlated per charge row so a list is one query (wire
  * contract notes J5; the arithmetic of `refundsRepository.sumNonFailedForCharge`
  * and of its report's `remainingCents`): the charge's `amount_cents` minus
- * every refund on it whose status is not `failed`, floored at 0. Until M5.10
- * adds `refunds.resolved_outcome`, every `resolved-external` row means the
- * money was returned, so it counts; a `withdrawn` hand-back will not.
+ * every refund on it that counts, floored at 0. A refund counts unless its
+ * status is `failed` or *Returned* closed it `withdrawn` (6.0.0; design
+ * §2.7:4242-4251): a `resolved-external` row with no outcome was closed before
+ * 6.0.0, was money returned, and counts (D5). `refundsRepository
+ * .capRemainingForCharge` is its twin, and a table test holds the two equal.
  *
  * The outer row is spelled `charges.…`, never `${charges.id}`: in a one-table
  * select drizzle renders a column bare (`"id"`), which inside the subquery
@@ -87,6 +93,7 @@ const INVOICE_PROJECTION = {
 const REFUNDABLE_CENTS = sql<number>`GREATEST(charges.amount_cents - COALESCE((
     SELECT SUM(r.amount_cents) FROM refunds r
      WHERE r.charge_id = charges.id AND r.status <> 'failed'
+       AND r.resolved_outcome IS DISTINCT FROM 'withdrawn'
   ), 0), 0)::int`;
 
 export const staffBillingRepository = {
@@ -139,6 +146,7 @@ export const staffBillingRepository = {
         paidCents: charges.amountCents,
         refundableCents: REFUNDABLE_CENTS,
         status: charges.status,
+        stripePaymentIntentId: charges.stripePaymentIntentId,
         purpose: charges.purpose,
         createdAt: charges.createdAt,
         dogId: charges.dogId,
@@ -164,6 +172,7 @@ export const staffBillingRepository = {
         amountCents: refunds.amountCents,
         status: refunds.status,
         reason: refunds.reason,
+        retryOfRefundId: refunds.retryOfRefundId,
         createdAt: refunds.createdAt,
       })
       .from(refunds)

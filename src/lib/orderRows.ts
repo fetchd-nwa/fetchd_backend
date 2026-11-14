@@ -146,6 +146,14 @@ export type CancellationNotice =
       event: 'picked-up-early' | 'sent-home' | 'turned-away' | 'didnt-come';
       dogName: string;
       credit: CreditLanding;
+      /**
+       * The session's instant, when the verb was recorded on a later Chicago day than the
+       * session's (a past day's board: *Didn't come* is recordable on any session dated
+       * today or earlier, `noShowInTx`). *Didn't come* then names that day, "didn't come on
+       * Thu 12 Nov", never "today" (P21's carry 0a, Opus r2 L3). Absent on the session's
+       * own day, where §2.9's "didn't come today" is true. The other arms name no day.
+       */
+      pastSessionAtIso?: string;
     };
 
 const CHICAGO = 'America/Chicago';
@@ -191,6 +199,16 @@ export function creditLines(landings: readonly CreditLanding[]): string[] {
   return [...merged.values()].map(creditLine);
 }
 
+/** "Fri 16 Oct": a session's day, in Chicago, as every who-line names it. */
+function sessionDay(iso: string): string {
+  return new Date(iso).toLocaleDateString('en-GB', {
+    timeZone: CHICAGO,
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+  });
+}
+
 const WHO_AT_THE_DOOR: Record<
   Extract<CancellationNotice, { kind: 'staff-return' }>['event'],
   string
@@ -218,15 +236,18 @@ function namesOf(dogNames: readonly string[]): string {
   return `${dogNames.slice(0, -1).join(', ')} and ${dogNames[dogNames.length - 1]}`;
 }
 
+/** What the door decided, as the staff-return who-line says it. */
+function atTheDoor(notice: Extract<CancellationNotice, { kind: 'staff-return' }>): string {
+  if (notice.event === 'didnt-come' && notice.pastSessionAtIso !== undefined) {
+    return `didn't come on ${sessionDay(notice.pastSessionAtIso)}`;
+  }
+  return WHO_AT_THE_DOOR[notice.event];
+}
+
 export function cancellationBody(notice: CancellationNotice): string {
   switch (notice.kind) {
     case 'cancel': {
-      const day = new Date(notice.scheduledAtIso).toLocaleDateString('en-GB', {
-        timeZone: CHICAGO,
-        weekday: 'short',
-        day: 'numeric',
-        month: 'short',
-      });
+      const day = sessionDay(notice.scheduledAtIso);
       const whose = `${namesOf(notice.dogNames)}'s ${PROGRAM[notice.category]}`;
       const who =
         notice.who.by === 'owner'
@@ -237,7 +258,7 @@ export function cancellationBody(notice: CancellationNotice): string {
       return [who, ...creditLines(notice.credits)].map((sentence) => `${sentence}.`).join(' ');
     }
     case 'staff-return':
-      return `${notice.dogName} ${WHO_AT_THE_DOOR[notice.event]}. ${creditLine(notice.credit)}.`;
+      return `${notice.dogName} ${atTheDoor(notice)}. ${creditLine(notice.credit)}.`;
   }
 }
 
@@ -336,6 +357,8 @@ export async function noticeCreditReturned(
           kind: 'staff-return';
           event: Extract<CancellationNotice, { kind: 'staff-return' }>['event'];
           eventId: string;
+          /** The session's instant when it was for an earlier day than the verb's. */
+          pastSessionAtIso?: string;
         };
     log: NoticeLog;
   },
@@ -362,6 +385,9 @@ export async function noticeCreditReturned(
               event: args.who.event,
               dogName: dog.name,
               credit,
+              ...(args.who.pastSessionAtIso !== undefined
+                ? { pastSessionAtIso: args.who.pastSessionAtIso }
+                : {}),
             })
           : cancellationBody({
               kind: 'cancel',

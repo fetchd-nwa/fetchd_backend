@@ -60,16 +60,20 @@
  * which, and the bump rules above apply step to step. LG1: 2.0.0-lg1.1 (P01,
  * additive), 2.0.0-lg1.2 (P02, breaking), 2.0.0 (P03, additive, LG1's close).
  * LG2, M1's part (design 3.0.0's S05 and S17 only): 3.0.0-lg2.1 (P05,
- * breaking), 3.0.0 (P12, breaking, its close). The rest of design 3.0.0
- * ships after M1 as 7.0.0 (LG2b), so a design label from 6.1.0 up reads one
- * major up here; 4.0.0, 5.0.0 and 6.0.0 keep theirs (build DECISIONS 6;
- * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
+ * breaking), 3.0.0 (P12, breaking, its close). Design labels up to 6.0.0
+ * are build labels too. After 6.0.0 the build ships in its own order, so a
+ * design label from 6.1.0 up is read through plan.json `wire_label_map` (the
+ * 11-10 re-plan; build DECISIONS 6, 229, 238): design 6.1.0 ships as build
+ * 11.1.0, design 7.0.0 as 12.0.0, design 8.0.0 as 10.0.0, and the rest of
+ * design 3.0.0 (LG2b) as 11.0.0. Some older sentences below still use the
+ * 11-02 map, under which design 6.1.0 read as 7.1.0 and design 7.0.0 as
+ * 8.0.0. LG3: 4.0.0-lg3.1 (P13, breaking),
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close). LG4:
  * 5.0.0-lg4.1 (P17, breaking), 5.0.0-lg4.2 (P18, breaking), 5.0.0 (P19,
  * additive, its close). LG5: 6.0.0-lg5.1 (P20, breaking), 6.0.0-lg5.2 (P21,
- * breaking).
+ * breaking), 6.0.0 (P22, additive, its close).
  */
-export const WIRE_CONTRACT_VERSION = '6.0.0-lg5.2';
+export const WIRE_CONTRACT_VERSION = '6.0.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -219,6 +223,15 @@ export const WIRE_CONTRACT_VERSION = '6.0.0-lg5.2';
  * appended, never inserted (design §1.1:1083-1085, §2.3:2558-2564; DAY-U43):
  * `'after_school_full'`, 422, with `details` (`AfterSchoolFullDetails`).
  * `POST /bookings` is its one route.
+ *
+ * 6.0.0 appends six thrown codes, the 50th to the 55th, after
+ * `'after_school_full'` — appended, never inserted (design §1.1:1094-1133,
+ * §2.7:4163-4334; PAY-U24, PAY-U25, PAY-U27): `'refund_role_required'`, 403;
+ * `'over_cap'`, `'instrument_unavailable'` and `'instrument_mismatch'`, each
+ * 422; `'refund_superseded'` and `'refund_in_flight'`, each 409. None carries
+ * `details`: the code is the whole signal. The refund routes (§ refunds) say
+ * which each answers. `'instrument_mismatch'` is typed here and thrown by no
+ * route until build 11.1.0 (design 6.1.0), when a charge can be paid by hand.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -270,7 +283,13 @@ export type ApiErrorCode =
   | 'attendance_state_conflict' // board verb blocked — the dog's folded state does not allow it (6.0.0-lg5.1)
   | 'session_not_today' // board verb blocked — the session's date is not one this verb takes (6.0.0-lg5.1)
   | 'no_show_too_early' // *Didn't come* blocked — before `day.pickup_close_time` on the date (6.0.0-lg5.1)
-  | 'after_school_full'; // booking blocked — a date's after-school session cannot take the dogs ticked for it (6.0.0-lg5.2)
+  | 'after_school_full' // booking blocked — a date's after-school session cannot take the dogs ticked for it (6.0.0-lg5.2)
+  | 'refund_role_required' // refund blocked — the role is off `staff.refund_role_list` (a new refund: and over the any-role limit) (6.0.0)
+  | 'over_cap' // refund blocked — more money than the payment can still return (6.0.0)
+  | 'instrument_unavailable' // refund blocked — cash or check, before a charge can be paid by hand (6.0.0)
+  | 'instrument_mismatch' // refund blocked — the instrument does not match how the charge was paid (6.0.0; thrown from build 11.1.0)
+  | 'refund_superseded' // retry or close blocked — a later retry in the refund's chain carries it (6.0.0)
+  | 'refund_in_flight'; // retry or close blocked — a refund on the same payment is still pending (6.0.0)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -323,6 +342,12 @@ export const API_ERROR_CODES = [
   'session_not_today',
   'no_show_too_early',
   'after_school_full',
+  'refund_role_required',
+  'over_cap',
+  'instrument_unavailable',
+  'instrument_mismatch',
+  'refund_superseded',
+  'refund_in_flight',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -431,6 +456,17 @@ export const API_ERROR_STATUS = {
   // refused by a campus count, the family of `insufficient_capacity` (design
   // §1.1:1083-1085).
   after_school_full: 422,
+  // 6.0.0 (new codes, so their statuses are set in the same bump): the role
+  // refusal is a 403 like every role refusal; the cap and the instrument are a
+  // well-formed request refused by the payment's own facts, 422; a retry chain
+  // and a refund still pending conflict with the refund's current state, 409
+  // (design §1.1:1094-1133).
+  refund_role_required: 403,
+  over_cap: 422,
+  instrument_unavailable: 422,
+  instrument_mismatch: 422,
+  refund_superseded: 409,
+  refund_in_flight: 409,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -1617,8 +1653,10 @@ export interface StaffCapabilitiesWire {
   /** Refund money, any amount up to what was paid (F2, R4). True for the
    *  owner, for a role on `StaffSettingsWire.refund_roles` (seeded owner,
    *  manager), and for EVERY role while `pay.refund_any_role_limit_cents` is
-   *  above 0 (seeded 0) (§1.1:697-699). The refund verbs it gates land at
-   *  design 6.0.0. */
+   *  above 0 (seeded 0) (§1.1:697-699). From 6.0.0 it is the rule of the
+   *  refund proposal's read and of the portal's *Refund* action. `POST
+   *  /staff/refunds` lets a role off the list through only up to that limit,
+   *  and *Retry to card* and *Returned* follow the list alone (§ refunds). */
   refund_money: boolean;
   /** Add or remove credits by hand and move a lot's expiry (A11, R4). True for
    *  the owner and for a role on `StaffSettingsWire.credit_hand_edit_roles`
@@ -3223,6 +3261,13 @@ export interface PostCreditPackagesPurchaseRequest {
  * `'remove'` debits one lot, the pool and owner read from the lot, whether or not
  * it is live. 422 `lot_insufficient` above the lot's unspent; a lot that is not
  * this owner's grant row is the generic 404.
+ *
+ * 6.0.0 (design §1.1:1118-1119, §2.4:3152-3156; CRED-U18): `'remove'` takes
+ * `refund_id?`, the refund this removal answers. Its use is a refund adopted from
+ * the Stripe dashboard, which removes no credits itself: the removal's row
+ * carries `credit_ledger.refund_id` (M5.10), and a refund a removal names leaves
+ * the end-of-day sheet's *needing attention* (build 11.1.0). A `refund_id` that
+ * names no refund of this owner is the generic 404.
  */
 export type PostStaffOwnersCreditAdjustmentsRequest =
   | {
@@ -3234,7 +3279,7 @@ export type PostStaffOwnersCreditAdjustmentsRequest =
       expires_at?: string;
       note: string;
     }
-  | { kind: 'remove'; lot_id: string; credits: number; note: string };
+  | { kind: 'remove'; lot_id: string; credits: number; note: string; refund_id?: string };
 
 /**
  * `PATCH /staff/credit-lots/:id` body: move a lot's expiry (5.0.0-lg4.2; design
@@ -5195,8 +5240,8 @@ export interface PostPaymentMethodsSetupIntentResponse {
  * a `charges` row that took money: status `'succeeded'` or `'refunded'`.
  */
 export interface StaffInvoicePaymentWire {
-  /** `charges.id` — the id design 6.0.0's `POST /staff/refunds {payment_id}`
-   *  will take. */
+  /** `charges.id` — the id `POST /staff/refunds {payment_id}` and `GET
+   *  /staff/payments/:id/refund-proposal` take (6.0.0, § refunds). */
   payment_id: string;
   /** What the charge took: its `amount_cents`. Never reduced by a refund. */
   paid_cents: number;
@@ -5209,15 +5254,14 @@ export interface StaffInvoicePaymentWire {
    * subtracted for days still booked: no charge pays for a day (R1). Floored
    * at 0. A client never recomputes it.
    *
-   * On today's schema: `withdrawn` and the outcome `returned` have no column
-   * yet — they are values of `refunds.resolved_outcome`, which design 6.0.0's
-   * M5.10 adds — and `refund_status` carries neither. Until then every
-   * `resolved-external` row means the money WAS returned outside our Stripe
-   * machinery, attested by a named human (`schema.sql:209-221`). So today the
-   * cap is `paid_cents` minus every refund whose status is not `failed`: the
-   * arithmetic of `refundsRepository.sumNonFailedForCharge`. When M5.10 lands,
-   * a `withdrawn` row stops counting too; this field's meaning and shape do
-   * not change.
+   * From 6.0.0, `POST /staff/refunds/:id/resolve-external` writes
+   * `refunds.resolved_outcome` (M5.10), so a row it closes `withdrawn` stops
+   * counting here and the cap reopens by that row's amount (design
+   * §2.7:4242-4251). A `resolved-external` row closed before 6.0.0 stores no
+   * outcome and still counts: every such row was money returned outside our
+   * Stripe machinery, attested by a named human. This is the cap `POST
+   * /staff/refunds` refuses above, 422 `over_cap`. The field's meaning and shape
+   * are unchanged.
    */
   refundable_cents: number;
 }
@@ -5290,8 +5334,10 @@ export interface StaffInvoiceWire {
 
 /**
  * One refund on a payment — an entry of `StaffPaymentWire.refunds`. New 2.0.0
- * (STAFF-U13). Not design 6.0.0's `RefundWire` (the refund verbs' row, with
- * its issuer, instrument and resolution), which is a later, wider shape.
+ * (STAFF-U13). Not `RefundWire` (6.0.0, § refunds), the refund verbs' row with
+ * its issuer, instrument and resolution: this row stays the history's narrow
+ * one, and 6.0.0 gives it only the retry link. Its `id` is what `POST
+ * /staff/refunds/:id/retry` and `/resolve-external` take.
  */
 export interface StaffPaymentRefundWire {
   id: string;
@@ -5301,6 +5347,14 @@ export interface StaffPaymentRefundWire {
   status: RefundStatus;
   /** `refunds.reason`, as stored; omitted when null. */
   reason?: string;
+  /** `refunds.retry_of_refund_id` (6.0.0, § refunds): the earlier row of this
+   *  same payment that this row retries; omitted on a row that retries none.
+   *  A retry is always on its row's payment, so a chain lies whole in one
+   *  `StaffPaymentWire.refunds`. A row that another row there names is no
+   *  longer its chain's head, whatever that later row's status: *Retry to
+   *  card* and *Returned* on it answer 409 `refund_superseded`, so a screen
+   *  draws neither on it and shows it as retried. */
+  retry_of_refund_id?: string;
   /** ISO-8601: when the refund row was written. */
   created_at: string;
 }
@@ -5315,9 +5369,10 @@ export interface StaffPaymentRefundWire {
  * `'refunded'`, the set the owner's own ledger shows (R32). A charge that
  * failed, or is still `requires_payment`, moved no money and is not listed.
  * Newest first (`created_at` DESC, then `id`); `[]` for none. No brand or
- * last4: the card is `/payment-methods`' (STAFF-13). Design 6.0.0 adds
- * `stripe_payment_intent_id?` and 6.1.0 adds `method`, `recorded_by?` and
- * `note?` to this row, additively (design.md:1119-1121, :1165-1167).
+ * last4: the card is `/payment-methods`' (STAFF-13). 6.0.0 adds
+ * `stripe_payment_intent_id?`; design 6.1.0 (build 11.1.0) adds `method`,
+ * `recorded_by?` and `note?` to this row, additively (design.md:1119-1121,
+ * :1165-1167).
  */
 export interface StaffPaymentWire extends StaffInvoicePaymentWire {
   status: Extract<ChargeStatus, 'succeeded' | 'refunded'>;
@@ -5330,6 +5385,12 @@ export interface StaffPaymentWire extends StaffInvoicePaymentWire {
    *  this charge); omitted for a charge that settled none (a pack bought
    *  outright, a class paid at enrolment). */
   invoice_id?: string;
+  /** `charges.stripe_payment_intent_id`, the Stripe PaymentIntent that took
+   *  this payment. The portal builds its link to the payment in Stripe's
+   *  dashboard from it, beside *Refund*, with no API call (6.0.0; design
+   *  §1.1:1119-1121, §2.7:4264-4270; question 58). Omitted on a charge with
+   *  none. Never on `StaffInvoiceWire`, so a trainer never reads it. */
+  stripe_payment_intent_id?: string;
   /** Every refund on this charge, any status, oldest first (`created_at`
    *  ASC, then `id`); `[]` for none. */
   refunds: StaffPaymentRefundWire[];
@@ -5874,15 +5935,30 @@ export interface GetStaffRatesHistoryQuery {
  *
  * 2.0.0 gives it its first field: `StaffPaymentRefundWire.status`, on the
  * staff payment history (`GET /staff/owners/:id/payments`, owner and manager;
- * STAFF-U13, § payments-invoices). Still no owner-facing read.
+ * STAFF-U13, § payments-invoices). 6.0.0 gives it `RefundWire.status`, the
+ * refund verbs' row (below). Still no owner-facing read: no staff refund sends
+ * the family a notice (design §2.9).
  *
- * The complete state machine (`refundsRepository.ts:36-56`) — nothing else is
- * reachable, and every arm below is written by exactly one verb:
+ * The complete state machine from 6.0.0 (design §2.7:4215-4228) — nothing else
+ * is reachable:
  *
- *   pending → succeeded | failed             (Stripe `charge.refund.updated`)
+ *   pending → succeeded | failed             (Stripe's reply, or a refund event)
+ *   succeeded → failed                       (once: the one backwards edge)
  *   pending → unroutable                     (born terminal, or the sweep's flip)
- *   failed | unroutable → resolved-external  (STAFF, note required)
- *   resolved-external → ∅                    (terminal; webhook events no-op)
+ *   failed | unroutable → resolved-external  (staff, a note required)
+ *   resolved-external → ∅                    (terminal; refund events no-op)
+ *
+ * Every refund event (`charge.refund.updated`, `refund.updated`,
+ * `refund.failed`, `charge.refunded`) reads the refund back from Stripe and
+ * applies its LIVE status, never the event's own. `succeeded → failed` happens
+ * at most once, when Stripe fails a refund it had reported done: the payment's
+ * cap reopens and a charge marked `'refunded'` is recomputed, while the credits
+ * the refund removed stay removed (the money is still owed). A row is born
+ * `'unroutable'` on a charge with no PaymentIntent, and from build 11.1.0 every
+ * cash or check refund is; a refund adopted from the Stripe dashboard is born
+ * at the status Stripe reports. A retry is a NEW row naming the failed one in
+ * `retry_of_refund_id` (on `RefundWire` and `StaffPaymentRefundWire`); the
+ * failed row stays `'failed'`.
  *
  * `'unroutable'` (2026-08-19, `designs/client-keyed-refund-recovery.md` §4;
  * extended 2026-08-24 by `designs/money-residue.md` §3 to the group-class
@@ -5904,7 +5980,274 @@ export type RefundStatus = 'pending' | 'succeeded' | 'failed' | 'unroutable' | '
 // refund ROWS, never over the vocabulary, and no client mirrors it. A tuple now
 // would be a §16 pin guarding a constant nothing reads. It becomes correct the
 // moment the portal wave's staff refund filter needs one — filed there, not
-// minted here.
+// minted here. The same holds for `RefundInstrument` and
+// `RefundResolvedOutcome` below: text CHECK columns, not pgEnums, so
+// `conformance.ts` has nothing to pin them to, and each route's zod enum is
+// pinned to its body type instead.
+
+/**
+ * How a refund's money goes back (`refunds.instrument`, M5.10's CHECK; design
+ * §1.1:1094-1107). `'original_card'`: a Stripe refund to the PaymentIntent that
+ * took the money. `'cash'` or `'check'`: handed back at the desk, outside the
+ * app (the hand-back arm, PAY-U27), accepted from build 11.1.0 (design 6.1.0),
+ * when a charge can be paid by hand. No `'account_credit'`: money comes back as
+ * money (the 10-12 money ruling, SIGNOFF.md:252; question 6, PAY-U26 out).
+ */
+export type RefundInstrument = 'original_card' | 'cash' | 'check';
+
+/**
+ * How *Returned* closed a row (`refunds.resolved_outcome`, M5.10; question 41,
+ * (a)). `'returned'`: the money went back outside the app. `'withdrawn'`: the
+ * family kept the purchase after all, so no money moved, and the credits the
+ * chain's first refund removed go back (design §2.7:4242-4262).
+ */
+export type RefundResolvedOutcome = 'returned' | 'withdrawn';
+
+// ---- (b) response wires ----------------------------------------------------
+//
+// The staff refund (6.0.0; plan unit P22, slice S35; design §1.1:1094-1133,
+// §2.7:4163-4334, §2.4:3112-3159, §2.10:5002-5021; PAY-U24, PAY-U25, PAY-U27,
+// PAY-U28, CRED-U18). Shanthi and Amber move money, any amount up to what was
+// paid, case by case; a trainer never does (SIGNOFF.md:252-254, follow-up 2;
+// answer 11). "The list" is `StaffSettingsWire.refund_roles`
+// (`staff.refund_role_list`, seeded owner and manager), which the owner role
+// always passes:
+//   GET  /staff/payments/:id/refund-proposal → GetStaffPaymentsRefundProposalResponse  refund_money's rule
+//   POST /staff/refunds                      → RefundWire (201)  the list, or the limit
+//   POST /staff/refunds/:id/retry            → RefundWire (201)  the list
+//   POST /staff/refunds/:id/resolve-external → RefundWire (200)  the list
+// On all four an owner (family) principal is 403 `forbidden`, a role the rule
+// refuses is 403 `refund_role_required` (no `details`), and a malformed `:id`
+// is 400 `bad_request`. The three POSTs take a REQUIRED `Idempotency-Key`. No
+// staff refund sends the family a notice: staff tell them (design §2.9).
+
+/**
+ * One `refunds` row as the refund verbs answer it (6.0.0; design
+ * §1.1:1094-1100, §2.7:4163-4172): the 201 of `POST /staff/refunds` and of
+ * `/staff/refunds/:id/retry`, the 200 of `/staff/refunds/:id/resolve-external`,
+ * and from build 11.1.0 the end-of-day sheet's refund rows. Written out so a
+ * screen composes "Alvarez, Maria · 2x Weekly pack · refund · check · Amber ·
+ * 07:45" from facts, never from a sentence the server wrote: the refunds
+ * repository returns the names joined.
+ *
+ * `owner.name` is the family's name, or its `email` when the name is empty, as
+ * on `PendingPaymentWire.owner`, so it is never `null`. `item` is what the
+ * refunded charge bought: the charge's `purpose`, and on a `'package'` charge
+ * the label of the pack or single-day row, read from `charges.package_id`
+ * (`package_label`, omitted when the charge stored none). `amount_cents` is this
+ * refund's, never the charge's.
+ *
+ * `instrument` is how the money was to go back, as first chosen.
+ * `returned_instrument` is what actually crossed the desk, set only on a row
+ * *Returned* closed `'returned'` (question 41's rider); the end-of-day sheet's
+ * returned totals follow it.
+ *
+ * `issued_by` is the staffer whose `POST /staff/refunds` or retry wrote the row,
+ * omitted on a row the app wrote by itself (the refund of a charge that won no
+ * seat or of a duplicate charge, a class withdrawal's until build 12.0.0) or
+ * adopted from the Stripe dashboard. `reason` is `refunds.reason`, omitted when
+ * null. `retry_of_refund_id` names the failed row this one retries.
+ * `enrollment_id` is never present before build 12.0.0 (design 7.0.0).
+ *
+ * A `'resolved-external'` row carries `resolved_at` and `resolution_note` (the
+ * human's evidence), and `resolved_by` (the attesting staffer) and
+ * `resolved_outcome`. Both of the last two are omitted on a row closed by script
+ * before 6.0.0: such a row was money returned, and counts as `'returned'`
+ * wherever money is summed. A `'withdrawn'` row moved no money.
+ *
+ * `status` is the row as its transaction committed it, so a card refund's 201
+ * reads `'pending'` even when Stripe answers a moment later; a replay of the
+ * same `Idempotency-Key` returns that same body. The payment history
+ * (`StaffPaymentWire.refunds`) reads the live state.
+ */
+export interface RefundWire {
+  id: string;
+  charge_id: string;
+  owner: { id: string; name: string };
+  item: { purpose: ChargePurpose; package_label?: string };
+  amount_cents: number;
+  instrument: RefundInstrument;
+  returned_instrument?: 'cash' | 'check';
+  status: RefundStatus;
+  reason?: string;
+  issued_by?: { staff_id: string; name: string };
+  retry_of_refund_id?: string;
+  enrollment_id?: string;
+  resolved_by?: { staff_id: string; name: string };
+  /** ISO-8601: when *Returned* closed the row. */
+  resolved_at?: string;
+  resolution_note?: string;
+  resolved_outcome?: RefundResolvedOutcome;
+  /** ISO-8601: when the row was written. */
+  created_at: string;
+}
+
+/**
+ * `GET /staff/payments/:id/refund-proposal` (200): what the *Refund* form
+ * pre-fills for one payment (6.0.0; design §1.1:1108-1114, §2.7:4188-4207,
+ * §2.4:3112-3149, §2.10:5002-5014; PAY-U28, CRED-U18). `:id` is the payment's
+ * `charges.id` (`StaffInvoicePaymentWire.payment_id`). A proposal, never a rule:
+ * staff may change the amount up to the payment's `refundable_cents` and the
+ * count up to the lot's unbooked, unspent credits, case by case (12-:35;
+ * question 42: staff choose). It is computed on each read and stores nothing.
+ *
+ * Who: `capabilities.refund_money`'s rule (the owner, a role on the list, or any
+ * role while `pay.refund_any_role_limit_cents` is above 0), else 403
+ * `refund_role_required`, before `:id` is looked up. An `:id` that names no
+ * charge, or a charge that took no money (`requires_payment`, `failed`), is 404
+ * `not_found`.
+ *
+ * `basis` says how `proposed_cents` was found:
+ *   · `'unbooked_credits'`, on a `'package'` charge (a pack, single days, a
+ *     booking's top-up). It reads the purchase's lot, the one `credit_ledger`
+ *     row of reason `'purchase'` the charge granted. `per_credit_cents` is the
+ *     charge's `amount_cents` ÷ the lot's granted count, rounded down (exact at
+ *     every seeded price). `unbooked_unspent_credits` is the lot's credits
+ *     neither spent nor booked, counted whether or not the lot is live: an
+ *     expired credit costs nothing to remove and must go, or a later date move
+ *     would revive it. `expired_unspent_credits` is the part of it on a lot no
+ *     longer live (`lot_is_live`, M4.08), so 0 or all of it. `proposed_cents`
+ *     is the live part × `per_credit_cents`, never above the payment's
+ *     `refundable_cents`: expired credits are removed but never proposed as
+ *     money. `booked_ahead` is the lot's debits on upcoming days, by
+ *     `CreditLotDetailWire.booked_ahead`'s rule. Those days stand unless staff
+ *     cancel them first; a cancel returns their credits to the lot, and a fresh
+ *     read counts them.
+ *   · `'class_seat'` (from build 12.0.0, design 7.0.0) and `'custom_invoice'`
+ *     (from build 11.1.0, design 6.1.0) are typed now, and no 6.0.0 charge
+ *     answers either. Until its basis lands, a charge of another purpose
+ *     (`'group-class'`, `'board-train'`) is 422 `invalid_payload`: there is
+ *     nothing to propose, and `POST /staff/refunds` still takes any amount up to
+ *     the cap on it.
+ *
+ * The four credit fields are present exactly when `basis` is
+ * `'unbooked_credits'`. `method` is how the payment was made, so the form offers
+ * the original card on a card charge and Cash or Check only on a hand charge;
+ * every charge is `'card'` until build 11.1.0 adds `charges.method` (M6.01).
+ * `recorded_by` names who took a hand payment, and is omitted until then.
+ */
+export interface GetStaffPaymentsRefundProposalResponse {
+  proposed_cents: number;
+  basis: 'unbooked_credits' | 'class_seat' | 'custom_invoice';
+  unbooked_unspent_credits?: number;
+  expired_unspent_credits?: number;
+  booked_ahead?: { count: number; dates: string[] };
+  per_credit_cents?: number;
+  method: 'card' | 'cash' | 'check';
+  recorded_by?: { staff_id: string; name: string };
+}
+
+// ---- (c) request bodies + query shapes -------------------------------------
+
+/**
+ * `POST /staff/refunds` body (6.0.0; design §1.1:1094-1107, §2.7:4163-4215,
+ * :4291-4334; PAY-U24, PAY-U25, PAY-U27, CRED-U18). `.strict()`;
+ * `Idempotency-Key` REQUIRED, and the Stripe refund's key derives from it, so a
+ * double tap is one refund: the portal mints the key when the form opens and
+ * reuses it on every resubmit. A derived suffix longer than the 49 characters
+ * the header bound reserves (the conventions block) would move that bound,
+ * which is a wire change. Response 201 `RefundWire`.
+ *
+ * Who: the owner and a role on the list refund any amount up to the cap. Any
+ * other role may refund only an `amount_cents` up to
+ * `pay.refund_any_role_limit_cents`, this refund's amount against the number in
+ * one comparison (seeded 0, so no other role refunds anything). Otherwise 403
+ * `refund_role_required`, before `payment_id` is looked up. No ladder, no
+ * second list, no `refund_over_limit` (never built).
+ *
+ * `payment_id` is a `charges.id` that took money (`StaffInvoicePaymentWire`),
+ * else 404 `not_found`. `amount_cents` is a positive integer no more than the
+ * payment's `refundable_cents`, read under the charge's lock, else 422
+ * `over_cap`. A refund still pending counts against the cap, so a second
+ * whole-amount refund minted before Stripe answers the first is 422. `reason`
+ * is required, 1..500 characters, and is written into the credit removal's
+ * note.
+ *
+ * `instrument`: `'original_card'` refunds through Stripe after commit. The 201
+ * carries the row as committed, `'pending'`; Stripe's reply then moves it, a
+ * `'succeeded'` reply in the transaction that follows the call, and otherwise a
+ * refund event or the retry sweep (also when the call got no answer). On a
+ * charge with no PaymentIntent the row is born `'unroutable'`: money owed by
+ * hand, closed by *Returned*. `'cash'` and `'check'` are 422
+ * `instrument_unavailable` until build 11.1.0 (design 6.1.0). From then they are
+ * accepted only on a charge paid by hand, and `'original_card'` only on a card
+ * charge, else 422 `instrument_mismatch`.
+ *
+ * `credits_to_remove`, an integer of 0 or more, is how many of the purchase
+ * lot's unbooked, unspent credits leave with the refund: one `adjustment` row of
+ * minus that count on the lot, in the refund's own transaction under the lot's
+ * lock, naming the refund (`credit_ledger.refund_id`, M5.10), with the note
+ * `refund <refund_id>: <reason>` and the refunder as `created_by_staff_id`.
+ * Omitted, it is the proposal's `unbooked_unspent_credits` at the moment of the
+ * mint; 0 writes no row. More than the lot holds unbooked and unspent, or any on
+ * a charge with no purchase lot, is 422 `lot_insufficient`, and the form re-reads
+ * the proposal. Booked-ahead days stand. A refunded credit is removed, never
+ * retired by moving the lot's date (`designs/p20-event-ledger-link.md` §10).
+ *
+ * `enrollment_id` is 422 `invalid_payload` until build 12.0.0 (design 7.0.0)
+ * creates `enrollments`.
+ */
+export interface PostStaffRefundsRequest {
+  payment_id: string;
+  amount_cents: number;
+  instrument: RefundInstrument;
+  reason: string;
+  credits_to_remove?: number;
+  enrollment_id?: string;
+}
+
+// `POST /staff/refunds/:id/retry` — *Retry to card*, BODYLESS (6.0.0; design
+// §1.1:1115-1118, §2.7:4228-4235). `Idempotency-Key` REQUIRED and minted fresh
+// for the retry; the retry's Stripe key derives from it. Response 201: a NEW
+// `RefundWire` for the same payment, amount and instrument, naming `:id` in
+// `retry_of_refund_id`. Money only: it writes no credit row, because the first
+// refund's removal stands for the whole chain. Who: the list, else 403
+// `refund_role_required`. 404 `not_found` for no row. `:id` must be a `'failed'`
+// `original_card` row, else 409 `conflict`, and must head its chain: a row any
+// later retry names is 409 `refund_superseded`, whatever that retry's state, so
+// one refund is never retried twice. 409 `refund_in_flight` while any refund on
+// the same payment is `'pending'`. The payment's cap holds: 422 `over_cap` when
+// the amount no longer fits.
+
+/**
+ * `POST /staff/refunds/:id/resolve-external` body — *Returned*, a refund closed
+ * outside the app (6.0.0; design §1.1:1122-1133, §2.7:4235-4262, :4310-4322;
+ * question 41, (a) with both riders). `.strict()`; `Idempotency-Key` REQUIRED.
+ * Response 200 `RefundWire`, status `'resolved-external'`. Who: the list, else
+ * 403 `refund_role_required`.
+ *
+ * `:id` must be a `'failed'` or `'unroutable'` row (404 `not_found` for none, 409
+ * `conflict` for any other status) that heads its retry chain (409
+ * `refund_superseded` when a later retry names it). 409 `refund_in_flight` while
+ * any refund on the same payment is `'pending'`. Every decision is taken under
+ * the charge's lock, and a 200 always means the row changed.
+ *
+ * `note` is required, 1..500 characters: the human's evidence ("check #1042").
+ * `outcome` defaults to `'returned'`:
+ *   · `'returned'`: the money went back outside the app. 422 `over_cap` when the
+ *     row's amount is more than the payment still owes. `instrument` records what
+ *     crossed the desk, in `RefundWire.returned_instrument`. It defaults to the
+ *     row's own instrument when that is cash or check, and is REQUIRED on a row
+ *     whose instrument is `'original_card'`, a failed card refund or a row born
+ *     `'unroutable'` (400 `bad_request` without it). The charge flips
+ *     `'refunded'` once returned money covers it.
+ *   · `'withdrawn'`: the family keeps the purchase, and no money moved. The row
+ *     counts nowhere money is summed, so the payment's cap reopens by its amount
+ *     and the charge is never flipped `'refunded'` for it. The credits the
+ *     chain's refunds removed (at the FIRST refund's mint, and by any hand
+ *     removal naming a refund of the chain) go back to the lots they came from,
+ *     each with its lot's date, in the same transaction and once: one
+ *     `adjustment` row per lot, naming the chain's first refund's `refund_id`.
+ *     422 `over_cap` when the payment has nothing left to return and credits
+ *     would go back: the money this refund stood for has gone back another way,
+ *     so the credits stay removed. `instrument` with `'withdrawn'` is 400
+ *     `bad_request`: nothing crossed the desk.
+ */
+export interface PostStaffRefundsResolveExternalRequest {
+  note: string;
+  outcome?: RefundResolvedOutcome;
+  instrument?: 'cash' | 'check';
+}
 
 // <<< domain:refunds ==========================================================
 
@@ -6970,7 +7313,9 @@ export interface PaymentSettingValueByKey {
   custom_invoice_card_kind_list: string[];
   /** Cents; seed 0 = owner and manager only (§3.7:5839). Editable by the
    *  owner and the manager (`money` class, §3.7): Allison's 11-02 answer,
-   *  "Shanthi or Amber" (DECISIONS 73). */
+   *  "Shanthi or Amber" (DECISIONS 73). From 6.0.0 `POST /staff/refunds`
+   *  reads it: a role off `staff.refund_role_list` may refund an amount up to
+   *  it (§ refunds). */
   refund_any_role_limit_cents: number;
   /** Days; seed 30 (§3.7:5837). */
   price_change_notice_days: number;
@@ -7072,12 +7417,12 @@ export interface VaccineSettingsWire extends SettingsAuditWire {
  * and the design states it with the shape; the registry stays the authority.
  */
 export interface StaffSettingsWire extends SettingsAuditWire {
-  /** Who refunds money, any amount up to what was paid; also the end-of-day
-   *  *Returned* action. Seed `['owner', 'manager']`; registry key
-   *  `staff.refund_role_list` (§3.14:5947; F2, R4, answer 11). Mirrored by
-   *  `capabilities.refund_money`, which is true for every role while
-   *  `pay.refund_any_role_limit_cents` is above 0. Its verbs land at design
-   *  6.0.0. */
+  /** Who refunds money, any amount up to what was paid; also *Retry to card*
+   *  and the end-of-day *Returned* action. Seed `['owner', 'manager']`;
+   *  registry key `staff.refund_role_list` (§3.14:5947; F2, R4, answer 11).
+   *  Mirrored by `capabilities.refund_money`, which is true for every role
+   *  while `pay.refund_any_role_limit_cents` is above 0. Read by the refund
+   *  routes from 6.0.0 (§ refunds). */
   refund_roles: StaffRole[];
   /** Who adds or removes credits by hand and moves a lot's expiry. Seed
    *  `['owner', 'manager']`; registry key `staff.credit_hand_edit_role_list`

@@ -376,6 +376,37 @@ export interface StripeRefundResult {
   id: StripeRefundId;
   status: StripeRefundStatus;
   amountCents: number;
+  /**
+   * Did Stripe REPLAY this answer from the key's record (`idempotent-replayed: true`, the
+   * measured header, P22's recording (d)) rather than execute the request? `undefined` when
+   * the reply did not come from a live SDK call, which is not `false`
+   * ({@link replayedFromResponse}).
+   */
+  replayed?: boolean;
+}
+
+/**
+ * A refund as Stripe holds it NOW, from a retrieve or a list (P22, design §2.7:4215-4228):
+ * every refund arm decides from this, never from the event's own status. `metadataRefundId`
+ * is the `metadata.refund_id` every create carries from P22 on (`refundCreateParams`), read
+ * across a trust boundary: absent, empty or not a string reads as `undefined`.
+ */
+export interface StripeRefundSnapshot {
+  id: StripeRefundId;
+  status: StripeRefundStatus;
+  amountCents: number;
+  paymentIntentId: StripePaymentIntentId | null;
+  metadataRefundId: string | undefined;
+}
+
+/**
+ * Every refund Stripe holds on one PaymentIntent, newest first as Stripe lists them.
+ * `complete` is `false` when the listing stopped before Stripe's last page: a caller that
+ * must know "none carries this id" (B-7(b)'s end state) reads only a complete list.
+ */
+export interface StripeRefundList {
+  refunds: StripeRefundSnapshot[];
+  complete: boolean;
 }
 
 /**
@@ -426,11 +457,31 @@ export type StripeWebhookEvent =
     }
   | {
       id: string;
-      type: 'charge.refund.updated';
+      /**
+       * The three events whose object is the refund itself (P22's recording: the account
+       * sends all three, and `refund.failed` is the only modern one that carries the
+       * backwards edge). Each is parsed whether or not an endpoint enables it, so enabling
+       * one needs no deploy. `status` is the event's own reading, kept for the log line:
+       * every arm retrieves the refund and applies its LIVE status.
+       */
+      type: 'charge.refund.updated' | 'refund.updated' | 'refund.failed';
       refundId: StripeRefundId;
       paymentIntentId: StripePaymentIntentId | null;
       amountCents: number;
       status: StripeRefundStatus;
+    }
+  | {
+      id: string;
+      /**
+       * A charge event: its object is the CHARGE (`ch_`), and at this API version it carries
+       * no refunds list, so the arm lists the PaymentIntent's refunds. The recording's (f):
+       * it fires at creation while the refund is still `pending`, so nothing is ever marked
+       * from this event itself.
+       */
+      type: 'charge.refunded';
+      chargeId: string;
+      paymentIntentId: StripePaymentIntentId | null;
+      amountRefundedCents: number;
     }
   | {
       id: string;
@@ -483,6 +534,46 @@ export function isStripeNetworkFailure(err: unknown): boolean {
  */
 export function stripeErrorCode(err: unknown): string | undefined {
   return err instanceof Stripe.errors.StripeError ? err.code : undefined;
+}
+
+/**
+ * Did Stripe REPLAY this thrown answer from the key's record? P22's recording (c): a
+ * refused create re-sent under its key replays the same error with `idempotent-replayed:
+ * true`, and the SDK hands that header back on the error (`err.headers`), as it does on a
+ * reply (`lastResponse.headers`). `undefined` when the error carries no headers (no live
+ * HTTP answer: a lost connection, or something that is not a Stripe error).
+ */
+export function stripeErrorReplayed(err: unknown): boolean | undefined {
+  if (!(err instanceof Stripe.errors.StripeError)) return undefined;
+  return replayedFromHeaders(err.headers as Record<string, unknown> | undefined);
+}
+
+/** A Stripe 5xx: Stripe answered, and the answer is "we failed", not "no". */
+export function isStripeServerError(err: unknown): boolean {
+  return (
+    err instanceof Stripe.errors.StripeError &&
+    typeof err.statusCode === 'number' &&
+    err.statusCode >= 500
+  );
+}
+
+/**
+ * **A definitive refusal of a refund create** (P22 brief B-7(c); P16 r3 Fable M2): HTTP 400
+ * with `type: invalid_request_error`, with or without a `code`. Stripe created no refund,
+ * and the answer is that key's stored answer: the recording's (c) shows an over-refund with
+ * NO `code` and a fully refunded charge with `charge_already_refunded`, each replayed under
+ * its key. Decided by status and type, never by `code` and never by message text, so a
+ * code Stripe adds or drops later changes nothing here. The caller asks
+ * {@link stripeIdempotencyErrorKind} FIRST: those keep their own arms. 401, 403, 429, a 5xx
+ * and a lost connection are not refusals. Returns Stripe's `code` (if any) and message, for
+ * the line a person reads.
+ */
+export function stripeRefundRefusal(
+  err: unknown,
+): { code: string | undefined; message: string } | undefined {
+  if (!(err instanceof Stripe.errors.StripeError)) return undefined;
+  if (err.statusCode !== 400 || err.rawType !== 'invalid_request_error') return undefined;
+  return { code: err.code, message: err.message };
 }
 
 export interface StripeClient {
@@ -711,9 +802,27 @@ export interface StripeClient {
    * `refunds` row's `status` on `charge.refund.updated`.
    */
   createRefund(
-    args: { paymentIntentId: StripePaymentIntentId; amountCents: number; reason?: string },
+    args: {
+      paymentIntentId: StripePaymentIntentId;
+      amountCents: number;
+      reason?: string;
+      /** From P22 every create carries `{refund_id: <our row id>}` (`refundCreateParams`). */
+      metadata?: Record<string, string>;
+    },
     idempotencyKey: string,
   ): Promise<StripeRefundResult>;
+
+  /**
+   * Read one refund as Stripe holds it now (P22, B-6). A GET: no key, no money. Called with
+   * no transaction open; the caller applies what it reads under the charge lock.
+   */
+  retrieveRefund(refundId: StripeRefundId): Promise<StripeRefundSnapshot>;
+
+  /**
+   * Every refund Stripe holds on one PaymentIntent (P22: `charge.refunded`'s arm, and the
+   * refund sweep's look-up by `metadata.refund_id`). Read-only; no transaction open.
+   */
+  listRefundsForPaymentIntent(paymentIntentId: StripePaymentIntentId): Promise<StripeRefundList>;
 
   /**
    * Fetch a payment method's displayable bits (brand/last4/exp/cardholder).
@@ -1032,15 +1141,45 @@ const REPLAYED_HEADER_NAMES = [
  * defect this replaced survived precisely because nothing asserted against what
  * Stripe actually sends.
  */
-export function replayedFromResponse(intent: Stripe.PaymentIntent): boolean | undefined {
-  const headers = (intent as Partial<Stripe.Response<Stripe.PaymentIntent>>).lastResponse?.headers;
-  if (headers === undefined) return undefined;
+export function replayedFromResponse(object: object): boolean | undefined {
+  return replayedFromHeaders(
+    (object as Partial<Stripe.Response<object>>).lastResponse?.headers as
+      | Record<string, unknown>
+      | undefined,
+  );
+}
+
+/** The header read behind {@link replayedFromResponse} and {@link stripeErrorReplayed}. */
+function replayedFromHeaders(headers: Record<string, unknown> | undefined): boolean | undefined {
+  if (headers === undefined || headers === null) return undefined;
   for (const name of REPLAYED_HEADER_NAMES) {
     const raw = headers[name];
     if (typeof raw === 'string') return raw.toLowerCase() === 'true';
   }
   return false;
 }
+
+/** A refund off the SDK, onto the narrow snapshot every refund arm reads. */
+function snapshotOfRefund(refund: Stripe.Refund): StripeRefundSnapshot {
+  const refundId: unknown = refund.metadata?.refund_id;
+  return {
+    id: refund.id,
+    status: (refund.status ?? 'pending') as StripeRefundStatus,
+    amountCents: refund.amount,
+    paymentIntentId:
+      typeof refund.payment_intent === 'string'
+        ? refund.payment_intent
+        : (refund.payment_intent?.id ?? null),
+    metadataRefundId: typeof refundId === 'string' && refundId.length > 0 ? refundId : undefined,
+  };
+}
+
+/**
+ * How many pages of 100 a refund listing reads before it says `complete: false`. A
+ * PaymentIntent with 1,000 refunds is not a Fetch'd payment; the bound keeps a corrupt
+ * answer from looping, and an incomplete list moves nothing that needs a complete one.
+ */
+const REFUND_LIST_MAX_PAGES = 10;
 
 /**
  * WHICH idempotency error is this? Stripe spends one error type
@@ -1342,14 +1481,39 @@ export const defaultStripeClient: StripeClient = {
         ...(args.reason !== undefined
           ? { reason: args.reason as Stripe.RefundCreateParams.Reason }
           : {}),
+        ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
       },
       { idempotencyKey },
     );
+    const replayed = replayedFromResponse(refund);
     return {
       id: refund.id,
       status: refund.status as StripeRefundStatus,
       amountCents: refund.amount,
+      ...(replayed !== undefined ? { replayed } : {}),
     };
+  },
+
+  async retrieveRefund(refundId) {
+    return snapshotOfRefund(await stripeSingleton.refunds.retrieve(refundId));
+  },
+
+  async listRefundsForPaymentIntent(paymentIntentId) {
+    const refunds: StripeRefundSnapshot[] = [];
+    let startingAfter: string | undefined;
+    for (let page = 0; page < REFUND_LIST_MAX_PAGES; page += 1) {
+      const answer = await stripeSingleton.refunds.list({
+        payment_intent: paymentIntentId,
+        limit: 100,
+        ...(startingAfter !== undefined ? { starting_after: startingAfter } : {}),
+      });
+      for (const refund of answer.data) refunds.push(snapshotOfRefund(refund));
+      if (!answer.has_more) return { refunds, complete: true };
+      const last = answer.data[answer.data.length - 1];
+      if (last === undefined) return { refunds, complete: false };
+      startingAfter = last.id;
+    }
+    return { refunds, complete: false };
   },
 
   async retrievePaymentMethod(paymentMethodId) {
@@ -1452,7 +1616,9 @@ export function projectStripeEvent(event: Stripe.Event): StripeWebhookEvent {
         customerId,
       };
     }
-    case 'charge.refund.updated': {
+    case 'charge.refund.updated':
+    case 'refund.updated':
+    case 'refund.failed': {
       const refund = event.data.object as Stripe.Refund;
       const piId =
         typeof refund.payment_intent === 'string'
@@ -1460,11 +1626,24 @@ export function projectStripeEvent(event: Stripe.Event): StripeWebhookEvent {
           : (refund.payment_intent?.id ?? null);
       return {
         id: event.id,
-        type: 'charge.refund.updated',
+        type: event.type,
         refundId: refund.id,
         paymentIntentId: piId,
         amountCents: refund.amount,
         status: (refund.status ?? 'pending') as StripeRefundStatus,
+      };
+    }
+    case 'charge.refunded': {
+      const charge = event.data.object as Stripe.Charge;
+      return {
+        id: event.id,
+        type: 'charge.refunded',
+        chargeId: charge.id,
+        paymentIntentId:
+          typeof charge.payment_intent === 'string'
+            ? charge.payment_intent
+            : (charge.payment_intent?.id ?? null),
+        amountRefundedCents: charge.amount_refunded,
       };
     }
     default:

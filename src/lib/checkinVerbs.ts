@@ -372,8 +372,9 @@ export async function sendHomeInTx(
  * `no-show`, the board's *Didn't come* (no body): the session's date is today or earlier,
  * and Chicago now is at or past the campus's `day.pickup_close_time` on that date (409
  * `no_show_too_early {recordable_from}` before it; question 48), and the dog is
- * `expected`. A day nobody recorded is settled on its own date's board this way. Her credit
- * comes back: no true penalty for a no-show (Shanthi, 12- #10).
+ * `expected`. A day nobody recorded is settled on its own date's board this way, and then
+ * the notice names that day ("didn't come on Thu 12 Nov"), never "today" (P21's carry 0a).
+ * Her credit comes back: no true penalty for a no-show (Shanthi, 12- #10).
  */
 export async function noShowInTx(tx: Tx, args: VerbArgs): Promise<VerbResult> {
   const share = await openShare(tx, args, 'today-or-earlier');
@@ -401,6 +402,11 @@ export async function noShowInTx(tx: Tx, args: VerbArgs): Promise<VerbResult> {
     ...args,
     ownerId: share.booking.ownerId,
     event: { id: event.id, kind: 'no-show', trainingCompleted: false },
+    // A past day's board: the notice names the session's day, never "today" (P21's carry
+    // 0a, Opus r2 L3). `openShare` refused a later date, so this is the earlier one.
+    ...(share.date !== share.today
+      ? { pastSessionAtIso: pgTimestampToIso(share.booking.scheduledAt) }
+      : {}),
   });
   return { body: await attendanceOf(tx, args), ...settled };
 }

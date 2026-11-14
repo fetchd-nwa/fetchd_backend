@@ -26,6 +26,7 @@ import { creditPackagesRepository } from '../db/repositories/creditPackagesRepos
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { dogsRepository } from '../db/repositories/dogsRepository.js';
 import { ownersRepository } from '../db/repositories/ownersRepository.js';
+import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import type { Tx } from '../db/tx.js';
@@ -78,6 +79,9 @@ const adjustmentBodySchema = z.discriminatedUnion('kind', [
       lot_id: uuidId('lot_id must be a UUID'),
       credits: z.number().int().positive(),
       note: noteSchema,
+      // 6.0.0 (CRED-U18; design §2.4:3152-3156): the refund this removal answers, any
+      // refund of this owner's, normalised at the parse like every id here.
+      refund_id: uuidId('refund_id must be a UUID').optional(),
     })
     .strict(),
 ]);
@@ -234,6 +238,14 @@ async function removeCredits(
   const { ownerId, body, staffId } = args;
   const lot = await findGrantLot(tx, body.lot_id);
   if (lot === undefined || lot.ownerId !== ownerId) throw lotNotFound(body.lot_id);
+  if (body.refund_id !== undefined) {
+    // A refund of this owner, or the generic 404: an id from another family's ledger says
+    // nothing about it. Its owner never changes, so no lock is needed to read it.
+    const refund = await refundsRepository.findById(tx, body.refund_id);
+    if (refund === undefined || refund.ownerId !== ownerId) {
+      throw new ApiError('not_found', `refund ${body.refund_id} not found`);
+    }
+  }
   await lockPools(tx, [lot]);
   const unspent = await creditLedgerRepository.lotUnspentInTx(tx, lot.id);
   if (body.credits > unspent) {
@@ -244,6 +256,7 @@ async function removeCredits(
     credits: body.credits,
     note: body.note,
     staffId,
+    ...(body.refund_id !== undefined ? { refundId: body.refund_id } : {}),
   });
   return lot;
 }

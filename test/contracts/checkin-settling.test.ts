@@ -1025,3 +1025,72 @@ describe('B2-4: a turn-away frees its seat', () => {
     },
   );
 });
+
+/**
+ * P21's carry 0a (Opus r2 L3; DECISIONS 295(a)(i); P22 brief `brief_must_say` 0a). *Didn't
+ * come* is recordable on any session dated today or earlier (`noShowInTx`: "a day nobody
+ * recorded is settled on its own date's board"), so a past day's board sends the family
+ * its notice a day or more after the session. P20's words, "didn't come today", were §2.9's
+ * copy for the 17:30 case and are false there (probe-q13 V5: a Thu 12 Nov session settled
+ * on Fri 13 Nov). On a past day's board the notice names the day the session was for, as
+ * the cancel arms do; on the session's own day it keeps §2.9's "today" (T6, T7 above).
+ */
+describe("P21's carry 0a: a past day's Didn't come names the session's day, never 'today'", () => {
+  test(
+    "Wed 14 Oct 09:00, Tue 13 Oct's board: Didn't come → 'Pepper didn't come on Tue 13 Oct.' and the credit line read from its lot",
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const { dogId, lotId, bookingId } = await onePepper();
+      const app = boardApp(FIXTURE_STAFF_PRINCIPAL, makeClock(at(NEXT_DAY, '09:00')));
+      const done = attendance(await verb(app, { bookingId, dogId, verb: 'no-show' }));
+      assert.equal(done.status, 'no-show');
+      assert.deepEqual(
+        (await ledgerOf(bookingId)).map((r) => [r.reason, r.lotId]),
+        [
+          ['booking-debit', lotId],
+          ['settlement-return', lotId],
+        ],
+        'the credit goes back into its lot, which pays a later date',
+      );
+      const bodies = (await cancelNotices(sessions)).map((n) => n.body);
+      assert.deepEqual(bodies, [
+        `Pepper didn't come on Tue 13 Oct. +1 credit, back to your Bentonville day-school credits (expires ${en(LOT_EXPIRES)}).`,
+      ]);
+      assert.doesNotMatch(bodies[0] ?? '', /today/);
+    },
+  );
+
+  test(
+    "key 0, the real clock's yesterday recorded this morning at 09:00, lot I dead since 09:40 yesterday → the day named and §2.9's dead-lot line",
+    SKIP_WHEN_NO_DB,
+    async () => {
+      await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 0`);
+      // Lot I, the day it paid (the REAL clock's yesterday), its date passed at 09:40, so it
+      // is dead at the database: the notice's line is §2.9's dead-lot one.
+      const day = realChicagoDate(-1);
+      const dogId = await pepper();
+      const lotI = await plantLot({ credits: 1, expiresAt: at(day, '09:40') });
+      const { bookingId } = await createSession({
+        dogIds: [dogId],
+        date: day,
+        lotId: lotI,
+        ledger: sessions,
+      });
+      const app = boardApp(FIXTURE_STAFF_PRINCIPAL, makeClock(at(realChicagoDate(0), '09:00')));
+      attendance(await verb(app, { bookingId, dogId, verb: 'no-show' }));
+      const [ret] = (await ledgerOf(bookingId)).filter((r) => r.reason === 'settlement-return');
+      assert.equal(ret?.lotId, lotI);
+      const sessionDay = at(day, '07:30').toLocaleDateString('en-GB', {
+        timeZone: 'America/Chicago',
+        weekday: 'short',
+        day: 'numeric',
+        month: 'short',
+      });
+      const bodies = (await cancelNotices(sessions)).map((n) => n.body);
+      assert.deepEqual(bodies, [
+        `Pepper didn't come on ${sessionDay}. 1 credit came back, but its date, ${en(at(day, '09:40'))}, has passed. Message us if you'd like it extended.`,
+      ]);
+      assert.doesNotMatch(bodies[0] ?? '', /today/);
+    },
+  );
+});

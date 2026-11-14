@@ -402,7 +402,7 @@ test(
     // demonstrate. The explicit 2x states that the doubling is expected here and
     // nowhere else (adversary round 3, 2026-08-20).
     stripe.setRefundableBalance('pi_test_probe', 10_000);
-    const params = refundCreateParams({ paymentIntentId: 'pi_test_probe', amountCents: 5_000 });
+    const params = refundCreateParams({ refundId: '00000000-0000-4000-8000-000000000022', paymentIntentId: 'pi_test_probe', amountCents: 5_000 });
     const first = await stripe.createRefund(params, 'the-key');
     const replayed = await stripe.createRefund(params, 'the-key');
     assert.equal(replayed.id, first.id, 'same key + same params → the same refund object');
@@ -418,13 +418,13 @@ test(
   async () => {
     const stripe = makeStripeStub();
     await stripe.createRefund(
-      refundCreateParams({ paymentIntentId: 'pi_test_drift', amountCents: 5_000 }),
+      refundCreateParams({ refundId: '00000000-0000-4000-8000-000000000022', paymentIntentId: 'pi_test_drift', amountCents: 5_000 }),
       'drift-key',
     );
     await assert.rejects(
       () =>
         stripe.createRefund(
-          refundCreateParams({ paymentIntentId: 'pi_test_drift', amountCents: 4_000 }),
+          refundCreateParams({ refundId: '00000000-0000-4000-8000-000000000022', paymentIntentId: 'pi_test_drift', amountCents: 4_000 }),
           'drift-key',
         ),
       /idempotent/i,
@@ -468,6 +468,9 @@ test(
     assert.deepEqual(retried.args, fired.args);
     assert.equal(JSON.stringify(retried.args), JSON.stringify(fired.args));
     assert.equal(retried.idempotencyKey, fired.idempotencyKey);
+    // P22 (B-7(b) 2): both name the row in `metadata.refund_id`, so the refund events and
+    // the sweep's look-up can find whose refund it is, and the pin watches that field too.
+    assert.deepEqual(fired.args.metadata, { refund_id: row.id });
     await cleanup();
   },
 );
@@ -745,7 +748,8 @@ test(
     assert.ok(alarm, 'the class with no surface at all now has one');
     assert.match(JSON.stringify(alarm.obj.refunds), new RegExp(row!.id));
     assert.match(JSON.stringify(alarm.obj.refunds), new RegExp(failedRefundId));
-    assert.match(alarm.msg ?? '', /did NOT return/);
+    // P22 B-7(e): the sentence names the two exits now; it still says the money did not return.
+    assert.match(alarm.msg ?? '', /no money went back/);
     // AMENDED by MR-A1.5: the instruction used to say "issue a FRESH refund",
     // which names no amount — so a human returned the ROW's figure even when
     // something else had already come back. It now names the OWED REMAINDER,
@@ -811,12 +815,12 @@ test(
     const pi = 'pi_test_capped';
     stripe.setRefundableBalance(pi, 5_000);
     await stripe.createRefund(
-      refundCreateParams({ paymentIntentId: pi, amountCents: 5_000 }),
+      refundCreateParams({ refundId: '00000000-0000-4000-8000-000000000022', paymentIntentId: pi, amountCents: 5_000 }),
       'k1',
     );
     await assert.rejects(
       () =>
-        stripe.createRefund(refundCreateParams({ paymentIntentId: pi, amountCents: 5_000 }), 'k2'),
+        stripe.createRefund(refundCreateParams({ refundId: '00000000-0000-4000-8000-000000000022', paymentIntentId: pi, amountCents: 5_000 }), 'k2'),
       (err: unknown) => (err as { code?: string }).code === 'charge_already_refunded',
       'a second full refund of a fully-refunded charge is refused',
     );
@@ -1477,8 +1481,10 @@ test(
       now: sweepNow(),
       log: logs.log,
     });
-    assert.equal(tick.abandonedByClass['stripe-failed'], 1, 'still owed');
-    const alarm = logs.error('stripe-failed');
+    // P22 B-7(c), Fable M1: a failed row larger than what its payment still owes shouts
+    // under its own class, whose sentence names the new refund rather than the two exits.
+    assert.equal(tick.abandonedByClass['failed-exceeds-owed'], 1, 'still owed');
+    const alarm = logs.error('failed-exceeds-owed');
     assert.ok(alarm, 'and still loud');
     const named = (
       alarm!.obj.refunds as { remainingCents?: number; actionableCents?: number }[]
@@ -1619,8 +1625,10 @@ test(
       now: sweepNow(),
       log: logs.log,
     });
-    assert.equal(tick.abandonedByClass['stripe-failed'], 1, 'still owed something');
-    const row = namedRow(logs.error('stripe-failed'));
+    // P22 B-7(c), Fable M1: the row is larger than the remainder, so it shouts under
+    // `failed-exceeds-owed`, its figure the remainder as before.
+    assert.equal(tick.abandonedByClass['failed-exceeds-owed'], 1, 'still owed something');
+    const row = namedRow(logs.error('failed-exceeds-owed'));
     assert.equal(row.actionableCents, 4_000, 'the cap wins when it is the smaller number');
     // Renamed by MR-A3.2: `clippedByRemainder` generalized to `clipped` + a
     // reason, because the cap is no longer the only thing that can clip a row.

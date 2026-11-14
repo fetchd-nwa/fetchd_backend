@@ -1,0 +1,2306 @@
+{
+  "recordedAt": "2026-11-14T00:51:12.708Z",
+  "stripeSdkVersion": "22.1.1",
+  "apiVersion": "2026-04-22.dahlia",
+  "note": "Machine-recorded by `npm run probe:stripe -- --refunds --record` from LIVE Stripe test mode (P22 brief B-1). Never hand-edit: no human chose its contents. Client secrets and receipt URLs are scrubbed at every depth. Re-record with the same command.",
+  "eventTypesAsked": [
+    "charge.refund.updated",
+    "refund.created",
+    "refund.updated",
+    "refund.failed",
+    "charge.refunded"
+  ],
+  "eventListErrors": [],
+  "allTypesReadCapped": false,
+  "a": {
+    "intent": {
+      "id": "pi_3UbV8sLE5OGXyaT10Yd54KY1",
+      "amount": 4500,
+      "status": "succeeded",
+      "latestCharge": "ch_3UbV8sLE5OGXyaT10oghGG7a"
+    },
+    "refund": {
+      "id": "re_3UbV8sLE5OGXyaT102bA9JKX",
+      "object": "refund",
+      "amount": 2000,
+      "application": null,
+      "balance_transaction": "txn_3UbV8sLE5OGXyaT10xZpfvEy",
+      "charge": "ch_3UbV8sLE5OGXyaT10oghGG7a",
+      "created": 1794617311,
+      "currency": "usd",
+      "customer": "cus_VckeSOKM1Vg50s",
+      "customer_account": null,
+      "destination_details": {
+        "card": {
+          "reference_status": "pending",
+          "reference_type": "acquirer_reference_number",
+          "type": "refund"
+        },
+        "type": "card"
+      },
+      "metadata": {
+        "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+      },
+      "payment_intent": "pi_3UbV8sLE5OGXyaT10Yd54KY1",
+      "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+      "reason": "requested_by_customer",
+      "receipt_number": null,
+      "source_transfer_reversal": null,
+      "status": "succeeded",
+      "transfer_reversal": null
+    },
+    "createdStatus": "succeeded",
+    "headers": {
+      "names": [
+        "access-control-allow-credentials",
+        "access-control-allow-methods",
+        "access-control-allow-origin",
+        "access-control-expose-headers",
+        "access-control-max-age",
+        "cache-control",
+        "connection",
+        "content-length",
+        "content-security-policy",
+        "content-type",
+        "date",
+        "idempotency-key",
+        "original-request",
+        "report-to",
+        "reporting-endpoints",
+        "request-id",
+        "server",
+        "strict-transport-security",
+        "stripe-should-retry",
+        "stripe-version",
+        "vary",
+        "x-stripe-priority-routing-enabled",
+        "x-stripe-routing-context-priority-tier",
+        "x-wc"
+      ],
+      "idempotentReplayed": null,
+      "idempotencyReplayed": null,
+      "originalRequestPresent": true,
+      "originalRequestIsFirst": null
+    },
+    "events": [
+      {
+        "type": "refund.created",
+        "id": "evt_3UbV8sLE5OGXyaT10FGEhrwS",
+        "created": 1794617311,
+        "objectType": "refund",
+        "objectId": "re_3UbV8sLE5OGXyaT102bA9JKX",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+        },
+        "previousAttributes": {},
+        "object": {
+          "id": "re_3UbV8sLE5OGXyaT102bA9JKX",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8sLE5OGXyaT10xZpfvEy",
+          "charge": "ch_3UbV8sLE5OGXyaT10oghGG7a",
+          "created": 1794617311,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "pending",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+          },
+          "payment_intent": "pi_3UbV8sLE5OGXyaT10Yd54KY1",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refunded",
+        "id": "evt_3UbV8sLE5OGXyaT10ZZMXSlC",
+        "created": 1794617311,
+        "objectType": "charge",
+        "objectId": "ch_3UbV8sLE5OGXyaT10oghGG7a",
+        "status": "partially-refunded",
+        "amountRefunded": 2000,
+        "metadata": {
+          "purpose": "probe-stripe-refunds"
+        },
+        "previousAttributes": {
+          "amount_refunded": 0,
+          "receipt_url": "<scrubbed by probe --refunds --record>"
+        },
+        "object": {
+          "id": "ch_3UbV8sLE5OGXyaT10oghGG7a",
+          "object": "charge",
+          "amount": 4500,
+          "amount_captured": 4500,
+          "amount_refunded": 2000,
+          "application": null,
+          "application_fee": null,
+          "application_fee_amount": null,
+          "balance_transaction": "txn_3UbV8sLE5OGXyaT10Cx1YUSN",
+          "billing_details": {
+            "address": {
+              "city": null,
+              "country": null,
+              "line1": null,
+              "line2": null,
+              "postal_code": null,
+              "state": null
+            },
+            "email": null,
+            "name": null,
+            "phone": null,
+            "tax_id": null
+          },
+          "calculated_statement_descriptor": "Stripe",
+          "captured": true,
+          "created": 1794617310,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "description": null,
+          "destination": null,
+          "dispute": null,
+          "disputed": false,
+          "failure_balance_transaction": null,
+          "failure_code": null,
+          "failure_message": null,
+          "fraud_details": {},
+          "livemode": false,
+          "metadata": {
+            "purpose": "probe-stripe-refunds"
+          },
+          "on_behalf_of": null,
+          "order": null,
+          "outcome": {
+            "advice_code": null,
+            "network_advice_code": null,
+            "network_decline_code": null,
+            "network_status": "approved_by_network",
+            "reason": null,
+            "risk_level": "normal",
+            "risk_score": 33,
+            "seller_message": "Payment complete.",
+            "type": "authorized"
+          },
+          "paid": true,
+          "payment_intent": "pi_3UbV8sLE5OGXyaT10Yd54KY1",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "payment_method_details": {
+            "card": {
+              "amount_authorized": 4500,
+              "authorization_code": "256094",
+              "brand": "visa",
+              "checks": {
+                "address_line1_check": null,
+                "address_postal_code_check": null,
+                "cvc_check": "pass"
+              },
+              "country": "US",
+              "electronic_commerce_indicator": "02",
+              "exp_month": 11,
+              "exp_year": 2027,
+              "extended_authorization": {
+                "status": "disabled"
+              },
+              "fingerprint": "AqedpK1RiBKnLun4",
+              "funding": "credit",
+              "incremental_authorization": {
+                "status": "unavailable"
+              },
+              "installments": null,
+              "last4": "4242",
+              "mandate": null,
+              "multicapture": {
+                "status": "unavailable"
+              },
+              "network": "visa",
+              "network_token": {
+                "used": false
+              },
+              "network_transaction_id": "651131011001127",
+              "overcapture": {
+                "maximum_amount_capturable": 4500,
+                "status": "unavailable"
+              },
+              "regulated_status": "unregulated",
+              "three_d_secure": null,
+              "transaction_link_id": null,
+              "wallet": null
+            },
+            "type": "card"
+          },
+          "radar_options": {},
+          "receipt_email": null,
+          "receipt_number": null,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": false,
+          "review": null,
+          "shipping": null,
+          "source": null,
+          "source_transfer": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "succeeded",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      },
+      {
+        "type": "refund.updated",
+        "id": "evt_3UbV8sLE5OGXyaT10myKK0kl",
+        "created": 1794617312,
+        "objectType": "refund",
+        "objectId": "re_3UbV8sLE5OGXyaT102bA9JKX",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference": null,
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8sLE5OGXyaT102bA9JKX",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8sLE5OGXyaT10xZpfvEy",
+          "charge": "ch_3UbV8sLE5OGXyaT10oghGG7a",
+          "created": 1794617311,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "328673154262692",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+          },
+          "payment_intent": "pi_3UbV8sLE5OGXyaT10Yd54KY1",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refund.updated",
+        "id": "evt_3UbV8sLE5OGXyaT10rb80ygm",
+        "created": 1794617312,
+        "objectType": "refund",
+        "objectId": "re_3UbV8sLE5OGXyaT102bA9JKX",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference": null,
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8sLE5OGXyaT102bA9JKX",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8sLE5OGXyaT10xZpfvEy",
+          "charge": "ch_3UbV8sLE5OGXyaT10oghGG7a",
+          "created": 1794617311,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "328673154262692",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+          },
+          "payment_intent": "pi_3UbV8sLE5OGXyaT10Yd54KY1",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      }
+    ]
+  },
+  "b": {
+    "intent": {
+      "id": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+      "amount": 4500,
+      "status": "succeeded",
+      "latestCharge": "ch_3UbV8oLE5OGXyaT11pALzQ0S"
+    },
+    "refund": {
+      "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+      "object": "refund",
+      "amount": 4500,
+      "application": null,
+      "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+      "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+      "created": 1794617307,
+      "currency": "usd",
+      "customer": "cus_VckeSOKM1Vg50s",
+      "customer_account": null,
+      "destination_details": {
+        "card": {
+          "reference_status": "pending",
+          "reference_type": "acquirer_reference_number",
+          "type": "refund"
+        },
+        "type": "card"
+      },
+      "metadata": {
+        "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+      },
+      "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+      "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+      "reason": "requested_by_customer",
+      "receipt_number": null,
+      "source_transfer_reversal": null,
+      "status": "succeeded",
+      "transfer_reversal": null
+    },
+    "createdStatus": "succeeded",
+    "timeline": [
+      {
+        "afterMs": 0,
+        "status": "succeeded",
+        "failureReason": null
+      },
+      {
+        "afterMs": 129644,
+        "status": "failed",
+        "failureReason": "expired_or_canceled_card"
+      }
+    ],
+    "failedWithinWait": true,
+    "retrievedAfter": {
+      "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+      "object": "refund",
+      "amount": 4500,
+      "application": null,
+      "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+      "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+      "created": 1794617307,
+      "currency": "usd",
+      "customer": "cus_VckeSOKM1Vg50s",
+      "customer_account": null,
+      "destination_details": {
+        "card": {
+          "reference_status": "unavailable",
+          "reference_type": "acquirer_reference_number",
+          "type": "refund"
+        },
+        "type": "card"
+      },
+      "failure_balance_transaction": "txn_1UbVAuLE5OGXyaT1vtjMuzlo",
+      "failure_reason": "expired_or_canceled_card",
+      "metadata": {
+        "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+      },
+      "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+      "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+      "reason": "requested_by_customer",
+      "receipt_number": null,
+      "source_transfer_reversal": null,
+      "status": "failed",
+      "transfer_reversal": null
+    },
+    "chargeAfter": {
+      "amountRefunded": 0,
+      "refunded": false
+    },
+    "events": [
+      {
+        "type": "refund.created",
+        "id": "evt_3UbV8oLE5OGXyaT11ljv8asC",
+        "created": 1794617308,
+        "objectType": "refund",
+        "objectId": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+        },
+        "previousAttributes": {},
+        "object": {
+          "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+          "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+          "created": 1794617307,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "pending",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+          },
+          "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refunded",
+        "id": "evt_3UbV8oLE5OGXyaT11SapOUb6",
+        "created": 1794617308,
+        "objectType": "charge",
+        "objectId": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+        "status": "refunded",
+        "amountRefunded": 4500,
+        "metadata": {
+          "purpose": "probe-stripe-refunds"
+        },
+        "previousAttributes": {
+          "amount_refunded": 0,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": false
+        },
+        "object": {
+          "id": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+          "object": "charge",
+          "amount": 4500,
+          "amount_captured": 4500,
+          "amount_refunded": 4500,
+          "application": null,
+          "application_fee": null,
+          "application_fee_amount": null,
+          "balance_transaction": "txn_3UbV8oLE5OGXyaT11JzV3gJJ",
+          "billing_details": {
+            "address": {
+              "city": null,
+              "country": null,
+              "line1": null,
+              "line2": null,
+              "postal_code": null,
+              "state": null
+            },
+            "email": null,
+            "name": null,
+            "phone": null,
+            "tax_id": null
+          },
+          "calculated_statement_descriptor": "Stripe",
+          "captured": true,
+          "created": 1794617306,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "description": null,
+          "destination": null,
+          "dispute": null,
+          "disputed": false,
+          "failure_balance_transaction": null,
+          "failure_code": null,
+          "failure_message": null,
+          "fraud_details": {},
+          "livemode": false,
+          "metadata": {
+            "purpose": "probe-stripe-refunds"
+          },
+          "on_behalf_of": null,
+          "order": null,
+          "outcome": {
+            "advice_code": null,
+            "network_advice_code": null,
+            "network_decline_code": null,
+            "network_status": "approved_by_network",
+            "reason": null,
+            "risk_level": "normal",
+            "risk_score": 45,
+            "seller_message": "Payment complete.",
+            "type": "authorized"
+          },
+          "paid": true,
+          "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+          "payment_method_details": {
+            "card": {
+              "amount_authorized": 4500,
+              "authorization_code": "900097",
+              "brand": "visa",
+              "checks": {
+                "address_line1_check": null,
+                "address_postal_code_check": null,
+                "cvc_check": "pass"
+              },
+              "country": "US",
+              "electronic_commerce_indicator": "02",
+              "exp_month": 11,
+              "exp_year": 2027,
+              "extended_authorization": {
+                "status": "disabled"
+              },
+              "fingerprint": "iSfqRAQC3eeWRrEz",
+              "funding": "credit",
+              "incremental_authorization": {
+                "status": "unavailable"
+              },
+              "installments": null,
+              "last4": "5126",
+              "mandate": null,
+              "multicapture": {
+                "status": "unavailable"
+              },
+              "network": "visa",
+              "network_token": {
+                "used": false
+              },
+              "network_transaction_id": "105831021138265",
+              "overcapture": {
+                "maximum_amount_capturable": 4500,
+                "status": "unavailable"
+              },
+              "regulated_status": "unregulated",
+              "three_d_secure": null,
+              "transaction_link_id": null,
+              "wallet": null
+            },
+            "type": "card"
+          },
+          "radar_options": {},
+          "receipt_email": null,
+          "receipt_number": null,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": true,
+          "review": null,
+          "shipping": null,
+          "source": null,
+          "source_transfer": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "succeeded",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      },
+      {
+        "type": "charge.refund.updated",
+        "id": "evt_3UbV8oLE5OGXyaT11eaiUWhW",
+        "created": 1794617432,
+        "objectType": "refund",
+        "objectId": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+          "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+          "created": 1794617307,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "unavailable",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+          },
+          "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "refund.updated",
+        "id": "evt_3UbV8oLE5OGXyaT11LL7ijV6",
+        "created": 1794617432,
+        "objectType": "refund",
+        "objectId": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+          "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+          "created": 1794617307,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "unavailable",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+          },
+          "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "refund.failed",
+        "id": "evt_3UbV8oLE5OGXyaT11jO6xiK7",
+        "created": 1794617436,
+        "objectType": "refund",
+        "objectId": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+        "status": "failed",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+        },
+        "previousAttributes": {
+          "failure_balance_transaction": null,
+          "failure_reason": null,
+          "status": "succeeded"
+        },
+        "object": {
+          "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+          "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+          "created": 1794617307,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "unavailable",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "failure_balance_transaction": "txn_1UbVAuLE5OGXyaT1vtjMuzlo",
+          "failure_reason": "expired_or_canceled_card",
+          "metadata": {
+            "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+          },
+          "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "failed",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refund.updated",
+        "id": "evt_3UbV8oLE5OGXyaT11shVgCIl",
+        "created": 1794617436,
+        "objectType": "refund",
+        "objectId": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+        "status": "failed",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+        },
+        "previousAttributes": {
+          "failure_balance_transaction": null,
+          "failure_reason": null,
+          "status": "succeeded"
+        },
+        "object": {
+          "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+          "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+          "created": 1794617307,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "unavailable",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "failure_balance_transaction": "txn_1UbVAuLE5OGXyaT1vtjMuzlo",
+          "failure_reason": "expired_or_canceled_card",
+          "metadata": {
+            "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+          },
+          "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "failed",
+          "transfer_reversal": null
+        }
+      }
+    ]
+  },
+  "c": {
+    "intent": {
+      "id": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+      "amount": 4500,
+      "status": "succeeded",
+      "latestCharge": "ch_3UbV8uLE5OGXyaT10nvqhp2L"
+    },
+    "firstRefund": {
+      "id": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+      "object": "refund",
+      "amount": 2000,
+      "application": null,
+      "balance_transaction": "txn_3UbV8uLE5OGXyaT10BXobSl3",
+      "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+      "created": 1794617313,
+      "currency": "usd",
+      "customer": "cus_VckeSOKM1Vg50s",
+      "customer_account": null,
+      "destination_details": {
+        "card": {
+          "reference_status": "pending",
+          "reference_type": "acquirer_reference_number",
+          "type": "refund"
+        },
+        "type": "card"
+      },
+      "metadata": {
+        "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+      },
+      "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+      "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+      "reason": "requested_by_customer",
+      "receipt_number": null,
+      "source_transfer_reversal": null,
+      "status": "succeeded",
+      "transfer_reversal": null
+    },
+    "overPartial": {
+      "requestedCents": 3000,
+      "heldCents": 2500,
+      "first": {
+        "refused": {
+          "sdkErrorClass": "StripeInvalidRequestError",
+          "type": "invalid_request_error",
+          "code": null,
+          "statusCode": 400,
+          "message": "Refund amount ($30.00) is greater than unrefunded amount on charge ($25.00)",
+          "headers": {
+            "names": [
+              "access-control-allow-credentials",
+              "access-control-allow-methods",
+              "access-control-allow-origin",
+              "access-control-expose-headers",
+              "access-control-max-age",
+              "cache-control",
+              "connection",
+              "content-length",
+              "content-security-policy",
+              "content-type",
+              "date",
+              "idempotency-key",
+              "original-request",
+              "report-to",
+              "reporting-endpoints",
+              "request-id",
+              "server",
+              "strict-transport-security",
+              "stripe-should-retry",
+              "stripe-version",
+              "vary",
+              "x-stripe-priority-routing-enabled",
+              "x-stripe-routing-context-priority-tier",
+              "x-wc"
+            ],
+            "idempotentReplayed": null,
+            "idempotencyReplayed": null,
+            "originalRequestPresent": true,
+            "originalRequestIsFirst": null
+          }
+        }
+      },
+      "sameKeyAgain": {
+        "refused": {
+          "sdkErrorClass": "StripeInvalidRequestError",
+          "type": "invalid_request_error",
+          "code": null,
+          "statusCode": 400,
+          "message": "Refund amount ($30.00) is greater than unrefunded amount on charge ($25.00)",
+          "headers": {
+            "names": [
+              "access-control-allow-credentials",
+              "access-control-allow-methods",
+              "access-control-allow-origin",
+              "access-control-expose-headers",
+              "access-control-max-age",
+              "cache-control",
+              "connection",
+              "content-length",
+              "content-security-policy",
+              "content-type",
+              "date",
+              "idempotency-key",
+              "idempotent-replayed",
+              "original-request",
+              "report-to",
+              "reporting-endpoints",
+              "request-id",
+              "server",
+              "strict-transport-security",
+              "stripe-should-retry",
+              "stripe-version",
+              "vary",
+              "x-stripe-priority-routing-enabled",
+              "x-stripe-routing-context-priority-tier",
+              "x-wc"
+            ],
+            "idempotentReplayed": "true",
+            "idempotencyReplayed": null,
+            "originalRequestPresent": true,
+            "originalRequestIsFirst": null
+          }
+        }
+      }
+    },
+    "restRefund": {
+      "id": "re_3UbV8uLE5OGXyaT100ifW7rg",
+      "object": "refund",
+      "amount": 2500,
+      "application": null,
+      "balance_transaction": "txn_3UbV8uLE5OGXyaT10UyFR9As",
+      "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+      "created": 1794617314,
+      "currency": "usd",
+      "customer": "cus_VckeSOKM1Vg50s",
+      "customer_account": null,
+      "destination_details": {
+        "card": {
+          "reference_status": "pending",
+          "reference_type": "acquirer_reference_number",
+          "type": "refund"
+        },
+        "type": "card"
+      },
+      "metadata": {
+        "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+      },
+      "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+      "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+      "reason": "requested_by_customer",
+      "receipt_number": null,
+      "source_transfer_reversal": null,
+      "status": "succeeded",
+      "transfer_reversal": null
+    },
+    "afterFull": {
+      "requestedCents": 100,
+      "heldCents": 0,
+      "first": {
+        "refused": {
+          "sdkErrorClass": "StripeInvalidRequestError",
+          "type": "invalid_request_error",
+          "code": "charge_already_refunded",
+          "statusCode": 400,
+          "message": "Charge ch_3UbV8uLE5OGXyaT10nvqhp2L has already been refunded.",
+          "headers": {
+            "names": [
+              "access-control-allow-credentials",
+              "access-control-allow-methods",
+              "access-control-allow-origin",
+              "access-control-expose-headers",
+              "access-control-max-age",
+              "cache-control",
+              "connection",
+              "content-length",
+              "content-security-policy",
+              "content-type",
+              "date",
+              "idempotency-key",
+              "original-request",
+              "report-to",
+              "reporting-endpoints",
+              "request-id",
+              "server",
+              "strict-transport-security",
+              "stripe-should-retry",
+              "stripe-version",
+              "vary",
+              "x-stripe-priority-routing-enabled",
+              "x-stripe-routing-context-priority-tier",
+              "x-wc"
+            ],
+            "idempotentReplayed": null,
+            "idempotencyReplayed": null,
+            "originalRequestPresent": true,
+            "originalRequestIsFirst": null
+          }
+        }
+      },
+      "sameKeyAgain": {
+        "refused": {
+          "sdkErrorClass": "StripeInvalidRequestError",
+          "type": "invalid_request_error",
+          "code": "charge_already_refunded",
+          "statusCode": 400,
+          "message": "Charge ch_3UbV8uLE5OGXyaT10nvqhp2L has already been refunded.",
+          "headers": {
+            "names": [
+              "access-control-allow-credentials",
+              "access-control-allow-methods",
+              "access-control-allow-origin",
+              "access-control-expose-headers",
+              "access-control-max-age",
+              "cache-control",
+              "connection",
+              "content-length",
+              "content-security-policy",
+              "content-type",
+              "date",
+              "idempotency-key",
+              "idempotent-replayed",
+              "original-request",
+              "report-to",
+              "reporting-endpoints",
+              "request-id",
+              "server",
+              "strict-transport-security",
+              "stripe-should-retry",
+              "stripe-version",
+              "vary",
+              "x-stripe-priority-routing-enabled",
+              "x-stripe-routing-context-priority-tier",
+              "x-wc"
+            ],
+            "idempotentReplayed": "true",
+            "idempotencyReplayed": null,
+            "originalRequestPresent": true,
+            "originalRequestIsFirst": null
+          }
+        }
+      }
+    },
+    "events": [
+      {
+        "type": "refund.created",
+        "id": "evt_3UbV8uLE5OGXyaT10JyVt6Wo",
+        "created": 1794617313,
+        "objectType": "refund",
+        "objectId": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+        },
+        "previousAttributes": {},
+        "object": {
+          "id": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10BXobSl3",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617313,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "pending",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refunded",
+        "id": "evt_3UbV8uLE5OGXyaT10vGoQa2Q",
+        "created": 1794617313,
+        "objectType": "charge",
+        "objectId": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+        "status": "partially-refunded",
+        "amountRefunded": 2000,
+        "metadata": {
+          "purpose": "probe-stripe-refunds"
+        },
+        "previousAttributes": {
+          "amount_refunded": 0,
+          "receipt_url": "<scrubbed by probe --refunds --record>"
+        },
+        "object": {
+          "id": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "object": "charge",
+          "amount": 4500,
+          "amount_captured": 4500,
+          "amount_refunded": 2000,
+          "application": null,
+          "application_fee": null,
+          "application_fee_amount": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10Ju8pPcf",
+          "billing_details": {
+            "address": {
+              "city": null,
+              "country": null,
+              "line1": null,
+              "line2": null,
+              "postal_code": null,
+              "state": null
+            },
+            "email": null,
+            "name": null,
+            "phone": null,
+            "tax_id": null
+          },
+          "calculated_statement_descriptor": "Stripe",
+          "captured": true,
+          "created": 1794617312,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "description": null,
+          "destination": null,
+          "dispute": null,
+          "disputed": false,
+          "failure_balance_transaction": null,
+          "failure_code": null,
+          "failure_message": null,
+          "fraud_details": {},
+          "livemode": false,
+          "metadata": {
+            "purpose": "probe-stripe-refunds"
+          },
+          "on_behalf_of": null,
+          "order": null,
+          "outcome": {
+            "advice_code": null,
+            "network_advice_code": null,
+            "network_decline_code": null,
+            "network_status": "approved_by_network",
+            "reason": null,
+            "risk_level": "normal",
+            "risk_score": 63,
+            "seller_message": "Payment complete.",
+            "type": "authorized"
+          },
+          "paid": true,
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "payment_method_details": {
+            "card": {
+              "amount_authorized": 4500,
+              "authorization_code": "689216",
+              "brand": "visa",
+              "checks": {
+                "address_line1_check": null,
+                "address_postal_code_check": null,
+                "cvc_check": "pass"
+              },
+              "country": "US",
+              "electronic_commerce_indicator": "02",
+              "exp_month": 11,
+              "exp_year": 2027,
+              "extended_authorization": {
+                "status": "disabled"
+              },
+              "fingerprint": "AqedpK1RiBKnLun4",
+              "funding": "credit",
+              "incremental_authorization": {
+                "status": "unavailable"
+              },
+              "installments": null,
+              "last4": "4242",
+              "mandate": null,
+              "multicapture": {
+                "status": "unavailable"
+              },
+              "network": "visa",
+              "network_token": {
+                "used": false
+              },
+              "network_transaction_id": "651131011001127",
+              "overcapture": {
+                "maximum_amount_capturable": 4500,
+                "status": "unavailable"
+              },
+              "regulated_status": "unregulated",
+              "three_d_secure": null,
+              "transaction_link_id": null,
+              "wallet": null
+            },
+            "type": "card"
+          },
+          "radar_options": {},
+          "receipt_email": null,
+          "receipt_number": null,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": false,
+          "review": null,
+          "shipping": null,
+          "source": null,
+          "source_transfer": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "succeeded",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      },
+      {
+        "type": "refund.created",
+        "id": "evt_3UbV8uLE5OGXyaT103P3fEel",
+        "created": 1794617314,
+        "objectType": "refund",
+        "objectId": "re_3UbV8uLE5OGXyaT100ifW7rg",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+        },
+        "previousAttributes": {},
+        "object": {
+          "id": "re_3UbV8uLE5OGXyaT100ifW7rg",
+          "object": "refund",
+          "amount": 2500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10UyFR9As",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617314,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "pending",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refunded",
+        "id": "evt_3UbV8uLE5OGXyaT10bfX69iE",
+        "created": 1794617314,
+        "objectType": "charge",
+        "objectId": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+        "status": "refunded",
+        "amountRefunded": 4500,
+        "metadata": {
+          "purpose": "probe-stripe-refunds"
+        },
+        "previousAttributes": {
+          "amount_refunded": 2000,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": false
+        },
+        "object": {
+          "id": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "object": "charge",
+          "amount": 4500,
+          "amount_captured": 4500,
+          "amount_refunded": 4500,
+          "application": null,
+          "application_fee": null,
+          "application_fee_amount": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10Ju8pPcf",
+          "billing_details": {
+            "address": {
+              "city": null,
+              "country": null,
+              "line1": null,
+              "line2": null,
+              "postal_code": null,
+              "state": null
+            },
+            "email": null,
+            "name": null,
+            "phone": null,
+            "tax_id": null
+          },
+          "calculated_statement_descriptor": "Stripe",
+          "captured": true,
+          "created": 1794617312,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "description": null,
+          "destination": null,
+          "dispute": null,
+          "disputed": false,
+          "failure_balance_transaction": null,
+          "failure_code": null,
+          "failure_message": null,
+          "fraud_details": {},
+          "livemode": false,
+          "metadata": {
+            "purpose": "probe-stripe-refunds"
+          },
+          "on_behalf_of": null,
+          "order": null,
+          "outcome": {
+            "advice_code": null,
+            "network_advice_code": null,
+            "network_decline_code": null,
+            "network_status": "approved_by_network",
+            "reason": null,
+            "risk_level": "normal",
+            "risk_score": 63,
+            "seller_message": "Payment complete.",
+            "type": "authorized"
+          },
+          "paid": true,
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "payment_method_details": {
+            "card": {
+              "amount_authorized": 4500,
+              "authorization_code": "689216",
+              "brand": "visa",
+              "checks": {
+                "address_line1_check": null,
+                "address_postal_code_check": null,
+                "cvc_check": "pass"
+              },
+              "country": "US",
+              "electronic_commerce_indicator": "02",
+              "exp_month": 11,
+              "exp_year": 2027,
+              "extended_authorization": {
+                "status": "disabled"
+              },
+              "fingerprint": "AqedpK1RiBKnLun4",
+              "funding": "credit",
+              "incremental_authorization": {
+                "status": "unavailable"
+              },
+              "installments": null,
+              "last4": "4242",
+              "mandate": null,
+              "multicapture": {
+                "status": "unavailable"
+              },
+              "network": "visa",
+              "network_token": {
+                "used": false
+              },
+              "network_transaction_id": "651131011001127",
+              "overcapture": {
+                "maximum_amount_capturable": 4500,
+                "status": "unavailable"
+              },
+              "regulated_status": "unregulated",
+              "three_d_secure": null,
+              "transaction_link_id": null,
+              "wallet": null
+            },
+            "type": "card"
+          },
+          "radar_options": {},
+          "receipt_email": null,
+          "receipt_number": null,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": true,
+          "review": null,
+          "shipping": null,
+          "source": null,
+          "source_transfer": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "succeeded",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      },
+      {
+        "type": "refund.updated",
+        "id": "evt_3UbV8uLE5OGXyaT10DkQd6VM",
+        "created": 1794617314,
+        "objectType": "refund",
+        "objectId": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference": null,
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10BXobSl3",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617313,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "4854179593625392",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refund.updated",
+        "id": "evt_3UbV8uLE5OGXyaT10vO6zdFT",
+        "created": 1794617314,
+        "objectType": "refund",
+        "objectId": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference": null,
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10BXobSl3",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617313,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "4854179593625392",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refund.updated",
+        "id": "evt_3UbV8uLE5OGXyaT1006qGpKu",
+        "created": 1794617315,
+        "objectType": "refund",
+        "objectId": "re_3UbV8uLE5OGXyaT100ifW7rg",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference": null,
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8uLE5OGXyaT100ifW7rg",
+          "object": "refund",
+          "amount": 2500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10UyFR9As",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617314,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "6291791936381369",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "refund.updated",
+        "id": "evt_3UbV8uLE5OGXyaT10UJ4R6M5",
+        "created": 1794617315,
+        "objectType": "refund",
+        "objectId": "re_3UbV8uLE5OGXyaT100ifW7rg",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+        },
+        "previousAttributes": {
+          "destination_details": {
+            "card": {
+              "reference": null,
+              "reference_status": "pending"
+            }
+          }
+        },
+        "object": {
+          "id": "re_3UbV8uLE5OGXyaT100ifW7rg",
+          "object": "refund",
+          "amount": 2500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10UyFR9As",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617314,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "6291791936381369",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      }
+    ]
+  },
+  "d": {
+    "replayedSameObject": true,
+    "replayStatus": "succeeded",
+    "headers": {
+      "names": [
+        "access-control-allow-credentials",
+        "access-control-allow-methods",
+        "access-control-allow-origin",
+        "access-control-expose-headers",
+        "access-control-max-age",
+        "cache-control",
+        "connection",
+        "content-length",
+        "content-security-policy",
+        "content-type",
+        "date",
+        "idempotency-key",
+        "idempotent-replayed",
+        "original-request",
+        "report-to",
+        "reporting-endpoints",
+        "request-id",
+        "server",
+        "strict-transport-security",
+        "stripe-should-retry",
+        "stripe-version",
+        "vary",
+        "x-stripe-priority-routing-enabled",
+        "x-stripe-routing-context-priority-tier",
+        "x-wc"
+      ],
+      "idempotentReplayed": "true",
+      "idempotencyReplayed": null,
+      "originalRequestPresent": true,
+      "originalRequestIsFirst": true
+    }
+  },
+  "f": {
+    "intent": {
+      "id": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+      "amount": 4500,
+      "status": "succeeded",
+      "latestCharge": "ch_3UbV8qLE5OGXyaT108j4Ven1"
+    },
+    "refund": {
+      "id": "re_3UbV8qLE5OGXyaT109NZxyli",
+      "object": "refund",
+      "amount": 4500,
+      "application": null,
+      "balance_transaction": "txn_3UbV8qLE5OGXyaT10gBh0Qpc",
+      "charge": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+      "created": 1794617309,
+      "currency": "usd",
+      "customer": "cus_VckeSOKM1Vg50s",
+      "customer_account": null,
+      "destination_details": {
+        "card": {
+          "type": "refund"
+        },
+        "type": "card"
+      },
+      "metadata": {
+        "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+      },
+      "payment_intent": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+      "payment_method": "pm_1UbV8oLE5OGXyaT1lXsiUkkc",
+      "pending_reason": "insufficient_funds",
+      "reason": "requested_by_customer",
+      "receipt_number": null,
+      "source_transfer_reversal": null,
+      "status": "pending",
+      "transfer_reversal": null
+    },
+    "createdStatus": "pending",
+    "timeline": [
+      {
+        "afterMs": 0,
+        "status": "pending",
+        "failureReason": null
+      },
+      {
+        "afterMs": 129812,
+        "status": "succeeded",
+        "failureReason": null
+      }
+    ],
+    "settledWithinWait": true,
+    "retrievedAfter": {
+      "id": "re_3UbV8qLE5OGXyaT109NZxyli",
+      "object": "refund",
+      "amount": 4500,
+      "application": null,
+      "balance_transaction": "txn_3UbV8qLE5OGXyaT10gBh0Qpc",
+      "charge": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+      "created": 1794617309,
+      "currency": "usd",
+      "customer": "cus_VckeSOKM1Vg50s",
+      "customer_account": null,
+      "destination_details": {
+        "card": {
+          "type": "refund"
+        },
+        "type": "card"
+      },
+      "metadata": {
+        "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+      },
+      "payment_intent": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+      "payment_method": "pm_1UbV8oLE5OGXyaT1lXsiUkkc",
+      "reason": "requested_by_customer",
+      "receipt_number": null,
+      "source_transfer_reversal": null,
+      "status": "succeeded",
+      "transfer_reversal": null
+    },
+    "events": [
+      {
+        "type": "charge.succeeded",
+        "id": "evt_3UbV8qLE5OGXyaT10OWTHIJE",
+        "created": 1794617308,
+        "objectType": "charge",
+        "objectId": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+        "status": "not-refunded",
+        "amountRefunded": 0,
+        "metadata": {
+          "purpose": "probe-stripe-refunds"
+        },
+        "previousAttributes": null,
+        "object": {
+          "id": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+          "object": "charge",
+          "amount": 4500,
+          "amount_captured": 4500,
+          "amount_refunded": 0,
+          "application": null,
+          "application_fee": null,
+          "application_fee_amount": null,
+          "balance_transaction": null,
+          "billing_details": {
+            "address": {
+              "city": null,
+              "country": null,
+              "line1": null,
+              "line2": null,
+              "postal_code": null,
+              "state": null
+            },
+            "email": null,
+            "name": null,
+            "phone": null,
+            "tax_id": null
+          },
+          "calculated_statement_descriptor": "Stripe",
+          "captured": true,
+          "created": 1794617308,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "description": null,
+          "destination": null,
+          "dispute": null,
+          "disputed": false,
+          "failure_balance_transaction": null,
+          "failure_code": null,
+          "failure_message": null,
+          "fraud_details": {},
+          "livemode": false,
+          "metadata": {
+            "purpose": "probe-stripe-refunds"
+          },
+          "on_behalf_of": null,
+          "order": null,
+          "outcome": {
+            "advice_code": null,
+            "network_advice_code": null,
+            "network_decline_code": null,
+            "network_status": "approved_by_network",
+            "reason": null,
+            "risk_level": "normal",
+            "risk_score": 54,
+            "seller_message": "Payment complete.",
+            "type": "authorized"
+          },
+          "paid": true,
+          "payment_intent": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+          "payment_method": "pm_1UbV8oLE5OGXyaT1lXsiUkkc",
+          "payment_method_details": {
+            "card": {
+              "amount_authorized": 4500,
+              "authorization_code": "819685",
+              "brand": "visa",
+              "checks": {
+                "address_line1_check": null,
+                "address_postal_code_check": null,
+                "cvc_check": "pass"
+              },
+              "country": "US",
+              "electronic_commerce_indicator": "02",
+              "exp_month": 11,
+              "exp_year": 2027,
+              "extended_authorization": {
+                "status": "disabled"
+              },
+              "fingerprint": "t8rqyGmRBB2KhXe1",
+              "funding": "credit",
+              "incremental_authorization": {
+                "status": "unavailable"
+              },
+              "installments": null,
+              "last4": "7726",
+              "mandate": null,
+              "multicapture": {
+                "status": "unavailable"
+              },
+              "network": "visa",
+              "network_token": {
+                "used": false
+              },
+              "network_transaction_id": "116561141131217",
+              "overcapture": {
+                "maximum_amount_capturable": 4500,
+                "status": "unavailable"
+              },
+              "regulated_status": "unregulated",
+              "three_d_secure": null,
+              "transaction_link_id": null,
+              "wallet": null
+            },
+            "type": "card"
+          },
+          "radar_options": {},
+          "receipt_email": null,
+          "receipt_number": null,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": false,
+          "review": null,
+          "shipping": null,
+          "source": null,
+          "source_transfer": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "succeeded",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      },
+      {
+        "type": "charge.refunded",
+        "id": "evt_3UbV8qLE5OGXyaT10a3SYECV",
+        "created": 1794617310,
+        "objectType": "charge",
+        "objectId": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+        "status": "refunded",
+        "amountRefunded": 4500,
+        "metadata": {
+          "purpose": "probe-stripe-refunds"
+        },
+        "previousAttributes": {
+          "amount_refunded": 0,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": false
+        },
+        "object": {
+          "id": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+          "object": "charge",
+          "amount": 4500,
+          "amount_captured": 4500,
+          "amount_refunded": 4500,
+          "application": null,
+          "application_fee": null,
+          "application_fee_amount": null,
+          "balance_transaction": "txn_3UbV8qLE5OGXyaT10gUtPrib",
+          "billing_details": {
+            "address": {
+              "city": null,
+              "country": null,
+              "line1": null,
+              "line2": null,
+              "postal_code": null,
+              "state": null
+            },
+            "email": null,
+            "name": null,
+            "phone": null,
+            "tax_id": null
+          },
+          "calculated_statement_descriptor": "Stripe",
+          "captured": true,
+          "created": 1794617308,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "description": null,
+          "destination": null,
+          "dispute": null,
+          "disputed": false,
+          "failure_balance_transaction": null,
+          "failure_code": null,
+          "failure_message": null,
+          "fraud_details": {},
+          "livemode": false,
+          "metadata": {
+            "purpose": "probe-stripe-refunds"
+          },
+          "on_behalf_of": null,
+          "order": null,
+          "outcome": {
+            "advice_code": null,
+            "network_advice_code": null,
+            "network_decline_code": null,
+            "network_status": "approved_by_network",
+            "reason": null,
+            "risk_level": "normal",
+            "risk_score": 54,
+            "seller_message": "Payment complete.",
+            "type": "authorized"
+          },
+          "paid": true,
+          "payment_intent": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+          "payment_method": "pm_1UbV8oLE5OGXyaT1lXsiUkkc",
+          "payment_method_details": {
+            "card": {
+              "amount_authorized": 4500,
+              "authorization_code": "819685",
+              "brand": "visa",
+              "checks": {
+                "address_line1_check": null,
+                "address_postal_code_check": null,
+                "cvc_check": "pass"
+              },
+              "country": "US",
+              "electronic_commerce_indicator": "02",
+              "exp_month": 11,
+              "exp_year": 2027,
+              "extended_authorization": {
+                "status": "disabled"
+              },
+              "fingerprint": "t8rqyGmRBB2KhXe1",
+              "funding": "credit",
+              "incremental_authorization": {
+                "status": "unavailable"
+              },
+              "installments": null,
+              "last4": "7726",
+              "mandate": null,
+              "multicapture": {
+                "status": "unavailable"
+              },
+              "network": "visa",
+              "network_token": {
+                "used": false
+              },
+              "network_transaction_id": "116561141131217",
+              "overcapture": {
+                "maximum_amount_capturable": 4500,
+                "status": "unavailable"
+              },
+              "regulated_status": "unregulated",
+              "three_d_secure": null,
+              "transaction_link_id": null,
+              "wallet": null
+            },
+            "type": "card"
+          },
+          "radar_options": {},
+          "receipt_email": null,
+          "receipt_number": null,
+          "receipt_url": "<scrubbed by probe --refunds --record>",
+          "refunded": true,
+          "review": null,
+          "shipping": null,
+          "source": null,
+          "source_transfer": null,
+          "statement_descriptor": null,
+          "statement_descriptor_suffix": null,
+          "status": "succeeded",
+          "transfer_data": null,
+          "transfer_group": null
+        }
+      },
+      {
+        "type": "refund.created",
+        "id": "evt_3UbV8qLE5OGXyaT10o6xoiIX",
+        "created": 1794617310,
+        "objectType": "refund",
+        "objectId": "re_3UbV8qLE5OGXyaT109NZxyli",
+        "status": "pending",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+        },
+        "previousAttributes": {},
+        "object": {
+          "id": "re_3UbV8qLE5OGXyaT109NZxyli",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8qLE5OGXyaT10gBh0Qpc",
+          "charge": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+          "created": 1794617309,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+          },
+          "payment_intent": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+          "payment_method": "pm_1UbV8oLE5OGXyaT1lXsiUkkc",
+          "pending_reason": "insufficient_funds",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "pending",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "charge.refund.updated",
+        "id": "evt_3UbV8qLE5OGXyaT10dqlthfF",
+        "created": 1794617430,
+        "objectType": "refund",
+        "objectId": "re_3UbV8qLE5OGXyaT109NZxyli",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+        },
+        "previousAttributes": {
+          "pending_reason": "insufficient_funds",
+          "status": "pending"
+        },
+        "object": {
+          "id": "re_3UbV8qLE5OGXyaT109NZxyli",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8qLE5OGXyaT10gBh0Qpc",
+          "charge": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+          "created": 1794617309,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+          },
+          "payment_intent": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+          "payment_method": "pm_1UbV8oLE5OGXyaT1lXsiUkkc",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "type": "refund.updated",
+        "id": "evt_3UbV8qLE5OGXyaT10LF2cOZf",
+        "created": 1794617430,
+        "objectType": "refund",
+        "objectId": "re_3UbV8qLE5OGXyaT109NZxyli",
+        "status": "succeeded",
+        "amountRefunded": null,
+        "metadata": {
+          "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+        },
+        "previousAttributes": {
+          "pending_reason": "insufficient_funds",
+          "status": "pending"
+        },
+        "object": {
+          "id": "re_3UbV8qLE5OGXyaT109NZxyli",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8qLE5OGXyaT10gBh0Qpc",
+          "charge": "ch_3UbV8qLE5OGXyaT108j4Ven1",
+          "created": 1794617309,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "402b8826-9669-4a8b-87a0-0c739f182d33"
+          },
+          "payment_intent": "pi_3UbV8qLE5OGXyaT10nHGaM4e",
+          "payment_method": "pm_1UbV8oLE5OGXyaT1lXsiUkkc",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      }
+    ]
+  },
+  "e": {
+    "a": [
+      {
+        "id": "re_3UbV8sLE5OGXyaT102bA9JKX",
+        "amount": 2000,
+        "status": "succeeded",
+        "metadata": {
+          "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+        },
+        "raw": {
+          "id": "re_3UbV8sLE5OGXyaT102bA9JKX",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8sLE5OGXyaT10xZpfvEy",
+          "charge": "ch_3UbV8sLE5OGXyaT10oghGG7a",
+          "created": 1794617311,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "328673154262692",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "28c0dff2-4a20-4309-8137-acbe2af2a928"
+          },
+          "payment_intent": "pi_3UbV8sLE5OGXyaT10Yd54KY1",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      }
+    ],
+    "b": [
+      {
+        "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+        "amount": 4500,
+        "status": "failed",
+        "metadata": {
+          "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+        },
+        "raw": {
+          "id": "re_3UbV8oLE5OGXyaT11DRDrOSk",
+          "object": "refund",
+          "amount": 4500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8oLE5OGXyaT11PfrTA7x",
+          "charge": "ch_3UbV8oLE5OGXyaT11pALzQ0S",
+          "created": 1794617307,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference_status": "unavailable",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "failure_balance_transaction": "txn_1UbVAuLE5OGXyaT1vtjMuzlo",
+          "failure_reason": "expired_or_canceled_card",
+          "metadata": {
+            "refund_id": "9577c647-7964-4d0b-9939-c29618273b6d"
+          },
+          "payment_intent": "pi_3UbV8oLE5OGXyaT11SUqYiN3",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1SHOpVB1s",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "failed",
+          "transfer_reversal": null
+        }
+      }
+    ],
+    "c": [
+      {
+        "id": "re_3UbV8uLE5OGXyaT100ifW7rg",
+        "amount": 2500,
+        "status": "succeeded",
+        "metadata": {
+          "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+        },
+        "raw": {
+          "id": "re_3UbV8uLE5OGXyaT100ifW7rg",
+          "object": "refund",
+          "amount": 2500,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10UyFR9As",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617314,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "6291791936381369",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "cace6470-19ab-427c-ab13-780fbc76a4ec"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      },
+      {
+        "id": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+        "amount": 2000,
+        "status": "succeeded",
+        "metadata": {
+          "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+        },
+        "raw": {
+          "id": "re_3UbV8uLE5OGXyaT10TIJFFCO",
+          "object": "refund",
+          "amount": 2000,
+          "application": null,
+          "balance_transaction": "txn_3UbV8uLE5OGXyaT10BXobSl3",
+          "charge": "ch_3UbV8uLE5OGXyaT10nvqhp2L",
+          "created": 1794617313,
+          "currency": "usd",
+          "customer": "cus_VckeSOKM1Vg50s",
+          "customer_account": null,
+          "destination_details": {
+            "card": {
+              "reference": "4854179593625392",
+              "reference_status": "available",
+              "reference_type": "acquirer_reference_number",
+              "type": "refund"
+            },
+            "type": "card"
+          },
+          "metadata": {
+            "refund_id": "12238330-0da0-4914-85bd-ee3035f5d107"
+          },
+          "payment_intent": "pi_3UbV8uLE5OGXyaT10CDRHLdG",
+          "payment_method": "pm_1UbV8nLE5OGXyaT1PyWv78JN",
+          "reason": "requested_by_customer",
+          "receipt_number": null,
+          "source_transfer_reversal": null,
+          "status": "succeeded",
+          "transfer_reversal": null
+        }
+      }
+    ],
+    "complete": {
+      "a": true,
+      "b": true,
+      "c": true
+    }
+  }
+}

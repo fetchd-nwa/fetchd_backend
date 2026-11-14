@@ -34,7 +34,10 @@ import {
   ordersRepository,
   type OrderRow,
 } from '../db/repositories/ordersRepository.js';
-import { refundsRepository } from '../db/repositories/refundsRepository.js';
+import {
+  LATE_SUCCESS_REFUND_REASON,
+  refundsRepository,
+} from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { withActor, type Tx } from '../db/tx.js';
@@ -278,8 +281,9 @@ const LATE_SUCCESS_ALARM =
 const LATE_SUCCESS_NO_INTENT_ALARM =
   'a charge succeeded after its order was cancelled, and no refund could be minted because the row names no intent: an owner is owed this money, its watch stays open, and a person must refund it';
 
-/** The `refunds.reason` of the automatic refund (follow-up 4, SIGNOFF.md:208-209). */
-export const LATE_SUCCESS_REFUND_REASON = 'late-success-refund';
+/** The `refunds.reason` of the automatic refund (follow-up 4, SIGNOFF.md:208-209); it lives
+ *  in `refundsRepository` since P22, so the apply function reads it without a cycle. */
+export { LATE_SUCCESS_REFUND_REASON };
 
 /** Thrown after {@link NO_PURCHASE_SETTLE_ALARM}: nothing commits, and a webhook retries. */
 export class OrderSettleUnreachableError extends Error {}
@@ -321,6 +325,11 @@ async function refundLateSuccess(
     bookingId: null,
     reason: LATE_SUCCESS_REFUND_REASON,
     stripeIdempotencyKey: (refundId) => `late-success-refund:${refundId}`,
+    // P22 B-7(d) (`brief_must_say` 2; r2 N3, p37): one refund per late success, whatever
+    // Stripe did to it. A refund Stripe later fails goes to the report and a person, who
+    // has *Retry to card* and *Returned*; a re-dispatched or late first delivery of
+    // `payment_intent.succeeded` mints nothing, decided under this charge lock.
+    oncePerReason: true,
   });
   if (minted.kind === 'no-payment-intent') {
     // Unreachable while the id above is stored in this transaction. If it ever isn't,

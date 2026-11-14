@@ -171,7 +171,7 @@ The mission's domain list maps as: auth/session + media + settings → §1; eval
 | 43 | `reports.delete` | C | NEW: `DELETE /staff/reports/:id` (soft, via `expired_at`) | VERIFIED |
 | 44 | `invoices.list` | B | `GET /staff/invoices` | VERIFIED |
 | 45 | `invoices.get` | C | NEW: `GET /staff/invoices/:id` | VERIFIED |
-| 46 | `invoices.refund` | C | NEW: `POST /staff/refunds` | VERIFIED |
+| 46 | `invoices.refund` | C | `POST /staff/refunds` (built at 6.0.0, P22: charge-keyed `{payment_id, amount_cents, instrument, reason, credits_to_remove?}`; with `GET /staff/payments/:id/refund-proposal`, `POST /staff/refunds/:id/retry`, `POST /staff/refunds/:id/resolve-external`) | VERIFIED |
 | 47 | `invoices.remind` | C | NEW: `POST /staff/invoices/:id/remind` | VERIFIED |
 | 48 | `credits.lotsForDog` | C | NEW: `GET /staff/dogs/:id/credit-lots` | VERIFIED |
 | 49 | `credits.ledgerForOwner` | C | NEW: `GET /staff/owners/:id/credit-ledger` | VERIFIED |
@@ -1176,7 +1176,7 @@ The entire credits domain is absent from wire.ts v1.0.0 (NOTE-12 @ DISCREPANCIES
 ## Invoices / Refunds / Payments / PAYG / Stripe <a id="invoices"></a>
 _Demand: InvoicesApi.list/get/refund/remind @ client.ts:257-260 (InvoiceListParams 130-136, RefundInput 138-145) · Supply: invoices.ts, staffInvoices.ts, paymentMethods.ts, stripeWebhook.ts, requestConfirmPayment.ts · Logic: refundGuard.ts · Business logic: payments-invoices.md_
 
-The portal exposes four staff invoice ops (InvoicesApi.list/get/refund/remind @ client.ts:257-260). **Since wire 2.0.0 (P03, STAFF-U13; design §1.1:710-717, §2.10:4682-4697) the backend serves staff billing reads, split by role** (04- item 128: "Trainers CAN open invoices. Trainers may NOT see payment history or cards on file"): `GET /staff/owners/:id/invoices` and `GET /staff/invoices/:id` (any staff role; `StaffInvoiceWire`, today's numberless one-line invoice, with `payments` — each settling charge's `payment_id`, `paid_cents`, `refundable_cents` — present only for a caller holding `capabilities.refund_money`) @ routes/staffOwners.ts and routes/staffInvoices.ts; `GET /staff/owners/:id/payments` (charges that took money, each with its refunds) and `GET /staff/owners/:id/payment-methods` (`PaymentMethodWire`), owner and manager only, a trainer 403 `forbidden` from the role guard before `:id` is read; and the owner picker `GET /staff/owners` (`StaffOwnerWire`, any role, no money field). Every shape is in wire.ts. So `InvoicesApi.get` is served by `GET /staff/invoices/:id` (on today's shape: no number, no lines — build DECISIONS 89 X2). Still unbuilt: the general staff invoice list (`GET /staff/invoices` stays `?parked`-only until design 6.1.0), the staff refund verb (`POST /staff/refunds {payment_id}`, design 6.0.0, P22) and any manual remind route. The deeper mismatch stands: the portal's money model diverges from backend runtime (DISCREPANCIES DRIFT-17) — multi-line numbered invoices (INV-2048), statuses Open|Paid|Overdue|Refunded|Void, and invoice-keyed card|credit|cash refunds, against single-amount numberless invoices (status open|paid|void) with charge-keyed refunds — so every op ALIGNS to the shipped charges/refunds model, not the portal spec. (The entries below predate 2.0.0 and are kept as the 2026-07 survey.)
+The portal exposes four staff invoice ops (InvoicesApi.list/get/refund/remind @ client.ts:257-260). **Since wire 2.0.0 (P03, STAFF-U13; design §1.1:710-717, §2.10:4682-4697) the backend serves staff billing reads, split by role** (04- item 128: "Trainers CAN open invoices. Trainers may NOT see payment history or cards on file"): `GET /staff/owners/:id/invoices` and `GET /staff/invoices/:id` (any staff role; `StaffInvoiceWire`, today's numberless one-line invoice, with `payments` — each settling charge's `payment_id`, `paid_cents`, `refundable_cents` — present only for a caller holding `capabilities.refund_money`) @ routes/staffOwners.ts and routes/staffInvoices.ts; `GET /staff/owners/:id/payments` (charges that took money, each with its refunds) and `GET /staff/owners/:id/payment-methods` (`PaymentMethodWire`), owner and manager only, a trainer 403 `forbidden` from the role guard before `:id` is read; and the owner picker `GET /staff/owners` (`StaffOwnerWire`, any role, no money field). Every shape is in wire.ts. So `InvoicesApi.get` is served by `GET /staff/invoices/:id` (on today's shape: no number, no lines — build DECISIONS 89 X2). Still unbuilt: the general staff invoice list (`GET /staff/invoices` stays `?parked`-only until design 6.1.0) and any manual remind route. *Δ 6.0.0 (P22): the staff refund verb is built, as `InvoicesApi.refund` below records.* The deeper mismatch stands: the portal's money model diverges from backend runtime (DISCREPANCIES DRIFT-17) — multi-line numbered invoices (INV-2048), statuses Open|Paid|Overdue|Refunded|Void, and invoice-keyed card|credit|cash refunds, against single-amount numberless invoices (status open|paid|void) with charge-keyed refunds — so every op ALIGNS to the shipped charges/refunds model, not the portal spec. (The entries below predate 2.0.0 and are kept as the 2026-07 survey.)
 
 ### `InvoicesApi.list` — staff invoice worklist + search
 - **Portal:** `list(params?: InvoiceListParams): Promise<Invoice[]> @ fetchd_staff_portal_desktop/src/api/client.ts:257 (InvoiceListParams @ client.ts:130-136)` · mock logic: mock invoices.list @ src/api/mock/index.ts:741-767; InvoiceListParams @ client.ts:130-136; Invoice/InvoiceStatus @ src/api/types.ts:441-465
@@ -1224,6 +1224,28 @@ The portal exposes four staff invoice ops (InvoicesApi.list/get/refund/remind @ 
     - Portal reason is an enum (RefundReason, types.ts:469-470: Returned item|Canceled session|Overcharge|Service issue|Goodwill|Other); refunds.reason is free text (schema.sql:1222). Adopt the enum or keep free text?
     - itemsReturned (line indices, client.ts:144) is UI-only amount prefill (mock only echoes it, index.ts:786) and has no server meaning given single-amount invoices — safe to accept-and-ignore or drop.
     - NEW (found this session): DATA-CONTRACT §C @ DATA-CONTRACT.md:2160 documents a `GET /refunds` refund-history endpoint, but no such route exists anywhere in src/routes/ (grep confirmed) — doc-vs-code drift. Any staff refund verb should decide whether that promised owner-facing refund read ships alongside it.
+
+> **Δ 2026-11-13 (P22, wire 6.0.0; PAY-U24, PAY-U25, PAY-U27, PAY-U28, CRED-U18; s17, s18):**
+> built, charge-keyed, as the wire and `DATA-CONTRACT.md` §U have it, not as proposed above.
+> `POST /staff/refunds {payment_id, amount_cents, instrument, reason, credits_to_remove?}`
+> (`src/routes/staffRefunds.ts`; no `invoice_id`, no `charge_id` key) → 201 `RefundWire`
+> `pending`; the cap is the payment less every refund not `failed` and not closed
+> `withdrawn` (422 `over_cap`, a `pending` one counting), and a refund may remove the
+> purchase lot's unbooked, unspent credits (422 `lot_insufficient` above them). Only a role
+> on `staff.refund_role_list` (seeded owner and manager), or any role at or under
+> `pay.refund_any_role_limit_cents` (seeded 0), may refund: 403 `refund_role_required`, never
+> a trainer at the seed. `GET /staff/payments/:id/refund-proposal` proposes the amount and the
+> credits; `POST /staff/refunds/:id/retry` (*Retry to card*) and
+> `POST /staff/refunds/:id/resolve-external` (*Returned*, outcome `returned` or `withdrawn`)
+> close a failed refund, on the newest row of its retry chain only (409
+> `refund_superseded`). The open questions above are answered by the design: methods are
+> `original_card` now (`cash` and `check` 422 `instrument_unavailable` until P24; no account
+> credit); `reason` stays free text (1-500 characters); there is no invoice-less "money back
+> to any client" mode beyond refunding a payment; `itemsReturned` has no server meaning. The
+> "NEW (found this session)" drift is settled by running it, not by a search: `GET /refunds`
+> answers 404 `Route GET:/refunds not found` on a real server with an owner principal
+> (2026-11-13, `units/P22/evidence/backend/get-refunds-run-2.log`); no owner-facing refund
+> read ships, and none is designed (the owner app shows the invoice and the balance).
 
 ### `InvoicesApi.remind` — send a payment reminder to the owner
 - **Portal:** `remind(id: InvoiceId): Promise<void> @ client.ts:260` · mock logic: mock invoices.remind @ src/api/mock/index.ts:810-817; refundGuard.canRemind @ src/api/mock/logic/refundGuard.ts:43-46 (blocks Paid/Refunded/Void)
@@ -1868,7 +1890,7 @@ All staff-scoped (`requireStaff`), snake_case wire, mutations idempotent (`Idemp
 8. `GET /staff/cohorts/:cohortId/sessions` — week-folded attendance roster (incl. per-write `booking_id`). (§6)
 
 **Money verbs:**
-9. `POST /staff/refunds` — charge-keyed staff refund (`charge_id` XOR `invoice_id`), R9 cumulative cap, Stripe post-commit + webhook reconciliation (UI must render "pending" until webhook lands — BUG-5 precedent). (§9)
+9. `POST /staff/refunds` — charge-keyed staff refund (`charge_id` XOR `invoice_id`), R9 cumulative cap, Stripe post-commit + webhook reconciliation (UI must render "pending" until webhook lands — BUG-5 precedent). (§9) *Δ 6.0.0 (P22): built, keyed by `payment_id` alone (no `invoice_id`); see `InvoicesApi.refund`.*
 10. `POST /staff/invoices/:id/remind` — staff dunning nudge via the scheduled-notifications lane; needs an idempotency/dedupe-window ruling. (§9)
 
 **Requests:**
