@@ -43,7 +43,7 @@ function appAt(now: () => Date): ReturnType<typeof makeContractApp>['app'] {
 }
 
 type App = ReturnType<typeof appAt>;
-type BookingBody = { id: string; dog_id: string; date: string; cancel_deadline_at: string };
+type BookingBody = { id: string; dog_id: string; date: string; cancel_deadline_at?: string };
 
 async function book(
   app: App,
@@ -89,7 +89,7 @@ test(
 );
 
 test(
-  'dropoff_open_time at 07:45 moves scheduled_at, the deadline and the reminder',
+  'dropoff_open_time at 07:45 moves scheduled_at and the reminder; no deadline is stamped (P21, D3)',
   SKIP_WHEN_NO_DB,
   async () => {
     await setCampusSettings('bentonville', { dropoffOpenTime: '07:45' });
@@ -98,8 +98,8 @@ test(
     assert.equal(res.statusCode, 201, res.body);
     const [wire] = res.bookings;
     assert.equal(wire?.date, '2026-06-16T12:45:00.000Z', '07:45 CDT');
-    // 48 hours is the seeded window, stamped from the new start.
-    assert.equal(wire?.cancel_deadline_at, '2026-06-14T12:45:00.000Z');
+    // No cancel window exists from P21 (M5.08): nothing is stamped, so the wire omits it.
+    assert.equal(wire?.cancel_deadline_at, undefined);
 
     const [reminder] = await db
       .select({ scheduledFor: scheduledNotifications.scheduledFor })

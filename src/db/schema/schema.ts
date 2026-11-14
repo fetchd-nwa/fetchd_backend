@@ -591,43 +591,6 @@ export const bookings = pgTable("bookings", {
 	}
 });
 
-export const afterSchoolOptins = pgTable("after_school_optins", {
-	id: uuid().defaultRandom().primaryKey().notNull(),
-	bookingId: uuid("booking_id").notNull(),
-	bookingCategory: serviceCategory("booking_category").notNull(),
-	dogId: uuid("dog_id").notNull(),
-	ownerId: uuid("owner_id").notNull(),
-	schoolDayCount: integer("school_day_count").notNull(),
-	externalRef: text("external_ref"),
-	source: recordSource().default('app').notNull(),
-	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
-}, (table) => {
-	return {
-		dogIdx: index("after_school_optins_dog_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops")),
-		ownerIdx: index("after_school_optins_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
-		sourceRefUidx: uniqueIndex("after_school_optins_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("text_ops"), table.externalRef.asc().nullsLast().op("text_ops")).where(sql`(expired_at IS NULL)`),
-		uidx: uniqueIndex("after_school_optins_uidx").using("btree", table.bookingId.asc().nullsLast().op("uuid_ops"), table.dogId.asc().nullsLast().op("uuid_ops")).where(sql`(expired_at IS NULL)`),
-		afterSchoolOptinsDogIdFkey: foreignKey({
-			columns: [table.dogId],
-			foreignColumns: [dogs.id],
-			name: "after_school_optins_dog_id_fkey"
-		}).onDelete("cascade"),
-		afterSchoolOptinsOwnerIdFkey: foreignKey({
-			columns: [table.ownerId],
-			foreignColumns: [owners.id],
-			name: "after_school_optins_owner_id_fkey"
-		}).onDelete("cascade"),
-		afterSchoolOptinsBookingIdBookingCategoryFkey: foreignKey({
-			columns: [table.bookingId, table.bookingCategory],
-			foreignColumns: [bookings.id, bookings.category],
-			name: "after_school_optins_booking_id_booking_category_fkey"
-		}).onDelete("cascade"),
-		afterSchoolOptinsSchoolDayCountCheck: check("after_school_optins_school_day_count_check", sql`school_day_count > 0`),
-		afterSchoolOptinsBookingCategoryCheck: check("after_school_optins_booking_category_check", sql`booking_category = 'day-school'::service_category`),
-	}
-});
-
 export const pendingRequests = pgTable("pending_requests", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
 	ownerId: uuid("owner_id").notNull(),
@@ -689,22 +652,6 @@ export const intakeFieldSettings = pgTable("intake_field_settings", {
 			foreignColumns: [staff.id],
 			name: "intake_field_settings_updated_by_staff_id_fkey"
 		}).onDelete("set null"),
-	}
-});
-
-export const cancelWindowSettings = pgTable("cancel_window_settings", {
-	category: serviceCategory().primaryKey().notNull(),
-	hoursBefore: integer("hours_before").notNull(),
-	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
-	updatedByStaffId: uuid("updated_by_staff_id"),
-}, (table) => {
-	return {
-		cancelWindowSettingsUpdatedByStaffIdFkey: foreignKey({
-			columns: [table.updatedByStaffId],
-			foreignColumns: [staff.id],
-			name: "cancel_window_settings_updated_by_staff_id_fkey"
-		}).onDelete("set null"),
-		cancelWindowSettingsHoursBeforeCheck: check("cancel_window_settings_hours_before_check", sql`hours_before > 0`),
 	}
 });
 
@@ -2062,6 +2009,8 @@ export const bookingDogs = pgTable("booking_dogs", {
 	dogId: uuid("dog_id").notNull(),
 	isLead: boolean("is_lead").default(false).notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	// M5.04 (DAY-U43): her opt-in to that date's after-school session.
+	afterSchool: boolean("after_school").default(false).notNull(),
 }, (table) => {
 	return {
 		dogIdx: index("booking_dogs_dog_idx").using("btree", table.dogId.asc().nullsLast().op("uuid_ops")),

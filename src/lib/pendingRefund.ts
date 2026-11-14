@@ -3,9 +3,10 @@ import type { StripeClient, StripePaymentIntentId } from './stripe.js';
 
 /**
  * The handle a pending-refund writer hands its caller to fire after commit —
- * ONE type for all five money-back sites (`designs/client-keyed-refund-recovery.md`
- * §2.2). It used to be two structurally identical interfaces declared in two
- * files (`cancelBookingService.PendingStripeRefund`,
+ * ONE type for every money-back site (`designs/client-keyed-refund-recovery.md`
+ * §2.2 named five; the booking cancel's money-back branch, one of them, was
+ * deleted in P21, wire 6.0.0-lg5.2). It used to be two structurally identical
+ * interfaces declared in two files (`cancelBookingService.PendingStripeRefund`,
  * `settleInvoiceCharge.PendingDuplicateRefund`), which is how the fourth field
  * below could have been added to one and forgotten on the other.
  *
@@ -61,8 +62,8 @@ export function refundCreateParams(pending: { paymentIntentId: string; amountCen
  *
  * `stripe` is narrowed to the one verb so a caller cannot be handed more Stripe
  * surface than this needs. A no-op on `undefined` — the defensive zero-refund
- * cases (a charge already fully pending-refunded, a forfeited cancel) have
- * nothing to send back.
+ * cases (a charge already fully pending-refunded; every booking cancel since P21,
+ * which moves no money) have nothing to send back.
  */
 export async function firePendingRefundPostCommit(args: {
   pending: PendingStripeRefund | undefined;
@@ -101,11 +102,11 @@ export async function firePendingRefundPostCommit(args: {
  * path will ever send it. Money owed with no route is a page-once event, at the
  * moment it becomes true — not a line that repeats on every worker tick forever.
  *
- * Called IN-TRANSACTION at the mint (`cancelBookingService`'s money-back
- * branch, and since 2026-08-24 the group-class withdraw's `refund_manual` arm —
- * `designs/money-residue.md` §3), never from a
- * post-commit seam — ruled by the 2026-08-20 adversary panel, which proved the
- * post-commit placement loses the announcement PERMANENTLY on the
+ * Called IN-TRANSACTION at the mint (since 2026-08-24 the group-class withdraw's
+ * `refund_manual` arm — `designs/money-residue.md` §3; `cancelBookingService`'s
+ * money-back branch, its first caller, was deleted in P21, wire 6.0.0-lg5.2),
+ * never from a post-commit seam — ruled by the 2026-08-20 adversary panel, which
+ * proved the post-commit placement loses the announcement PERMANENTLY on the
  * crash-then-replay arc (`withMutation` replays skip postCommit, and no report
  * class can ever name an unroutable row again). The cost of this placement is
  * a rare false alarm if the transaction then rolls back — loud and

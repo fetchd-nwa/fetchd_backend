@@ -242,6 +242,15 @@ test(
     const body = res.json() as { id: string; status: string };
     assert.equal(body.status, 'converted');
 
+    // P21 (M5.08; contract notes D3): no cancel window exists, so the card confirm stamps none.
+    const [converted] = await db
+      .select({ cancelDeadlineAt: bookings.cancelDeadlineAt })
+      .from(pendingRequests)
+      .innerJoin(bookings, eq(bookings.id, pendingRequests.convertedBookingId))
+      .where(eq(pendingRequests.id, requestId));
+    assert.ok(converted, 'the converted booking');
+    assert.equal(converted.cancelDeadlineAt, null);
+
     const [chargeRow] = await db
       .select({
         amountCents: charges.amountCents,

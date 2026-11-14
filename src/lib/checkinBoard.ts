@@ -21,6 +21,7 @@ import { cancelFacts, dayHasEnded, statesByDog } from './dayCancel.js';
  *     the board's date, finds a requirement she no longer meets. The other two kinds are
  *     typed and never sent (P09, S14).
  *   - `can_cancel`: her `dog_shares[].can_cancel` on a staff read.
+ *   - `after_school`: her share's opt-in to the day's after-school session (M5.04, D12).
  */
 export async function readCheckinBoard(args: {
   location: LocationKey;
@@ -66,7 +67,10 @@ export async function readCheckinBoard(args: {
         state: folded.state,
         events: folded.log.map((e) => toCheckinEventWire(e, returned)),
         booking_status: session.status,
+        // D12 (question 89's default): an after-school dog is flagged at the call time
+        // like any other; the row carries her opt-in so staff read past it.
         late_pickup_due: isOnSite(folded.state) && args.now.getTime() >= lateCall.getTime(),
+        after_school: share.afterSchool,
         settled: folded.settled,
         can_cancel: facts.shareCanCancel.get(share.dogId) ?? false,
         payment_pending: session.status === 'payment-pending',

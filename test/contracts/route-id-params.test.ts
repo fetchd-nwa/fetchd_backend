@@ -49,7 +49,6 @@ const NOT_UUID_PARAMS: Readonly<Record<string, readonly string[]>> = {
   '/staff/settings/:domain/:location': ['domain', 'location'],
 
   '/staff/day-capacity/:location/:date': ['location', 'date'],
-  '/staff/cancel-window/:category': ['category'],
   '/staff/dogs/:dogId/completed-programs/:program': ['program'],
   '/credit-packages/:key/purchase': ['key'],
   '/staff/credit-packages/:key': ['key'],

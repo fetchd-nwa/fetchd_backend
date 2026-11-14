@@ -587,48 +587,6 @@ test(
 );
 
 test(
-  'POST /invoices/:id/pay — the stake: a paid board-train invoice, its booking cancelled in the window, refunds in full',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    // `cancelBookingService` finds the charge with `findSucceededForBooking`, by
-    // `charges.booking_id` and nothing else. With no anchor the cancel still answers
-    // 200, and $3,000.00 stays taken with no refund row and no alarm.
-    await cleanupInvoicesAndCharges();
-    const { app, stripe } = anchorApp();
-    const { bookingId, invoiceId } = await seedBoardTrainInvoice(300_000);
-    const { chargeId, intentId } = await payForCharge(app, invoiceId);
-
-    const cancelled = await app.inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': `anchor-cancel-${randomUUID()}` },
-      payload: {},
-    });
-    assert.equal(cancelled.statusCode, 200, cancelled.body);
-    const body = cancelled.json() as { status: string; cancel_forfeited: boolean };
-    assert.equal(body.status, 'cancelled');
-    assert.equal(body.cancel_forfeited, false, 'inside the window, so the money comes back');
-
-    const rows = await db
-      .select({
-        chargeId: refunds.chargeId,
-        amountCents: refunds.amountCents,
-        reason: refunds.reason,
-      })
-      .from(refunds)
-      .where(eq(refunds.bookingId, bookingId));
-    assert.deepEqual(rows, [{ chargeId, amountCents: 300_000, reason: 'cancel' }]);
-
-    const sent = stripe.calls.filter((call) => call.method === 'createRefund');
-    assert.equal(sent.length, 1, 'and the refund is sent to Stripe, once');
-    const args = sent[0]?.args as { paymentIntentId: string; amountCents: number };
-    assert.equal(args.paymentIntentId, intentId);
-    assert.equal(args.amountCents, 300_000);
-    await cleanupInvoicesAndCharges();
-  },
-);
-
-test(
   'POST /invoices/:id/pay — a class invoice that lost its anchor: the same-transaction witness names it, and WARNs (§A3.19 F2)',
   SKIP_WHEN_NO_DB,
   async () => {

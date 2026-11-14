@@ -75,8 +75,6 @@ import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { computeCohortSessionDates } from '../lib/cohortSchedule.js';
 import { toBookingWire, type BookingWire } from '../lib/bookingWire.js';
-import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
-import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
 import { loadStripePaymentContext } from '../lib/loadStripePaymentContext.js';
@@ -586,8 +584,9 @@ export function registerEnrollmentsRoute(
            * Record a refund the school OWES on a charge with no Stripe route
            * home — `designs/money-residue.md` §3, transplanted verbatim from
            * `cancelBookingService`'s money-back branch so "money owed with no
-           * Stripe route" has ONE shape in this codebase rather than one per
-           * lane.
+           * Stripe route" had ONE shape in this codebase rather than one per
+           * lane. That branch was deleted in P21 (wire 6.0.0-lg5.2: a booking
+           * cancel moves no money), so this arm is now the one shape.
            *
            * Written TERMINAL at `'unroutable'`, under the charge row's lock
            * that {@link mintRefund}'s helper already took, with the amount the
@@ -1494,10 +1493,6 @@ async function runAllOrNothingEnrollment(
         //    wall-time cadence), one single-dog booking per (dog × week).
         const startInstant = pgTimestampToDate(cohortRow.startDate);
         const sessionDates = computeCohortSessionDates(startInstant, cohortRow.weeks);
-        const groupClassHours = await cancelWindowSettingsRepository.resolveHoursFor(
-          'group-class',
-          tx,
-        );
         const insertedWires: BookingWire[] = [];
         // The enrollment ANCHOR per dog (§A3.17): the earliest-scheduled
         // booking row THIS transaction inserted for that dog, stamped onto its
@@ -1508,7 +1503,6 @@ async function runAllOrNothingEnrollment(
         // re-point the money.
         const anchorByDog = new Map<string, { id: string; scheduledAt: string }>();
         for (const scheduledAt of sessionDates) {
-          const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAt, groupClassHours);
           for (const dogId of sortedDogIds) {
             const inserted = await insertBookingWithGateMapping(tx, {
               ownerId: principal.ownerId,
@@ -1517,7 +1511,6 @@ async function runAllOrNothingEnrollment(
               scheduledAt,
               location: cohortRow.location,
               notes: null,
-              cancelDeadlineAt,
               additionalDogIds: [],
               cohortId: cohortRow.id,
               sessionReportId: null,
@@ -1931,10 +1924,6 @@ async function runPartialEnrollmentInner(
 
         const startInstant = pgTimestampToDate(cohortRow.startDate);
         const sessionDates = computeCohortSessionDates(startInstant, cohortRow.weeks);
-        const groupClassHours = await cancelWindowSettingsRepository.resolveHoursFor(
-          'group-class',
-          tx,
-        );
         const dueAt = new Date(
           pgTimestampToDate(cohortRow.startDate).getTime() - GROUP_CLASS_INVOICE_DUE_LEAD_MS,
         ).toISOString();
@@ -1956,10 +1945,6 @@ async function runPartialEnrollmentInner(
               // per-dog by construction rather than by convention.
               const anchorByDog = new Map<string, { id: string; scheduledAt: string }>();
               for (const scheduledAt of sessionDates) {
-                const cancelDeadlineAt = computeCancelDeadlineFromHours(
-                  scheduledAt,
-                  groupClassHours,
-                );
                 const inserted = await insertBookingWithGateMapping(sp, {
                   ownerId: principal.ownerId,
                   leadDogId: dogId,
@@ -1967,7 +1952,6 @@ async function runPartialEnrollmentInner(
                   scheduledAt,
                   location: cohortRow.location,
                   notes: null,
-                  cancelDeadlineAt,
                   additionalDogIds: [],
                   cohortId: cohortRow.id,
                   sessionReportId: null,

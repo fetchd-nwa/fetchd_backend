@@ -66,9 +66,10 @@
  * plan.json `wire_label_map`). LG3: 4.0.0-lg3.1 (P13, breaking),
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close). LG4:
  * 5.0.0-lg4.1 (P17, breaking), 5.0.0-lg4.2 (P18, breaking), 5.0.0 (P19,
- * additive, its close). LG5: 6.0.0-lg5.1 (P20, breaking).
+ * additive, its close). LG5: 6.0.0-lg5.1 (P20, breaking), 6.0.0-lg5.2 (P21,
+ * breaking).
  */
-export const WIRE_CONTRACT_VERSION = '6.0.0-lg5.1';
+export const WIRE_CONTRACT_VERSION = '6.0.0-lg5.2';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -213,6 +214,11 @@ export const WIRE_CONTRACT_VERSION = '6.0.0-lg5.1';
  * too. Four carry `details` (`SessionEndedDetails`,
  * `AttendanceStateConflictDetails`, `SessionNotTodayDetails`,
  * `NoShowTooEarlyDetails`); on the other four the code is the whole signal.
+ *
+ * 6.0.0-lg5.2 appends one thrown code, the 49th, after `'no_show_too_early'` —
+ * appended, never inserted (design §1.1:1083-1085, §2.3:2558-2564; DAY-U43):
+ * `'after_school_full'`, 422, with `details` (`AfterSchoolFullDetails`).
+ * `POST /bookings` is its one route.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -263,7 +269,8 @@ export type ApiErrorCode =
   | 'per_dog_cancel_off' // owner one-dog cancel blocked — `cxl.per_dog_cancel_enabled` is off (6.0.0-lg5.1)
   | 'attendance_state_conflict' // board verb blocked — the dog's folded state does not allow it (6.0.0-lg5.1)
   | 'session_not_today' // board verb blocked — the session's date is not one this verb takes (6.0.0-lg5.1)
-  | 'no_show_too_early'; // *Didn't come* blocked — before `day.pickup_close_time` on the date (6.0.0-lg5.1)
+  | 'no_show_too_early' // *Didn't come* blocked — before `day.pickup_close_time` on the date (6.0.0-lg5.1)
+  | 'after_school_full'; // booking blocked — a date's after-school session cannot take the dogs ticked for it (6.0.0-lg5.2)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -315,6 +322,7 @@ export const API_ERROR_CODES = [
   'attendance_state_conflict',
   'session_not_today',
   'no_show_too_early',
+  'after_school_full',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -419,6 +427,10 @@ export const API_ERROR_STATUS = {
   attendance_state_conflict: 409,
   session_not_today: 409,
   no_show_too_early: 409,
+  // 6.0.0-lg5.2 (new code, so its status is set in the same bump): a booking
+  // refused by a campus count, the family of `insufficient_capacity` (design
+  // §1.1:1083-1085).
+  after_school_full: 422,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -898,6 +910,24 @@ export interface NoShowTooEarlyDetails {
 }
 
 /**
+ * Rides code `after_school_full` (422) — `kind` equals `code`. New 6.0.0-lg5.2
+ * (design §1.1:1083-1085, §2.3:2558-2564; DAY-U43, PAY-28). `POST /bookings`
+ * whose after-school ticks for one date (`PostBookingsRequest.after_school`) do
+ * not fit that date's session at the campus. `capacity` is the campus's
+ * `day.after_school_capacity_count`; `booked` is the dogs already opted in
+ * there on that date before this order, counted the way the seats are counted
+ * for `insufficient_capacity`. `date` is the first such date in date order,
+ * `YYYY-MM-DD`. The order is refused whole: nothing is booked, debited or
+ * charged. Untick a dog on that date and send again.
+ */
+export interface AfterSchoolFullDetails {
+  kind: 'after_school_full';
+  date: string;
+  capacity: number;
+  booked: number;
+}
+
+/**
  * Every `details` payload the API can emit, closed. Provably complete at
  * 1.13.0 by full construction-site sweep, and kept complete by the fold-in:
  * `ApiError`'s constructor takes exactly this union, so a future route
@@ -910,7 +940,8 @@ export interface NoShowTooEarlyDetails {
  * backend lands. 4.0.0 appends `CreditExpiredBeforeDateDetails`, which no route
  * emitted until its predicate landed at 5.0.0-lg4.2. 5.0.0 appends
  * `AlumniPackageIneligibleDetails` (ALUM-U11). 6.0.0-lg5.1 appends the four
- * board and cancel arms (DAY-U29, DAY-U33, CXL-U09).
+ * board and cancel arms (DAY-U29, DAY-U33, CXL-U09). 6.0.0-lg5.2 appends
+ * `AfterSchoolFullDetails` (DAY-U43).
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -935,7 +966,8 @@ export type ApiErrorDetailWire =
   | SessionEndedDetails
   | AttendanceStateConflictDetails
   | SessionNotTodayDetails
-  | NoShowTooEarlyDetails;
+  | NoShowTooEarlyDetails
+  | AfterSchoolFullDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -1569,9 +1601,10 @@ export interface StaffCapabilitiesWire {
   edit_prices: boolean;
   /** Edit a `money`-class setting (STAFF-77). Owner and manager; the trainer
    *  never. A fixed role rule with no list or switch (STAFF-U08 folds in;
-   *  §3.14:5957-5958). The same two roles pass the legacy editors'
+   *  §3.14:5957-5958). The same two roles pass the legacy editor's
    *  `requireStaffRole('owner', 'manager')`: `POST /staff/rates` and its
-   *  void, `PATCH /staff/cancel-window/:category`. */
+   *  void. `PATCH /staff/cancel-window/:category` is removed at 6.0.0-lg5.2:
+   *  the cancellation policy is the `cxl` settings domain's. */
   edit_money_policy: boolean;
   /** Open the money reports (STAFF-12). Owner and manager; the trainer never.
    *  The end-of-day totals are NOT behind this flag: they follow
@@ -1864,13 +1897,20 @@ export interface BookingWire {
   notes?: string;
   session_report_id?: string;
   location?: LocationKey;
-  // The instant the free-cancel window closes (Δ 2026-07-08). Stamped at
-  // creation from the active `cancel_window_settings` policy; omitted when null
-  // (legacy-import rows pre-Day-10). The client reads it to warn, BEFORE a
-  // cancel confirms, that cancelling now forfeits the credit/charge — powering
-  // the booking-overlap "cancel it to book this" flow.
+  // Omit-on-null: `bookings.cancel_deadline_at`, where a free-cancel window
+  // used to close (Δ 2026-07-08). From 6.0.0-lg5.2 no cancel forfeits and no
+  // route stamps one (design §2.7:4115-4127, question 54; CXL-U04): M5.08 drops
+  // `cancel_window_settings`, its one source, so a row booked from this version
+  // never carries it. A row stamped earlier keeps its instant, which nothing
+  // reads: no cancel consults it, and the app shows no cancel warning (CXL-U05).
+  // Not a deadline to show.
   cancel_deadline_at?: string;
   cancelled_at?: string;
+  // On a cancelled row only. From 6.0.0-lg5.2 every cancel writes `false`:
+  // nothing is withheld (CXL-U04, CXL-01; design §2.7:4115-4127; 12-:67-69 "no
+  // true penalty"), and no amount is reported (`cancel_withheld_cents` is never
+  // built, §1.1:1135-1136). `true` stays only on a row cancelled before this
+  // version inside the old 48-hour window.
   cancel_forfeited?: boolean;
   // Who cancelled + why (R5, Allison sim-QA 2026-07-27). Emitted only on a
   // cancelled booking, omit-on-null like `cancelled_at`. `cancelled_by` = 'owner'
@@ -1914,6 +1954,25 @@ export interface BookingWire {
   //   `payment-pending`, the clock before `day.pickup_close_time`, and HER folded
   //   state `expected`. On an owner's read it is also `false` while
   //   `cxl.per_dog_cancel_enabled` is off, which a staff cancel ignores.
+  //   `after_school`: this dog is opted in to that day's after-school session
+  //   (6.0.0-lg5.2; design §1.1:1083-1085, §2.3:2558-2564; DAY-U43), as
+  //   `PostBookingsRequest.after_school` sent it. Always `false` on a day-care
+  //   row. No route changes it after the booking.
+  //   `return_expires_at`: ISO-8601 (6.0.0-lg5.2; design §2.3:2741-2748,
+  //   §2.7:4412-4414; CXL-U05), on each share still on an `'upcoming'` session
+  //   whose credit has not come back: the expiry that credit would carry if it
+  //   came back now, so a cancel sheet names it before Confirm. It is her live
+  //   debit's lot's `expires_at` while that lot expires after the next Chicago
+  //   midnight; else the fresh lot's, now plus `cred.returned_credit_expiry_months`
+  //   (seeded 1; design §2.4:2958-2964). Two arms keep the lot's own date even
+  //   when it is passed or passing today: with that key at 0 the credit comes
+  //   back into its lot dead, and the sheet says so; with
+  //   `cred.expiry_enforced_enabled` off nothing expires, so the credit goes
+  //   back into its lot and the date names the lot, not a deadline.
+  //   `cred.booking_outlives_lot_expiry_enabled` plays no part: a returned
+  //   credit is unbooked, so a lot dying tonight would take it. Read on
+  //   `can_cancel`'s clock; the return itself reads the lot again under its
+  //   locks.
   //   `cancelled_at`: ISO-8601, on a share cancelled alone, before its session.
   //   A share that went with its session carries none (read `cancelled_at`
   //   above), and that includes the last dog of a session cancelled one dog at a
@@ -1921,11 +1980,12 @@ export interface BookingWire {
   // `dog_id` and `additional_dog_ids` list only the dogs whose shares were not
   // cancelled alone, so a card never names a dog who is not coming. When the
   // lead's share is cancelled alone, `dog_id` is the first remaining dog in
-  // `additional_dog_ids`' order and she leaves that list. `after_school` joins
-  // each entry at 6.0.0-lg5.2 (DAY-U43).
+  // `additional_dog_ids`' order and she leaves that list.
   dog_shares?: {
     dog_id: string;
     can_cancel: boolean;
+    after_school: boolean;
+    return_expires_at?: string;
     cancelled_at?: string;
   }[];
 }
@@ -2026,15 +2086,20 @@ export interface AttendanceWire {
  *     checked out folds `'out'` and stays settled.
  *   - `can_cancel`: as `BookingWire.dog_shares[].can_cancel` on a staff read,
  *     for this dog.
+ *   - `after_school`: as `BookingWire.dog_shares[].after_school`, for this dog
+ *     (6.0.0-lg5.2; DAY-U43). `late_pickup_due` does not read it: an
+ *     after-school dog on site is flagged at `day.late_pickup_call_time` like
+ *     any other (question 89's default; DAY-U41, which moves her flag to
+ *     `day.after_school_end_time`, is later), and staff read past the flag.
  *   - `gate_warnings`: a gate this dog fails on the board's date that her
  *     booking passed, read with the booking gate's own reads, `[]` when none.
  *     Check-in still lands (the door decides, DAY-05); the row offers *Turn
  *     away*. `'vaccine_lapsed'` is sent from 6.0.0-lg5.1. `'spay_neuter_overdue'`
  *     is typed and sent from P09 (S11), and `'reevaluation_due'` typed and sent
  *     once S14 lands (dated): no route sends either before then.
- * `after_school` joins at 6.0.0-lg5.2 (DAY-U43), `draft_report_id?` at design
- * 8.0.0 (RPT-U07). There is no `unrecorded_earlier`: a day nobody recorded is
- * fixed on that date's board (question 50 → (c)).
+ * `draft_report_id?` joins at design 8.0.0 (RPT-U07). There is no
+ * `unrecorded_earlier`: a day nobody recorded is fixed on that date's board
+ * (question 50 → (c)).
  */
 export interface CheckinBoardWire {
   booking_id: string;
@@ -2045,6 +2110,7 @@ export interface CheckinBoardWire {
   late_pickup_due: boolean;
   settled: boolean;
   can_cancel: boolean;
+  after_school: boolean;
   payment_pending: boolean;
   gate_warnings: ('vaccine_lapsed' | 'spay_neuter_overdue' | 'reevaluation_due')[];
 }
@@ -2130,6 +2196,7 @@ export const POST_BOOKINGS_ERROR_DETAIL_KINDS = [
   'insufficient_credits',
   'already_booked',
   'insufficient_capacity',
+  'after_school_full',
   'payment_failed',
 ] as const satisfies readonly [
   PostBookingsErrorDetails['kind'],
@@ -2161,7 +2228,8 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  *
  * A day-program booking carries no arrival time (4.0.0-lg3.1; DAY-U11): each
  * session's `scheduled_at` is the campus's `day.dropoff_open_time` on its date,
- * America/Chicago, and the cancel deadline and the reminders follow from it.
+ * America/Chicago, and the reminders follow from it. No cancel deadline is
+ * stamped (6.0.0-lg5.2; question 54).
  *
  * Zod-enforced bounds, transcribed (NOT tightenable by a client rereading
  * this): `dates` 1..30 entries (`MAX_DATES_PER_REQUEST`, a constant: a
@@ -2203,6 +2271,22 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  * A closed date has no refusal of its own: its cap is 0, so the request meets
  * `insufficient_capacity`. `PostBookingsErrorDetails` lists the arms that do
  * carry `details`.
+ *
+ * `after_school` is the after-school opt-in, per dog per date (6.0.0-lg5.2;
+ * design §1.1:1083-1085, §2.3:2558-2564; DAY-U43, question 47): a dog of this
+ * request → the dates of `dates` on which she stays for the campus's
+ * after-school session (`day.after_school_start_time` to
+ * `day.after_school_end_time`). Each tick is her
+ * `BookingWire.dog_shares[].after_school` on that date's session; omitted, or a
+ * dog absent from it, opts no one in. A key that is not a dog of this request,
+ * a date not in `dates` or listed twice, or any tick on a `day-care` request is
+ * 422 `invalid_payload`; a key that is not a UUID or a value that is not a
+ * calendar date is 400 `bad_request`, the strict parse. The session's price is
+ * `day.after_school_price_cents` (seeded 0), never charged in v1 (DAY-U45
+ * later). Each date's ticks are counted under its `(location, date)` lock,
+ * right after its seats, against the campus's `day.after_school_capacity_count`:
+ * a date that cannot take them all is 422 `after_school_full`
+ * (`AfterSchoolFullDetails`), and the whole order is refused before any charge.
  *
  * Credits are the only tender (4.0.0; design §1.1:864-874; R1). `payment` is
  * required, so every booking says so, and it has no pay-as-you-go and no card
@@ -2258,6 +2342,8 @@ export interface PostBookingsRequest {
   dates: string[];
   location: LocationKey;
   notes?: string;
+  /** Dog id → `YYYY-MM-DD` dates of `dates` (see above; 6.0.0-lg5.2). */
+  after_school?: Record<string, string[]>;
   /** Credits, the only tender (see above). */
   payment: {
     kind: 'credits';
@@ -2585,6 +2671,15 @@ export interface PostStaffBookingsDogsSendHomeRequest {
  * while any dog still on it has folded past `'expected'` (design §1.1:1064-1067,
  * §2.3:2418-2428; CXL-U09). A pending row still cancels its whole order, as
  * before. `BookingWire.can_cancel` reads the same two checks.
+ *
+ * From 6.0.0-lg5.2 no cancel forfeits (CXL-U04; design §1.1:1064-1067,
+ * §2.7:4115-4133; s07, s17). A whole-session cancel of an `'upcoming'`
+ * day-school or day-care session, the owner's or any staff role's, of any date
+ * it accepts, returns one credit for each dog still on it, each to the lot her
+ * debit named while that lot can pay a later date, else as a fresh lot
+ * (`CreditLotDetailWire.reason`), and moves no money; `cancel_forfeited` is
+ * `false`. A staff cancel's notice to the owner quotes this `reason` verbatim
+ * (NOTIF-U17; design §2.9).
  */
 export interface PostStaffBookingsCancelRequest {
   reason?: string;
@@ -2611,9 +2706,9 @@ export interface PostStaffBookingsCancelRequest {
  * `session_checked_in` while THIS dog's folded state is not `'expected'`.
  *
  * `reason` is trimmed, 1..500 characters, and required: the board's *Cancel*
- * opens a reason sheet. It rides the idempotency hash, and NOTIF-U17
- * (6.0.0-lg5.2) puts it on the owner's notice. No column stores a share's
- * reason, so `BookingWire.cancel_reason` stays the session's.
+ * opens a reason sheet. It rides the idempotency hash, and from 6.0.0-lg5.2
+ * the owner's notice quotes it verbatim (NOTIF-U17; design §2.9). No column
+ * stores a share's reason, so `BookingWire.cancel_reason` stays the session's.
  */
 export interface PostStaffBookingsDogsCancelRequest {
   reason: string;
@@ -2675,6 +2770,34 @@ export interface GetStaffCheckinBoardQuery {
   date: string;
 }
 
+/**
+ * `GET /staff/owners/:ownerId/bookings?from=<date>` query `[staff]`, any role,
+ * either campus (6.0.0-lg5.2; design §1.1:1076-1078, §2.3:2448-2455,
+ * §2.10:5069-5072; CXL-U04, s17): the family's day sessions for the profile's
+ * *Bookings*, from which a staff cancel reaches any future date, not only the
+ * board's today. `from` is required, a Chicago calendar day; a missing or
+ * malformed value is 400 `bad_request`, the query convention. An `:ownerId`
+ * that names no owner is 404 `not_found`; an owner principal is 403 `forbidden`.
+ *
+ * Response `GetStaffOwnersBookingsResponse`: every live day-school and day-care
+ * session of that owner dated `from` or later that is not cancelled, soonest
+ * first, each a staff read of `BookingWire`. So `can_cancel` and
+ * `dog_shares[].can_cancel` are the staff cancels' own (the
+ * `cxl.per_dog_cancel_enabled` switch ignored), on the same fold and clock as
+ * their 409s: a dog whose state is not `'expected'` reads `false`, and so does
+ * every dog of a day that has ended. A share cancelled alone stays in
+ * `dog_shares` with its `cancelled_at`. *Cancel* is `POST
+ * /staff/bookings/:id/cancel` (the whole session) or `POST
+ * /staff/bookings/:id/dogs/:dogId/cancel` (one dog), any role, credits only.
+ */
+export interface GetStaffOwnersBookingsQuery {
+  /** `YYYY-MM-DD`, Chicago, inclusive lower bound. */
+  from: string;
+}
+
+/** `GET /staff/owners/:ownerId/bookings` response: `[]` when she has none. */
+export type GetStaffOwnersBookingsResponse = BookingWire[];
+
 // ---- (d) per-endpoint 422 detail unions (§3.5) -----------------------------
 
 /**
@@ -2694,7 +2817,9 @@ export interface GetStaffCheckinBoardQuery {
  *   6. `insufficient_credits`  — `createDayProgramBookings`
  *   7. `already_booked`        — `createDayProgramBookings`
  *   8. `insufficient_capacity` — `dayCapacityRepository.assertCapacityWithinLock`
- *   9. `payment_failed`        — 402, not 422: the top-up's charge did not
+ *   9. `after_school_full`     — the date's after-school count, under the same
+ *      lock right after that date's seats (6.0.0-lg5.2; `PostBookingsRequest`).
+ *  10. `payment_failed`        — 402, not 422: the top-up's charge did not
  *      complete (`PaymentFailedDetails`). Every row is cancelled, every debit
  *      returned, nothing granted, and the 402 is stored.
  * Arms 1-4 can also arrive from the DB trigger floor with EMPTY arrays
@@ -2708,7 +2833,7 @@ export interface GetStaffCheckinBoardQuery {
  * gates and before arm 5.
  *
  * Arm 6 runs before arm 7, so a date she already holds is met only once the
- * credits fit. Arms 1 to 8 all answer inside tx1, before any Stripe call, so a
+ * credits fit. Arms 1 to 9 all answer inside tx1, before any Stripe call, so a
  * `top_up` refused by one of them charges nothing.
  */
 export type PostBookingsErrorDetails =
@@ -2720,6 +2845,7 @@ export type PostBookingsErrorDetails =
   | InsufficientCreditsDetails
   | AlreadyBookedDetails
   | InsufficientCapacityDetails
+  | AfterSchoolFullDetails
   | PaymentFailedDetails;
 
 /**
@@ -2949,8 +3075,11 @@ export type CreditPackageWithheldReason = 'no-evaluated-dog' | 'alumni-only';
  *
  * `booked_ahead` is the lot's debits on upcoming days, so a screen can name them
  * ("3 days are booked on this pack"): `dates` has one `YYYY-MM-DD` entry per
- * debit, ascending, so its length is `count`, and it is `{ count: 0, dates: [] }`
- * when there are none.
+ * live debit (one whose credit has not come back: no `settlement-return` names
+ * it; 6.0.0-lg5.2), ascending, so its length is `count`, and it is
+ * `{ count: 0, dates: [] }` when there are none. A dog cancelled alone, turned
+ * away, sent home or marked *Didn't come* on a day still upcoming no longer
+ * counts.
  */
 export interface CreditLotDetailWire {
   id: string;
@@ -5575,39 +5704,6 @@ export interface DayCapacityWire {
 }
 
 /**
- * One category's free-cancel policy row — an element of
- * `GET /staff/cancel-window` and the response of
- * `PATCH /staff/cancel-window/:category`. Promoted 1.13.0 from the
- * route-local and previously **unexported** interface at
- * `routes/staffCancelWindow.ts:55` (digest rates-availability/M;
- * BUSINESS-LOGIC/bookings-scheduling.md:212 records that it had no client
- * consumer in either sibling repo — this is the freeze that lets the portal
- * wave build against it).
- *
- * Staff-only: owner principals get 403 on both verbs
- * (`staffCancelWindow.ts:90, :109`); from 2.0.0-lg1.2 the PATCH is also 403
- * for a trainer (see `PatchStaffCancelWindowRequest`), while the GET stays any
- * staff role. The list is always 7 rows — one per
- * `service_category`, seeded at 48h flat (`schema.sql:889`, seed `:896-903`;
- * BUSINESS-LOGIC/bookings-scheduling.md:14).
- *
- * `updated_at` is ISO-8601, converted from the pg timestamp
- * (`staffCancelWindow.ts:71`). `updated_by_staff_id` is `null` — present,
- * not omitted — while the row is still the seeded default; that null IS the
- * "policy never customized" signal the portal reads.
- *
- * Editing a row changes only FUTURE bookings: `bookings.cancel_deadline_at`
- * is stamped once at creation from the then-current `hours_before` and is
- * never re-stamped (R12 @ BUSINESS-LOGIC/bookings-scheduling.md:68).
- */
-export interface CancelWindowSettingWire {
-  category: ServiceCategory;
-  hours_before: number;
-  updated_at: string;
-  updated_by_staff_id: string | null;
-}
-
-/**
  * `POST /staff/rates` body — set the evaluation rate of one campus,
  * effective-dated. Promoted 1.13.0 from `routes/staffRates.ts:63-79`
  * (digest rates-availability/M) and pinned to that schema in the route file
@@ -5652,31 +5748,6 @@ export interface PostStaffRatesRequest {
   unit: RateUnit;
   effective_from?: string;
   note?: string;
-}
-
-/**
- * `PATCH /staff/cancel-window/:category` body. Promoted 1.13.0 from
- * `routes/staffCancelWindow.ts:44-53` (digest rates-availability/M) and
- * pinned to that schema in the route file by
- * `PatchStaffCancelWindowBodyConformance` (§5.1.3, `z.input`).
- *
- * Staff-only; `Idempotency-Key` required (`staffCancelWindow.ts:112`).
- * `.strict()` — unknown keys rejected. `hours_before` is an integer in
- * 1 … 720, and both bounds are deliberate: below 1h the policy becomes
- * "same-day cancel", which fits none of the business categories, and the
- * 720h (30-day) ceiling stops a typo from pushing the policy to a year and
- * silently blocking every cancel (`staffCancelWindow.ts:46-51`).
- *
- * `:category` is a path param validated against `service_category`
- * (`staffCancelWindow.ts:40-42`), not part of this body.
- *
- * Owner and manager only from 2.0.0-lg1.2: `requireStaffRole('owner',
- * 'manager')` whole (STAFF-U07, a money-policy edit, STAFF-77; design
- * §1.1:706-709, §2.1:2080-2086), so a trainer is 403 `forbidden`, no
- * `details`. The design removes this verb at 6.0.0 (§1.1:682-684).
- */
-export interface PatchStaffCancelWindowRequest {
-  hours_before: number;
 }
 
 /**
@@ -6232,11 +6303,13 @@ export function isSessionProgram(program: ReportProgram): boolean {
 // 2.0.0-lg1.1 (acct alum cash cred day dog eval mig msg notif pay rpt vax) and
 // `staff` (M1.21, `StaffSettingsWire`), appended at 2.0.0-lg1.2 by P02, which
 // owns the rebuilt `staff_role` enum it needs (DECISIONS 47;
-// design.md:6153). `cxl` joins at design 6.0.0 over
-// M5.07's two tables, with CXL-U02 (plan unit P21). The tables land at
-// 6.0.0-lg5.1 (P20) with no settings route over them: the owner's one-dog
-// cancel reads `cxl.per_dog_cancel_enabled` directly, and nothing else reads
-// either table. `brd`, `bt`, `pl` have no table in v1 (§3.18-3.20), and
+// design.md:6153). FIFTEEN from 6.0.0-lg5.2: `cxl` (CXL-U02, P21), appended
+// over M5.07's two tables, the one domain on two (§1.1:631-632, "fifteen
+// domains on sixteen tables"; `CancellationSettingsWire`). It replaces
+// `GET /staff/cancel-window` and `PATCH /staff/cancel-window/:category`. Every
+// `cxl` key is stored only but `per_dog_cancel_enabled`, which the owner's
+// one-dog cancel has read since 6.0.0-lg5.1 (P20, where the tables landed).
+// `brd`, `bt`, `pl` have no table in v1 (§3.18-3.20), and
 // `cls` is no settings domain: its keys are `group_classes` columns
 // (§1.1:633-635).
 //
@@ -6276,7 +6349,7 @@ export function isSessionProgram(program: ReportProgram): boolean {
 //         body PatchStaffSettingsRequest<D>, `Idempotency-Key` REQUIRED
 // A `:domain` outside `SETTINGS_DOMAINS`, a `:location` on a domain other than
 // `day`/`eval`, or a `:location` outside `LOCATIONS` is 400 `bad_request` —
-// the path parse, as `/staff/cancel-window/:category` answers today.
+// the path parse.
 //   GET   /staff/settings/manifest  → GetStaffSettingsManifestResponse (2.0.0)
 // `manifest` is a static path segment, which the router matches before
 // `:domain` whatever the registration order, so it can never be a domain
@@ -6290,10 +6363,11 @@ export function isSessionProgram(program: ReportProgram): boolean {
 /**
  * The settings domains `GET/PATCH /staff/settings/:domain` serves, by their
  * registry prefix (§1.1:628-631). Thirteen at 2.0.0-lg1.1 (DECISIONS 47);
- * `'staff'` APPENDED at 2.0.0-lg1.2 (P02), fourteen; `'cxl'` appends at
- * design 6.0.0 — new members go at the end of the tuple (§1.1:590-591), so
- * the order is alphabetical through `'vax'` and append order after it. No
- * pgEnum: the domain is a route segment, not a column.
+ * `'staff'` APPENDED at 2.0.0-lg1.2 (P02), fourteen; `'cxl'` APPENDED at
+ * 6.0.0-lg5.2 (P21; CXL-U02), fifteen, v1's last — new members go at the end
+ * of the tuple (§1.1:590-591), so the order is alphabetical through `'vax'`
+ * and append order after it. No pgEnum: the domain is a route segment, not a
+ * column.
  */
 export type SettingsDomain =
   | 'acct'
@@ -6309,7 +6383,8 @@ export type SettingsDomain =
   | 'pay'
   | 'rpt'
   | 'vax'
-  | 'staff';
+  | 'staff'
+  | 'cxl';
 
 /** No pgEnum (a route segment) — member order mirrors `SettingsDomain`; §16
  *  pins set equality, and pins `SettingsWireByDomain` / `SettingsPatchByDomain`
@@ -6330,6 +6405,7 @@ export const SETTINGS_DOMAINS = [
   'rpt',
   'vax',
   'staff',
+  'cxl',
 ] as const satisfies readonly [SettingsDomain, ...SettingsDomain[]];
 
 /** `acct.locked_account_view_mode`'s value set — ACCT-U02's wire note (ledger
@@ -6408,6 +6484,16 @@ export type BroadcastAudienceKind = 'everyone' | 'campus' | 'class' | 'day-schoo
 /** When a service is charged — `pay.charge_timing_mode`'s value set
  *  (§3.7:5833). Stored only: every v1 purchase is charged at Confirm. */
 export type PaymentChargeTimingMode = 'at_confirm' | 'at_close_out';
+
+/** Whether a service's cancel has a window — `cancellation_policy_settings
+ *  .window_state` (M5.07's CHECK; design §1.1:1053, §3.8:5871): `'none'`, no
+ *  window; `'hours'`, a window of `window_hours`; `'unset'`, NOT SEEDED. Stored
+ *  only. New 6.0.0-lg5.2. */
+export type CancellationWindowState = 'unset' | 'none' | 'hours';
+
+/** `cxl.no_show_declare_mode`'s value set (M5.07's CHECK; §3.8:5864). Stored
+ *  only. New 6.0.0-lg5.2. */
+export type CancellationNoShowDeclareMode = 'staff_only' | 'auto_after_hours';
 
 /**
  * A settings key's role class — the registry's four (design §2.1:1779-1798),
@@ -7023,11 +7109,83 @@ export interface StaffSettingsWire extends SettingsAuditWire {
 }
 
 /**
+ * One service's cancellation policy, a row of `cancellation_policy_settings`
+ * (M5.07; design §1.1:1050-1061, §2.7:4115-4126, §3.8:5849-5871; CXL-U02). New
+ * 6.0.0-lg5.2. One row per `ServiceCategory`, seven, the evaluation's included
+ * (§3.8:5855, "one row per service and one for the evaluation"). STORED ONLY:
+ * no v1 code reads any column here (money cut 3; 12-:67-69 "no true penalty"),
+ * so no cancel forfeits, withholds or warns, and a PATCH naming any of them is
+ * 422 `setting_inert`. Seeds: `window_state` `'none'`, `window_hours` `null`,
+ * both fractions 0, `flat_fee_cents` 0, `unpaid_no_show_close_after_hours` 24
+ * and `no_show_declare_mode` `'staff_only'` on every row but boarding's, which
+ * is `'unset'` with its fractions, fee and declare mode NOT SEEDED and its
+ * hours 24. NON-OMIT, every field: `null` = NOT SEEDED, and no reader may
+ * default it.
+ */
+export interface CancellationPolicyWire extends SettingsAuditWire {
+  category: ServiceCategory;
+  window_state: CancellationWindowState;
+  /** Hours before the session, at least 1; `null` on every seeded row
+   *  (§3.8:5871). */
+  window_hours: number | null;
+  /** Fraction (§3.8:5863). */
+  forfeit_fraction: number | null;
+  /** Fraction (§3.8:5865). */
+  no_show_forfeit_fraction: number | null;
+  /** Cents (§3.8:5862). */
+  flat_fee_cents: number | null;
+  /** Hours, at least 1 (§3.8:5870). */
+  unpaid_no_show_close_after_hours: number;
+  /** §3.8:5864. */
+  no_show_declare_mode: CancellationNoShowDeclareMode | null;
+}
+
+/**
+ * The `cancellation_global_settings` singleton (M5.07; design §1.1:1055-1058,
+ * §3.8:5861-5869; CXL-U02). New 6.0.0-lg5.2. Stored only but
+ * `per_dog_cancel_enabled`. NON-OMIT: `null` = NOT SEEDED.
+ */
+export interface CancellationGlobalPolicyWire extends SettingsAuditWire {
+  /** Seed true (§3.8:5866; s11). The one live `cxl` key: while it is false the
+   *  owner's `POST /bookings/:id/dogs/:dogId/cancel` answers 409
+   *  `per_dog_cancel_off` and her `dog_shares[].can_cancel` reads `false`; a
+   *  staff cancel ignores it. Read since 6.0.0-lg5.1, editable from
+   *  6.0.0-lg5.2. */
+  per_dog_cancel_enabled: boolean;
+  /** Seed true (§3.8:5867). Stored only. */
+  staff_entered_client_cancel_follows_owner_rules_enabled: boolean;
+  /** Seed true (§3.8:5868). Stored only. */
+  staff_initiated_cancel_full_return_enabled: boolean;
+  /** NOT SEEDED (§3.8:5861; answer 13: a missed or called-off class meeting
+   *  returns nothing). No value set is designed. Stored only. */
+  class_missed_meeting_money_return_mode: string | null;
+  /** NOT SEEDED (§3.8:5869). No value set is designed. Stored only. */
+  started_run_cancel_return_mode: string | null;
+}
+
+/**
+ * `GET/PATCH /staff/settings/cxl` — the `cxl` domain over M5.07's two tables
+ * (design §1.1:1050-1061; CXL-U02). New 6.0.0-lg5.2. Never on the owner
+ * document (§3.8:5852). It replaces `GET /staff/cancel-window`, `PATCH
+ * /staff/cancel-window/:category`, `CancelWindowSettingWire` and
+ * `PatchStaffCancelWindowRequest`, removed: M5.08 drops their table.
+ *
+ * `policies` holds every `cancellation_policy_settings` row, in no promised
+ * order (key them by `category`); `global` is the singleton. Each carries its
+ * own audit pair. The stored-only editor: every key is inert but
+ * `per_dog_cancel_enabled` (§3.8:5851-5853).
+ */
+export interface CancellationSettingsWire {
+  policies: CancellationPolicyWire[];
+  global: CancellationGlobalPolicyWire;
+}
+
+/**
  * What `GET` and `PATCH /staff/settings/:domain[/:location]` return, by
  * domain (§1.1:635-636: "each returning its `<Domain>SettingsWire`"). `day`
  * and `eval` return the global arm on the bare path and the campus arm on
- * `/:location`; `pay` returns every row. §16 pins this map's keys to
- * `SettingsDomain`.
+ * `/:location`; `pay` returns every row; `cxl` both of its tables. §16 pins
+ * this map's keys to `SettingsDomain`.
  */
 export interface SettingsWireByDomain {
   acct: AccountSettingsWire;
@@ -7044,6 +7202,7 @@ export interface SettingsWireByDomain {
   rpt: ReportsSettingsWire;
   vax: VaccineSettingsWire;
   staff: StaffSettingsWire;
+  cxl: CancellationSettingsWire;
 }
 
 /** `GET /staff/settings/:domain[/:location]` response (200) — the domain's
@@ -7245,9 +7404,11 @@ export type GetSettingsResponse = OwnerSettingsWire;
  * always the registry key without its prefix (`acct.signup_field_requirement_map`
  * is `signup_fields`) — and on `pay` the `key` of the `PaymentSettingWire`
  * rows holding it: one row (scope `'global'`) for every pay key but
- * `charge_timing_mode`, which has one row per service scope. `path`, when
- * present, walks into that field's jsonb value (`['day-school', 'offered']`
- * inside `offerings`); omitted otherwise.
+ * `charge_timing_mode`, which has one row per service scope. On `cxl` (from
+ * 6.0.0-lg5.2) `field` is the column's name in `CancellationSettingsWire`'s
+ * `global` for a global key, and on every row of its `policies` for a
+ * per-service key. `path`, when present, walks into that field's jsonb value
+ * (`['day-school', 'offered']` inside `offerings`); omitted otherwise.
  */
 export interface SettingReadWire {
   tier: 'global' | 'campus';
@@ -7439,6 +7600,26 @@ export interface PatchStaffSettingsPayRequest {
   charge_timing_mode?: Record<string, PaymentChargeTimingMode>;
 }
 
+/** A `cancellation_policy_settings` column a PATCH edits row by row. */
+export type CancellationPolicyColumn = Exclude<
+  keyof CancellationPolicyWire,
+  'category' | SettingsAuditKey
+>;
+
+/**
+ * `PATCH /staff/settings/cxl` body (6.0.0-lg5.2; CXL-U02). One optional key per
+ * column of the two tables: a `global` column carries its value, and a
+ * `cancellation_policy_settings` column a category → value map of the rows it
+ * edits (`charge_timing_mode`'s shape on `pay`). Every key but
+ * `per_dog_cancel_enabled` is inert, so in v1 that is the one key a PATCH can
+ * change; any other is 422 `setting_inert` (refusal step 3).
+ */
+export type PatchStaffSettingsCxlRequest = Partial<
+  Omit<CancellationGlobalPolicyWire, SettingsAuditKey>
+> & {
+  [K in CancellationPolicyColumn]?: Partial<Record<ServiceCategory, CancellationPolicyWire[K]>>;
+};
+
 /**
  * The `PATCH /staff/settings/:domain[/:location]` body, by domain: every
  * column of the domain's row, each optional (§1.1:628-630). `day` and `eval`
@@ -7473,6 +7654,7 @@ export interface SettingsPatchByDomain {
   rpt: Partial<Omit<ReportsSettingsWire, SettingsAuditKey>>;
   vax: Partial<Omit<VaccineSettingsWire, SettingsAuditKey>>;
   staff: Partial<Omit<StaffSettingsWire, SettingsAuditKey>>;
+  cxl: PatchStaffSettingsCxlRequest;
 }
 
 /**
@@ -7548,8 +7730,9 @@ export type PatchStaffSettingsErrorDetails =
 // 2.0.0-lg1.1 adds three KEY-SET pins beside the tuple pins (same `Equal`,
 // applied to `keyof`): the two settings by-domain maps and the pay PATCH body
 // must cover exactly their union, so a domain appended to `SETTINGS_DOMAINS`
-// fails `tsc` until both maps gain it (2.0.0-lg1.2's `'staff'` was proven red
-// that way, by a mutant missing from one map; design 6.0.0's `'cxl'` is next),
+// fails `tsc` until both maps gain it (2.0.0-lg1.2's `'staff'` and
+// 6.0.0-lg5.2's `'cxl'` were each proven red that way, by a mutant missing from
+// one map),
 // and a `payment_settings` key cannot be added to one of the pay shapes alone.
 //
 // 2.0.0 adds one RESERVED-SEGMENT pin: `manifest` is a static path segment

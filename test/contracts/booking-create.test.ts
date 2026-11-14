@@ -506,14 +506,11 @@ test(
 );
 
 test(
-  'POST /bookings — stamps cancel_deadline_at from active cancel_window_settings policy (seeded 48h flat)',
+  'POST /bookings — stamps no cancel_deadline_at: no cancel window exists (P21, M5.08; design question 54, contract notes D3)',
   SKIP_WHEN_NO_DB,
   async () => {
-    // Day 13 moved the active policy to the cancel_window_settings DB
-    // table, seeded at 48h flat across all categories. The route reads
-    // it via cancelWindowSettingsRepository.resolveHoursFor() at booking
-    // creation and stamps the resolved deadline on the row. A test that
-    // tunes the policy then booked would see its tuned value land here.
+    // Until P21 the route read cancel_window_settings and stamped scheduled_at − 48 h.
+    // M5.08 drops that table and §3.8 stores every cxl key only: "no deadline stamped".
     await topUpCredits(FIXTURE_IDS.dog1Id, 'school', 1);
     const { app } = bookingApp();
     const date = futureDate(14);
@@ -537,8 +534,8 @@ test(
       .from(bookingsTable)
       .where(eq(bookingsTable.id, body[0]!.id));
     assert.ok(row);
-    const delta = new Date(row.scheduledAt).getTime() - new Date(row.cancelDeadlineAt!).getTime();
-    assert.equal(delta, 48 * 60 * 60 * 1000);
+    assert.equal(row.cancelDeadlineAt, null);
+    assert.equal('cancel_deadline_at' in body[0]!, false, 'the wire omits a NULL deadline');
   },
 );
 

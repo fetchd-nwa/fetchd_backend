@@ -59,6 +59,9 @@ function readOf(store: SettingStore): SettingReadWire | null {
   switch (store.kind) {
     case 'column':
       return { tier: store.tier ?? 'global', field: store.column };
+    case 'per-category':
+      // `cxl` (P21): the column's name on every row of `policies` (SettingReadWire).
+      return { tier: 'global', field: store.column };
     case 'payment':
       return { tier: 'global', field: store.key };
     case 'path':
@@ -71,6 +74,7 @@ function readOf(store: SettingStore): SettingReadWire | null {
 function editorOf(store: SettingStore): SettingEditorWire {
   switch (store.kind) {
     case 'column':
+    case 'per-category':
     case 'payment':
       return { kind: 'here' };
     case 'path':
@@ -98,6 +102,8 @@ function valueSpecOf(value: SettingValue): SettingValueSpecWire {
         nullable: value.nullable === true,
       };
     case 'fraction':
+      // The wire's fraction spec carries no `nullable` (a cxl fraction's NULL is NOT
+      // SEEDED, and every one is inert: the editor shows the stored value, P21).
       return value.oneOf === undefined
         ? { type: 'fraction' }
         : { type: 'fraction', one_of: [...value.oneOf] };

@@ -23,16 +23,12 @@ import {
   STRIPE_IDEMPOTENCY_KEY_MAX_LEN,
   requireIdempotencyKey,
 } from '../../src/db/mutation.js';
-import { cancelBookingInTx } from '../../src/lib/cancelBookingService.js';
-import { refundCreateParams } from '../../src/lib/pendingRefund.js';
-import { registerBookingsRoute } from '../../src/routes/bookings.js';
+import { firePendingRefundPostCommit, refundCreateParams } from '../../src/lib/pendingRefund.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
-import { registerStaffBookingsRoute } from '../../src/routes/staffBookings.js';
 import { runDuplicateRefundRetryOnce } from '../../src/workers/duplicateRefundRetry.js';
 import { clearInvoiceReferrers, FIXTURE_IDS, FIXTURE_NOW, FIXTURE_TODAY } from './_fixture.js';
 import {
   FIXTURE_OWNER_PRINCIPAL,
-  FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
   registerFixtureHooks,
@@ -145,16 +141,58 @@ async function theOnlyRefund() {
 
 // ── writer seams ──────────────────────────────────────────────────────────
 
-function cancelApp(stripe: StripeStub) {
-  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
-  registerBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe });
-  return app;
-}
-
-function staffCancelApp(stripe: StripeStub) {
-  const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
-  registerStaffBookingsRoute(app, { authenticate, now: FIXTURE_NOW, stripe });
-  return app;
+/**
+ * The writer seam (P21). Until 6.0.0-lg5.2 the booking cancel's money-back branch minted
+ * these rows; P21 deleted that branch, because no cancel mints a refund (design.md:4151-4154),
+ * and its own tests went with it by name. The sweep these tests pin still serves the live
+ * legs (the group-class withdraw, the invoice settle, the late success), each minting
+ * through `mintCappedPendingRefund` with its Stripe key stored in the same transaction and
+ * firing `firePendingRefundPostCommit` after commit, or writing a TERMINAL `'unroutable'`
+ * row when the charge has no PaymentIntent. That is exactly what this seam does, under the
+ * key spelling the cancel used (`<request key>:refund`).
+ */
+async function mintAndFire(args: {
+  bookingId: string;
+  stripe: StripeStub;
+  requestKey: string;
+}): Promise<void> {
+  const [charge] = await db
+    .select({ id: charges.id })
+    .from(charges)
+    .where(eq(charges.bookingId, args.bookingId));
+  assert.ok(charge, `no charge behind booking ${args.bookingId}`);
+  const stripeIdempotencyKey = `${args.requestKey}:refund`;
+  const minted = await withActor(`owner:${FIXTURE_IDS.ownerId}`, async (tx) => {
+    const mint = await refundsRepository.mintCappedPendingRefund(tx, {
+      chargeId: charge.id,
+      ownerId: FIXTURE_IDS.ownerId,
+      bookingId: args.bookingId,
+      reason: 'cancel',
+      stripeIdempotencyKey: () => stripeIdempotencyKey,
+    });
+    if (mint.kind === 'no-payment-intent') {
+      await refundsRepository.createUnroutable(tx, {
+        ownerId: FIXTURE_IDS.ownerId,
+        chargeId: charge.id,
+        bookingId: args.bookingId,
+        amountCents: mint.amountCents,
+        reason: 'cancel',
+      });
+    }
+    return mint;
+  });
+  if (minted.kind !== 'minted') return;
+  await firePendingRefundPostCommit({
+    pending: {
+      refundId: minted.refundId,
+      paymentIntentId: minted.paymentIntentId,
+      amountCents: minted.amountCents,
+      stripeIdempotencyKey: minted.stripeIdempotencyKey,
+    },
+    stripe: args.stripe,
+    log: { error: () => undefined },
+    context: { bookingId: args.bookingId },
+  });
 }
 
 /**
@@ -226,101 +264,6 @@ function armRefundCap(
 // ──────────────────────────────────────────────────────────────────────────
 // 1. Each writer × recovery — the money comes back
 // ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'owner cancel: a money-back refund whose Stripe call fails is retried under the EXACT key the row stored',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { bookingId, amountCents, paymentIntentId } = await seedMoneyPaidBooking();
-    const stripe = makeStripeStub();
-    // The failure this whole design exists for: the post-commit call throws,
-    // so nothing at Stripe knows about the refund and — before the stored key —
-    // nothing anywhere could ever try again.
-    stripe.throwOnRefund();
-    const requestKey = `cancel-${randomUUID()}`;
-    const res = await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
-    assert.equal(res.statusCode, 200, res.body);
-
-    const row = await theOnlyRefund();
-    assert.equal(row.status, 'pending');
-    assert.equal(row.stripeRefundId, null, 'nothing at Stripe knows about this refund');
-    assert.equal(
-      row.stripeIdempotencyKey,
-      `${requestKey}:refund`,
-      'the row carries the CLIENT-derived key its own fire used — the entire point',
-    );
-
-    await ageIntoTheClaimWindow(row.id);
-    const sweeper = makeStripeStub();
-    armRefundCap(paymentIntentId, amountCents, stripe, sweeper);
-    const tick = await runDuplicateRefundRetryOnce({ stripe: sweeper, now: sweepNow() });
-    assert.equal(tick.scanned, 1, 'a class of row the sweep could not previously touch');
-    assert.equal(tick.sent, 1);
-
-    const retried = sweeper.calls.filter((c) => c.method === 'createRefund');
-    assert.equal(retried.length, 1);
-    assert.equal(
-      retried[0]?.idempotencyKey,
-      `${requestKey}:refund`,
-      'the SAME key the route used — a different one would refund the owner twice',
-    );
-    assert.equal(
-      retried[0]?.method === 'createRefund' ? retried[0].args.amountCents : undefined,
-      amountCents,
-    );
-    assert.ok((await readRefund(row.id))?.stripeRefundId, 'the re_* id closes the row');
-
-    // And it leaves the worklist for good.
-    const second = await runDuplicateRefundRetryOnce({
-      stripe: sweeper,
-      now: new Date(sweepNow().getTime() + HOUR),
-    });
-    assert.equal(second.scanned, 0);
-    assert.equal(sweeper.calls.filter((c) => c.method === 'createRefund').length, 1);
-    await cleanup();
-  },
-);
-
-test(
-  'staff cancel: the cross-owner cancel stores its key too — one transaction, one contract',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { bookingId, amountCents, paymentIntentId } = await seedMoneyPaidBooking({
-      amountCents: 7_700,
-    });
-    const stripe = makeStripeStub();
-    stripe.throwOnRefund();
-    const requestKey = `staff-cancel-${randomUUID()}`;
-    const res = await staffCancelApp(stripe).inject({
-      method: 'POST',
-      url: `/staff/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
-    assert.equal(res.statusCode, 200, res.body);
-
-    const row = await theOnlyRefund();
-    assert.equal(row.stripeIdempotencyKey, `${requestKey}:refund`);
-    await ageIntoTheClaimWindow(row.id);
-
-    const sweeper = makeStripeStub();
-    armRefundCap(paymentIntentId, amountCents, stripe, sweeper);
-    const tick = await runDuplicateRefundRetryOnce({ stripe: sweeper, now: sweepNow() });
-    assert.equal(tick.sent, 1);
-    assert.equal(
-      sweeper.calls.find((c) => c.method === 'createRefund')?.idempotencyKey,
-      `${requestKey}:refund`,
-    );
-    await cleanup();
-  },
-);
 
 test(
   'group-class withdraw: a failed refund is retried under the stored key',
@@ -413,13 +356,7 @@ test(
     // The test then reds on the refusal as well as on the count.
     armRefundCap(paymentIntentId, amountCents, stripe);
     const requestKey = `replay-${randomUUID()}`;
-    const res = await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
-    assert.equal(res.statusCode, 200, res.body);
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: requestKey });
 
     const row = await theOnlyRefund();
     assert.equal(row.stripeRefundId, null, 'we never learned the id');
@@ -512,12 +449,7 @@ test(
     const stripe = makeStripeStub();
     stripe.throwOnRefund();
     const requestKey = `params-${randomUUID()}`;
-    await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: requestKey });
     const fired = stripe.calls.find((c) => c.method === 'createRefund');
     assert.ok(fired, 'the route attempted the refund');
 
@@ -552,12 +484,7 @@ test(
     const { bookingId } = await seedMoneyPaidBooking({ amountCents: 5_100 });
     const stripe = makeStripeStub();
     stripe.throwOnRefund();
-    await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': `nullkey-${randomUUID()}` },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: `nullkey-${randomUUID()}` });
     const row = await theOnlyRefund();
     await ageIntoTheClaimWindow(row.id);
     // Forge what a PRE-2026-08-19 row looks like on disk. This is the shape the
@@ -654,55 +581,6 @@ test(
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'a cancel against a charge with no PaymentIntent mints a TERMINAL row, not a worklist entry',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { bookingId, amountCents } = await seedMoneyPaidBooking({
-      amountCents: 4_200,
-      withPaymentIntent: false,
-    });
-    const stripe = makeStripeStub();
-    const res = await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': `unroutable-${randomUUID()}` },
-      payload: {},
-    });
-    assert.equal(res.statusCode, 200, res.body);
-
-    const row = await theOnlyRefund();
-    assert.equal(row.status, 'unroutable', 'terminal at mint — there is nothing to send');
-    assert.equal(row.amountCents, amountCents, 'the obligation is still RECORDED, not skipped');
-    assert.equal(row.stripeIdempotencyKey, null, 'there is no Stripe call to key');
-    assert.equal(
-      stripe.calls.filter((c) => c.method === 'createRefund').length,
-      0,
-      'and nothing was sent to Stripe for a charge Stripe never had',
-    );
-
-    // It counts toward the cumulative cap: nothing may double-mint against it.
-    const summed = await withActor('system:scheduler', (tx) =>
-      refundsRepository.sumNonFailedForCharge(tx, row.chargeId),
-    );
-    assert.equal(summed, amountCents, 'an unroutable refund still occupies the charge');
-
-    // And it is invisible to every automatic worklist, forever.
-    const logs = collectLogs();
-    const sweeper = makeStripeStub();
-    const tick = await runDuplicateRefundRetryOnce({
-      stripe: sweeper,
-      now: sweepNow(),
-      log: logs.log,
-    });
-    assert.equal(tick.scanned, 0);
-    assert.equal(tick.abandoned, 0, 'it is not owed-money-with-a-route, so it is not reported');
-    assert.equal(logs.errors.length, 0, 'and it is not re-shouted on a later tick');
-    await cleanup();
-  },
-);
-
-test(
   'a legacy never-sent pending row is flipped terminal ONCE, and the report stops carrying it forever',
   SKIP_WHEN_NO_DB,
   async () => {
@@ -778,12 +656,7 @@ test(
     const stripe = makeStripeStub();
     stripe.throwOnRefund();
     const requestKey = `aged-${randomUUID()}`;
-    await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: requestKey });
     const row = await theOnlyRefund();
     // Older than Stripe keeps a key: a same-key call is no longer guaranteed to
     // REPLAY, and a fresh execution would be a second refund of real money.
@@ -963,12 +836,7 @@ test(
       amountCents: 4_800,
       withPaymentIntent: false,
     });
-    await cancelApp(makeStripeStub()).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': `wh-${randomUUID()}` },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: makeStripeStub(), requestKey: `wh-${randomUUID()}` });
     const row = await theOnlyRefund();
     assert.equal(row.status, 'unroutable');
     const found = await withActor('system:stripe-webhook', (tx) =>
@@ -994,12 +862,7 @@ test(
     const stripe = makeStripeStub();
     stripe.throwOnRefund();
     const requestKey = `proj-${randomUUID()}`;
-    await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: requestKey });
     const row = await theOnlyRefund();
     await ageIntoTheClaimWindow(row.id);
     const claimed = await withActor('system:stripe-webhook', (tx) =>
@@ -1021,106 +884,6 @@ test(
 // ──────────────────────────────────────────────────────────────────────────
 // Adversary round 1 (2026-08-20) — the findings, each pinned
 // ──────────────────────────────────────────────────────────────────────────
-
-test(
-  'F1: the unroutable mint announces itself INSIDE the transaction, not from the post-commit seam',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { bookingId, amountCents } = await seedMoneyPaidBooking({
-      amountCents: 3_900,
-      withPaymentIntent: false,
-    });
-    // Drive the SERVICE directly, inside a transaction that is still open. An
-    // announcement made from `withMutation.postCommit` cannot appear here — and
-    // that is the whole finding: `postCommit` is skipped outright on an
-    // idempotent replay, so the crash-then-replay arc (client never sees the
-    // response, retries the same key) lost this line permanently, on a row that
-    // is terminal and therefore appears in NO worklist ever.
-    const errors: { obj: Record<string, unknown>; msg?: string }[] = [];
-    const captured = await withActor('system:scheduler', async (tx) => {
-      const result = await cancelBookingInTx(tx, {
-        id: bookingId,
-        requireOwnerId: FIXTURE_IDS.ownerId,
-        cancelledBy: 'owner',
-        now: FIXTURE_TODAY,
-        stripeIdempotencyKey: `intx-${randomUUID()}:refund`,
-        log: {
-          info: () => undefined,
-          warn: () => undefined,
-          error: (obj, msg) => errors.push({ obj, msg }),
-        },
-      });
-      // Asserted while the tx is STILL OPEN: the announcement has already
-      // happened by the time the service returns.
-      assert.equal(errors.length, 1, 'announced during the service call itself');
-      return result;
-    });
-    assert.ok(captured.unroutableRefund, 'the mint is still reported to the caller');
-    const alarm = errors[0]!;
-    assert.equal(alarm.obj.amountCents, amountCents);
-    assert.equal(alarm.obj.ownerId, FIXTURE_IDS.ownerId);
-    assert.match(alarm.msg ?? '', /no Stripe route/i);
-    assert.doesNotMatch(
-      alarm.msg ?? '',
-      /refund by hand in the .*dashboard/i,
-      'still never an instruction a human cannot follow',
-    );
-
-    // And the row really is invisible to every worklist — which is why losing
-    // the line above was permanent rather than merely late.
-    const row = await theOnlyRefund();
-    assert.equal(row.status, 'unroutable');
-    const tick = await runDuplicateRefundRetryOnce({
-      stripe: makeStripeStub(),
-      now: sweepNow(),
-    });
-    assert.equal(tick.abandoned, 0);
-    assert.deepEqual(tick.abandonedByClass, {
-      'row-keyed': 0,
-      'client-keyed': 0,
-      'never-sent': 0,
-      'stripe-failed': 0,
-      // MR-A1.5: the quiet class exists on every tick's summary, at 0 here.
-      covered: 0,
-    });
-    await cleanup();
-  },
-);
-
-test(
-  'F1: the route path announces it exactly once, and a replay does not double-announce',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    await cleanup();
-    const { bookingId } = await seedMoneyPaidBooking({
-      amountCents: 4_100,
-      withPaymentIntent: false,
-    });
-    const key = `replay-unroutable-${randomUUID()}`;
-    const app = cancelApp(makeStripeStub());
-    const first = await app.inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': key },
-      payload: {},
-    });
-    assert.equal(first.statusCode, 200, first.body);
-    // Same key again: `withMutation` replays the stored response and the
-    // transaction body never runs, so no second row and no second announcement.
-    const replay = await app.inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': key },
-      payload: {},
-    });
-    assert.equal(replay.statusCode, 200, replay.body);
-    const rows = await db.select().from(refunds).where(eq(refunds.ownerId, FIXTURE_IDS.ownerId));
-    assert.equal(rows.length, 1, 'one mint, one row');
-    assert.equal(rows[0]?.status, 'unroutable');
-    await cleanup();
-  },
-);
 
 test(
   'F2: the buried-class alarm hands over SQL that actually finds that class',
@@ -1307,12 +1070,7 @@ test(
     const stripe = makeStripeStub();
     stripe.throwOnRefund();
     const requestKey = `inflight-${randomUUID()}`;
-    await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: requestKey });
     const row = await theOnlyRefund();
     await ageIntoTheClaimWindow(row.id);
 
@@ -1371,12 +1129,7 @@ test(
     const requestKey = `drift-${randomUUID()}`;
     // The refund LANDS at Stripe under this key with these params...
     stripe.refundLandsThenThrows();
-    await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: requestKey });
     const row = await theOnlyRefund();
     await ageIntoTheClaimWindow(row.id);
     // ...and then the row's amount is rewritten underneath us, so the sweep
@@ -1578,12 +1331,7 @@ test(
     const stripe = makeStripeStub();
     stripe.throwOnRefund();
     const requestKey = `guard-${randomUUID()}`;
-    await cancelApp(stripe).inject({
-      method: 'POST',
-      url: `/bookings/${bookingId}/cancel`,
-      headers: { 'idempotency-key': requestKey },
-      payload: {},
-    });
+    await mintAndFire({ bookingId, stripe: stripe, requestKey: requestKey });
     const row = await theOnlyRefund();
     await ageIntoTheClaimWindow(row.id);
 

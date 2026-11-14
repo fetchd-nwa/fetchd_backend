@@ -54,7 +54,8 @@ export interface BookingRow {
  * Full row with `ownerId` — a field the route layer needs for cross-owner
  * defense, but the public wire shape doesn't carry. Day-13 cancel txn reads
  * this projection. (`cancelDeadlineAt` graduated to the base `BookingRow`
- * Δ 2026-07-08 — it's now on the wire for the overlap-cancel forfeit warning.)
+ * Δ 2026-07-08 for the overlap-cancel forfeit warning; since P21, wire 6.0.0-lg5.2,
+ * no cancel forfeits and nothing stamps it, so it is only a pre-P21 row's instant.)
  */
 export interface BookingFullRow extends BookingRow {
   ownerId: string;
@@ -86,6 +87,8 @@ export interface BookingDogJoinRow {
 /** A share, live or cancelled alone: `expiredAt` is the one-dog cancel's stamp. */
 export interface BookingShareRow extends BookingDogJoinRow {
   expiredAt: string | null;
+  /** Her after-school opt-in on this session (M5.04, DAY-U43). */
+  afterSchool: boolean;
 }
 
 /**
@@ -177,6 +180,28 @@ export const bookingsRepository = {
       .select(BOOKING_PROJECTION)
       .from(bookings)
       .where(and(...conditions));
+  },
+
+  /**
+   * The profile's *Bookings* (6.0.0-lg5.2; CXL-U04, D8, s17): one family's live day-school
+   * and day-care sessions on Chicago calendar day `fromChicagoDate` or later, not
+   * cancelled (a `payment-pending` row included: its cancel cancels its order), soonest
+   * first. The same Chicago-day expression as {@link findLiveActive}'s `from`.
+   */
+  async findOwnerDaySessionsFrom(ownerId: string, fromChicagoDate: string): Promise<BookingRow[]> {
+    return db
+      .select(BOOKING_PROJECTION)
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.ownerId, ownerId),
+          inArray(bookings.category, ['day-school', 'day-care']),
+          ne(bookings.status, 'cancelled'),
+          live(bookings),
+          sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date >= ${fromChicagoDate}::date`,
+        ),
+      )
+      .orderBy(asc(bookings.scheduledAt), asc(bookings.id));
   },
 
   /**
@@ -448,6 +473,7 @@ export const bookingsRepository = {
         dogId: bookingDogs.dogId,
         isLead: bookingDogs.isLead,
         expiredAt: bookingDogs.expiredAt,
+        afterSchool: bookingDogs.afterSchool,
       })
       .from(bookingDogs)
       .where(inArray(bookingDogs.bookingId, bookingIds));
@@ -465,6 +491,7 @@ export const bookingsRepository = {
         dogId: bookingDogs.dogId,
         isLead: bookingDogs.isLead,
         expiredAt: bookingDogs.expiredAt,
+        afterSchool: bookingDogs.afterSchool,
       })
       .from(bookingDogs)
       .where(and(eq(bookingDogs.bookingId, bookingId), eq(bookingDogs.dogId, dogId)));
@@ -593,7 +620,6 @@ export const bookingsRepository = {
       scheduledAt: Date;
       location: LocationKey;
       notes: string | null;
-      cancelDeadlineAt: Date;
       additionalDogIds: readonly string[];
       cohortId?: string | null;
       sessionReportId?: string | null;
@@ -603,6 +629,9 @@ export const bookingsRepository = {
       orderId?: string | null;
       // A top-up's rows wait for Stripe. Every other row is born `upcoming`.
       status?: 'payment-pending';
+      /** The dogs of this row opted in to its after-school session (M5.04; only
+       *  `createDayProgramBookings` passes it, for a day-school row). */
+      afterSchoolDogIds?: readonly string[];
     },
   ): Promise<BookingRow> {
     const [bookingRow] = await tx
@@ -614,7 +643,8 @@ export const bookingsRepository = {
         scheduledAt: values.scheduledAt.toISOString(),
         location: values.location,
         notes: values.notes,
-        cancelDeadlineAt: values.cancelDeadlineAt.toISOString(),
+        // No cancel_deadline_at: no cancel has a window (6.0.0-lg5.2, P21; M5.08 dropped
+        // cancel_window_settings, and §3.8 stores every cxl.* key only). It stays NULL.
         cohortId: values.cohortId ?? null,
         sessionReportId: values.sessionReportId ?? null,
         lessonSetting: values.lessonSetting ?? null,
@@ -628,12 +658,19 @@ export const bookingsRepository = {
     if (!bookingRow) {
       throw new Error('bookingsRepository.create: bookings INSERT returned no row');
     }
+    const afterSchool = new Set(values.afterSchoolDogIds ?? []);
     const dogRows = [
-      { bookingId: bookingRow.id, dogId: values.leadDogId, isLead: true },
+      {
+        bookingId: bookingRow.id,
+        dogId: values.leadDogId,
+        isLead: true,
+        afterSchool: afterSchool.has(values.leadDogId),
+      },
       ...values.additionalDogIds.map((dogId) => ({
         bookingId: bookingRow.id,
         dogId,
         isLead: false,
+        afterSchool: afterSchool.has(dogId),
       })),
     ];
     await tx.insert(bookingDogs).values(dogRows);
@@ -709,20 +746,16 @@ export const bookingsRepository = {
 
   /**
    * Soft-cancel one booking. Sets `status='cancelled'`, `cancelledAt` to
-   * the caller's `now`, `cancelForfeited` per the per-row deadline check,
+   * the caller's `now`, `cancelForfeited` false (below),
    * and — R5 (Allison sim-QA 2026-07-27) — `cancelledBy` ('owner' |
    * 'staff') plus the optional `cancelReason` staff supplies. These drive
    * the owner app's cancelled-booking banner ("You cancelled this…" vs
    * "The school cancelled this…" + the reason line). (The older
    * `cancellation_reason` column stays unused — `cancel_reason` supersedes it.)
    *
-   * `cancelForfeited` is computed in SQL against `cancel_deadline_at`
-   * (`now > cancel_deadline_at`) — but `now` is the caller's instant,
-   * bound as a parameter, NOT Postgres `now()`. The comparison still
-   * happens in SQL so a deadline of NULL — possible on legacy-import
-   * rows pre-Day-10 — coerces to `cancel_forfeited = false` (NULL >
-   * anything is NULL, COALESCEd to false). Defensible behavior: a
-   * missing deadline can't be enforced, so treat the cancel as in-window.
+   * `cancelForfeited` is false on every cancel from 6.0.0-lg5.2 (P21; CXL-U04): no
+   * cancel window exists, so no deadline is stamped and one stamped before P21 is
+   * read by nothing. Only a row cancelled before P21 can read true.
    *
    * `now` is required, not defaulted (Δ 2026-08-12). The route already
    * owns an injectable clock (`registerXxxRoute(app, { now })`); reading
@@ -751,7 +784,9 @@ export const bookingsRepository = {
       .set({
         status: 'cancelled',
         cancelledAt: nowIso,
-        cancelForfeited: sql`COALESCE(${nowIso}::timestamptz > ${bookings.cancelDeadlineAt}, false)`,
+        // Nothing is forfeited (6.0.0-lg5.2, P21; CXL-U04): no cancel window exists, so a
+        // deadline stamped on a row before P21 is read by nothing.
+        cancelForfeited: false,
         cancelledBy: args.cancelledBy,
         cancelReason: args.cancelReason ?? null,
       })

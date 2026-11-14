@@ -53,6 +53,8 @@ after(async () => {
 
 const WED = '2026-10-21';
 const LOT_EXPIRES = at('2027-06-01', '12:00');
+/** Luna's lot's date (`nguyens`): her live share names it as `return_expires_at` (P21, D1). */
+const LUNA_LOT_EXPIRES = at('2027-07-01', '12:00');
 
 async function named(name: string): Promise<string> {
   const dogId = await createBookableDog(createdDogs);
@@ -75,7 +77,7 @@ async function nguyens(date = WED): Promise<Nguyens> {
   const bao = await named('Bao');
   const luna = await named('Luna');
   const baoLot = await plantLot({ credits: 3, expiresAt: LOT_EXPIRES });
-  const lunaLot = await plantLot({ credits: 3, expiresAt: at('2027-07-01', '12:00') });
+  const lunaLot = await plantLot({ credits: 3, expiresAt: LUNA_LOT_EXPIRES });
   const { bookingId, debitIds } = await createSession({
     dogIds: [bao, luna],
     date,
@@ -116,8 +118,18 @@ describe('R8, R10: one dog leaves, the last dog takes the session with her', () 
       assert.equal(after.dog_id, n.bao);
       assert.equal(after.additional_dog_ids, undefined);
       assert.deepEqual(after.dog_shares, [
-        { dog_id: n.bao, can_cancel: true },
-        { dog_id: n.luna, can_cancel: false, cancelled_at: at(WED, '06:50').toISOString() },
+        {
+          dog_id: n.bao,
+          can_cancel: true,
+          after_school: false,
+          return_expires_at: LOT_EXPIRES.toISOString(),
+        },
+        {
+          dog_id: n.luna,
+          can_cancel: false,
+          after_school: false,
+          cancelled_at: at(WED, '06:50').toISOString(),
+        },
       ]);
       const returns = (await ledgerOf(n.bookingId)).filter((r) => r.reason === 'settlement-return');
       assert.equal(returns.length, 1);
@@ -162,8 +174,13 @@ describe('R8, R10: one dog leaves, the last dog takes the session with her', () 
         'the last dog keeps her share, so a cancelled session has a dog',
       );
       assert.deepEqual(last.dog_shares, [
-        { dog_id: n.bao, can_cancel: false },
-        { dog_id: n.luna, can_cancel: false, cancelled_at: at(WED, '06:50').toISOString() },
+        { dog_id: n.bao, can_cancel: false, after_school: false },
+        {
+          dog_id: n.luna,
+          can_cancel: false,
+          after_school: false,
+          cancelled_at: at(WED, '06:50').toISOString(),
+        },
       ]);
       const [reminder] = await db
         .select({ status: scheduledNotifications.status })
@@ -196,7 +213,8 @@ describe('R8, R10: one dog leaves, the last dog takes the session with her', () 
     assert.deepEqual(
       (await cancelNotices(sessions)).map((x) => x.body),
       [
-        "The school cancelled Pepper's day school on Wed 21 Oct. +1 credit, back to your Bentonville day-school credits (expires 1 Jun).",
+        // P21 (NOTIF-U17, D13): the staff reason, from the reason sheet, quoted verbatim.
+        `The school cancelled Pepper's day school on Wed 21 Oct: "Family called the desk". +1 credit, back to your Bentonville day-school credits (expires 1 Jun).`,
       ],
     );
   });
@@ -345,8 +363,18 @@ describe('D3: a lead cancelled alone', () => {
       wire(await ownerDogCancel(owner, { bookingId: n.bookingId, dogId: n.bao }));
       clock.set(at(WED, '07:00'));
       const expectShares = [
-        { dog_id: n.luna, can_cancel: true },
-        { dog_id: n.bao, can_cancel: false, cancelled_at: at(WED, '06:50').toISOString() },
+        {
+          dog_id: n.luna,
+          can_cancel: true,
+          after_school: false,
+          return_expires_at: LUNA_LOT_EXPIRES.toISOString(),
+        },
+        {
+          dog_id: n.bao,
+          can_cancel: false,
+          after_school: false,
+          cancelled_at: at(WED, '06:50').toISOString(),
+        },
       ];
 
       const ownerList = await owner.inject({ method: 'GET', url: '/bookings?view=upcoming' });
@@ -473,7 +501,7 @@ describe('P20 fix 1, F1, T4: a cancel names no check-in event', () => {
       wire(
         await staffDogCancel(staff, { bookingId: staffAlone.bookingId, dogId: staffAlone.luna }),
       );
-      // The whole cancel inside its window, so it returns (outside it, it forfeits).
+      // The whole cancel returns every credit: no cancel forfeits from P21 (CXL-U04).
       const early = boardApp(FIXTURE_STAFF_PRINCIPAL, makeClock(at('2026-10-18', '12:00')));
       wire(await staffCancel(early, { bookingId: whole.bookingId }));
       for (const [n, returns] of [
@@ -511,15 +539,30 @@ describe('D14: the switch', () => {
         await owner.inject({ method: 'GET', url: `/bookings/${n.bookingId}` }),
       );
       assert.deepEqual(ownerRead.dog_shares, [
-        { dog_id: n.bao, can_cancel: false },
-        { dog_id: n.luna, can_cancel: false },
+        {
+          dog_id: n.bao,
+          can_cancel: false,
+          after_school: false,
+          return_expires_at: LOT_EXPIRES.toISOString(),
+        },
+        {
+          dog_id: n.luna,
+          can_cancel: false,
+          after_school: false,
+          return_expires_at: LUNA_LOT_EXPIRES.toISOString(),
+        },
       ]);
       assert.equal(ownerRead.can_cancel, true, 'the whole session still cancels');
 
       const staffAfter = wire(
         await staffDogCancel(staff, { bookingId: n.bookingId, dogId: n.luna }),
       );
-      assert.deepEqual(staffAfter.dog_shares?.[0], { dog_id: n.bao, can_cancel: true });
+      assert.deepEqual(staffAfter.dog_shares?.[0], {
+        dog_id: n.bao,
+        can_cancel: true,
+        after_school: false,
+        return_expires_at: LOT_EXPIRES.toISOString(),
+      });
     },
   );
 });
@@ -661,8 +704,18 @@ describe('BookingWire.can_cancel', () => {
       const read = wire(await owner.inject({ method: 'GET', url: `/bookings/${n.bookingId}` }));
       assert.equal(read.can_cancel, false);
       assert.deepEqual(read.dog_shares, [
-        { dog_id: n.bao, can_cancel: true },
-        { dog_id: n.luna, can_cancel: false },
+        {
+          dog_id: n.bao,
+          can_cancel: true,
+          after_school: false,
+          return_expires_at: LOT_EXPIRES.toISOString(),
+        },
+        {
+          dog_id: n.luna,
+          can_cancel: false,
+          after_school: false,
+          return_expires_at: LUNA_LOT_EXPIRES.toISOString(),
+        },
       ]);
       clock.set(at(WED, '17:30'));
       const ended = wire(await owner.inject({ method: 'GET', url: `/bookings/${n.bookingId}` }));
@@ -676,7 +729,7 @@ describe('the alarm, through the route', () => {
     'a cancel that finds no live debit for a live share of a day row → 500 and one alarm naming the booking and the dog',
     SKIP_WHEN_NO_DB,
     async () => {
-      // Three days out, inside no forfeit window, so the whole-session cancel returns credits.
+      // The whole-session cancel returns credits (no cancel forfeits from P21, CXL-U04).
       const dogId = await named('Ghost');
       const lunaId = await named('Luna');
       const lotId = await plantLot({ credits: 2, expiresAt: LOT_EXPIRES });

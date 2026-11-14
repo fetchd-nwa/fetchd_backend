@@ -7,12 +7,10 @@ import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../db/repositories/invoicesRepository.js';
-import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import { notificationsRepository } from '../db/repositories/notificationsRepository.js';
 import { requestsRepository } from '../db/repositories/requestsRepository.js';
 import { bookings } from '../db/schema/schema.js';
 import { boardTrainPriceCentsForLengthWeeks } from '../lib/boardTrainPricing.js';
-import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { ApiError, isIdempotencyInflight } from '../lib/errors.js';
@@ -264,20 +262,15 @@ export function registerRequestConfirmPaymentRoute(
               );
             }
 
-            // Resolve dogs + cancel-window deadline + build the booking row.
+            // Resolve dogs + build the booking row (no cancel deadline: P21, M5.08).
             const dogRows = await requestsRepository.findDogsByRequestIds([id], tx);
             const grouped = groupRequestDogs(dogRows).get(id);
             if (grouped === undefined) {
               throw new Error(`pending_request ${id}: no live pending_request_dogs rows`);
             }
-            const hours = await cancelWindowSettingsRepository.resolveHoursFor(
-              'board-and-train',
-              tx,
-            );
             const scheduledAtDate = new Date(body.scheduled_at);
             const dropoffAtDate = new Date(body.dropoff_at);
             const pickupAtDate = new Date(body.pickup_at);
-            const cancelDeadlineAt = computeCancelDeadlineFromHours(scheduledAtDate, hours);
 
             const inserted = await insertBookingWithGateMapping(tx, {
               ownerId: row.ownerId,
@@ -286,7 +279,6 @@ export function registerRequestConfirmPaymentRoute(
               scheduledAt: scheduledAtDate,
               location: body.location,
               notes: body.notes ?? null,
-              cancelDeadlineAt,
               additionalDogIds: grouped.additional,
             });
 

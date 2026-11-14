@@ -422,7 +422,7 @@ test(
 );
 
 test(
-  'POST /staff/bookings/:id/cancel — money-back fires the Stripe refund post-commit',
+  'POST /staff/bookings/:id/cancel — over a planted succeeded charge, the staff cancel mints no refund and fires no Stripe call (P21: no cancel moves money)',
   SKIP_WHEN_NO_DB,
   async () => {
     const id = await seedBooking({
@@ -439,15 +439,17 @@ test(
     });
     assert.equal(res.statusCode, 200, res.body);
 
+    // The P20 tree minted a pending refund here and fired Stripe after commit. No route a
+    // v1 client reaches puts a charge on a private lesson; money comes back only as a staff
+    // refund, case by case (design.md:4151-4154; P22).
     const refundCalls = stripe.calls.filter((c) => c.method === 'createRefund');
-    assert.equal(refundCalls.length, 1, 'exactly one Stripe refund fired post-commit');
+    assert.equal(refundCalls.length, 0, 'no Stripe refund');
 
     const refundRows = await db
       .select({ amountCents: refunds.amountCents })
       .from(refunds)
       .where(eq(refunds.bookingId, id));
-    assert.equal(refundRows.length, 1, 'pending refunds row created');
-    assert.equal(refundRows[0]!.amountCents, 9000);
+    assert.equal(refundRows.length, 0, 'no refunds row');
   },
 );
 

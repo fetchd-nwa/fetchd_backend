@@ -37,7 +37,7 @@ after(async () => {
 
 const ANY_ID = '99999999-9999-4999-8999-999999999999';
 
-const REMOVED: ReadonlyArray<{ method: 'GET' | 'POST' | 'DELETE'; url: string }> = [
+const REMOVED: ReadonlyArray<{ method: 'GET' | 'POST' | 'PATCH' | 'DELETE'; url: string }> = [
   { method: 'POST', url: '/memberships' },
   { method: 'GET', url: '/memberships' },
   { method: 'DELETE', url: `/memberships/${ANY_ID}` },
@@ -48,6 +48,10 @@ const REMOVED: ReadonlyArray<{ method: 'GET' | 'POST' | 'DELETE'; url: string }>
   // 6.0.0-lg5.1 (P20; DAY-U29, M5.12): the overwritable attendance verb, replaced by the
   // board's append-only log.
   { method: 'POST', url: `/staff/bookings/${ANY_ID}/attendance` },
+  // 6.0.0-lg5.2 (P21; CXL-U02, M5.08): the cancel window and its table, replaced by the
+  // stored-only `cxl` settings domain (`GET/PATCH /staff/settings/cxl`).
+  { method: 'GET', url: '/staff/cancel-window' },
+  { method: 'PATCH', url: '/staff/cancel-window/day-school' },
 ];
 
 for (const { method, url } of REMOVED) {
@@ -65,6 +69,7 @@ for (const { method, url } of [
   { method: 'GET', url: `/staff/dogs/${ANY_ID}/completed-programs` },
   { method: 'POST', url: `/staff/bookings/${ANY_ID}/dogs/${ANY_ID}/check-in` },
   { method: 'GET', url: '/staff/checkin-board?location=bentonville&date=2026-10-13' },
+  { method: 'GET', url: '/staff/settings/cxl' },
 ] as const) {
   test(`${method} ${url} is still registered`, async () => {
     const res = await app.inject({ method, url });

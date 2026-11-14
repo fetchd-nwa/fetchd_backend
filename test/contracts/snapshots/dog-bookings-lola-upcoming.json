@@ -11,7 +11,8 @@
     "dog_shares": [
       {
         "dog_id": "33333333-3333-4333-8333-333333333332",
-        "can_cancel": true
+        "can_cancel": true,
+        "after_school": false
       }
     ]
   },

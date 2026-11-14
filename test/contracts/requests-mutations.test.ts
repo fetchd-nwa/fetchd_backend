@@ -629,11 +629,14 @@ test(
         leadDogId: bookingsTable.leadDogId,
         location: bookingsTable.location,
         scheduledAt: bookingsTable.scheduledAt,
+        cancelDeadlineAt: bookingsTable.cancelDeadlineAt,
       })
       .from(bookingsTable)
       .where(eq(bookingsTable.id, body.converted_booking_id!));
     assert.ok(booking, 'booking row created');
     assert.equal(booking?.category, 'private-lesson');
+    // P21 (M5.08; contract notes D3): no cancel window exists, so the approval stamps none.
+    assert.equal(booking?.cancelDeadlineAt, null);
     assert.equal(booking?.leadDogId, FIXTURE_IDS.dog1Id);
     assert.equal(booking?.location, 'fayetteville');
 

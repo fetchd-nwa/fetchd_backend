@@ -8,6 +8,7 @@ import {
   type GetStaffSettingsManifestResponse,
   type PaymentSettingWire,
   type SettingsManifestEntryWire,
+  type SettingsWireByDomain,
 } from '../../src/contracts/wire.js';
 import { SETTINGS_REGISTRY } from '../../src/lib/settingsRegistry.js';
 import {
@@ -60,6 +61,16 @@ function pathOf(entry: SettingsManifestEntryWire): string {
 
 /** The current value of `field` on a domain GET, in PATCH body form. */
 function currentValue(domain: string, body: unknown, field: string): unknown {
+  if (domain === 'cxl') {
+    // A global key reads from `global`; a per-service key from every `policies` row,
+    // sent as a category → value map (SettingReadWire's cxl sentence; P21 D4, D5).
+    const { policies, global } = body as SettingsWireByDomain['cxl'];
+    if (Object.hasOwn(global, field)) return (global as unknown as Record<string, unknown>)[field];
+    assert.ok(policies.length > 0, 'cxl has no policy rows');
+    return Object.fromEntries(
+      policies.map((p) => [p.category, (p as unknown as Record<string, unknown>)[field]]),
+    );
+  }
   if (domain !== 'pay') return (body as Record<string, unknown>)[field];
   const rows = (body as PaymentSettingWire[]).filter((r) => r.key === field);
   assert.ok(rows.length > 0, `pay has no ${field} row`);

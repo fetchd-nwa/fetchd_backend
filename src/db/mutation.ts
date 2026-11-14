@@ -44,7 +44,7 @@ export const STRIPE_IDEMPOTENCY_KEY_MAX_LEN = 255;
  * the old hint grepped the one spelling (2026-08-20).
  */
 export const STRIPE_DERIVED_KEY_SUFFIXES = [
-  ':refund', // bookings, staffBookings, enrollments cancel/withdraw money-back
+  ':refund', // enrollments withdraw money-back (the booking cancels' left in P21)
   ':payment-intent', // requestConfirmPayment, creditPackages
   ':customer', // paymentMethods
   ':setup-intent', // paymentMethods
@@ -188,11 +188,12 @@ export interface MutationParams<T = unknown> {
    *     over a local variable — the body parameter is the
    *     route-independent surface.
    *
-   * Two production sites today (Day-14):
+   * The first two production sites (Day-14):
    *   1. `DELETE /payment-methods/:id` — `stripe.detachPaymentMethod`
    *   2. `POST /bookings/:id/cancel` — `stripe.createRefund` (closure-
-   *      captured refund handle, fired conditionally on money-back
-   *      branch).
+   *      captured refund handle). Since P21 (wire 6.0.0-lg5.2) its
+   *      money-back branch is deleted and the handle is set only when a
+   *      pending row's order cancel refunds a top-up that won no seat (F4).
    *
    * Adding a third site (Day-15 invoice-pay / setup_intent.succeeded
    * webhook) is "implement the callback" — no boilerplate copy.

@@ -146,23 +146,28 @@ const bookingPaymentSchema = z
   })
   .strict();
 
+/** A Chicago calendar day, `YYYY-MM-DD`, that exists. */
+const calendarDate = z
+  .string()
+  .regex(ISO_DATE, 'must be YYYY-MM-DD')
+  .refine(isValidCalendarDate, 'not a real calendar date');
+
 const postBookingBodySchema = z
   .object({
     category: z.enum(['day-school', 'day-care']),
     lead_dog_id: dogIdField,
     additional_dog_ids: z.array(dogIdField).max(ADDITIONAL_DOGS_PARSE_CEILING).optional(),
-    dates: z
-      .array(
-        z
-          .string()
-          .regex(ISO_DATE, 'must be YYYY-MM-DD')
-          .refine(isValidCalendarDate, 'not a real calendar date'),
-      )
-      .min(1)
-      .max(MAX_DATES_PER_REQUEST),
+    dates: z.array(calendarDate).min(1).max(MAX_DATES_PER_REQUEST),
     location: z.enum(LOCATION_KEYS),
     notes: z.string().max(2000).optional(),
     payment: bookingPaymentSchema,
+    // The after-school opt-in (6.0.0-lg5.2; DAY-U43): dog → dates. Each key lowercased
+    // here, like every dog id at this boundary, so a capitalised key is that dog; a key
+    // that is not a UUID or a value that is not a date is this parse's 400. Its fit with
+    // the request is `validateBookingBody`'s (D11).
+    after_school: z
+      .record(dogIdField, z.array(calendarDate).max(MAX_DATES_PER_REQUEST))
+      .optional(),
   })
   .strict();
 
@@ -181,10 +186,12 @@ export type PostBookingsBodyConformance = Expect<
 export interface BookingsRouteOptions extends AuthRouteOptions {
   now?: () => Date;
   /**
-   * Stripe seam (Day 14). The cancel route's money-back branch fires a
-   * post-commit `stripe.createRefund` against the prior PaymentIntent.
-   * Contract tests inject an in-memory stub; production wires
-   * `defaultStripeClient`.
+   * Stripe seam (Day 14). `POST /bookings` charges a top-up through it; the
+   * cancel route asks Stripe about a pending row's order through it and fires
+   * that order's F4 refund (a top-up that won no seat) post-commit. A booking
+   * cancel itself moves no money: its money-back branch was deleted in P21
+   * (wire 6.0.0-lg5.2). Contract tests inject an in-memory stub; production
+   * wires `defaultStripeClient`.
    */
   stripe?: StripeClient;
 }
@@ -332,7 +339,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       requireOwner(principal, 'create a booking');
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const body = parseOrThrow(postBookingBodySchema, request.body, 'body');
-      const parsed = validateBookingBody(body);
+      const parsed = validateBookingBody(body, request.body);
 
       // The ceiling, the ownership gate and the core, in whichever path's transaction.
       const book = async (tx: Tx, orderId: string) => {
@@ -366,6 +373,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
           notes: parsed.notes,
           payment: parsed.payment,
           now: nowFactory(),
+          afterSchool: parsed.afterSchool,
         });
       };
       const endpoint = 'POST /bookings';
@@ -490,29 +498,26 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
 
   // --- POST /bookings/:id/cancel -----------------------------------------
   //
-  // Day 13 owner-self cancel (schema.sql `cancelBooking` txn-contract).
-  // Three outcome branches:
+  // Day 13 owner-self cancel (schema.sql `cancelBooking` txn-contract), through the
+  // shared `cancelBookingInTx`. No cancel has a window, forfeits, or moves money
+  // (P21, wire 6.0.0-lg5.2; CXL-U04): the Day-13 FORFEIT and MONEY-BACK branches were
+  // deleted, every cancel writes `cancel_forfeited` false, and none mints a `refunds`
+  // row. What comes back is credit:
   //
-  //   1. FORFEIT — `now > cancel_deadline_at`. `cancel_forfeited=true`;
-  //      no credit refund, no money refund, capacity still released via
-  //      the status flip.
-  //   2. CREDIT-BACK — within window, booking was credit-paid (one or
-  //      more `credit_ledger` 'booking-debit' rows exist). One +1
-  //      'settlement-return' row per live debit, naming it; balance recomputes.
-  //      A day row whose live share holds no live debit is a 500 and an alarm.
+  //   - An `upcoming` day-school or day-care row returns one credit per dog still on
+  //     it (`returnDayShares`): one +1 'settlement-return' per live debit, naming it,
+  //     to that debit's lot or a fresh lot; balance recomputes. A day row whose live
+  //     share holds no live debit is a 500 and an alarm.
+  //   - Any other row returns what it debited (`returnDebitsToLots`): nothing, for a
+  //     row that spent no credit (e.g. an evaluation), so its status just flips.
+  //   - A `payment-pending` row cancels its whole order instead (`cancelOrderInTx`),
+  //     where the engine refunds a top-up that won no seat (F4), fired post-commit
+  //     below. Its notices are the order engine's.
   //
   // A day-school or day-care row is refused first (6.0.0-lg5.1, CXL-U09): 409
   // `session_ended` once its day has ended, then 409 `session_checked_in` while any
-  // dog still on it has folded past `expected`.
-  //   3. MONEY-BACK — within window, booking was money-paid (succeeded
-  //      `charges` row exists). A `refunds` row inserted at 'pending';
-  //      the Stripe refund API call is queued post-commit (Day 14
-  //      wires the real seam; Day 13 is the DB-side substrate).
-  //
-  // A booking that's neither credit-paid nor money-paid (free service,
-  // e.g. evaluation) within-window cancel just flips status — no
-  // ledger or refund row. Forfeited cancels of free services do the
-  // same. Either way, the booking-cancelled notification fires.
+  // dog still on it has folded past `expected`. A cancel of a non-pending row queues
+  // one booking-cancelled notice: who cancelled, and a credit line per credit back.
   //
   // Capacity release: day-school / day-care use dynamic counting
   // (`assertCapacityWithinLock` excludes `status='cancelled'` rows),
@@ -522,8 +527,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
   // Group-class is NOT supported by this endpoint — those bookings
   // are tied to a cohort row's `filled` counter that increments per
   // dog (not per per-week booking), so the right verb is "withdraw
-  // dog from cohort" (deferred Day-11 sibling). Group-class cancel
-  // attempts surface 422 with a typed message.
+  // dog from cohort" (`POST /enrollments/:cohortId/withdraw`). Group-class
+  // cancel attempts surface 422 with a typed message.
   app.post(
     '/bookings/:id/cancel',
     { preHandler: [authHook] },
@@ -533,13 +538,10 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
       const { id } = parseUuidParam(request.params);
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
-      // Day-14: closure-captured handle for the post-commit Stripe refund.
-      // Set inside the money-back branch below; read by the postCommit
-      // callback below. Stays undefined for forfeit / credit-back /
-      // free-service / no-prior-refunds paths (postCommit no-ops).
+      // Closure-captured handle for the post-commit Stripe refund: set only when a
+      // pending row's cancel of its order refunds a top-up that won no seat (F4).
+      // An upcoming row's cancel moves no money (P21), so it stays undefined.
       let pendingStripeRefund: PendingStripeRefund | undefined;
-      // Computed ONCE, here, so the row stores the same string the fire sends.
-      const refundIdempotencyKey = `${idempotencyKey}:refund`;
       // The owner credited back on this cancel (unset on every non-credit-back
       // path); post-commit we wipe her `credits:{ownerId}:*` display cache.
       let creditRefundedOwnerId: string | undefined;
@@ -571,8 +573,8 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             }
             return patterns;
           },
-          // Day-14: post-commit Stripe refund. Fires only on new (non-
-          // replayed) money-back branches via the closure-captured handle
+          // Day-14: post-commit Stripe refund. Fires only on a new (non-
+          // replayed) pending-order cancel's F4 refund via the closure-captured handle
           // (the response body — a BookingWire — doesn't carry refund
           // metadata). MutationParams.postCommit owns the swallow/log/
           // skip-on-replay boilerplate; the DB `refunds` row at 'pending'
@@ -599,7 +601,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
         async (tx) => {
           // Owner self-cancel runs the shared cancel txn (schema.sql
           // `cancelBooking` contract) scoped to the principal's own
-          // bookings — a cross-owner id 404s. The money-back branch
+          // bookings — a cross-owner id 404s. A pending row's F4 refund
           // returns a Stripe-refund handle the postCommit above fires.
           const result = await cancelBookingInTx(tx, {
             id,
@@ -607,8 +609,6 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             // Owner self-cancel → "You cancelled this on …" (R5). No reason line.
             cancelledBy: 'owner',
             now: nowFactory(),
-            stripeIdempotencyKey: refundIdempotencyKey,
-            // The unroutable mint announces itself in-tx through this logger.
             log: request.log,
             whatWon,
           });
@@ -663,7 +663,7 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             id,
             dogId,
             requireOwnerId: principal.ownerId,
-            cancelledBy: 'owner',
+            who: { by: 'owner' },
             now: nowFactory(),
             log: request.log,
           });
@@ -728,9 +728,56 @@ interface ValidatedBookingBody {
   location: (typeof LOCATION_KEYS)[number];
   notes: string | null;
   payment: PostBookingBody['payment'];
+  /** Dog → the dates she stays for after school; only dogs with a tick. */
+  afterSchool: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
-function validateBookingBody(body: PostBookingBody): ValidatedBookingBody {
+/**
+ * D11: the after-school map against its own request, each a 422 `invalid_payload`. A key
+ * that is not a dog of this request, a date not in `dates`, a date listed twice for one
+ * dog, any tick on a day-care request ("refused on a daycare date", design §2.3:2560), or
+ * two keys that name one dog in two spellings. Pure checks of the body, true or false
+ * whenever it is sent, so they run before the claim; the count, which a replay must not
+ * re-read, is the core's, after it.
+ */
+function validateAfterSchool(
+  body: PostBookingBody,
+  rawBody: unknown,
+  dogIds: ReadonlySet<string>,
+  dates: ReadonlySet<string>,
+): Map<string, Set<string>> {
+  const ticks = new Map<string, Set<string>>();
+  const map = body.after_school;
+  if (map === undefined) return ticks;
+  const rawKeys = Object.keys(
+    ((rawBody as { after_school?: Record<string, unknown> }).after_school ?? {}) as object,
+  );
+  if (rawKeys.length !== Object.keys(map).length) {
+    throw new ApiError('invalid_payload', 'after_school names one dog twice');
+  }
+  for (const [dogId, listed] of Object.entries(map)) {
+    if (!dogIds.has(dogId)) {
+      throw new ApiError('invalid_payload', `after_school names ${dogId}, not a dog of this booking`);
+    }
+    if (listed.length > 0 && body.category === 'day-care') {
+      throw new ApiError('invalid_payload', 'after-school is offered on day-school dates only');
+    }
+    const own = new Set<string>();
+    for (const date of listed) {
+      if (!dates.has(date)) {
+        throw new ApiError('invalid_payload', `after_school's ${date} is not one of this booking's dates`);
+      }
+      if (own.has(date)) {
+        throw new ApiError('invalid_payload', `after_school lists ${date} twice for one dog`);
+      }
+      own.add(date);
+    }
+    if (own.size > 0) ticks.set(dogId, own);
+  }
+  return ticks;
+}
+
+function validateBookingBody(body: PostBookingBody, rawBody: unknown): ValidatedBookingBody {
   // Combined dog list — lead first, then additionals.
   const additionalDogIds = body.additional_dog_ids ?? [];
   const allDogIds = [body.lead_dog_id, ...additionalDogIds];
@@ -749,6 +796,7 @@ function validateBookingBody(body: PostBookingBody): ValidatedBookingBody {
     dateSet.add(date);
   }
   const sortedDates = [...body.dates].sort();
+  const afterSchool = validateAfterSchool(body, rawBody, dogIdSet, dateSet);
 
   return {
     category: body.category,
@@ -759,5 +807,6 @@ function validateBookingBody(body: PostBookingBody): ValidatedBookingBody {
     location: body.location,
     notes: body.notes ?? null,
     payment: body.payment,
+    afterSchool,
   };
 }

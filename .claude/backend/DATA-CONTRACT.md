@@ -98,7 +98,9 @@ math). (3) **Agreement gate** (legal): `agreement_documents` +
 `agreement_signatures` (append-only); trigger blocks a booking until the owner
 has signed the current required waiver for the category. (4) **Refunds +
 cancellation window:** `refunds` table (partial allowed, append-only) +
-`bookings.cancelled_at/cancellation_reason/cancel_deadline_at/cancel_forfeited`.
+`bookings.cancelled_at/cancellation_reason/cancel_deadline_at/cancel_forfeited`
+(*Δ 6.0.0-lg5.2, P21: no cancel has a window, forfeits or moves money; nothing stamps
+`cancel_deadline_at`. §T*).
 (5) **Per-location capacity:** `bookings.location` + `day_capacity` re-keyed
 `(location, date)`. (6) **Pricing + idempotency:** effective-dated
 `service_rates` catalog; `idempotency_keys` for client-mutation dedupe (the
@@ -820,6 +822,9 @@ required }[] }`.
      Day-13's cancel route reads this same module; Day-13 may add a
      per-cohort override path (analogous to day_capacity overrides over
      the default rule).
+   *Superseded at 6.0.0-lg5.2 (P21; M5.08): no route stamps
+   `cancel_deadline_at`; `src/lib/cancelWindow.ts`, its constants and
+   `cancel_window_settings` are deleted. §T.*
 
 6. **`scheduled_at` composition for day programs lives in
    `src/lib/bookingSchedule.ts`** — the campus's `day.dropoff_open_time` on
@@ -978,7 +983,8 @@ discriminated union, and locks one composition decision.
 2. **`bookings` columns stamped at enrollment.** Per row:
    `category = 'group-class'`, `status = 'upcoming'`,
    `cohort_id = $cohort_id`, `lead_dog_id = $dog`, `location =
-cohort.location`, `cancel_deadline_at = scheduled_at − 48h`,
+cohort.location`, `cancel_deadline_at = scheduled_at − 48h` (*NULL since
+   6.0.0-lg5.2, P21: both enrolment sites stamp none; §T*),
    `notes = NULL`, `session_report_id = NULL`. The shared per-(cohort,
    dog) report does not exist at enrollment time; Day-19 staff "author
    report" verb creates the report row and back-links every weekly
@@ -2277,7 +2283,8 @@ bookings/:id/confirm [staff]` → stamps `confirmed_at` only when NULL
 :id/cancel [staff]` → returns `BookingWire`; runs the SAME cancel txn as
   the owner self-cancel (schema `cancelBooking` is owner-OR-staff
   authorized — one transaction, identical forfeit/refund branching,
-  cross-owner). `POST /staff/bookings/:id/attendance [staff]` → body
+  cross-owner; *since 6.0.0-lg5.2 that branching is gone: every cancel returns
+  the row's credits and moves no money, §T*). `POST /staff/bookings/:id/attendance [staff]` → body
   `{ dog_id, status: 'attended'|'no-show'|'excused' }`, sets
   `booking_dogs.attendance` + `checked_in_at` + `checked_in_by_staff_id`;
   **response `{ booking_id, dog_id, attendance, checked_in_at }`** (the §B
@@ -2579,6 +2586,14 @@ primaryVet?, otherVaccines? }`, each bool; omit when empty). Staff-set,
   `pickup_at` for day programs — parents arrive when they arrive, and the
   booking is active until the campus's `day.pickup_close_time`. Both times
   are per campus, in `GET /settings`.
+- Δ 2026-11-13 (wire 6.0.0-lg5.2, P21; §T): `cancel_forfeited` is `false` on
+  every cancel (`true` only on a row cancelled before P21 inside the old
+  48-hour window), and no route stamps `cancel_deadline_at`, so a new row omits
+  it and an older row's instant is read by nothing. Every `dog_shares[]` entry
+  carries `after_school` (her opt-in for that date), and a live share of an
+  `upcoming` day session that holds a live debit carries `return_expires_at`,
+  the date her credit would carry if it came back now. The wire's doc comments
+  are the contract.
 
 **PendingRequest** — `{ id, dog_id, additional_dog_ids?, category, submitted_at, preferred_dates:[iso], notes?:{per_dog?,joint?}, focus:{staff_preference?,descriptor_keys?}, length_weeks?, status, approved_at?, converted_booking_id? }`
 
@@ -2819,9 +2834,9 @@ invisible to the repository layer.
 
 - `GET /bookings?view=upcoming|past` — runtime-bucketed by session end-time
 - `GET /bookings/up-next` · `GET /bookings/:id` · `GET /dogs/:id/bookings?view=`
-- `POST /bookings` — book Day School/Care (multi-dog body; credit-debit txn). Credits only (wire 4.0.0): short is 422 `insufficient_credits`, and no booking moves money.
-- `POST /bookings/:id/cancel` — cancel + credit-back or money-back refund branching (Day 13); group-class returns 422 (cohort-withdraw is a separate verb)
-- `GET /staff/cancel-window` [staff] · `PATCH /staff/cancel-window/:category` [staff] — Day-13 admin-config surface: Shanthi tunes the per-category free-cancel hours from the staff portal. Affects future bookings only; existing rows keep their stamped `cancel_deadline_at`.
+- `POST /bookings` — book Day School/Care (multi-dog body; credit-debit txn). Credits only (wire 4.0.0): short is 422 `insufficient_credits`, and no booking moves money. Since 6.0.0-lg5.2 the body takes the after-school opt-in, `after_school` (dog → dates), counted per date against `day.after_school_capacity_count` (422 `after_school_full`); §T.
+- `POST /bookings/:id/cancel` — cancel; every credit the row debited comes back, nothing is forfeited and no money moves (6.0.0-lg5.2, P21; the Day-13 forfeit and money-back branches are gone, §T); group-class returns 422 (cohort-withdraw is a separate verb)
+- ~~`GET /staff/cancel-window` [staff] · `PATCH /staff/cancel-window/:category` [staff]~~ — **removed at 6.0.0-lg5.2** (P21, M5.08): both are 404, `cancel_window_settings` is dropped, and no route stamps `cancel_deadline_at`. The cancellation settings are the `cxl` settings domain, `GET|PATCH /staff/settings/cxl` (§T).
 
 **Pending requests**
 
@@ -2920,7 +2935,7 @@ invisible to the repository layer.
 - `GET /invoices` · `POST /invoices/:id/pay` [$] — **Day 15** for `POST /pay` (pay-later settlement; rides the order engine since 4.0.0-lg3.2, §P). `GET /invoices` deferred to Day-19 staff portal (no current FE consumer; `invoicesRepository.findOpenByOwner` is ready when needed).
 - `POST /invoices/:id/pay-in-person` — **Notifications Phase 4c (2026-07-27, R3)**: owner elects cash/check at drop-off. Charges nothing — flips `invoices.payment_expected` → 'in-person' + enqueues the `payment-due` reminder (~1h before the linked booking's drop-off, else the invoice's `due_at`; past → now) in one tx. Bodyless 204; repeat under a new key → 409. See §A Amendment 2026-07-27 (Phase 4c).
 - `POST /requests/:id/confirm-payment` — **Day 15** — B&T `approved-awaiting-payment` → `converted`. Server-authoritative pricing via `lib/boardTrainPricing.ts`. Pay-now (charges row + booking) or pay-later (open invoice + booking).
-- `GET /refunds` — refund history; refunds are created by the cancel txn (`POST /bookings/:id/cancel`), not a direct client endpoint. Past the `cancel_deadline_at` window the booking is `cancel_forfeited` (no refund); within it → credit `cancel-refund` (credit bookings) or a `refunds` row + Stripe refund (money bookings). **Day 14**: cancel route's money-back branch now fires `stripe.createRefund` post-commit (Day-13 stubbed the seam).
+- `GET /refunds` — refund history; refunds are created by the cancel txn (`POST /bookings/:id/cancel`), not a direct client endpoint. Past the `cancel_deadline_at` window the booking is `cancel_forfeited` (no refund); within it → credit `cancel-refund` (credit bookings) or a `refunds` row + Stripe refund (money bookings). **Day 14**: cancel route's money-back branch now fires `stripe.createRefund` post-commit (Day-13 stubbed the seam). *Δ 6.0.0-lg5.2 (P21; §T): superseded. No booking cancel forfeits, writes a `refunds` row or calls Stripe; every credit comes back as a `settlement-return` (§S). The one refund a cancel still causes is a pending row's whole-order cancel, where the engine refunds a top-up that won no seat (F4, §P).*
 - `POST /workers/tick` [public, signed] — **Day 16** — production scheduler trigger. Bearer secret (`SCHEDULER_WEBHOOK_SECRET`) compared constant-time; pg_cron + pg_net signs into this. Runs `runSchedulerTickOnce` (**13 phases, one result field each on `SchedulerTickResult`** — corrected 2026-08-25, D20-A3 §L5; this line said 7, frozen at §J 2026-07-14, and the Day-20 design said 9; P15 added the order sweeper): `scheduled_notifications` claim + dispatch / §J.1 membership roll / invoice-attempt verify / capture reconciler / order sweeper / duplicate-refund retry / invoice auto-charge / media-derivatives / credits-expiring scan / §J.3 alumni-attendance monthly scan / invoice-overdue scan / card-expiry scan / `idempotency_keys` TTL sweep. The tick's Railway completion log line carries every phase's counters as of the same date (it carried five, omitting both money phases — DISCREPANCIES NOTE-39). Worker runs under `system:scheduler` actor.
 
 > `scheduled_notifications` + `media_derivative_jobs` are server-internal
@@ -2950,20 +2965,41 @@ of all six — they differ only in how a row gets _created_.
 
 **Model 1 — Direct, credit/charge-debited.** Day School · Day Care.
 
-- `POST /bookings` `{ category, lead_dog_id, additional_dog_ids[], dates[], payment }`.
+- `POST /bookings` `{ category, lead_dog_id, additional_dog_ids?, dates[], location, notes?, payment, after_school? }`.
 - ONE txn: insert booking (+booking_dogs); per dog per mode insert
   `credit_ledger` debit (delta −1, reason `booking-debit`); assert post-balance
   ≥ 0. No charge, and no invoice (wire 4.0.0).
 - 8 AM–5 PM, `duration_minutes 540`; runtime end-time forced to 17:00.
-- Day School only: optional **After School Coaching opt-in** sub-phase (per-dog,
-  with a school-day count). Persisted as an `after_school_optins` row; the
-  **"only if in Day School" gate is enforced in the schema** (composite FK to a
-  `day-school` booking + `CHECK booking_category='day-school'`), not just the
-  flow — sent in the `POST /bookings` payload (or `POST /bookings/:id/after-school`).
-  Distinct from B&T's bundled After School Coaching (part of the B&T program, not
-  this opt-in).
-- Cancel `POST /bookings/:id/cancel` → status `cancelled` + `credit_ledger`
-  refund (delta +1) if it was credit-funded.
+- Day School only: the optional **after-school opt-in**, per dog per date
+  (6.0.0-lg5.2, P21; DAY-U43, DAY-U44). It is sent only in the `POST /bookings`
+  body, as `after_school`: a dog of the request → the dates of `dates` on which
+  she stays for the campus's after-school session. There is no
+  `POST /bookings/:id/after-school`; changing a tick after booking is not designed
+  (contract notes D11). Each
+  tick is stored as `booking_dogs.after_school` on that date's share (M5.04; the
+  `after_school_optins` table and its schema-enforced subtype FK are dropped), so
+  the "only in Day School" rule is the route's: a tick on a `day-care` request is
+  422 `invalid_payload`, as is a key that is not a dog of the request, a date not in
+  `dates`, or a date listed twice for one dog; a key that is not a UUID or a value
+  that is not a date is 400 (the strict parse; a capitalised dog id is that dog).
+  Each date's ticks are counted in dogs, the way its seats are (a share cancelled
+  alone, a cancelled session and a turned-away share free their place; a staff-owned
+  dog is exempt, as from the seats), under that
+  date's `(location, date)` lock right after its seat check, against the campus's
+  `day.after_school_capacity_count`; a date that cannot take them is 422
+  `after_school_full {kind, date, capacity, booked}`, and the whole order is refused
+  before any charge (a replay of a stored 201 returns that 201). The session runs
+  from the campus's `day.after_school_start_time` to `day.after_school_end_time`
+  (`GET /settings` `day.by_location`), and its price is
+  `day.after_school_price_cents` (`GET /settings` `day`, seeded 0), never charged in
+  v1: a client reads all three from the settings, never a constant ("30 minutes",
+  "no extra charge"). Read back as `BookingWire.dog_shares[].after_school` and
+  `CheckinBoardWire.after_school`. Distinct from B&T's bundled After School
+  Coaching (part of the B&T program, not this opt-in).
+- Cancel `POST /bookings/:id/cancel` → status `cancelled` + one
+  `settlement-return` (delta +1) per dog still on the session, to the lot her
+  live debit drew from, or a fresh lot when that lot can pay no later date (§S);
+  never money, never a forfeit (6.0.0-lg5.2, §T).
 
 **Model 2 — Enrollment, capacity-gated, real bookings.** Group Class.
 
@@ -3073,7 +3109,8 @@ portal** (locked scope, ARCHITECTURE.md "Minimum staff portal"). This is a
 _surface/scope_ deferral, **not a data gap**: the schema already supports every
 such query —
 
-- after-school counts → `after_school_optins` ⋈ active day-school `bookings`
+- after-school counts → `booking_dogs.after_school` on live shares of non-cancelled
+  day-school `bookings` (since 6.0.0-lg5.2, M5.04; `after_school_optins` is dropped)
 - days-most-booked-by-category → `bookings(scheduled_at, category)` group-by
 - cohort attendance / no-show → `bookings(cohort_id)` ⋈ `booking_dogs.attendance`
   - `cohorts(filled, capacity)`
@@ -3217,6 +3254,15 @@ ruling, not a pattern accident — a future audit should not re-flag it.
   pre-empt every gate.
 
 ## I. Refunds & cancellation window (locked 2026-05-19; staff-tunable 2026-05-26)
+
+> **Superseded at wire 6.0.0-lg5.2 (P21, 2026-11-13; §T).** The two bullets below are
+> the record of what was built in May. There is no cancellation window: M5.08 dropped
+> `cancel_window_settings`, `lib/cancelWindow.ts` and its fallback are deleted, the
+> `/staff/cancel-window` routes are 404, no route stamps `cancel_deadline_at`, and every
+> cancel writes `cancel_forfeited = false`. A cancel returns the credits the row
+> debited and moves no money: it writes no `refunds` row and calls no Stripe refund
+> (Allison's 2026-10-12 money ruling, `product/rebuild/SIGNOFF.md:252`). `refunds`
+> stays the money-back record for what still writes it (a pending order's F4, §P).
 
 - **Cancellation window.** The category-specific free-cancel _rule_ is API
   logic backed by the `cancel_window_settings` DB table (Day 13 §A
@@ -5701,7 +5747,8 @@ Wire is the contract; this records what the sections above no longer say. It sup
   cancel, owner or staff, is 409 `session_ended` once Chicago now reaches the campus's
   `day.pickup_close_time` on its date, and 409 `session_checked_in` while any dog still on
   it is past `expected`. `BookingWire.can_cancel` and `dog_shares[]` read the same fold and
-  clock. The 48-hour forfeit stays on the whole-session cancel until P21 (D21).
+  clock. The 48-hour forfeit stays on the whole-session cancel until P21 (D21). *(It ended
+  at 6.0.0-lg5.2: no cancel forfeits, §T.)*
 - **One dog of several** (s11). `POST /bookings/:id/dogs/:dogId/cancel` (owner, refused 409
   `per_dog_cancel_off` while `cxl.per_dog_cancel_enabled` is off) and
   `POST /staff/bookings/:id/dogs/:dogId/cancel {reason}` (any role): her share's
@@ -5713,4 +5760,118 @@ Wire is the contract; this records what the sections above no longer say. It sup
   written, and reads as `settlement-return` on `CreditLotDetailWire`.
 - **M5.07's tables are stored only.** `cancellation_policy_settings` (one row per service
   category) and `cancellation_global_settings`, audited, no settings route until P21; the
-  owner's one-dog cancel reads `per_dog_cancel_enabled`.
+  owner's one-dog cancel reads `per_dog_cancel_enabled`. *(P21 serves both as the `cxl`
+  settings domain, `GET|PATCH /staff/settings/cxl`, §T.)*
+
+## T. A cancel returns a credit; the after-school opt-in; the `cxl` settings (wire 6.0.0-lg5.2, 2026-11-13)
+
+Δ 2026-11-13 (P21 backend; DECISIONS 263-269; S31: DAY-U43, DAY-U44; S33: CXL-U02, CXL-U04,
+CXL-U05, STAFF-U45; CXL-U01 kept; NOTIF-U17; migrations M5.04, M5.08). Wire is the
+contract; this records what the code does now and what the sections above no longer say.
+It supersedes §I whole, item 5 of the 2026-05-22 Day-10 amendment (`cancelWindow.ts`), the
+group-class enrolment's `cancel_deadline_at = scheduled_at − 48h`, §C's
+`/staff/cancel-window` line and its cancel-branching lines, §C.1 Model 1's
+after-school bullet and `POST /bookings/:id/after-school` (which does not exist), §D.1's
+`after_school_optins`, and §S's "the 48-hour forfeit stays until P21". Where §K.2 keeps
+"Refund is on the way" over a cancel's hand-sent refund, and the 2026-06-09 withdraw
+amendment and §N compare the withdraw with the booking cancel's money-back branch, that
+branch no longer exists: no booking cancel mints a refund, so the sentence and the
+comparison describe deleted code (the withdraw itself is unchanged).
+
+- **No cancel has a window, forfeits, or moves money** (CXL-U04; Allison's 2026-10-12
+  money ruling, `product/rebuild/SIGNOFF.md:252`: "you get the credit back, but not
+  actual money"; design §2.7:4151-4154). The shared cancel (`POST /bookings/:id/cancel`
+  and `POST /staff/bookings/:id/cancel`, any staff role, `cancelBookingInTx`) and the
+  two one-dog cancels write `cancel_forfeited = false` on every cancel, a row whose
+  `cancel_deadline_at` was stamped before P21 included. An `upcoming` day session returns
+  one credit per dog still on it through the one return writer
+  (`creditLedgerRepository.refundForBooking`): a `settlement-return` naming her live
+  debit, into that debit's lot, or a fresh lot `cred.returned_credit_expiry_months` on
+  when the lot can pay no date after today (at key 0 it goes back into its own lot, live
+  or dead). A live share with no live debit is a 500 and one alarm naming the booking and
+  the dog. Any other cancellable row returns what it debited (nothing, for a row that
+  spent no credit). No booking cancel writes a `refunds` row or calls Stripe;
+  `chargesRepository.findSucceededForBooking` is deleted. A row a charge paid for keeps
+  the charge, with no `refunds` row and no alarm: the one producer is a board-and-train
+  booking made through `POST /staff/requests/:id/approve` then
+  `POST /requests/:id/confirm-payment` (pay now, or pay later and then
+  `POST /invoices/:id/pay`). Both routes are registered; board-and-train is seeded
+  `offered: false` at both campuses, and the design calls the request-convert producers
+  unreachable in v1 (§2.9, design.md:4546). Whether such a cancel should refuse or alarm
+  instead is an open design question, not built. A `payment-pending` row still cancels its
+  whole order, where the engine refunds a top-up that won no seat (F4, §P): unchanged. The
+  refusals are P20's, unchanged (404, 409 `conflict`, 409 `session_ended`, 409
+  `session_checked_in`), and the class cancel is still refused: a `group-class` booking is
+  422 `invalid_payload` ("cohort withdraw"), and a class is left through
+  `POST /enrollments/:cohortId/withdraw` and its settlement
+  (`lib/withdrawSettlement.ts`), untouched (CXL-U01, KEEP); the class-refusal and withdraw tests pass unchanged.
+- **Nothing stamps `cancel_deadline_at`** (D3). A day booking, both class-enrolment sites,
+  a request approval and a request's card confirm leave it NULL, so a new row omits it on
+  the wire; a row stamped earlier keeps an instant nothing reads. M5.08 deleted the seven
+  `cancel_window_settings` rows (each pre-image in `audit_log` under actor
+  `system:migrate-M5.08`) and dropped the table; `lib/cancelWindow.ts` (the 48-hour
+  constant and its fallback table), `cancelWindowSettingsRepository` and
+  `routes/staffCancelWindow.ts` are deleted. `GET /staff/cancel-window` and
+  `PATCH /staff/cancel-window/:category` are 404.
+- **The `cxl` settings domain** (CXL-U02; D4, D5, D7, D15). `GET /staff/settings/cxl`, any
+  staff role (an owner principal 403), answers `CancellationSettingsWire {policies,
+  global}`: `policies` is every `cancellation_policy_settings` row (seven, one per
+  `service_category`, ordered by the `category` text) and `global` the
+  `cancellation_global_settings` singleton, each with its audit pair; a NULL (boarding's
+  `window_state 'unset'` row) is served `null`, never defaulted. `PATCH /staff/settings/cxl`
+  (`Idempotency-Key` required) takes a global column by value and a per-service column as a
+  category → value map naming at least one known category; an unknown key or category, an
+  empty map, a value of the wrong type, an empty body or a `/:location` segment is 400.
+  Then, in order: a role that may not edit class `money` (a trainer) is 403 `forbidden`
+  `{kind: 'refused_keys'}`; any key but `per_dog_cancel_enabled` is 422 `setting_inert`
+  `{kind, inert_keys}` (every other `cxl` key is stored only); a value out of bounds is 422
+  `invalid_payload`. The owner or a manager setting `per_dog_cancel_enabled` gets 200 and
+  the whole domain back, and one audit row names the staffer; while it is off the owner's
+  one-dog cancel is 409 `per_dog_cancel_off`. Every `cxl` key is in the manifest (class
+  `money`; read `{tier: 'global', field: <column>}`, for a per-service key the column on
+  each `policies` row; editor `here`; the fractions' spec carries no `nullable`), and
+  `StaffCapabilitiesWire.edit_money_policy` covers the domain.
+- **Every cancel notice says what came back, and never money** (NOTIF-U17, D13; design
+  §2.9:4546). Every `booking-cancelled` body is `cancellationBody`'s. Who: "You cancelled
+  {names}'s {program}, {Wed 21 Oct}." (the owner, whole session or one dog); "The school
+  cancelled {names}'s {program} on {Wed 21 Oct}: "{reason}"." (staff, the reason quoted
+  verbatim; without the quote when a whole-session staff cancel sends none). Then one line
+  per landing: "+1 credit, back to your Bentonville day-school credits (expires 10 Nov)."
+  (credits that land alike are summed: "+2 credits"); into a dead lot, "1 credit came
+  back, but its date, 19 Oct, has passed. Message us if you'd like it extended."; no line
+  for a cancel that returned nothing. "Refund is on the way" and "The cancellation window
+  has passed — no refund" are gone. An order's rows cancelled after it settled
+  (`settled_then_cancelled`) each read their own returns' lines, written after them. The
+  failed-payment notice says only what came back: "Your $60.00 payment didn't go
+  through, so you weren't charged and your booking is cancelled." or "Your booking and its
+  $60.00 payment were cancelled, so you weren't charged.", then the credit lines, or
+  nothing ("Any credits it used are back in your account" is gone). Feed rows until P31.
+- **The after-school opt-in** (DAY-U43, DAY-U44; D9-D12; M5.04): `POST /bookings`'
+  `after_school`, stored as `booking_dogs.after_school`, counted per date in dogs against
+  `day.after_school_capacity_count` under the date's capacity lock (422
+  `after_school_full {kind, date, capacity, booked}`, the first full date in date order,
+  before any charge), with D11's 422 `invalid_payload` and 400 refusals, as §C.1 Model 1
+  now says. Read back on every share as `BookingWire.dog_shares[].after_school` (a share
+  cancelled alone included) and on the board as `CheckinBoardWire.after_school`; the
+  board's 17:30 late-pickup flag is unchanged for her. `after_school_optins` and
+  `bookings_id_category_uidx` are dropped. Never charged in v1.
+- **The cancel sheet's date** (D1, CXL-U05's server half). `dog_shares[].return_expires_at`
+  is on each live share of an `upcoming` day session that holds a live debit: the date the
+  credit would carry if it came back now, on `can_cancel`'s clock, computed from her live
+  debit (the newest no return names, so a re-check-in's re-debit, never the first)
+  through `planReturns`, the rule the return writer writes by. Absent on a share cancelled
+  alone, a cancelled or `payment-pending` session, and a share with no live debit.
+- **The profile's *Bookings*** (D8, s17). `GET /staff/owners/:ownerId/bookings?from=YYYY-MM-DD`
+  (registered as `/staff/owners/:id/bookings`, the same URL), any staff role: an owner
+  principal 403, a malformed id 400, an id naming no owner 404, then `from` absent,
+  malformed, not a real date, or any other query key 400 (strict). The id is lowercased
+  at the parse. It answers `BookingWire[]`: the family's day-school and day-care sessions
+  on Chicago dates ≥ `from`, not cancelled, `payment-pending` included, soonest first
+  (then by id), each a staff read (`can_cancel` and `dog_shares[].can_cancel` are the
+  staff cancels', the owner's one-dog switch ignored). No `Idempotency-Key`: a read.
+- **A missing seeded settings row is a 500** (STAFF-U45). Every settings read
+  (`settingsRepository`'s seeded rows, `payment_settings`, and `GET /settings`' campus rows
+  and `max_sessions_per_booking_count`) throws a plain error naming the row and the step
+  that seeds it, so the request is 500 `internal` and the error log names the row; it was
+  404 `not_found`. No reader falls back to a number in code. A `PATCH /staff/settings/...`
+  whose UPDATE finds no row is still 404 `not_found`.

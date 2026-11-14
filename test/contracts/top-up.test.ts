@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, afterEach, test } from 'node:test';
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import pg from 'pg';
 import { db } from '../../src/db/client.js';
 import {
@@ -584,10 +584,27 @@ test(
 
 const PAST_THE_LEASE = new Date(FIXTURE_TODAY.getTime() + 60 * 60 * 1000);
 
-const gone = (amount: string) => ({
-  declined: `Your ${amount} payment didn't go through, so you weren't charged and your booking is cancelled. Any credits it used are back in your account.`,
-  cancelled: `Your booking and its ${amount} payment were cancelled, so you weren't charged. Any credits it used are back in your account.`,
+/**
+ * P21 (`brief_must_say` 3; P18 185(b)): the notice says only what came back, as §2.9's
+ * credit line for each landing, never "Any credits it used are back in your account",
+ * which was false for a credit returned into a dead lot and for a `past` row's.
+ */
+const gone = (amount: string, credits = '') => ({
+  declined: `Your ${amount} payment didn't go through, so you weren't charged and your booking is cancelled.${credits}`,
+  cancelled: `Your booking and its ${amount} payment were cancelled, so you weren't charged.${credits}`,
 });
+
+/** §2.9's day and month, in Chicago, as every credit line prints a date. */
+const shown = (at: Date | string) =>
+  new Date(at).toLocaleDateString('en-GB', {
+    timeZone: 'America/Chicago',
+    day: 'numeric',
+    month: 'short',
+  });
+
+/** The credit line for `n` credits back into `dogWithCredits`' lot. */
+const back = (n: number) =>
+  ` +${n} ${n === 1 ? 'credit' : 'credits'}, back to your Bentonville day-school credits (expires ${shown(FIXTURE_LOT_EXPIRES_AT)}).`;
 
 /** What she is told: every failed-payment push queued to her, whichever trigger wrote it. */
 const failurePushes = () =>
@@ -666,7 +683,7 @@ test(
       {
         trigger: 'charge-failed',
         title: 'Booking cancelled',
-        body: gone('$60.00').declined,
+        body: gone('$60.00', back(7)).declined,
       },
     ]);
   },
@@ -689,13 +706,13 @@ test(
     await assertRowsDown(dogId, 2);
     assert.equal(await poolBalance(), 1);
     assert.deepEqual(await failurePushes(), [
-      { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$60.00').declined },
+      { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$60.00', back(1)).declined },
     ]);
   },
 );
 
 test(
-  'Opus M2, a top-up that used no credits: no debit to return, and "any credits it used" stays true',
+  'Opus M2, a top-up that used no credits: no debit to return, and the notice names no credit (P21)',
   SKIP_WHEN_NO_DB,
   async () => {
     const { stripe, dogId, intentId } = await processingTopUp({
@@ -712,6 +729,75 @@ test(
     assert.equal(await poolBalance(), 0);
     assert.deepEqual(await failurePushes(), [
       { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$120.00').declined },
+    ]);
+  },
+);
+
+test(
+  'P21 (brief_must_say 3): at cred.returned_credit_expiry_months 0, the paying lot dead at the failure → the notice carries §2.9\'s dead-lot line, never "back in your account"',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe, dogId, intentId } = await processingTopUp({
+      credits: 1,
+      days: 2,
+      total: 6_000,
+    });
+    // The lot that paid the first day dies before the failure is reached: its date moved
+    // by SQL to an hour ago (a hand edit's effect), so the return lands in a dead lot.
+    const died = new Date(Date.now() - 60 * 60 * 1000);
+    await db.execute(sql`
+      UPDATE credit_ledger SET expires_at = ${died.toISOString()}
+       WHERE owner_id = ${FIXTURE_IDS.ownerId} AND reason = 'purchase' AND note LIKE 'pool-fixture%'`);
+    await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 0`);
+    try {
+      stripe.setIntentState(intentId, 'canceled');
+      const hook = await deliverEvent(app, stripe, 'payment_intent.canceled', intentId);
+      assert.equal(hook.statusCode, 200, hook.body);
+      await assertRowsDown(dogId, 2);
+      assert.deepEqual(await failurePushes(), [
+        {
+          trigger: 'charge-failed',
+          title: 'Booking cancelled',
+          body: gone(
+            '$60.00',
+            ` 1 credit came back, but its date, ${shown(died)}, has passed. Message us if you'd like it extended.`,
+          ).declined,
+        },
+      ]);
+    } finally {
+      await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 1`);
+    }
+  },
+);
+
+test(
+  'P21 (brief_must_say 3): a `past` row keeps its debit, so the notice names no credit for it (the row planted by SQL: no src writer of `past` exists, 185(b))',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, stripe, dogId, intentId } = await processingTopUp({
+      credits: 1,
+      days: 2,
+      total: 6_000,
+    });
+    const [paid] = await debitsOf(dogId);
+    assert.ok(paid, 'the credit paid one day');
+    const [debit] = await db
+      .select({ bookingId: creditLedger.bookingId })
+      .from(creditLedger)
+      .where(eq(creditLedger.id, paid.id));
+    await db.update(bookings).set({ status: 'past' }).where(eq(bookings.id, debit!.bookingId!));
+
+    stripe.setIntentState(intentId, 'canceled');
+    const hook = await deliverEvent(app, stripe, 'payment_intent.canceled', intentId);
+    assert.equal(hook.statusCode, 200, hook.body);
+    assert.deepEqual(
+      (await rowsOf(dogId)).map((r) => r.status).sort(),
+      ['cancelled', 'past'],
+      'the past row stands, with its debit',
+    );
+    assert.equal(await poolBalance(), 0, 'nothing came back');
+    assert.deepEqual(await failurePushes(), [
+      { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$60.00').declined },
     ]);
   },
 );
@@ -734,7 +820,7 @@ test(
     await assertRowsDown(dogId, 2);
     assert.equal(await poolBalance(), 1);
     assert.deepEqual(await failurePushes(), [
-      { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$60.00').declined },
+      { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$60.00', back(1)).declined },
     ]);
   },
 );
@@ -762,7 +848,7 @@ test(
     assert.equal(res.statusCode, 402, res.body);
     await assertRowsDown(dogId, 2);
     assert.deepEqual(await failurePushes(), [
-      { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$60.00').declined },
+      { trigger: 'charge-failed', title: 'Booking cancelled', body: gone('$60.00', back(1)).declined },
     ]);
   },
 );
@@ -791,7 +877,7 @@ test(
     await assertRowsDown(dogId, 2);
     assert.equal(await poolBalance(), 1);
     assert.deepEqual(await failurePushes(), [
-      { trigger: 'order-cancelled', title: 'Booking cancelled', body: gone('$60.00').cancelled },
+      { trigger: 'order-cancelled', title: 'Booking cancelled', body: gone('$60.00', back(1)).cancelled },
     ]);
   },
 );
@@ -819,7 +905,7 @@ test(
     await assertRowsDown(dogId, 2);
     assert.equal(await poolBalance(), 1);
     assert.deepEqual(await failurePushes(), [
-      { trigger: 'order-cancelled', title: 'Booking cancelled', body: gone('$60.00').cancelled },
+      { trigger: 'order-cancelled', title: 'Booking cancelled', body: gone('$60.00', back(1)).cancelled },
     ]);
   },
 );
@@ -861,10 +947,13 @@ test(
       2,
       'both days came back as credits, the bought lot with them',
     );
-    // An ordinary cancel of each row: one notice a row, by the row's own link.
+    // An ordinary cancel of each row: one notice a row, by the row's own link, naming the
+    // credit that row got back, read from where it landed (P21 plan_added [0]: never
+    // "Refund is on the way" for a credit return).
+    const [dog] = await db.select({ name: dogs.name }).from(dogs).where(eq(dogs.id, dogId));
     for (const row of await rowsOf(dogId)) {
       const notices = await db
-        .select({ id: notifications.id })
+        .select({ body: notifications.body })
         .from(notifications)
         .where(
           and(
@@ -873,6 +962,21 @@ test(
           ),
         );
       assert.equal(notices.length, 1, 'one ordinary notice per row');
+      const { rows: landed } = await db.execute(sql`
+        SELECT lot.expires_at AS "expiresAt"
+          FROM credit_ledger r JOIN credit_ledger lot ON lot.id = COALESCE(r.lot_id, r.id)
+         WHERE r.booking_id = ${row.id} AND r.reason = 'settlement-return'`);
+      assert.equal(landed.length, 1, 'one credit back for this row');
+      const day = new Date(row.scheduledAt).toLocaleDateString('en-GB', {
+        timeZone: 'America/Chicago',
+        weekday: 'short',
+        day: 'numeric',
+        month: 'short',
+      });
+      assert.equal(
+        notices[0]?.body,
+        `The school cancelled ${dog!.name}'s day school on ${day}. +1 credit, back to your Bentonville day-school credits (expires ${shown((landed[0] as { expiresAt: string }).expiresAt)}).`,
+      );
     }
   },
 );
@@ -1007,8 +1111,18 @@ test(
   },
 );
 
+/**
+ * P21 fix 1, B-F2 (Opus r1 L6 = Fable r1 L2): a pending order cancelled while Stripe says
+ * processing gets back the credit it used, and this notice is all she hears of it (the
+ * failure arms write no `booking-cancelled` row), so it carries §2.9's credit line for each
+ * landing after its sentence, the dead-lot line included, as `order-cancelled` and
+ * `charge-failed` do (`brief_must_say` 3). The sentence itself is unchanged.
+ */
+const WHILE_PROCESSING =
+  'Cancelled. If your bank still takes the $60.00, we refund it automatically.';
+
 test(
-  'a staff cancel of a processing top-up Stripe refuses: the rows go, and she hears the honest words',
+  'a staff cancel of a processing top-up Stripe refuses: the rows go, and she hears the honest words, with the credit that came back',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, stripe } = buildApp();
@@ -1028,21 +1142,78 @@ test(
     });
 
     assert.equal(cancelled.statusCode, 200, cancelled.body);
-    const pushes = await db
-      .select({ title: scheduledNotifications.title, body: scheduledNotifications.body })
-      .from(scheduledNotifications)
-      .where(
-        and(
-          eq(scheduledNotifications.ownerId, FIXTURE_IDS.ownerId),
-          eq(scheduledNotifications.type, 'payment-failed'),
-        ),
-      );
-    assert.deepEqual(pushes, [
+    await assertRowsDown(dogId, 2);
+    assert.equal(await poolBalance(), 1, 'the credit it used came back');
+    assert.deepEqual(await failurePushes(), [
       {
+        trigger: 'cancel-while-processing',
         title: 'Booking cancelled',
-        body: 'Cancelled. If your bank still takes the $60.00, we refund it automatically.',
+        body: `${WHILE_PROCESSING}${back(1)}`,
       },
     ]);
+  },
+);
+
+test(
+  'her own cancel of a pending day while Stripe says processing: the whole order goes, and the notice names the credit that came back',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, dogId } = await processingTopUp({ credits: 1, days: 2, total: 6_000 });
+    const [first] = await rowsOf(dogId);
+    assert.ok(first);
+
+    const cancelled = await app.inject({
+      method: 'POST',
+      url: `/bookings/${first.id}/cancel`,
+      headers: { 'idempotency-key': `top-up-own-processing-${randomUUID()}` },
+    });
+
+    assert.equal(cancelled.statusCode, 200, cancelled.body);
+    await assertRowsDown(dogId, 2);
+    assert.equal(await poolBalance(), 1, 'the credit it used came back');
+    assert.deepEqual(await failurePushes(), [
+      {
+        trigger: 'cancel-while-processing',
+        title: 'Booking cancelled',
+        body: `${WHILE_PROCESSING}${back(1)}`,
+      },
+    ]);
+  },
+);
+
+test(
+  "the desk's cancel while processing at cred.returned_credit_expiry_months 0, the paying lot dead at the cancel → §2.9's dead-lot line, never '+1'",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { stripe, dogId, orderId } = await processingTopUp({ credits: 1, days: 2, total: 6_000 });
+    const { app: staffApp, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+    registerStaffOrdersRoute(staffApp, { authenticate, stripe, now: FIXTURE_NOW });
+    // The lot that paid the first day dies before the cancel: its date moved by SQL to an
+    // hour ago (a hand edit's effect), so at key 0 the return lands in a dead lot.
+    const died = new Date(Date.now() - 60 * 60 * 1000);
+    await db.execute(sql`
+      UPDATE credit_ledger SET expires_at = ${died.toISOString()}
+       WHERE owner_id = ${FIXTURE_IDS.ownerId} AND reason = 'purchase' AND note LIKE 'pool-fixture%'`);
+    await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 0`);
+    try {
+      const cancelled = await staffApp.inject({
+        method: 'POST',
+        url: `/staff/orders/${orderId}/cancel`,
+        headers: { 'idempotency-key': `top-up-processing-dead-${randomUUID()}` },
+      });
+      assert.equal(cancelled.statusCode, 200, cancelled.body);
+      await assertRowsDown(dogId, 2);
+      assert.equal(await poolBalance(), 0, 'it came back dead');
+      assert.deepEqual(await failurePushes(), [
+        {
+          trigger: 'cancel-while-processing',
+          title: 'Booking cancelled',
+          body: `${WHILE_PROCESSING} 1 credit came back, but its date, ${shown(died)}, has passed. Message us if you'd like it extended.`,
+        },
+      ]);
+    } finally {
+      await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 1`);
+    }
   },
 );
 

@@ -12,6 +12,85 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [6.0.0-lg5.2] — 2026-11-13
+
+BREAKING. LG5's second of three steps toward 6.0.0 (plan unit P21, slices S31 and
+S33; ledger DAY-U43, CXL-U02, CXL-U04 and one field for CXL-U05's cancel sheet, with
+no wire of their own DAY-U44, CXL-U01, STAFF-U45, NOTIF-U17; migrations M5.04,
+M5.08; design §1.1 6.0.0, `designs/fetchd-v1-technical-design.md:1050-1061`,
+`:1064-1067`, `:1076-1078`, `:1083-1085`; §2.3 `:2448-2455`, `:2558-2564`,
+`:2741-2749`; §2.7 `:4115-4162`, `:4412-4414`; §3.8 `:5849-5871`). 6.0.0-lg5.2 lands
+for clients when P21 is gate-green and pushed on `v1/build`. Contract-first: the
+routes keep today's behaviour until P21's backend lands them. Resync both clients
+(`npm run sync:contracts` in mobile and portal). Against the resynced copy (a
+scratch run at the landed P20 trees, not their gates) the backend fails 13 times in
+6 files, the portal 4 times in 3 files, and mobile once, in its money fake.
+
+Breaking:
+
+- `GET /staff/cancel-window`, `PATCH /staff/cancel-window/:category`,
+  `CancelWindowSettingWire` and `PatchStaffCancelWindowRequest` removed (CXL-U02):
+  M5.08 drops `cancel_window_settings`. The cancellation policy is the `cxl`
+  settings domain below.
+
+Added:
+
+- `'cxl'`, the fifteenth `SettingsDomain`, appended to `SETTINGS_DOMAINS` (CXL-U02),
+  over M5.07's two tables: `GET/PATCH /staff/settings/cxl` →
+  `CancellationSettingsWire {policies: CancellationPolicyWire[], global:
+  CancellationGlobalPolicyWire}`. `CancellationPolicyWire {category, window_state,
+  window_hours, forfeit_fraction, no_show_forfeit_fraction, flat_fee_cents,
+  unpaid_no_show_close_after_hours, no_show_declare_mode, updated_at,
+  updated_by_staff_id}`, one row per `ServiceCategory`, seven;
+  `CancellationGlobalPolicyWire {per_dog_cancel_enabled,
+  staff_entered_client_cancel_follows_owner_rules_enabled,
+  staff_initiated_cancel_full_return_enabled, class_missed_meeting_money_return_mode,
+  started_run_cancel_return_mode, updated_at, updated_by_staff_id}`; `null` = NOT
+  SEEDED. The stored-only editor: every key is 422 `setting_inert` but
+  `per_dog_cancel_enabled`. The body is `PatchStaffSettingsCxlRequest` (a global
+  column takes its value, a per-service column a category → value map), with
+  `CancellationPolicyColumn`, `CancellationWindowState` and
+  `CancellationNoShowDeclareMode`. A client keyed by every domain must cover `cxl`.
+- `GET /staff/owners/:ownerId/bookings?from=` (`GetStaffOwnersBookingsQuery`) →
+  `GetStaffOwnersBookingsResponse = BookingWire[]`, any role: the family's day
+  sessions dated `from` or later and not cancelled, each a staff read, so a staff
+  cancel reaches any future date (CXL-U04, s17).
+- `PostBookingsRequest.after_school?: Record<dog_id, YYYY-MM-DD[]>`, the after-school
+  opt-in per dog per day-school date (DAY-U43, question 47), and the tick on
+  `BookingWire.dog_shares[].after_school` and `CheckinBoardWire.after_school`.
+- `ApiErrorCode` gains the 49th, `'after_school_full'`, 422, appended, with
+  `AfterSchoolFullDetails {date, capacity, booked}`, appended to
+  `ApiErrorDetailWire` and to `PostBookingsErrorDetails`, and to
+  `POST_BOOKINGS_ERROR_DETAIL_KINDS` before `'payment_failed'` (the tuple follows
+  execution order). The order is refused whole.
+- `BookingWire.dog_shares[].return_expires_at?`: the expiry a credit coming back
+  now would carry (its lot's, a fresh lot's, or a lot dead before tomorrow), so the
+  cancel sheet names it before Confirm (CXL-U05).
+
+Changed (live, no shape change):
+
+- No cancel forfeits (CXL-U04): a whole-session cancel of an `'upcoming'` day-school
+  or day-care session, owner or any staff role, returns one credit per dog still on
+  it and moves no money. `BookingWire.cancel_forfeited` is `false` on every cancel
+  from this version, and no route stamps `cancel_deadline_at` (question 54).
+- A staff cancel's notice to the owner, of a session or of one dog, quotes the
+  staff `reason` verbatim (NOTIF-U17).
+- `CreditLotDetailWire.booked_ahead` counts only live debits: a dog cancelled alone,
+  turned away, sent home or marked *Didn't come* on a day still `'upcoming'` no longer
+  counts as booked on the lot its credit came back to (the same rule the return writer
+  and `return_expires_at` read).
+
+### Documentation
+
+- `BookingWire.cancel_deadline_at` and `cancel_forfeited` say what they mean now;
+  `PostBookingsRequest`'s session-time sentence no longer names a cancel deadline.
+- `StaffCapabilitiesWire.edit_money_policy` no longer names the removed verb.
+- `CheckinBoardWire.after_school`: the courtesy-call flag still fires at
+  `day.late_pickup_call_time` for an after-school dog (question 89's default).
+- `SettingReadWire` says where a `cxl` key's value is read; the settings header,
+  `SettingsDomain` and the §16 note count fifteen domains.
+- The landing-group note names 6.0.0-lg5.2.
+
 ## [6.0.0-lg5.1] — 2026-11-11
 
 BREAKING. LG5's first of three steps toward 6.0.0 (plan unit P20, slices S29 then

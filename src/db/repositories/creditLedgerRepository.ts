@@ -1,7 +1,8 @@
-import { and, eq, gt, isNull, sql } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql, type SQL } from 'drizzle-orm';
 import type { CreditTier } from '../../contracts/wire.js';
 import { bucketChicagoToday } from '../../lib/chicagoDate.js';
 import { addChicagoMonths } from '../../lib/creditExpiry.js';
+import { pgTimestampToDate } from '../../lib/pgTimestamp.js';
 import { db } from '../client.js';
 import {
   creditLedger,
@@ -127,6 +128,18 @@ export async function findPayableLots(
   return lots.map((lot) => ({ ...lot, paysDates: pays.get(lot.id) ?? [] }));
 }
 
+/**
+ * THE live debit, as SQL on a ledger row aliased `d`: a `booking-debit` no
+ * `settlement-return` names yet (design §2.3:2486-2488), so its credit has not come back.
+ * The one rule: the return writer reads the debit it reverses by it, the wire's
+ * `dog_shares[].return_expires_at` reads it (both through {@link liveDebitsWhere}), and
+ * a lot's `booked_dates` counts only the debits it holds ({@link findLotDetails}).
+ */
+const LIVE_DEBIT_SQL = sql`(d.reason = 'booking-debit'
+  AND NOT EXISTS (
+    SELECT 1 FROM credit_ledger r
+     WHERE r.reverses_entry_id = d.id AND r.reason = 'settlement-return'))`;
+
 export const creditLedgerRepository = {
   /**
    * INSERT one `booking-debit` for the dog served, from the lot the picker chose. M4.10's
@@ -187,36 +200,23 @@ export const creditLedgerRepository = {
     args: { bookingId: string; dogId?: string },
   ): Promise<BookingDebitForRefund[]> {
     const dogClause = args.dogId !== undefined ? sql`AND d.dog_id = ${args.dogId}` : sql``;
-    const result = await tx.execute(sql`
-      SELECT d.id, d.booking_id, d.owner_id, d.dog_id, d.mode, d.location, d.tier, d.lot_id
-        FROM credit_ledger d
-       WHERE d.booking_id = ${args.bookingId} AND d.reason = 'booking-debit' ${dogClause}
-         AND NOT EXISTS (
-           SELECT 1 FROM credit_ledger r
-            WHERE r.reverses_entry_id = d.id AND r.reason = 'settlement-return')
-       ORDER BY d.created_at DESC, d.id DESC
-    `);
-    return (
-      result.rows as {
-        id: string;
-        booking_id: string;
-        owner_id: string;
-        dog_id: string | null;
-        mode: BookingMode;
-        location: LocationKey;
-        tier: CreditTier;
-        lot_id: string;
-      }[]
-    ).map((r) => ({
-      id: r.id,
-      bookingId: r.booking_id,
-      ownerId: r.owner_id,
-      dogId: r.dog_id,
-      mode: r.mode,
-      location: r.location,
-      tier: r.tier,
-      lotId: r.lot_id,
-    }));
+    return liveDebitsWhere(tx, sql`d.booking_id = ${args.bookingId} ${dogClause}`);
+  },
+
+  /**
+   * {@link findLiveDebits} for a batch of bookings in one read, newest first within each
+   * share: what a list read names `dog_shares[].return_expires_at` from (D1), so a staff
+   * list of every owner's sessions costs one query, not one per share.
+   */
+  async findLiveDebitsOfBookings(
+    runner: Tx | typeof db,
+    bookingIds: readonly string[],
+  ): Promise<BookingDebitForRefund[]> {
+    if (bookingIds.length === 0) return [];
+    return liveDebitsWhere(
+      runner,
+      sql`d.booking_id IN (SELECT unnest(string_to_array(${bookingIds.join(',')}, ',')::uuid[]))`,
+    );
   },
 
   /**
@@ -239,8 +239,12 @@ export const creditLedgerRepository = {
     tx: Tx,
     args: BookingDebitForRefund & { now: Date; checkinEventId: string | null },
   ): Promise<{ id: string }> {
-    const { returned_credit_expiry_months: months } = await settingsRepository.credit(tx);
-    const back = months === 0 || (await lotPaysAfterToday(tx, args.lotId, args.now));
+    // Where it lands is {@link planReturns}', the one rule the cancel sheet reads too.
+    const plan = (await planReturns(tx, [args.lotId], args.now)).get(args.lotId);
+    if (plan === undefined) {
+      throw new Error(`debit ${args.id} names lot ${args.lotId}, which has no row`);
+    }
+    const back = plan.intoLot;
     const [row] = await tx
       .insert(creditLedger)
       .values({
@@ -253,7 +257,7 @@ export const creditLedgerRepository = {
         reason: 'settlement-return',
         bookingId: args.bookingId,
         lotId: back ? args.lotId : null,
-        expiresAt: back ? null : addChicagoMonths(args.now, months).toISOString(),
+        expiresAt: back ? null : plan.expiresAt.toISOString(),
         reversesEntryId: args.id,
         checkinEventId: args.checkinEventId,
       })
@@ -470,7 +474,10 @@ export interface LotDetailRow extends CreditPool {
  * Every lot of one owner, newest first, spent and expired included, narrowed to one pool or
  * one lot when the write asks. `remaining` is the grant plus every allocation, whether or
  * not the lot is live, and `live` is `lot_is_live`, at read. `booked_dates` is one Chicago
- * date per debit on a row still to come, so a cancelled day is not in it.
+ * date per LIVE debit ({@link LIVE_DEBIT_SQL}) on a row still to come: a debit whose credit
+ * came back is not a day the lot pays, so a cancelled day is not in it, nor a dog cancelled
+ * alone, nor a turn-away, *Didn't come*, unfinished send-home or re-issued check-out on a
+ * session that still reads `upcoming` (no board verb writes the row's status).
  */
 export async function findLotDetails(
   runner: Tx | typeof db,
@@ -507,7 +514,7 @@ export async function findLotDetails(
               FROM credit_ledger d
               JOIN bookings b ON b.id = d.booking_id
              WHERE d.lot_id = lot.id
-               AND d.reason = 'booking-debit'
+               AND ${LIVE_DEBIT_SQL}
                AND b.status IN ('upcoming', 'payment-pending')
                AND (b.scheduled_at AT TIME ZONE 'America/Chicago')::date >= ${today}::date
           ) day
@@ -531,16 +538,93 @@ export interface GrantedLot extends CreditPool {
 }
 
 /**
- * Can this lot still pay a date after today? `now` is the caller's cancel instant, on
- * Chicago's calendar; `lot_pays_date` is the one predicate that answers.
+ * Where a return of a credit drawn from one of these lots would land at `now` (CRED-U16;
+ * design §2.4:2955-2973; contract notes D1): back into that lot, keeping its date, while it
+ * can still pay a date after today, which is while it expires after the next Chicago
+ * midnight; always at `cred.returned_credit_expiry_months` 0; and always with
+ * `cred.expiry_enforced_enabled` off, when no lot's date binds. Otherwise as a fresh lot
+ * dated `now` plus that key. The one rule: the return writer
+ * (`creditLedgerRepository.refundForBooking`) writes by it under the pool lock, and the
+ * cancel sheet's `dog_shares[].return_expires_at` reads by it on `can_cancel`'s clock, so
+ * the date she is shown is the date the credit takes (the write reads the lot again).
+ *
+ * Not `lot_pays_date`: that is the booking's rule, and with
+ * `cred.booking_outlives_lot_expiry_enabled` on it lets a lot still alive now pay any
+ * later date, because a booked day keeps its credit when the lot dies. A returned credit is
+ * unbooked, so a lot dying tonight would take it with it (P21 fix 1, Opus r1 M1): the
+ * switch plays no part here.
  */
-async function lotPaysAfterToday(tx: Tx, lotId: string, now: Date): Promise<boolean> {
-  const result = await tx.execute(sql`
-    SELECT lot_pays_date(lot.expires_at, (${bucketChicagoToday(now)}::date + 1)) AS pays
+export interface ReturnPlan {
+  /** Back into the lot it drew from (else a fresh one-credit lot). */
+  intoLot: boolean;
+  /** The date the returned credit carries: the lot's, or the fresh lot's. */
+  expiresAt: Date;
+}
+
+export async function planReturns(
+  runner: Tx | typeof db,
+  lotIds: readonly string[],
+  now: Date,
+): Promise<Map<string, ReturnPlan>> {
+  if (lotIds.length === 0) return new Map();
+  const { returned_credit_expiry_months: months, expiry_enforced_enabled: enforced } =
+    await settingsRepository.credit(runner);
+  const result = await runner.execute(sql`
+    SELECT lot.id, lot.expires_at AS "expiresAt",
+           lot.expires_at > ((${bucketChicagoToday(now)}::date + 1)::timestamp
+                             AT TIME ZONE 'America/Chicago') AS "paysAfterToday"
       FROM credit_ledger lot
-     WHERE lot.id = ${lotId}
+     WHERE lot.id IN (SELECT unnest(string_to_array(${lotIds.join(',')}, ',')::uuid[]))
   `);
-  return (result.rows[0] as { pays: boolean | null } | undefined)?.pays === true;
+  const plans = new Map<string, ReturnPlan>();
+  for (const row of result.rows as {
+    id: string;
+    expiresAt: string | null;
+    paysAfterToday: boolean | null;
+  }[]) {
+    if (row.expiresAt === null) throw new Error(`lot ${row.id} has no date for a return to keep`);
+    const intoLot = months === 0 || !enforced || row.paysAfterToday === true;
+    plans.set(row.id, {
+      intoLot,
+      expiresAt: intoLot ? pgTimestampToDate(row.expiresAt) : addChicagoMonths(now, months),
+    });
+  }
+  return plans;
+}
+
+/** Every live `booking-debit` ({@link LIVE_DEBIT_SQL}) matching `where` (alias `d`), newest
+ *  first. */
+async function liveDebitsWhere(
+  runner: Tx | typeof db,
+  where: SQL,
+): Promise<BookingDebitForRefund[]> {
+  const result = await runner.execute(sql`
+    SELECT d.id, d.booking_id, d.owner_id, d.dog_id, d.mode, d.location, d.tier, d.lot_id
+      FROM credit_ledger d
+     WHERE ${where} AND ${LIVE_DEBIT_SQL}
+     ORDER BY d.created_at DESC, d.id DESC
+  `);
+  return (
+    result.rows as {
+      id: string;
+      booking_id: string;
+      owner_id: string;
+      dog_id: string | null;
+      mode: BookingMode;
+      location: LocationKey;
+      tier: CreditTier;
+      lot_id: string;
+    }[]
+  ).map((r) => ({
+    id: r.id,
+    bookingId: r.booking_id,
+    ownerId: r.owner_id,
+    dogId: r.dog_id,
+    mode: r.mode,
+    location: r.location,
+    tier: r.tier,
+    lotId: r.lot_id,
+  }));
 }
 
 /** The ledger row one check-in event's transaction wrote for its share. */

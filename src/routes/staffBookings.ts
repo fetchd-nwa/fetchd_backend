@@ -37,8 +37,9 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *   POST /staff/bookings/:id/dogs/:dogId/cancel — one dog of several (s11, 6.0.0-lg5.1)
  *
  * Cancel reuses `lib/cancelBookingService.cancelBookingInTx` — the SAME
- * forfeit/refund transaction the owner self-cancel runs (schema.sql
- * `cancelBooking` contract: owner-OR-staff authorized, one transaction).
+ * transaction the owner self-cancel runs (schema.sql `cancelBooking` contract:
+ * owner-OR-staff authorized, one transaction): the row's credits come back and
+ * nothing is forfeited or refunded in money (P21, wire 6.0.0-lg5.2).
  * The only difference is `requireOwnerId: null` (cross-owner) here vs the
  * owner's own id in `routes/bookings.ts`.
  *
@@ -125,13 +126,15 @@ export type PostStaffBookingsDogsCancelBodyConformance = Expect<
 >;
 
 export interface StaffBookingsRouteOptions extends AuthRouteOptions {
-  /** Stripe seam for the cancel money-back postCommit (mirrors bookings). */
+  /** Stripe seam (mirrors bookings): a pending row's order is asked about and its
+   *  F4 refund fired post-commit; the cancel's money-back branch was deleted in P21. */
   stripe?: StripeClient;
   /**
    * Injectable clock (mirrors `BookingsRouteOptions.now`). The staff cancel
    * runs the same `cancelBookingInTx` the owner cancel does, and that
-   * transaction's forfeit check now reads the caller's instant rather than
-   * Postgres `now()` — so this route has to own one. Production passes the
+   * transaction's time-sensitive decisions (the day session's refusals and the
+   * return's landing) read the caller's instant rather than Postgres `now()` —
+   * so this route has to own one. Production passes the
    * real clock; contract tests freeze it.
    */
   now?: () => Date;
@@ -227,9 +230,9 @@ export function registerStaffBookingsRoute(
 
   // --- POST /staff/bookings/:id/cancel ------------------------------------
   //
-  // Cross-owner cancel via the shared txn. Same forfeit/refund branching as
-  // the owner self-cancel; the money-back branch fires the Stripe refund
-  // post-commit (skipped on idempotency replay — the txn body doesn't run).
+  // Cross-owner cancel via the shared txn, any role (no ladder): every credit back,
+  // nothing forfeited, no money (P21). A pending row's F4 refund fires post-commit
+  // (skipped on idempotency replay — the txn body doesn't run).
   app.post(
     '/staff/bookings/:id/cancel',
     { preHandler: [authHook] },
@@ -240,10 +243,9 @@ export function registerStaffBookingsRoute(
       const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
       const reason = parseCancelReason(request.body);
 
+      // Set only by a pending row's F4 refund; an upcoming row's cancel moves no money.
       let pendingStripeRefund: PendingStripeRefund | undefined;
       let creditRefundedOwnerId: string | undefined;
-      // Computed ONCE, here, so the row stores the same string the fire sends.
-      const refundIdempotencyKey = `${idempotencyKey}:refund`;
       // A pending row cancels its whole order, through the one service (DECISIONS
       // 142(e)), and asks Stripe first with no transaction open.
       const whatWon = await askWhatWonForPendingRow({ id, requireOwnerId: null, stripe });
@@ -287,9 +289,7 @@ export function registerStaffBookingsRoute(
             cancelledBy: 'staff',
             ...(reason !== undefined ? { cancelReason: reason } : {}),
             now: nowFactory(),
-            stripeIdempotencyKey: refundIdempotencyKey,
             whatWon,
-            // The unroutable mint announces itself in-tx through this logger.
             log: request.log,
           });
           pendingStripeRefund = result.pendingStripeRefund;
@@ -341,7 +341,8 @@ export function registerStaffBookingsRoute(
             id,
             dogId,
             requireOwnerId: null,
-            cancelledBy: 'staff',
+            // The reason sheet's words, quoted verbatim in the owner's notice (D13).
+            who: { by: 'staff', reason },
             now: nowFactory(),
             log: request.log,
           });

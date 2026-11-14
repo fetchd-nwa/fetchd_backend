@@ -5,7 +5,7 @@ import type { FastifyInstance } from 'fastify';
 import type pg from 'pg';
 import type { Principal } from '../../src/auth/principal.js';
 import { pool } from '../../src/db/pool.js';
-import { AUDITED_SETTINGS_TABLES } from '../../src/lib/settingsRegistry.js';
+import { AUDITED_SETTINGS_TABLES, SETTINGS_TABLES } from '../../src/lib/settingsRegistry.js';
 import { registerStaffDayCapacityRoute } from '../../src/routes/staffDayCapacity.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -52,6 +52,13 @@ async function inRolledBackTx<T>(fn: (client: pg.PoolClient) => Promise<T>): Pro
     client.release();
   }
 }
+
+test('the audited list names each table once, the cxl two through SETTINGS_TABLES, and no dropped table (P21)', () => {
+  assert.equal(new Set(AUDITED_SETTINGS_TABLES).size, AUDITED_SETTINGS_TABLES.length);
+  assert.ok(SETTINGS_TABLES.includes('cancellation_policy_settings'));
+  assert.ok(SETTINGS_TABLES.includes('cancellation_global_settings'));
+  assert.equal(AUDITED_SETTINGS_TABLES.includes('cancel_window_settings'), false, 'M5.08 drops it');
+});
 
 describe(
   'R4 — an UPDATE of a seeded settings row writes exactly one audit_log row',
@@ -104,7 +111,13 @@ describe('row_pk names the row the way each table is keyed', SKIP_WHEN_NO_DB, ()
     { table: 'day_program_settings', where: 'location IS NULL', rowPk: '<global>' },
     { table: 'day_program_settings', where: "location = 'bentonville'", rowPk: 'bentonville' },
     { table: 'evaluation_settings', where: 'location IS NULL', rowPk: '<global>' },
-    { table: 'cancel_window_settings', where: "category = 'day-school'", rowPk: 'day-school' },
+    // P21: M5.08 drops cancel_window_settings; the category arm now names M5.07's rows.
+    {
+      table: 'cancellation_policy_settings',
+      where: "category = 'day-school'",
+      rowPk: 'day-school',
+    },
+    { table: 'cancellation_global_settings', where: 'id', rowPk: 'true' },
     { table: 'intake_field_settings', where: "field_key = 'feeding'", rowPk: 'feeding' },
     { table: 'dog_descriptors', where: "key = 'nervous'", rowPk: 'nervous' },
   ];

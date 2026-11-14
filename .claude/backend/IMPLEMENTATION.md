@@ -64,7 +64,7 @@ observable behavior, not "looks right."
 | 12 | Txn: pending requests + approve (portal verb 1) | Allison | ☑ |
 | 12b1 | Txn: evaluation gate (4th BOOKING GATE — backend) | Allison | ☑ |
 | 12b2 | FE: EvaluationGateModal extraction + program-tile gate + picker parity | Claude | ☐ |
-| 13 | Txn: cancelBooking + refunds + cancel window + staff-tunable policy | Allison | ☑ |
+| 13 | Txn: cancelBooking + refunds + cancel window + staff-tunable policy (window, forfeit and money-back gone at 6.0.0-lg5.2, P21) | Allison | ☑ |
 | 14 | Stripe test-mode core (intents/cards/charges) | Allison | ☑ |
 | 15 | Stripe webhooks + invoices + dunning worker | Allison | ☑ |
 | 16 | Scheduler worker (scheduled_notifications) | Allison | ☑ |
@@ -802,6 +802,13 @@ observable behavior, not "looks right."
   future feature pushes it further.
 
 ### Day 10 — Txn: bookSession (Day School/Care) + 3 gates
+
+> `POST /bookings` gained the after-school opt-in at wire 6.0.0-lg5.2 (P21; DAY-U43, M5.04):
+> `after_school` (dog → dates) is stored on each share as `booking_dogs.after_school` and
+> counted per date in dogs against `day.after_school_capacity_count` under that date's
+> `(location, date)` lock, right after its seats (422 `after_school_full`, before any
+> charge). It stamps no `cancel_deadline_at`. DATA-CONTRACT §C.1, §T.
+
 - **Owner:** Allison
 - **Depends on:** Day 9
 - **Governing contract:** schema.sql txn-notes `bookSession` + BOOKING GATES
@@ -836,7 +843,8 @@ observable behavior, not "looks right."
   pre-checks (payment → vaccine → agreement, priority order, same
   shape as Day-10) → INSERT `len(dog_ids) × cohort.weeks` single-dog
   bookings + their `booking_dogs` rows + `cancel_deadline_at =
-  scheduled_at − 48h` (per `lib/cancelWindow`) → atomic
+  scheduled_at − 48h` (per `lib/cancelWindow`) *(no deadline since 6.0.0-lg5.2,
+  P21: `lib/cancelWindow` is deleted and both enrolment sites leave it NULL)* → atomic
   `cohortsRepository.bumpFilled(tx, cohort_id, +|dog_ids|)`. NO
   credit_ledger debit (group-class is paid per-purchase, Day 14). NO
   cache invalidation today (`keysToInvalidate: () => []` per the
@@ -866,7 +874,8 @@ observable behavior, not "looks right."
   ('puppy','manners-1','manners-2')` so per-test cohort inserts
   don't dangle. **Tests:** 19 contract tests in
   `test/contracts/enrollment-create.test.ts` covering happy 1-dog +
-  multi-dog + weekly cadence delta + `cancel_deadline_at = -48h`;
+  multi-dog + weekly cadence delta + `cancel_deadline_at = -48h` *(since P21 the
+  test asserts NULL on every week)*;
   `cohort_full` with structured details; R7 eligibility-fail (Lola
   missing manners-1) + eligibility-pass (Waffles has manners-1);
   all 3 gates against 'group-class'; cohort row-lock race
@@ -892,7 +901,8 @@ observable behavior, not "looks right."
   dog, same cohort, two different Idempotency-Keys, same body would
   replay; different bodies could double-enroll); flagged for Day-13
   cancel-refund revisit since "re-enroll after cancel" interacts.
-  Cancel-window 48h for group-class TUNABLE pre-launch.
+  Cancel-window 48h for group-class TUNABLE pre-launch. *(Gone at 6.0.0-lg5.2, P21:
+  no cancel has a window.)*
 
 **Confidence-score self-review (Day-11 sign-off, all ≥ 95):**
 - Correctness: 95 — 408/408 green; 19 contract tests cover every
@@ -1400,6 +1410,22 @@ observable behavior, not "looks right."
     consumer beyond private-lesson + B&T), extract to its own file.
 
 ### Day 13 — Txn: cancelBooking + refunds + cancel window + staff-tunable policy ☑
+
+> Dated log. The cancel window, the FORFEIT and MONEY-BACK branches and the cancel-window
+> routes below left at wire 6.0.0-lg5.2 (P21; CXL-U02, CXL-U04, NOTIF-U17; M5.08): every cancel,
+> owner or staff, whole session or one dog, writes `cancel_forfeited = false`, returns one credit
+> for each dog it takes off a day session through `creditLedgerRepository.refundForBooking` (a
+> `settlement-return` naming her live debit, to its lot or a fresh one), writes no `refunds`
+> row and calls no Stripe refund; `chargesRepository.findSucceededForBooking` is deleted. A
+> pending row still cancels its whole order (F4, the one automatic refund). `cancel_window_settings`
+> is dropped, `lib/cancelWindow.ts`, `cancelWindowSettingsRepository` and
+> `routes/staffCancelWindow.ts` are deleted, both `/staff/cancel-window` routes are 404, and no
+> route stamps `cancel_deadline_at`. The staff-tunable policy is the `cxl` settings domain,
+> `GET|PATCH /staff/settings/cxl` (`routes/staffSettings.ts`), every key stored only but
+> `per_dog_cancel_enabled` (owner and manager). The `booking-cancelled` body is
+> `orderRows.cancellationBody`'s: who cancelled (the staff `reason` quoted) and a credit line per
+> landing, never money. The group-class refusal (422) stays. DATA-CONTRACT §T.
+
 - **Owner:** Allison
 - **Depends on:** Day 12b1 (Day 12b2 is FE — does not block backend Day 13)
 - **Governing contract:** schema.sql txn-notes `cancelBooking`; DATA-CONTRACT §I
@@ -1462,6 +1488,8 @@ observable behavior, not "looks right."
 > one order and one charge, settled by the route, the webhook or the sweeper. A lot's date is
 > its row's `expiry_months` through `addChicagoMonths`, and a single-day pack expires like any
 > other.
+> The cancel route's money-back wire below left at wire 6.0.0-lg5.2 (P21): no booking cancel
+> mints a refund or calls Stripe (Day 13's note).
 
 - **Owner:** Allison
 - **Depends on:** Day 13
@@ -1500,7 +1528,7 @@ observable behavior, not "looks right."
   3 new booking-cancel tests for the refund wire (fires post-
   commit / swallow on failure / replay skips). Fixture: `_fixture.ts`
   now seeds `stripe_customers` row + resets `cancel_window_settings`
-  to 48h on every seed (Day-13 leak fix); `credit_ledger` → `charges`
+  to 48h on every seed (Day-13 leak fix; *the reset left with the table at P21*); `credit_ledger` → `charges`
   teardown FK order corrected. **Post-review refactor pass** (per
   Allison's "easy for additions" review): extracted
   `stripeIntentStatusToChargeStatus` from `routes/creditPackages.ts`
@@ -2031,6 +2059,9 @@ real-sized chunks:
     `POST /staff/bookings/:id/dogs/:dogId/{check-in,check-out,undo}`, `src/routes/staffCheckin.ts`
     — and one dog of several cancels through `POST /staff/bookings/:id/dogs/:dogId/cancel`.
     DATA-CONTRACT §S.)*
+    *(Δ 2026-11-13, P21 / wire 6.0.0-lg5.2: the staff cancel returns credits only, no forfeit and
+    no money; the board row carries `after_school`; and the owner profile's Bookings tab reads
+    `GET /staff/owners/:ownerId/bookings?from=` (`routes/staffOwners.ts`). DATA-CONTRACT §T.)*
     New `routes/staffBookings.ts`. Cancel reuses the SHARED
     `lib/cancelBookingService.cancelBookingInTx` (extracted from the owner
     cancel route — schema `cancelBooking` is owner-OR-staff authorized, one
@@ -2738,6 +2769,9 @@ card shows the set-location pool.
 - Every write sets `app.actor` or `audit_log` is blind. No exceptions.
 - Every mutation is idempotent (the Day-3 wrapper) — clients retry.
 - All calendar/day math in **America/Chicago**, never off raw UTC.
+- A missing seeded settings row is a broken database, never a default: its read throws, so the
+  request is a 500 whose error log names the row and the step that seeds it (STAFF-U45, P21;
+  it was a 404). No reader falls back to a number in code.
 - The frozen wire shapes (DATA-CONTRACT §B) are the regression net — contract
   tests, not unit-test theater. A mismatch = STOP + surface, never edit the
   frozen contract silently.

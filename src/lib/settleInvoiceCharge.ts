@@ -106,7 +106,9 @@ export interface ReceiptPush {
  * The actual Stripe `createRefund` is NOT fired here (no Stripe call inside a
  * tx -- the project-wide invariant). On the 'refunded' outcome the caller fires
  * it post-commit and persists the `re_*` id, exactly as cancelBookingService's
- * money-back branch does. A refund-API failure leaves the 'pending' row for the
+ * money-back branch did until P21 deleted it (wire 6.0.0-lg5.2), and as the
+ * engine's F4 refund and the class withdraw still do. A refund-API failure leaves
+ * the 'pending' row for the
  * webhook's race-recovery / admin retry -- never silently swallowed past the
  * caller's logged post-commit seam.
  *
@@ -146,7 +148,8 @@ export async function settleChargeAgainstInvoice(
   // it locks the charge row, sums the non-failed refunds and mints at most the
   // remainder, so a re-run that finds the full amount already pending-refunded
   // creates no second row — exactly as cancelBookingService's money-back branch
-  // does, through the same function. The one production caller, the order
+  // did through the same function until P21 deleted it (wire 6.0.0-lg5.2). The
+  // one production caller, the order
   // engine's settle (`settleChargeInTx`), took this charge's row lock
   // (`lockCharge`, `FOR UPDATE`) before it came here, so the helper's lock is
   // already this transaction's and costs nothing; the uniformity is the point,
@@ -363,8 +366,9 @@ const STDERR_NOTICE_LOG: NoticeLog = {
  * should search Stripe for.
  *
  * The post-commit fire itself moved to `lib/pendingRefund.ts`
- * ({@link firePendingRefundPostCommit}) — all five money-back writers now share
- * one helper and one params constructor, because a same-key retry only replays
+ * ({@link firePendingRefundPostCommit}) — every money-back writer shares one
+ * helper and one params constructor (five when this moved; the booking cancel's
+ * left in P21, wire 6.0.0-lg5.2), because a same-key retry only replays
  * when the parameters match byte-for-byte.
  */
 export function duplicateRefundIdempotencyKey(refundId: string): string {

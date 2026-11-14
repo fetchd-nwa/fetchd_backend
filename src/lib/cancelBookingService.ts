@@ -4,7 +4,6 @@ import { bookingsRepository, type BookingFullRow } from '../db/repositories/book
 import { chargesRepository } from '../db/repositories/chargesRepository.js';
 import { checkinEventsRepository } from '../db/repositories/checkinEventsRepository.js';
 import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
-import { refundsRepository } from '../db/repositories/refundsRepository.js';
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import type { Tx } from '../db/tx.js';
@@ -26,14 +25,13 @@ import {
   noLiveDebit,
   noticeBookingCancelled,
   noticeCreditReturned,
+  liveDogsLeadFirst,
   returnDebitsToLots,
   tearDownBookingReminders,
+  type CancellationWho,
+  type ReturnedCredit,
 } from './orderRows.js';
-import {
-  logUnroutableRefundMint,
-  type PendingStripeRefund,
-  type UnroutableRefundMint,
-} from './pendingRefund.js';
+import type { PendingStripeRefund } from './pendingRefund.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import type { StripeClient } from './stripe.js';
 import { wireManyBookings } from './wireManyBookings.js';
@@ -43,41 +41,29 @@ export type { PendingStripeRefund };
 export interface CancelBookingResult {
   wire: BookingWire;
   /**
-   * Set on the money-back branch; the caller fires the actual Stripe
-   * refund post-commit (the route owns the `withMutation.postCommit`
-   * seam). Undefined for forfeit / credit-back / free-service paths.
+   * Set only by a pending row's cancel of its whole order, when the engine refunds a
+   * top-up that won no seat (F4, the one automatic refund); the caller fires it
+   * post-commit (the route owns the `withMutation.postCommit` seam). An upcoming row's
+   * cancel moves no money, so it never sets this (P21; design.md:4151-4154).
    */
   pendingStripeRefund?: PendingStripeRefund;
   /**
-   * Set INSTEAD of `pendingStripeRefund` when the money-back branch found a
-   * charge with no `stripe_payment_intent_id` — pre-Stripe-wire money the
-   * school owes back through a channel no code here can reach (design §4). The
-   * row is written TERMINAL at `'unroutable'`.
-   *
-   * Returned for the CALLER'S information only. The announcement is NOT the
-   * caller's job: it is emitted in-transaction at the mint below, and this
-   * field must never become the thing an alarm depends on again — see the
-   * comment there.
-   */
-  unroutableRefund?: UnroutableRefundMint;
-  /**
    * The owner credited back on this cancel. The route wipes her `credits:{ownerId}:*`
-   * display cache post-commit. Absent on every non-credit-back path (forfeit / money-back
-   * / free).
+   * display cache post-commit. Absent when nothing came back (a row that spent no credit).
    */
   creditRefundedOwnerId?: string;
 }
 
 /**
- * The shared cancel transaction (schema.sql `cancelBooking` contract,
- * line ~1491). Both the owner self-cancel (`POST /bookings/:id/cancel`)
- * and the Day-19 staff-portal cancel (`POST /staff/bookings/:id/cancel`)
- * run this identical body — same forfeit rule (`now > cancel_deadline_at`,
- * resolved in SQL against the caller's `now`), same credit-back /
- * money-back / forfeit branching, same booking-cancelled notification to
- * the booking's owner. The schema pins the cancel as owner-OR-staff
- * authorized with no separate staff refund policy, so there is exactly
- * one transaction.
+ * The shared cancel transaction (schema.sql `cancelBooking` contract). Both the
+ * owner self-cancel (`POST /bookings/:id/cancel`) and the staff cancel
+ * (`POST /staff/bookings/:id/cancel`, any role: no ladder, question 51 dissolved) run
+ * this identical body: every credit the row debited comes back, through the one
+ * return writer, nothing is forfeited and no money moves (6.0.0-lg5.2, P21; CXL-U04,
+ * design §2.7:4115-4159: "No settlement reaches a charge ... no cancel ... ever mints
+ * a `refunds` row"), and the owner gets one booking-cancelled notice. A pending row
+ * cancels its whole order instead, where the engine refunds a top-up that won no
+ * seat (F4).
  *
  * The only caller difference is ownership scope:
  *   - owner route passes `requireOwnerId = principal.ownerId` → a
@@ -85,13 +71,10 @@ export interface CancelBookingResult {
  *   - staff route passes `requireOwnerId = null` → cross-owner by design
  *     (`requireStaff` already gated the route).
  *
- * `now` is required and threads through BOTH time-sensitive decisions in
- * this transaction — the forfeit check and the credit-lot re-mint. One
- * instant per cancel: a cancel that is in-window for the refund must not
- * be able to be out-of-window for the lot expiry it writes.
- *
- * The Stripe refund API call is NOT made here; the money-back branch
- * returns a `pendingStripeRefund` handle the route fires after commit.
+ * `now` is required and threads through every time-sensitive decision in this
+ * transaction: the day session's refusals and the return's landing (a lot that can
+ * pay no date after `now`'s Chicago day sends the credit to a fresh lot). One instant
+ * per cancel.
  */
 export async function cancelBookingInTx(
   tx: Tx,
@@ -104,23 +87,7 @@ export async function cancelBookingInTx(
     cancelReason?: string;
     /** The cancel instant — the route's `nowFactory()`, never a fresh wall clock. */
     now: Date;
-    /**
-     * The EXACT Stripe idempotency key the route's post-commit `createRefund`
-     * will send (`` `${request Idempotency-Key}:refund` ``), stored on the
-     * refunds row in THIS transaction (design §2.1).
-     *
-     * Required, and required of both routes: the key lives only in the request
-     * closure, so if the row does not carry it, a `createRefund` that fails
-     * post-commit can never be retried by anything and the owner's money simply
-     * does not come back. Passing it down is what makes the sweep possible.
-     */
-    stripeIdempotencyKey: string;
-    /**
-     * Where the `'unroutable'` mint announces itself. Required, because that
-     * announcement is the ONLY surface a terminal unroutable refund ever gets
-     * (see the mint below) and a default no-op logger would make losing it a
-     * silent, one-argument mistake.
-     */
+    /** Where the no-live-debit alarm and a failed notice are logged: the request's. */
     log: EngineLog;
     /**
      * What Stripe said about this row's pending order, asked by the route with no
@@ -129,7 +96,7 @@ export async function cancelBookingInTx(
     whatWon?: WhatWon | undefined;
   },
 ): Promise<CancelBookingResult> {
-  const { id, requireOwnerId, cancelledBy, cancelReason, now, stripeIdempotencyKey, log } = args;
+  const { id, requireOwnerId, cancelledBy, cancelReason, now, log } = args;
 
   // 1. Refusals that write nothing, on a plain read: the 404 collapses not-found,
   //    expired and (owner route only) not-yours into one response, and the class
@@ -181,122 +148,36 @@ export async function cancelBookingInTx(
   //     `expected` it is the board's (an undone check-in does not count).
   const liveDogIds = isDayProgram(row.category) ? await refuseDayCancel(tx, row, now) : [];
 
-  // 4. Soft-cancel. `cancelForfeited` is computed in SQL against the
-  //    stamped `cancel_deadline_at` and the caller's `now`; the resolved
-  //    value lands on commit.
-  //    `cancelledBy` + `cancelReason` (R5) record WHO/WHY for the banner.
+  // 4. Soft-cancel, nothing forfeited (P21: no cancel window exists, so a deadline
+  //    stamped before P21 is read by nothing). `cancelledBy` + `cancelReason` (R5)
+  //    record WHO/WHY for the banner.
   await bookingsRepository.markCancelled(tx, { id, cancelledBy, cancelReason, now });
 
-  // 5. Re-read so the refund branch reads the resolved `cancelForfeited`
-  //    (not the pre-update snapshot).
-  const updated = await bookingsRepository.findFullByIdInTx(tx, id);
-  if (updated === undefined) {
-    throw new Error(`cancelBooking ${id}: row vanished after mark-cancelled`);
-  }
-
-  // 6. Refund branching — within the cancel window only.
-  let pendingStripeRefund: PendingStripeRefund | undefined;
-  let unroutableRefund: UnroutableRefundMint | undefined;
-  let creditRefundedOwnerId: string | undefined;
-  if (!updated.cancelForfeited) {
-    // CREDIT-BACK: one +1 `settlement-return` per live debit, routed back to the lot it
-    // drew from. `now` is the caller's cancel instant, so the lot the refund lands in
-    // is dated by the same clock the forfeit check used. A day session's every live
-    // share must hold one (design §2.3:2502-2505), or the cancel is a 500 and an alarm.
-    creditRefundedOwnerId = isDayProgram(row.category)
-      ? await returnDayShares(tx, { bookingId: id, liveDogIds, now, log })
-      : await returnDebitsToLots(tx, { bookingIds: [id], now });
-    if (creditRefundedOwnerId === undefined) {
-      const charge = await chargesRepository.findSucceededForBooking(tx, id);
-      if (charge !== undefined) {
-        // MONEY-BACK: refunds row at 'pending'; cumulative-refund rule
-        // (refunds ≤ charge) enforced API-side. Stripe call fires
-        // post-commit via the returned handle.
-        // Capped under the charge row's LOCK, through the one shared helper
-        // (§A3.18 D2) — R9's cap is a read-modify-write, and an unlocked one
-        // was measured double-refunding a charge across two overlapping
-        // transactions. The helper REFUSES a charge with no PaymentIntent
-        // rather than minting a 'pending' row nothing could ever send, and
-        // hands back the cap so the unroutable branch below can record the
-        // obligation under that same lock.
-        const minted = await refundsRepository.mintCappedPendingRefund(tx, {
-          chargeId: charge.id,
-          ownerId: row.ownerId,
-          bookingId: id,
-          reason: 'cancel',
-          // Stored in the SAME tx as the row, so the retry sweep can send
-          // exactly what the post-commit fire sends — a replay, never a
-          // second refund. The client's key, so the row id is ignored.
-          stripeIdempotencyKey: () => stripeIdempotencyKey,
-        });
-        if (minted.kind !== 'nothing-to-refund') {
-          const maxRefund = minted.amountCents;
-          if (minted.kind === 'minted') {
-            pendingStripeRefund = {
-              refundId: minted.refundId,
-              paymentIntentId: minted.paymentIntentId,
-              amountCents: minted.amountCents,
-              stripeIdempotencyKey: minted.stripeIdempotencyKey,
-            };
-          } else {
-            // Charges with NULL stripe_payment_intent_id are pre-Stripe-wire
-            // seeds. The refunds row still records the obligation, but there is
-            // no PaymentIntent to reverse and there never will be, so it is
-            // written TERMINAL rather than 'pending' (design §4): a 'pending'
-            // row here meant a worklist entry no sweep could send and no
-            // webhook could close, re-shouted on every process restart forever.
-            const refund = await refundsRepository.createUnroutable(tx, {
-              ownerId: row.ownerId,
-              chargeId: charge.id,
-              bookingId: id,
-              amountCents: maxRefund,
-              reason: 'cancel',
-            });
-            unroutableRefund = {
-              refundId: refund.id,
-              ownerId: row.ownerId,
-              chargeId: charge.id,
-              amountCents: maxRefund,
-            };
-            // ANNOUNCED HERE, IN-TRANSACTION, and never from the route's
-            // post-commit seam (adversary panel, 2026-08-20 — proven on :5433).
-            //
-            // An `'unroutable'` row is TERMINAL at birth, so it appears in no
-            // worklist by design: `markUnroutable` requires `status='pending'`
-            // and `findAbandonedPending` excludes it. This log line is its
-            // ONLY surface, ever. Announcing it post-commit lost it outright on
-            // the crash-then-replay arc — a request whose response the client
-            // never saw commits the row, then the client retries the same
-            // Idempotency-Key, `withMutation` replays the stored response and
-            // SKIPS `postCommit` entirely (`db/mutation.ts` — the whole
-            // post-commit block is gated on `!outcome.replayed`), which also
-            // swallows anything thrown. Result: money owed, recorded, and
-            // announced nowhere. Permanently.
-            //
-            // The cost of moving it here is a false alarm if this transaction
-            // later rolls back — an ERROR about a row that does not exist. That
-            // failure is loud and recoverable by looking; the one it replaces
-            // is silent and permanent. Wrong direction traded for right one.
-            logUnroutableRefundMint(log, unroutableRefund, {
-              bookingId: id,
-              cancelledBy,
-            });
-          }
-        }
-      }
-    }
-  }
-  // Forfeited branch: no refund of any kind.
+  // 5. Every credit back, and no money (CXL-U04, D14; design.md:4151-4154). A day
+  //    session returns one credit per dog still on it, each to the lot its live debit
+  //    drew from (or a fresh lot when that lot can pay no later date), and a live share
+  //    with no live debit is a 500 and one alarm (design §2.3:2502-2505). Any other row
+  //    returns what it debited, which for a private lesson or an evaluation is nothing.
+  //    `now` is the caller's cancel instant, so a fresh lot is dated by the same clock.
+  const returned = isDayProgram(row.category)
+    ? await returnDayShares(tx, { bookingId: id, liveDogIds, now, log })
+    : await returnDebitsToLots(tx, { bookingIds: [id], now });
+  const creditRefundedOwnerId = returned[0]?.ownerId;
 
   // 7. booking-cancelled notification to the booking's owner (dog chips
   //    resolved from booking_dogs), in its own savepoint: a notice never un-records
-  //    the credit or the refund above.
+  //    the credits returned above.
   await noticeBookingCancelled(tx, {
     bookingId: id,
     ownerId: row.ownerId,
     category: row.category,
     scheduledAt: row.scheduledAt,
-    forfeited: updated.cancelForfeited,
+    who:
+      cancelledBy === 'owner'
+        ? { by: 'owner' }
+        : { by: 'staff', ...(cancelReason !== undefined ? { reason: cancelReason } : {}) },
+    dogIds: (await liveDogsLeadFirst(tx, [id])).get(id) ?? [],
+    returnIds: returned.map((r) => r.returnId),
     log,
   });
 
@@ -305,8 +186,6 @@ export async function cancelBookingInTx(
   // 8. Wire the updated row for the response.
   return {
     wire: await wireOne(tx, id, { now, viewer: viewerOf(requireOwnerId) }),
-    pendingStripeRefund,
-    unroutableRefund,
     ...(creditRefundedOwnerId !== undefined ? { creditRefundedOwnerId } : {}),
   };
 }
@@ -337,12 +216,12 @@ function viewerOf(requireOwnerId: string | null): 'owner' | 'staff' {
 /**
  * A day session's credits back, one per dog still on it, each through the one return
  * writer to the lot its live debit drew from. A live share with no live debit is the
- * alarm (design §2.3:2502-2505), never "moves nothing". Answers the owner credited.
+ * alarm (design §2.3:2502-2505), never "moves nothing". Answers each return written.
  */
 async function returnDayShares(
   tx: Tx,
   args: { bookingId: string; liveDogIds: readonly string[]; now: Date; log: EngineLog },
-): Promise<string | undefined> {
+): Promise<ReturnedCredit[]> {
   const debits = await creditLedgerRepository.findLiveDebits(tx, { bookingId: args.bookingId });
   const owed = args.liveDogIds.map((dogId) => {
     const debit = debits.find((d) => d.dogId === dogId);
@@ -350,15 +229,17 @@ async function returnDayShares(
     return debit;
   });
   await lockPools(tx, owed);
+  const returned: ReturnedCredit[] = [];
   for (const debit of owed) {
     // A cancel's return names no check-in event (M5.10's link is the board verbs').
-    await creditLedgerRepository.refundForBooking(tx, {
+    const { id } = await creditLedgerRepository.refundForBooking(tx, {
       ...debit,
       now: args.now,
       checkinEventId: null,
     });
+    returned.push({ bookingId: debit.bookingId, dogId: debit.dogId, ownerId: debit.ownerId, returnId: id });
   }
-  return owed[0]?.ownerId;
+  return returned;
 }
 
 async function wireOne(
@@ -426,7 +307,9 @@ export async function cancelOneDogInTx(
     id: string;
     dogId: string;
     requireOwnerId: string | null;
-    cancelledBy: 'owner' | 'staff';
+    /** Who cancelled her: the owner, or the school with its reason, which her notice
+     *  quotes (D13; the staff route requires one). */
+    who: CancellationWho;
     now: Date;
     log: EngineLog;
   },
@@ -479,7 +362,7 @@ export async function cancelOneDogInTx(
   } else {
     await bookingsRepository.markCancelledWithLastDog(tx, {
       id,
-      cancelledBy: args.cancelledBy,
+      cancelledBy: args.who.by,
       now,
     });
     await tearDownBookingReminders(tx, id);
@@ -503,7 +386,7 @@ export async function cancelOneDogInTx(
     returnId: returned.id,
     who: {
       kind: 'one-dog',
-      by: args.cancelledBy,
+      by: args.who,
       category: row.category as 'day-school' | 'day-care',
       scheduledAtIso: pgTimestampToIso(row.scheduledAt),
     },

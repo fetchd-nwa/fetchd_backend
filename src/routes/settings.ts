@@ -14,7 +14,6 @@ import {
 import { serviceRatesRepository } from '../db/repositories/serviceRatesRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { bucketChicagoToday } from '../lib/chicagoDate.js';
-import { ApiError } from '../lib/errors.js';
 
 /**
  * `GET /settings` `[auth]` — the owner settings document (SET-U01, E51;
@@ -58,10 +57,8 @@ function byLocation<T>(
   const present = new Set(rows.map((r) => r.location));
   const missing = LOCATIONS.filter((l) => !present.has(l));
   if (missing.length > 0) {
-    throw new ApiError(
-      'not_found',
-      `day_program_settings has no row for ${missing.join(', ')} — apply M1.07`,
-    );
+    // A broken database, a 500 whose log names the row (STAFF-U45, P21).
+    throw new Error(`day_program_settings has no row for ${missing.join(', ')} — apply M1.07`);
   }
   return Object.fromEntries(LOCATIONS.map((l) => [l, pick(l)])) as Record<LocationKey, T>;
 }
@@ -111,10 +108,7 @@ export async function buildOwnerSettings(today: string): Promise<GetSettingsResp
     if (row.key === 'max_sessions_per_booking_count') maxSessions = row.value;
   }
   if (maxSessions === undefined) {
-    throw new ApiError(
-      'not_found',
-      'payment_settings has no max_sessions_per_booking_count row — apply M1.13',
-    );
+    throw new Error('payment_settings has no max_sessions_per_booking_count row — apply M1.13');
   }
 
   return {

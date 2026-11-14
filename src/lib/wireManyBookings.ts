@@ -1,6 +1,10 @@
 import { db } from '../db/client.js';
 import { bookingsRepository, type BookingRow } from '../db/repositories/bookingsRepository.js';
 import { checkinEventsRepository } from '../db/repositories/checkinEventsRepository.js';
+import {
+  creditLedgerRepository,
+  planReturns,
+} from '../db/repositories/creditLedgerRepository.js';
 import { cohortsRepository } from '../db/repositories/cohortsRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
@@ -69,6 +73,12 @@ export async function wireManyBookings(
     context,
     runner,
   );
+  const returnDates = await returnExpiries(
+    rows.filter((row) => isDayProgram(row.category) && row.status === 'upcoming'),
+    dogsByBooking,
+    context,
+    runner,
+  );
   return rows.map((row) => {
     const dogIds = dogsByBooking.get(row.id);
     if (dogIds === undefined) {
@@ -81,8 +91,55 @@ export async function wireManyBookings(
       trainerName(row.trainerStaffId),
       groupClassName,
       factsByBooking.get(row.id),
+      {
+        afterSchool: new Map(
+          shareRows.filter((s) => s.bookingId === row.id).map((s) => [s.dogId, s.afterSchool]),
+        ),
+        returnExpiresAt: returnDates.get(row.id) ?? new Map(),
+      },
     );
   });
+}
+
+/**
+ * `dog_shares[].return_expires_at` (6.0.0-lg5.2; D1; CXL-U05's server half): for each dog
+ * still on an `'upcoming'` day session whose credit has not come back, the date that credit
+ * would carry if it came back now, on `can_cancel`'s clock (`context.now`). Read from her
+ * live debit, the newest one no return names yet (after a re-check-in, the re-debit, never
+ * the first), through `planReturns`, the rule the return writer itself writes by. A share
+ * cancelled alone, a cancelled or pending session and a share with no live debit get none.
+ */
+async function returnExpiries(
+  upcomingDayRows: BookingRow[],
+  dogsByBooking: ReturnType<typeof groupBookingDogs>,
+  context: WireReadContext,
+  runner: Tx | typeof db,
+): Promise<Map<string, Map<string, string>>> {
+  if (upcomingDayRows.length === 0) return new Map();
+  const debits = await creditLedgerRepository.findLiveDebitsOfBookings(
+    runner,
+    upcomingDayRows.map((row) => row.id),
+  );
+  const liveDebitOf = new Map<string, string>();
+  for (const debit of debits) {
+    // Newest first, so the first a share meets is her live one.
+    const key = `${debit.bookingId}:${debit.dogId}`;
+    if (!liveDebitOf.has(key)) liveDebitOf.set(key, debit.lotId);
+  }
+  const plans = await planReturns(runner, [...new Set(liveDebitOf.values())], context.now);
+  const byBooking = new Map<string, Map<string, string>>();
+  for (const row of upcomingDayRows) {
+    const dogIds = dogsByBooking.get(row.id);
+    if (dogIds === undefined) continue;
+    const dates = new Map<string, string>();
+    for (const dogId of [dogIds.lead, ...dogIds.additional]) {
+      const lotId = liveDebitOf.get(`${row.id}:${dogId}`);
+      const plan = lotId === undefined ? undefined : plans.get(lotId);
+      if (plan !== undefined) dates.set(dogId, plan.expiresAt.toISOString());
+    }
+    byBooking.set(row.id, dates);
+  }
+  return byBooking;
 }
 
 /** `can_cancel` and each share's, for the day rows, from one read of the log and the day. */

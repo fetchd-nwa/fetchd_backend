@@ -16,11 +16,12 @@ import {
  * §3 every key and its seed; P01, wire 2.0.0-lg1.1).
  *
  * A typed map, written by hand and checked by tests, from every setting key of
- * the fourteen domains of `wire.ts`'s `SETTINGS_DOMAINS` (acct, alum, cash,
- * cred, day, dog, eval, mig, msg, notif, pay, rpt, vax — and `staff`, P02's,
- * DECISIONS 47) to:
+ * the fifteen domains of `wire.ts`'s `SETTINGS_DOMAINS` (acct, alum, cash,
+ * cred, day, dog, eval, mig, msg, notif, pay, rpt, vax — `staff`, P02's,
+ * DECISIONS 47 — and `cxl`, P21's, the one domain on two tables) to:
  *
- *   - its **store**: a column of its domain's settings table; a
+ *   - its **store**: a column of its domain's settings table; a column of a
+ *     per-category table, edited row by row (`cxl`'s per-service policy); a
  *     `payment_settings` key and scope; a path inside a jsonb column (a
  *     read-only name for part of another key's value); or a catalog row that
  *     another route edits (`credit_packages`, `service_rates`,
@@ -54,8 +55,9 @@ export type { SettingClass };
 
 export { SETTINGS_DOMAINS, type SettingsDomain };
 
-/** Every settings table, by domain: P01's (M1.01–M1.16 less M1.03, M1.04,
- *  M1.14) and P02's `staff_settings` (M1.21). Keyed by the WIRE's domain union,
+/** Every domain's own settings table — its singleton, or its two-tier table:
+ *  P01's (M1.01–M1.16 less M1.03, M1.04, M1.14), P02's `staff_settings` (M1.21)
+ *  and `cxl`'s global singleton (M5.07, P21). Keyed by the WIRE's domain union,
  *  so a missing domain does not compile. */
 export const SETTINGS_TABLE_BY_DOMAIN = {
   acct: 'account_settings',
@@ -72,27 +74,38 @@ export const SETTINGS_TABLE_BY_DOMAIN = {
   rpt: 'reports_settings',
   vax: 'vaccine_settings',
   staff: 'staff_settings',
+  cxl: 'cancellation_global_settings',
 } as const satisfies Record<SettingsDomain, string>;
-export type SettingsTable = (typeof SETTINGS_TABLE_BY_DOMAIN)[SettingsDomain];
-export const SETTINGS_TABLES: readonly SettingsTable[] = Object.values(SETTINGS_TABLE_BY_DOMAIN);
+
+/**
+ * A domain's per-category table, beside its own: `cxl` is the one domain on two
+ * tables (design §1.1:631-632, "fifteen domains on sixteen tables"), its five global
+ * keys on the singleton above and its seven per-service columns on
+ * `cancellation_policy_settings`, one row per `ServiceCategory` keyed by `category`
+ * (M5.07). A PATCH sends such a column as a category → value map
+ * (`PatchStaffSettingsCxlRequest`, contract notes D5).
+ */
+export const PER_CATEGORY_TABLE_BY_DOMAIN = {
+  cxl: 'cancellation_policy_settings',
+} as const satisfies Partial<Record<SettingsDomain, string>>;
+export type PerCategoryTable =
+  (typeof PER_CATEGORY_TABLE_BY_DOMAIN)[keyof typeof PER_CATEGORY_TABLE_BY_DOMAIN];
+export type SettingsTable = (typeof SETTINGS_TABLE_BY_DOMAIN)[SettingsDomain] | PerCategoryTable;
+export const SETTINGS_TABLES: readonly SettingsTable[] = [
+  ...Object.values(SETTINGS_TABLE_BY_DOMAIN),
+  ...Object.values(PER_CATEGORY_TABLE_BY_DOMAIN),
+];
 
 /**
  * Every settings table under the audit trigger (M1.18, STAFF-U22; M1.21): the
- * four that predate LG1 and every settings table LG1 creates, `staff_settings`
- * included (it joins through `SETTINGS_TABLE_BY_DOMAIN`), and `credit_packages`, whose
- * `expiry_months` is a money-class edit (M4.05, DECISIONS 177(d)). The audit test is
- * generated from this list.
- *
- * M5.07's two `cxl` tables are named by hand, as `cancel_window_settings` is: `cxl` is
- * not a settings domain until CXL-U02 (P21) adds it with its shapes and registry rows,
- * so they are not in `SETTINGS_TABLES`, and without their names here the generated
- * audit test would stay green over two unaudited tables (P20 notes, D1). P21 drops the
- * two names when `'cxl'` brings them in through `SETTINGS_TABLES`.
+ * two catalog tables that predate LG1 and every settings table, `staff_settings` and
+ * M5.07's two `cxl` tables included (each joins through `SETTINGS_TABLES`), and
+ * `credit_packages`, whose `expiry_months` is a money-class edit (M4.05, DECISIONS
+ * 177(d)). The audit test is generated from this list. P21 took out the two `cxl`
+ * names P20 wrote here by hand, now that the domain brings them in, and
+ * `cancel_window_settings`, which M5.08 drops.
  */
 export const AUDITED_SETTINGS_TABLES: readonly string[] = [
-  'cancel_window_settings',
-  'cancellation_policy_settings',
-  'cancellation_global_settings',
   'credit_packages',
   'intake_field_settings',
   'dog_descriptors',
@@ -121,6 +134,9 @@ export const INT4_MAX = 2147483647;
 export type SettingStore =
   /** A column of the domain's settings table — what the settings PATCH writes. */
   | { kind: 'column'; table: SettingsTable; column: string; tier?: Tier }
+  /** A column of a per-category table: one value per category row, PATCHed as a
+   *  category → value map (`cxl`'s per-service policy, M5.07). */
+  | { kind: 'per-category'; table: PerCategoryTable; column: string }
   /** One field inside a jsonb column; read-only here, edited as part of `via`. */
   | {
       kind: 'path';
@@ -143,8 +159,9 @@ export type EnumValue = { type: 'enum'; values: readonly string[]; nullable?: tr
 export type SettingValue =
   | { type: 'boolean' }
   | { type: 'integer'; min: number; max?: number; nullable?: true }
-  /** A numeric fraction in [0, 1]; `oneOf` narrows it to listed values. */
-  | { type: 'fraction'; oneOf?: readonly number[] }
+  /** A numeric fraction in [0, 1]; `oneOf` narrows it to listed values. `nullable`
+   *  for a column a design line leaves NOT SEEDED (`cxl`'s boarding row). */
+  | { type: 'fraction'; oneOf?: readonly number[]; nullable?: true }
   /** Wall-clock `HH:MM`, America/Chicago. */
   | { type: 'time' }
   | EnumValue
@@ -229,8 +246,14 @@ const BOOLEAN: SettingValue = { type: 'boolean' };
 const ROLE_LIST: SettingValue = { type: 'role-list' };
 const TIME: SettingValue = { type: 'time' };
 const FRACTION: SettingValue = { type: 'fraction' };
+const NULLABLE_FRACTION: SettingValue = { type: 'fraction', nullable: true };
 const atLeast = (min: number): SettingValue => ({ type: 'integer', min });
 const between = (min: number, max: number): SettingValue => ({ type: 'integer', min, max });
+
+/** A `cxl` per-service column (`cancellation_policy_settings`, one row per category). */
+function perCategory(name: string): SettingStore {
+  return { kind: 'per-category', table: PER_CATEGORY_TABLE_BY_DOMAIN.cxl, column: name };
+}
 
 function column(table: SettingsTable, name: string, tier?: Tier): SettingStore {
   return tier === undefined
@@ -1331,10 +1354,107 @@ const ENTRIES: readonly Entry[] = [
     value: between(1, 60),
     inert: LIVE,
   },
+
+  // cxl — cancellation_global_settings and cancellation_policy_settings (M5.07; §3.8;
+  // CXL-U02, P21). Every key is money and stored only (money cut 3; 12-:67-69 "no true
+  // penalty"), but per_dog_cancel_enabled, which the owner's one-dog cancel reads (s11).
+  // The bounds are the two tables' CHECKs; a NULL is NOT SEEDED (boarding's row).
+  {
+    key: 'cxl.class_missed_meeting_money_return_mode',
+    class: 'money',
+    store: column('cancellation_global_settings', 'class_missed_meeting_money_return_mode'),
+    // NOT SEEDED, no value set designed (answer 13: a missed meeting returns nothing).
+    value: { type: 'text', nullable: true },
+    inert: STORED,
+  },
+  {
+    key: 'cxl.per_dog_cancel_enabled',
+    class: 'money',
+    store: column('cancellation_global_settings', 'per_dog_cancel_enabled'),
+    value: BOOLEAN,
+    inert: LIVE,
+  },
+  {
+    key: 'cxl.staff_entered_client_cancel_follows_owner_rules_enabled',
+    class: 'money',
+    store: column(
+      'cancellation_global_settings',
+      'staff_entered_client_cancel_follows_owner_rules_enabled',
+    ),
+    value: BOOLEAN,
+    inert: STORED,
+  },
+  {
+    key: 'cxl.staff_initiated_cancel_full_return_enabled',
+    class: 'money',
+    store: column('cancellation_global_settings', 'staff_initiated_cancel_full_return_enabled'),
+    value: BOOLEAN,
+    inert: STORED,
+  },
+  {
+    key: 'cxl.started_run_cancel_return_mode',
+    class: 'money',
+    store: column('cancellation_global_settings', 'started_run_cancel_return_mode'),
+    // NOT SEEDED, no value set designed.
+    value: { type: 'text', nullable: true },
+    inert: STORED,
+  },
+  {
+    key: 'cxl.flat_fee_cents',
+    class: 'money',
+    store: perCategory('flat_fee_cents'),
+    value: { type: 'integer', min: 0, nullable: true },
+    inert: STORED,
+  },
+  {
+    key: 'cxl.forfeit_fraction',
+    class: 'money',
+    store: perCategory('forfeit_fraction'),
+    value: NULLABLE_FRACTION,
+    inert: STORED,
+  },
+  {
+    key: 'cxl.no_show_declare_mode',
+    class: 'money',
+    store: perCategory('no_show_declare_mode'),
+    value: { type: 'enum', values: ['staff_only', 'auto_after_hours'], nullable: true },
+    inert: STORED,
+  },
+  {
+    key: 'cxl.no_show_forfeit_fraction',
+    class: 'money',
+    store: perCategory('no_show_forfeit_fraction'),
+    value: NULLABLE_FRACTION,
+    inert: STORED,
+  },
+  {
+    key: 'cxl.unpaid_no_show_close_after_hours',
+    class: 'money',
+    store: perCategory('unpaid_no_show_close_after_hours'),
+    value: atLeast(1),
+    inert: STORED,
+  },
+  {
+    key: 'cxl.window_hours',
+    class: 'money',
+    store: perCategory('window_hours'),
+    value: { type: 'integer', min: 1, nullable: true },
+    inert: STORED,
+  },
+  {
+    // §3.8 names no key for this column (contract notes D5, Read this first 5): it is the
+    // window's on/off that `window_hours` is the size of, so it is stored only with it.
+    key: 'cxl.window_state',
+    class: 'money',
+    store: perCategory('window_state'),
+    value: { type: 'enum', values: ['unset', 'none', 'hours'] },
+    inert: STORED,
+  },
 ];
 
 function scopeOf(entry: Entry): SettingScope {
   if (entry.scope !== undefined) return entry.scope;
+  if (entry.store.kind === 'per-category') return 'service';
   if (
     (entry.store.kind === 'column' || entry.store.kind === 'path') &&
     entry.store.tier === 'campus'
@@ -1365,12 +1485,18 @@ export function settingEntry(key: string): SettingEntry | undefined {
 }
 
 /**
- * True for a key the settings PATCH writes: its own column or payment row, and
+ * True for a key the settings PATCH writes: its own column, a per-category
+ * column (row by row) or a payment row, and
  * a class some role may hold. A path is edited through its `via` key; a catalog
  * row through its own route.
  */
 export function isPatchable(entry: SettingEntry): boolean {
-  return (entry.store.kind === 'column' || entry.store.kind === 'payment') && entry.class !== null;
+  return (
+    (entry.store.kind === 'column' ||
+      entry.store.kind === 'per-category' ||
+      entry.store.kind === 'payment') &&
+    entry.class !== null
+  );
 }
 
 // ── Who may edit which class ─────────────────────────────────────────────────

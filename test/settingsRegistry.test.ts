@@ -45,7 +45,8 @@ import { SETTINGS_TARGETS, patchableFields } from '../src/routes/staffSettings.j
  * the clients' `FETCHD_REQUIRE_WIRE`).
  */
 
-const STRUCTURAL = new Set(['id', 'location', 'updated_at', 'updated_by_staff_id']);
+// `category` keys `cancellation_policy_settings`, the `cxl` domain's per-service rows (P21).
+const STRUCTURAL = new Set(['id', 'location', 'category', 'updated_at', 'updated_by_staff_id']);
 const PAYMENT_STRUCTURAL = new Set(['key', 'scope', 'value', 'updated_at', 'updated_by_staff_id']);
 
 function drizzleTable(name: string): Table {
@@ -73,10 +74,17 @@ describe('the registry against the Drizzle schema', () => {
     for (const table of SETTINGS_TABLES) {
       if (table === 'payment_settings') continue; // key/value rows, checked below
       const editable = SETTINGS_REGISTRY.filter(
-        (e) => isPatchable(e) && e.store.kind === 'column' && e.store.table === table,
+        (e) =>
+          isPatchable(e) &&
+          (e.store.kind === 'column' || e.store.kind === 'per-category') &&
+          e.store.table === table,
       );
       for (const column of columnsOf(table).filter((c) => !STRUCTURAL.has(c))) {
-        const keys = editable.filter((e) => e.store.kind === 'column' && e.store.column === column);
+        const keys = editable.filter(
+          (e) =>
+            (e.store.kind === 'column' || e.store.kind === 'per-category') &&
+            e.store.column === column,
+        );
         assert.equal(
           keys.length,
           1,
@@ -89,7 +97,7 @@ describe('the registry against the Drizzle schema', () => {
   test('no key names a column, path or table that is not there', () => {
     for (const entry of SETTINGS_REGISTRY) {
       const { store } = entry;
-      if (store.kind === 'column' || store.kind === 'path') {
+      if (store.kind === 'column' || store.kind === 'path' || store.kind === 'per-category') {
         assert.ok(
           columnsOf(store.table).includes(store.column),
           `${entry.key} → ${store.table}.${store.column}`,
@@ -178,6 +186,44 @@ describe('the class gate: owner, manager, trainer (STAFF-U07; design §2.1:1798-
   test("the registry's domain list IS the wire's tuple (a domain appended there reaches here)", () => {
     assert.equal(SETTINGS_DOMAINS, WIRE_SETTINGS_DOMAINS);
     assert.ok(SETTINGS_TABLES.includes('staff_settings'));
+    // P21: `cxl`, the one domain on two tables, brings both into the walk above.
+    assert.ok(SETTINGS_TABLES.includes('cancellation_global_settings'));
+    assert.ok(SETTINGS_TABLES.includes('cancellation_policy_settings'));
+  });
+
+  test('the cxl domain (P21; §3.8, D5, D7): twelve keys over its two tables, every one money, every one inert but per_dog_cancel_enabled', () => {
+    const keys = SETTINGS_REGISTRY.filter((e) => e.domain === 'cxl');
+    const where = (e: (typeof keys)[number]) =>
+      e.store.kind === 'column' || e.store.kind === 'per-category'
+        ? `${e.store.table}.${e.store.column}`
+        : e.store.kind;
+    assert.deepEqual(keys.map((e) => `${e.key} → ${where(e)}`).sort(), [
+      'cxl.class_missed_meeting_money_return_mode → cancellation_global_settings.class_missed_meeting_money_return_mode',
+      'cxl.flat_fee_cents → cancellation_policy_settings.flat_fee_cents',
+      'cxl.forfeit_fraction → cancellation_policy_settings.forfeit_fraction',
+      'cxl.no_show_declare_mode → cancellation_policy_settings.no_show_declare_mode',
+      'cxl.no_show_forfeit_fraction → cancellation_policy_settings.no_show_forfeit_fraction',
+      'cxl.per_dog_cancel_enabled → cancellation_global_settings.per_dog_cancel_enabled',
+      'cxl.staff_entered_client_cancel_follows_owner_rules_enabled → cancellation_global_settings.staff_entered_client_cancel_follows_owner_rules_enabled',
+      'cxl.staff_initiated_cancel_full_return_enabled → cancellation_global_settings.staff_initiated_cancel_full_return_enabled',
+      'cxl.started_run_cancel_return_mode → cancellation_global_settings.started_run_cancel_return_mode',
+      'cxl.unpaid_no_show_close_after_hours → cancellation_policy_settings.unpaid_no_show_close_after_hours',
+      'cxl.window_hours → cancellation_policy_settings.window_hours',
+      'cxl.window_state → cancellation_policy_settings.window_state',
+    ]);
+    for (const entry of keys) {
+      assert.equal(entry.class, 'money', entry.key);
+      assert.equal(
+        entry.inert === false,
+        entry.key === 'cxl.per_dog_cancel_enabled',
+        `${entry.key}: only per_dog_cancel_enabled has a v1 reader`,
+      );
+      assert.equal(
+        entry.scope,
+        entry.store.kind === 'per-category' ? 'service' : 'global',
+        `${entry.key}: a per-service column is service-scoped`,
+      );
+    }
   });
 
   test('the counts, per class and inert', (t) => {
@@ -236,7 +282,12 @@ const CLASS_OVERRIDES: Readonly<
 /** Keys the registry carries that §3 names no row for. */
 const DESIGN_ADDED: Readonly<Record<string, string>> = {
   'day.offerings': "E03's per-campus service document (M1.07, §2.1)",
+  'cxl.window_state':
+    "M5.07's per-service window_state column, which §3.8 names no key for (contract notes D5, Read this first 5)",
 };
+
+/** The design-added keys that are stored only: §3.8's whole domain but one key is. */
+const DESIGN_ADDED_STORED = new Set(['cxl.window_state']);
 
 /** The 11-02 re-cut (plan.json P01 deferred_arms): inert until P06, P07, P09. */
 const RECUT_INERT = new Set([
@@ -287,7 +338,7 @@ function readSection3(): DesignRow[] {
 }
 
 describe("the registry against the design's §3", () => {
-  test('every §3 key of the fourteen domains is registered with §3’s class — or is dropped, or has no store yet', () => {
+  test('every §3 key of the fifteen domains is registered with §3’s class — or is dropped, or has no store yet', () => {
     const rows = readSection3();
     assert.ok(rows.length > 100, `parsed only ${rows.length} §3 rows`);
     const registry = new Map(SETTINGS_REGISTRY.map((e) => [e.key, e]));
@@ -330,7 +381,7 @@ describe("the registry against the design's §3", () => {
         .map((r) => r.key),
     );
     for (const entry of SETTINGS_REGISTRY) {
-      if (stored.has(entry.key)) {
+      if (stored.has(entry.key) || DESIGN_ADDED_STORED.has(entry.key)) {
         assert.ok(
           entry.inert !== false && entry.inert.kind === 'stored',
           `${entry.key} is *stored* in §3 but not inert-stored`,

@@ -10,7 +10,9 @@ import { mayEditClass } from './settingsRegistry.js';
  * Three sources, each the one place its rule lives:
  *   - the settings registry's class map (`mayEditClass`): `edit_prices` (the
  *     `price` class — no role in v1, the owner included: q27 → (a)) and
- *     `edit_money_policy` (the `money` class: owner and manager, STAFF-77);
+ *     `edit_money_policy` (the `money` class: owner and manager, STAFF-77; since
+ *     6.0.0-lg5.2 it also covers the `cxl` domain's keys, the cancel window and
+ *     its route being gone, P21);
  *   - the two fixed reads of STAFF-12 / STAFF-13: `open_money_reports` and
  *     `open_payment_history`, owner and manager (contract notes J2);
  *   - the five `staff_settings` lists (`passesRoleList`), and

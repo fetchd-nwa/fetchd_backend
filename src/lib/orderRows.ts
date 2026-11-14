@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { deepLinkToPath } from '../contracts/wire.js';
 import { bookingsRepository } from '../db/repositories/bookingsRepository.js';
 import { lockPools } from '../db/locks.js';
@@ -31,6 +31,14 @@ export async function findDebitsOfRows(
   return debits;
 }
 
+/** One credit a cancel returned: the row and dog it paid for, and the return's id. */
+export interface ReturnedCredit {
+  bookingId: string;
+  dogId: string | null;
+  ownerId: string;
+  returnId: string;
+}
+
 /**
  * Return every credit these rows debited and nothing has returned yet, each through the
  * one return writer to the lot it drew from, or a fresh lot if that lot can pay no later
@@ -39,24 +47,31 @@ export async function findDebitsOfRows(
  * in `lockPools`' one order (`db/locks.ts`). The order's cancels use it: a pending row's
  * slots may wait on the settle, so a share with no debit here is not an alarm.
  *
- * Returns the owner credited, whose balance cache the caller wipes post-commit, or nothing
- * if these rows debited nothing.
+ * Answers every return written, empty if these rows debited nothing: the owner's notice
+ * reads where each landed, and the caller wipes her balance cache post-commit.
  */
 export async function returnDebitsToLots(
   tx: Tx,
   args: { bookingIds: readonly string[]; now: Date },
-): Promise<string | undefined> {
+): Promise<ReturnedCredit[]> {
   const debits = await findDebitsOfRows(tx, args.bookingIds);
   await lockPools(tx, debits);
+  const returned: ReturnedCredit[] = [];
   for (const debit of debits) {
     // A cancel's return names no check-in event (M5.10's link is the board verbs').
-    await creditLedgerRepository.refundForBooking(tx, {
+    const { id } = await creditLedgerRepository.refundForBooking(tx, {
       ...debit,
       now: args.now,
       checkinEventId: null,
     });
+    returned.push({
+      bookingId: debit.bookingId,
+      dogId: debit.dogId,
+      ownerId: debit.ownerId,
+      returnId: id,
+    });
   }
-  return debits[0]?.ownerId;
+  return returned;
 }
 
 /** The constant sentence of design §2.3:2502-2505's alarm. */
@@ -102,22 +117,29 @@ export interface CreditLanding {
 }
 
 /**
+ * Who cancelled: the owner, or the school with the staff reason, quoted verbatim in the
+ * notice when there is one (D13: the whole-session staff cancel's `reason?` stays
+ * optional; the one-dog staff cancel requires one).
+ */
+export type CancellationWho = { by: 'owner' } | { by: 'staff'; reason?: string };
+
+/**
  * Every `booking-cancelled` body, by §2.9's two arms (design.md:4546): who, and the credit
- * line. `session` is the whole-session cancel, its body byte for byte as before P20 until
- * P21 rewrites it with the staff reason (NOTIF-U17). `one-dog` is one dog cancelled out of
- * her day (s11), by the owner or by the school (the reason joins at P21). `staff-return`
- * is a credit the door decided: a ticked check-out (*picked up early*) now, and from pass
- * 2 the send-home, the turn-away and *Didn't come*.
+ * line. `cancel` is a cancel of the whole session or of one dog of it (s11), by the owner
+ * or by the school, naming the dogs it took and every credit that came back, one entry
+ * per credit, each read from where it landed (none for a row that spent no credit: a
+ * private lesson, an evaluation). `staff-return` is a credit the door decided: a ticked
+ * check-out (*picked up early*), the send-home, the turn-away and *Didn't come*. No arm
+ * names money (P21, NOTIF-U17): a cancel returns a credit and nothing else.
  */
 export type CancellationNotice =
-  | { kind: 'session'; category: ServiceCategory; scheduledAtIso: string; forfeited: boolean }
   | {
-      kind: 'one-dog';
-      by: 'owner' | 'staff';
-      dogName: string;
-      category: 'day-school' | 'day-care';
+      kind: 'cancel';
+      who: CancellationWho;
+      dogNames: readonly string[];
+      category: ServiceCategory;
       scheduledAtIso: string;
-      credit: CreditLanding;
+      credits: readonly CreditLanding[];
     }
   | {
       kind: 'staff-return';
@@ -128,14 +150,15 @@ export type CancellationNotice =
 
 const CHICAGO = 'America/Chicago';
 
+/** A lot's date as every credit line prints it: "10 Nov", in Chicago. */
+function shownDate(at: Date): string {
+  return at.toLocaleDateString('en-GB', { timeZone: CHICAGO, day: 'numeric', month: 'short' });
+}
+
 /** "+1 credit, back to your Bentonville day-school credits (expires 19 Oct)", or, into a
  *  dead lot, §2.9's line: never a date she cannot spend shown as current. */
 function creditLine(credit: CreditLanding): string {
-  const date = credit.expiresAt.toLocaleDateString('en-GB', {
-    timeZone: CHICAGO,
-    day: 'numeric',
-    month: 'short',
-  });
+  const date = shownDate(credit.expiresAt);
   const noun = credit.credits === 1 ? 'credit' : 'credits';
   if (!credit.live) {
     const its = credit.credits === 1 ? 'its' : 'their';
@@ -144,6 +167,28 @@ function creditLine(credit: CreditLanding): string {
   const campus = `${credit.location.charAt(0).toUpperCase()}${credit.location.slice(1)}`;
   const program = credit.mode === 'school' ? 'day-school' : 'daycare';
   return `+${credit.credits} ${noun}, back to your ${campus} ${program} credits (expires ${date})`;
+}
+
+/**
+ * One credit line per landing, each true (brief B-5; §2.9 is silent on a day whose returns
+ * landed in more than one place): credits that read the same line (one pool, one printed
+ * date, both live or both dead) are summed into it ("+2 credits"), and two dogs on two
+ * lots of two dates get two lines, never one date for credits that carry two. No landing,
+ * no line. Shared by `booking-cancelled` and the failed-payment notice.
+ */
+export function creditLines(landings: readonly CreditLanding[]): string[] {
+  const merged = new Map<string, CreditLanding>();
+  for (const landing of landings) {
+    const key = [landing.location, landing.mode, landing.live, shownDate(landing.expiresAt)].join(
+      '|',
+    );
+    const seen = merged.get(key);
+    merged.set(
+      key,
+      seen === undefined ? landing : { ...seen, credits: seen.credits + landing.credits },
+    );
+  }
+  return [...merged.values()].map(creditLine);
 }
 
 const WHO_AT_THE_DOOR: Record<
@@ -156,23 +201,40 @@ const WHO_AT_THE_DOOR: Record<
   'didnt-come': "didn't come today",
 };
 
+/** What a cancel takes, as its notice names it. */
+const PROGRAM: Record<ServiceCategory, string> = {
+  'day-school': 'day school',
+  'day-care': 'day care',
+  'group-class': 'class',
+  'private-lesson': 'private lesson',
+  boarding: 'boarding stay',
+  'board-and-train': 'board & train',
+  evaluation: 'evaluation',
+};
+
+/** "Pepper", "Bao and Luna", "Bao, Luna and Pepper". */
+function namesOf(dogNames: readonly string[]): string {
+  if (dogNames.length <= 1) return dogNames[0] ?? 'your dog';
+  return `${dogNames.slice(0, -1).join(', ')} and ${dogNames[dogNames.length - 1]}`;
+}
+
 export function cancellationBody(notice: CancellationNotice): string {
   switch (notice.kind) {
-    case 'session':
-      return sessionCancellationBody(notice.category, notice.scheduledAtIso, notice.forfeited);
-    case 'one-dog': {
+    case 'cancel': {
       const day = new Date(notice.scheduledAtIso).toLocaleDateString('en-GB', {
         timeZone: CHICAGO,
         weekday: 'short',
         day: 'numeric',
         month: 'short',
       });
-      const program = notice.category === 'day-school' ? 'day school' : 'day care';
+      const whose = `${namesOf(notice.dogNames)}'s ${PROGRAM[notice.category]}`;
       const who =
-        notice.by === 'owner'
-          ? `You cancelled ${notice.dogName}'s ${program}, ${day}`
-          : `The school cancelled ${notice.dogName}'s ${program} on ${day}`;
-      return `${who}. ${creditLine(notice.credit)}.`;
+        notice.who.by === 'owner'
+          ? `You cancelled ${whose}, ${day}`
+          : notice.who.reason === undefined
+            ? `The school cancelled ${whose} on ${day}`
+            : `The school cancelled ${whose} on ${day}: "${notice.who.reason}"`;
+      return [who, ...creditLines(notice.credits)].map((sentence) => `${sentence}.`).join(' ');
     }
     case 'staff-return':
       return `${notice.dogName} ${WHO_AT_THE_DOOR[notice.event]}. ${creditLine(notice.credit)}.`;
@@ -180,51 +242,14 @@ export function cancellationBody(notice: CancellationNotice): string {
 }
 
 /**
- * The whole-session arm: brief, category-aware, mentions the forfeit state when
- * applicable so the owner doesn't have to open the booking detail to learn the refund
- * didn't land.
- *
- * "Refund is on the way" also covers the `'unroutable'` branch, where it is true
- * because a human will send the money by hand rather than because a worker will.
- * Flagged to Allison with exactly that caveat and **ruled KEEP on 2026-08-20 —
- * explicitly including refunds a human sends by hand** (the money IS coming; the
- * owner does not need to know which channel carries it). Do not "fix" this to a
- * hedged variant without a new ruling.
- *
- * Provenance, because an earlier version of this comment cited the wrong date:
- * 2026-08-19's only ruling was the two flagged push titles. This copy ruling is
- * 2026-08-20.
+ * The `booking-cancelled` feed row for a cancelled row, in its own savepoint: who, the
+ * dogs it took, and a credit line for each credit that came back, composed inside the
+ * savepoint from where each return landed, read after the write (§2.9), so a failed read
+ * rolls the notice back and never the credit. `dogIds` are the dogs the cancel took (a
+ * day's live shares; every dog on any other row); `returnIds` the returns it wrote, none
+ * for a row that spent no credit. Until P31 it is a feed row, not a push
+ * (`m1_known_gaps`), so the reason is quoted whole.
  */
-function sessionCancellationBody(
-  category: ServiceCategory,
-  scheduledAtIso: string,
-  forfeited: boolean,
-): string {
-  const when = new Date(scheduledAtIso).toLocaleDateString('en-US', {
-    timeZone: 'America/Chicago',
-    month: 'short',
-    day: 'numeric',
-  });
-  const noun =
-    category === 'boarding'
-      ? `boarding stay starting ${when}`
-      : category === 'board-and-train'
-        ? `board & train starting ${when}`
-        : category === 'private-lesson'
-          ? `private lesson on ${when}`
-          : category === 'day-school'
-            ? `day school on ${when}`
-            : category === 'day-care'
-              ? `day care on ${when}`
-              : category === 'evaluation'
-                ? `evaluation on ${when}`
-                : `session on ${when}`;
-  return forfeited
-    ? `Your ${noun} is cancelled. The cancellation window has passed — no refund.`
-    : `Your ${noun} is cancelled. Refund is on the way.`;
-}
-
-/** The `booking-cancelled` feed row for one row, in its own savepoint. */
 export async function noticeBookingCancelled(
   tx: Tx,
   args: {
@@ -232,7 +257,9 @@ export async function noticeBookingCancelled(
     ownerId: string;
     category: ServiceCategory;
     scheduledAt: string;
-    forfeited: boolean;
+    who: CancellationWho;
+    dogIds: readonly string[];
+    returnIds: readonly string[];
     log: NoticeLog;
   },
 ): Promise<void> {
@@ -244,21 +271,39 @@ export async function noticeBookingCancelled(
       log: args.log,
     },
     async (sp) => {
-      const dogJoinRows = await bookingsRepository.findDogsByBookingIds([args.bookingId]);
+      const named =
+        args.dogIds.length === 0
+          ? []
+          : await sp
+              .select({ id: dogs.id, name: dogs.name })
+              .from(dogs)
+              .where(inArray(dogs.id, [...args.dogIds]));
+      // In the cancel's own order (a day's lead first), not the read's.
+      const dogNames = args.dogIds.map((id) => {
+        const dog = named.find((d) => d.id === id);
+        if (dog === undefined) throw new Error(`dog ${id} has no row to name`);
+        return dog.name;
+      });
+      const credits: CreditLanding[] = [];
+      for (const returnId of args.returnIds) {
+        credits.push(toCreditLanding(await findReturnLanding(sp, returnId)));
+      }
       await notificationsRepository.enqueue(sp, {
         ownerId: args.ownerId,
         type: 'booking-cancelled',
         title: 'Booking cancelled',
         body: cancellationBody({
-          kind: 'session',
+          kind: 'cancel',
+          who: args.who,
+          dogNames,
           category: args.category,
           scheduledAtIso: args.scheduledAt,
-          forfeited: args.forfeited,
+          credits,
         }),
         deepLinkPath: deepLinkToPath({ kind: 'booking', id: args.bookingId }),
         deepLinkKind: 'booking',
         deepLinkId: args.bookingId,
-        dogIds: dogJoinRows.map((r) => r.dogId),
+        dogIds: [...args.dogIds],
       });
     },
   );
@@ -266,10 +311,10 @@ export async function noticeBookingCancelled(
 
 /**
  * The owner's notice for one credit that came back, in its own savepoint: one dog
- * cancelled out of her day, or a credit the door decided (a ticked check-out). Composed
- * inside the savepoint from where the credit landed, read after the write (§2.9), so a
- * failed read rolls the notice back and never the credit. Until P31 it is a feed row, not
- * a push (`m1_known_gaps`); its trigger, `owner-cancel`, `staff-cancel` or
+ * cancelled out of her day, or a credit the door decided (a ticked check-out, a settling
+ * verb). Composed inside the savepoint from where the credit landed, read after the write
+ * (§2.9), so a failed read rolls the notice back and never the credit. Until P31 it is a
+ * feed row, not a push (`m1_known_gaps`); its trigger, `owner-cancel`, `staff-cancel` or
  * `staff-return`, is the alarm's dedupe key here and has no column until the queue.
  */
 export async function noticeCreditReturned(
@@ -283,7 +328,7 @@ export async function noticeCreditReturned(
     who:
       | {
           kind: 'one-dog';
-          by: 'owner' | 'staff';
+          by: CancellationWho;
           category: 'day-school' | 'day-care';
           scheduledAtIso: string;
         }
@@ -298,7 +343,7 @@ export async function noticeCreditReturned(
   const trigger =
     args.who.kind === 'staff-return'
       ? `staff-return:${args.who.eventId}`
-      : `${args.who.by}-cancel:${args.bookingId}:${args.dogId}`;
+      : `${args.who.by.by}-cancel:${args.bookingId}:${args.dogId}`;
   await noticeInSavepoint(
     tx,
     {
@@ -319,12 +364,12 @@ export async function noticeCreditReturned(
               credit,
             })
           : cancellationBody({
-              kind: 'one-dog',
-              by: args.who.by,
-              dogName: dog.name,
+              kind: 'cancel',
+              who: args.who.by,
+              dogNames: [dog.name],
               category: args.who.category,
               scheduledAtIso: args.who.scheduledAtIso,
-              credit,
+              credits: [credit],
             });
       await notificationsRepository.enqueue(sp, {
         ownerId: args.ownerId,
@@ -340,7 +385,27 @@ export async function noticeCreditReturned(
   );
 }
 
-function toCreditLanding(landing: ReturnLanding): CreditLanding {
+/**
+ * Each row's dogs still on it (a share cancelled alone is not), lead first then by id: the
+ * dogs a whole cancel takes, in the order its notice names them. Through the caller's
+ * transaction.
+ */
+export async function liveDogsLeadFirst(
+  tx: Tx,
+  bookingIds: readonly string[],
+): Promise<Map<string, string[]>> {
+  const shares = (await bookingsRepository.findSharesByBookingIds(tx, [...bookingIds]))
+    .filter((share) => share.expiredAt === null)
+    .sort((a, b) => Number(b.isLead) - Number(a.isLead) || a.dogId.localeCompare(b.dogId));
+  const byRow = new Map<string, string[]>();
+  for (const share of shares) {
+    byRow.set(share.bookingId, [...(byRow.get(share.bookingId) ?? []), share.dogId]);
+  }
+  return byRow;
+}
+
+/** Where one return landed, as a credit line reads it (one credit a return). */
+export function toCreditLanding(landing: ReturnLanding): CreditLanding {
   return {
     credits: 1,
     location: landing.location,
@@ -355,6 +420,8 @@ export interface CancelledOrderRows {
   location: string | null;
   /** The owner credited back, if any was: the caller wipes her balance cache post-commit. */
   creditRefundedOwnerId?: string;
+  /** Every credit these rows got back, each return's own id: what a notice reads. */
+  returned: ReturnedCredit[];
 }
 
 /**
@@ -367,8 +434,10 @@ export interface CancelledOrderRows {
  * was never confirmed, and a settled top-up's rows go back as credits.
  *
  * `cancelledBy` is NULL for a failure no person chose. `notifyEachRow` is the
- * `settled_then_cancelled` arm, an ordinary cancel with an ordinary notice; every
- * other caller's one notice is the failed-payment one.
+ * `settled_then_cancelled` arm, an ordinary cancel with an ordinary notice per row, each
+ * naming the credit that row got back (P21 `plan_added` [0]: never "Refund is on the
+ * way"), so every notice is written after every return; every other caller's one notice
+ * is the failed-payment one, which reads `returned`.
  */
 export async function cancelOrderRowsInTx(
   tx: Tx,
@@ -390,24 +459,41 @@ export async function cancelOrderRowsInTx(
       now: args.now,
     });
     await tearDownBookingReminders(tx, row.id);
-    if (args.notifyEachRow) {
+  }
+  const returned = await returnDebitsToLots(tx, {
+    bookingIds: rows.map((r) => r.id),
+    now: args.now,
+  });
+  if (args.notifyEachRow) {
+    if (args.cancelledBy === null) {
+      throw new Error(`order ${args.orderId}: an ordinary cancel's notice needs who cancelled`);
+    }
+    const who: CancellationWho =
+      args.cancelledBy === 'owner'
+        ? { by: 'owner' }
+        : { by: 'staff', ...(args.cancelReason !== undefined ? { reason: args.cancelReason } : {}) };
+    const shares = await liveDogsLeadFirst(
+      tx,
+      rows.map((r) => r.id),
+    );
+    for (const row of rows) {
       await noticeBookingCancelled(tx, {
         bookingId: row.id,
         ownerId: row.ownerId,
         category: row.category,
         scheduledAt: row.scheduledAt,
-        forfeited: false,
+        who,
+        dogIds: shares.get(row.id) ?? [],
+        returnIds: returned.filter((r) => r.bookingId === row.id).map((r) => r.returnId),
         log: args.log,
       });
     }
   }
-  const creditRefundedOwnerId = await returnDebitsToLots(tx, {
-    bookingIds: rows.map((r) => r.id),
-    now: args.now,
-  });
+  const creditRefundedOwnerId = returned[0]?.ownerId;
   return {
     bookingIds: rows.map((r) => r.id),
     location: rows[0]?.location ?? null,
     ...(creditRefundedOwnerId !== undefined ? { creditRefundedOwnerId } : {}),
+    returned,
   };
 }

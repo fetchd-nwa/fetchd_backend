@@ -40,8 +40,6 @@ export const QUIET_LOG = {
   error: (): void => undefined,
 };
 
-const A_MINUTE_MS = 60_000;
-
 export interface SeededOrder {
   orderId: string;
   chargeId: string;
@@ -168,7 +166,6 @@ export async function seedPendingBookingOrder(
         scheduledAt,
         location: 'fayetteville',
         notes: null,
-        cancelDeadlineAt: new Date(scheduledAt.getTime() - 24 * 60 * A_MINUTE_MS),
         additionalDogIds: [],
       });
       const pool = {

@@ -296,7 +296,18 @@ describe('GET /staff/settings/:domain[/:location]', SKIP_WHEN_NO_DB, () => {
         const url = `/staff/settings/${target.domain}${location === null ? '' : `/${location}`}`;
         const row = (await app.inject({ method: 'GET', url })).json<unknown>();
         const body: Record<string, unknown> = {};
-        if (Array.isArray(row)) {
+        if (target.domain === 'cxl') {
+          // `cxl`'s two parts in PATCH body form: a global column by value, a per-service
+          // column as a category → value map (`PatchStaffSettingsCxlRequest`).
+          const { policies, global } = row as SettingsWireByDomain['cxl'];
+          Object.assign(body, global);
+          for (const policy of policies) {
+            for (const [column, value] of Object.entries(policy)) {
+              if (['category', 'updated_at', 'updated_by_staff_id'].includes(column)) continue;
+              body[column] = { ...(body[column] as object), [policy.category]: value };
+            }
+          }
+        } else if (Array.isArray(row)) {
           for (const r of row as PaymentSettingWire[]) {
             if (r.key === 'charge_timing_mode') {
               body.charge_timing_mode = {
@@ -314,7 +325,8 @@ describe('GET /staff/settings/:domain[/:location]', SKIP_WHEN_NO_DB, () => {
   test('a bad path is 400: an unknown domain, a location on a one-row domain, an unknown campus', async () => {
     const app = appAs(TRAINER);
     for (const url of [
-      '/staff/settings/cxl',
+      // `brd` has no table in v1 (§3.18); `cxl` is a domain from P21.
+      '/staff/settings/brd',
       '/staff/settings/acct/fayetteville',
       '/staff/settings/day/springdale',
     ]) {

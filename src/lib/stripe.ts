@@ -700,9 +700,13 @@ export interface StripeClient {
   ): Promise<StripePaymentIntentResult>;
 
   /**
-   * Refund a portion (or all) of a prior PaymentIntent. Used by POST
-   * /bookings/:id/cancel money-back branch post-commit (Day-13 stubbed
-   * this; Day-14 wires it). Stripe is asynchronous for refunds — the
+   * Refund a portion (or all) of a prior PaymentIntent. Fired post-commit by
+   * `firePendingRefundPostCommit` (a pending order's F4 refund, a class withdraw's
+   * refund, the webhook's lost-settle double charge, the capture reconciler's
+   * surplus), by the duplicate-refund retry worker, and by confirm-payment's unwind
+   * of a capture whose transaction failed. A booking cancel no longer calls it:
+   * its money-back branch was deleted in P21 (wire 6.0.0-lg5.2). Stripe is
+   * asynchronous for refunds — the
    * initial status is usually 'pending'; Day-15 webhook flips the
    * `refunds` row's `status` on `charge.refund.updated`.
    */

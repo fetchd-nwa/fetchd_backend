@@ -22,7 +22,10 @@ import {
   type ChargePurpose,
   type EngineChargeRow,
 } from '../db/repositories/chargesRepository.js';
-import { creditLedgerRepository } from '../db/repositories/creditLedgerRepository.js';
+import {
+  creditLedgerRepository,
+  findReturnLanding,
+} from '../db/repositories/creditLedgerRepository.js';
 import { creditPackagesRepository } from '../db/repositories/creditPackagesRepository.js';
 import { creditsInvalidationPattern } from '../db/repositories/creditsRepository.js';
 import { invoicesRepository, repointPaymentMethod } from '../db/repositories/invoicesRepository.js';
@@ -42,7 +45,14 @@ import { enqueueBookingReminders } from './enqueueBookingReminders.js';
 import { ApiError, toErrorEnvelope } from './errors.js';
 import { creditReceiptBody, formatDollars } from './invoiceReceiptCopy.js';
 import { noticeInSavepoint } from './noticeInSavepoint.js';
-import { cancelOrderRowsInTx, findDebitsOfRows, type CancelledOrderRows } from './orderRows.js';
+import {
+  cancelOrderRowsInTx,
+  creditLines,
+  findDebitsOfRows,
+  toCreditLanding,
+  type CancelledOrderRows,
+  type CreditLanding,
+} from './orderRows.js';
 import { firePendingRefundPostCommit, type PendingStripeRefund } from './pendingRefund.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
 import { settleChargeAgainstInvoice } from './settleInvoiceCharge.js';
@@ -639,17 +649,28 @@ type FailureNotice = 'charge-failed' | 'order-cancelled' | 'cancel-while-process
  * is true to say of credits (§2.4:3013-3016, §2.7:4021-4026). A failure that took booking
  * rows down says the booking is gone, because this notice is all she hears of it: those
  * rows write no `booking-cancelled` row, and the last thing she read was "Confirmed!".
- * "Any credits it used" holds for a top-up that used none. `cancel-while-processing`
- * never says the payment failed, which it may not have: Stripe would not stop it. Its
- * trigger is §2.9's. Its type, `payment-refunded`, is born with M7.09, so until LG7 it
- * rides `payment-failed` with a title that does not say so.
+ * What came back is said only as it came back (P21, `brief_must_say` 3; P18 185(b)):
+ * §2.9's credit line for each landing, the dead-lot line for a credit returned into a dead
+ * lot (`cred.returned_credit_expiry_months` 0), and nothing for a row that returned
+ * nothing (a `past` row keeps its debit; a top-up that used no credit). It was "Any
+ * credits it used are back in your account", false in both of the last cases. Every arm
+ * that took rows down carries those lines, `cancel-while-processing` included (P21 fix 1,
+ * Opus r1 L6): this notice is all she hears of the credit, since the failure arms write no
+ * `booking-cancelled` row. `cancel-while-processing` never says the payment failed, which
+ * it may not have: Stripe would not stop it. Its trigger is §2.9's. Its type,
+ * `payment-refunded`, is born with M7.09, so until LG7 it rides `payment-failed` with a
+ * title that does not say so.
  */
 function failureNoticeCopy(
   trigger: FailureNotice,
   charge: Pick<EngineChargeRow, 'amountCents' | 'packageId'>,
   tookDownRows: boolean,
+  credits: readonly CreditLanding[],
 ): { title: string; body: string } {
   const amount = formatDollars(charge.amountCents);
+  const back = creditLines(credits)
+    .map((line) => ` ${line}.`)
+    .join('');
   const bought = charge.packageId !== null;
   const pack = bought && !tookDownRows;
   switch (trigger) {
@@ -661,13 +682,13 @@ function failureNoticeCopy(
           }
         : {
             title: 'Booking cancelled',
-            body: `Cancelled. If your bank still takes the ${amount}, we refund it automatically.`,
+            body: `Cancelled. If your bank still takes the ${amount}, we refund it automatically.${back}`,
           };
     case 'order-cancelled':
       if (tookDownRows) {
         return {
           title: 'Booking cancelled',
-          body: `Your booking and its ${amount} payment were cancelled, so you weren't charged. Any credits it used are back in your account.`,
+          body: `Your booking and its ${amount} payment were cancelled, so you weren't charged.${back}`,
         };
       }
       return pack
@@ -680,7 +701,7 @@ function failureNoticeCopy(
       if (tookDownRows) {
         return {
           title: 'Booking cancelled',
-          body: `Your ${amount} payment didn't go through, so you weren't charged and your booking is cancelled. Any credits it used are back in your account.`,
+          body: `Your ${amount} payment didn't go through, so you weren't charged and your booking is cancelled.${back}`,
         };
       }
       return pack
@@ -720,6 +741,8 @@ export async function noticePaymentFailed(
     trigger: FailureNotice;
     /** This failure cancelled at least one row, so what she lost is a booking. */
     tookDownRows: boolean;
+    /** The returns the failure's cancel wrote: the notice says where each landed. */
+    returnIds: readonly string[];
     now: Date;
     log: EngineLog;
   },
@@ -727,13 +750,18 @@ export async function noticePaymentFailed(
   const { charge, order, trigger, tookDownRows, now, log } = args;
   const dedupeKey = `${trigger}:${charge.id}`;
   await noticeInSavepoint(tx, { subject: { chargeId: charge.id }, dedupeKey, log }, async (sp) => {
+    // Read inside the savepoint, after the returns were written (§2.9's compose rule).
+    const credits: CreditLanding[] = [];
+    for (const returnId of args.returnIds) {
+      credits.push(toCreditLanding(await findReturnLanding(sp, returnId)));
+    }
     await scheduledNotificationsRepository.enqueueIdempotent(sp, {
       ownerId: charge.ownerId,
       type: 'payment-failed',
       trigger,
       dedupeKey,
       scheduledFor: now,
-      ...failureNoticeCopy(trigger, charge, tookDownRows),
+      ...failureNoticeCopy(trigger, charge, tookDownRows, credits),
       ...(order.invoiceId !== null
         ? {
             deepLinkPath: deepLinkToPath({
@@ -821,6 +849,7 @@ export async function failChargeInTx(
       order,
       trigger: args.notice,
       tookDownRows: (cancelled?.bookingIds.length ?? 0) > 0,
+      returnIds: cancelled?.returned.map((r) => r.returnId) ?? [],
       now: args.now,
       log: args.log,
     });

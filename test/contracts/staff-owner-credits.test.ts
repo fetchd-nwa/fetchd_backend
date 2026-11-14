@@ -17,17 +17,21 @@ import {
   staffSettings,
 } from '../../src/db/schema/schema.js';
 import type {
+  BookingWire,
   CreditLotDetailWire,
+  PostBookingsResponse,
   StaffCreditPoolWire,
   StaffOwnerCreditsWire,
 } from '../../src/contracts/wire.js';
 import { creditsInvalidationPattern } from '../../src/db/repositories/creditsRepository.js';
 import { invalidatePattern } from '../../src/lib/cache.js';
+import { bucketChicagoToday } from '../../src/lib/chicagoDate.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerCreditsRoute } from '../../src/routes/credits.js';
 import { registerStaffCreditPackagesRoute } from '../../src/routes/staffCreditPackages.js';
 import { registerStaffCreditsRoute } from '../../src/routes/staffCredits.js';
 import { registerStaffSettingsRoute } from '../../src/routes/staffSettings.js';
+import { at, boardApp, makeClock, ownerDogCancel, verb } from './_checkinFixture.js';
 import { createBookableDog, removeDogs } from './_dayFixture.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import {
@@ -909,6 +913,159 @@ test(
         .find((l) => l.id === lotId)?.booked_ahead,
       { count: 0, dates: [] },
     );
+  },
+);
+
+/** One lot as `GET /staff/owners/:id/credits` reads it at `now`. */
+async function lotAt(lotId: string, now: () => Date): Promise<CreditLotDetailWire | undefined> {
+  const res = await read(staffApp(FIXTURE_MANAGER_PRINCIPAL, now));
+  assert.equal(res.statusCode, 200, res.body);
+  return (res.json() as StaffOwnerCreditsWire).pools
+    .flatMap((pool) => pool.lots)
+    .find((l) => l.id === lotId);
+}
+
+/** Two dogs on these dates, paid in credits, through `POST /bookings`: the session of each date. */
+async function bookTwo(
+  owner: ReturnType<typeof bookingApp>,
+  dogIds: readonly [string, string],
+  dates: readonly string[],
+): Promise<Map<string, BookingWire>> {
+  const res = await owner.inject({
+    method: 'POST',
+    url: '/bookings',
+    headers: { 'idempotency-key': `ahead-${randomUUID()}` },
+    payload: {
+      category: 'day-school',
+      lead_dog_id: dogIds[0],
+      additional_dog_ids: [dogIds[1]],
+      dates,
+      location: 'bentonville',
+      payment: { kind: 'credits' },
+    },
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  const { sessions } = res.json() as PostBookingsResponse;
+  // `date` is the session's instant: its day is the Chicago one.
+  return new Map(sessions.map((s) => [bucketChicagoToday(new Date(s.date)), s]));
+}
+
+/** Each dog's `booking-debit` on one session, and the lot it drew from. */
+async function debitLots(bookingId: string): Promise<Map<string, string>> {
+  const rows = await db
+    .select({ dogId: creditLedger.dogId, lotId: creditLedger.lotId })
+    .from(creditLedger)
+    .where(and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'booking-debit')));
+  return new Map(rows.map((r) => [r.dogId as string, r.lotId as string]));
+}
+
+async function statusOf(bookingId: string): Promise<string | undefined> {
+  const [row] = await db
+    .select({ status: bookings.status })
+    .from(bookings)
+    .where(eq(bookings.id, bookingId));
+  return row?.status;
+}
+
+test(
+  'GET: booked_ahead, one dog of two cancelled alone: the day is named once, for the dog who stays',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Biscuit and Mochi on Tue 20 and Wed 21 Oct, both from one lot. The owner cancels
+    // Biscuit alone on the 20th: the session stays upcoming for Mochi, Biscuit's debit
+    // stays and a return brings her credit back to the lot.
+    const biscuit = await createBookableDog(createdDogs);
+    const mochi = await createBookableDog(createdDogs);
+    const lotId = await plantLot({ credits: 5, expiresAt: LOT_FAR });
+    const owner = bookingApp();
+    const sessions = await bookTwo(owner, [biscuit, mochi], ['2037-10-20', '2037-10-21']);
+    const tuesday = sessions.get('2037-10-20');
+    assert.ok(tuesday !== undefined, 'a session on the 20th');
+
+    const res = await ownerDogCancel(owner, { bookingId: tuesday.id, dogId: biscuit });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as BookingWire).status, 'upcoming', 'Mochi still comes');
+    assert.equal(await statusOf(tuesday.id), 'upcoming');
+
+    const lot = await lotAt(lotId, BOOKING_CLOCK);
+    assert.equal(lot?.remaining, 2, 'three credits out: Mochi on the 20th, both on the 21st');
+    assert.deepEqual(lot?.booked_ahead, {
+      count: 3,
+      dates: ['2037-10-20', '2037-10-21', '2037-10-21'],
+    });
+  },
+);
+
+test(
+  'GET: booked_ahead, a lot whose only debit on a day came back reads that day nowhere, while the session stays',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // A two-dog household on Thu 22 Oct, each dog paid from her own lot: the one-credit lot
+    // is the soonest to expire, so it pays one dog and the other lot pays the other. The
+    // owner cancels the dog the small lot paid: that lot's one debit on the 22nd came back,
+    // and the session stays upcoming for the other dog.
+    const first = await createBookableDog(createdDogs);
+    const second = await createBookableDog(createdDogs);
+    const small = await plantLot({ credits: 1, expiresAt: '2038-01-01T00:00:00.000Z' });
+    const large = await plantLot({ credits: 3, expiresAt: LOT_FAR });
+    const owner = bookingApp();
+    const thursday = (await bookTwo(owner, [first, second], ['2037-10-22'])).get('2037-10-22');
+    assert.ok(thursday !== undefined, 'a session on the 22nd');
+    const paidBy = await debitLots(thursday.id);
+    assert.deepEqual(
+      new Set(paidBy.values()),
+      new Set([small, large]),
+      'each dog drew from her own lot',
+    );
+    const leaving = [...paidBy].find(([, lot]) => lot === small)?.[0] as string;
+
+    const res = await ownerDogCancel(owner, { bookingId: thursday.id, dogId: leaving });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(await statusOf(thursday.id), 'upcoming', 'the other dog still comes');
+
+    const smallLot = await lotAt(small, BOOKING_CLOCK);
+    assert.equal(smallLot?.remaining, 1, 'its credit came back');
+    assert.deepEqual(smallLot?.booked_ahead, { count: 0, dates: [] });
+    assert.deepEqual((await lotAt(large, BOOKING_CLOCK))?.booked_ahead, {
+      count: 1,
+      dates: ['2037-10-22'],
+    });
+  },
+);
+
+test(
+  'GET: booked_ahead, a turn-away leaves the session upcoming and its day leaves the lot, dog by dog',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // Fri 23 Oct, two dogs from one lot. At 07:35 the door turns one away: her credit comes
+    // back (`day.sent_home_before_training_return_fraction` 1), and no verb writes the
+    // booking's status, so the session reads `upcoming` while the day is still today.
+    const day = '2037-10-23';
+    const one = await createBookableDog(createdDogs);
+    const two = await createBookableDog(createdDogs);
+    const lotId = await plantLot({ credits: 5, expiresAt: LOT_FAR });
+    const friday = (await bookTwo(bookingApp(), [one, two], [day])).get(day);
+    assert.ok(friday !== undefined, 'a session on the 23rd');
+    const board = boardApp(FIXTURE_STAFF_PRINCIPAL, makeClock(at(day, '07:35')));
+    const morning = (): Date => at(day, '09:00');
+    assert.deepEqual((await lotAt(lotId, morning))?.booked_ahead, {
+      count: 2,
+      dates: [day, day],
+    });
+
+    const away = await verb(board, { bookingId: friday.id, dogId: one, verb: 'turn-away' });
+    assert.equal(away.statusCode, 200, away.body);
+    assert.equal(await statusOf(friday.id), 'upcoming', 'a turn-away writes no status');
+    const afterOne = await lotAt(lotId, morning);
+    assert.equal(afterOne?.remaining, 4, 'her credit came back');
+    assert.deepEqual(afterOne?.booked_ahead, { count: 1, dates: [day] });
+
+    const both = await verb(board, { bookingId: friday.id, dogId: two, verb: 'turn-away' });
+    assert.equal(both.statusCode, 200, both.body);
+    assert.equal(await statusOf(friday.id), 'upcoming', 'with every dog turned away, too');
+    const afterTwo = await lotAt(lotId, morning);
+    assert.equal(afterTwo?.remaining, 5);
+    assert.deepEqual(afterTwo?.booked_ahead, { count: 0, dates: [] });
   },
 );
 

@@ -36,11 +36,12 @@ export type CappedRefundMint =
 
 /**
  * `schema.sql` `refund_status`. `'unroutable'` (2026-08-19, design §4) is
- * TERMINAL and reachable three ways: minted there by `cancelBookingService`'s
- * no-PaymentIntent branch, minted there by the group-class withdraw's
+ * TERMINAL and reachable two ways: minted there by the group-class withdraw's
  * `refund_manual` arm (2026-08-24, `designs/money-residue.md` §3 — the last
  * NULL-PI money-back path that recorded nothing), or flipped there from
- * `'pending'` by {@link refundsRepository.markUnroutable}. Nothing ever leaves
+ * `'pending'` by {@link refundsRepository.markUnroutable}. (A third,
+ * `cancelBookingService`'s no-PaymentIntent branch, was deleted with the
+ * cancel's money-back branch in P21, wire 6.0.0-lg5.2; rows it minted stay.) Nothing ever leaves
  * it automatically — the money returns when a human returns it.
  *
  * `'resolved-external'` (2026-08-24, `designs/money-residue.md` §4) is the exit
@@ -79,7 +80,8 @@ export type { RefundStatus } from '../../contracts/wire.js';
  * refunds are allowed.
  *
  * Lifecycle by day:
- *   - Day 13: `createPending` from the cancel-money-back branch.
+ *   - Day 13: `createPending` from the cancel-money-back branch (deleted in
+ *             P21, wire 6.0.0-lg5.2: a booking cancel mints no refund).
  *   - Day 14: stripe.createRefund fires post-commit against the prior PI.
  *   - Day 15: `markStripeId` lands the `re_*` on the row post-commit;
  *             `findByStripeRefundId` / `markStatus` are the webhook
@@ -616,12 +618,12 @@ export const refundsRepository = {
    * reopened remainder surfaces on the `stripe-failed` abandon report for a
    * human, and no money leaves twice.
    *
-   * **It is one helper, and that is the point.** Six legs mint capped refunds
-   * (the withdraw's succeeded and refunded-verdict arms,
-   * `settlePostWithdrawRefund`, the invoice settle's lost-race/void arm,
-   * `cancelBookingService`'s money-back branch, and the reconciler's
-   * surplus arm). Open-coding lock-sum-cap-mint six times is how the seventh
-   * one forgets the lock.
+   * **It is one helper, and that is the point.** Several legs mint capped
+   * refunds (the withdraw's succeeded and refunded-verdict arms,
+   * `settlePostWithdrawRefund`, the invoice settle's lost-race/void arm, and the
+   * reconciler's surplus arm; `cancelBookingService`'s money-back branch was one
+   * until P21, wire 6.0.0-lg5.2, deleted it). Open-coding lock-sum-cap-mint in
+   * each is how the next one forgets the lock.
    *
    * Three answers, because the callers genuinely differ:
    *   - `'minted'` — a pending row exists and the caller must fire it.
@@ -696,7 +698,9 @@ export const refundsRepository = {
 
   /**
    * INSERT one refund row TERMINAL at `status='unroutable'` (design §4) — the
-   * money-back branch of a charge that carries no `stripe_payment_intent_id`.
+   * money-back mint for a charge that carries no `stripe_payment_intent_id` (the
+   * group-class withdraw's `refund_manual` arm; the booking cancel's
+   * no-PaymentIntent branch, its first caller, was deleted in P21, wire 6.0.0-lg5.2).
    *
    * Deliberately a separate verb rather than a `status` argument on
    * {@link createPending}: a function named `createPending` that can mint a

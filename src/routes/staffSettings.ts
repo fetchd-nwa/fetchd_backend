@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import {
   LOCATIONS,
+  SERVICE_CATEGORIES,
   SETTINGS_DOMAINS,
   type AccountSettingsWire,
   type AlumniSettingsWire,
@@ -18,9 +19,11 @@ import {
   type LocationKey,
   type MigrationSettingsWire,
   type NotificationSettingsWire,
+  type PatchStaffSettingsCxlRequest,
   type PatchStaffSettingsPayRequest,
   type PatchStaffSettingsResponse,
   type ReportsSettingsWire,
+  type ServiceCategory,
   type SettingsAuditKey,
   type SettingsDomain,
   type SettingsPatchByDomain,
@@ -39,6 +42,7 @@ import { requireStaff } from '../lib/principalNarrows.js';
 import { settingsManifest } from '../lib/settingsManifest.js';
 import {
   INT4_MAX,
+  PER_CATEGORY_TABLE_BY_DOMAIN,
   SETTINGS_REGISTRY,
   SETTINGS_TABLE_BY_DOMAIN,
   isPatchable,
@@ -50,11 +54,15 @@ import { formatZodIssues } from '../lib/zodIssues.js';
 
 /**
  * `GET` and `PATCH /staff/settings/:domain[/:location]` `[staff]` — every
- * staff-editable setting of the fourteen domains (SET-U01, STAFF-U07's per-key
+ * staff-editable setting of the fifteen domains (SET-U01, STAFF-U07's per-key
  * class gate; design §1.1:628-649, §2.1:1849-1869; wire 2.0.0-lg1.2
- * § settings; `staff` is P02's, M1.21). `day` and `eval` have two tiers: the
- * bare path is the global row, `/:location` that campus's row. Any staff role
- * reads every key; an owner (family) principal is 403.
+ * § settings; `staff` is P02's, M1.21; `cxl` P21's, M5.07). `day` and `eval` have
+ * two tiers: the bare path is the global row, `/:location` that campus's row.
+ * `cxl` is on two tables (design §1.1:1050-1061; contract notes D4, D5): its GET is
+ * `CancellationSettingsWire {policies, global}`, and its PATCH takes a global
+ * column by value and a per-service column as a category → value map, one UPDATE
+ * per category row. Any staff role reads every key; an owner (family) principal is
+ * 403.
  *
  * **The PATCH.** Partial: the editor sends its dirty set and every key in the
  * body is an edit (no stored-value compare). A jsonb key is one value, replaced
@@ -152,8 +160,15 @@ function parseTarget(params: unknown): Target {
 /** The body field a registry entry is edited under: its column, or its pay key. */
 function fieldOf(entry: SettingEntry): string {
   if (entry.store.kind === 'payment') return entry.store.key;
-  if (entry.store.kind === 'column') return entry.store.column;
+  if (entry.store.kind === 'column' || entry.store.kind === 'per-category') {
+    return entry.store.column;
+  }
   throw new Error(`settings registry: ${entry.key} is not patchable`);
+}
+
+/** The domain's per-category table, if it has one (`cxl`'s policy rows). */
+function perCategoryTableOf(domain: SettingsDomain): string | undefined {
+  return (PER_CATEGORY_TABLE_BY_DOMAIN as Partial<Record<SettingsDomain, string>>)[domain];
 }
 
 function entriesFor(target: {
@@ -171,6 +186,9 @@ function entriesFor(target: {
     if (entry.domain !== target.domain || !isPatchable(entry)) continue;
     const { store } = entry;
     if (store.kind === 'column' && (store.table !== table || store.tier !== tier)) continue;
+    if (store.kind === 'per-category' && store.table !== perCategoryTableOf(target.domain)) {
+      continue;
+    }
     const field = fieldOf(entry);
     if (fields.has(field)) throw new Error(`settings registry: two keys edit ${table}.${field}`);
     fields.set(field, entry);
@@ -178,16 +196,32 @@ function entriesFor(target: {
   return fields;
 }
 
-/** The JSON type a value must have — the 400 half of the parse. */
-function shapeOf(value: SettingValue, perScope: boolean): z.ZodTypeAny {
-  if (perScope) return z.record(z.string(), z.string());
+/**
+ * The JSON type an entry's body value must have — the 400 half of the parse. A
+ * per-service pay key is a scope → enum map (its scopes checked against the rows
+ * later); a per-category column a map of known categories, at least one, each
+ * holding the column's own shape.
+ */
+function shapeFor(entry: SettingEntry): z.ZodTypeAny {
+  if (isPerScope(entry)) return z.record(z.string(), z.string());
+  if (entry.store.kind === 'per-category') {
+    const member = shapeOf(entry.value).optional();
+    return z
+      .object(Object.fromEntries(SERVICE_CATEGORIES.map((c) => [c, member])))
+      .strict()
+      .refine((map) => Object.keys(map).length > 0, 'must name at least one category');
+  }
+  return shapeOf(entry.value);
+}
+
+function shapeOf(value: SettingValue): z.ZodTypeAny {
   switch (value.type) {
     case 'boolean':
       return z.boolean();
     case 'integer':
       return value.nullable === true ? z.number().nullable() : z.number();
     case 'fraction':
-      return z.number();
+      return value.nullable === true ? z.number().nullable() : z.number();
     case 'time':
       return z.string();
     case 'enum':
@@ -235,15 +269,28 @@ const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
 const CONTROL_CHARACTER = /[\u0000-\u001f]/;
 const CONTROL_MESSAGE = 'must not hold a control character (CR, LF, tab, NUL…)';
 
-/** Whether a well-shaped value is in bounds — the 422 half. `null` = valid. */
-function boundsError(value: SettingValue, input: unknown, perScope: boolean): string | null {
-  if (perScope) {
+/** Whether an entry's well-shaped body value is in bounds — the 422 half. `null` = valid. */
+function boundsErrorFor(entry: SettingEntry, input: unknown): string | null {
+  const { value } = entry;
+  if (isPerScope(entry)) {
     if (value.type !== 'enum') return 'not a per-scope enum';
     const bad = Object.values(input as Record<string, string>).filter(
       (v) => !value.values.includes(v),
     );
     return bad.length === 0 ? null : `not one of ${value.values.join(', ')}`;
   }
+  if (entry.store.kind === 'per-category') {
+    const problems = Object.entries(input as Record<string, unknown>).flatMap(([category, v]) => {
+      const error = boundsError(value, v);
+      return error === null ? [] : [`${category}: ${error}`];
+    });
+    return problems.length === 0 ? null : problems.join('; ');
+  }
+  return boundsError(value, input);
+}
+
+/** Whether a well-shaped value is in bounds. `null` = valid. */
+function boundsError(value: SettingValue, input: unknown): string | null {
   if (input === null) return null; // the shape parse admitted null only where it is allowed
   switch (value.type) {
     case 'boolean':
@@ -358,10 +405,7 @@ function planFor(target: { domain: SettingsDomain; location: LocationKey | null 
   const shape = z
     .object(
       Object.fromEntries(
-        [...fields].map(([field, entry]) => [
-          field,
-          shapeOf(entry.value, isPerScope(entry)).optional(),
-        ]),
+        [...fields].map(([field, entry]) => [field, shapeFor(entry).optional()]),
       ),
     )
     .strict() as unknown as z.ZodType<Record<string, unknown>>;
@@ -528,6 +572,20 @@ const WIRE_BODY_KEYS: Readonly<Record<TargetName, Record<string, true>>> = {
     cash_day_totals_roles: true,
     portal_idle_signout_minutes: true,
   } satisfies Keys<BodyOf<StaffSettingsWire>>,
+  cxl: {
+    per_dog_cancel_enabled: true,
+    staff_entered_client_cancel_follows_owner_rules_enabled: true,
+    staff_initiated_cancel_full_return_enabled: true,
+    class_missed_meeting_money_return_mode: true,
+    started_run_cancel_return_mode: true,
+    window_state: true,
+    window_hours: true,
+    forfeit_fraction: true,
+    no_show_forfeit_fraction: true,
+    flat_fee_cents: true,
+    unpaid_no_show_close_after_hours: true,
+    no_show_declare_mode: true,
+  } satisfies Keys<PatchStaffSettingsCxlRequest>,
 };
 
 /** Every row a path can address. */
@@ -569,7 +627,7 @@ export function boundsErrors(
   return Object.entries(body).flatMap(([field, input]) => {
     const entry = plan.fields.get(field);
     if (entry === undefined) return [];
-    const error = boundsError(entry.value, input, isPerScope(entry));
+    const error = boundsErrorFor(entry, input);
     return error === null ? [] : [`${field}: ${error}`];
   });
 }
@@ -618,6 +676,8 @@ async function read(target: Target, runner?: Tx): Promise<GetStaffSettingsRespon
       return settingsRepository.vaccine(runner);
     case 'staff':
       return settingsRepository.staff(runner);
+    case 'cxl':
+      return settingsRepository.cancellation(runner);
   }
 }
 
@@ -650,6 +710,10 @@ async function write(
     }
     return;
   }
+  if (target.domain === 'cxl') {
+    await writeCancellation(tx, plan, body, staffId);
+    return;
+  }
   const written = await settingsRepository.updateRow(tx, {
     table: SETTINGS_TABLE_BY_DOMAIN[target.domain],
     row: TIERED.has(target.domain)
@@ -667,6 +731,55 @@ async function write(
       'not_found',
       `${SETTINGS_TABLE_BY_DOMAIN[target.domain]} has no row for ${targetName(target)}`,
     );
+  }
+}
+
+/**
+ * The `cxl` write: its global columns on the singleton, each per-category column's
+ * map one row at a time, grouped so each category row takes one UPDATE (and one
+ * audit row). Every row is M5.07's seed, so a row not written is a broken database.
+ */
+async function writeCancellation(
+  tx: Tx,
+  plan: Plan,
+  body: Record<string, unknown>,
+  staffId: string,
+): Promise<void> {
+  const global: Array<{ column: string; value: unknown; jsonb: false }> = [];
+  const byCategory = new Map<ServiceCategory, Array<{ column: string; value: unknown; jsonb: false }>>();
+  for (const [column, input] of Object.entries(body)) {
+    if ((plan.fields.get(column) as SettingEntry).store.kind !== 'per-category') {
+      global.push({ column, value: input, jsonb: false });
+      continue;
+    }
+    for (const [category, value] of Object.entries(input as Record<ServiceCategory, unknown>)) {
+      const columns = byCategory.get(category as ServiceCategory) ?? [];
+      columns.push({ column, value, jsonb: false });
+      byCategory.set(category as ServiceCategory, columns);
+    }
+  }
+  const rows: Array<{
+    table: (typeof SETTINGS_TABLE_BY_DOMAIN)['cxl'] | (typeof PER_CATEGORY_TABLE_BY_DOMAIN)['cxl'];
+    row: { kind: 'singleton' } | { kind: 'category'; category: ServiceCategory };
+    values: Array<{ column: string; value: unknown; jsonb: false }>;
+  }> = [
+    ...(global.length > 0
+      ? [{ table: SETTINGS_TABLE_BY_DOMAIN.cxl, row: { kind: 'singleton' as const }, values: global }]
+      : []),
+    ...[...byCategory].map(([category, values]) => ({
+      table: PER_CATEGORY_TABLE_BY_DOMAIN.cxl,
+      row: { kind: 'category' as const, category },
+      values,
+    })),
+  ];
+  for (const { table, row, values } of rows) {
+    const written = await settingsRepository.updateRow(tx, { table, row, values, staffId });
+    if (written !== 1) {
+      throw new ApiError(
+        'not_found',
+        `${table} has no ${row.kind === 'category' ? `${row.category} ` : ''}row — apply M5.07`,
+      );
+    }
   }
 }
 
@@ -830,7 +943,7 @@ export function registerStaffSettingsRoute(
 
         // 4. 422 invalid_payload — a value out of bounds.
         const invalid = fields
-          .map((f) => [f, boundsError(entryOf(f).value, body[f], isPerScope(entryOf(f)))] as const)
+          .map((f) => [f, boundsErrorFor(entryOf(f), body[f])] as const)
           .filter(([, error]) => error !== null);
         if (invalid.length > 0) {
           throw new ApiError(

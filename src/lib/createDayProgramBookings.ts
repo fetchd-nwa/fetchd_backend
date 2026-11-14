@@ -1,6 +1,5 @@
 import { lockPools, withCapacityLocks, withDogLocks } from '../db/locks.js';
 import { bookingsRepository, type BookingRow } from '../db/repositories/bookingsRepository.js';
-import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
 import {
   creditLedgerRepository,
   findPayableLots,
@@ -28,7 +27,6 @@ import { dayProgramCategoryToMode } from './bookingMode.js';
 import { computeDayProgramScheduledAt, type DayProgramCategory } from './bookingSchedule.js';
 import type { BookingWire, LocationKey } from './bookingWire.js';
 import { bucketChicagoToday, chicagoTimeOnDate } from './chicagoDate.js';
-import { computeCancelDeadlineFromHours } from './cancelWindow.js';
 import { addChicagoMonths } from './creditExpiry.js';
 import {
   alternativePack,
@@ -75,10 +73,14 @@ import { wireManyBookings } from './wireManyBookings.js';
  *      check on purpose (D22): a `top_up` on a day she holds answers `shortfall: 0` when
  *      her credits cover it and `already_booked` when they do not, and either way no
  *      arm that refuses reaches a card.
- *   9. Per-session (date ASC): capacity assert → INSERT booking + booking_dogs → the
- *      debits the picker assigned → scheduled reminders. With a `top_up` every row is born
+ *   9. Per-session (date ASC): capacity assert → the after-school count (the dogs ticked
+ *      for that date against `day.after_school_capacity_count`, counted as the seats are,
+ *      under the same `(location, date)` lock: 6.0.0-lg5.2, D10) → INSERT booking +
+ *      booking_dogs, each share's `after_school` from her ticks → the debits the picker
+ *      assigned → scheduled reminders. With a `top_up` every row is born
  *      `payment-pending`, the dates her lots could not pay stay undebited, and the settle
- *      debits them and queues the reminders.
+ *      debits them and queues the reminders. Every refusal here is in tx1, before the
+ *      engine's charge, so a `top_up` refused by one charges nothing.
  *
  * Every booking spends a credit (R1): this core opens no invoice and touches no card. The
  * one charge a booking can carry buys credits, and the engine makes it from the terms this
@@ -108,6 +110,12 @@ export interface CreateDayProgramBookingsArgs {
   now: Date;
   /** The Confirm's order: every session of it carries this id (PAY-U04). */
   orderId: string;
+  /**
+   * The after-school ticks (6.0.0-lg5.2; DAY-U43): dog → the dates of `dates` she stays
+   * for. The caller validated it against this request (D11): every key a dog of it, every
+   * date one of its dates, a day-school request only. Empty: no one opted in.
+   */
+  afterSchool: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
 /** What a `top_up` that fits will charge: the engine's `ChargeTerms`, frozen in tx1. */
@@ -381,12 +389,13 @@ export async function createDayProgramBookings(
           rule: campus,
           requestedCount: allDogIds.length,
         });
-
-        // Resolve the active free-cancel hours from `cancel_window_settings`
-        // (Day 13 — staff-tunable). Stamped at creation; a later policy
-        // change does NOT retroactively re-stamp existing bookings.
-        const hours = await cancelWindowSettingsRepository.resolveHoursFor(args.category, tx);
-        const cancelDeadlineAt = computeCancelDeadlineFromHours(session.scheduledAt, hours);
+        const staying = allDogIds.filter((dogId) => args.afterSchool.get(dogId)?.has(session.date));
+        await dayCapacityRepository.assertAfterSchoolWithinLock(tx, {
+          location: args.location,
+          date: session.date,
+          capacity: campus.after_school_capacity_count,
+          requestedCount: staying.length,
+        });
 
         const inserted = await insertBookingWithGateMapping(tx, {
           ownerId: args.ownerId,
@@ -395,10 +404,10 @@ export async function createDayProgramBookings(
           scheduledAt: session.scheduledAt,
           location: args.location,
           notes: args.notes,
-          cancelDeadlineAt,
           additionalDogIds: args.additionalDogIds,
           orderId: args.orderId,
           ...(topUp !== undefined ? { status: 'payment-pending' as const } : {}),
+          afterSchoolDogIds: staying,
         });
 
         for (const slot of plan.paid.filter((paid) => paid.date === session.date)) {

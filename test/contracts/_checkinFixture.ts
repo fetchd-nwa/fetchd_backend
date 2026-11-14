@@ -271,12 +271,15 @@ export function ownerCancel(app: FastifyInstance, args: { bookingId: string; key
   });
 }
 
-export function staffCancel(app: FastifyInstance, args: { bookingId: string; key?: string }) {
+export function staffCancel(
+  app: FastifyInstance,
+  args: { bookingId: string; key?: string; reason?: string },
+) {
   return app.inject({
     method: 'POST',
     url: `/staff/bookings/${args.bookingId}/cancel`,
     headers: { 'idempotency-key': args.key ?? `p20-staff-cancel-${randomUUID()}` },
-    payload: {},
+    payload: args.reason !== undefined ? { reason: args.reason } : {},
   });
 }
 

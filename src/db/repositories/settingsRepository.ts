@@ -5,6 +5,7 @@ import {
   accountSettings,
   alumniSettings,
   cancellationGlobalSettings,
+  cancellationPolicySettings,
   cashSettings,
   creditSettings,
   dayProgramSettings,
@@ -24,6 +25,9 @@ import type { Tx } from '../tx.js';
 import type {
   AccountSettingsWire,
   AlumniSettingsWire,
+  CancellationNoShowDeclareMode,
+  CancellationSettingsWire,
+  CancellationWindowState,
   CashSettingsWire,
   CreditSettingsWire,
   DayProgramCampusSettingsWire,
@@ -38,10 +42,10 @@ import type {
   OwnerClassSettingsWire,
   PaymentSettingWire,
   ReportsSettingsWire,
+  ServiceCategory,
   StaffSettingsWire,
   VaccineSettingsWire,
 } from '../../contracts/wire.js';
-import { ApiError } from '../../lib/errors.js';
 import { pgTimestampToIso } from '../../lib/pgTimestamp.js';
 import type { SettingsTable } from '../../lib/settingsRegistry.js';
 
@@ -57,8 +61,10 @@ import type { SettingsTable } from '../../lib/settingsRegistry.js';
  * jsonb columns are served as stored: the settings PATCH is their one writer
  * and validates the shape before it writes, and their seeds are the steps'.
  *
- * A missing seeded row is a broken database, not an absence to paper over:
- * every read refuses with `not_found`, naming the step that seeds the row.
+ * A missing seeded row is a broken database, not an absence to paper over and not
+ * a client's 404: every read throws, so the request is a 500 and its error log names
+ * the row and the step that seeds it (STAFF-U45, P21: "a missing settings row fails
+ * loudly", never a number from code).
  */
 
 type Runner = Tx | typeof db;
@@ -73,9 +79,7 @@ function audit(row: { updatedAt: string; updatedByStaffId: string | null }) {
 }
 
 function seeded<T>(row: T | undefined, what: string, step: string): T {
-  if (row === undefined) {
-    throw new ApiError('not_found', `${what} has no seeded row — apply ${step}`);
-  }
+  if (row === undefined) throw new Error(`${what} has no seeded row — apply ${step}`);
   return row;
 }
 
@@ -331,8 +335,7 @@ export const settingsRepository = {
       .select()
       .from(paymentSettings)
       .orderBy(paymentSettings.key, paymentSettings.scope);
-    if (rows.length === 0)
-      throw new ApiError('not_found', 'payment_settings has no seeded rows — apply M1.13');
+    if (rows.length === 0) throw new Error('payment_settings has no seeded rows — apply M1.13');
     return rows.map(
       (r) =>
         ({
@@ -384,10 +387,52 @@ export const settingsRepository = {
   },
 
   /**
+   * The `cxl` domain (M5.07; CXL-U02, P21; contract notes D4): every
+   * `cancellation_policy_settings` row, ordered by category, and the
+   * `cancellation_global_settings` singleton, each with its own audit pair. NULL is NOT
+   * SEEDED (boarding's row) and is served `null`, never defaulted. Stored only, but
+   * `per_dog_cancel_enabled`.
+   */
+  async cancellation(runner: Runner = db): Promise<CancellationSettingsWire> {
+    const rows = await runner
+      .select()
+      .from(cancellationPolicySettings)
+      .orderBy(cancellationPolicySettings.category);
+    if (rows.length === 0) {
+      throw new Error('cancellation_policy_settings has no seeded rows — apply M5.07');
+    }
+    const [row] = await runner.select().from(cancellationGlobalSettings).limit(1);
+    const g = seeded(row, 'cancellation_global_settings', 'M5.07');
+    const fraction = (value: string | null) => (value === null ? null : Number(value));
+    return {
+      policies: rows.map((p) => ({
+        category: p.category as ServiceCategory,
+        window_state: p.windowState as CancellationWindowState,
+        window_hours: p.windowHours,
+        forfeit_fraction: fraction(p.forfeitFraction),
+        no_show_forfeit_fraction: fraction(p.noShowForfeitFraction),
+        flat_fee_cents: p.flatFeeCents,
+        unpaid_no_show_close_after_hours: p.unpaidNoShowCloseAfterHours,
+        no_show_declare_mode: p.noShowDeclareMode as CancellationNoShowDeclareMode | null,
+        ...audit(p),
+      })),
+      global: {
+        per_dog_cancel_enabled: g.perDogCancelEnabled,
+        staff_entered_client_cancel_follows_owner_rules_enabled:
+          g.staffEnteredClientCancelFollowsOwnerRulesEnabled,
+        staff_initiated_cancel_full_return_enabled: g.staffInitiatedCancelFullReturnEnabled,
+        class_missed_meeting_money_return_mode: g.classMissedMeetingMoneyReturnMode,
+        started_run_cancel_return_mode: g.startedRunCancelReturnMode,
+        ...audit(g),
+      },
+    };
+  },
+
+  /**
    * `cxl.per_dog_cancel_enabled` (M5.07; §3.8), the one `cxl` key with a v1 reader: off,
    * the owner's one-dog cancel answers 409 `per_dog_cancel_off` and her
-   * `dog_shares[].can_cancel` reads false (s11; P20 notes D14). Staff are unaffected. No
-   * `cxl` settings route exists until P21, so its only writer is the seed.
+   * `dog_shares[].can_cancel` reads false (s11; P20 notes D14). Staff are unaffected. Its
+   * editor is `PATCH /staff/settings/cxl` (P21; class `money`, owner and manager).
    */
   async perDogCancelEnabled(runner: Runner = db): Promise<boolean> {
     const [row] = await runner
@@ -493,7 +538,8 @@ export const settingsRepository = {
   /**
    * Write one settings row: every `(column, value)` pair, plus `updated_at` and
    * `updated_by_staff_id`. `row` picks the singleton (`id`), a two-tier table's
-   * global row (`location: null`) or a campus row. `jsonbColumns` are sent as
+   * global row (`location: null`), a campus row, or a per-category table's row
+   * (`cxl`'s `cancellation_policy_settings`, keyed by `category`). `jsonbColumns` are sent as
    * JSON text and cast — node-postgres would otherwise send a JS array as a
    * Postgres array literal. A CHECK violation surfaces as Postgres `23514` for
    * the caller to map. Returns the rows written (1, or 0 if the row is absent).
@@ -504,7 +550,10 @@ export const settingsRepository = {
     tx: Tx,
     args: {
       table: SettingsTable;
-      row: { kind: 'singleton' } | { kind: 'tier'; location: LocationKey | null };
+      row:
+        | { kind: 'singleton' }
+        | { kind: 'tier'; location: LocationKey | null }
+        | { kind: 'category'; category: ServiceCategory };
       values: ReadonlyArray<{ column: string; value: unknown; jsonb: boolean }>;
       staffId: string;
     },
@@ -518,9 +567,11 @@ export const settingsRepository = {
     const where =
       args.row.kind === 'singleton'
         ? sql`id`
-        : args.row.location === null
-          ? sql`location IS NULL`
-          : sql`location = ${args.row.location}`;
+        : args.row.kind === 'category'
+          ? sql`category = ${args.row.category}`
+          : args.row.location === null
+            ? sql`location IS NULL`
+            : sql`location = ${args.row.location}`;
     const result = await tx.execute(sql`
       UPDATE ${sql.identifier(args.table)}
          SET ${sql.join(assignments, sql`, `)},

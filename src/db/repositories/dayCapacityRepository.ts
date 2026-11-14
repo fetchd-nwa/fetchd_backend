@@ -2,7 +2,7 @@ import { and, between, eq, inArray, ne, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import { readThrough } from '../../lib/cache.js';
 import { dayCapacityFor, type DayCapacityRule } from '../../lib/availability.js';
-import { insufficientCapacityError } from '../../lib/bookingErrors.js';
+import { afterSchoolFullError, insufficientCapacityError } from '../../lib/bookingErrors.js';
 import type { DayProgramCategory } from '../../lib/bookingSchedule.js';
 import { db } from '../client.js';
 import { bookingDogs, bookings, dayCapacity, dogs, type LocationKey } from '../schema/schema.js';
@@ -90,6 +90,30 @@ function notTurnedAway(): SQL {
      WHERE turned.booking_id = ${bookingDogs.bookingId}
        AND turned.dog_id = ${bookingDogs.dogId}
        AND turned.kind = 'turn-away')`;
+}
+
+/**
+ * The shares that hold a seat at `location` on Chicago `date`: live, non-cancelled
+ * day-school and day-care rows, live shares, not turned away, staff dogs exempt. The one
+ * WHERE both `assertCapacityWithinLock` and `assertAfterSchoolWithinLock` count, so the
+ * after-school count is in dogs "the way the seats are counted for insufficient_capacity"
+ * (`AfterSchoolFullDetails`; D9) and cannot drift from it. `findBookedCountsInRange` spells
+ * the same population as a sargable range (its COUPLING note).
+ */
+function holdsASeat(location: LocationKey, date: string): SQL[] {
+  return [
+    eq(bookings.location, location),
+    inArray(bookings.category, DAY_PROGRAM_CATEGORIES),
+    sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date = ${date}::date`,
+    ne(bookings.status, 'cancelled'),
+    live(bookings),
+    live(bookingDogs),
+    notTurnedAway(),
+    // Staff dogs are capacity-exempt — see `dogs.capacity_exempt`
+    // generated column + the three booking-gate triggers' parallel
+    // exemption (schema.sql lines 1192-1198).
+    sql`${dogs.staffOwnerId} IS NULL`,
+  ];
 }
 
 export const dayCapacityRepository = {
@@ -381,21 +405,7 @@ export const dayCapacityRepository = {
       .from(bookingDogs)
       .innerJoin(bookings, eq(bookings.id, bookingDogs.bookingId))
       .innerJoin(dogs, eq(dogs.id, bookingDogs.dogId))
-      .where(
-        and(
-          eq(bookings.location, args.location),
-          inArray(bookings.category, DAY_PROGRAM_CATEGORIES),
-          sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date = ${args.date}::date`,
-          ne(bookings.status, 'cancelled'),
-          live(bookings),
-          live(bookingDogs),
-          notTurnedAway(),
-          // Staff dogs are capacity-exempt — see `dogs.capacity_exempt`
-          // generated column + the three booking-gate triggers' parallel
-          // exemption (schema.sql lines 1192-1198).
-          sql`${dogs.staffOwnerId} IS NULL`,
-        ),
-      );
+      .where(and(...holdsASeat(args.location, args.date)));
     const used = usage?.used ?? 0;
     const remaining = capacity - used;
     if (remaining < args.requestedCount) {
@@ -405,6 +415,32 @@ export const dayCapacityRepository = {
         openings_remaining: Math.max(0, remaining),
         requested: args.requestedCount,
       });
+    }
+  },
+
+  /**
+   * The after-school count (6.0.0-lg5.2; DAY-U43; D9, D10): the dogs already opted in to
+   * `date`'s after-school session at `location`, counted exactly as the seats are
+   * ({@link holdsASeat}: a share cancelled alone, a cancelled session and a turned-away
+   * share each free their place), against the campus's `day.after_school_capacity_count`.
+   * MUST run inside `withCapacityLocks(tx, location, dates, ...)`, right after that date's
+   * seat check: the same `(location, date)` lock serialises two bookings ticking the last
+   * place, so no new lock is taken. 422 `after_school_full` when the ticks do not fit.
+   */
+  async assertAfterSchoolWithinLock(
+    tx: Tx,
+    args: { location: LocationKey; date: string; capacity: number; requestedCount: number },
+  ): Promise<void> {
+    if (args.requestedCount <= 0) return;
+    const [usage] = await tx
+      .select({ booked: sql<number>`count(*)::int`.as('booked') })
+      .from(bookingDogs)
+      .innerJoin(bookings, eq(bookings.id, bookingDogs.bookingId))
+      .innerJoin(dogs, eq(dogs.id, bookingDogs.dogId))
+      .where(and(...holdsASeat(args.location, args.date), eq(bookingDogs.afterSchool, true)));
+    const booked = usage?.booked ?? 0;
+    if (booked + args.requestedCount > args.capacity) {
+      throw afterSchoolFullError({ date: args.date, capacity: args.capacity, booked });
     }
   },
 };

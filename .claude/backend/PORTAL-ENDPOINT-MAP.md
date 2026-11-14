@@ -70,7 +70,7 @@ rebind fires only on a clean succeeded settle, never on the lost-settle-race or
 
 ### Clarifications — 2026-07-27, rounds 2–3 (Allison)
 
-- **Board cancel (op `checkin.cancelSession`) is the real money cancel.** Refunds mirror the payment method: credit-paid → credit restored to the lot; card-charged single session → actual card refund. **No-shows also get credit/money back.** Owner late-cancel forfeit (§I window) remains the only keep-the-money case — its consistency with no-show generosity is on the comeback list.
+- **Board cancel (op `checkin.cancelSession`) is the real money cancel.** Refunds mirror the payment method: credit-paid → credit restored to the lot; card-charged single session → actual card refund. **No-shows also get credit/money back.** Owner late-cancel forfeit (§I window) remains the only keep-the-money case — its consistency with no-show generosity is on the comeback list. **SUPERSEDED 2026-10-12** by Allison's money ruling (`product/rebuild/SIGNOFF.md:252`: "if you book a class and dont go, you get the credit back, but not actual money … you get refunded actual money case by case via shanthi"), **built at wire 6.0.0-lg5.2 (P21):** every cancel, the board's included, returns the session's credits and moves no money; there is no forfeit and no window (comeback ④ answered: §I's forfeiture does not survive). See the P21 note under [§3](#bookings).
 - **Walk-ins: a distinct, simple v1 flow.** Dog walks in (gates apply, overridable per ruling 4) → staff create that day's day-school/day-care booking flagged `walk_in` → pay at front or at pickup → explicit paid/unpaid marker on the booking. Depth deferred (comeback).
 - **Cash/check formalized:** both are payment methods (infrequent; card-on-file is the pushed norm). **No pay-later**: unpaid cash/check flagged at drop-off, **hard stop at checkout** unless a logged staff override; any staff can "mark paid — cash/check" and it must hit the books (charges/ledger).
 - **Unified package model confirmed:** one catalog; any **day-school/day-care** package buyable one-time or as an auto-renewing subscription; existing §J.1 membership machinery merges into it. Subscriptions do NOT apply to other session types. Billing anchor, term menu, and upfront-discount knobs get pinned at design (comeback).
@@ -81,7 +81,7 @@ rebind fires only on a clean succeeded settle, never on the lost-settle-race or
 - **Announcements:** group-targeted sends wanted once groups exist.
 - **Staff phone-booking:** no dedicated verb — covered by request-approval, walk-in creation, and mid-stay day-school add.
 
-**Comeback list (Allison):** ① Staff HR design — waiting on Shanthi. ② Per-role access matrix (which of owner/manager/trainer sees what) — Allison + Shanthi later. ③ Package-subscription knobs: billing anchor (calendar-month vs 30-day-from-first-use), term menu (fixed vs 1–36), upfront-% discount — pin at design. ④ Late-cancel forfeit: does §I forfeiture survive given no-shows refund? ⑤ Retail sales tax — Shanthi. ⑥ Walk-in flow depth beyond the simple v1. ⑦ Flags/groups design details (unify with `dog_descriptors`? groups first-class vs audience helper). ⑧ Messaging read-state storage choice + channel prefs.
+**Comeback list (Allison):** ① Staff HR design — waiting on Shanthi. ② Per-role access matrix (which of owner/manager/trainer sees what) — Allison + Shanthi later. ③ Package-subscription knobs: billing anchor (calendar-month vs 30-day-from-first-use), term menu (fixed vs 1–36), upfront-% discount — pin at design. ④ Late-cancel forfeit: does §I forfeiture survive given no-shows refund? *(Answered 2026-10-12, built at 6.0.0-lg5.2, P21: no; no cancel forfeits or moves money.)* ⑤ Retail sales tax — Shanthi. ⑥ Walk-in flow depth beyond the simple v1. ⑦ Flags/groups design details (unify with `dog_descriptors`? groups first-class vs audience helper). ⑧ Messaging read-state storage choice + channel prefs.
 
 **Matrix effect:** A 6 · B 15 · **C 56 · OPEN 0** (the three offerings rows flipped); the two check-in OPEN anchors resolve to `checkin_events`-backed verbs; the eval-verdict OPEN item resolves to a staff-only verb.
 
@@ -104,7 +104,7 @@ rebind fires only on a clean succeeded settle, never on the lost-settle-race or
   9. [Invoices / Refunds / Payments / PAYG / Stripe](#invoices)
   10. [Memberships (removed)](#memberships)
   11. [Offerings: Reservation types, Packages, Retail, Rates](#offerings)
-  12. [Booking rules, Flags, Groups, Cancel-window settings](#rules)
+  12. [Booking rules, Flags, Groups, Cancel-window settings (removed; now `cxl`)](#rules)
   13. [Staff roster, Shifts, Clock in/out, Pay periods, Time off](#staff)
   14. [Messaging / Threads](#messaging)
   15. [Announcements, School events, Notifications, Device tokens](#announcements)
@@ -226,7 +226,7 @@ Every implemented route is either an anchor for a portal op or listed in its sec
 | `enrollments.ts` | [§6](#classes) | `requiredVaccines.ts` | [§2](#dogs) |
 | `events.ts` | [§15](#announcements) | `staffAlumni.ts` | [§2](#dogs) |
 | `groupClasses.ts` | [§6](#classes) | `staffBookings.ts` | [§3](#bookings), [§5](#stays) |
-| `health.ts` | [§1](#auth) | `staffCancelWindow.ts` | [§12](#rules) |
+| `health.ts` | [§1](#auth) | ~~`staffCancelWindow.ts`~~ deleted at 6.0.0-lg5.2 (P21); the `cxl` domain is `staffSettings.ts` | [§12](#rules) |
 | `invoices.ts` | [§9](#invoices) | `staffCredits.ts` | [§8](#credits) |
 | | | `staffDogs.ts` | [§2](#dogs) |
 | | | `staffInvoices.ts` | [§9](#invoices) |
@@ -398,6 +398,18 @@ The Dogs & Owners domain surfaces exactly 4 portal demand ops — DogsApi.list/g
   - Portal Owner.contactPref (single 'Text message'|'Email'|'Phone call' enum) + channels[] don't map 1:1 to owners' push/email booleans + *_notification_categories JSONB — send the raw prefs and derive portal shape client-side, or reshape?
 
 ### `owners.get` — single cross-owner owner detail
+
+> **Δ 2026-11-13 (P21, wire 6.0.0-lg5.2; CXL-U04, s17):** the profile's *Bookings* has
+> its read. `GET /staff/owners/:ownerId/bookings?from=YYYY-MM-DD` (`src/routes/staffOwners.ts`,
+> registered as `/staff/owners/:id/bookings`, the same URL as its siblings), any staff role,
+> answers `BookingWire[]`: the family's day-school and day-care sessions on Chicago dates
+> ≥ `from`, not cancelled, `payment-pending` included, soonest first (then by id), each a
+> staff read (`can_cancel` and `dog_shares[].can_cancel` are the staff cancels', the
+> owner's one-dog switch ignored). An owner principal 403; a malformed id 400; an id
+> naming no owner 404; `from` absent, malformed or not a real date, or any other query
+> key, 400. The id is lowercased at the parse. A read: no `Idempotency-Key`. Its rows
+> cancel through `POST /staff/bookings/:id/cancel` and
+> `POST /staff/bookings/:id/dogs/:dogId/cancel {reason}`, credits only (see §3's P21 note).
 - **Portal:** `get(id: string): Promise<Owner> @ client.ts:190` · mock logic: mock owners.get index.ts:245-248; requireOwner index.ts:84-88; Owner shape types.ts:119-131
 - **Behavior:** Single cross-owner owner by id, full portal Owner shape; 'not-found' if missing (mock index.ts:245-248 + requireOwner index.ts:84-88). Backs a staff client-profile detail screen.
 - **Bucket:** C
@@ -455,6 +467,31 @@ The Dogs & Owners domain surfaces exactly 4 portal demand ops — DogsApi.list/g
 > /staff/bookings/:id/dogs/:dogId/cancel {reason}` (staff), credits only. Every return is one
 > `settlement-return` naming the debit it reverses (M5.03, M5.10); `cancel-refund` is no longer
 > written. The wire's doc comments are the contract; this section is history.
+>
+> **Δ 2026-11-13 — P21 backend (wire 6.0.0-lg5.2; CXL-U02, CXL-U04, CXL-U05, DAY-U43,
+> DAY-U44, NOTIF-U17, STAFF-U45; M5.04, M5.08).** A cancel returns a credit, never money:
+> the whole-session cancels (`POST /bookings/:id/cancel`, `POST /staff/bookings/:id/cancel`,
+> any staff role) and the one-dog cancels write `cancel_forfeited = false` every time, return
+> one credit per dog still on the session through the one return writer
+> (`creditLedgerRepository.refundForBooking`: her live debit's lot, or a fresh lot when it
+> can pay no later date), and write no `refunds` row and make no Stripe call (a live share
+> with no live debit is a 500 and one alarm). There is no cancel window: M5.08 dropped
+> `cancel_window_settings`, no route stamps `cancel_deadline_at`, and
+> `GET /staff/cancel-window` and `PATCH /staff/cancel-window/:category` are 404 (see §12). The
+> owner's `booking-cancelled` notice says who cancelled and what came back, one credit line
+> per landing, never money; a staff cancel's notice quotes the staff `reason` verbatim (the
+> whole-session `reason?` stays optional). `POST /bookings` takes the after-school opt-in,
+> `after_school` (dog → dates), stored on each share as `booking_dogs.after_school` and
+> counted per date in dogs against `day.after_school_capacity_count` (422
+> `after_school_full {kind, date, capacity, booked}`, before any charge). Every
+> `BookingWire.dog_shares[]` entry carries `after_school`, a live share of an `upcoming`
+> day session with a live debit carries `return_expires_at` (the date her credit would
+> carry if it came back now), and the board's row carries `CheckinBoardWire.after_school`
+> (the 17:30 flag is unchanged; the campus's session time is
+> `day.after_school_start_time`–`day.after_school_end_time`, its price
+> `day.after_school_price_cents`, never charged in v1). The owner profile's *Bookings* is
+> `GET /staff/owners/:ownerId/bookings?from=` (§2, `owners.get`). A missing seeded settings
+> row is now a 500 whose log names it (was 404). DATA-CONTRACT §T is the full record.
 _Demand: BookingsApi (client.ts:203-211), CheckInApi (client.ts:218-222), DashboardApi (client.ts:317-319), BookingListParams @ client.ts:75-81 · Supply: bookings.ts, staffBookings.ts, availability.ts · Logic: capacity.ts, checkinFold.ts · Business logic: bookings-scheduling.md, portal-dashboard-analytics.md_
 
 Portal demand here is three interfaces — BookingsApi's staff cross-owner list plus capacity outlook, the CheckInApi board/checkIn/checkOut/undo/cancelSession family, and DashboardApi's operational snapshot — against backend supply in bookings.ts, staffBookings.ts, and availability.ts. Only three ops map cleanly onto existing routes with additive changes (bucket B: bookings.list -> GET /staff/bookings, capacityOutlook -> GET /availability, cancelSession -> POST /staff/bookings/:id/cancel); five are net-new (bucket C: board, checkIn, checkOut, undo, dashboard), and eight backend routes are supply-only owner/staff surfaces the portal never calls. The headline mismatch is the check-in reconciliation (LOAD-BEARING OQ #7): the portal's event-sourced fold (expected->in|eval->out, stepwise undo, cancel-session, stay-derived lodger rows) has no backend substrate — the backend has a single terminal booking_dogs.attendance write with no in/out state, no event log, no eval-start, no undo, and no departure stamp — already adjudicated as parallel-universe drift D7 @ bookings-scheduling.md:233 / DRIFT-4 @ DISCREPANCIES.md:265. Capacity numbers disagreed at the data layer until P13 (portal 24/12/15/8=59 vs a backend 3/3); since wire 4.0.0-lg3.1 there is one combined `day.daily_capacity_dogs` per campus, seeded 15, and `GET /availability` serves `capacity_dogs` and `remaining_dogs`; the one materially-corrected prior claim is that location columns DO exist across owners/staff/cohorts/bookings/pending_requests/day_capacity — the genuine per-campus gaps are threads (no location) and shifts (no table).
@@ -545,6 +582,14 @@ Portal demand here is three interfaces — BookingsApi's staff cross-owner list 
 > after a check-in, and the board's per-dog *Cancel* is `POST
 > /staff/bookings/:id/dogs/:dogId/cancel {reason}` (one dog, her credit back, the session
 > cancelled with its last dog).
+>
+> **Δ 2026-11-13 (P21, wire 6.0.0-lg5.2; CXL-U04):** the "forfeit / credit-back /
+> money-back" branching below is gone. Any staff role's cancel returns one credit per dog
+> still on the session and moves no money: `cancel_forfeited` is always `false`, no
+> `refunds` row, no Stripe call, no window. The board's cancel is therefore not a "money
+> cancel" (the open question at the end is answered: the backend cancel is credits only).
+> The owner's notice names the dogs, the date, the staff `reason` when sent (quoted
+> verbatim) and each credit's landing.
 - **Portal:** `cancelSession(dogId: DogId, date: ISODate): Promise<CheckInEvent> @ src/api/client.ts:222` · mock logic: mock/index.ts:455-463; assertCancelable @ mock/logic/checkinFold.ts:100-107
 - **Behavior:** Board action: end the dog's day (append 'cancel-session') AND cancel the underlying booking row (CI-7 -> status 'canceled'); the canceled row stays visible on the board. Today-only, blocked after check-out. mock/index.ts:455-463, assertCancelable @ checkinFold.ts:100-107.
 - **Bucket:** B
@@ -579,8 +624,8 @@ Portal demand here is three interfaces — BookingsApi's staff cross-owner list 
 | GET /bookings/:id | routes/bookings.ts:219 | SUPPLY-ONLY. GET /bookings/:id [owner] — single booking lookup, owner-scoped; cross-owner/missing id -> identical 404 (bookings.ts:216-235; R19 @ bookings-scheduling.md:88). Cancelled rows visible here (excluded from list views — bookingsRepository.ts:125 comment). A portal booking-detail would need a staff cross-owner variant, not this route. | No portal demand today — owner-scoped detail. A portal booking-detail drawer would need a staff cross-owner variant. |
 | GET /dogs/:id/bookings | routes/bookings.ts:241 | SUPPLY-ONLY. GET /dogs/:id/bookings?view= [owner] — per-dog bookings (dog as lead OR additional — route doc bookings.ts:237-240), owner-scoped, runtime-bucketed; not-owned dog -> [] (no id leak). Owner-app per-dog history. | No portal demand today — owner-scoped. Portal dog-profile booking history would need a [staff] cross-owner per-dog read. |
 | POST /bookings/preview | deleted | **DELETED at wire 3.0.0 (P12; DOG-U08).** The route, its schema and its conformance pin are gone; a call is a 404. | No portal demand. |
-| POST /bookings | routes/bookings.ts:353 | SUPPLY-ONLY. POST /bookings [owner] — day-program creation (day-school/day-care): ownership gate -> one outcome, 201 PostBookingsResponse {order, sessions} (wire 4.0.0-lg3.2) or a refusal (wire 3.0.0), with locks + gates + credits + capacity + overlap + reminders in `lib/createDayProgramBookings.ts`. Credits are the only tender since wire 4.0.0: `payment` is required, no booking writes an invoice, and `top_up` is typed and refused until P18. requireOwner @ 358. The portal's BookNewModal does NOT call this route. | No portal demand — OWNER-only creation. Sharpened: the portal ApiClient has NO booking-create method at all (BookingsApi @ client.ts:203-211 = list/requests/approve/decline/undo/approveAll/capacityOutlook); BookNewModal is a UI-local flow over features/bookings/lib/bookingSession helpers and calls no API. The portal will eventually need a STAFF-side create — a candidate new [staff] route, distinct from this owner path. |
-| POST /bookings/:id/cancel | routes/bookings.ts:551 | SUPPLY-ONLY. POST /bookings/:id/cancel [owner] — owner self-cancel via the shared cancel txn (forfeit/credit-back/money-back/free), bookings.ts:551-641. The portal cancels via the [staff] POST /staff/bookings/:id/cancel (see checkin.cancelSession). | No portal demand — owner self-cancel; the portal uses the staff cross-owner cancel (staffBookings.ts:136). Same BUG-20 reminder caveat applies (DISCREPANCIES.md:169-173) — **FIXED — committed on `notifications-phase-1` (2026-07-25)** (cancelBookingService.ts:180-183 cancels pending `booking-reminder:` + `boarding-24h:` rows in-tx); not yet on `main`. |
+| POST /bookings | routes/bookings.ts:353 | SUPPLY-ONLY. POST /bookings [owner] — day-program creation (day-school/day-care): ownership gate -> one outcome, 201 PostBookingsResponse {order, sessions} (wire 4.0.0-lg3.2) or a refusal (wire 3.0.0), with locks + gates + credits + capacity + overlap + reminders in `lib/createDayProgramBookings.ts`. Credits are the only tender since wire 4.0.0: `payment` is required, no booking writes an invoice, and `top_up` is typed and refused until P18. requireOwner @ 358. The portal's BookNewModal does NOT call this route. Since 6.0.0-lg5.2 (P21) the body takes `after_school` (dog → dates), refused 422 `after_school_full` when a date's session is full, and stamps no `cancel_deadline_at`. | No portal demand — OWNER-only creation. Sharpened: the portal ApiClient has NO booking-create method at all (BookingsApi @ client.ts:203-211 = list/requests/approve/decline/undo/approveAll/capacityOutlook); BookNewModal is a UI-local flow over features/bookings/lib/bookingSession helpers and calls no API. The portal will eventually need a STAFF-side create — a candidate new [staff] route, distinct from this owner path. |
+| POST /bookings/:id/cancel | routes/bookings.ts:551 | SUPPLY-ONLY. POST /bookings/:id/cancel [owner] — owner self-cancel via the shared cancel txn (forfeit/credit-back/money-back/free; since 6.0.0-lg5.2, P21, credits back only: no forfeit, no money), bookings.ts:551-641. The portal cancels via the [staff] POST /staff/bookings/:id/cancel (see checkin.cancelSession). | No portal demand — owner self-cancel; the portal uses the staff cross-owner cancel (staffBookings.ts:136). Same BUG-20 reminder caveat applies (DISCREPANCIES.md:169-173) — **FIXED — committed on `notifications-phase-1` (2026-07-25)** (cancelBookingService.ts:180-183 cancels pending `booking-reminder:` + `boarding-24h:` rows in-tx); not yet on `main`. |
 | POST /staff/bookings/:id/confirm | routes/staffBookings.ts:87 | SUPPLY-ONLY. POST /staff/bookings/:id/confirm [staff] — stamp confirmed_at only when NULL (first-confirm preserved; re-confirm 200 no-op; 409 cancelled) — staffBookings.ts:87-129. The portal has NO confirm verb (bookings-scheduling.md:195). Genuine staff supply the portal will likely consume. | No current portal demand — the mock has no confirm. Flags: BookingWire carries no confirmed_at so confirmation STATE isn't readable (candidate §A amendment — DATA-CONTRACT.md:1594-1597); and 'confirmed_at drives reminders' is aspirational — nothing at runtime reads it (D6 @ bookings-scheduling.md:231; DRIFT-3 @ DISCREPANCIES.md:259). Promote: if the portal shows confirmation state, BookingWire needs an additive confirmed_at (DATA-CONTRACT.md:1594-1597). Open question: does the portal need confirmation state on the wire? BookingWire omits confirmed_at today, and D6 records that nothing reads it. |
 
 ### Open questions
@@ -619,7 +664,7 @@ The portal's five approvals-queue operations (client.ts:205-209) all target the 
 - **Bucket:** A
 - **Backend:** POST /staff/requests/:id/approve @ routes/staffRequests.ts:137 · wire: PendingRequestWire @ src/contracts/wire.ts:198 · contract: §C.1 Amendment 2026-05-24 item 4 @ DATA-CONTRACT.md:659-679 · tables: pending_requests @ schema.sql:745; writes bookings (schema.sql:629)/booking_dogs (schema.sql:688) via insertBookingWithGateMapping
 - **Request:** `{scheduled_at?: ISO, pickup_at?: ISO, location?: 'fayetteville'|'bentonville', notes?: string<=2000} + header Idempotency-Key. Validated against the LOCKED row's category (validateApproveBody @ staffRequests.ts:420-466): private-lesson requires scheduled_at + location; boarding requires scheduled_at + pickup_at (strictly after, staffRequests.ts:450-452) + location; board-and-train body MAY be empty; day-school/day-care take NO body fields (booked verbatim from the stored request, staffRequests.ts:190-260).` **Response:** `PendingRequestWire (200, UPDATED — status→'converted' for PL/boarding/day-program, or 'approved-awaiting-payment' for B&T; approved_at + converted_booking_id populated as applicable). NOT the BookingWire — the created booking is a side effect, FE follows converted_booking_id (DATA-CONTRACT.md:675-677).`
-- **Auth:** [staff] (+idempotent) · **Side effects:** PL/boarding: checkBookingGates → INSERT booking + cancel_deadline_at from cancel_window_settings (staffRequests.ts:272-273) → markConverted → enqueue 'booking-confirmed' notification + reminders (staffRequests.ts:261-327); boarding also stamps dropoff_at/pickup_at via setBoardingStayWindow (staffRequests.ts:292-297,509-523). B&T: markApprovedAwaitingPayment (staffRequests.ts:186-189) — NO booking; owner completes via POST /requests/:id/confirm-payment (requestConfirmPayment.ts:95-96, domain 09) which creates the booking + Stripe charge/invoice — but per DRIFT-7 (DISCREPANCIES.md:283-287) NO client calls confirm-payment and approve-B&T enqueues no notification, so the B&T leg dead-ends in product today. Booking gates fired: payment, vaccine, agreement, evaluation. · **Errors:** 404 not_found (missing/soft-expired row); 409 conflict (status != 'submitted'; or any category but private-lesson, boarding and board-and-train, wire 3.0.0: the row stays 'submitted', nothing moves, and deny still works); 422 invalid_payload (missing per-category scheduled_at/location/pickup_at); 422 gate bounces (payment_required/vaccine_missing/agreement_unsigned/evaluation_required). NOT already_requested — that code fires only at submission time on POST /requests (requests.ts:308-314), never at approve.
+- **Auth:** [staff] (+idempotent) · **Side effects:** PL/boarding: checkBookingGates → INSERT booking ~~+ cancel_deadline_at from cancel_window_settings (staffRequests.ts:272-273)~~ (no deadline since 6.0.0-lg5.2, P21: the table is dropped, M5.08; the column stays NULL, and so does B&T's at confirm-payment) → markConverted → enqueue 'booking-confirmed' notification + reminders (staffRequests.ts:261-327); boarding also stamps dropoff_at/pickup_at via setBoardingStayWindow (staffRequests.ts:292-297,509-523). B&T: markApprovedAwaitingPayment (staffRequests.ts:186-189) — NO booking; owner completes via POST /requests/:id/confirm-payment (requestConfirmPayment.ts:95-96, domain 09) which creates the booking + Stripe charge/invoice — but per DRIFT-7 (DISCREPANCIES.md:283-287) NO client calls confirm-payment and approve-B&T enqueues no notification, so the B&T leg dead-ends in product today. Booking gates fired: payment, vaccine, agreement, evaluation. · **Errors:** 404 not_found (missing/soft-expired row); 409 conflict (status != 'submitted'; or any category but private-lesson, boarding and board-and-train, wire 3.0.0: the row stays 'submitted', nothing moves, and deny still works); 422 invalid_payload (missing per-category scheduled_at/location/pickup_at); 422 gate bounces (payment_required/vaccine_missing/agreement_unsigned/evaluation_required). NOT already_requested — that code fires only at submission time on POST /requests (requests.ts:308-314), never at approve.
 - **Action:** REUSE. POST /staff/requests/:id/approve is the real approve verb and fully serves the operation. The gap is DEMAND-side, not supply: the portal's one-click approveRequest(id) (useBookingRequests.ts:19-22, ApprovalsTab.tsx:73-80) sends NO body, but the endpoint requires per-category scheduling for PL/boarding. Portal must add a per-category approve form (scheduled_at + location, +pickup_at for boarding; empty for B&T; none for day-program). No backend change needed — the mock's model is simply lighter than reality (already adjudicated as DRIFT-10, DISCREPANCIES.md:301-305).
 - **Confidence:** VERIFIED
   - Portal must branch the approve body by category — but the mock's BookingRequest carries no location/preferred_dates in wire form and includes an 'Evaluation' type the backend can't approve at all. The approve UX is a redesign, not a field-add (DRIFT-10, adjudicated).
@@ -720,6 +765,14 @@ The portal models Stay as a first-class entity (5-state StayStatus, exclusive en
     - No GET /staff/bookings/:id exists today (staffBookings.ts registers only list @ 68 / confirm @ 87 / cancel @ 136 / attendance @ 202 — re-verified) — staff single-read is genuinely absent; could alternatively be satisfied by filtering the list client-side, but that leaks the whole queue for one detail fetch
 
 ### `stays.cancel` — cancel a stay
+
+> **Δ 2026-11-13 (P21, wire 6.0.0-lg5.2; CXL-U04):** the FORFEIT / CREDIT-BACK / MONEY-BACK
+> branching and `cancel_window_settings` below are gone (M5.08). A stay's cancel writes
+> `cancel_forfeited = false`, returns what the row debited (a stay spends no credit, so
+> nothing), writes no `refunds` row and calls no Stripe refund. A board-and-train stay paid
+> through `POST /requests/:id/confirm-payment` keeps its charge on cancel, with no refund
+> row and no alarm; the design calls that producer unreachable in v1 (design.md:4546) and
+> board-and-train is seeded not offered. Any money back is Shanthi's, case by case (P22).
 - **Portal:** `cancel(id: StayId): Promise<Stay> @ client.ts:228` · mock logic: mock/index.ts:488-499 (cancel; checked-out/canceled guards @ 491-496)
 - **Behavior:** Staff cancels a boarding / board-and-train stay; returns the updated (cancelled) stay.
 - **Bucket:** A
@@ -738,8 +791,8 @@ The portal models Stay as a first-class entity (5-state StayStatus, exclusive en
 - **Bucket:** C
 - **Backend:** POST /bookings @ routes/bookings.ts:353 (unrelated; NO reschedule verb exists — window is set once at approve, staffRequests.ts:288-297, or at B&T confirm-payment) · wire: BookingWire @ wire.ts:143-171 (proposed additive dropoff_at/pickup_at) · contract: §A Amendment Day-12 approve body @ DATA-CONTRACT.md:659-674 (boarding pickup_at strictly after scheduled_at @ 671-672); §F lifecycle; boarding-24h reminder anchored on (dropoffAt ?? scheduledAt) - 24h @ DATA-CONTRACT.md:1204-1207 · tables: bookings @ schema.sql:629 (scheduled_at:635, dropoff_at:652, pickup_at:653, cancel_deadline_at:666); no CHECK pickup>dropoff exists (only the category gate @ 675)
 - **Request:** `{ scheduled_at?: string, dropoff_at?: string, pickup_at?: string } (ISO ts)` **Response:** `BookingWire (+ dropoff_at?, pickup_at?)`
-- **Auth:** [staff] (+idempotent) · **Side effects:** Re-time may need to re-anchor the boarding-24h profile-check reminder (keyed off dropoff_at, DATA-CONTRACT.md:1204-1207) and re-stamp cancel_deadline_at. · **Errors:** not_found(404), conflict(409), invalid_payload/422 (pickup<=dropoff, non-stay category)
-- **Action:** Build PATCH /staff/bookings/:id/timing (staff). Body: { scheduled_at?: ISO, dropoff_at?: ISO, pickup_at?: ISO }. Response: 200 BookingWire (+ dropoff_at/pickup_at). Auth: staff. Logic: lock booking (404 missing, 409 if cancelled); require category IN ('boarding','board-and-train') — the schema CHECK gates dropoff_at/pickup_at to stay categories only (schema.sql:675); validate pickup_at strictly after dropoff_at/scheduled_at API-side (NO DB CHECK enforces pickup>dropoff — re-verified; mirror the approve rule at DATA-CONTRACT.md:671-672 and the confirm-payment Zod refine at requestConfirmPayment.ts:83-85); if scheduled_at moves, re-stamp cancel_deadline_at from cancel_window_settings and re-anchor the pending boarding-24h reminder. Errors: not_found(404), conflict(409 cancelled), 422 (pickup<=dropoff / non-stay category). Idempotency-Key required. Why not reuse: NO endpoint updates a booking's scheduled_at/dropoff_at/pickup_at after creation — staffRequests approve (staffRequests.ts:288-297 via setBoardingStayWindow @ 509-523) and requestConfirmPayment set the window once and are single-shot; full route enumeration confirms no PATCH/reschedule verb on bookings anywhere (the only adjacent PATCH is owner-scoped PATCH /requests/:id @ requests.ts:365, submitted-status requests only, pre-conversion).
+- **Auth:** [staff] (+idempotent) · **Side effects:** Re-time may need to re-anchor the boarding-24h profile-check reminder (keyed off dropoff_at, DATA-CONTRACT.md:1204-1207) and ~~re-stamp cancel_deadline_at~~ (no deadline exists since 6.0.0-lg5.2, P21: nothing stamps it). · **Errors:** not_found(404), conflict(409), invalid_payload/422 (pickup<=dropoff, non-stay category)
+- **Action:** Build PATCH /staff/bookings/:id/timing (staff). Body: { scheduled_at?: ISO, dropoff_at?: ISO, pickup_at?: ISO }. Response: 200 BookingWire (+ dropoff_at/pickup_at). Auth: staff. Logic: lock booking (404 missing, 409 if cancelled); require category IN ('boarding','board-and-train') — the schema CHECK gates dropoff_at/pickup_at to stay categories only (schema.sql:675); validate pickup_at strictly after dropoff_at/scheduled_at API-side (NO DB CHECK enforces pickup>dropoff — re-verified; mirror the approve rule at DATA-CONTRACT.md:671-672 and the confirm-payment Zod refine at requestConfirmPayment.ts:83-85); if scheduled_at moves, ~~re-stamp cancel_deadline_at from cancel_window_settings and~~ re-anchor the pending boarding-24h reminder (no deadline to re-stamp since 6.0.0-lg5.2, P21: the table is dropped, M5.08). Errors: not_found(404), conflict(409 cancelled), 422 (pickup<=dropoff / non-stay category). Idempotency-Key required. Why not reuse: NO endpoint updates a booking's scheduled_at/dropoff_at/pickup_at after creation — staffRequests approve (staffRequests.ts:288-297 via setBoardingStayWindow @ 509-523) and requestConfirmPayment set the window once and are single-shot; full route enumeration confirms no PATCH/reschedule verb on bookings anywhere (the only adjacent PATCH is owner-scoped PATCH /requests/:id @ requests.ts:365, submitted-status requests only, pre-conversion).
   - _promote:_ Timing patch keys map to bookings.scheduled_at/dropoff_at/pickup_at; the portal's startISO/endISO ISO-DAY encoding must promote to real ISO timestamps (backend: absolute timestamptz), not the mock's day-string exclusive-night model.
 - **Confidence:** VERIFIED
   - Open questions:
@@ -1329,6 +1382,28 @@ Demand outruns supply across this domain. The reservation-type/offering-config c
 ---
 
 ## Booking rules, Flags, Groups, Cancel-window settings <a id="rules"></a>
+
+> **Δ 2026-11-13 (P21, wire 6.0.0-lg5.2; CXL-U02, M5.08):** the cancel-window supply below
+> is gone. `src/routes/staffCancelWindow.ts`, `lib/cancelWindow.ts` and
+> `cancelWindowSettingsRepository` are deleted, `cancel_window_settings` is dropped (its
+> seven rows deleted first, each pre-image in `audit_log` under `system:migrate-M5.08`),
+> `GET /staff/cancel-window` and `PATCH /staff/cancel-window/:category` are 404 (pinned in
+> `test/contracts/removed-routes.test.ts`), and no route stamps `cancel_deadline_at`.
+> The cancellation settings are the **`cxl` settings domain** in `src/routes/staffSettings.ts`:
+> `GET /staff/settings/cxl` (any staff role; an owner principal 403) answers
+> `CancellationSettingsWire {policies, global}`, seven `cancellation_policy_settings` rows
+> ordered by their `category` text (boarding `window_state 'unset'` with NULLs, served `null`) and
+> the `cancellation_global_settings` singleton. `PATCH /staff/settings/cxl`
+> (`Idempotency-Key`) takes a global key by value and a per-service key as a category →
+> value map (an unknown category, an empty map, a wrong type or a `/:location` segment is
+> 400); a trainer is 403 `refused_keys` (every `cxl` key is class `money`, owner and
+> manager); every key but `per_dog_cancel_enabled` is 422 `setting_inert` (stored only:
+> "no true penalty"); `{per_dog_cancel_enabled}` by the owner or a manager is 200 with the
+> whole domain back and one audit row naming the staffer. The manifest serves every `cxl`
+> key (read `{tier: 'global', field: <column>}`, editor `here`; the fractions' spec carries
+> no `nullable`), and `StaffCapabilitiesWire.edit_money_policy` covers them. The wire types
+> live in `wire.ts` (`CancellationSettingsWire`, `PatchStaffSettingsCxlRequest`);
+> `CancelWindowSettingWire` was never promoted and is gone with its route.
 _Demand: RulesApi/FlagsApi/GroupsApi @ client.ts:297-300, 304-307, 311-314 (input types 165/167/169; ApiClient 327-346) · Supply: staffCancelWindow.ts · Logic: none dedicated · Business logic: bookings-scheduling.md (rules), dogs-evaluations.md (flags context), portal-staff-operations.md_
 
 All 12 portal ops in this domain (`rules.*`, `flags.*`, `groups.*`) are bucket C: nothing in the backend serves any of them — proven by full CREATE TABLE enumeration of schema.sql (no booking_rules / flag-catalog / dog-flag-join / groups / group_members tables) and a broad grep + full route enumeration of every file under src/routes/. The only supply in this domain is the two staffCancelWindow.ts routes, and both are SUPPLY-ONLY: the portal ApiClient (client.ts:327-346) has no cancel-window namespace, so backend supply exists with only latent demand. Headline mismatches: the portal models a configurable 15-condition block/approve/warn rules engine that collides with the backend's four unbypassable BEFORE-INSERT gate triggers (schema.sql:1673-1839); flags and groups have no backend model at all; and cancel-window is the one existing staff-tunable-setting precedent that the future rules/flags/groups mutations should copy.
@@ -1476,10 +1551,10 @@ All 12 portal ops in this domain (`rules.*`, `flags.*`, `groups.*`) are bucket C
 
 | Route | Where | Serves | Portal-relevant? |
 |---|---|---|---|
-| GET /staff/cancel-window | staffCancelWindow.ts:85 | SUPPLY-ONLY. GET /staff/cancel-window [staff] lists every service_category's current free-cancel policy (always 7 rows per the schema seed: hours_before, updated_at, updated_by_staff_id). updated_by_staff_id NULL = still the seeded 48h default. Owner principals get 403. This is the read half of the one existing staff-tunable-setting precedent (§I). | SUPPLY-ONLY: no portal demand op today (client.ts has no cancel-window namespace). LATENT demand — the portal will eventually need a cancel-window editor (BL bookings-scheduling.md:193 marks it MISSING); when built it should CONSUME this endpoint. This route is also the cited pattern precedent for the (unbuilt) rules/flags/groups staff-tunable surfaces. |
-| PATCH /staff/cancel-window/:category | staffCancelWindow.ts:104 | SUPPLY-ONLY. PATCH /staff/cancel-window/:category [staff] updates one category's hours_before (int 1..720), stamping updated_at=now() and updated_by_staff_id (cancelWindowSettingsRepository.updateHoursFor @ cancelWindowSettingsRepository.ts:94-102). Requires Idempotency-Key. Affects FUTURE bookings only — existing rows keep their stamped cancel_deadline_at. Owner principals 403; a category outside the service_category enum fails path validation; an enum-valid category with no seeded row is 404. | SUPPLY-ONLY: no portal demand op today. LATENT demand — this is the mutation the future portal cancel-window editor would call. It is the canonical staff-tunable-PATCH template (parseOrThrow + requireStaff + requireIdempotencyKey + withMutation) the proposed rules/flags/groups mutations should copy. |
+| GET /staff/cancel-window | deleted | **DELETED at wire 6.0.0-lg5.2 (P21; CXL-U02, M5.08).** A call is a 404 (`removed-routes.test.ts`); `cancel_window_settings` is dropped and no route stamps `cancel_deadline_at`. Was: the seven per-category free-cancel hours (seeded 48h). | The portal reads the cancellation settings at `GET /staff/settings/cxl` (the Δ note at the top of this section). |
+| PATCH /staff/cancel-window/:category | deleted | **DELETED at wire 6.0.0-lg5.2 (P21; CXL-U02, M5.08).** A call is a 404 (`removed-routes.test.ts`). Was: one category's `hours_before` (1..720), stamped on future bookings. | The portal edits the one live cancellation key, `per_dog_cancel_enabled`, through `PATCH /staff/settings/cxl`; every other `cxl` key is 422 `setting_inert`. |
 
-Supply-only detail (not lost from the audit):
+Supply-only detail (not lost from the audit; both routes and everything this describes were deleted at 6.0.0-lg5.2, P21, so it records the deleted code):
 - **GET /staff/cancel-window** — wire: CancelWindowSettingWire[] = { category: service_category, hours_before, updated_at, updated_by_staff_id: string|null } (interface @ staffCancelWindow.ts:55-60, toWire @ 62-74) · contract: DATA-CONTRACT.md:2454-2478 (§I cancel window, locked 2026-05-19 / staff-tunable 2026-05-26); endpoint listed at DATA-CONTRACT.md:2067 · tables: cancel_window_settings @ schema.sql:844 (PK category, CHECK hours_before > 0 @ :846; seeded 48h flat across 7 categories @ :851-858) · auth: [staff] · errors: 403 (owner principal via requireStaff, staffCancelWindow.ts:90) · mock: No portal op consumes this; the portal mock has NO CancelWindowApi (ApiClient interface @ client.ts:327-346 has no such namespace). The mock instead encodes advance-notice as the booking-rules 'notice' condition (fixtures.ts:3227-3237), which is booking-ahead lead, NOT cancellation lead. · promote: CancelWindowSettingWire is route-local, not in wire.ts (confirmed; also recorded at BL bookings-scheduling.md:212) — when the portal builds its cancel-window editor, promote the shape into wire.ts so both repos share it.
   - _Open:_ When the portal builds a cancel-window UI it must map the mock's display-cased ServiceCategory ('Day School') to the backend service_category enum ('day-school'); and reconcile the mock's booking-rules 'notice' concept (advance-booking hours) with cancellation-window hours — they are different axes.
 - **PATCH /staff/cancel-window/:category** — request: { hours_before: number } (int, min 1, max 720; .strict) @ staffCancelWindow.ts:44-53; :category path validated against the service_category enum @ 40-42 · response: CancelWindowSettingWire (updated row) · contract: DATA-CONTRACT.md:2454-2478 (§I staff-tunable amendment 2026-05-26); DATA-CONTRACT.md:2067 · tables: cancel_window_settings @ schema.sql:844 · auth: [staff] [idempotent] · errors: 403 (owner, requireStaff @ 109); validation (non-enum category via path schema @ 40-42,110; hours_before out of 1..720 @ 44-53,111); 404 not_found (enum-valid category missing its seeded row, staffCancelWindow.ts:137-140) · side effects: Changes future bookings' stamped cancel_deadline_at; no cache invalidation (keysToInvalidate returns [], staffCancelWindow.ts:125); withMutation idempotency (staffCancelWindow.ts:112,114-119).
@@ -1489,7 +1564,7 @@ Supply-only detail (not lost from the audit):
 - Flags vs dog_descriptors: staff dog-flags (colored staff-applied pills on dogs) and dog_descriptors (owner-selected intake traits stored on requests) overlap structurally but not semantically; dog_descriptors itself has no read endpoint yet (DATA-CONTRACT.md:1858) and the intake_field_settings/dog_descriptors staff editors are unbuilt (BL dogs-evaluations.md:224 Q6). Decide whether to unify into one staff-label catalog or build dog_flags separately (this domain proposes separate + a new dog_flags join for per-dog application).
 - Flag applications have no per-dog storage: the only per-dog flag column is alumni_attendance_flagged_at (single-purpose, schema.sql:278, with its own dedicated clear verb staffAlumni.ts:211); a generic dog_flags(dog_id, flag_id) join table is needed, and whether flag_ids should be promoted onto the shared Dog wire (cross-ref domain 02; BL dogs-evaluations.md:227 Q9) or a dedicated resource is open.
 - Groups are entirely unmodeled backend-side: no groups/group_members tables, and announcements target only category+location (announcements.ts:31-33,41-49; target_location @ schema.sql:1554) — no audience-by-group. The smart 'alumni' group must derive from dog_completed_programs (BL dogs-evaluations.md:20), never a stored dog.alumni boolean (the mock's types.ts:89). Whether groups are a first-class entity or an announcement-audience helper is undecided.
-- Cancel-window has backend supply (GET/PATCH /staff/cancel-window) but NO portal demand op in client.ts today; both routes are SUPPLY-ONLY with latent demand (BL bookings-scheduling.md:193 marks the portal UI MISSING). The mock instead expresses advance-notice as the booking-rules 'notice' condition (a different axis from cancellation lead). A future portal cancel-window editor must also translate display-cased ServiceCategory to the service_category enum, and CancelWindowSettingWire should be promoted from route-local into wire.ts when consumed.
+- Cancel-window has backend supply (GET/PATCH /staff/cancel-window) but NO portal demand op in client.ts today; both routes are SUPPLY-ONLY with latent demand (BL bookings-scheduling.md:193 marks the portal UI MISSING). The mock instead expresses advance-notice as the booking-rules 'notice' condition (a different axis from cancellation lead). A future portal cancel-window editor must also translate display-cased ServiceCategory to the service_category enum, and CancelWindowSettingWire should be promoted from route-local into wire.ts when consumed. **Answered at 6.0.0-lg5.2 (P21):** the routes are deleted and there is no cancel window; the cancellation settings are the `cxl` domain (`GET|PATCH /staff/settings/cxl`, wire types in `wire.ts`).
 
 ---
 
@@ -1801,7 +1876,7 @@ All staff-scoped (`requireStaff`), snake_case wire, mutations idempotent (`Idemp
 12. `POST /staff/requests/approve-all` — bulk approve with per-request `decisions[]` + partial-success envelope; **likely YAGNI** (per-category scheduling makes a no-arg bulk impossible) — confirm intent before building. (§4)
 
 **Stays:**
-13. `PATCH /staff/bookings/:id/timing` — re-time a stay (`dropoff_at`/`pickup_at`, pickup>dropoff, re-stamp `cancel_deadline_at`, re-anchor 24h reminder). (§5)
+13. `PATCH /staff/bookings/:id/timing` — re-time a stay (`dropoff_at`/`pickup_at`, pickup>dropoff, ~~re-stamp `cancel_deadline_at`~~ (none since 6.0.0-lg5.2), re-anchor 24h reminder). (§5)
 14. `POST /staff/bookings` — staff cross-owner booking create (v1 scope: mid-stay day-school days for a lodger; capacity override switch; comp/credit/PAYG money model needs a ruling). (§5)
 
 **Check-in (gated on the model decision, roll-up 5 #2):**
@@ -1893,7 +1968,7 @@ The systemic finding: **wire.ts v1.0.0 covers ~6 staff surfaces, responses only.
 - `CreditsWire` (`credits.ts:39-58`, mirrored in mobile `creditsRepository.ts:58-81`) — NOTE-12.
 - `MembershipWire` + `MembershipCreateWire` (`memberships.ts:66-100`) + `StaffMembershipWire` (`staffMemberships.ts:33-35`) — promote BEFORE the parked pause/resume portal UI (DRIFT-21).
 - `AnnouncementWire` (`announcementWire.ts:35`), `EventWire` + `EventRsvpWire` (`eventWire.ts:36,48`) — domain entirely uncovered.
-- `DayCapacityWire` (route-local; bypasses contract sync today — NOTE-1), `CancelWindowSettingWire` (`staffCancelWindow.ts`, when a portal editor lands), `CreditExpirySettingWire` (same trigger).
+- `DayCapacityWire` (route-local; bypasses contract sync today — NOTE-1), ~~`CancelWindowSettingWire` (`staffCancelWindow.ts`, when a portal editor lands)~~ (deleted with its route at 6.0.0-lg5.2; the `cxl` domain's `CancellationSettingsWire` is in `wire.ts`), `CreditExpirySettingWire` (same trigger).
 - `ParkedInvoiceWire` → widened `StaffInvoiceWire` + `RefundWire` (charge-keyed). (§9)
 - Owner `DogWire` (`lib/dogWire.ts`) — the standing STATUS.md owner-surface expansion follow-up; the staff dog extension builds on it.
 - Error envelope + `ApiErrorCode` enum (`lib/errors.ts` ↔ portal `ApiError`) — the standing STATUS.md follow-up; portal's code vocabulary is currently disjoint.

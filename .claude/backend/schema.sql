@@ -748,12 +748,15 @@ CREATE TABLE bookings (
   -- (day_capacity is keyed by location) and the rate lookup. FKs locations(slug);
   -- owners/staff now reference the same locations table (unified Δ 2026-06-08).
   location          text REFERENCES locations(slug),
-  -- Cancellation window (locked 2026-05-19). The category-specific free-cancel
-  -- RULE is API logic; the schema stores the RESOLVED outcome the way
-  -- day_capacity stores resolved overrides: cancel_deadline_at is the computed
-  -- last free-cancel instant (set at creation); on cancel the API sets
-  -- cancelled_at + cancel_forfeited (true = cancelled past the deadline →
-  -- credit/charge forfeited, no refund). status still flips to 'cancelled'.
+  -- Cancellation (6.0.0-lg5.2, P21; CXL-U04, design §2.7:4115-4159): no cancel has
+  -- a window and none forfeits. On cancel the API sets cancelled_at, status
+  -- 'cancelled' and cancel_forfeited = false, and every credit the row debited comes
+  -- back; no cancel moves money. cancel_deadline_at is stamped by nothing (M5.08
+  -- dropped cancel_window_settings, the 2026-05-19 window's per-category hours): new
+  -- rows hold NULL, and a deadline stamped on a row before P21 is read by nothing.
+  -- cancel_forfeited = true survives only on a row cancelled before P21 inside the old
+  -- 48-hour window. Both columns stay, as BookingWire's typed fields do (contract
+  -- notes D2).
   cancelled_at        timestamptz,
   cancellation_reason text,
   cancel_deadline_at  timestamptz,
@@ -799,6 +802,11 @@ CREATE TABLE booking_dogs (
   dog_id     uuid NOT NULL REFERENCES dogs(id) ON DELETE CASCADE,
   is_lead    boolean NOT NULL DEFAULT false,
   expired_at             timestamptz,                 -- NULL = live; unlinking a dog expires the row
+  -- M5.04 (S31, DAY-U43): this dog stays for that date's after-school session at the
+  -- campus (day.after_school_start_time to _end_time), her opt-in, ticked at booking
+  -- (POST /bookings `after_school`). Counted in dogs, as the seats are, against
+  -- day.after_school_capacity_count under the date's capacity lock. Never charged in v1.
+  after_school           boolean NOT NULL DEFAULT false,
   PRIMARY KEY (booking_id, dog_id)
 );
 CREATE INDEX booking_dogs_dog_idx ON booking_dogs (dog_id);
@@ -874,43 +882,9 @@ CREATE TRIGGER checkin_events_append_only_truncate BEFORE TRUNCATE ON checkin_ev
   FOR EACH STATEMENT EXECUTE FUNCTION checkin_events_append_only();
 REVOKE ALL ON FUNCTION checkin_events_append_only() FROM PUBLIC, anon, authenticated;
 
--- ----------------------------------------------------------------------------
--- After School Coaching opt-in (locked 2026-05-19) — a per-dog add-on that is
--- ONLY bookable against a Day School booking (the booking flow's `after-school`
--- phase / afterSchoolByDogId). The "only if in Day School" rule is enforced in
--- pure DDL, not app code: the composite FK targets bookings(id, category) and
--- the CHECK pins booking_category = 'day-school', so a row physically cannot
--- reference a non-day-school booking — no trigger required. (B&T's bundled
--- "4 months After School Coaching" is part of the B&T program/request, NOT
--- this user opt-in, and is intentionally not modeled here.)
--- ----------------------------------------------------------------------------
--- Composite-unique on bookings enables the subtype foreign key below.
-CREATE UNIQUE INDEX bookings_id_category_uidx ON bookings (id, category);
-
-CREATE TABLE after_school_optins (
-  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  booking_id       uuid NOT NULL,
-  booking_category service_category NOT NULL,
-  dog_id           uuid NOT NULL REFERENCES dogs(id) ON DELETE CASCADE,
-  owner_id         uuid NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
-  school_day_count integer NOT NULL CHECK (school_day_count > 0),
-  external_ref     text,
-  source           record_source NOT NULL DEFAULT 'app',
-  created_at       timestamptz NOT NULL DEFAULT now(),
-  expired_at       timestamptz,                       -- NULL = live (soft opt-out)
-  -- Subtype FK: the backing booking must exist AND be category 'day-school'.
-  FOREIGN KEY (booking_id, booking_category)
-    REFERENCES bookings (id, category) ON DELETE CASCADE,
-  CHECK (booking_category = 'day-school')          -- "only if in Day School"
-);
--- One LIVE opt-in per (booking, dog); partial so a soft opt-out doesn't block
--- re-opting the same dog into the same day-school booking.
-CREATE UNIQUE INDEX after_school_optins_uidx
-  ON after_school_optins (booking_id, dog_id) WHERE expired_at IS NULL;
-CREATE UNIQUE INDEX after_school_optins_source_ref_uidx
-  ON after_school_optins (source, external_ref) WHERE expired_at IS NULL;
-CREATE INDEX after_school_optins_dog_idx   ON after_school_optins (dog_id);
-CREATE INDEX after_school_optins_owner_idx ON after_school_optins (owner_id);
+-- (M5.04, P21: the after-school opt-in is booking_dogs.after_school, one flag per
+-- share. `after_school_optins` and `bookings_id_category_uidx`, the index that
+-- existed only for its subtype FK, are dropped; design §4 M5.04, question 43.)
 
 -- ----------------------------------------------------------------------------
 -- Pending requests (R1: same multi-dog shape as bookings; R8 structured tags)
@@ -987,49 +961,16 @@ CREATE TABLE day_capacity (
   PRIMARY KEY (location, date)
 );
 
--- ----------------------------------------------------------------------------
--- Cancel-window settings (locked 2026-05-26, Day 13 §A amendment) — per-
--- category free-cancel hours, tunable from the staff portal (owner-only).
--- Same shape as day_capacity: a config table the API reads at booking-
--- creation time to stamp bookings.cancel_deadline_at; if a category row is
--- absent the API falls back to the TUNABLE per-category default table in
--- lib/cancelWindow.ts. Seeded at 48h flat across all categories (locked
--- 2026-05-26, Shanthi's call); staff portal PATCH /staff/cancel-window/
--- :category lets Shanthi tune any category.
---
--- One row per service_category; updated_by_staff_id stamps the actor on
--- the last edit (NULL = still the seeded default — useful for portal UX
--- "policy never customized" hint).
---
--- Resolved deadline math is API logic (lib/cancelWindow.computeCancelDeadline);
--- once a booking is created, bookings.cancel_deadline_at carries the resolved
--- instant forward. Changing the policy later does NOT retroactively re-stamp
--- existing rows — promise made at booking time honors at cancel time even if
--- policy moves later.
--- ----------------------------------------------------------------------------
-CREATE TABLE cancel_window_settings (
-  category               service_category PRIMARY KEY,
-  hours_before           integer NOT NULL CHECK (hours_before > 0),
-  updated_at             timestamptz NOT NULL DEFAULT now(),
-  updated_by_staff_id    uuid REFERENCES staff(id) ON DELETE SET NULL
-);
-
-INSERT INTO cancel_window_settings (category, hours_before) VALUES
-  ('day-school',      48),
-  ('day-care',        48),
-  ('private-lesson',  48),
-  ('group-class',     48),
-  ('boarding',        48),
-  ('board-and-train', 48),
-  ('evaluation',      48);
+-- (M5.08, P21: `cancel_window_settings`, the per-category free-cancel hours that
+-- stamped bookings.cancel_deadline_at, is dropped with its seed and COMMENT. No
+-- cancel has a window: every cxl.* key is stored only, design §3.8.)
 
 -- Intake field settings (added 2026-06-17) — the app-wide default for which
--- optional dog-form sections we collect, tunable from the staff portal. Same
--- shape/role as cancel_window_settings: one row per field key, the API reads it
+-- optional dog-form sections we collect, tunable from the staff portal. One row
+-- per field key, the API reads it
 -- to seed the owner dog form (sign-up + the default for new dogs), and
 -- dogs.field_overrides layers per-dog exceptions on top. A missing row falls
--- back to collected=true in API code (same code-side-default pattern as the
--- cancel window). `field_key` is the FE DogFieldKey (camelCase) so the JSONB
+-- back to collected=true in API code. `field_key` is the FE DogFieldKey (camelCase) so the JSONB
 -- override keys, the wire, and this table share one vocabulary — no mapping.
 -- updated_by_staff_id stamps the last editor (NULL = still the seeded default).
 CREATE TABLE intake_field_settings (
@@ -2511,7 +2452,7 @@ CREATE INDEX audit_log_table_row_idx ON audit_log (table_name, row_pk, at DESC);
 
 -- row_pk is the first arm that names the row. M1.18 (STAFF-U22) added the
 -- key/scope arm (payment_settings) BEFORE the bare key arm, and the category
--- (cancel_window_settings), field_key (intake_field_settings) and location arms
+-- (cancellation_policy_settings), field_key (intake_field_settings) and location arms
 -- AFTER date — a NULL location is the '<global>' row of a two-tier settings
 -- table. A table none of the arms can name aborts every UPDATE (row_pk is NOT
 -- NULL), so a new audited table needs a key one of them reads.
@@ -2590,7 +2531,7 @@ BEGIN
   FOR t IN SELECT unnest(ARRAY[
     'owners','staff','dogs','vets','dog_vaccines','required_vaccines','dog_medications',
     'dog_feeding','dog_completed_classes','group_classes','cohorts','reports',
-    'media_assets','bookings','booking_dogs','after_school_optins',
+    'media_assets','bookings','booking_dogs',
     'pending_requests','pending_request_dogs','pending_request_preferred_dates',
     'day_capacity','payment_methods','agreement_documents',
     'service_rates','threads','thread_dogs','messages','event_series','events',
@@ -2598,7 +2539,7 @@ BEGIN
     -- M1.18 (STAFF-U22): every settings edit keeps the value it replaced —
     -- the four settings tables that predate LG1, and every table M1.01–M1.16
     -- creates (src/lib/settingsRegistry.ts AUDITED_SETTINGS_TABLES).
-    'cancel_window_settings','intake_field_settings',
+    'intake_field_settings',
     'dog_descriptors','account_settings','alumni_settings','cash_settings',
     'credit_settings','day_program_settings','dog_gate_settings',
     'evaluation_settings','migration_settings','messaging_settings',
@@ -2879,37 +2820,31 @@ CREATE TRIGGER bookings_eval_gate_check
 --       `session_checked_in` while any dog still on it has folded past
 --       `expected` on the check-in log (an undone check-in does not count).
 --    2. UPDATE bookings SET status='cancelled', cancelled_at=now(),
---       cancel_forfeited = (now() > cancel_deadline_at). The deadline was
---       stamped at creation from cancel_window_settings (live policy at
---       book time) — changing the policy later doesn't retroactively re-
---       stamp existing rows.
---    3. IF NOT forfeited: credit booking back —
---         For credit-funded bookings: each live booking-debit (one no
---           return names yet) → INSERT one +1 'settlement-return' naming it
---           in reverses_entry_id (M5.03, M5.10), to the lot it drew from, or
---           a fresh lot when that lot can pay no later date. Append-only;
---           balance recomputes to its pre-booking value. A day row's live
---           share with no live debit is a 500 and one alarm, never a cancel
---           that moves nothing (design §2.3:2502-2505).
---         For money-funded bookings: SELECT charges WHERE booking_id=$id
---           AND status='succeeded' → INSERT refunds row (status='pending',
---           amount_cents <= the charge minus any prior succeeded refunds
---           for that charge). The Stripe refund API call is queued POST-
---           COMMIT (same shape as Day-10's payment_intents create).
---           Day-15 webhook flips refunds.status → 'succeeded'; charges.
---           status → 'refunded' only when cumulative succeeded refunds ==
---           charge.amount_cents (API logic, NOT a schema invariant).
---    4. IF forfeited: no ledger entry, no refund row. cancel_forfeited =
---       true, status = 'cancelled', and we still proceed through capacity
---       release so the seat doesn't sit blocked.
---    5. Capacity release:
+--       cancel_forfeited = false. No cancel forfeits (6.0.0-lg5.2, P21;
+--       CXL-U04, design §2.7:4115-4159): every cxl.* key is stored only and
+--       no cancel window exists (M5.08 dropped cancel_window_settings), so a
+--       deadline stamped on a row before P21 is read by nothing.
+--    3. Credit the booking back, and move no money: each live booking-debit
+--       (one no return names yet) → INSERT one +1 'settlement-return' naming
+--       it in reverses_entry_id (M5.03, M5.10), to the lot it drew from, or a
+--       fresh lot when that lot can pay no later date (the one return writer,
+--       creditLedgerRepository.refundForBooking). Append-only; the balance
+--       recomputes to its pre-booking value. A day row's live share with no
+--       live debit is a 500 and one alarm, never a cancel that moves nothing
+--       (design §2.3:2502-2505). No cancel mints a refunds row: there is no
+--       card-paid session (design.md:4151-4154). A pending row's cancel
+--       cancels its whole order, where the engine refunds a top-up that won
+--       no seat (F4), the one automatic refund.
+--    4. Capacity release:
 --         - day_capacity is dynamic (assertCapacityWithinLock counts
 --           non-cancelled rows). Flipping status='cancelled' IS the
 --           release; no decrement needed.
 --         - cohorts.filled is an explicit counter; for group-class
 --           bookings, decrement by the non-staff dog count under the
---           same cohort row lock the enroll path uses.
---    6. Enqueue 'booking-cancelled' notification (deep-links to
+--           same cohort row lock the enroll path uses. (This cancel refuses a
+--           group-class booking, 422 "cohort withdraw", so the decrement is the
+--           withdraw's, POST /enrollments/:cohortId/withdraw.)
+--    5. Enqueue 'booking-cancelled' notification (deep-links to
 --       /bookings/:id so the owner sees it in the bell popover).
 --    Post-commit: invalidate caches for the booking list, dog credit
 --    balance, capacity (avail:{location}:*), and dog profile.
@@ -2968,13 +2903,12 @@ COMMENT ON TABLE  media_assets                   IS 'Metadata + Cloudflare-R2 ob
 COMMENT ON TABLE  media_derivative_jobs          IS 'Worker queue: one row per media_assets row needing derivative processing (sharp images / ffmpeg video). Append-only by nature; status flips pending → processing → done | failed.';
 COMMENT ON TABLE  bookings                       IS 'A confirmed scheduled session of any service category; the unified booking record (all six categories read back here).';
 COMMENT ON TABLE  booking_dogs                   IS 'Dogs on a booking (lead + additional), one share each; a share cancelled alone carries expired_at. A dog''s presence is the check-in log''s (checkin_events).';
+COMMENT ON COLUMN booking_dogs.after_school      IS 'Her opt-in to that date''s after-school session at the campus (M5.04, DAY-U43): counted in dogs against day.after_school_capacity_count; never charged in v1.';
 COMMENT ON TABLE  checkin_events                 IS 'The append-only check-in log: one row per board verb on one dog''s share of one session (M5.01). A dog''s state is folded from her live events in seq order; an undo names the event it removes. Never edited or deleted, except by a cascade from booking_dogs.';
-COMMENT ON TABLE  after_school_optins            IS 'Per-dog After School Coaching opt-in; DDL-gated so it can only attach to a day-school booking.';
 COMMENT ON TABLE  pending_requests               IS 'Owner-submitted requests awaiting staff approval (private lesson, boarding, board-and-train) before they convert to bookings.';
 COMMENT ON TABLE  pending_request_dogs           IS 'Dogs attached to a pending request (lead + additional), mirroring booking_dogs.';
 COMMENT ON TABLE  pending_request_preferred_dates IS 'The owner ranked preferred date/time slots for a pending request.';
 COMMENT ON TABLE  day_capacity                   IS 'Sparse per-(location, calendar-day) seat overrides for Day School and Day Care combined; a live row wins over the campus''s day.daily_capacity_dogs and day.open_weekdays_list, which the API applies when no row exists.';
-COMMENT ON TABLE  cancel_window_settings         IS 'Owner-tunable per-category free-cancel hours (Day 13). One row per service_category; seeded 48h flat. API reads at booking creation to stamp bookings.cancel_deadline_at; the resolved deadline travels with the booking.';
 COMMENT ON TABLE cancellation_policy_settings IS 'The cxl per-service cancellation policy (M5.07): one row per service category, every key seeded and stored only, read by nothing in v1 (money cut 3). Audited.';
 COMMENT ON TABLE cancellation_global_settings IS 'The cxl global switches (M5.07; singleton, id = true): stored only, except per_dog_cancel_enabled, which the owner''s one-dog cancel reads (s11). Audited.';
 COMMENT ON TABLE migrations_applied IS 'One row per migration step applied through npm run migrate:apply: the step id, who ran it, and the sha256 of the exact bytes sent. Written as the step''s last statement, in its transaction.';

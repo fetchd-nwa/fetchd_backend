@@ -28,20 +28,21 @@ import {
 
 /**
  * Day 13 contract tests for `POST /bookings/:id/cancel` — owner-self
- * cancel with three outcome branches (forfeit / credit-back /
- * money-back) plus the obvious edge cases.
+ * cancel, plus the obvious edge cases. From P21 (6.0.0-lg5.2; CXL-U04, design
+ * §2.7:4115-4159) a cancel has one outcome: every credit back, nothing forfeited,
+ * and no money moved ("No settlement reaches a charge", design.md:4151-4154).
+ * The forfeit branch and the money-back branch are gone with their tests.
  *
  * Test seed strategy:
  *   - Credit-back path uses POST /bookings to create the booking + its
  *     debit row naturally (the API substrate).
- *   - Money-back path manually seeds a `charges` row alongside a hand-
- *     inserted booking (no API path writes `charges` until Day 14).
- *   - Forfeit path hand-inserts a booking with a `cancel_deadline_at`
- *     already in the past; the markCancelled SQL `<injected now> >
- *     deadline` resolves forfeited=true on commit.
+ *   - A row stamped before P21 is hand-inserted with a `cancel_deadline_at`
+ *     already in the past: it is cancelled with nothing forfeited.
+ *   - A non-day booking holding a succeeded charge is hand-planted: no v1
+ *     route writes one (the board-and-train conversion is reachable from no
+ *     v1 client), and its cancel mints no refund.
  *   - Free-service (eval-style) path hand-inserts a booking with NO
- *     ledger rows and NO charge — the route's "neither credit-paid
- *     nor money-paid" branch.
+ *     ledger rows and NO charge.
  *
  * Cross-test isolation: each test uses unique idempotency keys + new
  * booking ids; the fixture's hard-DELETE teardown wipes everything.
@@ -209,14 +210,14 @@ async function seedSucceededCharge(opts: {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Branch 1 — Forfeit
+// No forfeit (P21): a deadline stamped before P21 is read by nothing
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /bookings/:id/cancel — forfeit branch (past deadline) → cancel_forfeited=true, no ledger, no refund',
+  'POST /bookings/:id/cancel — a deadline stamped before P21 and already past → cancel_forfeited=false, no ledger, no refund (P21: no cancel forfeits)',
   SKIP_WHEN_NO_DB,
   async () => {
-    // scheduledAt 30h ahead, deadline 6h ago → outside the 48h window.
+    // scheduledAt 30h ahead, deadline 6h ago: the P20 tree forfeited this row.
     const scheduledAt = new Date(FIXTURE_NOW_MS + 30 * ONE_HOUR_MS);
     const cancelDeadlineAt = new Date(FIXTURE_NOW_MS - 6 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
@@ -236,7 +237,7 @@ test(
     const body = res.json() as { id: string; status: string; cancel_forfeited?: boolean };
     assert.equal(body.id, bookingId);
     assert.equal(body.status, 'cancelled');
-    assert.equal(body.cancel_forfeited, true);
+    assert.equal(body.cancel_forfeited, false);
 
     const [row] = await db
       .select({
@@ -247,7 +248,7 @@ test(
       .from(bookingsTable)
       .where(eq(bookingsTable.id, bookingId));
     assert.equal(row?.status, 'cancelled');
-    assert.equal(row?.cancelForfeited, true);
+    assert.equal(row?.cancelForfeited, false);
     assert.ok(row?.cancelledAt !== null, 'cancelled_at stamped');
 
     const ledgerRows = await db
@@ -256,10 +257,10 @@ test(
       .where(
         and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
       );
-    assert.equal(ledgerRows.length, 0, 'no settlement-return ledger row on forfeit');
+    assert.equal(ledgerRows.length, 0, 'a private lesson spends no credit, so none comes back');
 
     const refundRows = await db.select().from(refunds).where(eq(refunds.bookingId, bookingId));
-    assert.equal(refundRows.length, 0, 'no refunds row on forfeit');
+    assert.equal(refundRows.length, 0, 'no refunds row');
   },
 );
 
@@ -282,6 +283,7 @@ test(
     assert.equal(res.statusCode, 200, res.body);
     const body = res.json() as { status: string; cancel_forfeited?: boolean };
     assert.equal(body.status, 'cancelled');
+    // No cancel forfeits from P21 (CXL-U04), whatever the row's deadline says.
     assert.notEqual(body.cancel_forfeited, true);
 
     // One settlement-return row, delta=+1, mode=school, dog=dog1, booking=this one.
@@ -334,13 +336,16 @@ test(
 );
 
 // ──────────────────────────────────────────────────────────────────────────
-// Branch 3 — Money-back
+// No money moves (P21): a cancel mints no refund, even over a charge
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /bookings/:id/cancel — money-back creates pending refunds row equal to charge amount',
+  'POST /bookings/:id/cancel — a non-day booking holding a succeeded charge (planted: no v1 route writes one) → cancelled, zero refunds rows, no Stripe call',
   SKIP_WHEN_NO_DB,
   async () => {
+    // The P20 tree minted a pending refund for the charge and fired Stripe after commit.
+    // From P21 no cancel mints a refunds row (design.md:4151-4154): money comes back
+    // only as a staff refund, case by case (P22).
     const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
     const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
     const bookingId = await seedRawBooking({
@@ -349,169 +354,31 @@ test(
       cancelDeadlineAt,
       location: null,
     });
-    const chargeId = await seedSucceededCharge({ bookingId, amountCents: 8500 });
+    await seedSucceededCharge({ bookingId, amountCents: 8500 });
 
-    const { app } = cancelApp();
+    const { app, stripe } = cancelApp();
     const res = await postCancel({
       app,
       bookingId,
       idempotencyKey: `cn-money-${randomUUID()}`,
     });
     assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as { status: string }).status, 'cancelled');
 
-    const refundRows = await db
-      .select({
-        chargeId: refunds.chargeId,
-        amountCents: refunds.amountCents,
-        status: refunds.status,
-      })
-      .from(refunds)
-      .where(eq(refunds.bookingId, bookingId));
-    assert.equal(refundRows.length, 1);
-    assert.equal(refundRows[0]!.chargeId, chargeId);
-    assert.equal(refundRows[0]!.amountCents, 8500);
-    assert.equal(refundRows[0]!.status, 'pending');
-
+    const refundRows = await db.select().from(refunds).where(eq(refunds.bookingId, bookingId));
+    assert.equal(refundRows.length, 0, 'no cancel mints a refund');
+    assert.deepEqual(
+      stripe.calls.filter((c) => c.method === 'createRefund'),
+      [],
+      'no Stripe refund',
+    );
     const ledgerRefunds = await db
       .select()
       .from(creditLedger)
       .where(
         and(eq(creditLedger.bookingId, bookingId), eq(creditLedger.reason, 'settlement-return')),
       );
-    assert.equal(ledgerRefunds.length, 0, 'no ledger refund for money-paid');
-  },
-);
-
-test(
-  'POST /bookings/:id/cancel — money-back honors cumulative-refund cap (charge − prior succeeded)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
-    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
-    const bookingId = await seedRawBooking({
-      category: 'private-lesson',
-      scheduledAt,
-      cancelDeadlineAt,
-      location: null,
-    });
-    const chargeId = await seedSucceededCharge({ bookingId, amountCents: 10_000 });
-    // Pre-existing partial refund of $30 (succeeded) — cancel should
-    // only refund the remaining $70.
-    await db.insert(refunds).values({
-      ownerId: FIXTURE_IDS.ownerId,
-      chargeId,
-      bookingId,
-      amountCents: 3000,
-      status: 'succeeded',
-      stripeRefundId: `re_test_${randomUUID().slice(0, 8)}`,
-    });
-
-    const { app } = cancelApp();
-    const res = await postCancel({
-      app,
-      bookingId,
-      idempotencyKey: `cn-money-partial-${randomUUID()}`,
-    });
-    assert.equal(res.statusCode, 200, res.body);
-
-    const cancelRefundRows = await db
-      .select({ amountCents: refunds.amountCents, status: refunds.status })
-      .from(refunds)
-      .where(and(eq(refunds.bookingId, bookingId), eq(refunds.status, 'pending')));
-    assert.equal(cancelRefundRows.length, 1);
-    assert.equal(cancelRefundRows[0]!.amountCents, 7000, 'remaining = 10000 - 3000 prior');
-  },
-);
-
-test(
-  'POST /bookings/:id/cancel — money-back fires post-commit Stripe refund (Day-14 seam)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
-    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
-    const bookingId = await seedRawBooking({
-      category: 'private-lesson',
-      scheduledAt,
-      cancelDeadlineAt,
-      location: null,
-    });
-    await seedSucceededCharge({ bookingId, amountCents: 12_345 });
-
-    const { app, stripe } = cancelApp();
-    const res = await postCancel({
-      app,
-      bookingId,
-      idempotencyKey: `cn-money-stripe-${randomUUID()}`,
-    });
-    assert.equal(res.statusCode, 200, res.body);
-
-    const refundCalls = stripe.calls.filter((c) => c.method === 'createRefund');
-    assert.equal(refundCalls.length, 1, 'post-commit Stripe refund fired exactly once');
-    const args = refundCalls[0]!.args as { paymentIntentId: string; amountCents: number };
-    assert.equal(args.amountCents, 12_345);
-    assert.match(args.paymentIntentId, /^pi_test_/);
-  },
-);
-
-test(
-  'POST /bookings/:id/cancel — money-back: Stripe refund failure is swallowed (DB refund row persists)',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
-    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
-    const bookingId = await seedRawBooking({
-      category: 'private-lesson',
-      scheduledAt,
-      cancelDeadlineAt,
-      location: null,
-    });
-    await seedSucceededCharge({ bookingId, amountCents: 5_000 });
-
-    const { app, stripe } = cancelApp();
-    stripe.throwOnRefund();
-    const res = await postCancel({
-      app,
-      bookingId,
-      idempotencyKey: `cn-money-stripe-fail-${randomUUID()}`,
-    });
-    assert.equal(res.statusCode, 200, 'route still returns success — DB is source of truth');
-
-    const refundRows = await db
-      .select({ amountCents: refunds.amountCents, status: refunds.status })
-      .from(refunds)
-      .where(eq(refunds.bookingId, bookingId));
-    assert.equal(refundRows.length, 1);
-    assert.equal(refundRows[0]!.status, 'pending', 'Day-15 webhook reconciles to terminal state');
-  },
-);
-
-test(
-  'POST /bookings/:id/cancel — replay does NOT re-fire Stripe refund',
-  SKIP_WHEN_NO_DB,
-  async () => {
-    const scheduledAt = new Date(FIXTURE_NOW_MS + 7 * ONE_DAY_MS);
-    const cancelDeadlineAt = new Date(scheduledAt.getTime() - 48 * ONE_HOUR_MS);
-    const bookingId = await seedRawBooking({
-      category: 'private-lesson',
-      scheduledAt,
-      cancelDeadlineAt,
-      location: null,
-    });
-    await seedSucceededCharge({ bookingId, amountCents: 3_000 });
-
-    const { app, stripe } = cancelApp();
-    const key = `cn-money-replay-${randomUUID()}`;
-    const first = await postCancel({ app, bookingId, idempotencyKey: key });
-    assert.equal(first.statusCode, 200);
-    assert.equal(stripe.calls.filter((c) => c.method === 'createRefund').length, 1);
-
-    const replay = await postCancel({ app, bookingId, idempotencyKey: key });
-    assert.equal(replay.statusCode, 200);
-    assert.equal(
-      stripe.calls.filter((c) => c.method === 'createRefund').length,
-      1,
-      'replay skipped the post-commit Stripe round-trip',
-    );
+    assert.equal(ledgerRefunds.length, 0, 'nothing was debited, so nothing comes back');
   },
 );
 

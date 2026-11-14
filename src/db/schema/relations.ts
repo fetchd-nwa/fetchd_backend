@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm/relations";
-import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, afterSchoolOptins, pendingRequests, intakeFieldSettings, cancelWindowSettings, dogDescriptors, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs, checkinEvents } from "./schema.js";
+import { locations, owners, staff, dogs, vets, dogVaccines, requiredVaccines, dogMedications, dogFeeding, dogCompletedClasses, groupClasses, classPrereqOptions, classResources, cohorts, reports, mediaAssets, mediaDerivativeJobs, bookings, pendingRequests, intakeFieldSettings, dogDescriptors, creditPackages, creditLedger, charges, stripeCustomers, paymentMethods, invoices, refunds, serviceRates, agreementSignatures, agreementDocuments, idempotencyKeys, threads, messages, messageAttachments, eventSeries, events, eventRsvps, notifications, scheduledNotifications, announcements, deviceTokens, notificationDogs, threadDogs, eventRsvpDogs, pendingRequestDogs, pendingRequestPreferredDates, dayCapacity, bookingDogs, checkinEvents } from "./schema.js";
 
 export const ownersRelations = relations(owners, ({one, many}) => ({
 	location: one(locations, {
@@ -9,7 +9,6 @@ export const ownersRelations = relations(owners, ({one, many}) => ({
 	dogs: many(dogs),
 	mediaAssets: many(mediaAssets),
 	bookings: many(bookings),
-	afterSchoolOptins: many(afterSchoolOptins),
 	pendingRequests: many(pendingRequests),
 	stripeCustomers: many(stripeCustomers),
 	paymentMethods: many(paymentMethods),
@@ -43,7 +42,6 @@ export const staffRelations = relations(staff, ({one, many}) => ({
 	bookings: many(bookings),
 	pendingRequests: many(pendingRequests),
 	intakeFieldSettings: many(intakeFieldSettings),
-	cancelWindowSettings: many(cancelWindowSettings),
 	dogDescriptors: many(dogDescriptors),
 	serviceRates_createdByStaffId: many(serviceRates, {
 		relationName: "serviceRates_createdByStaffId_staff_id"
@@ -77,7 +75,6 @@ export const dogsRelations = relations(dogs, ({one, many}) => ({
 	reports: many(reports),
 	mediaAssets: many(mediaAssets),
 	bookings: many(bookings),
-	afterSchoolOptins: many(afterSchoolOptins),
 	pendingRequests: many(pendingRequests),
 	creditLedgers: many(creditLedger),
 	charges: many(charges),
@@ -249,7 +246,6 @@ export const bookingsRelations = relations(bookings, ({one, many}) => ({
 		fields: [bookings.location],
 		references: [locations.slug]
 	}),
-	afterSchoolOptins: many(afterSchoolOptins),
 	pendingRequests: many(pendingRequests),
 	creditLedgers: many(creditLedger),
 	charges: many(charges),
@@ -257,21 +253,6 @@ export const bookingsRelations = relations(bookings, ({one, many}) => ({
 	refunds: many(refunds),
 	scheduledNotifications: many(scheduledNotifications),
 	bookingDogs: many(bookingDogs),
-}));
-
-export const afterSchoolOptinsRelations = relations(afterSchoolOptins, ({one}) => ({
-	dog: one(dogs, {
-		fields: [afterSchoolOptins.dogId],
-		references: [dogs.id]
-	}),
-	owner: one(owners, {
-		fields: [afterSchoolOptins.ownerId],
-		references: [owners.id]
-	}),
-	booking: one(bookings, {
-		fields: [afterSchoolOptins.bookingId],
-		references: [bookings.id]
-	}),
 }));
 
 export const pendingRequestsRelations = relations(pendingRequests, ({one, many}) => ({
@@ -299,13 +280,6 @@ export const pendingRequestsRelations = relations(pendingRequests, ({one, many})
 export const intakeFieldSettingsRelations = relations(intakeFieldSettings, ({one}) => ({
 	staff: one(staff, {
 		fields: [intakeFieldSettings.updatedByStaffId],
-		references: [staff.id]
-	}),
-}));
-
-export const cancelWindowSettingsRelations = relations(cancelWindowSettings, ({one}) => ({
-	staff: one(staff, {
-		fields: [cancelWindowSettings.updatedByStaffId],
 		references: [staff.id]
 	}),
 }));

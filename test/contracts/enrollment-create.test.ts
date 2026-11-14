@@ -331,7 +331,7 @@ test(
 );
 
 test(
-  'POST /enrollments — sets cancel_deadline_at = scheduled_at - 48h (group-class)',
+  'POST /enrollments — stamps no cancel_deadline_at on any week (P21, M5.08; contract notes D3: the class constant goes with the table)',
   SKIP_WHEN_NO_DB,
   async () => {
     const cohort = await makeCohort({ classKey: 'puppy', capacity: 6, filled: 0, weeks: 2 });
@@ -351,10 +351,8 @@ test(
       .from(bookingsTable)
       .where(eq(bookingsTable.cohortId, cohort.id));
     assert.equal(rows.length, body.length);
-    for (const row of rows) {
-      const delta = new Date(row.scheduledAt).getTime() - new Date(row.cancelDeadlineAt!).getTime();
-      assert.equal(delta, 48 * 60 * 60 * 1000, '48h window for group-class');
-    }
+    assert.ok(rows.length > 0);
+    for (const row of rows) assert.equal(row.cancelDeadlineAt, null, row.scheduledAt);
   },
 );
 

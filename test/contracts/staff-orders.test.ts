@@ -642,6 +642,7 @@ test(
       .select({ cancelForfeited: bookings.cancelForfeited })
       .from(bookings)
       .where(eq(bookings.id, seeded.bookingIds[0]!));
+    // No cancel forfeits (P21, CXL-U04); a pending row never could.
     assert.equal(forfeit?.cancelForfeited, false, 'a pending row forfeits nothing');
   },
 );

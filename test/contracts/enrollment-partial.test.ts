@@ -528,10 +528,15 @@ test(
       // Two dogs × weeks bookings, and only for the two that enrolled.
       assert.equal(body.bookings.length, 2 * cohort.weeks);
       const bookingRows = await db
-        .select({ leadDogId: bookingsTable.leadDogId })
+        .select({
+          leadDogId: bookingsTable.leadDogId,
+          cancelDeadlineAt: bookingsTable.cancelDeadlineAt,
+        })
         .from(bookingsTable)
         .where(eq(bookingsTable.cohortId, cohort.id));
       assert.equal(bookingRows.length, 2 * cohort.weeks);
+      // P21 (M5.08; contract notes D3): the partial path stamps no cancel deadline either.
+      for (const row of bookingRows) assert.equal(row.cancelDeadlineAt, null);
       assert.equal(
         bookingRows.filter((b) => b.leadDogId === gapped || b.leadDogId === ineligible).length,
         0,
@@ -1217,7 +1222,6 @@ test(
               scheduledAt: new Date(SIX_WEEKS_OUT_UTC),
               location: 'fayetteville',
               notes: null,
-              cancelDeadlineAt: new Date(SIX_WEEKS_OUT_UTC),
               additionalDogIds: [],
               cohortId: cohort.id,
               sessionReportId: null,

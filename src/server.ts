@@ -30,7 +30,6 @@ import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerSettingsRoute } from './routes/settings.js';
 import { registerStaffAlumniRoute } from './routes/staffAlumni.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
-import { registerStaffCancelWindowRoute } from './routes/staffCancelWindow.js';
 import { registerStaffCheckinRoute } from './routes/staffCheckin.js';
 import { registerStaffDayCapacityRoute } from './routes/staffDayCapacity.js';
 import { registerStaffCreditPackagesRoute } from './routes/staffCreditPackages.js';
@@ -135,7 +134,6 @@ export function buildApp(): FastifyInstance {
   registerRequestsRoute(app); // [auth] — owner-only
   registerSettingsRoute(app); // [auth] — the owner settings document (2.0.0), read from pg every call
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
-  registerStaffCancelWindowRoute(app); // [staff] — Day-13 portal verb 3 (cancel-window policy)
   registerStaffDayCapacityRoute(app); // [staff] — PUT/DELETE one date's cap (4.0.0-lg3.1)
   registerStaffCreditPackagesRoute(app); // [staff] — a catalog row's expiry window (CRED-U08)
   registerStaffCreditsRoute(app); // [staff] — an owner's pools, hand edits, a lot's date (CRED-U14, CRED-U15)

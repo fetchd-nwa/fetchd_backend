@@ -23,8 +23,10 @@ export type { BookingWire };
  * helper to columns it doesn't need (confirmed_at, cancellation_reason,
  * dropoff_at, pickup_at, external_ref, source — all internal state, none on
  * the §B wire today). `cohortId` joined the wire Day-19d so the FE can group +
- * title group-class bookings; `cancelDeadlineAt` joined Δ 2026-07-08 so the FE
- * can warn before a cancel forfeits (booking-overlap flow).
+ * title group-class bookings; `cancelDeadlineAt` joined Δ 2026-07-08 for the
+ * booking-overlap flow's forfeit warning. Since P21 (wire 6.0.0-lg5.2) no cancel
+ * forfeits and nothing stamps it: it is passed through for a row stamped earlier,
+ * and nothing reads it.
  */
 export interface BookingRowForWire {
   id: string;
@@ -77,6 +79,18 @@ export interface CancelFacts {
 }
 
 /**
+ * What each share of a day row carries beyond its cancel (6.0.0-lg5.2): her after-school
+ * opt-in (`dog_shares[].after_school`, M5.04), and, on a share whose credit has not come
+ * back, the date that credit would carry if it came back now
+ * (`dog_shares[].return_expires_at`, D1), read by `returnExpiryFor` through the return
+ * writer's own predicate.
+ */
+export interface ShareFacts {
+  afterSchool: ReadonlyMap<string, boolean>;
+  returnExpiresAt: ReadonlyMap<string, string>;
+}
+
+/**
  * Emit the wire shape. The denormalization is explicit: lead + additional
  * dog ids come pre-resolved by `groupBookingDogs` (rule-of-two with the
  * four bookings endpoints below); trainer name is pre-resolved by the
@@ -88,6 +102,7 @@ export function toBookingWire(
   trainerName: string | null,
   groupClassName?: string,
   cancel?: CancelFacts,
+  shares?: ShareFacts,
 ): BookingWire {
   const wire: BookingWire = {
     id: row.id,
@@ -126,13 +141,19 @@ export function toBookingWire(
     // `dog_id`, then `additional_dog_ids` in their order, then the shares cancelled
     // alone by `cancelled_at` (the wire's order).
     wire.dog_shares = [
-      ...[dogIds.lead, ...dogIds.additional].map((dogId) => ({
-        dog_id: dogId,
-        can_cancel: cancel.shareCanCancel.get(dogId) ?? false,
-      })),
+      ...[dogIds.lead, ...dogIds.additional].map((dogId) => {
+        const returnExpiresAt = shares?.returnExpiresAt.get(dogId);
+        return {
+          dog_id: dogId,
+          can_cancel: cancel.shareCanCancel.get(dogId) ?? false,
+          after_school: shares?.afterSchool.get(dogId) ?? false,
+          ...(returnExpiresAt !== undefined ? { return_expires_at: returnExpiresAt } : {}),
+        };
+      }),
       ...(dogIds.cancelled ?? []).map((share) => ({
         dog_id: share.dogId,
         can_cancel: false,
+        after_school: shares?.afterSchool.get(share.dogId) ?? false,
         cancelled_at: pgTimestampToIso(share.cancelledAt),
       })),
     ];

@@ -17,8 +17,6 @@ import { notificationsRepository } from '../db/repositories/notificationsReposit
 import { LOCATION_SLUGS, requestStatus } from '../db/schema/schema.js';
 import { ApiError } from '../lib/errors.js';
 import { checkBookingGates } from '../lib/bookingGatePreCheck.js';
-import { cancelWindowSettingsRepository } from '../db/repositories/cancelWindowSettingsRepository.js';
-import { computeCancelDeadlineFromHours } from '../lib/cancelWindow.js';
 import { enqueueBookingReminders } from '../lib/enqueueBookingReminders.js';
 import { insertBookingWithGateMapping } from '../lib/insertBookingWithGateMapping.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
@@ -209,8 +207,6 @@ export function registerStaffRequestsRoute(
               category: row.category,
             });
 
-            const hours = await cancelWindowSettingsRepository.resolveHoursFor(row.category, tx);
-            const cancelDeadlineAt = computeCancelDeadlineFromHours(parsed.scheduledAt, hours);
             const inserted = await insertBookingWithGateMapping(tx, {
               ownerId: row.ownerId,
               leadDogId: row.leadDogId,
@@ -218,7 +214,6 @@ export function registerStaffRequestsRoute(
               scheduledAt: parsed.scheduledAt,
               location: parsed.location,
               notes: parsed.notes,
-              cancelDeadlineAt,
               additionalDogIds: allDogIds.additionalDogIds,
               // Δ 2026-07-14: the private lesson's home/public setting rides
               // the conversion so the owner's bookings card can label it.

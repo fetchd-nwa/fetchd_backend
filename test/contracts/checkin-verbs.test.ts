@@ -856,6 +856,64 @@ describe("P20 F2 and F8 (§M1, §10): the re-check-in's re-debit reverses its ch
       assert.equal((rows[0] as { n: number }).n, 0, 'nothing drew on dead D');
     },
   );
+
+  /** A lot's credits left: its grant plus every allocation against it, live or not. */
+  async function unspent(lotId: string): Promise<number> {
+    const { rows } = await db.execute(sql`
+      SELECT (l.delta + COALESCE((SELECT sum(x.delta) FROM credit_ledger x WHERE x.lot_id = l.id), 0))::int AS n
+        FROM credit_ledger l WHERE l.id = ${lotId}`);
+    return (rows[0] as { n: number }).n;
+  }
+
+  test(
+    'T10e, a pin (P20 Opus r3 L1, mutant S10d; DECISIONS 263): at key 0 the returned credit is spent on another day, then J (1 credit, dies in 5 days) and K (2, in 60) both pay DAY → the fallback takes the soonest-expiring, J: J 0, K 2',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      // probe-p16-frozen.log as a test: Waffles's day paid from lot I; the 11:00 ticked
+      // check-out puts the credit back into I (key 0); that credit pays another day; then two
+      // live lots of different dates pay DAY. §10 rule 2: the soonest-expiring live lot.
+      await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 0`);
+      try {
+        const dogId = await pepper('Waffles');
+        const lotI = await plantLot({ credits: 1, expiresAt: new Date(Date.now() + 30 * 864e5) });
+        const { bookingId } = await createSession({
+          dogIds: [dogId],
+          date: DAY,
+          lotId: lotI,
+          ledger: sessions,
+        });
+        let lotJ = '';
+        let lotK = '';
+        const balances = await vetTrip(bookingId, dogId, async () => {
+          await createSession({
+            dogIds: [dogId],
+            date: '2026-10-20',
+            lotId: lotI,
+            ledger: sessions,
+          });
+          assert.equal(await unspent(lotI), 0, 'the returned credit has left I');
+          lotJ = await plantLot({ credits: 1, expiresAt: new Date(Date.now() + 5 * 864e5) });
+          lotK = await plantLot({ credits: 2, expiresAt: new Date(Date.now() + 60 * 864e5) });
+        });
+        assert.deepEqual(balances, [0, 1, 2]);
+        assert.deepEqual(
+          { J: await unspent(lotJ), K: await unspent(lotK) },
+          { J: 0, K: 2 },
+          'the re-debit spends J, the credit that dies first, and leaves K whole',
+        );
+        assert.deepEqual(
+          (await ledgerOf(bookingId)).map((r) => [r.reason, r.lotId]),
+          [
+            ['booking-debit', lotI],
+            ['settlement-return', lotI],
+            ['booking-debit', lotJ],
+          ],
+        );
+      } finally {
+        await db.execute(sql`UPDATE credit_settings SET returned_credit_expiry_months = 1`);
+      }
+    },
+  );
 });
 
 describe('P20 fix 1, F4: the board verbs wipe her balance cache (Opus L4)', () => {
@@ -1181,6 +1239,7 @@ describe('the board read', () => {
           events: ['check-in'],
           booking_status: 'upcoming',
           late_pickup_due: false,
+          after_school: false,
           settled: false,
           can_cancel: false,
           payment_pending: false,

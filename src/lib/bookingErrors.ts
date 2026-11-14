@@ -162,6 +162,23 @@ export function insufficientCapacityError(gap: CapacityGap): ApiError {
   );
 }
 
+/**
+ * A date's after-school session cannot take the dogs ticked for it (6.0.0-lg5.2; DAY-U43,
+ * `AfterSchoolFullDetails`): `capacity` is the campus's `day.after_school_capacity_count`,
+ * `booked` the dogs already opted in there that date. The whole order is refused.
+ */
+export function afterSchoolFullError(gap: {
+  date: string;
+  capacity: number;
+  booked: number;
+}): ApiError {
+  return new ApiError(
+    'after_school_full',
+    `${gap.date}'s after-school session is full (${gap.booked} of ${gap.capacity} places taken).`,
+    { kind: 'after_school_full', ...gap },
+  );
+}
+
 /** A date past the horizon (`lib/bookingHorizon.ts`). No `details`: the app reads
  *  the horizon from `GET /settings`. */
 export function beyondBookingHorizonError(date: string, lastBookable: string): ApiError {

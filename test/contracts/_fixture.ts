@@ -6,7 +6,6 @@ import {
   announcements,
   bookingDogs,
   bookings,
-  cancelWindowSettings,
   classPrereqOptions,
   cohorts,
   creditLedger,
@@ -356,14 +355,6 @@ export const FIXTURE_VACCINE_EXPIRIES = {
  */
 export async function seedFixture(): Promise<void> {
   await teardownFixture();
-
-  // Day-13 leak guard: the test container's DB is persistent across `npm test`
-  // runs (schema seed runs once at container create, not per-run), so any
-  // test that PATCHes `cancel_window_settings` leaves the policy tuned for
-  // subsequent runs. Restore the seeded 48h-flat baseline here so every file
-  // starts from the same policy — booking tests asserting the seeded delta
-  // are deterministic regardless of run order or prior leaks.
-  await db.update(cancelWindowSettings).set({ hoursBefore: 48, updatedByStaffId: null });
 
   await db.insert(vets).values({
     id: FIXTURE_IDS.vetId,
