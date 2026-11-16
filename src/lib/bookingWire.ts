@@ -70,12 +70,19 @@ export interface BookingDogIds {
  * Whether a cancel would be accepted now (6.0.0-lg5.1, CXL-U09): `BookingWire.can_cancel`
  * for the whole session and `dog_shares[].can_cancel` per dog, computed by
  * `lib/dayCancel.ts` from the same fold and clock the cancels refuse on. Day-school and
- * day-care rows only; every other category omits both.
+ * day-care rows only; every other category omits both. On a day-school row, the same read
+ * says whether each dog's after-school could be taken off now (6.2.0).
  */
 export interface CancelFacts {
   canCancel: boolean;
   /** By dog: whether a one-dog cancel of her would be accepted now. */
   shareCanCancel: ReadonlyMap<string, boolean>;
+  /**
+   * By dog, on a day-school row only (6.2.0, P48): whether her after-school removal would
+   * be accepted now (`dayCancel.afterSchoolRemovable`). Absent on a day-care row, whose
+   * shares carry no `can_remove_after_school` (after-school rides day school only).
+   */
+  shareCanRemoveAfterSchool?: ReadonlyMap<string, boolean>;
 }
 
 /**
@@ -138,6 +145,11 @@ export function toBookingWire(
   }
   if (cancel !== undefined) {
     wire.can_cancel = cancel.canCancel;
+    // 6.2.0: on every share of a day-school row (`false` on one cancelled alone), on no
+    // share of a day-care row.
+    const removable = cancel.shareCanRemoveAfterSchool;
+    const canRemove = (able: boolean) =>
+      removable === undefined ? {} : { can_remove_after_school: able };
     // `dog_id`, then `additional_dog_ids` in their order, then the shares cancelled
     // alone by `cancelled_at` (the wire's order).
     wire.dog_shares = [
@@ -147,6 +159,7 @@ export function toBookingWire(
           dog_id: dogId,
           can_cancel: cancel.shareCanCancel.get(dogId) ?? false,
           after_school: shares?.afterSchool.get(dogId) ?? false,
+          ...canRemove(removable?.get(dogId) ?? false),
           ...(returnExpiresAt !== undefined ? { return_expires_at: returnExpiresAt } : {}),
         };
       }),
@@ -154,6 +167,7 @@ export function toBookingWire(
         dog_id: share.dogId,
         can_cancel: false,
         after_school: shares?.afterSchool.get(share.dogId) ?? false,
+        ...canRemove(false),
         cancelled_at: pgTimestampToIso(share.cancelledAt),
       })),
     ];

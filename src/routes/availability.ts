@@ -7,6 +7,7 @@ import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import {
   availabilityMaxDates,
+  campusAfterSchoolCapacity,
   dayCapacityFor,
   dayCapacityWire,
   enumerateRangeWithCap,
@@ -49,6 +50,15 @@ import { settingsRepository } from '../db/repositories/settingsRepository.js';
  * `avail:*` range cache is invalidated by `day_capacity` writes only, so caching it
  * would reintroduce the same lie as staleness. The settings are uncached too: every
  * settings read goes to Postgres (conflict 19).
+ *
+ * **The after-school places** (6.2.0, P48; her #8: "say like X/10 for each day so
+ * people know when booking or grey it out if full"). `after_school_capacity` is the
+ * campus's `day.after_school_capacity_count`, 0 on a date with no seats or at a campus
+ * that does not offer day school (`campusAfterSchoolCapacity`);
+ * `after_school_remaining` is that minus the places taken, floored at 0, counted by
+ * `dayCapacityRepository.findAfterSchoolCountsInRange`, the one count the booking's
+ * 422 `after_school_full` is decided by. ADVISORY exactly as `remaining_dogs` is, and
+ * uncached for the same reason.
  */
 
 const LOCATIONS = LOCATION_SLUGS;
@@ -91,15 +101,18 @@ export function registerAvailabilityRoute(app: FastifyInstance, opts: AuthRouteO
       ]);
       const dates = resolveRange(from, to, availabilityMaxDates(global.booking_horizon_months));
 
-      // Two independent reads: the (cached) sparse override rows and the
-      // (uncached) live booked counts. Neither depends on the other, so they
-      // go in parallel — one round trip, not two.
-      const [overrides, booked] = await Promise.all([
+      // Three independent reads: the (cached) sparse override rows, the
+      // (uncached) live booked counts and the (uncached) after-school places
+      // taken. None depends on another, so they go in parallel — one round
+      // trip, not three.
+      const [overrides, booked, staying] = await Promise.all([
         dayCapacityRepository.findOverridesInRange(location, from, to),
         dayCapacityRepository.findBookedCountsInRange(location, from, to),
+        dayCapacityRepository.findAfterSchoolCountsInRange(location, from, to),
       ]);
       const overrideByDate = new Map(overrides.map((row) => [row.date, row] as const));
       const bookedByDate = new Map(booked.map((row) => [row.date, row.booked] as const));
+      const stayingByDate = new Map(staying.map((row) => [row.date, row.booked] as const));
 
       return dates.map((date) =>
         dayCapacityWire(
@@ -108,6 +121,10 @@ export function registerAvailabilityRoute(app: FastifyInstance, opts: AuthRouteO
           dayCapacityFor(date, campus, overrideByDate.get(date)),
           // A date nobody has booked is absent from the aggregate, not zeroed.
           bookedByDate.get(date) ?? 0,
+          {
+            capacity: campusAfterSchoolCapacity(campus),
+            booked: stayingByDate.get(date) ?? 0,
+          },
         ),
       );
     },

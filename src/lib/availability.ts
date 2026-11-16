@@ -1,4 +1,8 @@
-import type { DayCapacityWire, LocationKey } from '../contracts/wire.js';
+import type {
+  DayCapacityWire,
+  DayProgramCampusSettingsWire,
+  LocationKey,
+} from '../contracts/wire.js';
 
 /**
  * The day-program capacity rule and the range iteration behind
@@ -60,22 +64,54 @@ export function dayCapacityFor(
 }
 
 /**
+ * A date's after-school inputs (6.2.0, P48): the campus's places
+ * ({@link campusAfterSchoolCapacity}) and the places already taken that date, as
+ * `dayCapacityRepository.findAfterSchoolCountsInRange` counts them.
+ */
+export interface AfterSchoolPlaces {
+  capacity: number;
+  booked: number;
+}
+
+/**
+ * A campus's after-school places on a date with seats (6.2.0; build DECISIONS 428): its
+ * `day.after_school_capacity_count` while it offers day school, else 0. No day school, no
+ * after-school, and day care shares the seats, so the seats alone cannot say it. The flag
+ * is `offerings['day-school'].offered`, the one `POST /bookings` refuses
+ * `program_not_offered` by.
+ */
+export function campusAfterSchoolCapacity(
+  campus: Pick<DayProgramCampusSettingsWire, 'offerings' | 'after_school_capacity_count'>,
+): number {
+  return campus.offerings['day-school'].offered ? campus.after_school_capacity_count : 0;
+}
+
+/**
  * One date on the wire. `remaining_dogs` is floored at 0: a date can still be
  * over-full, when an imported booking arrives over its cap or a cap falls past the
  * horizon, and the booking transaction never rejects an existing booking to make
  * the numbers line up. The 422's `openings_remaining` floors the same way.
+ *
+ * The after-school places (6.2.0, P48; her #8, "X/10 for each day"): a date with no
+ * seats has no day school and so no after-school, 0 and 0; any other date offers the
+ * campus's places ({@link campusAfterSchoolCapacity}: 0 where day school is not offered),
+ * less the places taken, floored at 0 like the seats.
  */
 export function dayCapacityWire(
   location: LocationKey,
   date: string,
   capacity: number,
   booked: number,
+  afterSchool: AfterSchoolPlaces,
 ): DayCapacityWire {
+  const afterSchoolCapacity = capacity === 0 ? 0 : afterSchool.capacity;
   return {
     location,
     date,
     capacity_dogs: capacity,
     remaining_dogs: Math.max(0, capacity - booked),
+    after_school_capacity: afterSchoolCapacity,
+    after_school_remaining: Math.max(0, afterSchoolCapacity - afterSchool.booked),
   };
 }
 

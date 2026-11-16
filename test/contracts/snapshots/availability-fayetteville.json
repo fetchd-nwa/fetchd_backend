@@ -3,42 +3,56 @@
     "location": "fayetteville",
     "date": "2026-05-15",
     "capacity_dogs": 15,
-    "remaining_dogs": 15
+    "remaining_dogs": 15,
+    "after_school_capacity": 10,
+    "after_school_remaining": 10
   },
   {
     "location": "fayetteville",
     "date": "2026-05-16",
     "capacity_dogs": 0,
-    "remaining_dogs": 0
+    "remaining_dogs": 0,
+    "after_school_capacity": 0,
+    "after_school_remaining": 0
   },
   {
     "location": "fayetteville",
     "date": "2026-05-17",
     "capacity_dogs": 3,
-    "remaining_dogs": 3
+    "remaining_dogs": 3,
+    "after_school_capacity": 10,
+    "after_school_remaining": 10
   },
   {
     "location": "fayetteville",
     "date": "2026-05-18",
     "capacity_dogs": 15,
-    "remaining_dogs": 15
+    "remaining_dogs": 15,
+    "after_school_capacity": 10,
+    "after_school_remaining": 10
   },
   {
     "location": "fayetteville",
     "date": "2026-05-19",
     "capacity_dogs": 0,
-    "remaining_dogs": 0
+    "remaining_dogs": 0,
+    "after_school_capacity": 0,
+    "after_school_remaining": 0
   },
   {
     "location": "fayetteville",
     "date": "2026-05-20",
     "capacity_dogs": 15,
-    "remaining_dogs": 14
+    "remaining_dogs": 14,
+    "after_school_capacity": 10,
+    "after_school_remaining": 10
   },
   {
     "location": "fayetteville",
     "date": "2026-05-21",
     "capacity_dogs": 15,
-    "remaining_dogs": 15
+    "remaining_dogs": 15,
+    "after_school_capacity": 10,
+    "after_school_remaining": 10
   }
 ]

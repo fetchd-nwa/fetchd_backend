@@ -17,10 +17,12 @@ import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import type { Tx } from '../db/tx.js';
 import type {
   ApiErrorEnvelope,
+  PostBookingsDogsAfterSchoolRemoveResponse,
   PostBookingsRequest,
   PostBookingsResponse,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
+import { removeAfterSchoolInTx } from '../lib/afterSchoolRemoval.js';
 import { isInView, type PickupCloseByCampus } from '../lib/bookingBucket.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import type { DayProgramCategory } from '../lib/bookingSchedule.js';
@@ -668,6 +670,52 @@ export function registerBookingsRoute(app: FastifyInstance, opts: BookingsRouteO
             log: request.log,
           });
           freed = { ownerId: result.creditRefundedOwnerId, location: result.location };
+          return { status: 200, body: result.wire };
+        },
+      );
+      return outcome.body;
+    },
+  );
+
+  // --- POST /bookings/:id/dogs/:dogId/after-school/remove -------------------
+  //
+  // One dog's after-school, taken off (6.2.0, P48; build DECISIONS 407, 408(c)). No body.
+  // Her place in that date's after-school session is free at once; her share, her seat and
+  // her day stay; no credit and no money move. The one-dog cancel's refusals in its order,
+  // without its switch, and every refusal with a clock in it runs after the claim
+  // (DECISIONS 128(a)). The transaction is `removeAfterSchoolInTx`'s.
+  app.post(
+    '/bookings/:id/dogs/:dogId/after-school/remove',
+    { preHandler: [authHook] },
+    async (request): Promise<PostBookingsDogsAfterSchoolRemoveResponse> => {
+      const principal = requirePrincipal(request);
+      requireOwner(principal, "take a dog's after-school off");
+      const params = shareParamSchema.safeParse(request.params);
+      if (!params.success) {
+        throw new ApiError('bad_request', `invalid path: ${formatZodIssues(params.error)}`);
+      }
+      const { id, dogId } = params.data;
+      const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+      let campus: string | null | undefined;
+
+      const outcome = await withMutation<PostBookingsDogsAfterSchoolRemoveResponse>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /bookings/:id/dogs/:dogId/after-school/remove',
+          requestHash: hashRequestBody({ id, dogId }),
+          // Her place is free: every availability range cache of her campus goes. Her
+          // credits are untouched, so her balance cache stays.
+          patternsToInvalidate: () => (campus == null ? [] : [`avail:${campus}:*`]),
+        },
+        async (tx) => {
+          const result = await removeAfterSchoolInTx(tx, {
+            id,
+            dogId,
+            ownerId: principal.ownerId,
+            now: nowFactory(),
+          });
+          campus = result.location;
           return { status: 200, body: result.wire };
         },
       );

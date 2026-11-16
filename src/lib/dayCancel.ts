@@ -112,19 +112,54 @@ export function cancelFacts(args: {
   viewer: 'owner' | 'staff';
   perDogCancelEnabled: boolean;
 }): CancelFacts {
-  const expected = (dogId: string): boolean =>
-    (args.states.get(dogId) ?? 'expected') === 'expected';
+  const expected = expectedIn(args.states);
   const standing = args.status !== 'cancelled';
   const canCancel =
     standing &&
     (args.status === 'payment-pending' || (!args.ended && args.liveDogIds.every(expected)));
   const oneDogOpen =
-    standing &&
-    args.status !== 'payment-pending' &&
-    !args.ended &&
+    oneDogWindowOpen(args.status, args.ended) &&
     (args.viewer === 'staff' || args.perDogCancelEnabled);
   return {
     canCancel,
     shareCanCancel: new Map(args.liveDogIds.map((dogId) => [dogId, oneDogOpen && expected(dogId)])),
   };
+}
+
+/**
+ * `dog_shares[].can_remove_after_school` for a day-school row (6.2.0, P48; DECISIONS
+ * 408(c)): whether `POST /bookings/:id/dogs/:dogId/after-school/remove` would take each dog
+ * still on it off that day's after-school now. The one-dog cancel's predicate without its
+ * switch (`cxl.per_dog_cancel_enabled` does not govern it): the session not cancelled, not a
+ * pending top-up row, its day not ended, and SHE `expected`; and she is opted in. The route
+ * is the owner's, so a staff read is `false` throughout. The route refuses on these same
+ * facts, in the wire's order (`lib/afterSchoolRemoval.ts`).
+ */
+export function afterSchoolRemovable(args: {
+  status: BookingStatus;
+  ended: boolean;
+  liveDogIds: readonly string[];
+  states: ReadonlyMap<string, AttendanceStatus>;
+  viewer: 'owner' | 'staff';
+  /** The dogs of this row opted in to its after-school session. */
+  staying: ReadonlySet<string>;
+}): ReadonlyMap<string, boolean> {
+  const expected = expectedIn(args.states);
+  const open = args.viewer === 'owner' && oneDogWindowOpen(args.status, args.ended);
+  return new Map(
+    args.liveDogIds.map((dogId) => [dogId, open && args.staying.has(dogId) && expected(dogId)]),
+  );
+}
+
+/**
+ * A one-dog write's window on a day row, before her own state: the session stands, it is
+ * not a pending top-up row (which cancels its whole order), and its day has not ended.
+ */
+function oneDogWindowOpen(status: BookingStatus, ended: boolean): boolean {
+  return status !== 'cancelled' && status !== 'payment-pending' && !ended;
+}
+
+/** Whether a dog's folded state is `expected` (no event, or every event undone). */
+function expectedIn(states: ReadonlyMap<string, AttendanceStatus>): (dogId: string) => boolean {
+  return (dogId) => (states.get(dogId) ?? 'expected') === 'expected';
 }

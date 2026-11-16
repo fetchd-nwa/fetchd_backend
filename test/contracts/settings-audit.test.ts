@@ -258,6 +258,8 @@ describe('STAFF-74 on day_capacity: the row names who set the date', SKIP_WHEN_N
 
     // The wire does not change: no staff id is served.
     assert.deepEqual(Object.keys(res.json() as object).sort(), [
+      'after_school_capacity',
+      'after_school_remaining',
       'capacity_dogs',
       'date',
       'location',

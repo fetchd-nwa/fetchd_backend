@@ -122,12 +122,14 @@ describe('R8, R10: one dog leaves, the last dog takes the session with her', () 
           dog_id: n.bao,
           can_cancel: true,
           after_school: false,
+          can_remove_after_school: false,
           return_expires_at: LOT_EXPIRES.toISOString(),
         },
         {
           dog_id: n.luna,
           can_cancel: false,
           after_school: false,
+          can_remove_after_school: false,
           cancelled_at: at(WED, '06:50').toISOString(),
         },
       ]);
@@ -174,11 +176,12 @@ describe('R8, R10: one dog leaves, the last dog takes the session with her', () 
         'the last dog keeps her share, so a cancelled session has a dog',
       );
       assert.deepEqual(last.dog_shares, [
-        { dog_id: n.bao, can_cancel: false, after_school: false },
+        { dog_id: n.bao, can_cancel: false, after_school: false, can_remove_after_school: false },
         {
           dog_id: n.luna,
           can_cancel: false,
           after_school: false,
+          can_remove_after_school: false,
           cancelled_at: at(WED, '06:50').toISOString(),
         },
       ]);
@@ -367,12 +370,14 @@ describe('D3: a lead cancelled alone', () => {
           dog_id: n.luna,
           can_cancel: true,
           after_school: false,
+          can_remove_after_school: false,
           return_expires_at: LUNA_LOT_EXPIRES.toISOString(),
         },
         {
           dog_id: n.bao,
           can_cancel: false,
           after_school: false,
+          can_remove_after_school: false,
           cancelled_at: at(WED, '06:50').toISOString(),
         },
       ];
@@ -543,12 +548,14 @@ describe('D14: the switch', () => {
           dog_id: n.bao,
           can_cancel: false,
           after_school: false,
+          can_remove_after_school: false,
           return_expires_at: LOT_EXPIRES.toISOString(),
         },
         {
           dog_id: n.luna,
           can_cancel: false,
           after_school: false,
+          can_remove_after_school: false,
           return_expires_at: LUNA_LOT_EXPIRES.toISOString(),
         },
       ]);
@@ -561,6 +568,7 @@ describe('D14: the switch', () => {
         dog_id: n.bao,
         can_cancel: true,
         after_school: false,
+        can_remove_after_school: false,
         return_expires_at: LOT_EXPIRES.toISOString(),
       });
     },
@@ -708,12 +716,14 @@ describe('BookingWire.can_cancel', () => {
           dog_id: n.bao,
           can_cancel: true,
           after_school: false,
+          can_remove_after_school: false,
           return_expires_at: LOT_EXPIRES.toISOString(),
         },
         {
           dog_id: n.luna,
           can_cancel: false,
           after_school: false,
+          can_remove_after_school: false,
           return_expires_at: LUNA_LOT_EXPIRES.toISOString(),
         },
       ]);

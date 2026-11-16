@@ -12,7 +12,7 @@ import { dayCapacityRepository } from '../db/repositories/dayCapacityRepository.
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { LOCATION_SLUGS } from '../db/schema/schema.js';
 import type { Tx } from '../db/tx.js';
-import { dayCapacityFor, dayCapacityWire } from '../lib/availability.js';
+import { campusAfterSchoolCapacity, dayCapacityFor, dayCapacityWire } from '../lib/availability.js';
 import { assertCapEditKeepsBooked } from '../lib/capLowering.js';
 import { isValidCalendarDate } from '../lib/chicagoDate.js';
 import { requireStaff } from '../lib/principalNarrows.js';
@@ -66,12 +66,24 @@ export interface StaffDayCapacityRouteOptions extends AuthRouteOptions {
   now?: () => Date;
 }
 
-/** The date as it now stands, read in the write's transaction. */
+/**
+ * The date as it now stands, read in the write's transaction, its after-school places too
+ * (6.2.0: "present on every element"), by the count `GET /availability` reads.
+ */
 async function dateInTx(tx: Tx, location: LocationKey, date: string): Promise<DayCapacityWire> {
   const rule = await settingsRepository.dayCampus(location, tx);
   const [override] = await dayCapacityRepository.findLiveOverridesInTx(tx, location, date, date);
   const [count] = await dayCapacityRepository.findBookedCountsInRange(location, date, date, tx);
-  return dayCapacityWire(location, date, dayCapacityFor(date, rule, override), count?.booked ?? 0);
+  const [staying] = await dayCapacityRepository.findAfterSchoolCountsInRange(
+    location,
+    date,
+    date,
+    tx,
+  );
+  return dayCapacityWire(location, date, dayCapacityFor(date, rule, override), count?.booked ?? 0, {
+    capacity: campusAfterSchoolCapacity(rule),
+    booked: staying?.booked ?? 0,
+  });
 }
 
 export function registerStaffDayCapacityRoute(

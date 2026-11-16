@@ -514,6 +514,18 @@ export const bookingsRepository = {
   },
 
   /**
+   * The owner's after-school removal (6.2.0, P48): her share's opt-in off, so her place in
+   * that date's after-school session is free; her share and her seat stay. Under the
+   * booking row lock. No route turns it back on.
+   */
+  async clearAfterSchool(tx: Tx, args: { bookingId: string; dogId: string }): Promise<void> {
+    await tx
+      .update(bookingDogs)
+      .set({ afterSchool: false })
+      .where(and(eq(bookingDogs.bookingId, args.bookingId), eq(bookingDogs.dogId, args.dogId)));
+  },
+
+  /**
    * The session goes with its last live dog (s11): cancelled, nothing forfeited (a one-dog
    * cancel always returns the credit, D21), by whoever cancelled her. No reason: a share's
    * reason is not stored (`PostStaffBookingsDogsCancelRequest`).

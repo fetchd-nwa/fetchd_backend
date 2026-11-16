@@ -12,6 +12,36 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [6.2.0] — 2026-11-14
+
+ADDITIVE. The fix phase Allison ordered first (build DECISIONS 396, 402, 407,
+408(c)); plan unit P48, her playground #8 ("After school training caps out at 10
+people … say like X/10 for each day … or grey it out if full") and her 11-14 answer
+("i want the capacity shown for each day for the user to see … i should be able to go
+into each booking and unselect the after school training if i want"). Not a design
+section (design_label none). Build label 6.2.0: S42 (design 7.1.0), once build 6.2.0,
+now ships as build 6.5.0 (plan.json `wire_label_map`). Every field is optional and the
+route is new, so a 6.0.0 client reads 6.2.0 unchanged. Contract-first: the fields and
+the route do not exist until P48's backend lands them. Resync both clients.
+
+### Added
+
+- `DayCapacityWire.after_school_capacity?` and `.after_school_remaining?`: each date's
+  after-school places at that campus (`day.after_school_capacity_count`, 0 on a date
+  with no day school or at a campus not offering it) and the places still free,
+  advisory; 422 `after_school_full` stays the authority.
+- `POST /bookings/:id/dogs/:dogId/after-school/remove` (owner, no body, Idempotency-Key):
+  takes one dog's after-school off a day-school session, 200 `BookingWire`; moves no
+  credit or money; the one-dog cancel's refusals without its switch.
+- `BookingWire.dog_shares[].can_remove_after_school?`: whether that route would accept
+  this dog now.
+- `PostBookingsDogsAfterSchoolRemoveResponse` (= `BookingWire`), naming the route's 200.
+
+### Documentation
+
+- `BookingWire.dog_shares[].after_school`: "No route changes it after the booking" is
+  now "the owner may take it off (6.2.0); no route turns it on after the booking".
+
 ## [6.0.0] — 2026-11-14
 
 ADDITIVE. LG5's close (plan unit P22, slice S35; ledger PAY-U24, PAY-U25, PAY-U27,

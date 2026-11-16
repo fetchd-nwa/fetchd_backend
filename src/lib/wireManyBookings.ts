@@ -1,5 +1,9 @@
 import { db } from '../db/client.js';
-import { bookingsRepository, type BookingRow } from '../db/repositories/bookingsRepository.js';
+import {
+  bookingsRepository,
+  type BookingRow,
+  type BookingShareRow,
+} from '../db/repositories/bookingsRepository.js';
 import { checkinEventsRepository } from '../db/repositories/checkinEventsRepository.js';
 import {
   creditLedgerRepository,
@@ -16,7 +20,13 @@ import {
   type BookingWire,
   type CancelFacts,
 } from './bookingWire.js';
-import { cancelFacts, dayHasEnded, isDayProgram, statesByDog } from './dayCancel.js';
+import {
+  afterSchoolRemovable,
+  cancelFacts,
+  dayHasEnded,
+  isDayProgram,
+  statesByDog,
+} from './dayCancel.js';
 import { pgTimestampToDate } from './pgTimestamp.js';
 
 /**
@@ -70,6 +80,7 @@ export async function wireManyBookings(
   const factsByBooking = await dayCancelFacts(
     rows.filter((row) => isDayProgram(row.category)),
     dogsByBooking,
+    shareRows,
     context,
     runner,
   );
@@ -142,10 +153,15 @@ async function returnExpiries(
   return byBooking;
 }
 
-/** `can_cancel` and each share's, for the day rows, from one read of the log and the day. */
+/**
+ * `can_cancel` and each share's, for the day rows, from one read of the log and the day;
+ * and on a day-school row each share's `can_remove_after_school` (6.2.0), from the same
+ * fold and the same clock.
+ */
 async function dayCancelFacts(
   dayRows: BookingRow[],
   dogsByBooking: ReturnType<typeof groupBookingDogs>,
+  shareRows: readonly BookingShareRow[],
   context: WireReadContext,
   runner: Tx | typeof db,
 ): Promise<Map<string, CancelFacts>> {
@@ -165,17 +181,35 @@ async function dayCancelFacts(
   for (const row of dayRows) {
     const dogIds = dogsByBooking.get(row.id);
     if (dogIds === undefined) continue;
-    facts.set(
-      row.id,
-      cancelFacts({
-        status: row.status,
-        ended: dayHasEnded(row, pickupClose, context.now),
-        liveDogIds: [dogIds.lead, ...dogIds.additional],
-        states: statesByDog(events.filter((e) => e.bookingId === row.id)),
-        viewer: context.viewer,
-        perDogCancelEnabled,
-      }),
+    const ended = dayHasEnded(row, pickupClose, context.now);
+    const liveDogIds = [dogIds.lead, ...dogIds.additional];
+    const states = statesByDog(events.filter((e) => e.bookingId === row.id));
+    const cancel = cancelFacts({
+      status: row.status,
+      ended,
+      liveDogIds,
+      states,
+      viewer: context.viewer,
+      perDogCancelEnabled,
+    });
+    if (row.category !== 'day-school') {
+      facts.set(row.id, cancel);
+      continue;
+    }
+    const staying = new Set(
+      shareRows.filter((s) => s.bookingId === row.id && s.afterSchool).map((s) => s.dogId),
     );
+    facts.set(row.id, {
+      ...cancel,
+      shareCanRemoveAfterSchool: afterSchoolRemovable({
+        status: row.status,
+        ended,
+        liveDogIds,
+        states,
+        viewer: context.viewer,
+        staying,
+      }),
+    });
   }
   return facts;
 }

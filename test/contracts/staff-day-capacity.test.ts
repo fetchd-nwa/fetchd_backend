@@ -227,6 +227,9 @@ test(
       date: FRI_23,
       capacity_dogs: 9,
       remaining_dogs: 9,
+      // 6.2.0 (P48): present on every element, read in the write's transaction.
+      after_school_capacity: 5,
+      after_school_remaining: 5,
     });
 
     const withdrawn = await del(app, 'bentonville', FRI_23);
@@ -281,6 +284,8 @@ test(
       date: SAT_17,
       capacity_dogs: 6,
       remaining_dogs: 6,
+      after_school_capacity: 10,
+      after_school_remaining: 10,
     });
   },
 );
@@ -551,6 +556,9 @@ test(
       date: FRI_23,
       capacity_dogs: 1,
       remaining_dogs: 0,
+      // The places count those staying, not the seats: no one is.
+      after_school_capacity: 5,
+      after_school_remaining: 5,
     });
     assert.equal(await auditRows(), auditedBefore);
   },

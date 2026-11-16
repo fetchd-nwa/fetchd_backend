@@ -71,9 +71,12 @@
  * 4.0.0-lg3.2 (P15, breaking), 4.0.0 (P16, breaking, its close). LG4:
  * 5.0.0-lg4.1 (P17, breaking), 5.0.0-lg4.2 (P18, breaking), 5.0.0 (P19,
  * additive, its close). LG5: 6.0.0-lg5.1 (P20, breaking), 6.0.0-lg5.2 (P21,
- * breaking), 6.0.0 (P22, additive, its close).
+ * breaking), 6.0.0 (P22, additive, its close). The fix phase Allison ordered
+ * first (11-14; build DECISIONS 396, 402): 6.2.0 (P48, additive), after-school
+ * places and the after-school removal; S42 (design 7.1.0), once build 6.2.0,
+ * now ships as build 6.5.0.
  */
-export const WIRE_CONTRACT_VERSION = '6.0.0';
+export const WIRE_CONTRACT_VERSION = '6.2.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -1995,7 +1998,16 @@ export interface BookingWire {
   //   `after_school`: this dog is opted in to that day's after-school session
   //   (6.0.0-lg5.2; design §1.1:1083-1085, §2.3:2558-2564; DAY-U43), as
   //   `PostBookingsRequest.after_school` sent it. Always `false` on a day-care
-  //   row. No route changes it after the booking.
+  //   row. From 6.2.0 the owner may take it off with
+  //   `POST /bookings/:id/dogs/:dogId/after-school/remove` (P48; build
+  //   DECISIONS 407); no route turns it on after the booking.
+  //   `can_remove_after_school` (6.2.0, P48): present on every day-school share;
+  //   whether that owner route would take this dog's after-school off now:
+  //   `after_school` is true, her share and the session not cancelled, the row
+  //   not `payment-pending`, the clock before `day.pickup_close_time`, and HER
+  //   folded state `expected` (`can_cancel`'s predicate without
+  //   `cxl.per_dog_cancel_enabled`, which does not govern it). `false` on a
+  //   staff read.
   //   `return_expires_at`: ISO-8601 (6.0.0-lg5.2; design §2.3:2741-2748,
   //   §2.7:4412-4414; CXL-U05), on each share still on an `'upcoming'` session
   //   whose credit has not come back: the expiry that credit would carry if it
@@ -2023,6 +2035,7 @@ export interface BookingWire {
     dog_id: string;
     can_cancel: boolean;
     after_school: boolean;
+    can_remove_after_school?: boolean;
     return_expires_at?: string;
     cancelled_at?: string;
   }[];
@@ -2751,6 +2764,34 @@ export interface PostStaffBookingsCancelRequest {
 export interface PostStaffBookingsDogsCancelRequest {
   reason: string;
 }
+
+/**
+ * One dog's after-school, taken off (6.2.0; plan unit P48; build DECISIONS 407,
+ * 408(c); her words: "i should be able to go into each booking and unselect the
+ * after school training if i want"):
+ *   POST /bookings/:id/dogs/:dogId/after-school/remove    owner, no body
+ * Requires an `Idempotency-Key` and answers 200 `BookingWire`, the session after
+ * the change (that dog's `dog_shares[].after_school` is `false`). Her place in
+ * that date's after-school session is free at once (`DayCapacityWire
+ * .after_school_remaining`). It moves no credit and no money: after-school is
+ * priced `day.after_school_price_cents`, seeded 0 and never charged in v1. Her
+ * day-school seat is untouched. A share already off answers 200 with the session
+ * unchanged, once none of the refusals below applies: they run first. A retry
+ * with the same `Idempotency-Key` replays the stored answer whatever the clock,
+ * but a removal sent again under a NEW key after the day ended gets 409
+ * `session_ended` although the first one landed, so a client re-reads the
+ * booking on that refusal (build DECISIONS 428, 436). No route turns
+ * after-school on after the booking.
+ *
+ * Refusals, in this order (the one-dog cancel's, without its switch): 404
+ * `not_found` (no live booking, not hers, or the dog was never on it); 422
+ * `invalid_payload` (not a day-school session: after-school rides day school
+ * only); 409 `session_cancelled` (the session, or this dog's share, is
+ * cancelled); 409 `payment_pending`; 409 `session_ended`; 409
+ * `session_checked_in` while THIS dog's folded state is not `'expected'`.
+ * `cxl.per_dog_cancel_enabled` does not govern it.
+ */
+export type PostBookingsDogsAfterSchoolRemoveResponse = BookingWire;
 
 /**
  * `GET /staff/bookings` query `[staff]` — the server-side filters for the
@@ -5762,6 +5803,24 @@ export interface DayCapacityWire {
   capacity_dogs: number;
   /** `capacity_dogs` minus live client booking dogs, floored at 0 — advisory (see doc). */
   remaining_dogs: number;
+  /**
+   * 6.2.0 (P48; her #8: "say like X/10 for each day so people know when
+   * booking or grey it out if full"): the date's after-school places,
+   * `day.after_school_capacity_count` for the campus, and 0 when
+   * `capacity_dogs` is 0 or the campus does not offer day school (its
+   * `offerings`; no day school, no after-school; build DECISIONS 428). Present on every
+   * element from 6.2.0.
+   */
+  after_school_capacity?: number;
+  /**
+   * 6.2.0 (P48): `after_school_capacity` minus every live client dog opted in
+   * to that date's after-school session at that campus (her share and the
+   * session not cancelled, `after_school` true), floored at 0, counted as the
+   * booking's own check counts it (`dayCapacityRepository`'s after-school
+   * count, DAY-U43). ADVISORY like `remaining_dogs`: the booking's 422
+   * `after_school_full` (`AfterSchoolFullDetails`) stays the authority.
+   */
+  after_school_remaining?: number;
 }
 
 /**

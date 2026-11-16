@@ -3,18 +3,24 @@
     "location": "bentonville",
     "date": "2026-05-15",
     "capacity_dogs": 15,
-    "remaining_dogs": 15
+    "remaining_dogs": 15,
+    "after_school_capacity": 5,
+    "after_school_remaining": 5
   },
   {
     "location": "bentonville",
     "date": "2026-05-16",
     "capacity_dogs": 0,
-    "remaining_dogs": 0
+    "remaining_dogs": 0,
+    "after_school_capacity": 0,
+    "after_school_remaining": 0
   },
   {
     "location": "bentonville",
     "date": "2026-05-17",
     "capacity_dogs": 0,
-    "remaining_dogs": 0
+    "remaining_dogs": 0,
+    "after_school_capacity": 0,
+    "after_school_remaining": 0
   }
 ]

@@ -71,14 +71,33 @@ test('dayCapacityFor: a malformed date throws', () => {
   assert.throws(() => dayCapacityFor('', SEEDED, undefined), /invalid YYYY-MM-DD/);
 });
 
+const NO_ONE_STAYING = { capacity: 5, booked: 0 };
+
 test('dayCapacityWire: remaining is the cap minus the booked, floored at 0', () => {
-  assert.deepEqual(dayCapacityWire('bentonville', '2026-05-18', 15, 14), {
+  assert.deepEqual(dayCapacityWire('bentonville', '2026-05-18', 15, 14, NO_ONE_STAYING), {
     location: 'bentonville',
     date: '2026-05-18',
     capacity_dogs: 15,
     remaining_dogs: 1,
+    after_school_capacity: 5,
+    after_school_remaining: 5,
   });
-  assert.equal(dayCapacityWire('bentonville', '2026-05-18', 2, 3).remaining_dogs, 0);
+  assert.equal(
+    dayCapacityWire('bentonville', '2026-05-18', 2, 3, NO_ONE_STAYING).remaining_dogs,
+    0,
+  );
+});
+
+test('dayCapacityWire (6.2.0, P48): the after-school places, the campus count minus those staying, floored at 0', () => {
+  const day = (seats: number, afterSchool: { capacity: number; booked: number }) => {
+    const wire = dayCapacityWire('fayetteville', '2026-12-03', seats, 0, afterSchool);
+    return [wire.after_school_capacity, wire.after_school_remaining];
+  };
+  assert.deepEqual(day(15, { capacity: 10, booked: 3 }), [10, 7]);
+  assert.deepEqual(day(15, { capacity: 10, booked: 10 }), [10, 0]);
+  assert.deepEqual(day(15, { capacity: 10, booked: 12 }), [10, 0], 'floored, never negative');
+  assert.deepEqual(day(0, { capacity: 10, booked: 0 }), [0, 0], 'no day school, no after-school');
+  assert.deepEqual(day(0, { capacity: 10, booked: 2 }), [0, 0]);
 });
 
 test('availabilityMaxDates: months * 31 + 1', () => {

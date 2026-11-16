@@ -2666,6 +2666,8 @@ mode, remaining, expires_at }]` — the dog's LIVE expiring lots (count + lapse
   FE falls back to its client-side 60-day default when absent (mock mode).
 
 **DayCapacity** — `{ location, date:'YYYY-MM-DD', capacity_dogs, remaining_dogs }`.
+*Δ 6.2.0 (P48; §V): every element also carries `after_school_capacity` and
+`after_school_remaining`, the date's after-school places and the places still free.*
 One cap per `(location, date)`, shared by day school and daycare (wire
 4.0.0-lg3.1). The API applies the campus's rule: an open weekday in
 `day.open_weekdays_list` gets `day.daily_capacity_dogs`, any other date 0, and a
@@ -2835,6 +2837,7 @@ invisible to the repository layer.
 - `GET /bookings?view=upcoming|past` — runtime-bucketed by session end-time
 - `GET /bookings/up-next` · `GET /bookings/:id` · `GET /dogs/:id/bookings?view=`
 - `POST /bookings` — book Day School/Care (multi-dog body; credit-debit txn). Credits only (wire 4.0.0): short is 422 `insufficient_credits`, and no booking moves money. Since 6.0.0-lg5.2 the body takes the after-school opt-in, `after_school` (dog → dates), counted per date against `day.after_school_capacity_count` (422 `after_school_full`); §T.
+- `POST /bookings/:id/dogs/:dogId/after-school/remove` — **6.2.0** (P48; §V) — takes one dog's after-school off a booked day-school session; 200 `BookingWire`; moves no credit and no money.
 - `POST /bookings/:id/cancel` — cancel; every credit the row debited comes back, nothing is forfeited and no money moves (6.0.0-lg5.2, P21; the Day-13 forfeit and money-back branches are gone, §T); group-class returns 422 (cohort-withdraw is a separate verb)
 - ~~`GET /staff/cancel-window` [staff] · `PATCH /staff/cancel-window/:category` [staff]~~ — **removed at 6.0.0-lg5.2** (P21, M5.08): both are 404, `cancel_window_settings` is dropped, and no route stamps `cancel_deadline_at`. The cancellation settings are the `cxl` settings domain, `GET|PATCH /staff/settings/cxl` (§T).
 
@@ -6043,3 +6046,55 @@ that won no seat (§P).
   writer of `credits_settled_by_staff_id` / `credits_settled_at` (no route named); cash and
   check refunds (P24, M6.01); a `custom_invoice` or `class_seat` basis and `enrollment_id`;
   chargebacks and lost disputes (design.md:4487-4490).
+
+## V. After-school places on every date; taking after-school off a booked day (wire 6.2.0, 2026-11-14)
+
+Δ 2026-11-14 (P48 backend; build DECISIONS 396, 402, 407, 408(c); her playground #8,
+"After school training caps out at 10 people … say like X/10 for each day … or grey it out
+if full", and her 11-14 answer, "i want the capacity shown for each day for the user to see
+… i should be able to go into each booking and unselect the after school training if i
+want"). Additive: every field is optional and the route is new. Wire is the contract; this
+records what the code does.
+
+- **The places on every date** (`DayCapacityWire.after_school_capacity`,
+  `.after_school_remaining`). Both on every element of `GET /availability`, and on the
+  `PUT`/`DELETE /staff/day-capacity/:location/:date` answers ("present on every element").
+  `after_school_capacity` is the campus's `day.after_school_capacity_count` (Fayetteville
+  10, Bentonville 5; design §3.4), and 0 when `capacity_dogs` is 0 or the campus does not
+  offer day school (`offerings['day-school'].offered`, the flag `POST /bookings` refuses
+  `program_not_offered` by; `lib/availability.campusAfterSchoolCapacity`). It is not capped
+  by the seats: a 3-seat Fayetteville date reads 10 places, as the 422 counts them.
+  `after_school_remaining` is that minus every live client dog opted in on that date at
+  that campus, floored at 0, counted by `dayCapacityRepository.countStayingByDate`, the
+  ONE function the booking's 422 `after_school_full` is decided by (DAY-U43): the seat
+  population (`seatHolders`: a share cancelled alone, a cancelled session and a turned-away
+  share hold nothing; a payment-pending session holds its places; staff dogs are exempt)
+  with `after_school` true. ADVISORY like `remaining_dogs`, and uncached for the same
+  reason. Pinned by `test/contracts/after-school-places.test.ts`.
+- **Taking it off** (`POST /bookings/:id/dogs/:dogId/after-school/remove`, owner, no body,
+  `Idempotency-Key`, 200 `BookingWire` = `PostBookingsDogsAfterSchoolRemoveResponse`;
+  `lib/afterSchoolRemoval.ts`). Her share's `booking_dogs.after_school` goes false, so her
+  place is free at once; her share, her seat and her day stay. No credit, lot, order,
+  invoice, charge, refund or Stripe call (after-school is priced
+  `day.after_school_price_cents`, seeded 0, never charged in v1); the audit trigger records
+  the share's `UPDATE`. Refusals in the wire's order: 404 `not_found` (no live booking, not
+  hers, or the dog never on it), 422 `invalid_payload` (not day school), then the one-dog
+  cancel's refusals without `cxl.per_dog_cancel_enabled`: 409 `session_cancelled`, 409
+  `payment_pending`, 409 `session_ended` (the campus's `day.pickup_close_time`), 409
+  `session_checked_in` while HER folded state is not `expected` (408(c): "the same line as
+  the owner's cancel"). The refusals run first; a share already off then answers 200 with
+  no write. Every refusal with a clock in it runs after the claim, so an answer replays
+  unchanged (DECISIONS 128(a)). Invalidates `avail:{location}:*`. Staff cannot untick it for
+  a family, and no route turns it back on.
+- **Its locks**, in the one global order: the claim, her dog (`withDogLocks`, DECISIONS
+  123(c)), the session's `(location, date)` lock, then the booking row. The date lock is not
+  what keeps the cap (a removal only frees a place); it orders the removal with the bookings
+  queued on that date. A day row with no campus takes no date lock; her dog's lock and the
+  row lock still order it. The booking row orders it against a check-in or a cancel of the
+  same session. Pinned on real connections in `test/contracts/after-school-remove.test.ts`
+  ("the locks").
+- **`BookingWire.dog_shares[].can_remove_after_school`**. On every share of a day-school
+  row (absent on day care), on every read: `true` when that route would take this dog's
+  after-school off now, from the same fold and clock the route refuses on
+  (`lib/dayCancel.afterSchoolRemovable`); `false` on a staff read and on a share cancelled
+  alone.

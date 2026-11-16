@@ -118,6 +118,9 @@ test(
       date: WEDNESDAY,
       capacity_dogs: 15,
       remaining_dogs: 1,
+      // 6.2.0 (P48): Bentonville's five after-school places; no one opted in.
+      after_school_capacity: 5,
+      after_school_remaining: 5,
     });
 
     const lastSeat = await book(
@@ -168,6 +171,9 @@ test('a Saturday is 0 until a day row opens it', SKIP_WHEN_NO_DB, async () => {
     date: SATURDAY,
     capacity_dogs: 4,
     remaining_dogs: 4,
+    // Opened, so it offers the campus's after-school places too (6.2.0).
+    after_school_capacity: 5,
+    after_school_remaining: 5,
   });
   const open = await book(built, await createFundedDog(createdDogIds, 2), 'day-school', SATURDAY);
   assert.equal(open.statusCode, 201, open.body);

@@ -181,6 +181,9 @@ test(
         date: '2026-05-22',
         capacity_dogs: 15,
         remaining_dogs: 15,
+        // 6.2.0 (P48): Fayetteville's ten after-school places, none taken.
+        after_school_capacity: 10,
+        after_school_remaining: 10,
       },
     ]);
   },
@@ -331,6 +334,10 @@ test(
           // 2 configured − 2 booked = 0. The owner's calendar can finally
           // render this day full instead of walking her to the 422.
           remaining_dogs: 0,
+          // 6.2.0 (P48): a full day still offers its after-school places; neither dog
+          // opted in.
+          after_school_capacity: 10,
+          after_school_remaining: 10,
         },
       ]);
     } finally {
@@ -378,6 +385,8 @@ test(
           date: '2026-06-04',
           capacity_dogs: 1,
           remaining_dogs: 0,
+          after_school_capacity: 10,
+          after_school_remaining: 10,
         },
       ]);
     } finally {
@@ -438,6 +447,8 @@ test(
           capacity_dogs: 3,
           // 3 configured − exactly ONE booked (the 00:30 CDT one).
           remaining_dogs: 2,
+          after_school_capacity: 10,
+          after_school_remaining: 10,
         },
       ]);
     } finally {

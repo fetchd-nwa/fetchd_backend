@@ -93,18 +93,20 @@ function notTurnedAway(): SQL {
 }
 
 /**
- * The shares that hold a seat at `location` on Chicago `date`: live, non-cancelled
- * day-school and day-care rows, live shares, not turned away, staff dogs exempt. The one
- * WHERE both `assertCapacityWithinLock` and `assertAfterSchoolWithinLock` count, so the
- * after-school count is in dogs "the way the seats are counted for insufficient_capacity"
- * (`AfterSchoolFullDetails`; D9) and cannot drift from it. `findBookedCountsInRange` spells
- * the same population as a sargable range (its COUPLING note).
+ * The shares that hold a seat at `location`, on any date: live, non-cancelled day-school
+ * and day-care rows, live shares, not turned away, staff dogs exempt. The one population
+ * every count here reads (the seats one date at a time in `assertCapacityWithinLock`, the
+ * seats over a range in `findBookedCountsInRange`, and the after-school places in
+ * {@link countStayingByDate}), so the after-school count is in dogs "the way the seats are
+ * counted for insufficient_capacity" (`AfterSchoolFullDetails`; D9) and cannot drift from
+ * it. Only the date axis is spelled two ways: {@link holdsASeat}'s cast and
+ * {@link onChicagoDates}' sargable range, proven to select the same rows
+ * (`findBookedCountsInRange`'s doc).
  */
-function holdsASeat(location: LocationKey, date: string): SQL[] {
+function seatHolders(location: LocationKey): SQL[] {
   return [
     eq(bookings.location, location),
     inArray(bookings.category, DAY_PROGRAM_CATEGORIES),
-    sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date = ${date}::date`,
     ne(bookings.status, 'cancelled'),
     live(bookings),
     live(bookingDogs),
@@ -114,6 +116,62 @@ function holdsASeat(location: LocationKey, date: string): SQL[] {
     // exemption (schema.sql lines 1192-1198).
     sql`${dogs.staffOwnerId} IS NULL`,
   ];
+}
+
+/** The seat holders on one Chicago `date`, the column cast to its Chicago day. */
+function holdsASeat(location: LocationKey, date: string): SQL[] {
+  return [
+    ...seatHolders(location),
+    sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date = ${date}::date`,
+  ];
+}
+
+/**
+ * Sessions on a Chicago date in `[from, to]`: the half-open instant range
+ * `[midnight(from), midnight(to+1))` in Chicago wall time, bare column on the left so
+ * `bookings_location_time_idx` bounds it. `findBookedCountsInRange`'s doc holds the
+ * EXPLAIN before/after and the proof that it selects what the cast selects.
+ */
+function onChicagoDates(from: string, to: string): SQL[] {
+  return [
+    sql`${bookings.scheduledAt} >= (${from}::date::timestamp AT TIME ZONE 'America/Chicago')`,
+    sql`${bookings.scheduledAt} < ((${to}::date + 1)::timestamp AT TIME ZONE 'America/Chicago')`,
+  ];
+}
+
+/**
+ * A row's Chicago date as the `YYYY-MM-DD` string the routes' date lists are made of: the
+ * grouping LABEL only, never what selects the rows (`findBookedCountsInRange`'s doc).
+ */
+function chicagoDateLabel(): SQL<string> {
+  return sql<string>`to_char((${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date, 'YYYY-MM-DD')`;
+}
+
+/**
+ * THE after-school count (6.0.0-lg5.2, DAY-U43; 6.2.0, P48): per Chicago date in
+ * `[from, to]`, the seat holders at `location` opted in to that date's after-school
+ * session. A date nobody stays for is absent, not zero. The booking's 422
+ * (`assertAfterSchoolWithinLock`, one date, through its `tx` under the date's lock) and
+ * `DayCapacityWire.after_school_remaining` (a range, through the pool, advisory) both call
+ * this function and nothing else, so the number an owner reads is the number she is
+ * refused by.
+ */
+async function countStayingByDate(
+  runner: Runner,
+  location: LocationKey,
+  from: string,
+  to: string,
+): Promise<DayBookedCountRow[]> {
+  const label = chicagoDateLabel();
+  return runner
+    .select({ date: label, booked: sql<number>`count(*)::int` })
+    .from(bookingDogs)
+    .innerJoin(bookings, eq(bookings.id, bookingDogs.bookingId))
+    .innerJoin(dogs, eq(dogs.id, bookingDogs.dogId))
+    .where(
+      and(...seatHolders(location), ...onChicagoDates(from, to), eq(bookingDogs.afterSchool, true)),
+    )
+    .groupBy(label);
 }
 
 export const dayCapacityRepository = {
@@ -236,12 +294,12 @@ export const dayCapacityRepository = {
    * instead of filtered to one date: live, non-cancelled `booking_dogs` on live
    * day-program bookings at this location whose `scheduled_at`
    * bucket-to-Chicago-date falls in the range, excluding staff-owned
-   * (capacity-exempt) dogs. If those two predicates ever diverge, the calendar
-   * starts lying in a NEW direction — keep them edited together. They are
-   * spelled DIFFERENTLY on the date axis — that one asserts a single Chicago day
-   * by casting the column, this one an equivalent half-open instant range
-   * (below) — so a reader diffing them should compare the row SETS, which are
-   * proven identical, not the SQL text.
+   * (capacity-exempt) dogs. Both read it from {@link seatHolders} (P48), so the
+   * population cannot diverge. They are spelled DIFFERENTLY on the date axis —
+   * that one asserts a single Chicago day by casting the column
+   * ({@link holdsASeat}), this one an equivalent half-open instant range
+   * ({@link onChicagoDates}) — so a reader diffing them should compare the row
+   * SETS, which are proven identical, not the SQL text.
    *
    * `to_char(...)` rather than a bare `::date` cast so the grouping key comes
    * back as the same `YYYY-MM-DD` string the route's date list is made of;
@@ -306,31 +364,33 @@ export const dayCapacityRepository = {
     to: string,
     runner: Runner = db,
   ): Promise<DayBookedCountRow[]> {
-    const chicagoDate = sql<string>`to_char((${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date, 'YYYY-MM-DD')`;
+    const chicagoDate = chicagoDateLabel();
     return runner
       .select({ date: chicagoDate, booked: sql<number>`count(*)::int` })
       .from(bookingDogs)
       .innerJoin(bookings, eq(bookings.id, bookingDogs.bookingId))
       .innerJoin(dogs, eq(dogs.id, bookingDogs.dogId))
-      .where(
-        and(
-          eq(bookings.location, location),
-          inArray(bookings.category, DAY_PROGRAM_CATEGORIES),
-          // Half-open [midnight(from), midnight(to+1)) in Chicago wall time.
-          // Bare column on the left = index bound; see the doc block above for
-          // the EXPLAIN before/after and the equivalence proof.
-          sql`${bookings.scheduledAt} >= (${from}::date::timestamp AT TIME ZONE 'America/Chicago')`,
-          sql`${bookings.scheduledAt} < ((${to}::date + 1)::timestamp AT TIME ZONE 'America/Chicago')`,
-          ne(bookings.status, 'cancelled'),
-          live(bookings),
-          live(bookingDogs),
-          notTurnedAway(),
-          // Staff dogs are capacity-exempt — same exclusion, same reason as
-          // `assertCapacityWithinLock` (schema.sql lines 1192-1198).
-          sql`${dogs.staffOwnerId} IS NULL`,
-        ),
-      )
+      .where(and(...seatHolders(location), ...onChicagoDates(from, to)))
       .groupBy(chicagoDate);
+  },
+
+  /**
+   * The after-school places taken per date for one location across `[from, to]`
+   * inclusive (6.2.0, P48): {@link countStayingByDate}, the count the booking's 422
+   * `after_school_full` is decided by, behind `DayCapacityWire.after_school_remaining`.
+   * A date nobody stays for is ABSENT, not zero. Through the pool it is ADVISORY, as
+   * `findBookedCountsInRange` is: a booking can commit after the read. Read through a
+   * `tx` that holds the dates' capacity locks, no place can be TAKEN until it ends (every
+   * writer that adds a place holds that lock; the writers that free one need not).
+   * Uncached, for the same reason the booked count is.
+   */
+  async findAfterSchoolCountsInRange(
+    location: LocationKey,
+    from: string,
+    to: string,
+    runner: Runner = db,
+  ): Promise<DayBookedCountRow[]> {
+    return countStayingByDate(runner, location, from, to);
   },
 
   /**
@@ -421,8 +481,9 @@ export const dayCapacityRepository = {
   /**
    * The after-school count (6.0.0-lg5.2; DAY-U43; D9, D10): the dogs already opted in to
    * `date`'s after-school session at `location`, counted exactly as the seats are
-   * ({@link holdsASeat}: a share cancelled alone, a cancelled session and a turned-away
-   * share each free their place), against the campus's `day.after_school_capacity_count`.
+   * ({@link seatHolders}: a share cancelled alone, a cancelled session and a turned-away
+   * share each free their place), against the campus's `day.after_school_capacity_count`,
+   * by {@link countStayingByDate}, the one count `GET /availability` reads too (P48).
    * MUST run inside `withCapacityLocks(tx, location, dates, ...)`, right after that date's
    * seat check: the same `(location, date)` lock serialises two bookings ticking the last
    * place, so no new lock is taken. 422 `after_school_full` when the ticks do not fit.
@@ -432,12 +493,7 @@ export const dayCapacityRepository = {
     args: { location: LocationKey; date: string; capacity: number; requestedCount: number },
   ): Promise<void> {
     if (args.requestedCount <= 0) return;
-    const [usage] = await tx
-      .select({ booked: sql<number>`count(*)::int`.as('booked') })
-      .from(bookingDogs)
-      .innerJoin(bookings, eq(bookings.id, bookingDogs.bookingId))
-      .innerJoin(dogs, eq(dogs.id, bookingDogs.dogId))
-      .where(and(...holdsASeat(args.location, args.date), eq(bookingDogs.afterSchool, true)));
+    const [usage] = await countStayingByDate(tx, args.location, args.date, args.date);
     const booked = usage?.booked ?? 0;
     if (booked + args.requestedCount > args.capacity) {
       throw afterSchoolFullError({ date: args.date, capacity: args.capacity, booked });
