@@ -593,6 +593,14 @@ async function seed(): Promise<void> {
   // Cohorts — both locations, varied fills, future starts (relative to now so
   // they stay bookable), plus one FULL cohort to demo the cohort-full state.
   // capacity snapshots the class cap (15); end_date = start + (weeks-1) weeks.
+  // One cohort is past AND expired on purpose: the seeded group-class money rows
+  // below (and in seed-notifications-qa.ts) name it, so the Invoices tab reads
+  // their class and dog (P50 #11, DECISIONS 460). Expired, not only ended:
+  // `GET /group-classes/:key/cohorts` lists every unexpired cohort, past ones
+  // first, and POST /enrollments refuses no start date, so an ended cohort
+  // alone would take an enrolment and lend it a seeded invoice as its status.
+  // Expired, it is on no list and enrolling in it is a 404; `GET /invoices`
+  // still names its class (its cohort join carries no `live()`).
   await db.insert(cohorts).values([
     {
       id: SEED.cohortPuppyFayId,
@@ -674,6 +682,20 @@ async function seed(): Promise<void> {
       weeks: 6,
       capacity: 12,
       filled: 5,
+    },
+    {
+      // Ended 39 days ago and expired at its end: the seeded money rows' cohort
+      // (see above). Pinned by `test/seedEndedCohort.test.ts`.
+      id: SEED.cohortPuppyFayEndedId,
+      classKey: 'puppy',
+      location: 'fayetteville',
+      startDate: daysFromNow(-60, 15),
+      endDate: daysFromNow(-60 + 3 * 7, 15),
+      weeklyTime: '10:00 am',
+      weeks: 4,
+      capacity: 15,
+      filled: 0,
+      expiredAt: daysFromNow(-60 + 3 * 7, 15),
     },
   ]);
   // Lola has completed Manners 1 → she's eligible for Manners 2; Waffles
@@ -872,12 +894,16 @@ async function seed(): Promise<void> {
   await db.insert(charges).values([
     {
       // Refunded group-class charge — exercises the 'refunded' status + the
-      // purpose-derived category for a charge with no booking link.
+      // purpose-derived category for a charge with no booking link. It names
+      // the ended cohort and Waffles, so its Invoices line reads the class and
+      // the dog (P50 #11).
       id: SEED.chargeRefundedId,
       ownerId: SEED.ownerAllisonId,
       amountCents: 20000,
       status: 'refunded',
       purpose: 'group-class',
+      cohortId: SEED.cohortPuppyFayEndedId,
+      dogId: SEED.dogWafflesId,
       createdAt: daysFromNow(-25, 15),
     },
   ]);
@@ -1196,7 +1222,7 @@ async function main(): Promise<void> {
   await restoreRealStripeRows(preserved);
   console.log(
     `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 5 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
-      `2 threads, 10 credit packages, 4 group classes + 7 cohorts, billing ledger, 6 announcements, ` +
+      `2 threads, 10 credit packages, 4 group classes + 8 cohorts, billing ledger, 6 announcements, ` +
       `1 event. ` +
       `Preserved real Stripe rows: ${preserved.customers.length} customer(s), ${preserved.cards.length} card(s). ` +
       `Portal principal: staff:${SEED.staffShanthiId}:owner`,

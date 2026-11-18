@@ -79,6 +79,10 @@ export const SEED = {
   cohortManners2FayId: 'c0407000-0000-4000-8000-000000000005',
   cohortManners2FullId: 'c0407000-0000-4000-8000-000000000006',
   cohortPublicPupsFayId: 'c0407000-0000-4000-8000-000000000007',
+  // Past AND soft-expired on purpose (P50 #11, DECISIONS 460): the cohort the seeded
+  // group-class money rows name, so her Invoices tab reads the class and the dog, while no
+  // list shows it and no enrolment can join it (and so read a seeded invoice as its own).
+  cohortPuppyFayEndedId: 'c0407000-0000-4000-8000-000000000008',
   // Recent-Updates announcements (Fayetteville-targeted home-screen catalog).
   annClosureId: 'a11c0000-0000-4000-8000-000000000001',
   annYappyHourId: 'a11c0000-0000-4000-8000-000000000002',

@@ -77,6 +77,8 @@ const BASE = {
   invoiceOpenId: '12005000-0000-4000-8000-000000000001',
   lotAllisonSchoolId: '10700000-0000-4000-8000-000000000001',
   annYappyHourId: 'a11c0000-0000-4000-8000-000000000002',
+  // The ended, expired Puppy cohort the class money rows below name (P50 #11).
+  cohortPuppyFayEndedId: 'c0407000-0000-4000-8000-000000000008',
 } as const;
 
 /**
@@ -328,6 +330,11 @@ const BORROWED_FROM_SEED_DEV: ReadonlyArray<{ what: string; table: string; id: s
   { what: "Allison's card", table: 'payment_methods', id: BASE.paymentMethodAllisonId },
   { what: 'the open invoice', table: 'invoices', id: BASE.invoiceOpenId },
   { what: 'the Yappy Hour announcement', table: 'announcements', id: BASE.annYappyHourId },
+  {
+    what: 'the ended Puppy cohort the class money rows name',
+    table: 'cohorts',
+    id: BASE.cohortPuppyFayEndedId,
+  },
 ];
 
 /**
@@ -465,12 +472,16 @@ async function seedNotificationSubjects(): Promise<void> {
 
   // "Payment received" needs a PAID invoice and the charge that settled it —
   // the paid-invoice modal derives its card + paid date from that link.
+  // These three class money rows name seed-dev's ended, expired cohort and
+  // Waffles, so their Invoices lines read the class and the dog (P50 #11).
   await db.insert(charges).values({
     id: QA.chargePaidId,
     ownerId: BASE.ownerAllisonId,
     amountCents: QA_INVOICE_CENTS,
     status: 'succeeded',
     purpose: 'group-class',
+    cohortId: BASE.cohortPuppyFayEndedId,
+    dogId: BASE.dogWafflesId,
     createdAt: hoursAgo(7),
   });
   await db.insert(invoices).values([
@@ -480,6 +491,8 @@ async function seedNotificationSubjects(): Promise<void> {
       amountCents: QA_INVOICE_CENTS,
       status: 'paid',
       purpose: 'group-class',
+      cohortId: BASE.cohortPuppyFayEndedId,
+      dogId: BASE.dogWafflesId,
       paymentMethodId: BASE.paymentMethodAllisonId,
       paidChargeId: QA.chargePaidId,
       issuedAt: hoursAgo(48),
@@ -493,6 +506,8 @@ async function seedNotificationSubjects(): Promise<void> {
       amountCents: QA_INVOICE_CENTS,
       status: 'open',
       purpose: 'group-class',
+      cohortId: BASE.cohortPuppyFayEndedId,
+      dogId: BASE.dogWafflesId,
       paymentMethodId: BASE.paymentMethodAllisonId,
       paymentExpected: 'in-person',
       issuedAt: hoursAgo(24),
