@@ -1036,6 +1036,46 @@ test(
   },
 );
 
+// P49 carry (plan.json P49 `brief_must_say`): `EnrollmentWire.start_date` and
+// `first_session_at` are ISO-8601 instants, as every other wire timestamp is, through
+// `pgTimestampToIso` (`enrollmentsRepository.ts`), never Postgres's own text
+// ("2026-07-06 23:00:00+00"), which a client may not parse as an instant.
+test(
+  'GET /enrollments — start_date and first_session_at are ISO-8601 instants (pgTimestampToIso)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const cohort = await makeCohort({
+      classKey: 'puppy',
+      capacity: 6,
+      filled: 0,
+      weeks: 4,
+      startDate: SIX_WEEKS_OUT_UTC,
+    });
+    const { app } = enrollApp();
+    const posted = await postEnrollment({
+      app,
+      idempotencyKey: `enr-iso-${randomUUID()}`,
+      payload: { cohort_id: cohort.id, dog_ids: [FIXTURE_IDS.dog1Id], pay_later: true },
+    });
+    assert.equal(posted.statusCode, 201, posted.body);
+
+    const res = await app.inject({ method: 'GET', url: '/enrollments' });
+    assert.equal(res.statusCode, 200, res.body);
+    const rows = res.json() as EnrollmentWire[];
+    const mine = rows.find((r) => r.cohort_id === cohort.id && r.dog_id === FIXTURE_IDS.dog1Id);
+    assert.ok(mine, 'the new enrollment is listed');
+    const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+    assert.equal(mine!.start_date, new Date(SIX_WEEKS_OUT_UTC).toISOString());
+    assert.equal(mine!.first_session_at, new Date(SIX_WEEKS_OUT_UTC).toISOString());
+    for (const row of rows) {
+      assert.match(row.start_date, ISO_INSTANT, `start_date ${row.start_date}`);
+      assert.match(row.first_session_at, ISO_INSTANT, `first_session_at ${row.first_session_at}`);
+    }
+
+    await db.delete(invoicesTable).where(eq(invoicesTable.cohortId, cohort.id));
+  },
+);
+
 // ──────────────────────────────────────────────────────────────────────────
 // Money is never stranded (Δ 2026-07-18; converted to manual capture
 // 2026-08-20). Pay-now now AUTHORIZES each dog's card before the enroll tx and

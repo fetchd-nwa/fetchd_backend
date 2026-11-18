@@ -86,6 +86,12 @@ export interface RosterEntry {
   /** Which messaging responder this staffer is, if either (§3.13: Amber the
    *  default, Shanthi the backup). */
   responder?: 'default' | 'backup';
+  /** Her flat private-lesson price in cents (wire 9.0.0, P49): absent = she teaches no
+   *  lessons. Set from the roster on every run, so an absent key clears it. */
+  lesson_price_cents?: number;
+  /** Whether she may be requested for, and assigned, a Board & Train (wire 9.0.0, P49):
+   *  absent = no. Set from the roster on every run. */
+  board_train_eligible?: boolean;
 }
 
 export interface Deps {
@@ -126,6 +132,10 @@ const entrySchema = z
     role: z.enum(STAFF_ROLES),
     home_locations: z.array(z.string().trim().min(1)),
     responder: z.enum(['default', 'backup']).optional(),
+    // P49 (wire 9.0.0; design request-services-v1 §4.3; Fable change 7): the roster is the
+    // one writer of a trainer's lesson price and her Board & Train eligibility.
+    lesson_price_cents: z.number().int().positive().optional(),
+    board_train_eligible: z.boolean().optional(),
   })
   .strict();
 
@@ -539,15 +549,49 @@ export async function runRoster(
     }
     for (const plan of planned) {
       const { entry } = plan;
+      const uid = uidByEmail.get(entry.email);
+      // P49: the two service columns are set from the roster on EVERY run, so a key the
+      // roster leaves out writes NULL / false. Each change is printed before the write.
+      const lessonPriceCents = entry.lesson_price_cents ?? null;
+      const boardTrainEligible = entry.board_train_eligible ?? false;
+      const {
+        rows: [held],
+      } = await tx.query<{ p: number | null; e: boolean }>(
+        `SELECT lesson_price_cents AS p, board_train_eligible AS e
+           FROM staff WHERE supabase_uid = $1 AND expired_at IS NULL`,
+        [uid],
+      );
+      const heldPrice = held?.p ?? null;
+      const heldEligible = held?.e ?? false;
+      if (heldPrice !== lessonPriceCents) {
+        out(
+          `${entry.email}: lesson_price_cents ${heldPrice ?? '(none)'} → ${lessonPriceCents ?? '(none)'}`,
+        );
+      }
+      if (heldEligible !== boardTrainEligible) {
+        out(`${entry.email}: board_train_eligible ${heldEligible} → ${boardTrainEligible}`);
+      }
       const written = await tx.query(
-        `INSERT INTO staff (supabase_uid, name, role, home_locations, expired_at)
-         VALUES ($1, $2, $3::staff_role, $4::text[], NULL)
+        `INSERT INTO staff (supabase_uid, name, role, home_locations, expired_at,
+                            lesson_price_cents, board_train_eligible)
+         VALUES ($1, $2, $3::staff_role, $4::text[], NULL, $5, $6)
          ON CONFLICT (supabase_uid) DO UPDATE
-            SET name = EXCLUDED.name, role = EXCLUDED.role, home_locations = EXCLUDED.home_locations
+            SET name = EXCLUDED.name, role = EXCLUDED.role, home_locations = EXCLUDED.home_locations,
+                lesson_price_cents = EXCLUDED.lesson_price_cents,
+                board_train_eligible = EXCLUDED.board_train_eligible
           WHERE staff.expired_at IS NULL
-            AND (staff.name, staff.role, staff.home_locations)
-                IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.role, EXCLUDED.home_locations)`,
-        [uidByEmail.get(entry.email), entry.name, entry.role, canonical(entry.home_locations)],
+            AND (staff.name, staff.role, staff.home_locations, staff.lesson_price_cents,
+                 staff.board_train_eligible)
+                IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.role, EXCLUDED.home_locations,
+                                  EXCLUDED.lesson_price_cents, EXCLUDED.board_train_eligible)`,
+        [
+          uid,
+          entry.name,
+          entry.role,
+          canonical(entry.home_locations),
+          lessonPriceCents,
+          boardTrainEligible,
+        ],
       );
       out(`${entry.email}: staff row ${written.rowCount === 0 ? 'unchanged' : 'written'}`);
     }
@@ -809,6 +853,24 @@ export async function runRehire(
     `rehire ${email}: app_role ${entry.role}, the ban lifted, expired_at cleared, ` +
       `name '${entry.name}', home ${canonical(entry.home_locations).join(', ')}`,
   );
+  // P49 (Fable b1 L5): the two service columns come from her roster entry, as on a roster
+  // run, each change printed before any write; a key left out clears it.
+  const lessonPriceCents = entry.lesson_price_cents ?? null;
+  const boardTrainEligible = entry.board_train_eligible ?? false;
+  const {
+    rows: [held],
+  } = await db.query<{ p: number | null; e: boolean }>(
+    'SELECT lesson_price_cents AS p, board_train_eligible AS e FROM staff WHERE id = $1',
+    [row.id],
+  );
+  const heldPrice = held?.p ?? null;
+  const heldEligible = held?.e ?? false;
+  if (heldPrice !== lessonPriceCents) {
+    out(`${email}: lesson_price_cents ${heldPrice ?? '(none)'} → ${lessonPriceCents ?? '(none)'}`);
+  }
+  if (heldEligible !== boardTrainEligible) {
+    out(`${email}: board_train_eligible ${heldEligible} → ${boardTrainEligible}`);
+  }
   if (!options.confirm) {
     out('A rehire needs confirmation: re-run with --yes. Nothing was changed.');
     return 1;
@@ -819,9 +881,17 @@ export async function runRehire(
   });
   await withActorOn(db, ACTOR, (tx) =>
     tx.query(
-      `UPDATE staff SET expired_at = NULL, name = $2, role = $3::staff_role, home_locations = $4::text[]
+      `UPDATE staff SET expired_at = NULL, name = $2, role = $3::staff_role, home_locations = $4::text[],
+              lesson_price_cents = $5, board_train_eligible = $6
         WHERE id = $1`,
-      [row.id, entry.name, entry.role, canonical(entry.home_locations)],
+      [
+        row.id,
+        entry.name,
+        entry.role,
+        canonical(entry.home_locations),
+        entry.lesson_price_cents ?? null,
+        entry.board_train_eligible ?? false,
+      ],
     ),
   );
   out(`${email}: rehired (her old set-password link, if any, is dead: mint one with --link)`);

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
+import { withDogLocks } from '../db/locks.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import {
   dogFeedingRepository,
@@ -339,6 +340,17 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
 
     const body = parseOrThrow(postDogBodySchema, request.body, 'dog payload');
+    // A14 (wire 9.0.0; build DECISIONS 459): an owner may not set her dog's evaluation, so
+    // a body carrying either key, with any value (`null` and 'not-evaluated' included), is
+    // refused right after the parse, before the spay rule, the vet check and any write.
+    // This closes BUG-11's POST arm; PATCH /dogs/:id keeps its arm until P09 (EVAL-U02),
+    // which makes this body `.strict()` without the two keys.
+    if (body.evaluation_status !== undefined || body.evaluation_date !== undefined) {
+      throw new ApiError(
+        'bad_request',
+        'evaluation_status and evaluation_date are set by the school, not on a new dog',
+      );
+    }
     assertSpayFieldsCoherent(body);
     const primaryVetId = body.primary_vet_id ?? null;
     const values = {
@@ -349,8 +361,9 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
       ageMonthsOverride: body.age_months_override ?? null,
       primaryVetId,
       specialNotes: normalizeOptional(body.special_notes) ?? '',
-      evaluationStatus: body.evaluation_status ?? 'not-evaluated',
-      evaluationDate: body.evaluation_date ?? null,
+      // A14: every dog an owner creates starts unevaluated.
+      evaluationStatus: 'not-evaluated' as const,
+      evaluationDate: null,
       spayedNeutered: body.spayed_neutered ?? null,
       spayNeuterPlannedOn: body.spay_neuter_planned_on ?? null,
     };
@@ -515,6 +528,11 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
         if (!(await dogsRepository.findOwnedExists(dogId, principal.ownerId, tx))) {
           throw new ApiError('not_found', 'dog not found');
         }
+        // The dog lock the yes and the approve take before their removed-dog read
+        // (request-services-v1 § 14, A1.3), so her removal cannot land between that read
+        // and their INSERT: it waits for them, or they wait and read it. First in the lock
+        // order, as for every dog-lock holder; the delete takes no request row.
+        await withDogLocks(tx, [dogId], async () => undefined);
         await dogsRepository.softExpire(tx, dogId);
         return { status: 204, body: null };
       },

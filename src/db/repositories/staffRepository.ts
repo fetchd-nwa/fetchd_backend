@@ -1,8 +1,32 @@
-import { and, inArray } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, or } from 'drizzle-orm';
 import { db } from '../client.js';
 import { staff } from '../schema/schema.js';
 import { live } from '../softExpire.js';
+import type { Tx } from '../tx.js';
 import type { StaffRoleValue } from '../../lib/threadWire.js';
+
+type Runner = Tx | typeof db;
+
+/** A staffer as the request services read her (M5.21; wire 9.0.0). */
+export interface TrainerRow {
+  id: string;
+  name: string;
+  lessonPriceCents: number | null;
+  boardTrainEligible: boolean;
+  expiredAt: string | null;
+}
+
+const TRAINER_PROJECTION = {
+  id: staff.id,
+  name: staff.name,
+  lessonPriceCents: staff.lessonPriceCents,
+  boardTrainEligible: staff.boardTrainEligible,
+  expiredAt: staff.expiredAt,
+} as const;
+
+/** The canonical uuid spelling, so a `staff_preference` that is no uuid never reaches a
+ *  uuid comparison in SQL (Postgres would refuse the cast). */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Data-access seam for the `staff` table. Day-5a uses one method
@@ -79,5 +103,62 @@ export const staffRepository = {
       })
       .from(staff)
       .where(inArray(staff.id, ids));
+  },
+
+  /**
+   * Names for a batch of staff ids, EXPIRED staff included (P49, wire 9.0.0): what staff
+   * approved (`PendingRequestWire.approved_trainer`), whom a family asked for
+   * (`StaffRequestWire.preferred_trainer`) and a booked service's trainer
+   * (`StaffServiceBookingWire.trainer`) stay facts after she leaves.
+   */
+  async findAnyNamesByIds(
+    ids: readonly string[],
+    runner: Runner = db,
+  ): Promise<Map<string, string>> {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return new Map();
+    const rows = await runner
+      .select({ id: staff.id, name: staff.name })
+      .from(staff)
+      .where(inArray(staff.id, unique));
+    return new Map(rows.map((r) => [r.id, r.name] as const));
+  },
+
+  /**
+   * The staff row a text value names, live or expired, or `undefined` when it names none:
+   * a `focus.staff_preference` that is `'any'`, a slug such as `'rachel'`, or an unknown
+   * id (P49, wire 9.0.0, A4; notes R2). `FOR SHARE` inside a transaction, so a roster run
+   * cannot change her price or eligibility between this read and the write it decides.
+   */
+  async findTrainer(
+    runner: Runner,
+    value: string,
+    opts: { lock?: boolean } = {},
+  ): Promise<TrainerRow | undefined> {
+    if (!UUID.test(value)) return undefined;
+    const query = runner
+      .select(TRAINER_PROJECTION)
+      .from(staff)
+      .where(eq(staff.id, value.toLowerCase()))
+      .limit(1);
+    const [row] = await (opts.lock === true ? query.for('share') : query);
+    return row;
+  },
+
+  /**
+   * `GET /trainers` (P49, wire 9.0.0, A9): every live staffer with a lesson price or Board &
+   * Train eligibility, ordered by name (ties by id).
+   */
+  async listTrainers(runner: Runner = db): Promise<TrainerRow[]> {
+    return runner
+      .select(TRAINER_PROJECTION)
+      .from(staff)
+      .where(
+        and(
+          live(staff),
+          or(isNotNull(staff.lessonPriceCents), eq(staff.boardTrainEligible, true)),
+        ),
+      )
+      .orderBy(asc(staff.name), asc(staff.id));
   },
 };

@@ -1335,7 +1335,10 @@ function rehearsedStepFiles(dir: string): string[] {
   });
 }
 
-const GROUP_DIR = /^lg\d+[a-z]*$/;
+// A landing group (`lg<n>`), or since plan unit P49 a fix-phase unit's own steps
+// (`rs<n>`: `migrations/rs1/`, M5.20–M5.24, design request-services-v1 §5.1). Either is
+// a group: its last step must revoke every table it creates.
+const GROUP_DIR = /^(?:lg|rs)\d+[a-z]*$/;
 
 /** One group's steps in the order the rehearsal applies them (`scripts/migrate-rehearse.sh`). */
 function inAppliedOrder(group: string, dir: string, files: readonly string[]): string[] {
@@ -1372,8 +1375,9 @@ function groupsMissingTheirClosingRevoke(root: string): string[] {
   }
   if (outside.length > 0) {
     throw new Error(
-      `step file(s) outside an lg<n> group directory: ${outside.join(', ')} — the rehearsal ` +
-        'applies every M*.sql under migrations/, so each must sit directly in migrations/lg<n>/',
+      `step file(s) outside an lg<n> group directory (or rs<n>): ${outside.join(', ')} — the ` +
+        'rehearsal applies every M*.sql under migrations/, so each must sit directly in ' +
+        'migrations/lg<n>/ or migrations/rs<n>/',
     );
   }
   if (byGroup.size === 0) {

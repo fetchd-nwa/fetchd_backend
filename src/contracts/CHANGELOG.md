@@ -12,6 +12,169 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [9.0.0] — 2026-11-16
+
+BREAKING. The fix phase Allison ordered first (build DECISIONS 396, 402); plan unit P49,
+Part A of `designs/request-services-v1.md` (`ca68ec459711b786`, §2.2 A1–A13), adopted
+with changes by Fable's re-read (`units/P49/review-note-fable-r2.md`; DECISIONS 416,
+418, 421). Her words: "i want private and board and train to be active" (393); "default
+to what shanthi says / remember, for privates and board and trains staff must approve it
+for it to officially be booked / bookable and then fake stripe card, liek what ive been
+doing now" (413); "correct" (414). Private lessons and Board & Train become bookable and
+are booked only after staff approve: a lesson when staff confirm one of her times, a
+Board & Train when staff approve dates and a trainer and the family says yes to them.
+**No step moves money.** Nobody charges a card for either service; the bill at the end,
+which the family taps to pay, is plan unit P51's (9.1.0, additive). Shanthi's "paid at
+the end" binds (`12-shanthi-answers-10-01.md:40-41`, `:146`). Not a design section
+(design_label none). Build label 9.0.0 (DECISIONS 402, 418): a breaking fix-phase step
+skips 7.0.0 and 8.0.0, which are design labels, and nothing parses the version. It reads
+6.2.0 (P48). S42/P31 is relabelled to build 9.2.0, provisional. Breaking because A1
+removes a route and its body, and A3, A4, A5 and A14 refuse bodies and calls that used
+to succeed. A14 (DECISIONS 459) rides this step: it closes BUG-11's `POST /dogs` arm. No shipped client calls anything removed (mobile never calls
+`confirm-payment`, DRIFT-7; the portal has no request adapter); the route's 404 test is
+the proof, not that search. Contract-first: the routes keep today's behaviour until
+P49's backend lands them, and the two services stay off in the offerings seed until
+M5.24, P49's last backend commit. Resync both clients (`npm run sync:contracts` in
+mobile and portal). Against this copy the backend's `npx tsc --noEmit -p .` fails 4
+times in 3 files, each the builder's to close: `conformance.ts:89` (the
+`notification_type` Drizzle enum lacks `'request-approved'` until M5.20's mirror),
+`requestConfirmPayment.ts` twice (the file A1 deletes) and `staffRequests.ts:106` (the
+approve body's pin, until its schema gains the three keys). `wire.ts` alone compiles.
+The clients were not run against it.
+
+### Breaking
+
+- **A1 (breaking, removed).** `POST /requests/:id/confirm-payment` and its body
+  `PostRequestsConfirmPaymentRequest` removed. It charged $2,000.00 at confirm or wrote
+  an invoice due on a date the owner chose (BUG-6, NOTE-7). The route answers 404. Its
+  successor is A2.
+- **A3 (breaking, tightening).** `PostStaffRequestsApproveRequest` gains
+  `trainer_staff_id?`, `dropoff_at?` and `duration_minutes?`, and its rules tighten.
+  Private lesson: `scheduled_at` must be one of her `preferred_dates` and in the future
+  (at or before now is 422, DECISIONS 463);
+  `trainer_staff_id` is required, a live staffer with a lesson price, the one she named
+  unless she chose "anyone"; `duration_minutes` defaults to 60; the booking stores the
+  trainer, length and quote (that trainer's price), and the confirm notice names them.
+  Board & Train: the body is no longer ignored; `dropoff_at` (one of her starts, in the
+  future), `pickup_at` (after it) and `trainer_staff_id` (live and eligible; the one she
+  named, if any) are required, `scheduled_at`, `location`, `duration_minutes` and
+  `notes` refused; the four approved fields (A6) are stored, the request still parks at
+  `'approved-awaiting-payment'`, and `'request-approved'` (A11) is queued. An old row
+  with `length_weeks` other than 2 is refused in words. Boarding is unchanged and
+  refuses the three new keys. No arm moves money.
+- **A4 (breaking, tightening).** `PostRequestsRequest` and `PatchRequestsRequest`: a
+  Board & Train's `length_weeks` takes 2 only (was 1..12; Zod still bounds 1..12, so 3
+  is 422 and 13 is 400), and PATCH refuses `null` for it. On a private lesson or a
+  Board & Train, `focus.staff_preference` is `'any'` or the `staff_id` of a live
+  staffer with a price (lesson) or Board & Train eligibility, as `GET /trainers` lists
+  them; omitted or cleared means "anyone". Boarding's is unchanged.
+- **A5 (breaking in behaviour; it changes no type).** The owner's
+  `POST /bookings/:id/cancel` and the staff `POST /staff/bookings/:id/cancel` refuse,
+  with 409 `conflict`, a private-lesson or board-and-train booking whose start
+  (`dropoff_at`, else `scheduled_at`) has passed. `BookingWire.can_cancel` is now
+  present on every private-lesson and board-and-train row, `false` once its start has
+  passed or it is cancelled and `true` before, so the app hides Cancel. Doc only: no
+  type changes.
+- **A14 (breaking, tightening; no type change).** `POST /dogs` from an owner refuses a
+  body carrying `evaluation_status` or `evaluation_date`, with any value (`null` and
+  `'not-evaluated'` included), with 400 `bad_request` right after the parse: a body
+  that answered 201 now answers 400, and nothing is written. Every dog an owner
+  creates is `'not-evaluated'`. Closes BUG-11's `POST` arm (DECISIONS 459).
+  `PostDogsRequest` keeps both optional keys until P09's EVAL-U02 makes the body
+  `.strict()` without them; staff and seed paths are unchanged. `PATCH /dogs/:id`
+  still stores both from the owner, a known gap until P09 (BUG-11's `PATCH` arm).
+  The owner app sends neither (Add a dog opens at P07).
+
+### Added
+
+- **A2 (additive).** `POST /requests/:id/confirm` `[owner]`, body none or `{}`
+  (`.strict()`), Idempotency-Key → 200 `PostRequestsConfirmResponse {request:
+  PendingRequestWire, booking: BookingWire}`. The family's **Yes, book it**: Board &
+  Train only, from `'approved-awaiting-payment'`, her own (else 404). The booking gates
+  run (card on file, vaccines, agreements; no evaluation gate), the stay is inserted at
+  the approved dates, trainer and quote at her home campus, and the request is
+  `'converted'` keeping the approver's id. Moves $0. 409 `conflict` from any other state,
+  once the approved drop-off has passed, and when the approved trainer is no longer live
+  or Board & Train eligible (staff take it back; DECISIONS 463, 466). One winner against
+  her Withdraw or a staff Take back (the same row lock).
+- **A6 (additive).** `PendingRequestWire.approved_trainer? {staff_id, name}`,
+  `.approved_dropoff_at?`, `.approved_pickup_at?` and `.approved_price_cents?`, on a
+  Board & Train from its approval on, kept after her yes and after a cancel.
+- **A7 (additive, a supertype).** `GET /staff/requests` answers
+  `GetStaffRequestsResponse = StaffRequestWire[]`; `StaffRequestWire` is
+  `PendingRequestWire` + `owner {id, name, location?}` + `dogs {id, name}[]` +
+  `preferred_trainer? {staff_id, name}`. `owner.location` is the family's home campus,
+  omitted when it has none: the portal pre-fills a lesson's campus with it, and a Board &
+  Train books there at her yes. Query and order unchanged; approve and deny still answer
+  `PendingRequestWire`.
+- **A8 (additive).** `BookingWire.quoted_price_cents?` (private lesson and Board &
+  Train: the price fixed at booking), and `.dropoff_at?` and `.pickup_at?` on a
+  boarding or board-and-train row. The existing `BookingWire.trainer` is now filled for
+  every lesson and Board & Train booked from 9.0.0.
+- **A9 (additive).** `GET /trainers` `[any principal]` → `GetTrainersResponse =
+  TrainerWire[]`, `TrainerWire {staff_id, name, private_lesson_price_cents?,
+  board_and_train}`: live staff with a lesson price or Board & Train eligibility,
+  ordered by name.
+- **A10 (additive).** `GET /staff/service-bookings` `[staff]` →
+  `GetStaffServiceBookingsResponse = StaffServiceBookingWire[]`,
+  `StaffServiceBookingWire {booking_id, category, owner, dogs, scheduled_at,
+  duration_minutes?, dropoff_at?, pickup_at?, trainer?, quoted_price_cents?,
+  location?}`: every live, uncancelled private lesson and Board & Train, ordered by
+  start, no age bound, no card field. `trainer`, `quoted_price_cents` and `location`
+  are optional only for a row booked before 9.0.0 (dev only) or, for `location`, a
+  Board & Train whose family has no home campus.
+- **A11 (additive, unions widened).** `NotificationType` gains its 16th value,
+  `'request-approved'` (appended to `NOTIFICATION_TYPES`; M5.20); push category
+  `urgent-updates`. `NotificationDeepLinkKind` gains `'request'` (appended to
+  `NOTIFICATION_DEEP_LINK_KINDS`; `deep_link_kind` is `text`, no DDL), which joins
+  `NotificationDeepLink`'s id-bearing arm, and `deepLinkToPath` gains its case:
+  `{kind: 'request', id, params: {category}}` → `/request-detail/boardtrain?id=<id>`
+  for `'board-and-train'` or `/request-detail/private?id=<id>` for `'private-lesson'`;
+  any other or missing category throws at emit, as the `report` arm does.
+- **A13 (additive: it accepts what it refused; no type change).**
+  `POST /staff/requests/:id/deny` also takes back a Board & Train in
+  `'approved-awaiting-payment'` (the portal's **Take back**). The row keeps its
+  approved fields; a yes after it is 409; a new Board & Train request for the dog is
+  then accepted.
+
+### Documentation
+
+- **A12 (doc).** Board & Train leaves every evaluation-gate comment on `POST /requests`
+  and `evaluation_required` (`PostRequestsErrorDetails` arm 1 is boarding only;
+  `PostRequestsRequest` says so); s21. The arm, its tuple and its type are unchanged:
+  boarding still sends it.
+- `RequestStatus`: `'approved-awaiting-payment'` is a historical name meaning "waiting
+  for the family's yes"; nothing is paid there (A6).
+- `PendingRequestWire.approved_by_staff_id`: a Board & Train cancelled after approval
+  keeps a staff id whoever cancelled it (the approver's after her Withdraw, the denier's
+  after a Take back), so a cancelled row with `approved_dropoff_at` reads "Cancelled",
+  not "Denied by the school" (Fable r2 M5). `PostStaffRequestsDenyRequest` says the same.
+- `PostRequestsRequest`'s `service_not_offered`: the switch stops new requests only; the
+  staff approve and the family's yes do not read it, so an approval in flight stands
+  (DECISIONS 463).
+- `PostBookingsRequest` names the family's yes as a Board & Train's door;
+  `PostRequestsErrorDetails` says a Board & Train's gates fire at her yes.
+- The payments domain's `payment_failed` emitter list drops `requestConfirmPayment`.
+- `ServiceOfferingWire.offered` and `PostRequestsRequest`'s `service_not_offered` name
+  M5.24 as the step that seeds private-lesson and board-and-train on; boarding stays off.
+- The landing-group note names 9.0.0, P51's 9.1.0 and S42's 9.2.0.
+- A14: `PostDogsRequest`'s "accepted from the OWNER … deliberately NOT tightened" note is
+  rewritten (the owner's create refuses both keys; P09 removes them).
+  `PatchDogsRequest` names its owner-set evaluation as a known gap until P09.
+  `DogWire.evaluation_status` names the three gated categories (A12) and both arms.
+- Doc only, riding 9.0.0 (orchestrator, plan.json P49 `brief_must_say` 8 and 10):
+  `POST /bookings/:id/dogs/:dogId/after-school/remove`'s new-key refusal names
+  `session_checked_in` beside `session_ended` (P48 Opus C-N1, build DECISIONS 474);
+  `EnrollmentWire.start_date` and `first_session_at` are ISO-8601 instants
+  (`pgTimestampToIso`; before 9.0.0 they were Postgres text, which Hermes cannot
+  parse; build DECISIONS 489).
+- Riding 9.0.0 (design `request-services-v1.md` § 14, Amendment A1; build DECISIONS 511):
+  `RequestStayConflictDetails` (`kind: 'conflict'`, `reason: 'stay_overlap' | 'dog_removed'`,
+  `dog_id`) joins `ApiErrorDetailWire`; `POST /requests/:id/confirm` gains its two 409s;
+  `POST /staff/requests/:id/approve` refuses a removed dog on every arm, and on a Board &
+  Train an overlapping stay and a same-day hand-back (422); the validator names are
+  corrected (Fable b1 N3).
+
 ## [6.2.0] — 2026-11-14
 
 ADDITIVE. The fix phase Allison ordered first (build DECISIONS 396, 402, 407,

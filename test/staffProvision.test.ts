@@ -152,6 +152,16 @@ async function staffRows(uids: string[]) {
   return rows;
 }
 
+/** [name, lesson_price_cents, board_train_eligible] by name (P49). */
+async function serviceRows(uids: string[]): Promise<[string, number | null, boolean][]> {
+  const { rows } = await client.query<{ name: string; p: number | null; e: boolean }>(
+    `SELECT name, lesson_price_cents AS p, board_train_eligible AS e
+       FROM staff WHERE supabase_uid = ANY($1::uuid[]) ORDER BY name`,
+    [uids],
+  );
+  return rows.map((r) => [r.name, r.p, r.e]);
+}
+
 async function responders(): Promise<{ def: string | null; backup: string | null }> {
   const { rows } = await client.query<{ def: string | null; backup: string | null }>(
     'SELECT school_default_responder_staff_id AS def, school_backup_responder_staff_id AS backup FROM messaging_settings',
@@ -588,6 +598,49 @@ describe('staff:provision — against a fake admin client and the test database'
     assert.equal((await staffRows([uid]))[0]?.expired_at, null);
     assert.equal(admin.byEmail(back)?.app_metadata?.app_role, 'trainer');
     assert.equal(admin.canSignIn(back), true);
+  });
+
+  // Fable b1 L5: a rehire writes the two service columns from her roster entry, as a roster
+  // run does, each change printed before the write (a key left out clears it).
+  test('P49: --rehire sets lesson_price_cents and board_train_eligible from the roster entry, printing each change before the write', async () => {
+    const admin = new FakeAdmin();
+    const back = emailFor('priced-back');
+    const priced = entry({
+      email: back,
+      name: 'Priced',
+      role: 'trainer',
+      home_locations: ['fayetteville'],
+      lesson_price_cents: 15000,
+      board_train_eligible: true,
+    });
+    const { out, lines } = capture();
+    assert.equal(
+      await runRoster({ admin, db: client, out }, [priced], { portalOrigin: PORTAL, confirm: false }),
+      0,
+      lines.join('\n'),
+    );
+    track(admin);
+    assert.equal(await runExpire({ admin, db: client, out }, back, { confirm: true }), 0);
+    const uid = (admin.byEmail(back) as AdminUser).id;
+    assert.deepEqual(await serviceRows([uid]), [['Priced', 15000, true]], 'expired as she stood');
+
+    // Her roster entry no longer names a price or Board & Train.
+    const unpriced = entry({ email: back, name: 'Priced', role: 'trainer', home_locations: ['fayetteville'] });
+    const rehire = capture();
+    assert.equal(
+      await runRehire({ admin, db: client, out: rehire.out }, back, [unpriced], { confirm: true }),
+      0,
+      rehire.lines.join('\n'),
+    );
+    assert.deepEqual(await serviceRows([uid]), [['Priced', null, false]]);
+    const written = rehire.lines.findIndex((l) => l.startsWith(`${back}: rehired`));
+    for (const change of [
+      `${back}: lesson_price_cents 15000 → (none)`,
+      `${back}: board_train_eligible true → false`,
+    ]) {
+      const at = rehire.lines.indexOf(change);
+      assert.ok(at >= 0 && at < written, `not printed before the write: ${change}\n${rehire.lines.join('\n')}`);
+    }
   });
 
   test('--link re-mints one link for a live staffer, and refuses an email that is not one', async () => {
@@ -1289,6 +1342,94 @@ describe('staff:provision — against a fake admin client and the test database'
     assert.ok(admin.listed.length >= 4, `only pages ${admin.listed.join(',')} were read`);
     assert.equal(admin.writes().length, 0, 'the paged user was not adopted');
     assert.equal((await staffRows([target.id])).length, 1);
+  });
+
+  // P49 (wire 9.0.0; design request-services-v1 §4.3; Fable change 7): the roster is the one
+  // writer of a trainer's lesson price and her Board & Train eligibility, set on every run.
+  test('P49: a roster sets lesson_price_cents and board_train_eligible; a run without them clears them; each change prints before the write', async () => {
+    const admin = new FakeAdmin();
+    const rachel = emailFor('rachel');
+    const amber = emailFor('amber');
+    const amberEntry = entry({
+      email: amber,
+      name: 'Amber',
+      role: 'manager',
+      home_locations: ['bentonville'],
+    });
+    const run = async (roster: RosterEntry[]) => {
+      const { out, lines } = capture();
+      const code = await runRoster({ admin, db: client, out }, roster, {
+        portalOrigin: PORTAL,
+        confirm: false,
+      });
+      track(admin);
+      assert.equal(code, 0, lines.join('\n'));
+      return lines;
+    };
+    const before = (lines: string[], change: string, write: string) => {
+      const at = lines.indexOf(change);
+      const written = lines.indexOf(write);
+      assert.ok(at >= 0, `not printed: ${change}\n${lines.join('\n')}`);
+      assert.ok(written > at, `printed after the write: ${change}\n${lines.join('\n')}`);
+    };
+
+    const first = await run([
+      entry({ email: rachel, name: 'Rachel', lesson_price_cents: 15000, board_train_eligible: true }),
+      amberEntry,
+    ]);
+    assert.deepEqual(await serviceRows([...admin.users.keys()]), [
+      ['Amber', null, false],
+      ['Rachel', 15000, true],
+    ]);
+    before(first, `${rachel}: lesson_price_cents (none) → 15000`, `${rachel}: staff row written`);
+    before(first, `${rachel}: board_train_eligible false → true`, `${rachel}: staff row written`);
+    assert.deepEqual(
+      first.filter((l) => l.startsWith(`${amber}: lesson_price_cents`) || l.startsWith(`${amber}: board_train`)),
+      [],
+      'a staffer with neither prints no change',
+    );
+
+    const second = await run([entry({ email: rachel, name: 'Rachel' }), amberEntry]);
+    assert.deepEqual(await serviceRows([...admin.users.keys()]), [
+      ['Amber', null, false],
+      ['Rachel', null, false],
+    ]);
+    before(second, `${rachel}: lesson_price_cents 15000 → (none)`, `${rachel}: staff row written`);
+    before(second, `${rachel}: board_train_eligible true → false`, `${rachel}: staff row written`);
+
+    const third = await run([entry({ email: rachel, name: 'Rachel' }), amberEntry]);
+    assert.ok(third.includes(`${rachel}: staff row unchanged`), third.join('\n'));
+    assert.deepEqual(
+      third.filter((l) => /lesson_price_cents|board_train_eligible/.test(l)),
+      [],
+      'an unchanged run printed a change',
+    );
+  });
+
+  test('P49: lesson_price_cents 0 (or not whole, or negative) is refused before any call; a non-boolean eligibility too', async () => {
+    // The control: both keys are roster keys (a refusal below is about the value, not an
+    // unknown key, which a roster without them refused before P49).
+    const parsed = parseRoster([
+      { ...entry({ email: emailFor('ok') }), lesson_price_cents: 15000, board_train_eligible: true },
+    ]);
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+    for (const bad of [
+      { lesson_price_cents: 0 },
+      { lesson_price_cents: -100 },
+      { lesson_price_cents: 150.5 },
+      { board_train_eligible: 'yes' },
+    ]) {
+      const admin = new FakeAdmin();
+      const { out, lines } = capture();
+      const code = await runRoster(
+        { admin, db: client, out },
+        [{ ...entry({ email: emailFor('bad') }), ...bad } as unknown as RosterEntry],
+        { portalOrigin: PORTAL, confirm: false },
+      );
+      assert.equal(code, 1, lines.join('\n'));
+      assert.equal(admin.calls.length, 0, 'an admin call was made');
+      assert.ok(lines.some((l) => /refused/.test(l) && /lesson_price_cents|board_train_eligible/.test(l)), lines.join('\n'));
+    }
   });
 });
 

@@ -43,11 +43,15 @@ export interface BookingRow {
   cancelDeadlineAt: string | null;
   cancelledBy: 'owner' | 'staff' | null;
   cancelReason: string | null;
+  /** A stay's drop-off (boarding and board-and-train only; NULL elsewhere). */
+  dropoffAt: string | null;
   pickupAt: string | null;
   trainerStaffId: string | null;
   cohortId: string | null;
   /** The order this session belongs to (M3.02). NULL on a row made any other way. */
   orderId: string | null;
+  /** A lesson's or a Board & Train's price fixed at booking (M5.21, wire 9.0.0). */
+  quotedPriceCents: number | null;
 }
 
 /**
@@ -111,10 +115,12 @@ const BOOKING_PROJECTION = {
   cancelDeadlineAt: bookings.cancelDeadlineAt,
   cancelledBy: bookings.cancelledBy,
   cancelReason: bookings.cancelReason,
+  dropoffAt: bookings.dropoffAt,
   pickupAt: bookings.pickupAt,
   trainerStaffId: bookings.trainerStaffId,
   cohortId: bookings.cohortId,
   orderId: bookings.orderId,
+  quotedPriceCents: bookings.quotedPriceCents,
 } as const;
 
 const BOOKING_FULL_PROJECTION = {
@@ -123,6 +129,28 @@ const BOOKING_FULL_PROJECTION = {
   leadDogId: bookings.leadDogId,
   expiredAt: bookings.expiredAt,
 } as const;
+
+/**
+ * The residential half of the booking conflict read, written once: a live, uncancelled
+ * boarding or Board & Train stay of `dogId` (on its `booking_dogs` roster, lead or
+ * additional) whose whole-day window can reach the Chicago dates [`minDate`, `maxDate`]:
+ * its `scheduled_at` Chicago date on or before `maxDate`, and its `pickup_at` NULL (no
+ * pick-up yet) or on or after `minDate`. Inclusive on both ends: a stay covers its drop-off
+ * day through its pick-up day (`lib/bookingConflicts.ts`). Read by the day-program guard
+ * (`findConflictCandidatesForDog`) and by the Board & Train guard (`findStaysOverlapping`,
+ * design request-services-v1 § 14 A1.1).
+ */
+function residentialStayWhere(dogId: string, minDate: string, maxDate: string) {
+  return and(
+    eq(bookingDogs.dogId, dogId),
+    live(bookingDogs),
+    inArray(bookings.category, ['boarding', 'board-and-train']),
+    ne(bookings.status, 'cancelled'),
+    live(bookings),
+    sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date <= ${maxDate}`,
+    sql`(${bookings.pickupAt} IS NULL OR (${bookings.pickupAt} AT TIME ZONE 'America/Chicago')::date >= ${minDate})`,
+  );
+}
 
 export const bookingsRepository = {
   /**
@@ -331,19 +359,30 @@ export const bookingsRepository = {
       .select(projection)
       .from(bookings)
       .innerJoin(bookingDogs, eq(bookingDogs.bookingId, bookings.id))
-      .where(
-        and(
-          eq(bookingDogs.dogId, dogId),
-          live(bookingDogs),
-          inArray(bookings.category, ['boarding', 'board-and-train']),
-          ne(bookings.status, 'cancelled'),
-          live(bookings),
-          sql`(${bookings.scheduledAt} AT TIME ZONE 'America/Chicago')::date <= ${maxDate}`,
-          sql`(${bookings.pickupAt} IS NULL OR (${bookings.pickupAt} AT TIME ZONE 'America/Chicago')::date >= ${minDate})`,
-        ),
-      );
+      .where(residentialStayWhere(dogId, minDate, maxDate));
 
     return [...sessional, ...residential];
+  },
+
+  /**
+   * The stays a Board & Train from Chicago date `fromDate` (its drop-off) to `toDate` (its
+   * hand-back) would be booked over, for one dog (design request-services-v1 § 14 A1.1):
+   * the residential predicate above and nothing else, so a lesson or a day at school on
+   * those dates never refuses a stay. Earliest first (`scheduled_at`, ties by id). Run
+   * under `withDogLocks` (the approve and the yes take the dog's lock before it).
+   */
+  async findStaysOverlapping(
+    tx: Tx,
+    dogId: string,
+    fromDate: string,
+    toDate: string,
+  ): Promise<{ id: string; scheduledAt: string; pickupAt: string | null }[]> {
+    return tx
+      .select({ id: bookings.id, scheduledAt: bookings.scheduledAt, pickupAt: bookings.pickupAt })
+      .from(bookings)
+      .innerJoin(bookingDogs, eq(bookingDogs.bookingId, bookings.id))
+      .where(residentialStayWhere(dogId, fromDate, toDate))
+      .orderBy(asc(bookings.scheduledAt), asc(bookings.id));
   },
 
   /**
@@ -630,9 +669,17 @@ export const bookingsRepository = {
       leadDogId: string;
       category: ServiceCategory;
       scheduledAt: Date;
-      location: LocationKey;
+      /** NULL only for a Board & Train whose family has no home campus (wire 9.0.0, A2). */
+      location: LocationKey | null;
       notes: string | null;
       additionalDogIds: readonly string[];
+      /** A lesson's or a Board & Train's trainer, length and quote (wire 9.0.0, A3, A8). */
+      trainerStaffId?: string | null;
+      durationMinutes?: number | null;
+      quotedPriceCents?: number | null;
+      /** A stay's window: boarding and board-and-train only (the schema CHECK). */
+      dropoffAt?: Date | null;
+      pickupAt?: Date | null;
       cohortId?: string | null;
       sessionReportId?: string | null;
       // Δ 2026-07-14: private-lesson only — copied from the request at approve.
@@ -661,10 +708,15 @@ export const bookingsRepository = {
         sessionReportId: values.sessionReportId ?? null,
         lessonSetting: values.lessonSetting ?? null,
         orderId: values.orderId ?? null,
+        trainerStaffId: values.trainerStaffId ?? null,
+        durationMinutes: values.durationMinutes ?? null,
+        quotedPriceCents: values.quotedPriceCents ?? null,
+        dropoffAt: values.dropoffAt?.toISOString() ?? null,
+        pickupAt: values.pickupAt?.toISOString() ?? null,
         ...(values.status !== undefined ? { status: values.status } : {}),
-        // status defaults to 'upcoming' (schema), durationMinutes/trainer*/
-        // report_id/confirmed*/dropoff*/pickup*/cancelled*/source all
-        // remain at their schema defaults (NULL / 'app' / false).
+        // status defaults to 'upcoming' (schema); report_id/confirmed*/cancelled*/source
+        // remain at their schema defaults (NULL / 'app' / false). The trainer, length,
+        // quote and stay window are set only by the callers that pass them (9.0.0).
       })
       .returning(BOOKING_PROJECTION);
     if (!bookingRow) {
@@ -694,6 +746,25 @@ export const bookingsRepository = {
   // cancel route the row-lock + ownership/state checks it needs;
   // `markCancelled` performs the soft-cancel write (no row delete).
   // -------------------------------------------------------------------
+
+  /**
+   * `GET /staff/service-bookings` (wire 9.0.0, A10): every live, uncancelled private
+   * lesson and Board & Train of every family at both campuses, past ones included (no age
+   * bound), ordered by `scheduled_at`, ties by id. Read only.
+   */
+  async findServiceBookings(runner: Tx | typeof db = db): Promise<BookingFullRow[]> {
+    return runner
+      .select(BOOKING_FULL_PROJECTION)
+      .from(bookings)
+      .where(
+        and(
+          inArray(bookings.category, ['private-lesson', 'board-and-train']),
+          ne(bookings.status, 'cancelled'),
+          live(bookings),
+        ),
+      )
+      .orderBy(asc(bookings.scheduledAt), asc(bookings.id));
+  },
 
   /**
    * Row-lock a booking for the duration of the transaction. Concurrent

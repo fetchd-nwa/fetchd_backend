@@ -52,6 +52,9 @@ const REMOVED: ReadonlyArray<{ method: 'GET' | 'POST' | 'PATCH' | 'DELETE'; url:
   // stored-only `cxl` settings domain (`GET/PATCH /staff/settings/cxl`).
   { method: 'GET', url: '/staff/cancel-window' },
   { method: 'PATCH', url: '/staff/cancel-window/day-school' },
+  // 9.0.0 (P49; A1, BUG-6): the Board & Train charge at confirm, replaced by the family's
+  // $0 yes (`POST /requests/:id/confirm`).
+  { method: 'POST', url: `/requests/${ANY_ID}/confirm-payment` },
 ];
 
 for (const { method, url } of REMOVED) {
@@ -70,6 +73,10 @@ for (const { method, url } of [
   { method: 'POST', url: `/staff/bookings/${ANY_ID}/dogs/${ANY_ID}/check-in` },
   { method: 'GET', url: '/staff/checkin-board?location=bentonville&date=2026-10-13' },
   { method: 'GET', url: '/staff/settings/cxl' },
+  // 9.0.0 (P49; A2, A9, A10).
+  { method: 'POST', url: `/requests/${ANY_ID}/confirm` },
+  { method: 'GET', url: '/trainers' },
+  { method: 'GET', url: '/staff/service-bookings' },
 ] as const) {
   test(`${method} ${url} is still registered`, async () => {
     const res = await app.inject({ method, url });

@@ -86,6 +86,14 @@ import type { Tx } from './tx.js';
  * capacity locks are per campus, so with no dog lock one dog could be booked at both on
  * one day. It crosses nothing, because every holder takes it first, before capacity, and
  * the pool comes last.
+ *
+ * A request's row (`requestsRepository.lockById`, `FOR UPDATE`) sits before the dog: the
+ * staff approve of a Board & Train or a boarding request and the family's Board & Train yes
+ * take claim → that one request row → (the trainer's staff row, `FOR SHARE`) → the request's
+ * dogs ascending, then insert (design request-services-v1 § 14, A1). No holder of a dog lock
+ * reaches for a request row: the day-program create, the after-school removal, her dog's
+ * removal (`DELETE /dogs/:id`: claim → the dog → its row) and the cancels touch none, and
+ * her edit, her Withdraw and the deny take the request row alone.
  */
 
 /**

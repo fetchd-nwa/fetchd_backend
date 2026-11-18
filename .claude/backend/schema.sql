@@ -167,7 +167,12 @@ CREATE TYPE notification_type  AS ENUM (
   'card-expiring',
   -- A waitlisted request got a seat — either one opened up or staff overrode
   -- the cap. Deep-links to the booking that was just created.
-  'waitlist-spot-open'
+  'waitlist-spot-open',
+  -- M5.20 (P49; wire 9.0.0, A11): staff approved a Board & Train with dates and a
+  -- trainer, and it waits on the family's yes. Nothing is booked or charged then.
+  -- Deep-links to the request (`deep_link_kind` 'request'). `ADD VALUE` appends,
+  -- so it is last here too.
+  'request-approved'
 );
 CREATE TYPE announcement_category AS ENUM ('urgent','team','class','event','promo','report');
 -- M1.19 (STAFF-U02): rebuilt from ('owner-shanthi', 'trainer', 'office').
@@ -329,7 +334,15 @@ CREATE TABLE staff (
   -- writer, refuses an empty set, an unknown slug and a repeat). Descriptive
   -- only (STAFF-71): no route refuses a staffer outside them. Replaces
   -- `location` (one campus or NULL); `active` was dropped with it (q34).
-  home_locations text[] NOT NULL CHECK (cardinality(home_locations) > 0)
+  home_locations text[] NOT NULL CHECK (cardinality(home_locations) > 0),
+  -- M5.21 (P49; wire 9.0.0, A9; design request-services-v1 §4.3): her flat price per
+  -- private lesson, whatever the number of dogs, paid after (Shanthi #6.8). NULL = she
+  -- teaches no lessons, so she is never offered or assigned one. And whether she may be
+  -- requested for, and assigned, a Board & Train (its price is the program's). Both are
+  -- written by `npm run staff:provision`'s roster alone, on every run.
+  lesson_price_cents   integer CONSTRAINT staff_lesson_price_cents_check
+                         CHECK (lesson_price_cents > 0),
+  board_train_eligible boolean NOT NULL DEFAULT false
 );
 
 -- ----------------------------------------------------------------------------
@@ -789,6 +802,11 @@ CREATE TABLE bookings (
   -- M3.02: the order this session belongs to. Set only by `POST /bookings`; a
   -- walk-in, a class row, a request row and an evaluation row stay NULL.
   order_id          uuid REFERENCES orders(id),
+  -- M5.21 (P49; wire 9.0.0, A8): a private lesson's or a Board & Train's price, fixed
+  -- at booking: the trainer's lesson price at the staff confirm, or the flat price
+  -- the family said yes to. Nothing is charged at booking (P51 bills it after).
+  quoted_price_cents integer CONSTRAINT bookings_quoted_price_cents_check
+                       CHECK (quoted_price_cents > 0),
   -- #7 cross-column guards: cohort iff group-class; stay window only for stays.
   CHECK ((category = 'group-class') = (cohort_id IS NOT NULL)),
   CHECK (dropoff_at IS NULL OR category IN ('boarding','board-and-train'))
@@ -910,7 +928,7 @@ CREATE TABLE pending_requests (
   submitted_at        timestamptz NOT NULL DEFAULT now(),
   notes_per_dog       text,                            -- structured PendingNotes
   notes_joint         text,
-  staff_preference    text,                            -- R8: 'any' | staff slug
+  staff_preference    text,                            -- R8: 'any' | a staff id (lesson, B&T; P49) | free text
   lesson_setting      lesson_setting,                  -- Δ 2026-07-14: private-lesson only ('home'|'public'); NULL otherwise
   -- R8 + Δ 2026-06-17: replaced the single comfort_level enum with a
   -- staff-defined, multi-select trait list (the `descriptor:<key>` wire tags).
@@ -928,7 +946,20 @@ CREATE TABLE pending_requests (
   source              record_source NOT NULL DEFAULT 'app',
   created_at          timestamptz NOT NULL DEFAULT now(),
   updated_at          timestamptz NOT NULL DEFAULT now(),
-  expired_at          timestamptz                      -- NULL = live; cancel sets status, deletion expires
+  expired_at          timestamptz,                     -- NULL = live; cancel sets status, deletion expires
+  -- M5.21 (P49; wire 9.0.0, A6): what staff approved for a Board & Train, which is
+  -- exactly what the family says yes to: the trainer, the stay (the pick-up is the
+  -- cue transfer session) and the flat price. Kept after her yes and after a cancel.
+  -- NULL before approval and on every other category.
+  approved_trainer_staff_id uuid REFERENCES staff(id),
+  approved_dropoff_at       timestamptz,
+  approved_pickup_at        timestamptz,
+  approved_price_cents      integer CONSTRAINT pending_requests_approved_price_cents_check
+                              CHECK (approved_price_cents > 0),
+  CONSTRAINT pending_requests_approved_window_check
+    CHECK (approved_pickup_at > approved_dropoff_at),
+  CONSTRAINT pending_requests_approved_window_pair_check
+    CHECK ((approved_dropoff_at IS NULL) = (approved_pickup_at IS NULL))
 );
 CREATE UNIQUE INDEX pending_requests_source_ref_uidx
   ON pending_requests (source, external_ref) WHERE expired_at IS NULL;
@@ -2740,9 +2771,10 @@ BEGIN
   IF NEW.category = 'evaluation' THEN
     RETURN NEW;
   END IF;
-  -- Only the four gated categories run the check; PL + group-class + any
-  -- future free-text category fall through.
-  IF NEW.category NOT IN ('day-school','day-care','board-and-train','boarding') THEN
+  -- Only the three gated categories run the check; PL, B&T (M5.22, P49: Allison
+  -- s21, a dog with no passed evaluation may book a Board & Train), group-class
+  -- and any future free-text category fall through.
+  IF NEW.category NOT IN ('day-school','day-care','boarding') THEN
     RETURN NEW;
   END IF;
   SELECT (d.staff_owner_id IS NOT NULL) INTO lead_is_staff_dog

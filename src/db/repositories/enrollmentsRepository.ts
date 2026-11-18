@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import type { EnrollmentPaymentStatus } from '../../contracts/wire.js';
 import { z } from 'zod';
 import { db } from '../client.js';
+import { pgTimestampToIso } from '../../lib/pgTimestamp.js';
 
 /**
  * Read seam for the owner's CURRENT group-class enrollments (Δ 2026-06-09) —
@@ -137,10 +138,12 @@ export const enrollmentsRepository = {
         classKey: r.class_key,
         className: r.class_name,
         location: r.location,
-        startDate: r.start_date,
+        // ISO-8601 on the wire, as every timestamp (plan unit P49's carry): Postgres's own
+        // text ("2026-07-06 23:00:00+00") is not one.
+        startDate: pgTimestampToIso(r.start_date),
         weeklyTime: r.weekly_time,
         weeks: r.weeks,
-        firstSessionAt: r.first_session_at,
+        firstSessionAt: pgTimestampToIso(r.first_session_at),
         paymentStatus: r.payment_status,
       }));
   },

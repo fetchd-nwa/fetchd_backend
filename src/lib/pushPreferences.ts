@@ -47,7 +47,10 @@ type PushCapableType =
   | 'credits-expiring'
   | 'spay-neuter-reminder'
   | 'invoice-overdue'
-  | 'card-expiring';
+  | 'card-expiring'
+  // 9.0.0 (plan unit P49; design request-services-v1 §5.2): staff approved a Board & Train
+  // and it waits on the family's yes. Only she can act on it, so it is urgent.
+  | 'request-approved';
 
 const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   'booking-reminder': 'booking-reminders',
@@ -64,6 +67,7 @@ const PUSH_TYPE_CATEGORY: Record<PushCapableType, PushCategoryKey> = {
   // delivers under this category.
   'invoice-overdue': 'urgent-updates',
   'card-expiring': 'urgent-updates',
+  'request-approved': 'urgent-updates',
 };
 
 const PUSH_CAPABLE_TYPES: ReadonlySet<string> = new Set(Object.keys(PUSH_TYPE_CATEGORY));

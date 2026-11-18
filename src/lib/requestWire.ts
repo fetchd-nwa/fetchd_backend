@@ -29,7 +29,10 @@ import type {
  *   - `approved_by_staff_id?` (wire 1.13.0) — emit only when a STAFF actor
  *     resolved the request (approve OR deny). Its ABSENCE on a `'cancelled'`
  *     row is what says "the owner withdrew this" — the discriminator
- *     DATA-CONTRACT.md:1221 pins, now actually on the wire (DRIFT-8).
+ *     DATA-CONTRACT.md:1221 pins, now actually on the wire (DRIFT-8). From 9.0.0 a
+ *     Board & Train cancelled after approval keeps it (A6, Fable r2 M5).
+ *   - `approved_trainer?`, `approved_dropoff_at?`, `approved_pickup_at?`,
+ *     `approved_price_cents?` (9.0.0, A6) — a Board & Train's approval, omit-on-null.
  */
 export type RequestStatus = (typeof requestStatus.enumValues)[number];
 
@@ -55,6 +58,11 @@ export interface PendingRequestRowForWire {
   approvedAt: string | null;
   approvedByStaffId: string | null;
   convertedBookingId: string | null;
+  // M5.21 (wire 9.0.0, A6): a Board & Train's approval, NULL before it and elsewhere.
+  approvedTrainerStaffId: string | null;
+  approvedDropoffAt: string | null;
+  approvedPickupAt: string | null;
+  approvedPriceCents: number | null;
 }
 
 /** Lead + additional dog ids for one request, sorted for snapshot stability. */
@@ -88,6 +96,7 @@ export function toRequestWire(
   row: PendingRequestRowForWire,
   dogIds: PendingRequestDogIds,
   preferredDates: string[],
+  approvedTrainerName?: string,
 ): PendingRequestWire {
   const wire: PendingRequestWire = {
     id: row.id,
@@ -108,6 +117,14 @@ export function toRequestWire(
   // or denied; absent ⇒ the owner self-cancelled, or nobody has acted yet.
   if (row.approvedByStaffId !== null) wire.approved_by_staff_id = row.approvedByStaffId;
   if (row.convertedBookingId !== null) wire.converted_booking_id = row.convertedBookingId;
+  // 9.0.0 (A6): what staff approved for a Board & Train, kept after her yes and after a
+  // cancel. The trainer's name is the staff row's, expired or not: it is what was approved.
+  if (row.approvedTrainerStaffId !== null && approvedTrainerName !== undefined) {
+    wire.approved_trainer = { staff_id: row.approvedTrainerStaffId, name: approvedTrainerName };
+  }
+  if (row.approvedDropoffAt !== null) wire.approved_dropoff_at = pgTimestampToIso(row.approvedDropoffAt);
+  if (row.approvedPickupAt !== null) wire.approved_pickup_at = pgTimestampToIso(row.approvedPickupAt);
+  if (row.approvedPriceCents !== null) wire.approved_price_cents = row.approvedPriceCents;
   return wire;
 }
 

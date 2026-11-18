@@ -51,10 +51,11 @@ export const STRIPE_DERIVED_KEY_SUFFIXES = [
   // seconds>`, refundsRepository) is built from no client key, so it is no suffix:
   // a fixed 60 characters.
   ':refund',
-  ':payment-intent', // requestConfirmPayment, creditPackages
+  ':payment-intent', // creditPackages
   ':customer', // paymentMethods
   ':setup-intent', // paymentMethods
-  ':confirm-unwind', // requestConfirmPayment
+  // `:confirm-unwind` left with requestConfirmPayment at 9.0.0 (plan unit P49, A1). It was
+  // 15 characters, so the bound below stays 206: the longest entry is `:dog:<uuid>:capture`.
   `:dog:${'x'.repeat(36)}`, // enrollments — per-dog pay-now AUTHORIZE
   `:dog:${'x'.repeat(36)}:capture`, // enrollments — that dog's CAPTURE (1.11.0)
 ] as const;

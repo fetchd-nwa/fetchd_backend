@@ -21,6 +21,11 @@ import { bucketToChicagoDate } from '../lib/chicagoDate.js';
 import { ApiError } from '../lib/errors.js';
 import { pgEnumTuple } from '../lib/pgEnumTuple.js';
 import { requireOwner } from '../lib/principalNarrows.js';
+import {
+  BOARD_TRAIN_WEEKS,
+  isRequestService,
+  validateStaffPreference,
+} from '../lib/requestServices.js';
 import { type PendingRequestWire } from '../lib/requestWire.js';
 import { uuidId } from '../lib/uuidId.js';
 import { sortRequestsBySubmittedAt, wireManyRequests } from '../lib/wireManyRequests.js';
@@ -81,9 +86,9 @@ const uuidParamSchema = z.object({
  *      stays a constant (DECISIONS 128(e)). Hostile bodies are bounded BEFORE
  *      we touch the DB.
  *
- *   `MAX_LENGTH_WEEKS` — 12 weeks is a generous cap. NWA's standard
- *      B&T is 2 weeks; 12 covers an extended residential without
- *      letting the FE silently submit `length_weeks: 9999`.
+ *   `MAX_LENGTH_WEEKS` — 12 weeks is Zod's hostile-body bound (13 is 400). From
+ *      9.0.0 a B&T takes 2 only, as a cross-field 422 (A4): only the two-week
+ *      program has a price (`lib/boardTrainPricing.ts`).
  *
  *   `MAX_NOTE_LENGTH` — 2000 chars/note, same as POST /bookings.notes.
  */
@@ -93,9 +98,10 @@ const MAX_LENGTH_WEEKS = 12;
 const MAX_NOTE_LENGTH = 2000;
 const MAX_STAFF_PREF_LENGTH = 100;
 // `descriptor_keys` are staff-defined trait slugs (vocabulary in dog_descriptors,
-// surfaced as FE pills). Stored as an opaque text[] — no FK on array elements
-// (same loose coupling as staff_preference → staff slug), so the API only bounds
-// shape: a generous count cap and per-key length cap against a hostile body.
+// surfaced as FE pills). Stored as an opaque text[] — no FK on array elements, so
+// the API only bounds shape: a generous count cap and per-key length cap against a
+// hostile body. (A lesson's or B&T's staff_preference is checked against `staff`
+// from 9.0.0; boarding's stays free text.)
 const MAX_DESCRIPTOR_KEYS = 20;
 const MAX_DESCRIPTOR_KEY_LENGTH = 64;
 
@@ -248,8 +254,9 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
   //   2. Ownership gate per dog (lead + every additional).
   //   2b. `service_not_offered` — the service is off at the family's home campus.
   //   2c. The preferred dates: future, and within the horizon.
-  //   3. Evaluation gate at the request boundary for B&T + boarding
-  //      (Day 12b, §A Amendment 2026-05-23). Lead-only — additional
+  //   1d. A lesson's or B&T's staff_preference names a trainer who serves it (9.0.0, A4).
+  //   3. Evaluation gate at the request boundary for boarding (Day 12b, §A
+  //      Amendment 2026-05-23; from 9.0.0 B&T left it, A12). Lead-only — additional
   //      dogs are caught at the staff approve verb's checkBookingGates.
   //   4. INSERT pending_requests row (status='submitted'). Source = 'app'.
   //   5. INSERT pending_request_dogs (lead + additionals).
@@ -257,10 +264,11 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
   //   7. Re-read the full row + child rows and emit the wire shape.
   //
   // Returns 201 + PendingRequestWire. No payment/vaccine/agreement gates
-  // fire on submission — those fire when the staff approve verb attempts
-  // the booking INSERT. The evaluation gate is the one exception: B&T
-  // + boarding pre-check at the request boundary so owners can't submit
-  // for an un-evaluated dog (staff would otherwise bounce it back).
+  // fire on submission — those fire at the booking INSERT: the staff approve
+  // verb's for a lesson or boarding, the family's yes for a B&T (9.0.0). The
+  // evaluation gate is the one exception: boarding pre-checks at the request
+  // boundary so owners can't submit for an un-evaluated dog (staff would
+  // otherwise bounce it back). Sending a request books nothing and moves $0.
   app.post(
     '/requests',
     { preHandler: [authHook] },
@@ -302,20 +310,28 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
           // 1c. The preferred dates, on the clock and the horizon.
           await assertPreferredDatesWithinWindow(tx, parsed.preferredDates, nowFactory());
 
+          // 1d. A lesson's or B&T's trainer preference (9.0.0, A4): 'any', or a live
+          //     staffer who serves the category; omitted means anyone. It reads
+          //     `staff`, so it runs after the claim.
+          const staffPreference = isRequestService(parsed.category)
+            ? await validateStaffPreference(tx, parsed.category, parsed.staffPreference)
+            : parsed.staffPreference;
+
           // 2. Evaluation gate at the request boundary (Day 12b,
-          //    §A Amendment 2026-05-23 step 5). Board-and-train +
-          //    boarding require the LEAD dog to have a passing
-          //    evaluation before the owner can submit a request —
-          //    saves staff a round-trip otherwise the approve verb
-          //    would have to bounce it back. Private-lesson is
-          //    staff-curated and does NOT gate at this boundary.
+          //    §A Amendment 2026-05-23 step 5). Boarding requires the
+          //    LEAD dog to have a passing evaluation before the owner
+          //    can submit a request — saves staff a round-trip otherwise
+          //    the approve verb would have to bounce it back. From 9.0.0
+          //    (plan unit P49, A12; Allison s21) a Board & Train does not:
+          //    a dog with no passed evaluation may book one. Private-lesson
+          //    is staff-curated and does NOT gate at this boundary.
           //
           //    Additional dogs (boarding multi-dog) aren't checked
           //    here — the staff approve verb's checkBookingGates call
           //    will catch any unpassed additional dog at booking-
           //    insert time. Lead-only matches both the spec and the
           //    schema trigger's predicate.
-          if (parsed.category === 'board-and-train' || parsed.category === 'boarding') {
+          if (parsed.category === 'boarding') {
             const statuses = await dogsRepository.findEvaluationStatusInTx(tx, [parsed.leadDogId]);
             const leadEval = statuses[0];
             if (leadEval !== undefined && leadEval.evaluationStatus !== 'passed') {
@@ -354,7 +370,7 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
             category: parsed.category,
             notesPerDog: parsed.notesPerDog,
             notesJoint: parsed.notesJoint,
-            staffPreference: parsed.staffPreference,
+            staffPreference,
             descriptorKeys: parsed.descriptorKeys,
             lengthWeeks: parsed.lengthWeeks,
             lessonSetting: parsed.lessonSetting,
@@ -393,7 +409,9 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
   // notes, focus, length_weeks. Identity fields (category, lead_dog_id,
   // additional_dog_ids) are LOCKED — the owner re-submits if those
   // change. State-machine guard: only requests at status='submitted' are
-  // editable; once converted/approved/cancelled an edit is 422.
+  // editable; once converted/approved/cancelled an edit is 409. From 9.0.0 the edit
+  // keeps POST's rules for its category (A4) and reads the row under its lock, the
+  // one the staff approve takes, so an edit racing an approve has one winner.
   app.patch(
     '/requests/:id',
     { preHandler: [authHook] },
@@ -414,10 +432,11 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
           keysToInvalidate: () => [],
         },
         async (tx) => {
-          // 1. Read + owner-scope check. Same 404 response for not-found
-          //    vs not-yours so request ids don't enumerate.
-          const row = await requestsRepository.findFullByIdInTx(tx, id);
-          if (row === undefined || row.ownerId !== principal.ownerId) {
+          // 1. Row-lock + owner-scope check (Fable r2 M1: the lock the approve, the
+          //    deny and the yes take). Same 404 response for not-found, expired and
+          //    not-yours so request ids don't enumerate.
+          const row = await requestsRepository.lockById(tx, id);
+          if (row === undefined || row.expiredAt !== null || row.ownerId !== principal.ownerId) {
             throw new ApiError('not_found', `pending request ${id} not found`);
           }
 
@@ -449,10 +468,33 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
             );
           }
 
+          // 2c. A B&T's length stays the two-week program (9.0.0, A4): any other value,
+          //     null included, would leave it without a price.
+          if (
+            row.category === 'board-and-train' &&
+            parsed.lengthWeeks !== undefined &&
+            parsed.lengthWeeks !== BOARD_TRAIN_WEEKS
+          ) {
+            throw new ApiError('invalid_payload', boardTrainWeeksMessage());
+          }
+          if (row.category !== 'board-and-train' && parsed.lengthWeeks != null) {
+            throw new ApiError(
+              'invalid_payload',
+              `length_weeks is only valid for board-and-train requests, not ${row.category}`,
+            );
+          }
+
+          // 2d. A lesson's or B&T's trainer preference, as on POST (A4). Clearing it
+          //     (`focus: null`, or an empty string) means anyone.
+          const staffPreference =
+            typeof parsed.staffPreference === 'string' && isRequestService(row.category)
+              ? await validateStaffPreference(tx, row.category, parsed.staffPreference)
+              : parsed.staffPreference;
+
           await requestsRepository.update(tx, id, {
             notesPerDog: parsed.notesPerDog,
             notesJoint: parsed.notesJoint,
-            staffPreference: parsed.staffPreference,
+            staffPreference,
             descriptorKeys: parsed.descriptorKeys,
             lengthWeeks: parsed.lengthWeeks,
             lessonSetting: parsed.lessonSetting,
@@ -483,8 +525,10 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
   // Day 12 owner-side withdrawal. Sets status='cancelled' without
   // stamping approved_at / approved_by_staff_id (the staff deny verb
   // does both). Allowed from 'submitted' and 'approved-awaiting-payment'
-  // (a B&T request whose owner changed their mind before paying); 422
-  // from converted/cancelled.
+  // (a B&T the school approved that she no longer wants, before her yes);
+  // 409 `conflict` from converted/cancelled (NOTE-6). From 9.0.0 it reads the
+  // row under its lock (Fable r2 M1), the one her yes takes, so a Withdraw racing
+  // the yes has exactly one winner.
   app.post(
     '/requests/:id/cancel',
     { preHandler: [authHook] },
@@ -503,8 +547,8 @@ export function registerRequestsRoute(app: FastifyInstance, opts: RequestsRouteO
           keysToInvalidate: () => [],
         },
         async (tx) => {
-          const row = await requestsRepository.findFullByIdInTx(tx, id);
-          if (row === undefined || row.ownerId !== principal.ownerId) {
+          const row = await requestsRepository.lockById(tx, id);
+          if (row === undefined || row.expiredAt !== null || row.ownerId !== principal.ownerId) {
             throw new ApiError('not_found', `pending request ${id} not found`);
           }
           if (row.status === 'cancelled' || row.status === 'converted') {
@@ -630,7 +674,7 @@ interface ValidatedPostRequestBody {
  * constraints from §C.1 Model 3:
  *
  *   - Board-and-train: single dog only (no additional_dog_ids);
- *     `length_weeks` REQUIRED.
+ *     `length_weeks` REQUIRED, and 2 (9.0.0, A4).
  *   - Private-lesson + boarding: any of {1..5} dogs; `length_weeks`
  *     MUST be omitted.
  *   - Dog ids distinct; lead not in additionals; preferred dates distinct.
@@ -660,6 +704,9 @@ function validatePostRequestBody(body: PostRequestBody): ValidatedPostRequestBod
         'invalid_payload',
         'board-and-train requests require length_weeks (program duration)',
       );
+    }
+    if (body.length_weeks !== BOARD_TRAIN_WEEKS) {
+      throw new ApiError('invalid_payload', boardTrainWeeksMessage());
     }
   } else if (body.length_weeks !== undefined) {
     // PL + boarding don't carry length_weeks (it's a B&T-only field
@@ -695,6 +742,11 @@ function validatePostRequestBody(body: PostRequestBody): ValidatedPostRequestBod
     lengthWeeks: body.length_weeks ?? null,
     lessonSetting: body.lesson_setting ?? null,
   };
+}
+
+/** A Board & Train takes the two-week program only (9.0.0, A4). */
+function boardTrainWeeksMessage(): string {
+  return `board-and-train requests take length_weeks ${BOARD_TRAIN_WEEKS}: only the two-week program has a price`;
 }
 
 interface ValidatedPatchRequestBody {

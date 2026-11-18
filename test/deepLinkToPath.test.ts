@@ -10,7 +10,7 @@ import {
  * Unit coverage for `deepLinkToPath` — THE deep-link path grammar (contract
  * 1.4.0). Pure function, no DB: every producer computes its persisted
  * `deep_link_path` through here, so these expected strings ARE the wire
- * contract the FE route table must match. One assertion per `kind` (all 9),
+ * contract the FE route table must match. One assertion per `kind` (all 11; `request` from 9.0.0),
  * plus the entity-specific arms that branch on params: `report` (fail-loud on a
  * missing dogId), `invoice` (embeds the id), and `membership` (send-time routing
  * — dogId present ⇒ the dog page with `?highlight=<membershipId>`, absent ⇒ the
@@ -147,4 +147,33 @@ test('deepLinkToPath: invoice with params but no reason key is byte-identical to
     deepLinkToPath({ kind: 'invoice', id: 'inv-1' }),
     '/account/invoices?invoiceId=inv-1',
   );
+});
+
+// P49 (wire 9.0.0; design request-services-v1 §2.2 A11): `request` opens one of her
+// requests, the request-detail page the owner app already has for its service. Its one
+// producer is `'request-approved'` (a Board & Train waiting on her yes).
+
+test('deepLinkToPath: request → /request-detail/boardtrain?id= or /request-detail/private?id=, by category', () => {
+  assert.equal(
+    deepLinkToPath({ kind: 'request', id: 'req-1', params: { category: 'board-and-train' } }),
+    '/request-detail/boardtrain?id=req-1',
+  );
+  assert.equal(
+    deepLinkToPath({ kind: 'request', id: 'req-2', params: { category: 'private-lesson' } }),
+    '/request-detail/private?id=req-2',
+  );
+});
+
+test('deepLinkToPath: a request link with no category, or any other, throws at emit time', () => {
+  for (const link of [
+    { kind: 'request', id: 'req-3' },
+    { kind: 'request', id: 'req-3', params: {} },
+    { kind: 'request', id: 'req-3', params: { category: 'boarding' } },
+    { kind: 'request', id: 'req-3', params: { category: '' } },
+  ] as NotificationDeepLink[]) {
+    assert.throws(
+      () => deepLinkToPath(link),
+      /request link category must be board-and-train \| private-lesson/,
+    );
+  }
 });

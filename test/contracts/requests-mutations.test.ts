@@ -61,6 +61,12 @@ const PREFERRED_1 = '2026-07-15T15:00:00Z';
 const PREFERRED_2 = '2026-07-22T15:00:00Z';
 const PREFERRED_3 = '2026-07-29T15:00:00Z';
 const APPROVE_SCHEDULED_AT = '2026-07-20T15:00:00Z';
+/** 9.0.0 (A3): a lesson is confirmed at one of her times, with a priced trainer. */
+const LESSON_APPROVAL = {
+  scheduled_at: PREFERRED_1,
+  location: 'fayetteville',
+  trainer_staff_id: FIXTURE_IDS.staffRachelId,
+} as const;
 const APPROVE_PICKUP_AT = '2026-07-23T17:00:00Z';
 
 /** Build a Fastify app with both Day-12 routes mounted. */
@@ -69,7 +75,7 @@ function requestsApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL): {
 } {
   const { app, authenticate } = makeContractApp(principal);
   registerRequestsRoute(app, { authenticate, now: FIXTURE_NOW });
-  registerStaffRequestsRoute(app, { authenticate });
+  registerStaffRequestsRoute(app, { authenticate, now: FIXTURE_NOW });
   return { app };
 }
 
@@ -228,7 +234,11 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
       additional_dog_ids: [FIXTURE_IDS.dog2Id],
       preferred_dates: [PREFERRED_1, PREFERRED_2, PREFERRED_3],
       notes: { per_dog: 'Waffles needs leash polish', joint: 'walk best together' },
-      focus: { staff_preference: 'rachel', descriptor_keys: ['nervous', 'reactive-on-leash'] },
+      // 9.0.0 (A4): Rachel by her staff id; the slug 'rachel' is 422 (requests.test.ts).
+      focus: {
+        staff_preference: FIXTURE_IDS.staffRachelId,
+        descriptor_keys: ['nervous', 'reactive-on-leash'],
+      },
     },
   });
   assert.equal(res.statusCode, 201, res.body);
@@ -249,7 +259,7 @@ test('POST /requests — private-lesson multi-dog → 201 + wire shape', SKIP_WH
   assert.equal(body.preferred_dates.length, 3);
   assert.equal(body.notes?.per_dog, 'Waffles needs leash polish');
   assert.equal(body.notes?.joint, 'walk best together');
-  assert.equal(body.focus.staff_preference, 'rachel');
+  assert.equal(body.focus.staff_preference, FIXTURE_IDS.staffRachelId);
   assert.deepEqual(body.focus.descriptor_keys, ['nervous', 'reactive-on-leash']);
 });
 
@@ -608,7 +618,7 @@ test(
       app,
       id,
       idempotencyKey: `pr-approve-pl-${randomUUID()}`,
-      payload: { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' },
+      payload: LESSON_APPROVAL,
     });
     assert.equal(res.statusCode, 200, res.body);
     const body = res.json() as {
@@ -688,7 +698,12 @@ test(
       app,
       id,
       idempotencyKey: `pr-approve-bnt-${randomUUID()}`,
-      payload: {},
+      // 9.0.0 (A3): one of her starts, a hand-back after it, an eligible trainer.
+      payload: {
+        dropoff_at: PREFERRED_1,
+        pickup_at: APPROVE_PICKUP_AT,
+        trainer_staff_id: FIXTURE_IDS.staffRachelId,
+      },
     });
     assert.equal(res.statusCode, 200, res.body);
     const body = res.json() as {
@@ -797,7 +812,7 @@ test(
     const id = await seedSubmittedRequest({ category: 'private-lesson' });
     const { app } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
     const key = `pr-approve-idem-${randomUUID()}`;
-    const payload = { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' };
+    const payload = LESSON_APPROVAL;
     const first = await approveRequest({ app, id, idempotencyKey: key, payload });
     assert.equal(first.statusCode, 200, first.body);
     const replay = await approveRequest({ app, id, idempotencyKey: key, payload });
@@ -838,7 +853,7 @@ test(
     const id = await seedSubmittedRequest({ category: 'private-lesson' });
     const { app: app1 } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
     const { app: app2 } = requestsApp(FIXTURE_STAFF_PRINCIPAL);
-    const payload = { scheduled_at: APPROVE_SCHEDULED_AT, location: 'fayetteville' };
+    const payload = LESSON_APPROVAL;
     const [resA, resB] = await Promise.all([
       approveRequest({
         app: app1,

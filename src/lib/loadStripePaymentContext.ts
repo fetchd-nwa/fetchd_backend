@@ -8,7 +8,8 @@ import { ApiError } from './errors.js';
  * Validate the (owner, payment_method, stripe_customer) tuple required
  * for any pre-tx Stripe `paymentIntents.create + confirm` call. Extracted
  * Day-15 at the rule-of-two trigger (`creditPackages.ts` had been the
- * one site; `invoices.ts` and `requestConfirmPayment.ts` make it three).
+ * one site; `invoices.ts` and `requestConfirmPayment.ts` made it three, and 9.0.0
+ * removed the last, plan unit P49).
  *
  * Read-only: pool reads as a pre-validation before a route opens its transaction, or
  * inside tx1 when the card must be read after the refusals. It only surfaces the right

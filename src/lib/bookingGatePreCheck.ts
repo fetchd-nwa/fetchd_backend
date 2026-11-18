@@ -17,7 +17,11 @@ import type { ServiceCategory } from './bookingBucket.js';
 /**
  * Categories the EVALUATION gate applies to. Pinned at Day 12b
  * (DATA-CONTRACT §A Amendment 2026-05-23, §H "Booking gates"):
- *   - `day-school`, `day-care`, `board-and-train`, `boarding` — gated.
+ *   - `day-school`, `day-care`, `boarding` — gated.
+ *   - `board-and-train` — left the gate at 9.0.0 (plan unit P49; design
+ *     request-services-v1 §2.2 A12; Allison s21, `SIGNOFF.md:124`: a dog with no
+ *     passed evaluation may book a Board & Train). M5.22 moved the trigger and
+ *     `routes/requests.ts` the request boundary with it.
  *   - `evaluation` — bypasses (the booking that records the eval can't
  *     require the eval to exist first).
  *   - `group-class` — uses the R7 prereq system (`class_prereq_options`)
@@ -29,12 +33,7 @@ import type { ServiceCategory } from './bookingBucket.js';
  * gated category requires changing BOTH this set AND the trigger's
  * `category IN (...)` clause.
  */
-const EVAL_GATED_CATEGORIES = new Set<ServiceCategory>([
-  'day-school',
-  'day-care',
-  'board-and-train',
-  'boarding',
-]);
+const EVAL_GATED_CATEGORIES = new Set<ServiceCategory>(['day-school', 'day-care', 'boarding']);
 
 /**
  * Run the four booking gates in priority order
@@ -54,10 +53,10 @@ const EVAL_GATED_CATEGORIES = new Set<ServiceCategory>([
  *      cohort enrollments — per-dog vaccine accumulate because each dog
  *      becomes a lead in its own per-week bookings).
  *   3. Day-12 (`routes/staffRequests.ts`, POST /staff/requests/:id/
- *      approve — booking INSERT for private-lesson / boarding /
- *      board-and-train approval). B&T approve does NOT call this
- *      helper — no booking is created at the approve step; the gates
- *      will fire at confirm-payment (Day 14) instead.
+ *      approve — booking INSERT for private-lesson / boarding approval).
+ *      B&T approve does NOT call this helper — no booking is created at
+ *      the approve step; the gates fire at the family's yes
+ *      (`routes/requestConfirm.ts`, 9.0.0) instead.
  *
  * The gates are owner-once (payment, agreement) or per-dog (vaccine,
  * evaluation). Vaccine + evaluation are per-dog because the BEFORE-
@@ -67,8 +66,8 @@ const EVAL_GATED_CATEGORIES = new Set<ServiceCategory>([
  * ALL `booking_dogs` and accumulates one gap per dog so the FE renders
  * the complete picture.
  *
- * Eval-gate scope (Day 12b): only `day-school`, `day-care`,
- * `board-and-train`, `boarding` invoke the evaluation gate; `evaluation`
+ * Eval-gate scope (Day 12b; 9.0.0): only `day-school`, `day-care` and
+ * `boarding` invoke the evaluation gate; `board-and-train` left it (A12); `evaluation`
  * itself bypasses by construction, `group-class` uses R7 prereqs, and
  * `private-lesson` is staff-curated. The category whitelist is the
  * `EVAL_GATED_CATEGORIES` constant above; it mirrors the trigger

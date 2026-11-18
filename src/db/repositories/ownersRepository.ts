@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { LocationKey, StaffOwnerWire } from '../../contracts/wire.js';
 import { db } from '../client.js';
 import { owners } from '../schema/schema.js';
@@ -74,6 +74,28 @@ export const ownersRepository = {
         sql`lower(coalesce(${visibleOrNull(owners.name)}, ${owners.email}))`,
         asc(owners.id),
       );
+  },
+
+  /**
+   * The name a staff read prints for each family (wire 9.0.0, A7, A10): her name, or her
+   * email when the name is empty or invisible, as `StaffDogWire.owner_name` reads it, so
+   * it is never `null` or `''`; and her home campus, `null` when she has none.
+   */
+  async findNamesByIds(
+    ids: readonly string[],
+    runner: Runner = db,
+  ): Promise<Map<string, { name: string; location: LocationKey | null }>> {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return new Map();
+    const rows = await runner
+      .select({
+        id: owners.id,
+        name: sql<string>`coalesce(${visibleOrNull(owners.name)}, ${owners.email})`,
+        location: owners.location,
+      })
+      .from(owners)
+      .where(inArray(owners.id, unique));
+    return new Map(rows.map((r) => [r.id, { name: r.name, location: r.location }] as const));
   },
 
   /**

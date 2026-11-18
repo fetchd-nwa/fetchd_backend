@@ -7,7 +7,12 @@ import { creditLedgerRepository } from '../db/repositories/creditLedgerRepositor
 import { scheduledNotificationsRepository } from '../db/repositories/scheduledNotificationsRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import type { Tx } from '../db/tx.js';
-import { groupBookingDogs, type BookingWire } from './bookingWire.js';
+import {
+  SERVICE_CATEGORIES,
+  groupBookingDogs,
+  serviceStart,
+  type BookingWire,
+} from './bookingWire.js';
 import { askWhatWon, cancelOrderInTx, type WhatWon } from './cancelOrder.js';
 import { readEngineBudget, type EngineLog } from './confirmCharge.js';
 import {
@@ -104,6 +109,7 @@ export async function cancelBookingInTx(
   //    not (design §2.7:4007-4009).
   const seen = await bookingsRepository.findFullByIdInTx(tx, id);
   assertCancellable(seen, id, requireOwnerId);
+  refuseStartedService(seen, id, now);
 
   // 2. The lock order: charge, then the row, then the pool (`db/locks.ts`). A row whose
   //    order has a charge takes the charge first, so two cancels of one order, and a
@@ -118,6 +124,7 @@ export async function cancelBookingInTx(
   if (row.status === 'cancelled') {
     throw new ApiError('conflict', `booking ${id} is already cancelled`);
   }
+  refuseStartedService(row, id, now);
 
   // 3. A pending row cancels the whole order, and a per-session cancel exists only
   //    once the rows are `upcoming`. A row that was pending when the route asked and
@@ -207,6 +214,30 @@ function assertCancellable<
       'group-class bookings cancel via cohort withdraw — not yet implemented',
     );
   }
+}
+
+/**
+ * A private lesson or a Board & Train cannot be cancelled once it has started (9.0.0; design
+ * request-services-v1 §2.2 A5; BT-32, PL-52): from `dropoff_at`, else `scheduled_at`, the
+ * owner's and the staff whole-session cancels answer 409 `conflict` with no `details`. A
+ * started lesson or stay ends by a staff record (plan unit P51), never by a $0 cancel. Run
+ * on the plain read and again under the row lock; `BookingWire.can_cancel` reads the same
+ * instant (`wireManyBookings`).
+ */
+function refuseStartedService(
+  row: { category: string; dropoffAt: string | null; scheduledAt: string },
+  id: string,
+  now: Date,
+): void {
+  if (!SERVICE_CATEGORIES.has(row.category as Parameters<typeof SERVICE_CATEGORIES.has>[0])) {
+    return;
+  }
+  if (now.getTime() < serviceStart(row).getTime()) return;
+  const what = row.category === 'private-lesson' ? 'private lesson' : 'Board & Train stay';
+  throw new ApiError(
+    'conflict',
+    `booking ${id} is a ${what} that has already started, so it cannot be cancelled; the school closes it out`,
+  );
 }
 
 function viewerOf(requireOwnerId: string | null): 'owner' | 'staff' {

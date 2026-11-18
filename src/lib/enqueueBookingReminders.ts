@@ -7,8 +7,8 @@ import type { ServiceCategory } from './bookingBucket.js';
  * Booking-creation trigger: enqueue the schedule rows the scheduler
  * worker (Day-16) will later send. Called from all four booking-creation
  * paths (`routes/bookings.ts` day-program, `routes/enrollments.ts`
- * cohort, `routes/staffRequests.ts` approve, `routes/requestConfirmPayment.ts`
- * B&T conversion) right after the booking row + any time-stamping is
+ * cohort, `routes/staffRequests.ts` approve, `routes/requestConfirm.ts`
+ * the family's Board & Train yes, 9.0.0) right after the booking row + any time-stamping is
  * complete.
  *
  * Two enqueues today, both keyed by stable `dedupe_key`s so an idempotent

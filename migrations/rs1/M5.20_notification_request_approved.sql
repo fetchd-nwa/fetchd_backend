@@ -1,0 +1,11 @@
+-- migrate: no-transaction
+-- M5.20 (P49, plan unit; wire 9.0.0 A11) — `notification_type` gains 'request-approved'.
+-- design request-services-v1 §2.2 A11, §5.1. Rev.: no (Postgres has no DROP VALUE).
+--
+-- Staff approved a Board & Train with dates and a trainer, and it waits on the family's
+-- yes; nothing is booked or charged then. The notice deep-links to the request
+-- (`deep_link_kind` 'request', which is `text`: no DDL). Postgres refuses a new enum
+-- value's use in the transaction that added it (55P04), so this step runs alone, as
+-- M5.03 does. `ADD VALUE` appends, so `schema.sql` lists the value last, as
+-- `NOTIFICATION_TYPES` does (`scripts/db/fingerprint.sql` hashes the order).
+ALTER TYPE notification_type ADD VALUE 'request-approved';

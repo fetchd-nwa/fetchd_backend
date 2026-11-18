@@ -21,8 +21,9 @@ import { signedIntentEvent, signedRefundEvent } from './_signedEvents.js';
  * P22 B-8: the unfinished-claim alarm (`brief_must_say` 3; DECISIONS 174(b); Pace 8.1
  * finding 2). A first delivery that dies between its `stripe_events` claim and its handler
  * answers `duplicate` on every redelivery wherever `redispatchUnfinishedEvent` does not
- * re-run it (`requestConfirmPayment.ts:168`, `enrollmentPartial.ts:418` and `:546` until
- * `POST /enrollments` joins the engine), so the charge never flips and nobody is told.
+ * re-run it (`enrollmentPartial.ts:418` and `:546` until `POST /enrollments` joins the
+ * engine; `requestConfirmPayment.ts:168` until 9.0.0 removed it), so the charge never
+ * flips and nobody is told.
  * Proven through the production entry, `POST /workers/tick` with the route's own logger,
  * never an injected logger; the bound is on Postgres's clock, so the tests move
  * `received_at` (planted by SQL) rather than a process clock. Stripe is offline at the SDK.

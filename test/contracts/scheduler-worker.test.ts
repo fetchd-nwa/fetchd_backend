@@ -26,6 +26,7 @@ import {
   type AlarmEvent,
 } from '../../src/lib/observability.js';
 import { MAX_DELIVERY_ATTEMPTS, runSchedulerTickOnce } from '../../src/workers/scheduler.js';
+import { shouldSkipPush } from '../../src/lib/pushPreferences.js';
 import type { NotificationDeepLinkKind } from '../../src/lib/notificationWire.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
@@ -1735,3 +1736,12 @@ test(
     await clearScheduled();
   },
 );
+
+// Fable b1 L4(c) (P49 notes mechanic 15): the Board & Train "tap to confirm" notice is an
+// urgent update, muted by that category alone.
+test("'request-approved' is muted by urgent-updates and by nothing else", () => {
+  const prefs = (categories: Record<string, boolean>) =>
+    ({ pushNotificationsEnabled: true, pushNotificationCategories: categories }) as Parameters<typeof shouldSkipPush>[1];
+  assert.equal(shouldSkipPush('request-approved', prefs({ 'urgent-updates': false })), true);
+  assert.equal(shouldSkipPush('request-approved', prefs({ 'booking-reminders': false })), false);
+});

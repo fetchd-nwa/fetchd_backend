@@ -22,7 +22,7 @@ export type LocationKey = (typeof LOCATION_SLUGS)[number];
 export const mediaDerivativeJobStatus = pgEnum("media_derivative_job_status", ['pending', 'processing', 'done', 'failed'])
 export const mediaKind = pgEnum("media_kind", ['image', 'video'])
 export const mediaPurpose = pgEnum("media_purpose", ['dog-profile', 'owner-avatar', 'report-photo', 'report-video', 'message-attachment'])
-export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'spay-neuter-reminder', 'payment-due', 'invoice-overdue', 'card-expiring', 'waitlist-spot-open'])
+export const notificationType = pgEnum("notification_type", ['booking-confirmed', 'report-published', 'booking-cancelled', 'announcement', 'message-received', 'booking-reminder', 'boarding-profile-check', 'credits-expiring', 'payment-failed', 'payment-succeeded', 'spay-neuter-reminder', 'payment-due', 'invoice-overdue', 'card-expiring', 'waitlist-spot-open', 'request-approved'])
 export const rateUnit = pgEnum("rate_unit", ['per-day', 'per-night', 'per-session', 'per-week', 'flat'])
 export const recordSource = pgEnum("record_source", ['app', 'gingr', 'seed'])
 export const refundStatus = pgEnum("refund_status", ['pending', 'succeeded', 'failed', 'unroutable', 'resolved-external'])
@@ -98,10 +98,15 @@ export const staff = pgTable("staff", {
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 	// M1.20 (STAFF-U03): a non-empty set of locations.slug (no FK on an array).
 	homeLocations: text("home_locations").array().$type<LocationKey[]>().notNull(),
+	// M5.21 (P49): her flat lesson price (NULL = no lessons) and Board & Train eligibility,
+	// written by `npm run staff:provision`'s roster alone.
+	lessonPriceCents: integer("lesson_price_cents"),
+	boardTrainEligible: boolean("board_train_eligible").default(false).notNull(),
 }, (table) => {
 	return {
 		staffSupabaseUidKey: unique("staff_supabase_uid_key").on(table.supabaseUid),
 		staffHomeLocationsCheck: check("staff_home_locations_check", sql`cardinality(home_locations) > 0`),
+		staffLessonPriceCentsCheck: check("staff_lesson_price_cents_check", sql`lesson_price_cents > 0`),
 	}
 });
 
@@ -536,6 +541,8 @@ export const bookings = pgTable("bookings", {
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
 	orderId: uuid("order_id"),
+	// M5.21 (P49): a lesson's or a Board & Train's price, fixed at booking. Nothing charged.
+	quotedPriceCents: integer("quoted_price_cents"),
 }, (table) => {
 	return {
 		cohortIdx: index("bookings_cohort_idx").using("btree", table.cohortId.asc().nullsLast().op("uuid_ops")),
@@ -588,6 +595,7 @@ export const bookings = pgTable("bookings", {
 		}),
 		bookingsCheck: check("bookings_check", sql`(category = 'group-class'::service_category) = (cohort_id IS NOT NULL)`),
 		bookingsCheck1: check("bookings_check1", sql`(dropoff_at IS NULL) OR (category = ANY (ARRAY['boarding'::service_category, 'board-and-train'::service_category]))`),
+		bookingsQuotedPriceCentsCheck: check("bookings_quoted_price_cents_check", sql`quoted_price_cents > 0`),
 	}
 });
 
@@ -612,6 +620,11 @@ export const pendingRequests = pgTable("pending_requests", {
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	// M5.21 (P49): what staff approved for a Board & Train, which the family says yes to.
+	approvedTrainerStaffId: uuid("approved_trainer_staff_id"),
+	approvedDropoffAt: timestamp("approved_dropoff_at", { withTimezone: true, mode: 'string' }),
+	approvedPickupAt: timestamp("approved_pickup_at", { withTimezone: true, mode: 'string' }),
+	approvedPriceCents: integer("approved_price_cents"),
 }, (table) => {
 	return {
 		ownerIdx: index("pending_requests_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops")),
@@ -637,6 +650,14 @@ export const pendingRequests = pgTable("pending_requests", {
 			foreignColumns: [bookings.id],
 			name: "pending_requests_converted_booking_id_fkey"
 		}),
+		pendingRequestsApprovedTrainerStaffIdFkey: foreignKey({
+			columns: [table.approvedTrainerStaffId],
+			foreignColumns: [staff.id],
+			name: "pending_requests_approved_trainer_staff_id_fkey"
+		}),
+		pendingRequestsApprovedPriceCentsCheck: check("pending_requests_approved_price_cents_check", sql`approved_price_cents > 0`),
+		pendingRequestsApprovedWindowCheck: check("pending_requests_approved_window_check", sql`approved_pickup_at > approved_dropoff_at`),
+		pendingRequestsApprovedWindowPairCheck: check("pending_requests_approved_window_pair_check", sql`(approved_dropoff_at IS NULL) = (approved_pickup_at IS NULL)`),
 	}
 });
 

@@ -43,7 +43,8 @@
     "date": "2026-05-05T15:00:00.000Z",
     "trainer": "Rachel",
     "duration_minutes": 60,
-    "location": "fayetteville"
+    "location": "fayetteville",
+    "can_cancel": false
   },
   {
     "id": "77777777-7777-4777-8777-777777777778",
@@ -52,6 +53,8 @@
     "status": "past",
     "date": "2026-04-25T15:00:00.000Z",
     "trainer": "Donavan",
-    "location": "fayetteville"
+    "location": "fayetteville",
+    "dropoff_at": "2026-04-25T15:00:00.000Z",
+    "pickup_at": "2026-04-30T17:00:00.000Z"
   }
 ]

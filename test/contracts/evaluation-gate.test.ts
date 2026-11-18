@@ -17,6 +17,7 @@ import { gateTriggerErrorToApiError } from '../../src/lib/bookingErrors.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
 import { registerEnrollmentsRoute } from '../../src/routes/enrollments.js';
 import { registerRequestsRoute } from '../../src/routes/requests.js';
+import { registerRequestConfirmRoute } from '../../src/routes/requestConfirm.js';
 import { registerStaffRequestsRoute } from '../../src/routes/staffRequests.js';
 import type { Principal } from '../../src/auth/principal.js';
 import {
@@ -115,7 +116,8 @@ function bookingApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL) {
 function requestsApp(principal: Principal = FIXTURE_OWNER_PRINCIPAL) {
   const { app, authenticate } = makeContractApp(principal);
   registerRequestsRoute(app, { authenticate, now: FIXTURE_NOW });
-  registerStaffRequestsRoute(app, { authenticate });
+  registerRequestConfirmRoute(app, { authenticate, now: FIXTURE_NOW });
+  registerStaffRequestsRoute(app, { authenticate, now: FIXTURE_NOW });
   return { app };
 }
 
@@ -305,7 +307,7 @@ test(
 // ──────────────────────────────────────────────────────────────────────────
 
 test(
-  'POST /requests — board-and-train with un-passed lead → 422 evaluation_required',
+  'P49 (A12, s21): an unevaluated dog MAY request a Board & Train, and its yes books it, the DB trigger included',
   SKIP_WHEN_NO_DB,
   async () => {
     await withDogEvalStatus(FIXTURE_IDS.dog1Id, 'not-evaluated', async () => {
@@ -320,24 +322,93 @@ test(
           length_weeks: 2,
         },
       });
-      assert.equal(res.statusCode, 422, res.body);
-      const body = res.json() as {
-        error: {
-          code: string;
-          details: {
-            kind: string;
-            missing: { dog_id: string; evaluation_status: string }[];
-          };
-        };
-      };
-      assert.equal(body.error.code, 'evaluation_required');
-      assert.equal(body.error.details.kind, 'evaluation_required');
-      assert.equal(body.error.details.missing.length, 1);
-      assert.equal(body.error.details.missing[0]!.dog_id, FIXTURE_IDS.dog1Id);
-      assert.equal(body.error.details.missing[0]!.evaluation_status, 'not-evaluated');
+      assert.equal(res.statusCode, 201, res.body);
+      const requestId = (res.json() as { id: string }).id;
+      try {
+        const approved = await approveRequest({
+          app: requestsApp(FIXTURE_STAFF_PRINCIPAL).app,
+          id: requestId,
+          idempotencyKey: `eval-bt-approve-${randomUUID()}`,
+          payload: {
+            dropoff_at: PREFERRED_1,
+            pickup_at: APPROVE_PICKUP_AT,
+            trainer_staff_id: FIXTURE_IDS.staffRachelId,
+          },
+        });
+        assert.equal(approved.statusCode, 200, approved.body);
+        const yes = await app.inject({
+          method: 'POST',
+          url: `/requests/${requestId}/confirm`,
+          headers: { 'idempotency-key': `eval-bt-yes-${randomUUID()}` },
+          payload: {},
+        });
+        assert.equal(yes.statusCode, 200, yes.body);
+        const booked = (yes.json() as { booking: { id: string; category: string } }).booking;
+        assert.equal(booked.category, 'board-and-train');
+      } finally {
+        await removeRequestAndStay(requestId);
+      }
+
+      // The trigger floor by direct INSERT: a Board & Train for this dog goes in.
+      const bookingId = randomUUID();
+      try {
+        await db.insert(bookingsTable).values({
+          id: bookingId,
+          ownerId: FIXTURE_IDS.ownerId,
+          leadDogId: FIXTURE_IDS.dog1Id,
+          category: 'board-and-train',
+          status: 'upcoming',
+          scheduledAt: PREFERRED_1,
+          dropoffAt: PREFERRED_1,
+          pickupAt: APPROVE_PICKUP_AT,
+          location: 'fayetteville',
+        });
+      } finally {
+        await db.delete(bookingsTable).where(eq(bookingsTable.id, bookingId));
+      }
     });
   },
 );
+
+test(
+  'P49: boarding still refuses at the trigger floor — a direct INSERT for an unevaluated lead is a check_violation',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await withDogEvalStatus(FIXTURE_IDS.dog1Id, 'not-evaluated', async () => {
+      const bookingId = randomUUID();
+      try {
+        await assert.rejects(
+          db.insert(bookingsTable).values({
+            id: bookingId,
+            ownerId: FIXTURE_IDS.ownerId,
+            leadDogId: FIXTURE_IDS.dog1Id,
+            category: 'boarding',
+            status: 'upcoming',
+            scheduledAt: PREFERRED_1,
+            dropoffAt: PREFERRED_1,
+            pickupAt: APPROVE_PICKUP_AT,
+            location: 'fayetteville',
+          }),
+          (err: unknown) => /evaluation gate/.test(String((err as { cause?: unknown }).cause ?? err)),
+        );
+      } finally {
+        await db.delete(bookingsTable).where(eq(bookingsTable.id, bookingId));
+      }
+    });
+  },
+);
+
+/** A request this file made through the routes, with the stay its yes booked. */
+async function removeRequestAndStay(requestId: string): Promise<void> {
+  const [row] = await db
+    .select({ booking: pendingRequestsTable.convertedBookingId })
+    .from(pendingRequestsTable)
+    .where(eq(pendingRequestsTable.id, requestId));
+  await db.delete(pendingRequestsTable).where(eq(pendingRequestsTable.id, requestId));
+  if (row?.booking != null) {
+    await db.delete(bookingsTable).where(eq(bookingsTable.id, row.booking));
+  }
+}
 
 test(
   'POST /requests — boarding with un-passed lead → 422 evaluation_required (pending status)',
@@ -439,9 +510,11 @@ test(
         app,
         id: requestId,
         idempotencyKey: `eval-approve-pl-bypass-${randomUUID()}`,
+        // 9.0.0 (A3): one of her times, and a priced trainer.
         payload: {
-          scheduled_at: APPROVE_SCHEDULED_AT,
+          scheduled_at: PREFERRED_1,
           location: 'fayetteville',
+          trainer_staff_id: FIXTURE_IDS.staffRachelId,
         },
       });
       assert.equal(res.statusCode, 200, res.body);

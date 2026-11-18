@@ -179,6 +179,8 @@ test(
         'invoice-overdue',
         'card-expiring',
         'waitlist-spot-open',
+        // 9.0.0 (M5.20; plan unit P49, A11): appended, so last.
+        'request-approved',
       ],
     };
     assert.deepEqual([...chargePurpose.enumValues], expected.charge_purpose);

@@ -549,7 +549,9 @@ export async function seedFixture(): Promise<void> {
   // with >1 ids; one per real NWA role pattern (Donavan = day school,
   // Rachel = private lessons). P02 (design §2.1:1950-1968): Amber is the
   // manager and Shanthi the owner role, home to BOTH campuses (M1.20's
-  // backfill would give her one; `home_locations` is never empty).
+  // backfill would give her one; `home_locations` is never empty). P49 (M5.21, wire
+  // 9.0.0): the dev seed's trainers — Rachel $150 a lesson and Board & Train, Shanthi
+  // $200 and Board & Train, Donavan and Amber neither.
   await db.insert(staff).values([
     {
       id: FIXTURE_IDS.staffDonavanId,
@@ -566,6 +568,8 @@ export async function seedFixture(): Promise<void> {
       role: 'trainer',
       homeLocations: ['fayetteville'],
       imagePath: null,
+      lessonPriceCents: 15000,
+      boardTrainEligible: true,
     },
     {
       id: FIXTURE_IDS.staffAmberId,
@@ -582,6 +586,8 @@ export async function seedFixture(): Promise<void> {
       role: 'owner',
       homeLocations: ['fayetteville', 'bentonville'],
       imagePath: null,
+      lessonPriceCents: 20000,
+      boardTrainEligible: true,
     },
   ]);
 

@@ -552,7 +552,7 @@ function outcomeOfApply(applied: LiveRefundResult): WebhookHandlerResult {
  * none of our rows. At warn, not 50: no money of ours moved, and it is no inconsistency.
  */
 export const REFUND_ON_PAYMENT_NOT_RECORDED_WARNING =
-  "REFUND ON A PAYMENT NOT RECORDED HERE — no charge names this PaymentIntent and no refund in stripeRefundIds names a refund here by metadata.refund_id, so no charge or refund row was written and the event is answered 200, not retried. It can be a refund on a payment taken in Stripe itself (a payment link or invoice), by another environment on the same Stripe account, or by a B&T confirm-payment whose charge row was never written (its unwind refund). If this PaymentIntent should be one of this app's charges, look it up in charges and in Stripe before recording anything";
+  "REFUND ON A PAYMENT NOT RECORDED HERE — no charge names this PaymentIntent and no refund in stripeRefundIds names a refund here by metadata.refund_id, so no charge or refund row was written and the event is answered 200, not retried. It can be a refund on a payment taken in Stripe itself (a payment link or invoice), by another environment on the same Stripe account, or, only on a database that ran before wire 9.0.0, by the unwind refund of the removed B&T confirm-payment route. If this PaymentIntent should be one of this app's charges, look it up in charges and in Stripe before recording anything";
 
 /**
  * The row of ours a refund names by `metadata.refund_id`, on any charge, or `undefined`.
@@ -572,9 +572,11 @@ async function rowNamedByRefund(live: StripeRefundSnapshot): Promise<string | un
  * between its unconfirmed create and its confirm (`confirmCharge.ts`), and a class hold is
  * captured after its row commits, so money moves only on a PaymentIntent a charge already
  * records; every refund the app creates names its row (`refundCreateParams`). The one road
- * that captures first is B&T confirm-payment (`routes/requestConfirmPayment.ts`), whose row
- * commits in the transaction after the capture, and whose unwind refund, when that
- * transaction fails, lands here by design: the sentence names it.
+ * that captured first was B&T confirm-payment (`routes/requestConfirmPayment.ts`), whose row
+ * committed in the transaction after the capture, and whose unwind refund, when that
+ * transaction failed, landed here by design: the sentence still names it, for a refund on
+ * a capture made before 9.0.0 removed that route (plan unit P49, A1). No road captures
+ * first now: the Board & Train yes moves $0.
  */
 function refundOnPaymentNotOurs(
   event: StripeWebhookEvent,

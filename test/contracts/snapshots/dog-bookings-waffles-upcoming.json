@@ -28,7 +28,8 @@
     "date": "2026-05-26T15:00:00.000Z",
     "trainer": "Rachel",
     "duration_minutes": 60,
-    "notes": "Joint household session — leash skills with both dogs"
+    "notes": "Joint household session — leash skills with both dogs",
+    "can_cancel": true
   },
   {
     "id": "77777777-7777-4777-8777-777777777774",
@@ -38,7 +39,9 @@
     "date": "2026-06-15T15:00:00.000Z",
     "trainer": "Donavan",
     "notes": "5-night stay; includes a few day-school refreshers",
-    "location": "fayetteville"
+    "location": "fayetteville",
+    "dropoff_at": "2026-06-15T15:00:00.000Z",
+    "pickup_at": "2026-06-20T17:00:00.000Z"
   },
   {
     "id": "77777777-7777-4777-8777-77777777777a",

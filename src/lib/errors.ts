@@ -69,9 +69,10 @@ export function toErrorEnvelope(err: ApiError): ApiErrorEnvelope {
  * (`db/idempotency.ts` state 3). Read the `code`, never the message — the
  * prose is a UI string and changing it must not change behavior.
  *
- * Exists for the two routes that capture money BEFORE their transaction opens
- * (`routes/enrollments.ts`, `routes/requestConfirmPayment.ts`). Their catch
- * blocks unwind the capture on any failure, and this is the ONE failure where
+ * Exists for the route that captures money BEFORE its transaction opens
+ * (`routes/enrollments.ts`; `routes/requestConfirmPayment.ts` was the second until 9.0.0
+ * removed it, plan unit P49). Its catch block unwinds the capture on any failure, and
+ * this is the ONE failure where
  * unwinding is wrong: losing the claim race means the money the caller is
  * holding is the OTHER request's — Stripe's own idempotency keyed off the same
  * `Idempotency-Key` handed this request back the in-flight one's PaymentIntent.

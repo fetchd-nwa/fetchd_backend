@@ -21,8 +21,11 @@ export type { BookingWire };
  * The subset of `bookings` columns the wire shape consumes. A structural
  * type kept narrow so the query layer doesn't accidentally couple the wire
  * helper to columns it doesn't need (confirmed_at, cancellation_reason,
- * dropoff_at, pickup_at, external_ref, source — all internal state, none on
- * the §B wire today). `cohortId` joined the wire Day-19d so the FE can group +
+ * external_ref, source — all internal state, none on the §B wire). `dropoffAt` and
+ * `pickupAt` joined at 9.0.0 (plan unit P49, A8: `BookingWire.dropoff_at` and
+ * `pickup_at` on a boarding or board-and-train row), with `quotedPriceCents`
+ * (`BookingWire.quoted_price_cents` on a lesson or board-and-train row; optional here so
+ * a hand-built test row need not name them). `cohortId` joined the wire Day-19d so the FE can group +
  * title group-class bookings; `cancelDeadlineAt` joined Δ 2026-07-08 for the
  * booking-overlap flow's forfeit warning. Since P21 (wire 6.0.0-lg5.2) no cancel
  * forfeits and nothing stamps it: it is passed through for a row stamped earlier,
@@ -45,6 +48,26 @@ export interface BookingRowForWire {
   cancelReason: string | null;
   cohortId: string | null;
   orderId: string | null;
+  dropoffAt?: string | null;
+  pickupAt?: string | null;
+  quotedPriceCents?: number | null;
+}
+
+/** The categories the request services book (9.0.0): a quote, a trainer, `can_cancel`. */
+export const SERVICE_CATEGORIES: ReadonlySet<ServiceCategory> = new Set([
+  'private-lesson',
+  'board-and-train',
+]);
+
+/** The categories that carry a stay window on the wire (9.0.0, A8). */
+const STAY_CATEGORIES: ReadonlySet<ServiceCategory> = new Set(['boarding', 'board-and-train']);
+
+/**
+ * A private lesson's or a Board & Train's start (9.0.0, A5): `dropoff_at`, else
+ * `scheduled_at`. The cancels refuse from it, and `can_cancel` reads it.
+ */
+export function serviceStart(row: { dropoffAt?: string | null; scheduledAt: string }): Date {
+  return pgTimestampToDate(row.dropoffAt ?? row.scheduledAt);
 }
 
 export interface BookingDogRow {
@@ -110,6 +133,8 @@ export function toBookingWire(
   groupClassName?: string,
   cancel?: CancelFacts,
   shares?: ShareFacts,
+  /** A private lesson's or a Board & Train's `can_cancel` (9.0.0, A5); day rows use `cancel`. */
+  serviceCanCancel?: boolean,
 ): BookingWire {
   const wire: BookingWire = {
     id: row.id,
@@ -125,6 +150,14 @@ export function toBookingWire(
   if (row.sessionReportId !== null) wire.session_report_id = row.sessionReportId;
   if (row.location !== null) wire.location = row.location;
   if (row.lessonSetting !== null) wire.lesson_setting = row.lessonSetting;
+  // 9.0.0 (A8): the price fixed at booking, and a stay's window. Omit-on-null.
+  if (SERVICE_CATEGORIES.has(row.category) && row.quotedPriceCents != null) {
+    wire.quoted_price_cents = row.quotedPriceCents;
+  }
+  if (STAY_CATEGORIES.has(row.category)) {
+    if (row.dropoffAt != null) wire.dropoff_at = pgTimestampToIso(row.dropoffAt);
+    if (row.pickupAt != null) wire.pickup_at = pgTimestampToIso(row.pickupAt);
+  }
   if (row.cancelDeadlineAt !== null) {
     wire.cancel_deadline_at = pgTimestampToIso(row.cancelDeadlineAt);
   }
@@ -143,6 +176,7 @@ export function toBookingWire(
       wire.cancel_reason = row.cancelReason;
     }
   }
+  if (serviceCanCancel !== undefined) wire.can_cancel = serviceCanCancel;
   if (cancel !== undefined) {
     wire.can_cancel = cancel.canCancel;
     // 6.2.0: on every share of a day-school row (`false` on one cancelled alone), on no

@@ -338,6 +338,8 @@ async function seedBoughtPack(args: {
 async function seed(): Promise<void> {
   // M1.19/M1.20: owner | manager | trainer, and a non-empty set of home
   // campuses. Shanthi is home to BOTH (M1.20's backfill alone gives one).
+  // M5.21 (P49, wire 9.0.0): Rachel $150 a lesson and Board & Train, Shanthi $200 and
+  // Board & Train; Donavan, Fed and Amber neither, so `GET /trainers` lists two.
   await db.insert(staff).values([
     {
       id: SEED.staffShanthiId,
@@ -346,6 +348,8 @@ async function seed(): Promise<void> {
       role: 'owner',
       // Sorted, as staff:provision writes a set: a roster run then compares equal.
       homeLocations: ['bentonville', 'fayetteville'],
+      lessonPriceCents: 20000,
+      boardTrainEligible: true,
     },
     {
       id: SEED.staffRachelId,
@@ -353,6 +357,8 @@ async function seed(): Promise<void> {
       name: 'Rachel',
       role: 'trainer',
       homeLocations: ['fayetteville'],
+      lessonPriceCents: 15000,
+      boardTrainEligible: true,
     },
     {
       id: SEED.staffDonavanId,
@@ -734,6 +740,8 @@ async function seed(): Promise<void> {
       scheduledAt: daysFromNow(3, 15),
       durationMinutes: 60,
       trainerStaffId: SEED.staffRachelId,
+      // P49: the price fixed at the staff confirm, Rachel's, so a fresh seed models 9.0.0.
+      quotedPriceCents: 15000,
       notes: 'Leash reactivity — bikes.',
       location: 'fayetteville',
       lessonSetting: 'home',
@@ -979,7 +987,8 @@ async function seed(): Promise<void> {
       status: 'submitted',
       submittedAt: daysFromNow(-1, 16),
       notesPerDog: 'Waffles needs leash polish.',
-      staffPreference: 'rachel',
+      // P49 (wire 9.0.0, A4): a lesson names a trainer by her staff id, never a slug.
+      staffPreference: SEED.staffRachelId,
       lessonSetting: 'public',
       descriptorKeys: ['high-energy', 'food-motivated'],
     },

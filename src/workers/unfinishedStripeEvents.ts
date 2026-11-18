@@ -10,8 +10,9 @@ import type { WorkerLogger } from './workerLogger.js';
  * finding 2). A Stripe delivery that dies between its `stripe_events` claim and its
  * handler leaves `processed_at IS NULL`, and every redelivery answers 200 `duplicate`
  * wherever `redispatchUnfinishedEvent` may not re-run it (the older arms:
- * `requestConfirmPayment.ts:168`, hidden in M1, and `enrollmentPartial.ts:418`, `:546`
- * until `POST /enrollments` joins the engine at 8.0.0). The charge never flips, and until
+ * `enrollmentPartial.ts:418`, `:546` until `POST /enrollments` joins the engine at 8.0.0;
+ * `requestConfirmPayment.ts:168` was one until 9.0.0 removed that route, plan unit P49,
+ * A1). The charge never flips, and until
  * this phase nobody was told.
  *
  * Each such event past {@link UNFINISHED_EVENT_BOUND_MINUTES} is named at level 50 (id,

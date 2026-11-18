@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import {
   dogs,
@@ -517,7 +517,44 @@ function bucketBy<T, K>(items: T[], key: (item: T) => K): Map<K, T[]> {
   return result;
 }
 
+/**
+ * Names for a batch of dog ids, expired dogs included: the names a staff read prints for
+ * the dogs on a request or a booked service (wire 9.0.0, A7, A10).
+ */
+async function findNamesByIds(
+  ids: readonly string[],
+  runner: Runner = db,
+): Promise<Map<string, string>> {
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return new Map();
+  const rows = await runner
+    .select({ id: dogs.id, name: dogs.name })
+    .from(dogs)
+    .where(inArray(dogs.id, unique));
+  return new Map(rows.map((r) => [r.id, r.name] as const));
+}
+
+/**
+ * Of a request's dogs, the ones no longer on the family's account: soft-expired by her
+ * `DELETE /dogs/:id` (design request-services-v1 § 14 A1.2), each with its name. Every id
+ * names a row (`pending_request_dogs.dog_id` cascades on a hard delete), so a removed dog is
+ * an expired one.
+ */
+async function findRemovedAmong(
+  runner: Runner,
+  ids: readonly string[],
+): Promise<{ id: string; name: string }[]> {
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) return [];
+  return runner
+    .select({ id: dogs.id, name: dogs.name })
+    .from(dogs)
+    .where(and(inArray(dogs.id, unique), isNotNull(dogs.expiredAt)));
+}
+
 export const dogsRepository = {
+  findNamesByIds,
+  findRemovedAmong,
   findManyByOwner,
   findById,
   findOwnedExists,

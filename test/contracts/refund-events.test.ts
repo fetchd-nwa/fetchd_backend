@@ -1163,7 +1163,7 @@ describe("a Stripe refund whose metadata names a row but not its amount is a ref
 
 describe('a refund event on a payment no charge here records (Opus r1 L3)', () => {
   const NOT_OURS =
-    "REFUND ON A PAYMENT NOT RECORDED HERE — no charge names this PaymentIntent and no refund in stripeRefundIds names a refund here by metadata.refund_id, so no charge or refund row was written and the event is answered 200, not retried. It can be a refund on a payment taken in Stripe itself (a payment link or invoice), by another environment on the same Stripe account, or by a B&T confirm-payment whose charge row was never written (its unwind refund). If this PaymentIntent should be one of this app's charges, look it up in charges and in Stripe before recording anything";
+    "REFUND ON A PAYMENT NOT RECORDED HERE — no charge names this PaymentIntent and no refund in stripeRefundIds names a refund here by metadata.refund_id, so no charge or refund row was written and the event is answered 200, not retried. It can be a refund on a payment taken in Stripe itself (a payment link or invoice), by another environment on the same Stripe account, or, only on a database that ran before wire 9.0.0, by the unwind refund of the removed B&T confirm-payment route. If this PaymentIntent should be one of this app's charges, look it up in charges and in Stripe before recording anything";
   const events: string[] = [];
   afterEach(async () => {
     for (const id of events.splice(0)) await db.delete(stripeEvents).where(eq(stripeEvents.eventId, id));

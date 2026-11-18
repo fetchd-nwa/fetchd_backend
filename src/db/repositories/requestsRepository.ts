@@ -80,6 +80,11 @@ const PENDING_REQUEST_PROJECTION = {
   // Wire 1.13.0: on the wire now — the deny-vs-owner-cancel discriminator.
   approvedByStaffId: pendingRequests.approvedByStaffId,
   convertedBookingId: pendingRequests.convertedBookingId,
+  // M5.21 (wire 9.0.0, A6): a Board & Train's approved trainer, stay and price.
+  approvedTrainerStaffId: pendingRequests.approvedTrainerStaffId,
+  approvedDropoffAt: pendingRequests.approvedDropoffAt,
+  approvedPickupAt: pendingRequests.approvedPickupAt,
+  approvedPriceCents: pendingRequests.approvedPriceCents,
 } as const;
 
 const PENDING_REQUEST_FULL_PROJECTION = {
@@ -121,12 +126,17 @@ export const requestsRepository = {
    * (`requireStaff` gates the route); the owner-scoped sibling is
    * `findLiveByOwner`. The route sorts by submitted_at.
    */
-  async findLive(statusFilter?: RequestStatus): Promise<PendingRequestRow[]> {
+  async findLive(
+    statusFilter?: RequestStatus,
+  ): Promise<(PendingRequestRow & { ownerId: string })[]> {
     const conditions =
       statusFilter !== undefined
         ? and(eq(pendingRequests.status, statusFilter), live(pendingRequests))
         : live(pendingRequests);
-    return db.select(PENDING_REQUEST_PROJECTION).from(pendingRequests).where(conditions);
+    return db
+      .select({ ...PENDING_REQUEST_PROJECTION, ownerId: pendingRequests.ownerId })
+      .from(pendingRequests)
+      .where(conditions);
   },
 
   /**
@@ -439,21 +449,24 @@ export const requestsRepository = {
   },
 
   /**
-   * State-machine transition for non-B&T approval: 'submitted' →
-   * 'converted'. Stamps `approvedAt = now()`, `approvedByStaffId`, and
-   * `convertedBookingId` (the route created the booking row earlier in
-   * the txn and threads its id in here).
+   * State-machine transition to 'converted', with `convertedBookingId` (the route created
+   * the booking row earlier in the txn and threads its id in here) and the staff actor.
+   *   - The staff approve of a lesson or a boarding stay: `approvedAt = now()` and the
+   *     approver's id.
+   *   - The family's yes to a Board & Train (`POST /requests/:id/confirm`, 9.0.0): the
+   *     STORED approver's id, never `''` (NOTE-7), and `keepApprovedAt` leaves the
+   *     approval instant as staff stamped it, since nothing was approved at her yes.
    */
   async markConverted(
     tx: Tx,
     id: string,
-    args: { approvedByStaffId: string; convertedBookingId: string },
+    args: { approvedByStaffId: string; convertedBookingId: string; keepApprovedAt?: boolean },
   ): Promise<void> {
     await tx
       .update(pendingRequests)
       .set({
         status: 'converted',
-        approvedAt: sql`now()`,
+        ...(args.keepApprovedAt === true ? {} : { approvedAt: sql`now()` }),
         approvedByStaffId: args.approvedByStaffId,
         convertedBookingId: args.convertedBookingId,
       })
@@ -461,15 +474,22 @@ export const requestsRepository = {
   },
 
   /**
-   * State-machine transition for B&T approval: 'submitted' →
-   * 'approved-awaiting-payment'. NO booking is created at this step;
-   * the Day-14 confirm-payment verb completes the conversion by
-   * INSERTing the booking and flipping the state to 'converted'.
+   * State-machine transition for B&T approval: 'submitted' → 'approved-awaiting-payment'
+   * (from 9.0.0 "waiting for the family's yes"; nothing is paid there). It stores what
+   * staff approved (M5.21): the trainer, the stay and the flat price, which is exactly what
+   * her yes books. NO booking is created at this step; her yes
+   * (`routes/requestConfirm.ts`) inserts it and flips the state to 'converted'.
    */
   async markApprovedAwaitingPayment(
     tx: Tx,
     id: string,
-    args: { approvedByStaffId: string },
+    args: {
+      approvedByStaffId: string;
+      trainerStaffId: string;
+      dropoffAt: Date;
+      pickupAt: Date;
+      priceCents: number;
+    },
   ): Promise<void> {
     await tx
       .update(pendingRequests)
@@ -477,6 +497,10 @@ export const requestsRepository = {
         status: 'approved-awaiting-payment',
         approvedAt: sql`now()`,
         approvedByStaffId: args.approvedByStaffId,
+        approvedTrainerStaffId: args.trainerStaffId,
+        approvedDropoffAt: args.dropoffAt.toISOString(),
+        approvedPickupAt: args.pickupAt.toISOString(),
+        approvedPriceCents: args.priceCents,
       })
       .where(eq(pendingRequests.id, id));
   },
@@ -488,7 +512,8 @@ export const requestsRepository = {
    * the API distinguishes the two actors by `approvedByStaffId`'s
    * presence — owner self-cancel leaves it NULL, staff deny stamps it.
    * Surface in HANDOFF as a known semantic gap pending a future §A
-   * amendment that adds 'denied' to the enum.
+   * amendment that adds 'denied' to the enum. The approved columns (M5.21) are never
+   * touched here: a Board & Train taken back or withdrawn after approval keeps them (A13).
    */
   async markCancelled(
     tx: Tx,

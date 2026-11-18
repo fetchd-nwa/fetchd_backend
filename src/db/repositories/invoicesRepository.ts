@@ -16,8 +16,8 @@ type Runner = Tx | typeof db;
  * `paid_at` set.
  *
  * Lifecycle:
- *   - INSERT at status='open' (the pay-later arms of POST /enrollments and
- *     POST /requests/:id/confirm-payment).
+ *   - INSERT at status='open' (the pay-later arm of POST /enrollments; the one of
+ *     POST /requests/:id/confirm-payment left with that route at 9.0.0, plan unit P49).
  *   - `markPaid` inside the tx that settles the `charges` row.
  *
  * No worker bills a card on its own (wire 5.0.0-lg4.1, PAY-U15), so `due_at` is
@@ -119,8 +119,8 @@ export const invoicesRepository = {
   },
 
   /**
-   * INSERT an open invoice. Used by the pay-later arms of `POST /enrollments`
-   * and `POST /requests/:id/confirm-payment`.
+   * INSERT an open invoice. Used by the pay-later arm of `POST /enrollments`
+   * (`POST /requests/:id/confirm-payment`'s left with that route at 9.0.0).
    */
   async createOpen(
     tx: Tx,

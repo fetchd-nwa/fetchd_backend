@@ -107,8 +107,68 @@ async function createTestDog(
 // POST /dogs
 // ──────────────────────────────────────────────────────────────────────────
 
+// P49, contract item A14 (wire 9.0.0; DECISIONS 459): an owner may not set a dog's
+// evaluation. This test used to post `evaluation_status: 'pending'` and assert it stored
+// (BUG-11's POST arm); from 9.0.0 that body is 400 `bad_request` right after the parse and
+// writes nothing, and every dog an owner creates is 'not-evaluated'.
+
 test(
-  'POST /dogs — owner creates returns 201 + assembled Dog wire shape',
+  'A14: POST /dogs carrying evaluation_status → 400 bad_request, and no dogs row is written',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerDogsRoute(app, dogsOpts(authenticate));
+    const name = `Rusty ${randomUUID()}`;
+    const res = await app.inject({
+      method: 'POST',
+      url: '/dogs',
+      headers: { 'idempotency-key': `post-create-eval-${randomUUID()}` },
+      payload: {
+        name,
+        breed: 'Mutt',
+        birthdate: '2024-01-15',
+        special_notes: 'Loves squeaky toys',
+        evaluation_status: 'pending',
+      },
+    });
+    assert.equal(res.statusCode, 400, res.body);
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'bad_request');
+    const rows = await db.select({ id: dogs.id }).from(dogs).where(eq(dogs.name, name));
+    assert.deepEqual(rows, [], 'a refused create wrote a dog');
+  },
+);
+
+test(
+  'A14: any evaluation key with any value — evaluation_date alone, null, not-evaluated, passed — is 400 and writes nothing',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerDogsRoute(app, dogsOpts(authenticate));
+    for (const extra of [
+      { evaluation_date: '2026-05-01T15:00:00Z' },
+      { evaluation_date: null },
+      { evaluation_status: null },
+      { evaluation_status: 'not-evaluated' },
+      { evaluation_status: 'passed' },
+      { evaluation_status: 'passed', evaluation_date: '2026-05-01T15:00:00Z' },
+    ]) {
+      const name = `Eval Key Dog ${randomUUID()}`;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/dogs',
+        headers: { 'idempotency-key': `post-create-evalkey-${randomUUID()}` },
+        payload: { ...postBaseBody(), name, ...extra },
+      });
+      assert.equal(res.statusCode, 400, `${JSON.stringify(extra)}: ${res.body}`);
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'bad_request');
+      const rows = await db.select({ id: dogs.id }).from(dogs).where(eq(dogs.name, name));
+      assert.deepEqual(rows, [], `${JSON.stringify(extra)} wrote a dog`);
+    }
+  },
+);
+
+test(
+  'POST /dogs — owner creates returns 201 + assembled Dog wire shape, not-evaluated with no evaluation_date',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
@@ -123,11 +183,10 @@ test(
         breed: 'Mutt',
         birthdate: '2024-01-15',
         special_notes: 'Loves squeaky toys',
-        evaluation_status: 'pending',
       },
     });
 
-    assert.equal(res.statusCode, 201);
+    assert.equal(res.statusCode, 201, res.body);
     const body = res.json() as {
       id: string;
       name: string;
@@ -156,16 +215,19 @@ test(
       notes: null,
     });
     assert.equal(body.special_notes, 'Loves squeaky toys');
-    assert.equal(body.evaluation_status, 'pending');
+    assert.equal(body.evaluation_status, 'not-evaluated');
     // vet + completed_class_keys + evaluation_date omitted on a fresh dog.
     assert.equal('vet' in body, false);
     assert.equal('completed_class_keys' in body, false);
+    assert.equal('evaluation_date' in body, false);
 
     const [row] = await db.select().from(dogs).where(eq(dogs.id, body.id)).limit(1);
     assert.ok(row);
     assert.equal(row.ownerId, FIXTURE_IDS.ownerId);
     assert.equal(row.source, 'app');
     assert.equal(row.expiredAt, null);
+    assert.equal(row.evaluationStatus, 'not-evaluated');
+    assert.equal(row.evaluationDate, null);
   },
 );
 

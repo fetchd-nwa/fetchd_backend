@@ -3,6 +3,7 @@ import {
   requestsRepository,
   type PendingRequestRow,
 } from '../db/repositories/requestsRepository.js';
+import { staffRepository } from '../db/repositories/staffRepository.js';
 import type { Tx } from '../db/tx.js';
 import { pgTimestampToDate, pgTimestampToIso } from './pgTimestamp.js';
 import { groupRequestDogs, toRequestWire, type PendingRequestWire } from './requestWire.js';
@@ -29,9 +30,13 @@ export async function wireManyRequests(
 ): Promise<PendingRequestWire[]> {
   if (rows.length === 0) return [];
   const ids = rows.map((r) => r.id);
-  const [dogRows, dateRows] = await Promise.all([
+  const trainerIds = rows
+    .map((r) => r.approvedTrainerStaffId)
+    .filter((id): id is string => id !== null);
+  const [dogRows, dateRows, trainerNames] = await Promise.all([
     requestsRepository.findDogsByRequestIds(ids, runner),
     requestsRepository.findPreferredDatesByRequestIds(ids, runner),
+    staffRepository.findAnyNamesByIds(trainerIds, runner),
   ]);
   const dogsByRequest = groupRequestDogs(dogRows);
   const datesByRequest = groupPreferredDates(dateRows);
@@ -41,7 +46,9 @@ export async function wireManyRequests(
       throw new Error(`pending_request ${row.id}: no pending_request_dogs rows found`);
     }
     const dates = datesByRequest.get(row.id) ?? [];
-    return toRequestWire(row, dogIds, dates);
+    const trainer =
+      row.approvedTrainerStaffId === null ? undefined : trainerNames.get(row.approvedTrainerStaffId);
+    return toRequestWire(row, dogIds, dates, trainer);
   });
 }
 
@@ -51,10 +58,10 @@ export async function wireManyRequests(
  * V8-incompatible) round-trips correctly — same parser as
  * `routes/bookings.ts:sortByScheduledAt`.
  */
-export function sortRequestsBySubmittedAt(
-  rows: PendingRequestRow[],
+export function sortRequestsBySubmittedAt<Row extends PendingRequestRow>(
+  rows: Row[],
   direction: 'asc' | 'desc',
-): PendingRequestRow[] {
+): Row[] {
   const sorted = [...rows].sort(
     (a, b) =>
       pgTimestampToDate(a.submittedAt).getTime() - pgTimestampToDate(b.submittedAt).getTime(),

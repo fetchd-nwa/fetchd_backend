@@ -15,7 +15,9 @@ import { staffRepository } from '../db/repositories/staffRepository.js';
 import type { Tx } from '../db/tx.js';
 import type { PickupCloseByCampus } from './bookingBucket.js';
 import {
+  SERVICE_CATEGORIES,
   groupBookingDogs,
+  serviceStart,
   toBookingWire,
   type BookingWire,
   type CancelFacts,
@@ -71,10 +73,15 @@ export async function wireManyBookings(
   // Cohort ids on group-class bookings → resolve the class name so the FE can
   // title the booking with its class ("Manners 1") instead of "Group Class".
   const cohortIds = rows.map((r) => r.cohortId).filter((id): id is string => id !== null);
-  const [shareRows, trainerName, classNamesByCohort] = await Promise.all([
+  // 9.0.0 (A8): a lesson's or a Board & Train's trainer is a fact of the booking and stays after she leaves.
+  const serviceTrainerIds = rows
+    .filter((r) => SERVICE_CATEGORIES.has(r.category) && r.trainerStaffId !== null)
+    .map((r) => r.trainerStaffId as string);
+  const [shareRows, trainerName, classNamesByCohort, serviceTrainerNames] = await Promise.all([
     bookingsRepository.findSharesByBookingIds(runner, ids),
     staffRepository.resolveTrainerNames(rows),
     cohortsRepository.resolveClassNamesByIds(cohortIds),
+    staffRepository.findAnyNamesByIds(serviceTrainerIds, runner),
   ]);
   const dogsByBooking = groupBookingDogs(shareRows);
   const factsByBooking = await dayCancelFacts(
@@ -99,7 +106,9 @@ export async function wireManyBookings(
     return toBookingWire(
       row,
       dogIds,
-      trainerName(row.trainerStaffId),
+      SERVICE_CATEGORIES.has(row.category) && row.trainerStaffId !== null
+        ? (serviceTrainerNames.get(row.trainerStaffId) ?? null)
+        : trainerName(row.trainerStaffId),
       groupClassName,
       factsByBooking.get(row.id),
       {
@@ -108,8 +117,21 @@ export async function wireManyBookings(
         ),
         returnExpiresAt: returnDates.get(row.id) ?? new Map(),
       },
+      serviceCanCancel(row, context.now),
     );
   });
+}
+
+/**
+ * `can_cancel` on a private-lesson or board-and-train row (9.0.0; design
+ * request-services-v1 §2.2 A5): `false` once cancelled or once its start (`dropoff_at`,
+ * else `scheduled_at`) has passed, `true` before, on the clock the cancels refuse on
+ * (`cancelBookingService`). `undefined` on every other category.
+ */
+function serviceCanCancel(row: BookingRow, now: Date): boolean | undefined {
+  if (!SERVICE_CATEGORIES.has(row.category)) return undefined;
+  if (row.status === 'cancelled') return false;
+  return now.getTime() < serviceStart(row).getTime();
 }
 
 /**

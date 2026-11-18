@@ -73,10 +73,14 @@
  * additive, its close). LG5: 6.0.0-lg5.1 (P20, breaking), 6.0.0-lg5.2 (P21,
  * breaking), 6.0.0 (P22, additive, its close). The fix phase Allison ordered
  * first (11-14; build DECISIONS 396, 402): 6.2.0 (P48, additive), after-school
- * places and the after-school removal; S42 (design 7.1.0), once build 6.2.0,
- * now ships as build 6.5.0.
+ * places and the after-school removal; 9.0.0 (P49, breaking), private lessons
+ * and Board & Train bookable with staff approval and $0 moving (build DECISIONS
+ * 393, 413, 414, 418; a breaking fix-phase step skips 7.0.0 and 8.0.0, which are
+ * design labels). P51, the bill at the end of those two services, takes 9.1.0,
+ * and S42 (design 7.1.0), once build 6.2.0 and then 6.5.0, now ships as build
+ * 9.2.0; both are provisional until their contract steps.
  */
-export const WIRE_CONTRACT_VERSION = '6.2.0';
+export const WIRE_CONTRACT_VERSION = '9.0.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -967,6 +971,23 @@ export interface AfterSchoolFullDetails {
 }
 
 /**
+ * Rides code `conflict` (409) on `POST /requests/:id/confirm` only — `kind`
+ * equals `code`. New 9.0.0 (design `request-services-v1.md` § 14, Amendment A1;
+ * build DECISIONS 511). The family's yes booked nothing because a dog on the
+ * request (`dog_id`, the first by name when more than one) is no longer on her
+ * account (`'dog_removed'`), or already holds a live boarding or Board & Train
+ * stay whose Chicago-date window overlaps the approved one (`'stay_overlap'`).
+ * The response's `message` is the family's sentence for these two; every other
+ * 409 on this route carries no `details`. The request stays waiting: she
+ * withdraws it, or staff take it back.
+ */
+export interface RequestStayConflictDetails {
+  kind: 'conflict';
+  reason: 'stay_overlap' | 'dog_removed';
+  dog_id: string;
+}
+
+/**
  * Every `details` payload the API can emit, closed. Provably complete at
  * 1.13.0 by full construction-site sweep, and kept complete by the fold-in:
  * `ApiError`'s constructor takes exactly this union, so a future route
@@ -1006,7 +1027,8 @@ export type ApiErrorDetailWire =
   | AttendanceStateConflictDetails
   | SessionNotTodayDetails
   | NoShowTooEarlyDetails
-  | AfterSchoolFullDetails;
+  | AfterSchoolFullDetails
+  | RequestStayConflictDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -1039,6 +1061,18 @@ export type ServiceCategory =
  */
 export type BookingStatus = 'upcoming' | 'past' | 'cancelled' | 'payment-pending';
 
+/**
+ * A request's state, the `request_status` pgEnum (pinned in `conformance.ts`).
+ *
+ * `'approved-awaiting-payment'` is a historical name (9.0.0; plan unit P49; design
+ * request-services-v1 §2.2 A6, §9 alternative 7): it means **waiting for the
+ * family's yes**, and nothing is paid there. Only a Board & Train reaches it, when
+ * staff approve dates and a trainer (`POST /staff/requests/:id/approve`); her yes
+ * (`POST /requests/:id/confirm`) books the stay at $0 and makes it `'converted'`,
+ * and the stay is billed after the cue transfer session. Renaming the value would be
+ * a breaking enum change across the database, the wire and both clients for a label,
+ * so the doc and the copy change instead.
+ */
 export type RequestStatus =
   | 'submitted'
   | 'approved'
@@ -1157,10 +1191,11 @@ export type MediaPurpose =
 
 export type MediaKind = 'image' | 'video';
 
-/** The 15 notification kinds an owner can receive. A hand-maintained mirror of
+/** The 16 notification kinds an owner can receive. A hand-maintained mirror of
  *  the `notification_type` pgEnum; `conformance.ts` pins it to the Drizzle enum.
  *  5.0.0-lg4.1 (M4.02; CRED-U29, ALUM-U17): `'membership-ended'` and
- *  `'alumni-attendance'` left with the rebuild. */
+ *  `'alumni-attendance'` left with the rebuild. 9.0.0 (M5.20; plan unit P49)
+ *  appends `'request-approved'`. */
 export type NotificationType =
   | 'booking-confirmed'
   | 'report-published'
@@ -1194,13 +1229,21 @@ export type NotificationType =
   //                        booked or charged at this point (Allison 2026-07-29).
   | 'invoice-overdue'
   | 'card-expiring'
-  | 'waitlist-spot-open';
+  | 'waitlist-spot-open'
+  // 9.0.0 (M5.20; plan unit P49; design request-services-v1 §2.2 A11; DRIFT-7):
+  // staff approved a Board & Train with dates and a trainer, and it waits on the
+  // family's yes. Named for what FIRES, not for a booking: nothing is booked or
+  // charged at this point, as with `waitlist-spot-open`. Its deep link is the
+  // `request` kind. Push category `urgent-updates`.
+  | 'request-approved';
 
 /** The deep-link target a notification points at (`NotificationDeepLink.kind`).
  *  `deepLinkToPath` maps each arm to its owner-app route. `credits` opens the
  *  owner's credits screen and has no id, since credits are the owner's and not
  *  a dog's (5.0.0-lg4.2; CRED-U10). `announcement` is a reserved arm with no
- *  producer today. */
+ *  producer today. `request` (9.0.0; plan unit P49) opens one of her requests,
+ *  `id` the request's and `params.category` its service; its one producer is
+ *  `'request-approved'`. */
 export type NotificationDeepLinkKind =
   | 'booking'
   | 'report'
@@ -1211,7 +1254,8 @@ export type NotificationDeepLinkKind =
   | 'credits'
   | 'announcement'
   | 'payment-method'
-  | 'waitlist';
+  | 'waitlist'
+  | 'request';
 
 /**
  * The credit-axis booking mode for day programs (`schema.sql`:
@@ -1310,6 +1354,7 @@ export const NOTIFICATION_DEEP_LINK_KINDS = [
   'announcement',
   'payment-method',
   'waitlist',
+  'request',
 ] as const satisfies readonly [NotificationDeepLinkKind, ...NotificationDeepLinkKind[]];
 
 /** No pgEnum backs the tier, so §16's pin on this tuple is its one guard
@@ -1339,7 +1384,9 @@ export const GROUP_CLASS_KEYS = [
 /** Member order mirrors the `notification_type` pgEnum declaration order; §16
  *  pins set equality. New 1.13.0 (digest notifications item). 5.0.0-lg4.1:
  *  M4.02's rebuild keeps the survivors in this order, and `'evaluation-result'`
- *  is not in it: M2.15 appends it after this rebuild, in LG2b (P10). */
+ *  is not in it: M2.15 appends it after this rebuild, in LG2b (P10). 9.0.0:
+ *  M5.20 appends `'request-approved'` (`ALTER TYPE … ADD VALUE`, which appends),
+ *  so it is last. */
 export const NOTIFICATION_TYPES = [
   'booking-confirmed',
   'report-published',
@@ -1356,6 +1403,7 @@ export const NOTIFICATION_TYPES = [
   'invoice-overdue',
   'card-expiring',
   'waitlist-spot-open',
+  'request-approved',
 ] as const satisfies readonly [NotificationType, ...NotificationType[]];
 
 /** Member order mirrors the `media_purpose` pgEnum declaration order; §16 pins
@@ -1933,11 +1981,34 @@ export interface BookingWire {
    *  `2026-11-11T13:30:00.000Z`), never a bare calendar day: a client takes the
    *  day it shows from this instant in America/Chicago (P20 round 2, M1). */
   date: string;
+  // The trainer's name: `staff.name` of `bookings.trainer_staff_id`, omitted when
+  // the row has none. From 9.0.0 (plan unit P49; design request-services-v1 §2.2
+  // A8) every private-lesson and board-and-train booking carries one: the staff
+  // approve stores a lesson's, and the family's yes a Board & Train's.
   trainer?: string;
   duration_minutes?: number;
   notes?: string;
   session_report_id?: string;
   location?: LocationKey;
+  // Private-lesson and board-and-train only (9.0.0; plan unit P49; design
+  // request-services-v1 §2.2 A8, §4.1): the price fixed at booking, in cents, the
+  // one the family saw. A lesson's is its trainer's `lesson_price_cents` at the
+  // staff confirm (`TrainerWire.private_lesson_price_cents`), flat whatever the
+  // number of dogs; a Board & Train's is the flat price stored at approval
+  // (`PendingRequestWire.approved_price_cents`, 200000). Nothing is charged at
+  // booking, and no route bills it in 9.0.0: the bill after the service, which the
+  // family taps to pay, is plan unit P51's (Shanthi #6.4, #6.8; build DECISIONS
+  // 413). A client shows it, as "$150, paid after", and computes nothing from it.
+  // Omitted on every other category, and on a row booked before 9.0.0 (dev only).
+  quoted_price_cents?: number;
+  // Boarding and board-and-train only (9.0.0; plan unit P49; design
+  // request-services-v1 §2.2 A8; Fable r2 M3): the stay's window, ISO-8601
+  // instants, from `bookings.dropoff_at` and `pickup_at`. `date` equals
+  // `dropoff_at`. A Board & Train's `pickup_at` is the cue transfer session, when
+  // the dog is given back. Omitted on every other category, and where the column
+  // is null.
+  dropoff_at?: string;
+  pickup_at?: string;
   // Omit-on-null: `bookings.cancel_deadline_at`, where a free-cancel window
   // used to close (Δ 2026-07-08). From 6.0.0-lg5.2 no cancel forfeits and no
   // route stamps one (design §2.7:4115-4127, question 54; CXL-U04): M5.08 drops
@@ -1973,15 +2044,20 @@ export interface BookingWire {
   order_id?: string;
   // Whether a cancel of the WHOLE session would be accepted now (6.0.0-lg5.1;
   // design §1.1:1064-1067, §2.3:2418-2428; CXL-U09, CXL-U10). Present on every
-  // day-school and day-care row and omitted on every other category (the
-  // evaluation row joins with P09, plan `deferred_arms`). `false` once the
+  // day-school and day-care row, and from 9.0.0 on every private-lesson and
+  // board-and-train row; omitted on every other category (the evaluation row
+  // joins with P09, plan `deferred_arms`). On a day row it is `false` once the
   // session is cancelled, once any dog still on it has folded past `expected`
   // (`AttendanceStatus`; an undone check-in does not count), and once Chicago
-  // now reaches the campus's `day.pickup_close_time` on its date. It reads the
-  // same fold and clock as the cancel's 409s, so a `true` can still meet one if
-  // a check-in or the clock lands between the read and the tap: show that 409
-  // as a refusal, never as a connection error. A pending row is cancellable (it
-  // cancels its whole order, `BookingStatus`).
+  // now reaches the campus's `day.pickup_close_time` on its date. On a
+  // private-lesson or board-and-train row (9.0.0; plan unit P49; design
+  // request-services-v1 §2.2 A5; Fable r2 L5) it is `false` once the booking is
+  // cancelled and once its start has passed (`dropoff_at`, else `date`), and
+  // `true` before: a started lesson or stay ends by a staff record, never by a
+  // cancel. It reads the same fold and clock as the cancel's 409s, so a `true`
+  // can still meet one if a check-in or the clock lands between the read and the
+  // tap: show that 409 as a refusal, never as a connection error. A pending row
+  // is cancellable (it cancels its whole order, `BookingStatus`).
   can_cancel?: boolean;
   // One entry per dog the session was booked for, the shares cancelled alone
   // included (6.0.0-lg5.1; design §1.1:1068-1075, §2.3:2429-2447; CXL-U09, s11).
@@ -2197,17 +2273,143 @@ export interface PendingRequestWire {
   // Δ 1.13.0 (digest bookings/S; closes DRIFT-8 @
   // BUSINESS-LOGIC/DISCREPANCIES.md:291). The staff actor on a STAFF-driven
   // resolution — stamped by approve (`markApprovedAwaitingPayment`,
-  // `markConverted`) and by deny (`markCancelled`), all in `staffRequests.ts`,
-  // and left NULL by an owner self-cancel (`POST /requests/:id/cancel`).
+  // `markConverted`) and by deny (`markCancelled`), all in `staffRequests.ts`.
+  // An owner self-cancel (`POST /requests/:id/cancel`) writes none.
   // It is the discriminator the client branches on to render "Denied by the
   // school" vs "You cancelled this", because `request_status` has no 'denied'
   // member (DATA-CONTRACT.md:1217-1222; the column is on `pending_requests`). Omit-on-null
   // like its neighbours: present ⇒ staff acted, absent ⇒ they did not.
+  // From 9.0.0 one case reads differently (Fable r2 M5): a Board & Train cancelled
+  // AFTER staff approved it keeps a staff id whether the family withdrew it (the
+  // approver's) or staff took it back (the denier's, `PostStaffRequestsDenyRequest`,
+  // which also stamps a new `approved_at`), so a cancelled row that
+  // carries `approved_dropoff_at` says only "Cancelled"; "Denied by the school" is a
+  // cancelled row with this id and no `approved_dropoff_at`. Her yes
+  // (`POST /requests/:id/confirm`) keeps the approver's id on the converted row.
   approved_by_staff_id?: string;
   converted_booking_id?: string;
   // Private-lesson only (Δ 2026-07-14): where the lesson should happen.
   lesson_setting?: LessonSetting;
+  // Board & Train only (9.0.0; plan unit P49; design request-services-v1 §2.2 A6;
+  // DRIFT-7): what staff approved, which is exactly what the family says yes to.
+  // Written by the staff approve (the row is then `'approved-awaiting-payment'`)
+  // and kept after it: on the `'converted'` row her yes leaves, and on a row
+  // cancelled after approval. Omitted before approval, and on every private-lesson
+  // and boarding request, whose facts are its booking's (`converted_booking_id`).
+  //   `approved_trainer`: the trainer staff assigned (`staff.name`, as
+  //   `TrainerWire.name`); the one she named, when she named one.
+  //   `approved_dropoff_at` / `approved_pickup_at`: ISO-8601 instants. The drop-off
+  //   is one of her `preferred_dates`; the pick-up, after it, is the cue transfer
+  //   session, when the dog is given back.
+  //   `approved_price_cents`: the flat price fixed at approval, 200000 for the
+  //   two-week program (`lib/boardTrainPricing.ts`). Nothing is paid at approval or
+  //   at her yes: the stay is billed after the cue transfer session (plan unit P51).
+  approved_trainer?: { staff_id: string; name: string };
+  approved_dropoff_at?: string;
+  approved_pickup_at?: string;
+  approved_price_cents?: number;
 }
+
+/**
+ * One row of `GET /staff/requests?status=` `[staff]`, any role (9.0.0, ADDITIVE as a
+ * supertype; plan unit P49; design request-services-v1 §2.2 A7): `PendingRequestWire`
+ * with the names the portal's Requests screen prints, because the base wire carries
+ * ids only. The query and the order are unchanged: `status` one `RequestStatus`,
+ * omitted → every live request; newest submitted first. An owner principal is 403
+ * `forbidden`. The approve and the deny still answer `PendingRequestWire`.
+ *   - `owner`: the family. `name` is its name, or its `email` when the name is empty,
+ *     as on `StaffDogWire.owner_name`, so it is never `null` or `''`. `location`: the
+ *     family's home campus (`owners.location`), omitted when it has none. The portal
+ *     pre-fills a lesson's campus with it, and a Board & Train books there at her yes.
+ *   - `dogs`: every dog on the request, the lead (`dog_id`) first, then
+ *     `additional_dog_ids` in their order.
+ *   - `preferred_trainer`: the staffer her `focus.staff_preference` names, `name` as
+ *     `TrainerWire.name`, live or since expired (an expired one cannot be assigned,
+ *     so such a request can only be denied or edited by her). Omitted when the
+ *     preference is `'any'`, absent, or names no staff row (a free-text slug such
+ *     as boarding's, or an old private-lesson or Board & Train row's, dev only);
+ *     a private-lesson or Board & Train approve reads each of those as "anyone".
+ */
+export interface StaffRequestWire extends PendingRequestWire {
+  owner: { id: string; name: string; location?: LocationKey };
+  dogs: { id: string; name: string }[];
+  preferred_trainer?: { staff_id: string; name: string };
+}
+
+/** `GET /staff/requests` response (9.0.0): `[]` when none matches. */
+export type GetStaffRequestsResponse = StaffRequestWire[];
+
+/**
+ * One trainer a family may name, or staff may assign, for a private lesson or a
+ * Board & Train (9.0.0; plan unit P49; design request-services-v1 §2.2 A9, §4.3;
+ * PL-10, PL-24, PL-27, BT-15). `GET /trainers` `[any principal]`, a family or a
+ * staffer, answers `GetTrainersResponse`: every live staff row (`expired_at` null)
+ * that has a lesson price or is Board & Train eligible, ordered by `name`; `[]` when
+ * none. A staffer with neither is absent: having a price is what "teaches lessons"
+ * means, so a trainer with no price is not offered by name and cannot be assigned a
+ * lesson. Read only. The two fields are seeded by `npm run staff:provision`'s roster
+ * (and the dev seed), never edited on a screen (`SIGNOFF.md:166-167`). It replaces the
+ * owner app's hard-coded trainer strips.
+ */
+export interface TrainerWire {
+  staff_id: string;
+  /** `staff.name`, as `BookingWire.trainer` shows it. */
+  name: string;
+  /** `staff.lesson_price_cents`: her flat price per private lesson, whatever the
+   *  number of dogs, paid after (Shanthi #6.8, `12-shanthi-answers-10-01.md:49`;
+   *  PL-22, PL-26). Omitted when she has none. */
+  private_lesson_price_cents?: number;
+  /** `staff.board_train_eligible`: she may be requested for, and assigned, a
+   *  Board & Train. Its price is the program's, not hers. */
+  board_and_train: boolean;
+}
+
+/** `GET /trainers` response (9.0.0). */
+export type GetTrainersResponse = TrainerWire[];
+
+/**
+ * One row of `GET /staff/service-bookings` `[staff]`, any role (9.0.0; plan unit P49;
+ * design request-services-v1 §2.2 A10): a booked private lesson or Board & Train, for
+ * the portal's Requests → Booked tab, the one staff screen a confirmed lesson appears
+ * on while the portal's calendar, bookings and lodging screens are hidden. The
+ * response is `GetStaffServiceBookingsResponse`: every live, uncancelled
+ * private-lesson and board-and-train booking of every family at both campuses, past
+ * ones included (no age bound: a started lesson or stay is closed out by a staff
+ * record, plan unit P51), ordered by `scheduled_at` ascending, ties by `booking_id`;
+ * `[]` when none. No query in 9.0.0. An owner principal is 403 `forbidden`. Read
+ * only, and it carries no card, payment or invoice field.
+ *   - `owner`: `id` and `name` as on `StaffRequestWire.owner` (the booking's campus
+ *     is its own `location`). `dogs`: the dogs on it, the lead first.
+ *   - `scheduled_at`: the start, ISO-8601; a Board & Train's equals `dropoff_at`.
+ *   - `duration_minutes`: a lesson's length in minutes. Omitted on a Board & Train.
+ *   - `dropoff_at` / `pickup_at`: a Board & Train's stay, the pick-up being the cue
+ *     transfer session. Omitted on a lesson.
+ *   - `trainer`: the assigned trainer, `name` as `TrainerWire.name`.
+ *   - `quoted_price_cents`: the price fixed at booking, as
+ *     `BookingWire.quoted_price_cents`. Nothing has been charged.
+ *   - `location`: the campus. A lesson's is the one staff chose at approve; a Board &
+ *     Train's is the family's home campus at her yes.
+ * `trainer` and `quoted_price_cents` are on every booking made from 9.0.0 (the
+ * approve and the yes both store them), and `location` on every one but a Board &
+ * Train whose family has no home campus. Each is omitted where its column is null,
+ * which only such a family or a row booked before 9.0.0 (dev only) can leave.
+ */
+export interface StaffServiceBookingWire {
+  booking_id: string;
+  category: 'private-lesson' | 'board-and-train';
+  owner: { id: string; name: string };
+  dogs: { id: string; name: string }[];
+  scheduled_at: string;
+  duration_minutes?: number;
+  dropoff_at?: string;
+  pickup_at?: string;
+  trainer?: { staff_id: string; name: string };
+  quoted_price_cents?: number;
+  location?: LocationKey;
+}
+
+/** `GET /staff/service-bookings` response (9.0.0). */
+export type GetStaffServiceBookingsResponse = StaffServiceBookingWire[];
 
 /**
  * `POST /bookings` 201 body (4.0.0-lg3.2; design §1.1:857-863; PAY-U04, DAY-U16).
@@ -2274,8 +2476,9 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  *
  * Every other category reaches its booking by a different door — group-class
  * via `POST /enrollments`, PL/B&T/boarding via `POST /requests` + staff
- * approve, evaluation via a staff-picked slot — so `category` is genuinely two
- * values here, not a narrowed `ServiceCategory`.
+ * approve (and for B&T, from 9.0.0, the family's yes, `POST
+ * /requests/:id/confirm`), evaluation via a staff-picked slot — so `category`
+ * is genuinely two values here, not a narrowed `ServiceCategory`.
  *
  * A day-program booking carries no arrival time (4.0.0-lg3.1; DAY-U11): each
  * session's `scheduled_at` is the campus's `day.dropoff_open_time` on its date,
@@ -2429,9 +2632,27 @@ export interface PostBookingsRequest {
  * Cross-field rules (`validatePostRequestBody`, `routes/requests.ts`):
  *   - board-and-train is SINGLE-DOG (`additional_dog_ids` rejected) and
  *     REQUIRES `length_weeks`; private-lesson + boarding must OMIT it.
+ *     From 9.0.0 (BREAKING by tightening; plan unit P49; design
+ *     request-services-v1 §2.2 A4) a board-and-train `length_weeks` must be 2:
+ *     any other value inside Zod's 1..12 is 422 here, because only the two-week
+ *     program has a price (`lib/boardTrainPricing.ts`).
+ *   - From 9.0.0 (A4), on a private-lesson or board-and-train request,
+ *     `focus.staff_preference` is `'any'` or the `staff_id` of a live staffer who
+ *     has a lesson price (private-lesson) or is Board & Train eligible
+ *     (board-and-train), exactly as `GET /trainers` lists them; any other value
+ *     (a slug such as `'rachel'` names no staff row) is 422. Omitted means
+ *     "anyone", as `'any'`. The trainer she names binds the staff approve
+ *     (`PostStaffRequestsApproveRequest`). Boarding's stays free text, as before.
  *   - `lesson_setting` is private-lesson only (Δ 2026-07-14).
  *   - dog ids distinct; every preferred date strictly in the future.
  * All of the above are `invalid_payload` (422).
+ *
+ * A private lesson is one request for all of its dogs (up to five): the
+ * trainer's price is flat whatever their number (Shanthi #6.8). From 9.0.0 the lead dog of a
+ * board-and-train request needs no passed evaluation (Allison s21,
+ * `SIGNOFF.md:124`); boarding's lead still does (`PostRequestsErrorDetails`).
+ * Sending a request books nothing and moves $0: staff approve it first
+ * (`PostStaffRequestsApproveRequest`).
  *
  * Two refusals have a code of their own (4.0.0-lg3.1), each 422 with no
  * `details`:
@@ -2440,7 +2661,11 @@ export interface PostBookingsRequest {
  *     campus is the family's home campus (`owners.location`, read on
  *     `MeWire.location`), and `offerings[category].offered` false there
  *     refuses. A family with no home campus is refused only when no campus
- *     offers the service. As seeded, all three services are off everywhere.
+ *     offers the service. As seeded, all three services are off everywhere
+ *     until M5.24, the last step of plan unit P49, turns private-lesson and
+ *     board-and-train on at both campuses; boarding stays off. The switch
+ *     stops new requests only: the staff approve and the family's yes do not
+ *     read it, so an approval in flight stands (build DECISIONS 463).
  *   - `beyond_booking_horizon` — a preferred date is later than the horizon,
  *     reckoned as on `PostBookingsRequest` (DAY-U10; PL-39, BRD-06, BT-09).
  *
@@ -2454,7 +2679,8 @@ export interface PostRequestsRequest {
   preferred_dates: string[];
   notes?: PendingRequestNotesWire;
   focus?: PendingRequestFocusWire;
-  /** board-and-train ONLY, and REQUIRED there. 1..12. */
+  /** board-and-train ONLY, and REQUIRED there: 2 (9.0.0; was 1..12, which Zod
+   *  still bounds, so 13 is 400 and 3 is 422). */
   length_weeks?: number;
   /** private-lesson ONLY. */
   lesson_setting?: LessonSetting;
@@ -2489,6 +2715,19 @@ export interface PostRequestsRequest {
  * `assertPreferredDatesWithinWindow`). `Idempotency-Key` required (the body
  * rides the request hash, so a same-key replay with a
  * different body is 422 `idempotency_mismatch`).
+ *
+ * From 9.0.0 (BREAKING by tightening; plan unit P49; design request-services-v1
+ * §2.2 A4; Fable r1 M2) the edit keeps `POST /requests`' rules for its category,
+ * each 422 `invalid_payload`: on a board-and-train request `length_weeks` may
+ * only be set to 2 (any other value, `null` included); on a private-lesson or
+ * board-and-train request `focus.staff_preference` must be `'any'` or a staff id
+ * as on `POST /requests`, and clearing it (`focus: null`, or an empty string)
+ * means "anyone". This edit is the family's road when none of her times suits
+ * the school: staff ask her to change them, and there is no counter offer. The
+ * edit and the staff approve take the same row lock, so an edit racing an
+ * approve has one winner: the edit loses with this route's 409 (no longer
+ * `'submitted'`), or the approve with its 422 (the time it chose is no longer
+ * one of hers).
  */
 export interface PatchRequestsRequest {
   preferred_dates?: string[];
@@ -2505,79 +2744,169 @@ export interface PatchRequestsRequest {
 }
 
 /**
- * `POST /requests/:id/confirm-payment` body — the board-and-train conversion
- * verb (Day 15, `[auth, $]`). Promoted 1.13.0 from `confirmBodySchema` in
- * `routes/requestConfirmPayment.ts` (digest bookings/M); pinned by
- * `PostRequestsConfirmPaymentBodyConformance`.
+ * `POST /requests/:id/confirm` `[owner]` (9.0.0; plan unit P49; design
+ * request-services-v1 §2.2 A2, §3.2; BT-20, BT-21, BT-52; Allison 413(2), 414):
+ * the family's **Yes, book it** to a Board & Train that staff approved. Her yes,
+ * and only her yes after staff approved, books it. **It moves $0**: no Stripe
+ * call, no order, no invoice and no charge. A card on file is required, and
+ * nothing is charged then: the stay is billed after the cue transfer session and
+ * the family taps to pay (Shanthi #6.4, `12-shanthi-answers-10-01.md:40-41`,
+ * `:146`; plan unit P51). It replaces `POST /requests/:id/confirm-payment`,
+ * removed in 9.0.0 with its body `PostRequestsConfirmPaymentRequest`: that route
+ * charged $2,000.00 at confirm, or wrote an invoice due on a date the owner chose
+ * (BUG-6, `BUSINESS-LOGIC/DISCREPANCIES.md:59`), and now answers 404.
  *
- * **`pay_later` is optional-with-a-default, and this type documents the
- * SEND side**: the schema is `z.boolean().optional().default(false)`, so a
- * client may omit it and the server reads `false`. That gap between
- * `z.input` and `z.infer` is precisely why §5.1.3 pins `z.input`.
+ * Body: none, or `{}`. It is `.strict()`, so any key is 400 `bad_request`. Nothing
+ * she sends can change what she says yes to: the dates, the trainer and the price
+ * are the request's `approved_*` fields as staff stored them. `Idempotency-Key`
+ * required; a same-key replay returns the stored 200.
  *
- * Cross-field rules — these two live in the schema itself, as `.refine`s
- * (§4.6 renders them as prose, not as types):
- *   - `due_at` is REQUIRED when `pay_later: true`.
- *   - `pickup_at` must be strictly after `dropoff_at`.
- * Both surface as 400 `bad_request` (this route's `parseBody` uses
- * `bad_request`, unlike the `invalid_payload` used by the routes above —
- * transcribed as-is; unifying it would be a behavior change).
+ * Refusals, in this order:
+ *   - 404 `not_found`: no live request with this id, or not hers.
+ *   - 409 `conflict`: the request is not a Board & Train in
+ *     `'approved-awaiting-payment'`: still `'submitted'`, already `'converted'`
+ *     (a yes under a new key), or `'cancelled'` by her Withdraw or by staff's Take
+ *     back.
+ *   - 409 `conflict`: the approved drop-off has passed (`approved_dropoff_at` at or
+ *     before now). The request stays waiting; she withdraws it and asks again, or
+ *     staff take it back.
+ *   - 409 `conflict`: the approved trainer is no longer live or no longer Board &
+ *     Train eligible. The request stays waiting; staff take it back and she asks
+ *     again (build DECISIONS 466).
+ *   - 409 `conflict` with `RequestStayConflictDetails` `reason: 'dog_removed'`: a
+ *     dog on the request (lead or additional) is no longer on her account. Message:
+ *     "{Dog} is no longer on your account, so nothing was booked. Withdraw this
+ *     request." (design § 14 A1.2).
+ *   - 409 `conflict` with `RequestStayConflictDetails` `reason: 'stay_overlap'`: a
+ *     dog on the request already holds a live, uncancelled boarding or Board & Train
+ *     booking whose Chicago-date window overlaps the approved one (dates, not hours:
+ *     a hand-back and a drop-off on the same Chicago day overlap). Message: "{Dog}
+ *     already has a stay booked over these dates, so nothing was booked. Withdraw
+ *     this request and send a new one with other dates, or call the school."
+ *     (design § 14 A1.1). The yes takes the dog lock for every dog on the request,
+ *     in sorted id order, before this read. One failing dog refuses the whole yes;
+ *     a stay is never booked for the other dogs alone. The request stays waiting.
+ *   - 422 with `details`, the booking gates for `'board-and-train'` as
+ *     `checkBookingGates` runs them: `payment_required` (no card on file, BT-21),
+ *     `vaccine_missing`, `agreement_unsigned`. Each may also arrive from the DB
+ *     trigger floor with empty arrays. There is no evaluation gate: from 9.0.0 a
+ *     dog with no passed evaluation may book a Board & Train (Allison s21,
+ *     `SIGNOFF.md:124`). The request stays waiting.
  *
- * Money semantics the client must not re-derive: the amount is SERVER
- * authority (`boardTrainPriceCentsForLengthWeeks(request.length_weeks)`) —
- * the body never carries a price.
- * `scheduled_at` and `dropoff_at` are the same instant for B&T (two columns
- * for the schema CHECK). Pay-now is all-or-nothing: a confirm that does not
- * reach `succeeded` cancels its PaymentIntent and throws 402 `payment_failed`
- * with a `PaymentFailedDetails` — that arm
- * has no per-endpoint alias this bump (see the §3.5 debt note in the
- * bookings patch). `Idempotency-Key` required.
+ * On success, one transaction under the request's row lock, the lock the staff
+ * approve, the staff deny, her Withdraw and her edit take, so a yes racing a
+ * Withdraw or a Take back has exactly one winner (Fable r2 M1): either the stay
+ * is booked and the request is `'converted'`, or the request is `'cancelled'` and
+ * no booking exists. The stay is inserted at the approved dates (`BookingWire
+ * .date` = `dropoff_at` = `approved_dropoff_at`; `pickup_at` =
+ * `approved_pickup_at`), with the approved trainer and `quoted_price_cents` =
+ * `approved_price_cents`, at her home campus (`MeWire.location`; none when she has
+ * none), and its reminders are queued as for any Board & Train. The request
+ * becomes `'converted'` with `converted_booking_id`, keeping
+ * `approved_by_staff_id`, the approver's id. 200 `PostRequestsConfirmResponse`:
+ * `request` is the converted request and `booking` the stay, an owner read
+ * (`can_cancel` `true` until the drop-off).
  */
-export interface PostRequestsConfirmPaymentRequest {
-  payment_method_id: string;
-  /** ISO-8601 datetime; equals `dropoff_at` for B&T. */
-  scheduled_at: string;
-  dropoff_at: string;
-  /** ISO-8601 datetime, strictly after `dropoff_at`. */
-  pickup_at: string;
-  location: LocationKey;
-  notes?: string;
-  /** Omitted ⇒ `false` (charge now). `true` writes an open invoice instead. */
-  pay_later?: boolean;
-  /** REQUIRED when `pay_later: true`. */
-  due_at?: string;
+export interface PostRequestsConfirmResponse {
+  request: PendingRequestWire;
+  booking: BookingWire;
 }
 
 /**
- * `POST /staff/requests/:id/approve` body `[staff]`. Promoted 1.13.0 from
- * `approveBodySchema` in `routes/staffRequests.ts` (digest bookings/M);
- * pinned by `PostStaffRequestsApproveBodyConformance`.
+ * `POST /staff/requests/:id/approve` body `[staff]`, any role. Promoted 1.13.0
+ * from `approveBodySchema` in `routes/staffRequests.ts` (digest bookings/M);
+ * pinned by `PostStaffRequestsApproveBodyConformance`. Rewritten 9.0.0,
+ * BREAKING by tightening (plan unit P49; design request-services-v1 §2.2 A3,
+ * §4.1, §4.4; PL-06, PL-08, PL-10, PL-24, BT-15; Allison 413(2), 414): nothing
+ * is booked until staff approve, staff approve one of the family's own times,
+ * and the trainer is one whose price she saw. No arm moves money.
  *
  * Flat and fully optional ON PURPOSE: which keys are required depends on the
  * LOCKED request row's category, which is not known until the row is read, so
  * a discriminated union on the body alone could not help (the comment over
- * `approveBodySchema`). The per-category requirements, enforced in
- * `validateApproveBody` as 422 `invalid_payload`:
- *   - private-lesson: `scheduled_at` AND `location` required; `pickup_at`
- *     rejected.
- *   - boarding: `scheduled_at`, `location` AND `pickup_at` required, with
- *     `pickup_at` strictly after `scheduled_at`.
- *   - board-and-train: the body is IGNORED entirely — approval parks the
- *     request at `'approved-awaiting-payment'` and creates no booking.
+ * `approveBodySchema`). The request must be `'submitted'` (else 409
+ * `conflict`). The per-category requirements, enforced in `validateLessonApproval`,
+ * `validateBoardTrainApproval` and `validateBoardingApproval` as 422
+ * `invalid_payload`. On every arm, a dog on the request that is no longer on the
+ * family's account is 422 "{Dog} is no longer on this family's account. Deny the
+ * request." (design § 14 A1.2):
+ *   - private-lesson: **staff confirm one of her times, and that books it.**
+ *     `scheduled_at` required, equal to one of her `preferred_dates` (the same
+ *     instant) and in the future (at or before now is 422, as a Board & Train's
+ *     `dropoff_at` is: a lesson confirmed after its time could not be cancelled
+ *     and would be billed; build DECISIONS 463);
+ *     `location` required; `trainer_staff_id` required: a live staffer
+ *     with a lesson price (`TrainerWire.private_lesson_price_cents`) who is the
+ *     one her `focus.staff_preference` names, unless she chose "anyone" (`'any'`,
+ *     no preference, or a value naming no staff row: an old row, dev only). Her
+ *     named trainer binds (PL-08): the price is per trainer, so another trainer
+ *     would change her price without her yes, and a named trainer since expired
+ *     or unpriced means staff ask her to edit the request (`PatchRequestsRequest`)
+ *     or deny it. `duration_minutes` optional, omitted ⇒ 60. `pickup_at` and
+ *     `dropoff_at` rejected. Then the booking gates run (422 with `details`:
+ *     `payment_required`, `vaccine_missing`, `agreement_unsigned`; a lesson has no
+ *     evaluation gate), the booking is inserted with that trainer,
+ *     `duration_minutes`, `location`, her `lesson_setting`, this body's `notes`
+ *     and `quoted_price_cents` = that trainer's lesson price now
+ *     (`BookingWire.quoted_price_cents`), the request becomes `'converted'`, and
+ *     her `'booking-confirmed'` notice names the time, the trainer and the price,
+ *     paid after.
+ *   - board-and-train: **staff approve dates and a trainer, and it is not booked
+ *     until the family says yes** (`POST /requests/:id/confirm`). The body is no
+ *     longer ignored. `dropoff_at` required, equal to one of her
+ *     `preferred_dates` and in the future; `pickup_at` required, on a later Chicago
+ *     date than it (at least one night: "The hand-back must be on a later day than
+ *     the drop-off."; the cue transfer session, when the dog is given back);
+ *     `trainer_staff_id` required: a live, Board & Train eligible staffer
+ *     (`TrainerWire.board_and_train`), the one she named if she named one. No dog
+ *     on the request may hold a live boarding or Board & Train stay whose
+ *     Chicago-date window overlaps [`dropoff_at`, `pickup_at`]: 422 "{Dog} already
+ *     has a stay booked {Mon 7 Dec} – {Sun 20 Dec}, so this one can't be approved
+ *     over it. Pick another of their starts or another hand-back, or deny it." (the
+ *     earliest overlapping stay; one with no pick-up prints "from {Mon 7 Dec}";
+ *     design § 14 A1.1). The approve takes the dog locks before this read, and the
+ *     boarding approve takes the same locks before its INSERT.
+ *     `scheduled_at`, `location`, `duration_minutes` and `notes` rejected:
+ *     nothing stores them, because the stay starts at `dropoff_at`, at her home
+ *     campus, from her yes. A request whose `length_weeks` is not 2 (an old row,
+ *     dev only) is refused in words, never a 500: only the two-week program has a
+ *     price. On success the request stores `approved_trainer`,
+ *     `approved_dropoff_at`, `approved_pickup_at` and `approved_price_cents`
+ *     (200000, `lib/boardTrainPricing.ts`), parks at
+ *     `'approved-awaiting-payment'` (waiting for her yes; nothing is paid),
+ *     creates no booking, and queues her one `'request-approved'` notice with the
+ *     deep link `{kind: 'request', id, params: {category: 'board-and-train'}}`.
+ *   - boarding: unchanged. `scheduled_at`, `location` AND `pickup_at` required,
+ *     with `pickup_at` strictly after `scheduled_at`; `trainer_staff_id`,
+ *     `dropoff_at` and `duration_minutes` rejected.
  * A `day-school` or `day-care` request cannot be created any more (3.0.0);
  * approving one that survives answers 409 `conflict` and books and charges
  * nothing; the row stays `submitted`, and deny still works.
  * An absent body is accepted (`request.body ?? {}`, the approve handler).
- * `Idempotency-Key` required.
+ * Zod's own bounds (a malformed instant, a non-UUID `trainer_staff_id`,
+ * `duration_minutes` outside 15..240 or not an integer, an unknown key) are 400
+ * `bad_request`. `Idempotency-Key` required.
  */
 export interface PostStaffRequestsApproveRequest {
-  /** ISO-8601 datetime with offset. Required for private-lesson + boarding. */
+  /** ISO-8601 datetime with offset. Required for private-lesson (one of her
+   *  `preferred_dates`, in the future) and boarding; rejected for board-and-train. */
   scheduled_at?: string;
-  /** ISO-8601 datetime with offset. Boarding ONLY, and required there. */
+  /** ISO-8601 datetime with offset, strictly after the start. Required for
+   *  boarding and board-and-train (9.0.0); rejected for private-lesson. */
   pickup_at?: string;
-  /** Required for private-lesson + boarding. */
+  /** Required for private-lesson + boarding; rejected for board-and-train. */
   location?: LocationKey;
+  /** Copied onto a private-lesson or boarding booking; rejected for
+   *  board-and-train. */
   notes?: string;
+  /** 9.0.0. A `TrainerWire.staff_id`. Required for private-lesson and
+   *  board-and-train; rejected for boarding. */
+  trainer_staff_id?: string;
+  /** 9.0.0. ISO-8601 datetime with offset. Board-and-train ONLY, and required
+   *  there: one of her `preferred_dates`, in the future. */
+  dropoff_at?: string;
+  /** 9.0.0. Private-lesson ONLY: whole minutes, 15..240; omitted ⇒ 60. */
+  duration_minutes?: number;
 }
 
 /**
@@ -2605,6 +2934,18 @@ export interface PostStaffRequestsApproveRequest {
  * branch on `PendingRequestWire.approved_by_staff_id` being present to render
  * "Denied by the school" vs "You cancelled this" (DATA-CONTRACT.md:1221).
  * An absent body is accepted. `Idempotency-Key` required.
+ *
+ * From 9.0.0 (plan unit P49; design request-services-v1 §2.2 A13; Fable r2 M2)
+ * the deny also takes back a Board & Train that staff approved and the family has
+ * not yet said yes to (`'approved-awaiting-payment'`): the portal's **Take back**,
+ * for a wrong approval or one whose drop-off has passed. A `'submitted'` request
+ * is denied as before; any other state is 409 `conflict`. No type change. The
+ * deny keeps its row lock, the one the family's yes takes, so a Take back racing
+ * her yes has one winner, and a yes after it is 409 `conflict`. The taken-back
+ * row keeps its `approved_*` fields, so she sees it as "Cancelled", not "Denied by
+ * the school" (`PendingRequestWire.approved_by_staff_id`), and a new Board &
+ * Train request for the same dog is then accepted, since the duplicate guard
+ * counts open requests only. Nothing is booked or moved.
  */
 export interface PostStaffRequestsDenyRequest {
   /** Accepted, length-capped at 500 — and then dropped. See above. */
@@ -2731,6 +3072,15 @@ export interface PostStaffBookingsDogsSendHomeRequest {
  * (`CreditLotDetailWire.reason`), and moves no money; `cancel_forfeited` is
  * `false`. A staff cancel's notice to the owner quotes this `reason` verbatim
  * (NOTIF-U17; design §2.9).
+ *
+ * From 9.0.0 (BREAKING in behaviour, no type change; plan unit P49; design
+ * request-services-v1 §2.2 A5; BT-32, PL-52) both whole-session cancels, the
+ * owner's and this one, refuse a private-lesson or board-and-train booking with
+ * 409 `conflict` once its start has passed (`dropoff_at`, else `scheduled_at`,
+ * the instant `BookingWire.date` carries): a started lesson or stay is ended by
+ * a staff record (plan unit P51), never by a $0 cancel. Before its start the
+ * cancel is accepted and moves $0, with no credit and no money (nothing was
+ * charged). `BookingWire.can_cancel` reads the same instant.
  */
 export interface PostStaffBookingsCancelRequest {
   reason?: string;
@@ -2779,8 +3129,9 @@ export interface PostStaffBookingsDogsCancelRequest {
  * unchanged, once none of the refusals below applies: they run first. A retry
  * with the same `Idempotency-Key` replays the stored answer whatever the clock,
  * but a removal sent again under a NEW key after the day ended gets 409
- * `session_ended` although the first one landed, so a client re-reads the
- * booking on that refusal (build DECISIONS 428, 436). No route turns
+ * `session_ended`, or after her check-in 409 `session_checked_in`, although
+ * the first one landed, so a client re-reads the booking on either refusal
+ * (build DECISIONS 428, 436, 474). No route turns
  * after-school on after the booking.
  *
  * Refusals, in this order (the one-dog cancel's, without its switch): 404
@@ -2931,11 +3282,16 @@ export type PostBookingsErrorDetails =
  * Every `details` arm `POST /requests` can 422 with (digest bookings/L).
  * Much smaller than the booking set by design: submission runs no payment,
  * vaccine, agreement, credit or capacity gate — those fire later, at the
- * staff approve verb's booking INSERT (the comment over the `POST /requests`
- * handler). Two arms only:
+ * booking INSERT: the staff approve verb's for a private lesson or boarding,
+ * and from 9.0.0 the family's yes (`POST /requests/:id/confirm`) for a Board &
+ * Train (the comment over the `POST /requests` handler). Two arms only:
  *   1. `evaluation_required` — `evaluationRequiredError` in the handler, the
- *      LEAD dog only, and only for board-and-train + boarding. Private-lesson
- *      is staff-curated and does not gate here.
+ *      LEAD dog only, and only for boarding. From 9.0.0 board-and-train leaves
+ *      the evaluation gate here, at its yes and in the DB trigger (plan unit
+ *      P49; design request-services-v1 §2.2 A12, §4.5; Allison s21,
+ *      `SIGNOFF.md:124`: a dog with no passed evaluation may book an
+ *      evaluation, a private lesson, a Board & Train or a group class).
+ *      Private-lesson is staff-curated and does not gate here.
  *   2. `already_requested`   — `alreadyRequestedError` in the handler, the
  *      residential duplicate guard (board-and-train + boarding,
  *      roster-matched). Private-lesson is EXEMPT: an owner may keep several
@@ -3502,11 +3858,12 @@ export interface FeedingWire {
  *   - `is_alumni` is STORED from 5.0.0-lg4.2 (`dogs.is_alumni`, M4.11; ALUM-U02):
  *     set when the fifth live `dog_completed_programs` row is recorded, and never
  *     cleared by un-recording a level.
- *   - `evaluation_status` is the hard booking gate for the four in-school
- *     categories (R8 @ :54). It is TODAY owner-writable through `POST`/`PATCH
- *     /dogs` — the trust inversion recorded as DISCREPANCIES BUG-11 /
- *     dogs-evaluations.md D2 @ :204. This contract documents that; the fix is
- *     phase 3 (Adjudication 5), not this bump.
+ *   - `evaluation_status` is the hard booking gate for day school, day care and
+ *     boarding. R8 @ :54 names four categories; from 9.0.0 board-and-train
+ *     leaves the gate (A12; Allison s21, `SIGNOFF.md:124`). It is owner-writable
+ *     through `PATCH /dogs/:id` until P09 (EVAL-U02) — the trust inversion
+ *     recorded as DISCREPANCIES BUG-11 / dogs-evaluations.md D2 @ :204. From
+ *     9.0.0 `POST /dogs` refuses it from the owner (A14, `PostDogsRequest`).
  *   - There is NO `field_overrides` key: DATA-CONTRACT §B promises one and
  *     mobile reads one, but no server code has ever emitted it (DRIFT-27).
  *     Deciding it is a named out-of-scope design item (§17).
@@ -3687,11 +4044,19 @@ export interface StaffDogWire {
  *     null/blank → `''` (`dogs.ts:309-310`).
  *   - `Idempotency-Key` header is REQUIRED on this and every dogs mutation.
  *
- * **Transcribed embarrassment (§14.1):** `evaluation_status` — including
- * `'passed'` — is accepted from the OWNER here, and no staff verb sets it, so
- * an owner can clear the evaluation booking gate (DISCREPANCIES BUG-11;
- * BUSINESS-LOGIC/dogs-evaluations.md D2 @ :204). Documented, deliberately NOT
- * tightened in this bump; the fix is phase 3 / Adjudication 5.
+ * **The owner may not set a dog's evaluation (9.0.0, BREAKING by tightening;
+ * plan unit P49, contract item A14; build DECISIONS 459).** Until 9.0.0 the
+ * owner's `evaluation_status` (including `'passed'`) and `evaluation_date`
+ * were stored as sent, so an owner could clear the evaluation booking gate
+ * (DISCREPANCIES BUG-11; BUSINESS-LOGIC/dogs-evaluations.md D2 @ :204). From
+ * 9.0.0 an OWNER body carrying either key, with any value (`null` and
+ * `'not-evaluated'` included), is 400 `bad_request` right after the parse:
+ * before the spay rule's 422, the vet check and any write. Every dog an owner
+ * creates is `'not-evaluated'` with no evaluation date. No type change: both
+ * keys stay optional here so the schema pin holds, until P09 (EVAL-U02) makes
+ * the owner body `.strict()` without them and removes them from this type.
+ * Staff and seed paths that write a dog's evaluation are unchanged. BUG-11's
+ * POST arm closes here; its PATCH arm stays open (`PatchDogsRequest`).
  */
 export interface PostDogsRequest {
   name: string;
@@ -3726,8 +4091,11 @@ export interface PostDogsRequest {
  *     dog-profile asset (`dogs.ts:414-416`).
  *   - Answering `spayed_neutered` anything but `false` clears a stale
  *     `spay_neuter_planned_on` in the same write (`dogs.ts:384-391`).
- *   - Same `assertSpayFieldsCoherent` rule and same owner-writable
- *     `evaluation_status` caveat as `PostDogsRequest`.
+ *   - Same `assertSpayFieldsCoherent` rule as `PostDogsRequest`.
+ *   - **A known gap until P09 (EVAL-U02):** this owner edit still stores
+ *     `evaluation_status` (including `'passed'`) and `evaluation_date` as sent,
+ *     so an owner can still clear the evaluation booking gate here (BUG-11's
+ *     PATCH arm). 9.0.0 closes only the create's arm (`PostDogsRequest`, A14).
  */
 export interface PatchDogsRequest {
   name?: string;
@@ -4139,9 +4507,13 @@ export interface EnrollmentWire {
    *  `cohorts.location`, FK → `locations.slug` (`schema.sql:548`) — the SAME
    *  column {@link CohortWire.location} already types as `LocationKey`. */
   location: LocationKey;
+  /** An ISO-8601 instant (`pgTimestampToIso`, 9.0.0). Before 9.0.0 the server sent
+   *  Postgres text such as `'2026-11-23 15:00:00+00'`, which the owner app's Hermes
+   *  parses to NaN (build DECISIONS 489); a client should still read both forms. */
   start_date: string;
   weekly_time: string | null;
   weeks: number;
+  /** An ISO-8601 instant, as {@link EnrollmentWire.start_date} (9.0.0). */
   first_session_at: string;
   payment_status: EnrollmentPaymentStatus;
   can_withdraw: boolean;
@@ -4936,6 +5308,25 @@ export function deepLinkToPath(link: NotificationDeepLink): string {
     // 2026-07-30). Pointing at a booking that doesn't exist would 404.
     case 'waitlist':
       return `/waitlist/${link.id}`;
+    // One of her requests (9.0.0; plan unit P49; design request-services-v1 §2.2
+    // A11): `link.id` is the request's id and `params.category` its service, which
+    // picks the request-detail page the owner app already opens. Deliberately not
+    // a booking link, as `waitlist`: when `request-approved` fires nothing is
+    // booked yet, and her yes books it. A missing or other category throws here,
+    // as the `report` arm's missing dog does, rather than persist a link the app
+    // cannot open.
+    case 'request': {
+      const category = link.params?.category;
+      if (category === 'board-and-train') {
+        return `/request-detail/boardtrain?id=${link.id}`;
+      }
+      if (category === 'private-lesson') {
+        return `/request-detail/private?id=${link.id}`;
+      }
+      throw new Error(
+        `deepLinkToPath: request link category must be board-and-train | private-lesson, got ${String(category)}`,
+      );
+    }
     default: {
       const unreachable: never = link;
       throw new Error(
@@ -5679,8 +6070,8 @@ export interface PatchPaymentMethodsRequest {
 // rides `InvoicePayWire.charge_blocker` in a 201 body. The one `details`-carrying
 // money arm, `payment_failed` / `PaymentFailedDetails`, is a 402 and not a 422,
 // so it is no alias here either: `InvoicePayRequest` documents it for this route,
-// and enrollments, requestConfirmPayment, the pack purchase and the top-up emit it
-// too (wire.ts §1, design §3.3).
+// and enrollments, the pack purchase and the top-up emit it too (wire.ts §1, design
+// §3.3). `requestConfirmPayment` emitted it until 9.0.0 removed that route.
 
 // ---- (e) domain helpers ----------------------------------------------------
 //
@@ -7076,8 +7467,12 @@ export interface CreditSettingsWire extends SettingsAuditWire {
 export interface ServiceOfferingWire {
   /** Seed false for boarding, board-and-train and private-lesson at both
    *  campuses and for day-care at Fayetteville; true for the rest
-   *  (§2.6:3719-3721). Editable by any role, so turning one on is a
-   *  deliberate act in the settings editor (§2.6:3722; DECISIONS 69). */
+   *  (§2.6:3719-3721). M5.24, the last step of plan unit P49 (9.0.0; build
+   *  DECISIONS 393), sets private-lesson and board-and-train true at both
+   *  campuses, with `client_visible`, in the seed and on the dev database;
+   *  boarding stays false, opened per family on Shanthi's switch. Editable by
+   *  any role, so turning one on or off is a deliberate act in the settings
+   *  editor (§2.6:3722; DECISIONS 69). */
   offered: boolean;
   /** Whether the owner app shows the tile; seeded as `offered`
    *  (§2.6:3719-3721). */

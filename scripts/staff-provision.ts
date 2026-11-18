@@ -35,6 +35,11 @@
  *      "home_locations": ["bentonville"], "responder": "default" }, …]
  * `role` is owner | manager | trainer; `home_locations` a non-empty set of
  * `locations` slugs; `responder` (optional) default | backup, both or neither.
+ * From wire 9.0.0 (plan unit P49): `lesson_price_cents` (optional, a whole number of
+ * cents above 0: her flat private-lesson price) and `board_train_eligible` (optional,
+ * true | false), e.g. `"lesson_price_cents": 15000, "board_train_eligible": true`. Both
+ * are set from the roster on every run, each change printed first: a key left out
+ * clears it (no price, not eligible).
  *
  * Exit codes: 0 done; 1 refused or failed (the output says what was written);
  * 2 bad usage.

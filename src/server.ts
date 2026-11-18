@@ -24,10 +24,11 @@ import { registerNotificationsRoute } from './routes/notifications.js';
 import { registerPaymentMethodsRoute } from './routes/paymentMethods.js';
 import { registerRatesRoute } from './routes/rates.js';
 import { registerReportsRoute } from './routes/reports.js';
-import { registerRequestConfirmPaymentRoute } from './routes/requestConfirmPayment.js';
+import { registerRequestConfirmRoute } from './routes/requestConfirm.js';
 import { registerRequestsRoute } from './routes/requests.js';
 import { registerRequiredVaccinesRoute } from './routes/requiredVaccines.js';
 import { registerSettingsRoute } from './routes/settings.js';
+import { registerTrainersRoute } from './routes/trainers.js';
 import { registerStaffAlumniRoute } from './routes/staffAlumni.js';
 import { registerStaffBookingsRoute } from './routes/staffBookings.js';
 import { registerStaffCheckinRoute } from './routes/staffCheckin.js';
@@ -42,6 +43,7 @@ import { registerStaffRatesRoute } from './routes/staffRates.js';
 import { registerStaffRefundsRoute } from './routes/staffRefunds.js';
 import { registerStaffReportsRoute } from './routes/staffReports.js';
 import { registerStaffRequestsRoute } from './routes/staffRequests.js';
+import { registerStaffServiceBookingsRoute } from './routes/staffServiceBookings.js';
 import { registerStaffSettingsRoute } from './routes/staffSettings.js';
 import { registerStaffThreadsRoute } from './routes/staffThreads.js';
 import { registerStripeWebhookRoute } from './routes/stripeWebhook.js';
@@ -133,8 +135,10 @@ export function buildApp(): FastifyInstance {
   registerCreditPackagesRoute(app); // [auth] — catalog (owner + staff)
   registerRatesRoute(app); // [auth] — catalog (owner + staff)
   registerRequestsRoute(app); // [auth] — owner-only
+  registerTrainersRoute(app); // [auth] — catalog (owner + staff): the lesson and B&T trainers (9.0.0)
   registerSettingsRoute(app); // [auth] — the owner settings document (2.0.0), read from pg every call
   registerStaffRequestsRoute(app); // [staff] — Day-12 portal verb 1 (approve / deny) + Day-19 queue
+  registerStaffServiceBookingsRoute(app); // [staff] — the booked lessons and stays, read only (9.0.0)
   registerStaffDayCapacityRoute(app); // [staff] — PUT/DELETE one date's cap (4.0.0-lg3.1)
   registerStaffCreditPackagesRoute(app); // [staff] — a catalog row's expiry window (CRED-U08)
   registerStaffCreditsRoute(app); // [staff] — an owner's pools, hand edits, a lot's date (CRED-U14, CRED-U15)
@@ -159,7 +163,7 @@ export function buildApp(): FastifyInstance {
   registerPaymentMethodsRoute(app); // [auth] — owner-only
   registerDeviceTokensRoute(app); // [auth] — owner-only (Day-18c push registration)
   registerInvoicesRoute(app); // [auth, $] — Day-15 invoice settlement
-  registerRequestConfirmPaymentRoute(app); // [auth, $] — Day-15 B&T conversion
+  registerRequestConfirmRoute(app); // [auth] — the family's Board & Train yes; moves $0 (9.0.0)
   registerUploadsSignRoute(app); // [auth] — Day-17 presigned R2 PUT
   registerMediaRoute(app); // [auth] — Day-17 register/read/soft-expire media
   registerWorkersTickRoute(app); // [public, signed] — Day-16 scheduler trigger
