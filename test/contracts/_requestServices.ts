@@ -436,6 +436,26 @@ export async function holdCampusRow(slug: string): Promise<{ release: () => Prom
   };
 }
 
+/**
+ * A third connection holding one dog's row `FOR UPDATE` until `release`; releasing twice is a
+ * no-op. Her `DELETE /dogs/:id` takes the dog's lock and then waits here, at its `UPDATE`.
+ */
+export async function holdDogRow(dogId: string): Promise<{ release: () => Promise<void> }> {
+  const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  await client.query('BEGIN');
+  await client.query('SELECT id FROM dogs WHERE id = $1 FOR UPDATE', [dogId]);
+  let open = true;
+  return {
+    release: async () => {
+      if (!open) return;
+      open = false;
+      await client.query('COMMIT').catch(() => undefined);
+      await client.end();
+    },
+  };
+}
+
 /** Whether some transaction holds this dog's lock (`dog:<id>`): a try from a fourth connection fails. */
 export async function dogLockHeld(dogId: string): Promise<boolean> {
   const client = new pg.Client({ connectionString: process.env.DATABASE_URL });

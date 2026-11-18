@@ -1707,18 +1707,21 @@ export async function clearInvoiceReferrers(): Promise<void> {
   await db.delete(orders);
 }
 
-/** The three services `POST /requests` takes, each seeded off at both campuses. */
+/** The three services `POST /requests` takes. From M5.24 (P49) the schema seeds
+ *  private-lesson and board-and-train on at both campuses, and boarding off at both. */
 const REQUEST_SERVICES = ['boarding', 'board-and-train', 'private-lesson'] as const;
 
 /**
- * The one way a test switches the request services (P13 ruling (f)). The schema
- * seeds them off, so `POST /requests` answers `service_not_offered` until one is
- * on, and every test that posts a request calls this with `true` first and `false`
- * after. Pass `only` to move one campus or one service.
+ * The one way a test switches the request services (P13 ruling (f)). Every test that
+ * posts a request calls this with `true` first and `false` after, so it never depends
+ * on what the seed, or another suite, left on this database. Pass `only` to move one
+ * campus or one service.
  *
- * `false` writes the seed, not a saved copy of the document: a run that dies
- * between the two calls leaves them on, and a snapshot taken by the next run would
- * then restore "on" for good.
+ * `false` writes all three off: a fixed state, not a saved copy of the document, so a
+ * run that dies between the two calls cannot leave a snapshot that restores "on" for
+ * good. Since M5.24 (P49) that is no longer the seed, which offers private-lesson and
+ * board-and-train at both campuses; a test that needs the seed writes it from
+ * `schema.sql` itself (`_seedOfferings.ts`).
  */
 export async function setRequestServicesOffered(
   offered: boolean,

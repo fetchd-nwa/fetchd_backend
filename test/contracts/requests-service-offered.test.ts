@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { afterEach, test } from 'node:test';
-import { eq } from 'drizzle-orm';
+import { eq, isNotNull } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   dayProgramSettings,
@@ -17,6 +17,7 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
+import { seededOfferings } from './_seedOfferings.js';
 
 /**
  * P13 item 0b (ruling (f); design §2.6:3727, wire 4.0.0-lg3.1): `POST /requests`
@@ -182,5 +183,64 @@ test(
     await setRequestServicesOffered(true, { location: 'fayetteville', services: ['boarding'] });
     const retried = await postBoarding(app, key);
     assert.equal(retried.statusCode, 201);
+  },
+);
+
+// P49, M5.24 (her 393): the seed offers private lessons and Board & Train at both campuses,
+// and boarding at neither. Written here from schema.sql's own seed, not from whatever
+// another suite left on this database (`setRequestServicesOffered(false)` writes all three
+// off after many suites), and put back afterwards.
+test(
+  'M5.24: with both campuses as schema.sql seeds them, a lesson and a Board & Train are accepted, and boarding answers 422 service_not_offered',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const saved = await db
+      .select({ location: dayProgramSettings.location, offerings: dayProgramSettings.offerings })
+      .from(dayProgramSettings)
+      .where(isNotNull(dayProgramSettings.location));
+    const seed = seededOfferings();
+    try {
+      for (const campus of ['fayetteville', 'bentonville'] as const) {
+        await db
+          .update(dayProgramSettings)
+          .set({ offerings: seed[campus] })
+          .where(eq(dayProgramSettings.location, campus));
+      }
+      const app = ownerApp();
+      const send = async (payload: Record<string, unknown>) => {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/requests',
+          headers: { 'idempotency-key': randomUUID() },
+          payload,
+        });
+        const body = res.json() as { id?: string; error?: { code: string } };
+        if (body.id !== undefined) createdRequestIds.push(body.id);
+        return { statusCode: res.statusCode, code: body.error?.code, body: res.body };
+      };
+      const lesson = await send({
+        category: 'private-lesson',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: PREFERRED,
+      });
+      assert.equal(lesson.statusCode, 201, lesson.body);
+      const stay = await send({
+        category: 'board-and-train',
+        lead_dog_id: FIXTURE_IDS.dog1Id,
+        preferred_dates: PREFERRED,
+        length_weeks: 2,
+      });
+      assert.equal(stay.statusCode, 201, stay.body);
+      const boarding = await send(boardingBody());
+      assert.equal(boarding.statusCode, 422, boarding.body);
+      assert.equal(boarding.code, 'service_not_offered');
+    } finally {
+      for (const row of saved) {
+        await db
+          .update(dayProgramSettings)
+          .set({ offerings: row.offerings })
+          .where(eq(dayProgramSettings.location, row.location as 'fayetteville' | 'bentonville'));
+      }
+    }
   },
 );

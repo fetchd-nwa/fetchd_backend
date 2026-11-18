@@ -584,6 +584,68 @@ describe('B-N1: her DELETE /dogs/:id racing the yes for the same dog, on real co
   );
 });
 
+describe('B-N1, the other order: her delete holds Waffles\' lock first, on real connections', () => {
+  // A third connection holds Waffles' row FOR UPDATE, so her delete takes Waffles' dog lock and
+  // stops at its UPDATE. The yes then waits on that dog lock, and reads Waffles only once her
+  // removal has committed: 409 dog_removed, nothing booked. Red if the yes reads its dogs
+  // before it takes their locks.
+  test(
+    "her delete holds Waffles' lock, the yes waits for it, then reads her removal: 409, 0 bookings",
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const id = await approvedBoardTrain();
+      const answered: string[] = [];
+      const row = await rs.holdDogRow(WAFFLES);
+      let removal: Promise<{ statusCode: number; body: string }> | undefined;
+      let yes: Promise<{ statusCode: number; body: string }> | undefined;
+      try {
+        removal = rs.deleteDog(WAFFLES).then((res) => {
+          answered.push('delete');
+          return res;
+        });
+        await rs.blockedOrAnswered(1, removal);
+        const deleteHeld = {
+          waiting: await rs.lockWaits(),
+          wafflesLockHeld: await rs.dogLockHeld(WAFFLES),
+        };
+        yes = rs.confirm(id).then((res) => {
+          answered.push('yes');
+          return res;
+        });
+        await rs.blockedOrAnswered(2, yes);
+        const yesFired = { waiting: await rs.lockWaits(), answered: [...answered] };
+        await row.release();
+        const [removalAnswer, yesAnswer] = await Promise.all([removal, yes]);
+        assert.deepEqual(
+          deleteHeld,
+          { waiting: ['update "dogs" set'], wafflesLockHeld: true },
+          "her delete holds Waffles' lock and waits at its UPDATE",
+        );
+        assert.deepEqual(
+          yesFired,
+          { waiting: ['SELECT pg_advisory_xact_lock(hashtext($1))', 'update "dogs" set'], answered: [] },
+          "the yes waits on Waffles' lock while her delete holds it",
+        );
+        assert.equal(removalAnswer.statusCode, 204, removalAnswer.body);
+        const error = refused(
+          yesAnswer,
+          409,
+          'conflict',
+          'Waffles is no longer on your account, so nothing was booked. Withdraw this request.',
+        );
+        assert.deepEqual(error.details, { kind: 'conflict', reason: 'dog_removed', dog_id: WAFFLES });
+        assert.deepEqual(answered, ['delete', 'yes']);
+        assert.deepEqual(await rs.testBookings(), []);
+        assert.equal((await rs.requestRow(id))?.status, 'approved-awaiting-payment');
+      } finally {
+        await row.release();
+        await Promise.allSettled([removal, yes]);
+        await db.update(dogs).set({ expiredAt: null }).where(eq(dogs.id, WAFFLES));
+      }
+    },
+  );
+});
+
 describe('A1 item 3: the one-night floor, on Chicago dates', () => {
   test(
     'a hand-back on the drop-off\'s Chicago day → 422 in words, up to 23:59:59.999; Tue 00:00 is the next day and approves',

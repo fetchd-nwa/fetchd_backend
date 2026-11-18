@@ -8,6 +8,7 @@ import pg from 'pg';
 import { parseStep } from '../../src/db/migrate.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
+import { seededOfferings, type OfferingsDocument } from './_seedOfferings.js';
 
 /**
  * Plan unit P49's steps (`migrations/rs1/`; design request-services-v1 §5.1). The rehearsal
@@ -24,6 +25,7 @@ const stepBytes = (name: string): Buffer => fs.readFileSync(path.join(STEPS, nam
 
 const M520 = 'M5.20_notification_request_approved.sql';
 const M523 = 'M5.23_stale_bt_requests.sql';
+const M524 = 'M5.24_offer_private_and_bt.sql';
 
 async function withClient(run: (client: pg.Client) => Promise<void>): Promise<void> {
   const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
@@ -112,6 +114,70 @@ test(
       });
       assert.deepEqual(byId(after, newFlow), byId(before, newFlow), 'a row with approved dates moved');
       assert.deepEqual(byId(after, converted), byId(before, converted), 'a converted row moved');
+    });
+  },
+);
+
+// ── M5.24: the offerings flip (her 393), its own commit, landed last ─────────────
+
+const on = { offered: true, client_visible: true, name: null, description: null };
+const off = { offered: false, client_visible: false, name: null, description: null };
+
+/**
+ * Both campuses' documents before M5.24, as literals: `schema.sql`'s seed at the P49 base
+ * (`be82967`, `:1247-1253` and `:1260-1266`). Lessons, Board & Train and boarding off at
+ * both; day care off at Fayetteville.
+ */
+const PRE_M524: Record<'fayetteville' | 'bentonville', OfferingsDocument> = {
+  fayetteville: {
+    'day-school': on,
+    'day-care': off,
+    'group-class': on,
+    evaluation: on,
+    'private-lesson': off,
+    'board-and-train': off,
+    boarding: off,
+  },
+  bentonville: {
+    'day-school': on,
+    'day-care': on,
+    'group-class': on,
+    evaluation: on,
+    'private-lesson': off,
+    'board-and-train': off,
+    boarding: off,
+  },
+};
+
+test('M5.24 runs inside a transaction', () => {
+  const m524 = parseStep(M524, stepBytes(M524));
+  assert.ok(m524.ok, m524.ok ? '' : m524.reason);
+  assert.equal(m524.step.directives.has('no-transaction'), false);
+});
+
+test(
+  "M5.24 seed equals step: from the pre-M5.24 documents, the step's own text leaves both campuses exactly as schema.sql seeds them, boarding off",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    await withClient(async (client) => {
+      for (const campus of ['fayetteville', 'bentonville'] as const) {
+        await client.query('UPDATE day_program_settings SET offerings = $1::jsonb WHERE location = $2', [
+          JSON.stringify(PRE_M524[campus]),
+          campus,
+        ]);
+      }
+      await client.query(stepBytes(M524).toString('utf8'));
+      const { rows } = await client.query<{ location: string; offerings: OfferingsDocument }>(
+        `SELECT location, offerings FROM day_program_settings
+          WHERE location IN ('fayetteville', 'bentonville') ORDER BY location`,
+      );
+      const after = Object.fromEntries(rows.map((r) => [r.location, r.offerings]));
+      assert.deepEqual(after, seededOfferings(), "the step's documents are schema.sql's seed");
+      for (const campus of ['fayetteville', 'bentonville'] as const) {
+        assert.deepEqual(after[campus]?.boarding, off, `boarding moved at ${campus}`);
+        assert.deepEqual(after[campus]?.['private-lesson'], on, `private-lesson at ${campus}`);
+        assert.deepEqual(after[campus]?.['board-and-train'], on, `board-and-train at ${campus}`);
+      }
     });
   },
 );

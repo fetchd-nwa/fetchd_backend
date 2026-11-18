@@ -1268,6 +1268,9 @@ INSERT INTO day_program_settings (
   0, 1, 0
 );
 
+-- M5.24 (P49; wire 9.0.0; build DECISIONS 393): private-lesson and board-and-train are
+-- offered and shown at both campuses; boarding stays off, opened per family on Shanthi's
+-- switch. `rs1-steps.test.ts` holds this seed equal to the step's own result.
 INSERT INTO day_program_settings (
   location, offerings, open_weekdays_list, daily_capacity_dogs,
   dropoff_open_time, dropoff_close_time, pickup_open_time, pickup_close_time,
@@ -1279,8 +1282,8 @@ INSERT INTO day_program_settings (
     "day-care": {"offered": false, "client_visible": false, "name": null, "description": null},
     "group-class": {"offered": true, "client_visible": true, "name": null, "description": null},
     "evaluation": {"offered": true, "client_visible": true, "name": null, "description": null},
-    "private-lesson": {"offered": false, "client_visible": false, "name": null, "description": null},
-    "board-and-train": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "private-lesson": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "board-and-train": {"offered": true, "client_visible": true, "name": null, "description": null},
     "boarding": {"offered": false, "client_visible": false, "name": null, "description": null}}',
   '{1,2,3,4,5}', 15,
   '07:30', '08:30', '16:30', '17:30',
@@ -1292,8 +1295,8 @@ INSERT INTO day_program_settings (
     "day-care": {"offered": true, "client_visible": true, "name": null, "description": null},
     "group-class": {"offered": true, "client_visible": true, "name": null, "description": null},
     "evaluation": {"offered": true, "client_visible": true, "name": null, "description": null},
-    "private-lesson": {"offered": false, "client_visible": false, "name": null, "description": null},
-    "board-and-train": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "private-lesson": {"offered": true, "client_visible": true, "name": null, "description": null},
+    "board-and-train": {"offered": true, "client_visible": true, "name": null, "description": null},
     "boarding": {"offered": false, "client_visible": false, "name": null, "description": null}}',
   '{1,2,3,4,5}', 15,
   '07:30', '08:30', '16:30', '17:30',

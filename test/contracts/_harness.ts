@@ -123,9 +123,11 @@ export function registerFixtureHooks(): void {
 
 /**
  * A test file that posts a request calls this once at module load (P13 ruling
- * (f)): the schema seeds boarding, board-and-train and private lessons off, so
- * `POST /requests` answers `service_not_offered` until they are on. The one door
- * is `setRequestServicesOffered`, and `after` puts the seed back.
+ * (f)): `before` switches boarding, board-and-train and private lessons on, so
+ * `POST /requests` never answers `service_not_offered` for a reason the test is not
+ * about. The one door is `setRequestServicesOffered`, and `after` switches all three
+ * off again. That is not the seed since M5.24 (P49), which offers lessons and Board &
+ * Train: it is a fixed state the next suite starts from.
  */
 export function registerRequestServicesOn(): void {
   if (!DB_CONFIGURED) return;
