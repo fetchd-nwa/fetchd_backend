@@ -193,7 +193,13 @@ describe('PATCH /staff/settings/cxl: per_dog_cancel_enabled is the one live key,
     'the edit writes one audit row, naming the staffer, holding the value it replaced',
     SKIP_WHEN_NO_DB,
     async () => {
-      const since = new Date().toISOString();
+      // `since` comes from the database's clock, the same clock that stamps
+      // `audit_log.at`. A host `new Date()` here compared two clocks: with the
+      // Docker VM behind, Amber's row fell before `since` (0 rows); with it
+      // ahead, the afterEach reset just before this test fell after it (2 rows,
+      // the second actorless). IDEAS (P22 fix 1, DECISIONS 323); O-CREDITS
+      // DECISIONS 620.
+      const since = (await pool.query<{ t: string }>('SELECT clock_timestamp()::text AS t')).rows[0]!.t;
       cxlOf(await patchCxl(appAs(AMBER), { per_dog_cancel_enabled: false }));
       const { rows } = await pool.query<{ op: string; actor: string; before: { per_dog_cancel_enabled: boolean } }>(
         `SELECT op, actor, before FROM audit_log
