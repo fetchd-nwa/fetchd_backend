@@ -94,8 +94,15 @@
  * (`DogWire.alumni_at`; her #33, build DECISIONS 671, 702(1), 704). It is the
  * second pre-release counter toward 9.2.0, which takes it back with 9.2.0-pre.1
  * (the note's §1.2). It takes no minor either, so no label above moves.
+ * 9.2.0 (plan unit P45 with its one-off O-MSG-LIVE, additive): messaging, live, her 11-18
+ * "i want it just like imessage" (build DECISIONS 549, 583, 589; designs/messaging-live-v1.md
+ * §4 W1-W11 and Amendments A1 and A2, closed at DECISIONS 610), with the S45/S46 part of
+ * design 7.1.0 that P45 always set (once build 12.2.0; A1.4). Built before the pilot by her
+ * "B" (583), so under the same rule P51 moves to 9.3.0 and S42/P31 to 9.4.0, both still
+ * provisional. It takes back 9.2.0-pre.1 and 9.2.0-pre.2, whose paragraphs above stand as
+ * written (the after-count note §1.1-§1.2).
  */
-export const WIRE_CONTRACT_VERSION = '9.2.0-pre.2';
+export const WIRE_CONTRACT_VERSION = '9.2.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -2177,12 +2184,34 @@ export interface PostMediaRequest {
  *  (`media.ts:259-274`; reports-media.md:83 R25). Body cap 25 MB
  *  (`MAX_UPLOAD_BYTES`); the request's `Content-Type` header must match
  *  `purpose` (`media.ts:251-252`); an empty body 400s. `dog_id` is DERIVED from
- *  the report and is deliberately not a parameter. Response is `MediaWire` (201). */
+ *  the report and is deliberately not a parameter. Response is `MediaWire` (201).
+ *  From 9.2.0 the route also takes a second arm,
+ *  `PostMediaUploadMessageAttachmentQuery`; this one is unchanged. */
 export interface PostMediaUploadQuery {
   /** Only the two staff report purposes — a strict subset of `MediaPurpose`
    *  (`media.ts:103`). */
   purpose: Extract<MediaPurpose, 'report-photo' | 'report-video'>;
   report_id: string;
+}
+
+/** `POST /media/upload` query string, its second arm (9.2.0; plan unit P45 with one-off
+ *  O-MSG-LIVE; designs/messaging-live-v1.md §4 W7 `:192`; her answer 6, build DECISIONS 589:
+ *  staff photos and videos up to 25 MB, no PDFs). A staffer's photo or video for a
+ *  conversation. Everything `PostMediaUploadQuery` says of the route holds (`.strict()`,
+ *  STAFF-ONLY, `Idempotency-Key` REQUIRED and hashed over this query, the 25 MB cap, the
+ *  `Content-Type` matching the purpose, an empty body 400), with these differences:
+ *    · `thread_id`, a uuid, names a live thread; a missing one is 404 `not_found` (a
+ *      malformed one is 400 `bad_request`). The row is stamped
+ *      with that thread's owner and `created_by = 'staff'` (`schema.sql:689`), so it can be
+ *      attached only to a staff message to that family (`PostStaffThreadsMessagesRequest`).
+ *      An owner's send treats it as missing (404), and so does an owner's
+ *      `DELETE /media/:id` (A2 OL5 `:801`).
+ *    · `message-attachment` takes an image OR a video, as on `UploadsSignRequest`. No PDF
+ *      (MSG-U22, later).
+ *  The server pins its schema to the union of both arms. Response is `MediaWire` (201). */
+export interface PostMediaUploadMessageAttachmentQuery {
+  purpose: Extract<MediaPurpose, 'message-attachment'>;
+  thread_id: string;
 }
 
 // --- (d) per-endpoint 422 union aliases -------------------------------------
@@ -4099,8 +4128,11 @@ export interface PostCreditPackagesPurchaseRequest {
  * `'add'` writes a grant lot in the pool. `expires_at` is ISO-8601, omitted for
  * `cred.manual_grant_expiry_months` from now, and any instant later than now
  * otherwise (422 `expiry_not_in_future`). 422 `pool_not_bookable` for a pool no
- * v1 booking can draw from: a campus and program with no seeded package row, or
- * the alumni tier on an account with no alumni dog.
+ * v1 booking can draw from: a campus and program with no seeded package row, the
+ * alumni tier on an account with no alumni dog, or (from O-CREDITS fix 1,
+ * `routes/staffCredits.ts:211-213`; build DECISIONS 617, 624; doc added at 9.2.0) the
+ * alumni tier in a day-school pool at either campus: "alumni credits pay for day care
+ * only".
  *
  * `'remove'` debits one lot, the pool and owner read from the lot, whether or not
  * it is live. 422 `lot_insufficient` above the lot's unspent; a lot that is not
@@ -5349,11 +5381,106 @@ export type PostEventsRsvpErrorDetails = never;
 
 // >>> domain:messaging ========================================================
 
+// ---- (a) domain-local enums, constants and value tuples (9.2.0) ------------
+//
+// 9.2.0 (plan unit P45 with one-off O-MSG-LIVE; designs/messaging-live-v1.md revision 1 with
+// Amendments A1 and A2, closed at build DECISIONS 610): messaging "just like iMessage" (her
+// 11-18 words, DECISIONS 549; her seven answers, "yes to everything", 589). Every addition is
+// a new route, type, constant or tuple, an optional key, or a field a client only reads, so a
+// 9.1.0 client reads 9.2.0 unchanged and keeps polling (note §4 `:181-182`). The HTTP routes
+// stay the record: the socket says what changed and hands over rows built the way HTTP builds
+// them, and nothing is true because the socket said it (note `:112-113`).
+
+/** A receipt's step, on a message from the reader's own side (9.2.0; note §1 R2 `:32`, §4 W3
+ *  `:188`). `sent`: the server has it. `delivered`: an open screen on the other side has it
+ *  (that side's client acked a `seq` at or above it, by socket or after an HTTP catch-up;
+ *  L9-b). `read`: the other side read it. Each step implies the ones before it. */
+export type MessageReceiptState = 'sent' | 'delivered' | 'read';
+
+/** `GET /realtime`'s protocol number (9.2.0; W8 `:193`). The client sends it in `auth`; the
+ *  server answers `ready` with it; an unknown number closes 4426, and the client stops and
+ *  polls (note §3 rule 1, `:116-119`). Bumped only by a breaking frame change. */
+export const REALTIME_PROTOCOL_VERSION = 1;
+
+/** The largest `seq` the wire carries, and the bound on `after_seq`, both `up_to_seq`s and the
+ *  `ack` frame's (9.2.0): 2147483647, the range of rs3 M5.29's `integer` columns. Outside 0 to
+ *  this, an HTTP request is 400 `bad_request` (logged below the pager's level) and a frame is
+ *  dropped as a failed check. Unbounded, a value reached Postgres as 22003, a 500 that pages
+ *  (the Opus seat's contract read, M1, probe `p1_seq_overflow`). */
+export const MAX_MESSAGE_SEQ = 2147483647;
+
+/**
+ * Every close code `GET /realtime` sends, and what a client does on each (9.2.0; W11 `:196`;
+ * the table at note `:169-175`, with A2 FH1's 1011, `:773`).
+ *   · Retry, backing off with full jitter from 0.5 s to 30 s: `auth_timeout` (4408),
+ *     `server_error` (1011), `server_restart` (1012, its first retry jittered over 0–5 s),
+ *     `try_again_later` (1013), and a dropped socket (1006, which the server never sends: the
+ *     network, a missed `pong`, or the server ending a socket silent for 60 s).
+ *   · Stop and poll at 4 s in a thread and 8 s on the list, trying once more at the next app
+ *     foreground or portal `/me` reload (where a changed role re-derives what it hears):
+ *     `forbidden` (4403), `unknown_protocol` (4426), `evicted` (4429), `frame_too_large`
+ *     (1009).
+ *   · `token_invalid` (4401): refresh the token, then retry once. A failed refresh that is
+ *     retryable (`isAuthRetryableFetchError`) backs off and never signs out; any other takes
+ *     the sign-out path (A2 OL8 `:804`).
+ */
+export const REALTIME_CLOSE_CODES = {
+  token_invalid: 4401,
+  forbidden: 4403,
+  auth_timeout: 4408,
+  unknown_protocol: 4426,
+  evicted: 4429,
+  frame_too_large: 1009,
+  server_error: 1011,
+  server_restart: 1012,
+  try_again_later: 1013,
+} as const;
+
+/** One of `REALTIME_CLOSE_CODES`' values (9.2.0). */
+export type RealtimeCloseCode = (typeof REALTIME_CLOSE_CODES)[keyof typeof REALTIME_CLOSE_CODES];
+
+/** The `type` of every client frame (9.2.0): the runtime list the server's `.strict()` frame
+ *  parser and its table-driven tests iterate. Pinned in §16. */
+export const REALTIME_CLIENT_FRAME_TYPES = [
+  'auth',
+  'typing',
+  'ack',
+  'ping',
+] as const satisfies readonly [
+  RealtimeClientFrameWire['type'],
+  ...RealtimeClientFrameWire['type'][],
+];
+
+/** The `type` of every server frame (9.2.0): the list the stranger test runs over, one row per
+ *  member (note B1 `:295-297`). Pinned in §16. */
+export const REALTIME_SERVER_FRAME_TYPES = [
+  'ready',
+  'message.created',
+  'receipt',
+  'typing',
+  'staff.read',
+  'thread.changed',
+  'bell.changed',
+  'degraded',
+  'live',
+  'resync',
+  'pong',
+] as const satisfies readonly [
+  RealtimeServerFrameWire['type'],
+  ...RealtimeServerFrameWire['type'][],
+];
+
+// ---- (b) response wires ----------------------------------------------------
+
 export interface ThreadParticipantWire {
   id: string;
   name: string;
   role: StaffRole;
   image_path?: string;
+  /** 9.2.0 (design 7.1.0, MSG-U03): `true` only on the school's own participant, the *NWA
+   *  School for Dogs* system row (rs3 M5.26), shown without a role chip. Omitted on every
+   *  staffer. */
+  is_school?: true;
 }
 
 export interface ThreadWire {
@@ -5366,6 +5493,11 @@ export interface ThreadWire {
   last_message: string;
   last_message_at: string;
   unread_count: number;
+  /** 9.2.0 (W1 `:186`): the highest `seq` this thread has given out, counting messages expired
+   *  since, so it can sit above the last live message's `seq`; 0 before the first message. A
+   *  client whose cache is behind it fetches `?after_seq=` (the 60 s reconcile, note
+   *  `:265-266`). */
+  last_seq: number;
 }
 
 /** One photo/video attachment on a message. `url` is a short-lived signed GET
@@ -5385,15 +5517,163 @@ export interface MessageWire {
   id: string;
   thread_id: string;
   sender_id: string;
+  /** On a staff message in a school-addressed thread (9.2.0; design 7.1.0, MSG-U04, answer
+   *  22): the replying staffer's first name while `msg.reply_signature_mode` is
+   *  `staffer_first_name`, or *NWA School for Dogs* under `school_name`. The push title
+   *  follows it. */
   sender_name?: string;
   text: string;
   /** Photo/video attachments, ordered as sent. Omitted when the message has none. */
   attachments?: MessageAttachmentWire[];
   sent_at: string;
+  /** Unchanged. From 9.2.0 a client draws `receipt` under a message, never this (A1.3: the
+   *  fake *Read* is removed). */
   is_read: boolean;
+  /** 9.2.0 (W1 `:186`, M1): the message's number in its thread, from 1, strictly increasing
+   *  in COMMIT order (a trigger assigns it under the thread's row lock, rs3 M5.29), so two
+   *  sends never swap places. An expired message keeps its number, so a reader sees gaps.
+   *  Order a thread by it, never by `sent_at`, which is the transaction's start. */
+  seq: number;
+  /** 9.2.0 (W2 `:187`): the send's own `client_message_id`, echoed to the sender's SIDE only
+   *  (a family's on her messages; staff on the school's), so an echo that arrives before the
+   *  201 is matched, not doubled. Omitted when the send carried none, and always on the other
+   *  side's messages. */
+  client_message_id?: string;
+  /** 9.2.0 (W3 `:188`): `MessageReceiptWire`. Only on messages from the reader's own side. */
+  receipt?: MessageReceiptWire;
+  /** 9.2.0 (design 7.1.0, NOTIF-U38's staff-message arm; A1 D4 `:560`): `NoticeReachWire`.
+   *  Only on the 201 of `POST /staff/threads` (its `message`) and of `POST
+   *  /staff/threads/:id/messages`, and on their Idempotency-Key replays when the send carried
+   *  no `client_message_id`. A send that carried one is answered on any retry by the lookup,
+   *  200, without `reach` (the notice was decided once), so a client words that 200 as *Sent*
+   *  and claims nothing about her phone. Never on a GET, a socket frame or an owner route; a
+   *  conformance test pins that owner routes never emit it. */
+  reach?: NoticeReachWire;
 }
 
-// ---- (c) request bodies ----------------------------------------------------
+/** `MessageWire.receipt` (9.2.0; W3 `:188`; her answers 1-3, build DECISIONS 589). Present
+ *  only on messages from the reader's OWN side: a family's on her messages; staff on the
+ *  school's (every staffer's and the system row's). Omitted on the other side's. A client
+ *  draws it under its side's LAST message only: *Sent*, *Delivered*, *Read 2:14 PM*
+ *  (*Sending…* and *Waiting for a connection…* are the client's own, before the server has
+ *  the message). On a family's message `read` means ANY staffer read it (answer 1), and her
+ *  side never names who (answer 2). `at` (ISO-8601) is the step's instant: `sent_at`, the
+ *  first delivery, or the first read (on a family's message, the earliest staffer's). */
+export interface MessageReceiptWire {
+  state: MessageReceiptState;
+  at: string;
+}
+
+/** One row of `GET /staff/threads` `[staff]`, any role (9.2.0; design 7.1.0, MSG-U15,
+ *  MSG-U17, S46). `ThreadWire` plus the family and the caller's own read state.
+ *  `addressed_to_me`: a school thread for every owner- and manager-role staffer (question
+ *  72), a staff-started thread for its participant, a departed participant's thread for the
+ *  owner and manager roles (MSG-37). `staff_unread_count`: the family's messages with no read
+ *  row for the caller (`message_staff_reads`, rs3 M5.28); the portal's badge reads it.
+ *  `unread_count` keeps its owner-side meaning (DRIFT-39). Every staffer, trainers included,
+ *  sees every thread (MSG-12). */
+export type StaffThreadWire = ThreadWire & {
+  owner_id: string;
+  owner_name: string;
+  addressed_to_me: boolean;
+  staff_unread_count: number;
+};
+
+/** `POST /threads` 201 body (9.2.0; design 7.1.0, MSG-U05): the school thread for that topic,
+ *  new or continued, and the message just sent. A `client_message_id` repeat answers 200 with
+ *  the stored pair. */
+export interface PostThreadsResponse {
+  thread: ThreadWire;
+  message: MessageWire;
+}
+
+/** `POST /staff/threads` 201 body (9.2.0; design 7.1.0, MSG-U13): the staffer's thread with
+ *  that family on that topic, new or continued, and the message, with `reach`. A
+ *  `client_message_id` repeat answers 200 with the stored pair. */
+export interface PostStaffThreadsResponse {
+  thread: StaffThreadWire;
+  message: MessageWire;
+}
+
+/**
+ * A frame the server sends on `GET /realtime` (9.2.0; W10 `:195`, as A1 and A2 amend it):
+ * JSON text, one object per frame. The server picks what a socket hears from its principal;
+ * there is no subscribe frame (note §3 rule 2, `:124-129`). A family's socket hears only her
+ * own threads; a live staffer's (never the system row's) hears every thread (MSG-12).
+ *   · `ready`: the socket is authenticated AND registered, so nothing published after it is
+ *     missed (A2 OL4 `:800`). On every `ready`, `live` and `resync` the client refetches the
+ *     thread list and, for an open thread, `?after_seq=`.
+ *   · `message.created`: `message` is the element the reader's own `GET …/messages` returns
+ *     for it, built for that audience (a family's never carries `reach`; H4, B15).
+ *     `prev_seq` is the `seq` of the thread's previous LIVE message, and is sent as `null`,
+ *     never omitted, when there is none. A `prev_seq` above the client's last `seq` is a
+ *     gap: fetch `?after_seq=`; an empty answer closes it and is never fetched twice (M1).
+ *   · `receipt`: the other side acked (`delivered`) or read this side's messages up to
+ *     `up_to_seq`, at `at`. Sent only to the side whose messages they are, and to a family only
+ *     when it moves her receipt: a second staffer's read of the same messages sends nothing.
+ *   · `typing`: a family hears exactly `{type, thread_id, from: 'school'}`, with no staffer
+ *     named (her answer 2; A2 OL1 `:797`). Staff hear `from: 'owner'`, or `from: 'staff'`
+ *     with the colleague's `staff_id` and `first_name` (*Amber is typing…*). A client hides
+ *     the dots 6 s after the last frame, or when that side's message arrives.
+ *   · `staff.read`: staff only. A staffer read these family messages (MSG-U17); another
+ *     staffer's read leaves my count alone.
+ *   · `thread.changed`: refetch that thread and the list (her read on another of her devices,
+ *     M4; an attachment removed, OL5).
+ *   · `bell.changed`: staff only. Refetch `GET /staff/notifications/summary`.
+ *   · `degraded`: this instance cannot vouch for live delivery (its bus is not ready, or a
+ *     publish failed). Poll at 4 s in a thread and 8 s on the list until `live`, which comes
+ *     only once the bus is ready and a probe came back (H2; A2 FL5 `:782`).
+ *   · `resync`: events may have been missed (a bus reconnect, or a delivery the server could
+ *     not check). Refetch; the socket stays.
+ *   · `pong`: the answer to `ping`.
+ */
+export type RealtimeServerFrameWire =
+  | { type: 'ready'; protocol: number }
+  | { type: 'message.created'; thread_id: string; prev_seq: number | null; message: MessageWire }
+  | {
+      type: 'receipt';
+      thread_id: string;
+      state: Exclude<MessageReceiptState, 'sent'>;
+      up_to_seq: number;
+      at: string;
+    }
+  | { type: 'typing'; thread_id: string; from: 'school' }
+  | { type: 'typing'; thread_id: string; from: 'owner' }
+  | { type: 'typing'; thread_id: string; from: 'staff'; staff_id: string; first_name: string }
+  | { type: 'staff.read'; thread_id: string; staff_id: string; message_ids: string[] }
+  | { type: 'thread.changed'; thread_id: string }
+  | { type: 'bell.changed' }
+  | { type: 'degraded' }
+  | { type: 'live' }
+  | { type: 'resync' }
+  | { type: 'pong' };
+
+// ---- (c) request bodies + query shapes -------------------------------------
+
+/** `POST /threads` `[owner]`, Idempotency-Key → 201 `PostThreadsResponse` (9.2.0; design
+ *  7.1.0 and §2.9:4554, MSG-U05; note §2 row 11 `:78`). A family starts, or continues, her
+ *  conversation with the school on one topic. There is one live school thread per family and
+ *  `category` (a partial unique index, rs3 M5.27), so a second start on that topic adds its
+ *  message to the same thread. Two racing starts with different (or no) `client_message_id`s
+ *  both get 201 with one thread id; with one id, 201 and 200 (FL1). No trainer pick in v1
+ *  (MSG-U07, later).
+ *
+ *  The message grammar is `PostThreadsMessagesRequest`'s, with its 9.2.0 rules, but a
+ *  `client_message_id` repeat here always returns the stored thread and message, 200, whatever
+ *  the body: the request names no thread, so the 409 `conflict` is the two `/messages` verbs'
+ *  only (Fable's contract read, M7; the Opus seat's, L2). `dog_ids` are uuids of her live dogs
+ *  (404 `not_found` otherwise), at most 10, no repeats; the thread's dogs become the union of
+ *  every send's. `subtopic` is the compose wizard's sub-topic label,
+ *  trimmed, 1–120 characters, and becomes the thread's `sub_text`; `title` is the topic's
+ *  label. `.strict()`; a body failing the schema is 400 `bad_request`. */
+export interface PostThreadsRequest {
+  category: ThreadCategory;
+  subtopic?: string;
+  dog_ids?: string[];
+  text?: string;
+  attachment_media_ids?: string[];
+  client_message_id?: string;
+}
 
 /** `POST /threads/:id/messages` request body — the **owner** send grammar.
  *  Promoted 1.13.0 from `routes/threads.ts:48–59` (`messageBodySchema`);
@@ -5426,30 +5706,98 @@ export interface MessageWire {
  *
  *  This grammar is **deliberately different** from the staff reply grammar
  *  below; both are transcribed as they run (§14.1). See
- *  `BUSINESS-LOGIC/DISCREPANCIES.md:814` (NOTE-29). */
+ *  `BUSINESS-LOGIC/DISCREPANCIES.md:814` (NOTE-29).
+ *
+ *  **9.2.0** (plan unit P45 with one-off O-MSG-LIVE):
+ *    · `client_message_id` (W2 `:187`, as A2 OL2 `:798` and the Opus seat's last read N6
+ *      amend it): a uuid the client mints once per logical message and sends on every retry.
+ *      It is unique per SENDER, and the server looks it up BEFORE the Idempotency-Key's body
+ *      hash, so a repeat by the same sender of a message the server holds returns that
+ *      message, 200, whatever the body or key (a retry after the 201 was lost: M2). On the two
+ *      `/messages` verbs, the same sender's id on a message in ANOTHER thread is 409
+ *      `conflict` (the create verbs never answer it). Another sender's identical id is just
+ *      another message. Two concurrent first sends with one id give one 201, one 200 and one
+ *      row (A2 FL1). While the first send is still running, its key answers 409
+ *      `idempotency_inflight`. A client branches on `error.code`, never the status:
+ *      `idempotency_inflight` retries later with the same key; `conflict` is final.
+ *    · An id named twice in `attachment_media_ids` is 400 `bad_request` (it was a 500; P45
+ *      `plan_added`). A staff upload (`created_by = 'staff'`) is treated as missing: 404
+ *      (B12).
+ *    · The message goes out on the socket to the school, and to her other devices. */
 export interface PostThreadsMessagesRequest {
   text?: string;
   attachment_media_ids?: string[];
+  client_message_id?: string;
+}
+
+/** `POST /threads/:id/read` `[owner]` body, optional (9.2.0; W5 `:190`; note §2 row 3 `:70`).
+ *  Absent, or `{}`: as before, every unread school message is read. With `up_to_seq`: only
+ *  the school's messages with `seq ≤ up_to_seq` (the newest the client RENDERED), so a message
+ *  committed after her `GET` stays unread (B10). An integer from 0 to `MAX_MESSAGE_SEQ`;
+ *  `.strict()`; 400 `bad_request` otherwise. The Idempotency-Key's body hash covers
+ *  `up_to_seq`, so a reused key with another value is 422 `idempotency_mismatch`, never a
+ *  replayed 204 that marked nothing. Either way it also stamps *Delivered*, sends the school a
+ *  `receipt` frame, and sends `thread.changed` to her other devices (M4). 204. */
+export interface PostThreadsReadRequest {
+  up_to_seq?: number;
+}
+
+/** `GET /threads/:id/messages` query (9.2.0; W4 `:189`). `after_seq`, an integer from 0 to
+ *  `MAX_MESSAGE_SEQ`, returns only the messages whose `seq` is above it: the catch-up after a
+ *  gap, a `ready`, `live` or `resync`, a suppressed push, or the 60 s reconcile. Absent: the
+ *  whole thread, as before. A bad value (out of range, a fraction, `1e10`) is 400
+ *  `bad_request`. Typed `number`; it arrives as a string (`z.coerce`), as
+ *  `GetNotificationsQuery.limit` does. From 9.2.0 both message lists are in `seq` order. */
+export interface GetThreadsMessagesQuery {
+  after_seq?: number;
+}
+
+/** `POST /staff/threads` `[staff]`, any role, Idempotency-Key → 201 `PostStaffThreadsResponse`
+ *  (9.2.0; design 7.1.0 and §2.9:4555, MSG-U13). A staffer starts a conversation with a
+ *  family, or continues her own live one with that family on that topic (by lookup, with no
+ *  unique index: one staffer racing herself may duplicate, tolerated).
+ *
+ *  `.strict()`. `text` non-empty after trim, at most 4000 (the constant every message verb
+ *  shares). `owner_id` a uuid naming a live family and `dog_ids` uuids of hers (404
+ *  `not_found` otherwise), at most 10, no repeats. A `client_message_id` repeat always returns
+ *  the stored pair, 200, never 409 (as on `POST /threads`). A body failing the schema is 400
+ *  `bad_request`: this new verb follows
+ *  `api-conventions.md` R6, and the 422 asymmetry stays the reply's. Text only: a staff photo
+ *  uploads against a thread (`PostMediaUploadMessageAttachmentQuery`), so it goes in a reply.
+ *  **No `closure`** until P31's email lane (A1 D5 `:561`). The family is pushed at once (A1.2),
+ *  and the message carries `reach`. `client_message_id` as on `PostThreadsMessagesRequest`. */
+export interface PostStaffThreadsRequest {
+  owner_id: string;
+  category: ThreadCategory;
+  dog_ids?: string[];
+  text: string;
+  client_message_id?: string;
 }
 
 /** `POST /staff/threads/:id/messages` request body — the **staff** reply
  *  grammar. Promoted 1.13.0 from `routes/staffThreads.ts:33–35`
  *  (`messageBodySchema`); digest messaging/S, same item.
  *
- *  **Deliberately NOT the owner grammar above.** `text` is required and
- *  non-empty after trim (`.min(1)`), and a staff reply carries **no
- *  attachments**: the object is `.strict()`, so `attachment_media_ids` on this
- *  body is rejected. Staff attachments are approved-but-unbuilt (digest
- *  messaging design/L; `BUSINESS-LOGIC/DISCREPANCIES.md:814` NOTE-29) and this
- *  type pins the absence rather than pre-declaring the feature.
+ *  **9.2.0 widens it to the owner's grammar** (W6 `:191`; her answer 6, build DECISIONS 589:
+ *  staff photos and videos up to 25 MB, no PDFs; it reverses design §7.9 MSG-U20's text-only
+ *  pilot rule). A reply carries non-empty `text` OR at least one `attachment_media_ids`, `text`
+ *  at most 4000 after trim, at most 10 ids, no id twice. Each id must be a live
+ *  `message-attachment` row a staffer uploaded for this family
+ *  (`PostMediaUploadMessageAttachmentQuery`); missing, another family's, or an owner's upload ⇒
+ *  404 `not_found` (B12). An attachment-only reply is stored as `text: ''`, and its push reads
+ *  *Amber sent a photo*. The family is pushed at once (A1.2), and the 201 carries `reach`.
+ *  `client_message_id` as on `PostThreadsMessagesRequest`. Until 9.2.0 `text` was required
+ *  and attachments were refused (NOTE-29, `BUSINESS-LOGIC/DISCREPANCIES.md:814`); every 9.1.0
+ *  body is still a valid 9.2.0 body.
  *
  *  Cap: ≤ 4000 chars after trim (`MAX_MESSAGE_LEN`,
  *  `routes/staffThreads.ts:30`) — the same bound the owner send uses. Mobile's
  *  composer caps its input at 2000 (ledger NOTE-27, `DISCREPANCIES.md:800`);
  *  that is a client choice, not this contract.
  *
- *  **Status asymmetry — pinned, not repaired.** A body that fails THIS schema
- *  is **422 `invalid_payload`** (`routes/staffThreads.ts:158`), while the same
+ *  **Status asymmetry — pinned, not repaired, and kept at 9.2.0 (W6).** A body that fails
+ *  THIS schema (an id named twice included) is **422 `invalid_payload`**
+ *  (`parseMessageBody`, `routes/staffThreads.ts`), while the same
  *  class of failure on the owner send is **400 `bad_request`**. Both are
  *  test-pinned on the identical payload `{ text: '   ' }`
  *  (`test/contracts/staff-threads.test.ts:228` → 422;
@@ -5460,8 +5808,74 @@ export interface PostThreadsMessagesRequest {
  *  Changing the status is a behavior change wearing a doc change's clothes
  *  (§14.1) — recorded here and filed as STOP-1. */
 export interface PostStaffThreadsMessagesRequest {
-  text: string;
+  text?: string;
+  attachment_media_ids?: string[];
+  client_message_id?: string;
 }
+
+/** `POST /staff/threads/:id/read` `[staff]`, any role, Idempotency-Key → 204 (9.2.0; design
+ *  7.1.0 and §2.9:4555, MSG-U17). Marks read, FOR THE CALLER ONLY, the listed family messages
+ *  of this thread, the ones the portal rendered, so a message committed between the portal's
+ *  `GET` and this `POST` stays unread. Ids not in this thread, or not the family's, are
+ *  ignored; a repeat is a no-op. `message_ids`: 1–500 uuids; `.strict()`; 400 `bad_request`
+ *  otherwise (a client skips the call when it rendered no family message, and sends a longer
+ *  list in chunks of 500). It also stamps *Delivered*, sends every staff socket `staff.read`
+ *  and `bell.changed`, and sends the family a `receipt` (`read`: any staffer counts, her answer
+ *  1) only when this call is the school's first read of at least one of the messages, with
+ *  that instant: a second staffer's read never moves her *Read* time (Fable's contract read,
+ *  L3). */
+export interface PostStaffThreadsReadRequest {
+  message_ids: string[];
+}
+
+/** `GET /staff/threads/:id/messages` query (9.2.0; W4 `:189`): as `GetThreadsMessagesQuery`. */
+export interface GetStaffThreadsMessagesQuery {
+  after_seq?: number;
+}
+
+/**
+ * `GET /realtime` `[owner|staff]`: the live channel, and the frames a client sends on it
+ * (9.2.0; W8 `:193`, W9 `:194`; note §3 `:83-175` as A2 amends it). A WebSocket upgrade on the
+ * API's own origin (`wss://<api>/realtime`), with no query string, no cookie, and never a token
+ * in the URL.
+ *
+ * Auth (rule 1, `:116-123`): nothing is sent to a socket until its FIRST frame, `auth`, within
+ * 5 s (else 4408), verifies exactly as an HTTP bearer does: the system row and an unprovisioned
+ * uid are refused (4403). `protocol` must be `REALTIME_PROTOCOL_VERSION` (else 4426). The
+ * `dev_principal` arm (the `X-Dev-Principal` grammar) exists only while the dev bypass is on,
+ * never under `NODE_ENV=production`, and refuses the system row. The client re-sends `auth`
+ * with each refreshed token, which must resolve to the same principal (else 4403); at the
+ * token's `exp` with no new token, 4401. A valid re-`auth` gets no reply (`ready` is sent once
+ * per socket); an invalid one closes 4401 or 4403.
+ *
+ * After `ready` a client may send:
+ *   · `typing`: carries no text. Relayed at most once a second per socket; a client sends at
+ *     most one every 3 s while typing.
+ *   · `ack`: "an open screen here has the other side's messages up to this `seq`", whether
+ *     they came by socket or by HTTP. It stamps *Delivered* (L9-b). Coalesced to the highest
+ *     per thread, at most once a second.
+ *   · `ping`: every 25 s. No `pong` within 10 s means the socket is dead: reconnect as for
+ *     1006 (A2 OL4 `:800`).
+ * Every `thread_id` is a uuid and `ack.up_to_seq` an integer from 0 to `MAX_MESSAGE_SEQ`.
+ * Before honouring `typing` or `ack` the server re-resolves the principal and checks the
+ * thread as HTTP does. A failed check, a malformed id or an out-of-range `up_to_seq` is dropped
+ * silently (existence never leaks) and logged at warn at most; three in a
+ * minute close 4403. The server also re-resolves every 25 s (a principal gone or changed:
+ * 4403), checks liveness again at each delivery (OM2), and ends a socket that has sent nothing
+ * for 60 s (the client sees 1006; the Opus seat's last read, L6).
+ *
+ * Limits (rule 6): a frame of at most 16 KB (else 1009); at most 5 sockets per family and 20
+ * per staffer, the next evicting the OLDEST (4429); at most 200 unauthenticated sockets per
+ * instance (else 1013). Every deploy drops every socket once, with 1012. Whenever the socket
+ * is down, `degraded`, or closed by a stop code, the client polls at 4 s in a thread and 8 s
+ * on the list, exactly as a 9.1.0 client always does.
+ */
+export type RealtimeClientFrameWire =
+  | { type: 'auth'; protocol: number; token: string }
+  | { type: 'auth'; protocol: number; dev_principal: string }
+  | { type: 'typing'; thread_id: string }
+  | { type: 'ack'; thread_id: string; up_to_seq: number }
+  | { type: 'ping' };
 
 // <<< domain:messaging ========================================================
 
@@ -5519,6 +5933,23 @@ export type AnnouncementCtaKind = 'enroll' | 'route' | 'external';
  */
 export type DevicePlatform = 'ios' | 'android';
 
+/** `NoticeReachWire.channel` (9.2.0; design 7.1.0, NOTIF-U38, typed in full as signed; A1 D4
+ *  `:560`). No pgEnum backs it, and nothing iterates it, so no tuple is minted. */
+export type NoticeReachChannel = 'push' | 'email' | 'feed-only' | 'none';
+
+/** `NoticeReachWire.why` (9.2.0; design 7.1.0, NOTIF-U38, typed in full as signed). At 9.2.0
+ *  only `device`, `no-device`, `push-off` and `not-queued` are produced; the rest wait for
+ *  P31's producers. */
+export type NoticeReachWhy =
+  | 'device'
+  | 'no-device'
+  | 'push-off'
+  | 'category-muted'
+  | 'email-off'
+  | 'no-email-kind'
+  | 'no-sender'
+  | 'not-queued';
+
 // --- (b) response wires -----------------------------------------------------
 
 /**
@@ -5561,6 +5992,42 @@ export interface NotificationPushData {
   type: NotificationType;
   deep_link_path?: string;
   notification_id: string;
+  /** 9.2.0 (A2 FM1 `:774`, W12): the thread of a `message-received` push, so the app can
+   *  suppress the banner for the thread on screen and fetch `?after_seq=` instead (H2).
+   *  Omitted on every other type. The push's icon badge (her unread school messages, her
+   *  answer 4) rides the Expo message, not this payload. */
+  thread_id?: string;
+}
+
+/** Who a staff notice will reach, and why (9.2.0; design 7.1.0, NOTIF-U38; typed in full as
+ *  signed, so later units add producers and never widen it, A1 D4 `:560`). It states intent
+ *  at commit: `push` means a push will be sent, not that a phone received it. No `held_until`
+ *  (nothing is held).
+ *
+ *  At 9.2.0 it rides `MessageWire.reach` on the two staff message verbs only, which give four
+ *  answers from the two reads a push makes: `push`/`device`; `feed-only`/`no-device` (no live
+ *  device token); `feed-only`/`push-off` (her master switch is off); `none`/`not-queued` (the
+ *  notice could not be written; the message still stands, A2 FL2 `:779`). The other members
+ *  wait for P31 (the email lane, category mutes, `BookingWire.reach` on the staff cancel).
+ *  Until P31 a family with no device, or with push off, sees school messages only in the app,
+ *  and `reach` says so (A1 D5). The portal words each answer with the signed sentences. */
+export interface NoticeReachWire {
+  channel: NoticeReachChannel;
+  why: NoticeReachWhy;
+}
+
+/** `GET /staff/notifications/summary` `[staff]`, any role → 200 (9.2.0; design 7.1.0,
+ *  NOTIF-U33; note R6 `:36`; her answer 5: the desk is told by the bell and the tab title, no
+ *  sound or pop-up). Both campuses for every caller, keyed by the family's `location`.
+ *  `unread_client_threads`: the threads `addressed_to_me` for the caller whose
+ *  `staff_unread_count` is above 0, so a reply clears only the replier's bell (question 72).
+ *  `pending_requests`: live `submitted` requests whose family's `location` is that campus, the
+ *  read behind `GET /staff/requests?status=submitted` (A2.3 `:851`). Nothing about money
+ *  (RULING §10 item 8). An owner principal is 403 `forbidden`. A `bell.changed` frame means
+ *  refetch; request routes publish none, so `pending_requests` may lag by up to the 60 s
+ *  reconcile. */
+export interface StaffBellWire {
+  by_location: Record<LocationKey, { unread_client_threads: number; pending_requests: number }>;
 }
 
 /**
@@ -5689,6 +6156,14 @@ export interface GetNotificationsQuery {
  * server-side, and this type does not pretend otherwise. Registration is an UPSERT by
  * `(owner_id, expo_push_token)` and additionally replay-guarded by the required
  * `Idempotency-Key` header (BUSINESS-LOGIC/notifications-events.md:77 R24).
+ *
+ * **From 9.2.0, one live row per token** (A2 OH1 `:791`; DISCREPANCIES NOTE-38), so a phone
+ * that changes family never shows the last family's messages. Registering a token expires
+ * every OTHER family's live row holding it, in the same transaction (rs3 M5.30 adds a unique
+ * index on the live token). And `DELETE /device-tokens/:token` expires every live row holding
+ * the token, whoever's it is: 204 if any was expired, else 404 (the Fable seat's last read,
+ * M1: holding the token string is holding the device). The app sends the POST (push on) or the
+ * DELETE (push off) on every change of signed-in user. Shapes unchanged.
  */
 export interface PostDeviceTokensRequest {
   token: string;
@@ -9057,4 +9532,7 @@ export type WireTupleConformance = [
   Expect<Equal<(typeof SIGNUP_FIELDS)[number], SignupField>>,
   // 5.0.0-lg4.2: no pgEnum backs the tier, so this is its one pin.
   Expect<Equal<(typeof CREDIT_TIERS)[number], CreditTier>>,
+  // 9.2.0 (§ messaging): the realtime frame-type tuples, the same WC-A1 pin.
+  Expect<Equal<(typeof REALTIME_CLIENT_FRAME_TYPES)[number], RealtimeClientFrameWire['type']>>,
+  Expect<Equal<(typeof REALTIME_SERVER_FRAME_TYPES)[number], RealtimeServerFrameWire['type']>>,
 ];

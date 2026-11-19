@@ -12,6 +12,140 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [9.2.0] — 2026-11-20
+
+ADDITIVE. Plan unit P45 with its one-off O-MSG-LIVE: messaging, live. Her words: "honestly is
+messaging good to go? or does it need a lot of work? figured we'd use open sockets as well / i
+want it just like imessage" (build DECISIONS 549); "B" (583: built right after her fixes,
+before the pilot, standing alone); "yes to everything" (589: families see the school's Read,
+any staffer counts; no staff names on her side; Delivered shown; the icon badge counts unread
+messages only; the desk told by the bell and the tab title; staff photos and videos up to
+25 MB, no PDFs; the full set). Designed in `designs/messaging-live-v1.md` (`0327435d7be95930`):
+§4 W1–W11, Amendment A1 (the push sent directly until P31's queue exists, `NoticeReachWire`
+typed in full, no `closure` until P31) and Amendment A2 (W12; per-sender `client_message_id`;
+close code 1011), closed at revision 2 (DECISIONS 610) with both seats' last reads as brief
+lines (608, 609; one of them, the Opus seat's N6, is the 409 below). It also carries the
+S45/S46 part of design 7.1.0 (§1.1 `:1331-1353`), which P45 was always to set (once build
+12.2.0; A1.4). Not a design section of its own (design_label 7.1.0, its S45/S46 part). Build
+label 9.2.0: the next minor at its landing (DECISIONS 418's rule), so P51 moves to 9.3.0 and
+S42/P31 to 9.4.0, both provisional.
+It reads 9.2.0-pre.2, landed before it, and takes back 9.2.0-pre.1 (O-AFTERCOUNT, `PoolDrawWire`
+and `draws`) and 9.2.0-pre.2 (O-BUGS3 #33, `DogWire.alumni_at`): their entries below stand as
+written, and 9.2.0 includes them (the after-count note §1.1-§1.2).
+Every addition is a new route, type, constant or tuple, an optional key, or a response field a
+client only reads, so a 9.1.0, 9.2.0-pre.1 or 9.2.0-pre.2 client reads 9.2.0 unchanged and keeps polling.
+Contract-first: the routes, frames and fields do not exist until P45's backend lands them.
+Resync both clients (`npm run sync:contracts` in mobile and portal). The four backend type errors this contract
+forced at drafting (`lib/threadWire.ts` twice, `routes/threads.ts`, `routes/staffThreads.ts`) are closed
+by P45's backend in the same push.
+
+### Added
+
+- **The live channel, `GET /realtime`** `[owner|staff]` (WebSocket upgrade;
+  `REALTIME_PROTOCOL_VERSION = 1`).
+  - `RealtimeClientFrameWire`: `auth {protocol, token}` (or `{protocol, dev_principal}`, only
+    while the dev bypass is on, never in production), `typing {thread_id}`, `ack {thread_id,
+    up_to_seq}`, `ping`. Nothing is sent before a verified `auth`, within 5 s.
+  - `RealtimeServerFrameWire`: `ready {protocol}`, `message.created {thread_id, prev_seq,
+    message}`, `receipt {thread_id, state, up_to_seq, at}`, `typing` (a family hears only
+    `from: 'school'`; staff hear `'owner'`, or `'staff'` with `staff_id` and `first_name`),
+    `staff.read {thread_id, staff_id, message_ids}`, `thread.changed {thread_id}`,
+    `bell.changed`, `degraded`, `live`, `resync`, `pong`.
+  - The server picks what a socket hears; there is no subscribe frame. Frames are built per
+    audience through the HTTP serializer, so a family's `message.created` equals her GET's
+    element.
+  - `REALTIME_CLOSE_CODES` (4401, 4403, 4408, 4426, 4429, 1009, 1011, 1012, 1013) and
+    `RealtimeCloseCode`, with what a client does on each.
+  - `REALTIME_CLIENT_FRAME_TYPES` and `REALTIME_SERVER_FRAME_TYPES`, pinned in §16 (WC-A1).
+- `MessageWire.seq` (from 1, strictly increasing in commit order within a thread; expired
+  messages keep their number) and `ThreadWire.last_seq`. `MAX_MESSAGE_SEQ` (2147483647, the
+  columns' `integer` range) bounds every `seq` the wire carries and accepts: outside 0 to it,
+  HTTP answers 400 and a frame is dropped. Every new id on the wire is a uuid.
+- `MessageWire.client_message_id?`, `MessageWire.receipt?` (`MessageReceiptWire {state, at}`,
+  `MessageReceiptState`), and `MessageWire.reach?` (`NoticeReachWire`; only on the two staff
+  message verbs' 201s).
+- `client_message_id?` on `PostThreadsMessagesRequest`, `PostStaffThreadsMessagesRequest`, and
+  the two new create bodies. Unique per sender; a repeat by the same sender returns the stored
+  message, 200, whatever the body or key (on the create verbs, the stored thread and message,
+  always 200); on the two `/messages` verbs the same sender's id in another thread is 409
+  `conflict`, which a client tells from `idempotency_inflight` by `error.code`; another
+  sender's identical id is another message.
+- `GetThreadsMessagesQuery` and `GetStaffThreadsMessagesQuery` (`after_seq?`). From 9.2.0 both
+  message lists are in `seq` order.
+- `PostThreadsReadRequest {up_to_seq?}`, the optional body of `POST /threads/:id/read`. Absent,
+  it reads as before. Its Idempotency-Key hash covers `up_to_seq`.
+- `POST /threads` `[owner]` (`PostThreadsRequest {category, subtopic?, dog_ids?, text?,
+  attachment_media_ids?, client_message_id?}` → 201 `PostThreadsResponse {thread, message}`):
+  one live school thread per family and topic.
+- `ThreadParticipantWire.is_school?: true`, on the *NWA School for Dogs* participant only.
+- `StaffThreadWire` (`ThreadWire` + `owner_id`, `owner_name`, `addressed_to_me`,
+  `staff_unread_count`): the element of `GET /staff/threads`.
+- `POST /staff/threads` `[staff]` (`PostStaffThreadsRequest {owner_id, category, dog_ids?,
+  text, client_message_id?}` → 201 `PostStaffThreadsResponse {thread, message}`). No `closure`
+  until P31's email lane (A1 D5).
+- `POST /staff/threads/:id/read` `[staff]` (`PostStaffThreadsReadRequest {message_ids}` → 204):
+  per-staffer read state.
+- `GET /staff/notifications/summary` `[staff]` → `StaffBellWire {by_location:
+  Record<LocationKey, {unread_client_threads, pending_requests}>}`.
+- `NoticeReachWire {channel, why}` with `NoticeReachChannel` and `NoticeReachWhy`, typed in full
+  as signed. At 9.2.0 four answers are produced: `push`/`device`, `feed-only`/`no-device`,
+  `feed-only`/`push-off`, `none`/`not-queued`.
+- `NotificationPushData.thread_id?` (W12): on a `message-received` push.
+- `PostMediaUploadMessageAttachmentQuery {purpose: 'message-attachment', thread_id}`: the second
+  arm of `POST /media/upload` (staff only), stamped with that thread's family.
+
+### Changed (shape: widened)
+
+- `PostStaffThreadsMessagesRequest` is widened to the owner's grammar: `text` becomes `text?`,
+  plus `attachment_media_ids?` (at most 10) and `client_message_id?`; text or an attachment is
+  required. Every 9.1.0 body is still valid. Its 422 asymmetry is kept.
+
+### Changed (behaviour; no shape changes)
+
+- **Two behaviour changes are kept at a minor by build DECISIONS 619(4).** An owner's
+  `DELETE /media/:id` on a staff-uploaded row, which answered 204 before, now answers 404 (a
+  tightening); and `DELETE /device-tokens/:token` expires every live row holding the token (it
+  widens what the call does and refuses nothing). Neither changes a type. 9.0.0 called such a
+  refusal breaking (A5, A14), inside a major forced by a removal; here no shipped client calls
+  the tightened path (a search of mobile `dd463a0` and portal `6246524`, which proves nothing
+  alone, and no client test failed against 9.2.0). 10.0.0 stays reserved for refusing owners'
+  `POST /bookings` (DECISIONS 558, 561).
+- An attachment id named twice: 400 `bad_request` on the owner send (it was a 500), 422 on the
+  staff reply. A staff upload is refused on an owner send (404).
+- `POST /device-tokens` expires every other family's live row holding the token, and
+  `DELETE /device-tokens/:token` expires every live row holding it, whoever's (204 if any, else
+  404): one live row per token (A2 OH1; the Fable seat's last read, M1).
+- `DELETE /media/:id`: an owner deleting a row a staffer uploaded is 404, and the row stays
+  (A2 OL5). It also stops an owner deleting staff report media stamped with her id; named in
+  A2.5 (4).
+- `POST /staff/threads/:id/read` sends the family a `receipt` only when it is the school's first
+  read of at least one message, so a second staffer's read never moves her *Read* time.
+- A staff reply and `POST /staff/threads` push the family at once (A1.2), with the staffer's
+  name (or the school's) as the title and her unread count as the badge.
+
+### Documentation
+
+- `WIRE_CONTRACT_VERSION` `'9.2.0-pre.2'` → `'9.2.0'`. Its doc keeps 9.2.0-pre.1 and
+  9.2.0-pre.2's paragraphs and says 9.2.0 takes them back.
+- `MessageWire.sender_name`: a staff message in a school thread is signed per
+  `msg.reply_signature_mode`. `MessageWire.is_read`: a client draws `receipt`, never this.
+- `PostMediaUploadQuery` names its second arm. `PostDeviceTokensRequest` states the
+  one-live-row rule. `GET /realtime`: a valid re-`auth` gets no reply; a malformed frame id or
+  an out-of-range `up_to_seq` is dropped as a failed check.
+- `pool_not_bookable` (§ credits, the staff hand-add's doc) names its third case: alumni-tier
+  credits in a day-school pool at either campus, refused since O-CREDITS fix 1
+  (`staffCredits.ts:211-213`, "alumni credits pay for day care only"; DECISIONS 624).
+- `PostStaffThreadsMessagesRequest` cites its 422 by symbol, not a stale line.
+- The landing-group note names 9.2.0, P51's 9.3.0 and S42's 9.4.0.
+
+### Not in 9.2.0
+
+- `BookingWire.reach?` on the staff cancel, the email lane and `closure` (P31, build 9.4.0).
+- Photos on `POST /staff/threads` (a staff photo uploads against a thread, so it goes in a
+  reply).
+- Reactions, unsend, edit, inline replies, voice messages, link previews, PDFs and
+  per-conversation receipt switches (note §1 `:43-45`).
+
 ## [9.2.0-pre.2] — 2026-11-19
 
 ADDITIVE. Plan one-off O-BUGS3, her #33 (`PLAYGROUND-BUGS.md:41`) and her "default" to its
