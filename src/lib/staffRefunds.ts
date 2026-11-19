@@ -12,7 +12,7 @@ import {
   findPurchaseLotOfCharge,
 } from '../db/repositories/creditLedgerRepository.js';
 import { refundsRepository, type RefundWireRow } from '../db/repositories/refundsRepository.js';
-import type { Tx } from '../db/tx.js';
+import { withTransaction, type Tx } from '../db/tx.js';
 import { bucketChicagoToday } from './chicagoDate.js';
 import { ApiError } from './errors.js';
 import { logUnroutableRefundMint, type PendingStripeRefund } from './pendingRefund.js';
@@ -88,7 +88,9 @@ export async function refundProposal(args: {
   paymentId: string;
   now: Date;
 }): Promise<GetStaffPaymentsRefundProposalResponse> {
-  return db.transaction(async (tx) => {
+  // Through `withTransaction`, not `db.transaction`: its client goes back to the pool on
+  // every path, a BEGIN that meets a lost connection included (O-POOLFIX fix 1).
+  return withTransaction(async (tx) => {
     const charge = await lockCharge(tx, args.paymentId);
     if (charge === undefined || !TOOK_MONEY.has(charge.status)) {
       throw paymentNotFound(args.paymentId);

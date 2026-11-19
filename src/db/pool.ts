@@ -20,10 +20,19 @@ function buildSsl() {
  * nothing else in the codebase constructs a Pool. Day-0 lock #3: the API owns
  * all data access over this pool with a privileged app role — no PostgREST,
  * no Supabase client SDK, no RLS.
+ *
+ * `connectionTimeoutMillis` (O-POOLFIX fix 1): a checkout waits at most 10 s for
+ * a slot (or for a new connection to open), then rejects with "timeout exceeded
+ * when trying to connect". Without it a pool whose 10 slots were all held waited
+ * forever: every route hung, `/health` never answered, no request failed, so
+ * nothing logged at level 50 and nothing paged (O-POOLFIX r1 H1, executed). With
+ * it, exhaustion is a 500 that pages, and `/health` answers 503, each after the
+ * 10 s wait.
  */
 export const pool = new pg.Pool({
   connectionString: env.DATABASE_URL,
   ssl: buildSsl(),
+  connectionTimeoutMillis: 10_000,
 });
 
 /**
@@ -41,16 +50,30 @@ export const pool = new pg.Pool({
  *     client checked out at the time (a transaction, idle between statements or
  *     with a statement running), which pg-pool's idle listener does not cover.
  * A query running when its connection dies still rejects to its caller exactly
- * as before, and neither listener touches it: a bare query fails with the
- * server's error (57P01), and a drizzle transaction (`withActor`) with
- * "Connection terminated unexpectedly", its rollback's error on the dead client.
+ * as before, and neither listener touches it. The caller's error is one of
+ * three texts, depending on where the loss lands:
+ *   - "terminating connection due to administrator command" (57P01, the
+ *     server's own error): the statement was in flight when the server ended
+ *     the backend, e.g. a bare `pool.query`, or a transaction's BEGIN;
+ *   - "Connection terminated unexpectedly": the socket closed under a statement
+ *     already sent, e.g. a transaction killed mid-statement (`withActor`), whose
+ *     caller gets its ROLLBACK's error on the dead client;
+ *   - "Client has encountered a connection error and is not queryable": the
+ *     client already knew its connection was gone when the statement was issued
+ *     (a socket reset, or any loss between statements).
  *
  * The pool has no request in scope, so it logs as `withMutation` does
  * (`mutation.ts`): one tagged line written to stderr. It never passes through
  * pino, so it can never reach the level-50 pager tap (`server.ts`'s
- * `alarmForwardingHooks`). One line per lost connection: an idle client's error
- * reaches both listeners, and a checked-out one emits twice (the server's error,
- * then "Connection terminated unexpectedly" as the socket closes).
+ * `alarmForwardingHooks`). At most one line per lost connection: an idle
+ * client's error reaches both listeners, and a checked-out one emits twice (the
+ * server's error, then "Connection terminated unexpectedly" as the socket
+ * closes), and only the first is written. Some losses write none, because the
+ * client is gone before any `error` event: a `pool.query` whose statement took
+ * the server's error (pg-pool releases the client with it and ends it), and a
+ * transaction's client released with its error (`tx.ts`) before its socket's
+ * close arrives, as when its BEGIN takes the server's 57P01. There the caller's
+ * rejection is the signal, and a route's 500 pages.
  */
 const reportedClients = new WeakSet<object>();
 

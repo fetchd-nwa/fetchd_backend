@@ -10,6 +10,12 @@ import * as relations from './schema/relations.js';
  * (`drizzle-kit pull`) from the loaded DB; `schema.sql` stays canonical, this
  * only mirrors it into TypeScript for typed queries + the relational API.
  */
-const schema = { ...tables, ...relations };
+export const schema = { ...tables, ...relations };
 
+/**
+ * Bound to the pool: each query checks a client out and back in. The app opens
+ * no transaction here (`db.transaction`): it opens them through `withActor` /
+ * `withTransaction` (`tx.ts`), which check the client out themselves so that it
+ * goes back to the pool on every path, BEGIN included (O-POOLFIX fix 1).
+ */
 export const db = drizzle(pool, { schema });
