@@ -1,3 +1,4 @@
+import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
 import { threadsRepository, type ThreadRow } from '../db/repositories/threadsRepository.js';
 import {
@@ -9,6 +10,7 @@ import {
   toMessageWire,
   toThreadWire,
   type MessageAttachmentWire,
+  type MessageAudience,
   type MessageRowForWire,
   type MessageWire,
   type ResolvedParticipant,
@@ -57,28 +59,37 @@ export async function wireManyThreads(rows: ThreadRow[]): Promise<ThreadWire[]> 
 }
 
 /**
- * Denormalize a batch of message rows into wire shapes. One batched
- * staff-name lookup feeds the polymorphic-sender flattening (owner-sent
- * messages omit `sender_name` per `lib/threadWire.toMessageWire`); one batched
- * attachment lookup + parallel URL signing feeds the per-message media list.
- * `r2` is injected so contract tests substitute the in-memory stub.
+ * Denormalize a batch of message rows into wire shapes for one `audience` (the
+ * family's routes or staff's: `client_message_id` rides the sender's side only,
+ * `threadWire.toMessageWire`). One batched staff-name lookup feeds the
+ * polymorphic-sender flattening (owner-sent messages omit `sender_name` per
+ * `lib/threadWire.toMessageWire`); one batched attachment lookup + parallel URL
+ * signing feeds the per-message media list. `r2` is injected so contract tests
+ * substitute the in-memory stub.
+ *
+ * The signature (S45, MSG-U04; design §2.9:4554, answer 22; 9.2.0
+ * `MessageWire.sender_name`): a staff message in a SCHOOL-addressed thread is
+ * signed with the staffer's first name while `msg.reply_signature_mode` is
+ * `staffer_first_name`, or with the school's name (the system row's) under
+ * `school_name`. Elsewhere a staff message keeps the staffer's name. Read only
+ * when the batch holds a staff message.
  */
 export async function wireManyMessages(
   rows: MessageRowForWire[],
   r2: R2Client,
+  audience: MessageAudience,
 ): Promise<MessageWire[]> {
   if (rows.length === 0) return [];
+  const staffRows = rows.filter((m) => m.senderKind === 'staff');
   const staffSenderIds = [
-    ...new Set(
-      rows
-        .filter((m) => m.senderKind === 'staff')
-        .map((m) => m.senderStaffId)
-        .filter((v): v is string => v !== null),
-    ),
+    ...new Set(staffRows.map((m) => m.senderStaffId).filter((v): v is string => v !== null)),
   ];
-  const [staffNameRows, attachmentRows] = await Promise.all([
+  const [staffNameRows, attachmentRows, signature] = await Promise.all([
     staffRepository.findNamesByIds(staffSenderIds),
     messagesRepository.findAttachmentsByMessageIds(rows.map((r) => r.id)),
+    staffRows.length === 0
+      ? Promise.resolve(undefined)
+      : schoolSignature([...new Set(staffRows.map((m) => m.threadId))]),
   ]);
   const staffNamesById = new Map(staffNameRows.map((s) => [s.id, s.name] as const));
   const attachmentsByMessage = await signAttachmentsByMessage(attachmentRows, r2);
@@ -87,9 +98,33 @@ export async function wireManyMessages(
     let senderName: string | null = null;
     if (row.senderKind === 'staff' && row.senderStaffId !== null) {
       senderName = staffNamesById.get(row.senderStaffId) ?? null;
+      if (signature !== undefined && signature.schoolThreadIds.has(row.threadId)) {
+        senderName =
+          signature.mode === 'school_name' ? signature.schoolName : firstName(senderName);
+      }
     }
-    return toMessageWire(row, senderName, attachmentsByMessage.get(row.id) ?? []);
+    return toMessageWire(row, senderName, attachmentsByMessage.get(row.id) ?? [], audience);
   });
+}
+
+/** The school threads among `threadIds`, the signature mode and the school's own name. */
+async function schoolSignature(threadIds: string[]): Promise<{
+  schoolThreadIds: Set<string>;
+  mode: 'staffer_first_name' | 'school_name';
+  schoolName: string | null;
+}> {
+  const [schoolThreadIds, mode, school] = await Promise.all([
+    threadsRepository.findSchoolThreadIds(threadIds),
+    settingsRepository.replySignatureMode(),
+    staffRepository.findSchoolAccount(),
+  ]);
+  return { schoolThreadIds: new Set(schoolThreadIds), mode, schoolName: school?.name ?? null };
+}
+
+/** A staffer's first name: her name up to its first space (as the settings read words it). */
+function firstName(name: string | null): string | null {
+  if (name === null) return null;
+  return name.trim().split(/\s+/)[0] ?? null;
 }
 
 /**

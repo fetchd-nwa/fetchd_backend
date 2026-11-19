@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { LightMyRequestResponse } from 'fastify';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import {
   messages as messagesTable,
@@ -276,5 +276,32 @@ test(
       .from(messagesTable)
       .where(and(eq(messagesTable.threadId, FIXTURE_IDS.thread1Id), eq(messagesTable.text, text)));
     assert.equal(msgRows.length, 1, 'replay did not insert a second message');
+  },
+);
+
+// P45 `red_first` (design §2.9:4554; S45, MSG-U11): after `--expire`, the owner's
+// `GET /threads` (threads.test.ts) AND the staff queue both answer 200 with the thread present,
+// naming its departed participant. Both go red when the participant lookup's `live(staff)`
+// is put back.
+test(
+  'GET /staff/threads still answers when a thread participant has been expired (--expire), naming her',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = staffThreadsApp();
+    await db.execute(
+      sql`UPDATE staff SET expired_at = now() WHERE id = ${FIXTURE_IDS.staffDonavanId}`,
+    );
+    try {
+      const res = await app.inject({ method: 'GET', url: '/staff/threads' });
+      assert.equal(res.statusCode, 200, res.body);
+      const mine = (res.json() as Array<{ id: string; participant: { name: string } }>).find(
+        (t) => t.id === FIXTURE_IDS.thread1Id,
+      );
+      assert.equal(mine?.participant.name, 'Donavan', 'the departed participant vanished');
+    } finally {
+      await db.execute(
+        sql`UPDATE staff SET expired_at = NULL WHERE id = ${FIXTURE_IDS.staffDonavanId}`,
+      );
+    }
   },
 );

@@ -1,5 +1,6 @@
 import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../db/client.js';
+import { livePrincipal } from '../db/repositories/staffRepository.js';
 import { owners, staff } from '../db/schema/schema.js';
 import type { Principal } from './principal.js';
 import { ApiError } from '../lib/errors.js';
@@ -15,7 +16,10 @@ import { ApiError } from '../lib/errors.js';
  * with no row → `not_provisioned` (caller's concern), modeled here as `null`.
  *
  * Expired mirror rows are excluded: a soft-expired account is deactivated and
- * must not authenticate (cross-cutting soft-expire invariant). `kind` is
+ * must not authenticate (cross-cutting soft-expire invariant). So is the
+ * school's system row (S45, design §2.9:4554; rs3 M5.26): staff resolve through
+ * `livePrincipal`, so even a uid set on that row by hand could never yield it.
+ * `kind` is
  * table-derived; a uid living in BOTH tables is a data-integrity fault, not a
  * reachable user state — surfaced loudly, never silently picked.
  */
@@ -29,7 +33,7 @@ export async function resolvePrincipal(supabaseUid: string): Promise<Principal |
   const [staffRow] = await db
     .select({ id: staff.id, role: staff.role })
     .from(staff)
-    .where(and(eq(staff.supabaseUid, supabaseUid), isNull(staff.expiredAt)))
+    .where(and(eq(staff.supabaseUid, supabaseUid), livePrincipal()))
     .limit(1);
 
   if (ownerRow && staffRow) {
@@ -45,4 +49,19 @@ export async function resolvePrincipal(supabaseUid: string): Promise<Principal |
     return { kind: 'staff', staffId: staffRow.id, role: staffRow.role, supabaseUid };
   }
   return null;
+}
+
+/**
+ * Whether a staff id names the school's system row (S45; rs3 M5.26). The dev
+ * `X-Dev-Principal` bypass builds a principal from an id with no other read, so
+ * this one read is what refuses the system row there (design §2.9:4554, the
+ * third auth layer). An id naming no row is not the system row.
+ */
+export async function isSystemStaffId(staffId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: staff.id })
+    .from(staff)
+    .where(and(eq(staff.id, staffId), eq(staff.isSystemAccount, true)))
+    .limit(1);
+  return row !== undefined;
 }

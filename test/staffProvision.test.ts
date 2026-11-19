@@ -222,6 +222,17 @@ describe('staff:provision — against a fake admin client and the test database'
     await client.end();
   });
 
+  // OL6 (A2; P45, rs3 M5.26): the school's system row is live, has no uid and belongs to no
+  // auth user, by design. Read as a person row it would be "its uid has no auth user" and turn
+  // P23's preflight red on every database born from schema.sql.
+  test('OL6: with the school system row present, the staff clauses are [] (the system row is not a person row)', async () => {
+    const { rows } = await client.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM staff WHERE is_system_account AND expired_at IS NULL',
+    );
+    assert.equal(rows[0]?.n, 1, 'precondition: the system row is live (schema.sql M5.26)');
+    assert.deepEqual(await staffClauseViolations({ admin: new FakeAdmin(), db: client }, []), []);
+  });
+
   test('a roster email held by a user with no app_role → exit 1, zero auth writes, zero staff rows, the user described', async () => {
     const admin = new FakeAdmin();
     const signedUp = admin.seed({

@@ -304,6 +304,21 @@ export const settingsRepository = {
     };
   },
 
+  /**
+   * `msg.reply_signature_mode` alone (S45, MSG-U04; design §2.9:4554, answer 22): how a
+   * staff message in a school-addressed thread is signed on the wire.
+   */
+  async replySignatureMode(
+    runner: Runner = db,
+  ): Promise<MessagingSettingsWire['reply_signature_mode']> {
+    const [row] = await runner
+      .select({ mode: messagingSettings.replySignatureMode })
+      .from(messagingSettings)
+      .limit(1);
+    const r = seeded(row, 'messaging_settings', 'M1.11');
+    return r.mode as MessagingSettingsWire['reply_signature_mode'];
+  },
+
   async notification(runner: Runner = db): Promise<NotificationSettingsWire> {
     const [row] = await runner.select().from(notificationSettings).limit(1);
     const r = seeded(row, 'notification_settings', 'M1.12');

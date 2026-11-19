@@ -90,7 +90,8 @@ export const owners = pgTable("owners", {
 
 export const staff = pgTable("staff", {
 	id: uuid().defaultRandom().primaryKey().notNull(),
-	supabaseUid: uuid("supabase_uid").notNull(),
+	// NULL only on the system row (M5.26; the CHECK below).
+	supabaseUid: uuid("supabase_uid"),
 	name: text().notNull(),
 	role: staffRole().notNull(),
 	imagePath: text("image_path"),
@@ -102,11 +103,16 @@ export const staff = pgTable("staff", {
 	// written by `npm run staff:provision`'s roster alone.
 	lessonPriceCents: integer("lesson_price_cents"),
 	boardTrainEligible: boolean("board_train_eligible").default(false).notNull(),
+	// M5.26 (P45, MSG-U03): the school's own row, *NWA School for Dogs*. Never a principal:
+	// `livePrincipal(staff)` (staffRepository) is the default staff read.
+	isSystemAccount: boolean("is_system_account").default(false).notNull(),
 }, (table) => {
 	return {
 		staffSupabaseUidKey: unique("staff_supabase_uid_key").on(table.supabaseUid),
 		staffHomeLocationsCheck: check("staff_home_locations_check", sql`cardinality(home_locations) > 0`),
 		staffLessonPriceCentsCheck: check("staff_lesson_price_cents_check", sql`lesson_price_cents > 0`),
+		staffSystemAccountUidCheck: check("staff_system_account_uid_check", sql`is_system_account = (supabase_uid IS NULL)`),
+		staffOneSystemAccountUidx: uniqueIndex("staff_one_system_account_uidx").using("btree", sql`(true)`).where(sql`(is_system_account AND (expired_at IS NULL))`),
 	}
 });
 
@@ -1627,8 +1633,13 @@ export const threads = pgTable("threads", {
 	source: recordSource().default('app').notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	// M5.27 (P45, MSG-U05): a family's conversation with the school.
+	addressedToSchool: boolean("addressed_to_school").default(false).notNull(),
+	// M5.29 (P45, W1): the highest seq given out; written only by the messages trigger.
+	lastSeq: integer("last_seq").default(0).notNull(),
 }, (table) => {
 	return {
+		ownerSchoolTopicUidx: uniqueIndex("threads_owner_school_topic_uidx").using("btree", table.ownerId.asc().nullsLast().op("uuid_ops"), table.category.asc().nullsLast().op("enum_ops")).where(sql`(addressed_to_school AND (expired_at IS NULL))`),
 		ownerIdx: index("threads_owner_idx").using("btree", table.ownerId.asc().nullsLast().op("timestamptz_ops"), table.lastMessageAt.desc().nullsFirst().op("uuid_ops")),
 		sourceRefUidx: uniqueIndex("threads_source_ref_uidx").using("btree", table.source.asc().nullsLast().op("enum_ops"), table.externalRef.asc().nullsLast().op("enum_ops")).where(sql`(expired_at IS NULL)`),
 		threadsOwnerIdFkey: foreignKey({
@@ -1654,8 +1665,20 @@ export const messages = pgTable("messages", {
 	sentAt: timestamp("sent_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
 	readAt: timestamp("read_at", { withTimezone: true, mode: 'string' }),
 	expiredAt: timestamp("expired_at", { withTimezone: true, mode: 'string' }),
+	// M5.29 (P45, W1): NOT NULL, and ASSIGNED BY THE DATABASE: the BEFORE INSERT trigger
+	// `messages_assign_thread_seq()` sets it on every insert, under the thread's row lock. An
+	// insert names none: Drizzle sends DEFAULT (the column has none, so it is NULL until the
+	// trigger fills it, before the NOT NULL is checked).
+	threadSeq: integer("thread_seq").notNull().$defaultFn(() => sql`DEFAULT`),
+	// M5.30 (P45, W2 as A2 OL2 amends it): unique per sender.
+	clientMessageId: uuid("client_message_id"),
+	// M5.30 (W3): *Delivered*.
+	deliveredAt: timestamp("delivered_at", { withTimezone: true, mode: 'string' }),
 }, (table) => {
 	return {
+		threadSeqUidx: uniqueIndex("messages_thread_seq_uidx").using("btree", table.threadId.asc().nullsLast().op("uuid_ops"), table.threadSeq.asc().nullsLast().op("int4_ops")),
+		ownerClientMessageUidx: uniqueIndex("messages_owner_client_message_uidx").using("btree", table.senderOwnerId.asc().nullsLast().op("uuid_ops"), table.clientMessageId.asc().nullsLast().op("uuid_ops")).where(sql`(client_message_id IS NOT NULL)`),
+		staffClientMessageUidx: uniqueIndex("messages_staff_client_message_uidx").using("btree", table.senderStaffId.asc().nullsLast().op("uuid_ops"), table.clientMessageId.asc().nullsLast().op("uuid_ops")).where(sql`(client_message_id IS NOT NULL)`),
 		threadIdx: index("messages_thread_idx").using("btree", table.threadId.asc().nullsLast().op("timestamptz_ops"), table.sentAt.asc().nullsLast().op("timestamptz_ops")),
 		messagesThreadIdFkey: foreignKey({
 			columns: [table.threadId],
@@ -1885,6 +1908,50 @@ export const deviceTokens = pgTable("device_tokens", {
 			name: "device_tokens_owner_id_fkey"
 		}).onDelete("cascade"),
 		deviceTokensPlatformCheck: check("device_tokens_platform_check", sql`platform = ANY (ARRAY['ios'::text, 'android'::text])`),
+	}
+});
+
+// M5.28 (P45, MSG-U17): read state per staffer per family message.
+export const messageStaffReads = pgTable("message_staff_reads", {
+	messageId: uuid("message_id").notNull(),
+	staffId: uuid("staff_id").notNull(),
+	readAt: timestamp("read_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+}, (table) => {
+	return {
+		staffIdx: index("message_staff_reads_staff_idx").using("btree", table.staffId.asc().nullsLast().op("uuid_ops")),
+		messageStaffReadsMessageIdFkey: foreignKey({
+			columns: [table.messageId],
+			foreignColumns: [messages.id],
+			name: "message_staff_reads_message_id_fkey"
+		}).onDelete("cascade"),
+		messageStaffReadsStaffIdFkey: foreignKey({
+			columns: [table.staffId],
+			foreignColumns: [staff.id],
+			name: "message_staff_reads_staff_id_fkey"
+		}),
+		messageStaffReadsPkey: primaryKey({ columns: [table.messageId, table.staffId], name: "message_staff_reads_pkey"}),
+	}
+});
+
+// M5.30 (P45, A1.2, A2 FL3): the claim on a staff message's one direct push.
+export const messagePushes = pgTable("message_pushes", {
+	messageId: uuid("message_id").primaryKey().notNull(),
+	notificationId: uuid("notification_id"),
+	claimedAt: timestamp("claimed_at", { withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+	ticketsOk: integer("tickets_ok"),
+	ticketsError: integer("tickets_error"),
+}, (table) => {
+	return {
+		messagePushesMessageIdFkey: foreignKey({
+			columns: [table.messageId],
+			foreignColumns: [messages.id],
+			name: "message_pushes_message_id_fkey"
+		}).onDelete("cascade"),
+		messagePushesNotificationIdFkey: foreignKey({
+			columns: [table.notificationId],
+			foreignColumns: [notifications.id],
+			name: "message_pushes_notification_id_fkey"
+		}).onDelete("set null"),
 	}
 });
 

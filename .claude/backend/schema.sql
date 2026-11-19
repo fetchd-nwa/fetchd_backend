@@ -321,8 +321,9 @@ CREATE UNIQUE INDEX owners_source_ref_uidx
 
 CREATE TABLE staff (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  supabase_uid  uuid UNIQUE NOT NULL,                 -- staff log in via the SAME
-                                                      -- Supabase project, role:'staff'
+  supabase_uid  uuid UNIQUE,                          -- staff log in via the SAME
+                                                      -- Supabase project, role:'staff';
+                                                      -- NULL only on the system row (M5.26)
   name          text NOT NULL,                        -- seed = lib/staff.ts roster
   role          staff_role NOT NULL,
   image_path    text,
@@ -342,8 +343,25 @@ CREATE TABLE staff (
   -- written by `npm run staff:provision`'s roster alone, on every run.
   lesson_price_cents   integer CONSTRAINT staff_lesson_price_cents_check
                          CHECK (lesson_price_cents > 0),
-  board_train_eligible boolean NOT NULL DEFAULT false
+  board_train_eligible boolean NOT NULL DEFAULT false,
+  -- M5.26 (P45, wire 9.2.0; design §4 M8.03, MSG-U03): the school's own row, *NWA School for
+  -- Dogs*, the participant of every school-addressed thread. Never a principal (no login: its
+  -- uid is NULL, and only its uid may be), never on a roster, pick list or responder choice;
+  -- role `trainer`, which confers nothing. `livePrincipal(staff)` (live AND NOT
+  -- is_system_account) is the default staff read.
+  is_system_account boolean NOT NULL DEFAULT false,
+  CONSTRAINT staff_system_account_uid_check CHECK (is_system_account = (supabase_uid IS NULL))
 );
+-- One live system row.
+CREATE UNIQUE INDEX staff_one_system_account_uidx ON staff ((true))
+  WHERE is_system_account AND expired_at IS NULL;
+-- The system row, with M5.26's fixed id and columns (brief CR8): a database born from this file
+-- and one that ran M5.26 hold the same row (`test/contracts/rs3-steps.test.ts`). The one staff
+-- row `npm run staff:provision` never writes; `scripts/seed-dev.ts` re-inserts it after its
+-- staff delete. Never delete it.
+INSERT INTO staff (id, supabase_uid, name, role, image_path, home_locations, is_system_account)
+VALUES ('5c400001-0000-4000-8000-000000000001', NULL, 'NWA School for Dogs', 'trainer', NULL,
+        '{bentonville,fayetteville}', true);
 
 -- ----------------------------------------------------------------------------
 -- Dogs (R3 ownership root). A dog belongs to EITHER an owner (a client) OR a
@@ -2266,11 +2284,23 @@ CREATE TABLE threads (
   external_ref    text,
   source          record_source NOT NULL DEFAULT 'app',
   created_at      timestamptz NOT NULL DEFAULT now(),
-  expired_at      timestamptz                           -- NULL = live (soft delete)
+  expired_at      timestamptz,                          -- NULL = live (soft delete)
+  -- M5.27 (P45; design §4 M8.04, MSG-U05): a family's conversation with the school, whose
+  -- participant is the system row. One LIVE school thread per family and topic (the index
+  -- below), so `POST /threads` continues it.
+  addressed_to_school boolean NOT NULL DEFAULT false,
+  -- M5.29 (P45; wire 9.2.0 `ThreadWire.last_seq`): the highest `seq` the thread has given out,
+  -- expired messages counted; 0 before a first message. Written only by
+  -- `messages_assign_thread_seq()`.
+  last_seq        integer NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX threads_source_ref_uidx
   ON threads (source, external_ref) WHERE expired_at IS NULL;
 CREATE INDEX threads_owner_idx ON threads (owner_id, last_message_at DESC);
+-- Inferred by `ON CONFLICT (owner_id, category) WHERE addressed_to_school AND expired_at IS
+-- NULL`, never named (a partial unique index is not a constraint).
+CREATE UNIQUE INDEX threads_owner_school_topic_uidx ON threads (owner_id, category)
+  WHERE addressed_to_school AND expired_at IS NULL;
 
 CREATE TABLE thread_dogs (
   thread_id uuid NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
@@ -2289,6 +2319,17 @@ CREATE TABLE messages (
   sent_at         timestamptz NOT NULL DEFAULT now(),
   read_at         timestamptz,                          -- NULL = unread (R5: no bool)
   expired_at      timestamptz,                          -- NULL = live; "unsend"/delete = expire (text retained in audit_log)
+  -- M5.29 (P45; wire 9.2.0 `MessageWire.seq`): the message's number in its thread, from 1,
+  -- strictly increasing in COMMIT order. Assigned by `messages_assign_thread_seq()` under the
+  -- thread's row lock, on every insert, whatever the insert names. An expired message keeps
+  -- its number. Both message lists are ordered by it, never by `sent_at` (the transaction's
+  -- start).
+  thread_seq      integer NOT NULL,
+  -- M5.30 (P45; W2, A2 OL2): the sender's own id for one logical send, unique per sender
+  -- (the two indexes below), so a retry after a lost 201 returns the stored message.
+  client_message_id uuid,
+  -- M5.30 (W3): the *Delivered* receipt — an open screen on the other side has it.
+  delivered_at    timestamptz,
   CHECK (
     (sender_kind = 'owner' AND sender_owner_id IS NOT NULL AND sender_staff_id IS NULL)
     OR
@@ -2296,8 +2337,57 @@ CREATE TABLE messages (
   )
 );
 CREATE INDEX messages_thread_idx ON messages (thread_id, sent_at);
+CREATE UNIQUE INDEX messages_thread_seq_uidx ON messages (thread_id, thread_seq);
+CREATE UNIQUE INDEX messages_owner_client_message_uidx
+  ON messages (sender_owner_id, client_message_id) WHERE client_message_id IS NOT NULL;
+CREATE UNIQUE INDEX messages_staff_client_message_uidx
+  ON messages (sender_staff_id, client_message_id) WHERE client_message_id IS NOT NULL;
 -- unread_count is DERIVED (count of messages.read_at IS NULL not sent by owner,
 -- expired_at IS NULL) — never a stored mutable column.
+
+-- M5.29 (P45; design messaging-live-v1 §4 M8.07 (b), (e)): the permanent BEFORE INSERT
+-- trigger behind `seq` (it takes the thread's row lock, so concurrent sends serialize and
+-- `seq` follows commit order; it covers every insert site), and a thread's owner never
+-- changes (the publish choke point reads `owner_id` from the committed row).
+CREATE FUNCTION messages_assign_thread_seq() RETURNS trigger
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE threads SET last_seq = last_seq + 1
+   WHERE id = NEW.thread_id
+  RETURNING last_seq INTO NEW.thread_seq;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER messages_assign_thread_seq BEFORE INSERT ON messages
+  FOR EACH ROW EXECUTE FUNCTION messages_assign_thread_seq();
+REVOKE ALL ON FUNCTION messages_assign_thread_seq() FROM PUBLIC, anon, authenticated;
+
+CREATE FUNCTION threads_owner_id_immutable() RETURNS trigger
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.owner_id IS DISTINCT FROM OLD.owner_id THEN
+    RAISE EXCEPTION 'threads.owner_id never changes: thread % keeps its owner', OLD.id
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER threads_owner_id_immutable BEFORE UPDATE OF owner_id ON threads
+  FOR EACH ROW EXECUTE FUNCTION threads_owner_id_immutable();
+REVOKE ALL ON FUNCTION threads_owner_id_immutable() FROM PUBLIC, anon, authenticated;
+
+-- M5.28 (P45; design §4 M8.05, MSG-U17): read state per staffer per family message. Insert-only
+-- and keyed by its pair, so out of `audit_capture` (no `row_pk` arm could name a row of it).
+CREATE TABLE message_staff_reads (
+  message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  staff_id   uuid NOT NULL REFERENCES staff(id),
+  read_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (message_id, staff_id)
+);
+CREATE INDEX message_staff_reads_staff_idx ON message_staff_reads (staff_id);
+REVOKE ALL ON message_staff_reads FROM anon, authenticated;
 
 -- Photo/video attachments on a message (post-Day-19e). The message wire was
 -- text-only; owners attach media uploaded through the existing pipeline
@@ -2401,6 +2491,21 @@ CREATE TABLE notifications (
 );
 CREATE INDEX notifications_owner_idx ON notifications (owner_id, received_at DESC);
 
+-- M5.30 (P45; design messaging-live-v1 A1.2, A2 FL3, FM2): the claim on a staff message's one
+-- direct push. `INSERT … ON CONFLICT DO NOTHING RETURNING`, so a replay, a `client_message_id`
+-- repeat, a second instance or a second post-commit call sends nothing more (at most once).
+-- `notification_id` is the feed row the push announces; the ticket counts stay NULL until the
+-- send settles, so a boot counts the claims a crash lost. Append-only and not a soft-expire
+-- entity: out of `audit_capture`.
+CREATE TABLE message_pushes (
+  message_id      uuid PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+  notification_id uuid REFERENCES notifications(id) ON DELETE SET NULL,
+  claimed_at      timestamptz NOT NULL DEFAULT now(),
+  tickets_ok      integer,
+  tickets_error   integer
+);
+REVOKE ALL ON message_pushes FROM anon, authenticated;
+
 -- ----------------------------------------------------------------------------
 -- Scheduled / outbound notifications (locked 2026-05-19; PHASE-PLAN §648-649 +
 -- "wire the real push entry path"). `notifications` is the delivered in-app
@@ -2503,6 +2608,11 @@ CREATE TABLE device_tokens (
 -- re-registered (same device re-grants push) without a UNIQUE collision.
 CREATE UNIQUE INDEX device_tokens_uidx
   ON device_tokens (owner_id, expo_push_token) WHERE expired_at IS NULL;
+-- M5.30 (P45; A2 OH1, DISCREPANCIES NOTE-38): one LIVE row per token, whoever's, so one phone
+-- that walks two families is never live for both and a staff reply to one can never reach
+-- the other's lock screen. M5.30's last object; `/health` reads it (brief LR1).
+CREATE UNIQUE INDEX device_tokens_live_token_uidx ON device_tokens (expo_push_token)
+  WHERE expired_at IS NULL;
 
 -- ----------------------------------------------------------------------------
 -- Audit log (locked 2026-05-19) — the append-only history that makes "even
@@ -2583,7 +2693,8 @@ END $$;
 -- Attach audit_capture to every soft-expire entity + join table (AFTER
 -- UPDATE OR DELETE). Append-only/immutable-by-nature tables are intentionally
 -- excluded (credit_ledger, credit_lot_expiry_edits, charges, invoices, refunds, agreement_signatures,
--- scheduled_notifications, notifications, media_derivative_jobs, audit_log) as
+-- scheduled_notifications, notifications, media_derivative_jobs, audit_log,
+-- and from M5.28/M5.30 message_staff_reads and message_pushes) as
 -- is idempotency_keys (transport dedupe, TTL-pruned). day_capacity is
 -- included — it carries expired_at; its first write is an INSERT, which this
 -- trigger does not see, so the row's own updated_by_staff_id names that author.

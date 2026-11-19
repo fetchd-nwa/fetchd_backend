@@ -48,21 +48,61 @@ const MESSAGE_PROJECTION = {
   text: messages.text,
   sentAt: messages.sentAt,
   readAt: messages.readAt,
+  threadSeq: messages.threadSeq,
+  clientMessageId: messages.clientMessageId,
 } as const;
+
+/** A sender's stored message for one `client_message_id` (W2): where it is, and the row. */
+export type StoredClientMessage = MessageRow;
 
 export const messagesRepository = {
   /**
-   * All live messages in a thread, oldest first. Caller MUST have already
-   * verified the owner owns the thread (`threadsRepository.ownsThread`) —
-   * this repo trusts that gate. Sent-time ASC matches the chat UI's
-   * "oldest at top, newest at bottom" rendering.
+   * All live messages in a thread, in `seq` order (9.2.0, contract-notes mechanic 16):
+   * commit order, never `sent_at`, which is the transaction's start, so two sends never
+   * swap places. Caller MUST have already verified the owner owns the thread
+   * (`threadsRepository.ownsThread`) — this repo trusts that gate.
    */
   async findLiveByThread(threadId: string): Promise<MessageRow[]> {
     return db
       .select(MESSAGE_PROJECTION)
       .from(messages)
       .where(and(eq(messages.threadId, threadId), live(messages)))
-      .orderBy(asc(messages.sentAt));
+      .orderBy(asc(messages.threadSeq));
+  },
+
+  /**
+   * A family's stored message for her `client_message_id` (W2, A2 OL2: unique per sender),
+   * expired or not, as the unique index holds it, in whatever thread it is. The send routes
+   * read it BEFORE the Idempotency-Key's body hash (and again on the pool after a 23505,
+   * LR11), so a repeat of a message the server holds is that message.
+   */
+  async findByOwnerClientMessageId(
+    ownerId: string,
+    clientMessageId: string,
+  ): Promise<StoredClientMessage | undefined> {
+    const [row] = await db
+      .select(MESSAGE_PROJECTION)
+      .from(messages)
+      .where(
+        and(eq(messages.senderOwnerId, ownerId), eq(messages.clientMessageId, clientMessageId)),
+      )
+      .limit(1);
+    return row;
+  },
+
+  /** A staffer's stored message for her `client_message_id`, as above. */
+  async findByStaffClientMessageId(
+    staffId: string,
+    clientMessageId: string,
+  ): Promise<StoredClientMessage | undefined> {
+    const [row] = await db
+      .select(MESSAGE_PROJECTION)
+      .from(messages)
+      .where(
+        and(eq(messages.senderStaffId, staffId), eq(messages.clientMessageId, clientMessageId)),
+      )
+      .limit(1);
+    return row;
   },
 
   /**
@@ -74,7 +114,7 @@ export const messagesRepository = {
    */
   async createStaffMessage(
     tx: Tx,
-    args: { threadId: string; staffId: string; text: string },
+    args: { threadId: string; staffId: string; text: string; clientMessageId?: string | null },
   ): Promise<MessageRow> {
     const [row] = await tx
       .insert(messages)
@@ -83,6 +123,7 @@ export const messagesRepository = {
         senderKind: 'staff',
         senderStaffId: args.staffId,
         text: args.text,
+        clientMessageId: args.clientMessageId ?? null,
       })
       .returning(MESSAGE_PROJECTION);
     if (!row) {
@@ -99,7 +140,13 @@ export const messagesRepository = {
    */
   async createOwnerMessage(
     tx: Tx,
-    args: { threadId: string; ownerId: string; text: string; attachmentMediaIds?: string[] },
+    args: {
+      threadId: string;
+      ownerId: string;
+      text: string;
+      attachmentMediaIds?: string[];
+      clientMessageId?: string | null;
+    },
   ): Promise<MessageRow> {
     const [row] = await tx
       .insert(messages)
@@ -108,6 +155,7 @@ export const messagesRepository = {
         senderKind: 'owner',
         senderOwnerId: args.ownerId,
         text: args.text,
+        clientMessageId: args.clientMessageId ?? null,
       })
       .returning(MESSAGE_PROJECTION);
     if (!row) {

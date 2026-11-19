@@ -65,6 +65,8 @@ export interface ThreadRowForWire {
   participantStaffId: string | null;
   lastMessage: string;
   lastMessageAt: string;
+  /** rs3 M5.29 (`threads.last_seq`): the highest `seq` the thread has given out. */
+  lastSeq: number;
 }
 
 /**
@@ -81,6 +83,10 @@ export interface MessageRowForWire {
   text: string;
   sentAt: string;
   readAt: string | null;
+  /** rs3 M5.29 (`messages.thread_seq`): the message's number in its thread. */
+  threadSeq: number;
+  /** rs3 M5.30: the sender's own id for the send, or null when it carried none. */
+  clientMessageId: string | null;
 }
 
 /**
@@ -94,6 +100,8 @@ export interface ResolvedParticipant {
   name: string;
   role: StaffRoleValue;
   imagePath: string | null;
+  /** S45 (MSG-U03): the school's system row, the participant of a school thread. */
+  isSchool: boolean;
 }
 
 /**
@@ -116,6 +124,8 @@ export function toThreadWire(
   if (participant.imagePath !== null && participant.imagePath !== '') {
     participantWire.image_path = participant.imagePath;
   }
+  // 9.2.0 (design 7.1.0, MSG-U03): present only on the school's own participant.
+  if (participant.isSchool) participantWire.is_school = true;
   return {
     id: row.id,
     category: row.category,
@@ -126,8 +136,18 @@ export function toThreadWire(
     last_message: row.lastMessage,
     last_message_at: pgTimestampToIso(row.lastMessageAt),
     unread_count: unreadCount,
+    last_seq: row.lastSeq,
   };
 }
+
+/**
+ * Who reads a message wire: the family (owner routes, her socket) or staff (the
+ * `/staff/threads` routes). 9.2.0: some fields ride one side only — the send's
+ * `client_message_id` is echoed to the SENDER's side alone (contract-notes
+ * mechanic 11), so an echo is matched, never doubled, and the other side never
+ * sees the sender's id.
+ */
+export type MessageAudience = 'owner' | 'staff';
 
 /**
  * Emit the Message wire shape with polymorphic sender flattened. The route
@@ -135,12 +155,15 @@ export function toThreadWire(
  * extraction) and the owner name via a single lookup; `senderName` here is
  * the pre-resolved string for the message's sender (or null when the
  * message's sender row was hard-deleted, which shouldn't happen but is
- * tolerated). `is_read` derives from `read_at IS NOT NULL`.
+ * tolerated). `is_read` derives from `read_at IS NOT NULL`. `seq` is the
+ * trigger's number (W1); `client_message_id` rides only to `audience` when it
+ * is the sender's side (W2, mechanic 11).
  */
 export function toMessageWire(
   row: MessageRowForWire,
   senderName: string | null,
-  attachments: MessageAttachmentWire[] = [],
+  attachments: MessageAttachmentWire[],
+  audience: MessageAudience,
 ): MessageWire {
   const senderId = flattenMessageSenderId(row);
   const wire: MessageWire = {
@@ -150,12 +173,16 @@ export function toMessageWire(
     text: row.text,
     sent_at: pgTimestampToIso(row.sentAt),
     is_read: row.readAt !== null,
+    seq: row.threadSeq,
   };
   if (senderName !== null && senderName !== '') {
     wire.sender_name = senderName;
   }
   if (attachments.length > 0) {
     wire.attachments = attachments;
+  }
+  if (row.clientMessageId !== null && row.senderKind === audience) {
+    wire.client_message_id = row.clientMessageId;
   }
   return wire;
 }

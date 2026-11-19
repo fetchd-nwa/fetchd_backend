@@ -61,6 +61,8 @@ import {
   groupClasses,
   idempotencyKeys,
   invoices,
+  messagePushes,
+  messageStaffReads,
   messages,
   notificationDogs,
   notifications,
@@ -177,6 +179,10 @@ async function wipe(): Promise<void> {
   await db.delete(eventRsvps);
   await db.delete(events);
   await db.delete(notificationDogs);
+  // rs3 (P45): a push claim names its message and its feed row, and a staff read names
+  // its message and its staffer, so both go before any of their parents.
+  await db.delete(messagePushes);
+  await db.delete(messageStaffReads);
   // scheduled_notifications.emitted_notification_id → notifications.id, so the
   // child (scheduled) must be deleted before the parent (notifications).
   await db.delete(scheduledNotifications);
@@ -227,7 +233,22 @@ async function wipe(): Promise<void> {
   await db.delete(agreementDocuments);
   await db.delete(owners);
   await db.delete(staff);
+  // The school's system row went with every other staff row: it goes straight back, with
+  // rs3 M5.26's fixed id and columns, the row schema.sql inserts (brief CR8), so a school
+  // thread made after this seed has its participant, and the id never changes.
+  await db.insert(staff).values(SCHOOL_SYSTEM_ROW);
 }
+
+/** rs3 M5.26's row, column for column (`migrations/rs3/M5.26_school_system_account.sql`). */
+const SCHOOL_SYSTEM_ROW = {
+  id: '5c400001-0000-4000-8000-000000000001',
+  supabaseUid: null,
+  name: 'NWA School for Dogs',
+  role: 'trainer',
+  imagePath: null,
+  homeLocations: ['bentonville', 'fayetteville'],
+  isSystemAccount: true,
+} as const satisfies typeof staff.$inferInsert;
 
 // Real Stripe rows survive a re-seed (Δ 2026-07-16). The wipe has to clear
 // stripe_customers + payment_methods (FK order), but those tables can hold

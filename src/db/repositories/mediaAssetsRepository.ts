@@ -61,6 +61,9 @@ export interface MediaAssetRow {
   durationMs: number | null;
   blurhash: string | null;
   derivatives: MediaDerivative[];
+  /** Who uploaded it: the family, or a staffer (report media; from 9.2.0 a staff message's
+   *  attachment). An owner send refuses a staff upload as missing (B12). */
+  createdBy: 'owner' | 'staff';
   createdAt: string;
   expiredAt: string | null;
 }
@@ -80,6 +83,7 @@ const MEDIA_ASSET_PROJECTION = {
   durationMs: mediaAssets.durationMs,
   blurhash: mediaAssets.blurhash,
   derivatives: mediaAssets.derivatives,
+  createdBy: mediaAssets.createdBy,
   createdAt: mediaAssets.createdAt,
   expiredAt: mediaAssets.expiredAt,
 } as const;
@@ -107,6 +111,7 @@ function projectMediaAssetRow(raw: {
   durationMs: number | null;
   blurhash: string | null;
   derivatives: unknown;
+  createdBy: 'owner' | 'staff';
   createdAt: string;
   expiredAt: string | null;
 }): MediaAssetRow {

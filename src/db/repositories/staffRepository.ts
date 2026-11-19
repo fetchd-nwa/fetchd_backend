@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNotNull, or } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, or, type SQL } from 'drizzle-orm';
 import { db } from '../client.js';
 import { staff } from '../schema/schema.js';
 import { live } from '../softExpire.js';
@@ -23,6 +23,16 @@ const TRAINER_PROJECTION = {
   boardTrainEligible: staff.boardTrainEligible,
   expiredAt: staff.expiredAt,
 } as const;
+
+/**
+ * `livePrincipal(staff) = live AND NOT is_system_account` (design §2.9:4554, S45; rs3 M5.26): the
+ * default staff read. The school's system row, *NWA School for Dogs*, is a thread participant
+ * and nothing else: never a principal, never on a roster, pick list or responder choice, never a
+ * trainer. The one read that resolves it is `findParticipantsByIds` (a participant is history).
+ */
+export function livePrincipal(): SQL {
+  return and(live(staff), eq(staff.isSystemAccount, false)) as SQL;
+}
 
 /** The canonical uuid spelling, so a `staff_preference` that is no uuid never reaches a
  *  uuid comparison in SQL (Postgres would refuse the cast). */
@@ -92,7 +102,15 @@ export const staffRepository = {
    */
   async findParticipantsByIds(
     ids: string[],
-  ): Promise<{ id: string; name: string; role: StaffRoleValue; imagePath: string | null }[]> {
+  ): Promise<
+    {
+      id: string;
+      name: string;
+      role: StaffRoleValue;
+      imagePath: string | null;
+      isSchool: boolean;
+    }[]
+  > {
     if (ids.length === 0) return [];
     return db
       .select({
@@ -100,9 +118,26 @@ export const staffRepository = {
         name: staff.name,
         role: staff.role,
         imagePath: staff.imagePath,
+        // S45 (MSG-U03): the system row is the participant of every school thread, and the
+        // wire marks it `is_school` (it is the one exception to `livePrincipal`).
+        isSchool: staff.isSystemAccount,
       })
       .from(staff)
       .where(inArray(staff.id, ids));
+  },
+
+  /**
+   * The school's system row (rs3 M5.26), or `undefined` on a database that lacks it (which
+   * no database born from `schema.sql` or rs3 can be). `POST /threads` addresses it; a
+   * school thread's `school_name` signature reads its name.
+   */
+  async findSchoolAccount(runner: Runner = db): Promise<{ id: string; name: string } | undefined> {
+    const [row] = await runner
+      .select({ id: staff.id, name: staff.name })
+      .from(staff)
+      .where(and(eq(staff.isSystemAccount, true), live(staff)))
+      .limit(1);
+    return row;
   },
 
   /**
@@ -136,10 +171,12 @@ export const staffRepository = {
     opts: { lock?: boolean } = {},
   ): Promise<TrainerRow | undefined> {
     if (!UUID.test(value)) return undefined;
+    // D15 (A1): never the system row, whatever it holds, so a request or an approve naming
+    // it is refused exactly as one naming an unpriced staffer is.
     const query = runner
       .select(TRAINER_PROJECTION)
       .from(staff)
-      .where(eq(staff.id, value.toLowerCase()))
+      .where(and(eq(staff.id, value.toLowerCase()), eq(staff.isSystemAccount, false)))
       .limit(1);
     const [row] = await (opts.lock === true ? query.for('share') : query);
     return row;
@@ -155,7 +192,8 @@ export const staffRepository = {
       .from(staff)
       .where(
         and(
-          live(staff),
+          // D15 (A1): `livePrincipal`, so the system row is never listed, whatever it holds.
+          livePrincipal(),
           or(isNotNull(staff.lessonPriceCents), eq(staff.boardTrainEligible, true)),
         ),
       )

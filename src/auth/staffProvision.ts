@@ -906,7 +906,9 @@ export async function runRehire(
  * staff row belongs to an auth user on a roster email, and every auth user
  * whose `app_metadata.app_role` is set is on the roster (which `--expire` keeps
  * true by removing a leaver's `app_role`). Returns each violation; [] is green.
- * (The system row, M8.03's, is not a person row and does not exist yet.)
+ * The school's system row (rs3 M5.26, design M8.03) is not a person row: it has
+ * no uid and no auth user by design, so it is left out (A2 OL6), or every
+ * database born from schema.sql would read "its uid has no auth user".
  */
 export async function staffClauseViolations(
   deps: Pick<Deps, 'admin' | 'db'>,
@@ -920,7 +922,7 @@ export async function staffClauseViolations(
   const onRoster = (user: AdminUser) => rosterEmails.has(emailOf(user) ?? '');
   const violations: string[] = [];
   const { rows } = await deps.db.query<{ id: string; uid: string }>(
-    'SELECT id, supabase_uid::text AS uid FROM staff WHERE expired_at IS NULL',
+    'SELECT id, supabase_uid::text AS uid FROM staff WHERE expired_at IS NULL AND NOT is_system_account',
   );
   for (const row of rows) {
     const user = byId.get(row.uid);

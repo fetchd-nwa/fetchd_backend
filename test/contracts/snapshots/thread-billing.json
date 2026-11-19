@@ -11,5 +11,6 @@
   "related_dog_ids": [],
   "last_message": "Got it, thanks!",
   "last_message_at": "2026-05-10T17:00:00.000Z",
-  "unread_count": 0
+  "unread_count": 0,
+  "last_seq": 2
 }

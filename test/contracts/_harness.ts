@@ -1,10 +1,14 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { after, afterEach, before } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { inArray, sql } from 'drizzle-orm';
 import Fastify, { type FastifyInstance, type preHandlerHookHandler } from 'fastify';
 import { registerAuth } from '../../src/auth/plugin.js';
 import type { Principal } from '../../src/auth/principal.js';
+import { db } from '../../src/db/client.js';
+import { dogs, owners, threads } from '../../src/db/schema/schema.js';
 import { closeRedis, redis } from '../../src/redis.js';
 import { assertNoPoolReadInTransaction, installPoolReadGuard } from './_poolReadGuard.js';
 import {
@@ -217,4 +221,64 @@ export function makeContractApp(principal: Principal, capture?: LogCapture): Con
 export function loadSnapshot(name: string): unknown {
   const file = path.join(__dirname, 'snapshots', `${name}.json`);
   return JSON.parse(fs.readFileSync(file, 'utf-8'));
+}
+
+// ── messaging (plan unit P45 with O-MSG-LIVE) ────────────────────────────────
+
+/**
+ * The school's system row, *NWA School for Dogs* (rs3 M5.26): the participant of every
+ * school-addressed thread. `schema.sql` inserts it, so every database the suite runs on holds
+ * it from its load; the harness READS it and never inserts it (brief CR8), and the fixture's
+ * teardown deletes staff by id, never this row. Exactly one live row, or the load is wrong.
+ */
+export async function readSchoolAccount(): Promise<{ id: string; name: string }> {
+  const { rows } = await db.execute<{ id: string; name: string }>(
+    sql`SELECT id::text AS id, name FROM staff WHERE is_system_account AND expired_at IS NULL`,
+  );
+  if (rows.length !== 1) {
+    throw new Error(
+      `expected one live system staff row (schema.sql's M5.26 row), found ${rows.length}: reload the test database from schema.sql`,
+    );
+  }
+  return rows[0] as { id: string; name: string };
+}
+
+/** A second family for the stranger cases (B's thread, B's dog), removed by `removeFamilies`. */
+export interface PlantedFamily {
+  principal: Extract<Principal, { kind: 'owner' }>;
+  ownerId: string;
+  dogId: string;
+}
+
+const plantedFamilies: string[] = [];
+
+export async function plantFamily(name = 'The Hendersons'): Promise<PlantedFamily> {
+  const ownerId = randomUUID();
+  const supabaseUid = randomUUID();
+  const dogId = randomUUID();
+  plantedFamilies.push(ownerId);
+  await db.insert(owners).values({
+    id: ownerId,
+    supabaseUid,
+    name,
+    email: `family-${ownerId.slice(0, 8)}@example.com`,
+    location: 'bentonville',
+  });
+  await db
+    .insert(dogs)
+    .values({ id: dogId, ownerId, name: 'Biscuit', breed: 'Beagle', birthdate: '2024-03-01' });
+  return { principal: { kind: 'owner', ownerId, supabaseUid }, ownerId, dogId };
+}
+
+/** Every family `plantFamily` made: their threads (messages cascade), dogs and rows. */
+export async function removeFamilies(): Promise<void> {
+  const ids = plantedFamilies.splice(0);
+  if (ids.length === 0) return;
+  await db.delete(threads).where(inArray(threads.ownerId, ids));
+  await db.execute(sql`DELETE FROM media_assets WHERE owner_id = ANY(${sql.param(ids)}::uuid[])`);
+  await db.delete(dogs).where(inArray(dogs.ownerId, ids));
+  await db.execute(
+    sql`DELETE FROM idempotency_keys WHERE owner_id = ANY(${sql.param(ids)}::uuid[])`,
+  );
+  await db.delete(owners).where(inArray(owners.id, ids));
 }

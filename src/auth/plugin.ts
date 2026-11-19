@@ -10,7 +10,7 @@ import type { Principal, StaffRole } from './principal.js';
 import { bypassHeaderEnabled } from '../env.js';
 import { ApiError, toErrorEnvelope } from '../lib/errors.js';
 import { verifyAccessToken, type VerifiedToken } from './jwks.js';
-import { resolvePrincipal } from './mirror.js';
+import { isSystemStaffId, resolvePrincipal } from './mirror.js';
 import { staffRole } from '../db/schema/schema.js';
 
 declare module 'fastify' {
@@ -51,6 +51,11 @@ function extractBearer(request: FastifyRequest): string {
 // — same shape as `actorOf(principal)` so the audit_log gets a familiar
 // actor string. `supabaseUid` is the literal `'dev-bypass'` (never read for
 // reads, but the Principal field is required).
+//
+// S45 (design §2.9:4554; rs3 M5.26): the staff arm reads ONE thing — whether the
+// id names the school's system row — and refuses it (403 `not_provisioned`, the
+// answer the JWT arm gives the same row). That row is a thread participant, never
+// a principal, on every arm.
 const DEV_PRINCIPAL_HEADER = 'x-dev-principal' as const;
 const DEV_BYPASS_SUPABASE_UID = 'dev-bypass';
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -89,6 +94,11 @@ interface AuthDeps {
    * real `authenticate` reads `bypassHeaderEnabled` from `env.ts`.
    */
   bypassEnabled?: boolean;
+  /**
+   * S45: whether a bypass staff id names the school's system row (refused).
+   * Defaults to the mirror's read (`isSystemStaffId`).
+   */
+  isSystemStaff?: (staffId: string) => Promise<boolean>;
 }
 
 /**
@@ -103,11 +113,19 @@ interface AuthDeps {
  */
 export function makeAuthenticate(deps: AuthDeps): preHandlerHookHandler {
   const bypassEnabled = deps.bypassEnabled ?? false;
+  const isSystemStaff = deps.isSystemStaff ?? isSystemStaffId;
   return async function authenticate(request: FastifyRequest): Promise<void> {
     if (bypassEnabled) {
       const headerValue = request.headers[DEV_PRINCIPAL_HEADER];
       if (typeof headerValue === 'string' && headerValue.length > 0) {
-        request.principal = parseDevPrincipal(headerValue);
+        const principal = parseDevPrincipal(headerValue);
+        if (principal.kind === 'staff' && (await isSystemStaff(principal.staffId))) {
+          throw new ApiError(
+            'not_provisioned',
+            'X-Dev-Principal names the school system account, which is never a principal',
+          );
+        }
+        request.principal = principal;
         return;
       }
     }
