@@ -1,6 +1,7 @@
 import type { DogWire, FeedingWire, MedicationWire, VaccineWire } from '../contracts/wire.js';
 import type { AssembledDog } from '../db/repositories/dogsRepository.js';
 import { ageInMonths } from './ageMonths.js';
+import { alumniRecordedAt } from './alumni.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { toVetWire } from './vetWire.js';
 
@@ -14,6 +15,8 @@ import { toVetWire } from './vetWire.js';
  * Nullability decisions (carried from Day 4a, applied through 4b+):
  *   - `evaluation_date`, `completed_class_keys`, `vet` — optional; omit
  *     when null/empty.
+ *   - `alumni_at` (9.2.0-pre.2) — optional; omit unless the dog is alumni
+ *     and every curriculum level has a live record (`alumniRecordedAt`).
  *   - `feeding.notes` — `string | null`, always present per the FE Raw
  *     type (the FE reads `notes` unconditionally).
  *   - `profile_image_path` — required; null DB text → ''.
@@ -32,7 +35,7 @@ import { toVetWire } from './vetWire.js';
 export type { DogWire, FeedingWire, MedicationWire, VaccineWire } from '../contracts/wire.js';
 
 export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
-  const { dog, vet, vaccines, medications, feeding, completedClasses } =
+  const { dog, vet, vaccines, medications, feeding, completedClasses, completedPrograms } =
     assembled;
 
   const wire: DogWire = {
@@ -55,6 +58,10 @@ export function toDogWire(assembled: AssembledDog, today: Date): DogWire {
   };
 
   if (dog.evaluationDate !== null) wire.evaluation_date = pgTimestampToIso(dog.evaluationDate);
+  // 9.2.0-pre.2 (her #33): the fifth level's record date, as an ISO instant (Hermes refuses
+  // Postgres text). Omitted unless alumni with every level live (`alumniRecordedAt`).
+  const alumniAt = alumniRecordedAt(dog.isAlumni, completedPrograms);
+  if (alumniAt !== null) wire.alumni_at = pgTimestampToIso(alumniAt);
   if (dog.spayedNeutered !== null) wire.spayed_neutered = dog.spayedNeutered;
   if (dog.spayNeuterPlannedOn !== null) wire.spay_neuter_planned_on = dog.spayNeuterPlannedOn;
   if (dog.lastSeenOn !== null) wire.last_seen_on = dog.lastSeenOn;

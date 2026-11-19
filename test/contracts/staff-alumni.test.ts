@@ -307,10 +307,22 @@ test(
     });
     const dogBody = dogRes.json() as Record<string, unknown>;
     assert.equal(dogBody['is_alumni'], true);
+    // 9.2.0-pre.2 (her #33) adds `alumni_at`: the DATE the one status was reached, not a
+    // second status. So still one boolean, no tier, and the date is a string.
     assert.deepEqual(
-      Object.keys(dogBody).filter((key) => /alum|tier/i.test(key)),
-      ['is_alumni'],
+      Object.keys(dogBody)
+        .filter((key) => /alum|tier/i.test(key))
+        .sort(),
+      ['alumni_at', 'is_alumni'],
     );
+    assert.deepEqual(
+      Object.entries(dogBody)
+        .filter(([key, value]) => /alum|tier/i.test(key) && typeof value === 'boolean')
+        .map(([key]) => key),
+      ['is_alumni'],
+      'one alumni status',
+    );
+    assert.equal(typeof dogBody['alumni_at'], 'string', 'the date she became alumni');
   },
 );
 

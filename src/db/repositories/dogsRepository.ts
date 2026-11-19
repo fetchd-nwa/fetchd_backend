@@ -50,7 +50,10 @@ export interface AssembledDog {
   medications: (typeof dogMedications.$inferSelect)[];
   feeding: typeof dogFeeding.$inferSelect | null;
   completedClasses: (typeof dogCompletedClasses.$inferSelect)[];
-  /** §J.3: live day-school curriculum completions. Alumni status is `dog.isAlumni`. */
+  /**
+   * §J.3: live day-school curriculum completions. Alumni status is `dog.isAlumni`; the
+   * date she reached it (`DogWire.alumni_at`, 9.2.0-pre.2) is read from these rows.
+   */
   completedPrograms: (typeof dogCompletedPrograms.$inferSelect)[];
 }
 
