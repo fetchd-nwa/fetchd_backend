@@ -1,10 +1,12 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
+import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { requirePrincipal, resolveAuthHook, type AuthRouteOptions } from '../auth/plugin.js';
 import {
   MEDIA_PURPOSES,
   type MediaWire,
   type PostMediaRequest,
+  type PostMediaUploadMessageAttachmentQuery,
   type PostMediaUploadQuery,
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
@@ -17,6 +19,9 @@ import {
 } from '../db/repositories/mediaAssetsRepository.js';
 import { mediaDerivativeJobsRepository } from '../db/repositories/mediaDerivativeJobsRepository.js';
 import { reportsRepository } from '../db/repositories/reportsRepository.js';
+import { threadsRepository } from '../db/repositories/threadsRepository.js';
+import { mediaAssets } from '../db/schema/schema.js';
+import type { Tx } from '../db/tx.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { ApiError } from '../lib/errors.js';
 import {
@@ -53,8 +58,16 @@ import { formatZodIssues } from '../lib/zodIssues.js';
  *     (not the staffer) can read it back via the owner-scoped GET. An owner
  *     principal POSTing one of these → 403 (staff-only). `createdBy='staff'`.
  *
+ *   - **Staff conversation media (wire 9.2.0, O-MSG-LIVE; her answer 6):** a
+ *     staffer's photo or video for a thread, through the `POST /media/upload`
+ *     proxy's second arm (`purpose=message-attachment&thread_id=…`). The row is
+ *     stamped with that thread's owner and `createdBy='staff'`.
+ *
  * Read/delete scope: an owner sees + soft-expires only their own media
- * (cross-tenant → 404, never reveal existence). Staff are cross-owner trusted
+ * (cross-tenant → 404, never reveal existence), and from 9.2.0 never a row the
+ * school uploaded (`created_by = 'staff'`, A2 OL5): a staffer's conversation
+ * photo or report photo stamped with her id reads as hers but is the school's
+ * record, so her DELETE of it is the same 404. Staff are cross-owner trusted
  * — the staff portal reads dogs/bookings/threads cross-owner, so a staffer
  * may GET/DELETE any live media (reviewing a report needs the dog's photos
  * regardless of which owner authored them).
@@ -115,11 +128,47 @@ const uploadQuerySchema = z
   })
   .strict();
 
-type UploadQuery = z.infer<typeof uploadQuerySchema>;
-
 // §5.1.3 — the query half of the staff proxy path.
 export type PostMediaUploadQueryConformance = Expect<
   Equal<z.input<typeof uploadQuerySchema>, PostMediaUploadQuery>
+>;
+
+/**
+ * POST /media/upload query, its second arm (wire 9.2.0, O-MSG-LIVE; design §4 W7;
+ * her answer 6): a staffer's photo or video for a conversation. `thread_id` is a
+ * uuid (CR4: malformed → 400); the row is stamped with that LIVE thread's owner
+ * (missing or expired → 404) and `createdBy='staff'`, so it can be attached only to
+ * a staff message to that family and an owner's DELETE treats it as missing.
+ */
+const uploadMessageAttachmentQuerySchema = z
+  .object({
+    purpose: z.literal('message-attachment'),
+    thread_id: uuidId(),
+  })
+  .strict();
+
+// §5.1.3 — the second arm is its own interface, so the first pin above stays untouched.
+export type PostMediaUploadMessageAttachmentQueryConformance = Expect<
+  Equal<
+    z.input<typeof uploadMessageAttachmentQuerySchema>,
+    PostMediaUploadMessageAttachmentQuery
+  >
+>;
+
+/** The route's schema: both arms, told apart by `purpose`, each `.strict()`. */
+const uploadQueryArmsSchema = z.discriminatedUnion('purpose', [
+  uploadQuerySchema,
+  uploadMessageAttachmentQuerySchema,
+]);
+
+type UploadQuery = z.infer<typeof uploadQueryArmsSchema>;
+
+// §5.1.3 — "The server pins its schema to the union of both arms" (wire.ts 9.2.0).
+export type PostMediaUploadQueryArmsConformance = Expect<
+  Equal<
+    z.input<typeof uploadQueryArmsSchema>,
+    PostMediaUploadQuery | PostMediaUploadMessageAttachmentQuery
+  >
 >;
 
 // MediaWire is owned by the single-source contract (contracts/wire.ts).
@@ -204,12 +253,15 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
         keysToInvalidate: () => [],
       },
       async (tx) => {
-        // Owner: only their own row. Staff: any row (cross-owner trusted).
-        // Either miss is a 404 so existence never leaks across tenants.
-        const row = await mediaAssetsRepository.findById(id, tx);
+        // Owner: only their own row, and never one the school uploaded (A2
+        // OL5: `created_by = 'staff'`, a conversation photo or a report photo
+        // stamped with her id). Staff: any row (cross-owner trusted). Every
+        // miss is the same 404 so existence never leaks across tenants.
+        const row = await findLiveMediaUploaderInTx(tx, id);
         if (
           row === undefined ||
-          (principal.kind === 'owner' && row.ownerId !== principal.ownerId)
+          (principal.kind === 'owner' &&
+            (row.ownerId !== principal.ownerId || row.createdBy === 'staff'))
         ) {
           throw new ApiError('not_found', 'media not found');
         }
@@ -236,8 +288,11 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
  *
  * Bytes ride in the raw request body (a scoped `*` content-type parser reads
  * them as a Buffer — encapsulated so the other media routes keep JSON parsing);
- * `purpose` + `report_id` ride in the query string. Staff-only; the row's owner
- * resolves through the report (see {@link resolveStaffReportLinkage}).
+ * the metadata rides in the query string, one of two arms: `purpose` +
+ * `report_id` (report media; the row's owner resolves through the report, see
+ * {@link resolveStaffReportLinkage}) or, from wire 9.2.0, `purpose=message-
+ * attachment` + `thread_id` (a conversation photo or video; the row's owner is
+ * the thread's, see {@link resolveStaffThreadLinkage}). Staff-only.
  */
 function registerMediaUploadProxy(
   app: FastifyInstance,
@@ -279,7 +334,13 @@ function registerMediaUploadProxy(
         const key = mediaObjectKey(query.purpose, `staff-${principal.staffId}`, contentType);
         await r2.putObjectBytes({ key, contentType, bytes: new Uint8Array(bytes) });
 
-        const kind: MediaKind = query.purpose === 'report-video' ? 'video' : 'image';
+        // A conversation attachment is a photo OR a video, by what was sent.
+        const kind: MediaKind =
+          query.purpose === 'message-attachment'
+            ? mediaKindForContentType(contentType)
+            : query.purpose === 'report-video'
+              ? 'video'
+              : 'image';
         const outcome = await withMutation<MediaAssetRow>(
           {
             principal,
@@ -289,11 +350,17 @@ function registerMediaUploadProxy(
             keysToInvalidate: () => [],
           },
           async (tx) => {
-            const linkage = await resolveStaffReportLinkage(tx, query.report_id);
+            const linkage =
+              query.purpose === 'message-attachment'
+                ? await resolveStaffThreadLinkage(tx, query.thread_id)
+                : {
+                    ...(await resolveStaffReportLinkage(tx, query.report_id)),
+                    reportId: query.report_id,
+                  };
             const row = await createMediaRow(tx, {
               ownerId: linkage.ownerId,
               dogId: linkage.dogId,
-              reportId: query.report_id,
+              reportId: linkage.reportId,
               kind,
               purpose: query.purpose,
               objectKey: key,
@@ -461,9 +528,9 @@ function parsePostBody(raw: unknown): PostMediaBody {
   return parsed.data;
 }
 
-/** Parse the POST /media/upload query or throw a 400. */
+/** Parse the POST /media/upload query (either arm) or throw a 400. */
 function parseUploadQuery(raw: unknown): UploadQuery {
-  const parsed = uploadQuerySchema.safeParse(raw);
+  const parsed = uploadQueryArmsSchema.safeParse(raw);
   if (!parsed.success) {
     throw new ApiError('bad_request', `invalid upload query: ${formatZodIssues(parsed.error)}`);
   }
@@ -492,6 +559,41 @@ async function resolveStaffReportLinkage(
     throw new ApiError('not_found', `report ${reportId} dog is no longer live`);
   }
   return { ownerId, dogId: report.dogId };
+}
+
+/**
+ * Resolve a live thread's owner for a staffer's conversation photo or video
+ * (wire 9.2.0, W7): the media row carries THAT owner, so the family reads it
+ * back and it can be attached only to a staff message in her threads. 404 when
+ * the thread does not exist or is expired (the contract's "names a live thread").
+ * No dog or report linkage.
+ */
+async function resolveStaffThreadLinkage(
+  tx: Tx,
+  threadId: string,
+): Promise<{ ownerId: string; dogId: null; reportId: null }> {
+  const ownerId = await threadsRepository.findOwnerById(tx, threadId);
+  if (ownerId === undefined) {
+    throw new ApiError('not_found', `thread ${threadId} not found`);
+  }
+  return { ownerId, dogId: null, reportId: null };
+}
+
+/**
+ * The live row's owner stamp and uploader, for `DELETE /media/:id`'s scope check
+ * (A2 OL5). Read here rather than through `mediaAssetsRepository.findById`, whose
+ * row carries no `created_by`. `undefined` when the id is missing or expired.
+ */
+async function findLiveMediaUploaderInTx(
+  tx: Tx,
+  id: string,
+): Promise<{ ownerId: string; createdBy: 'owner' | 'staff' } | undefined> {
+  const [row] = await tx
+    .select({ ownerId: mediaAssets.ownerId, createdBy: mediaAssets.createdBy })
+    .from(mediaAssets)
+    .where(and(eq(mediaAssets.id, id), isNull(mediaAssets.expiredAt)))
+    .limit(1);
+  return row;
 }
 
 /**

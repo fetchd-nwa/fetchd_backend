@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { resolveAuthHook, requirePrincipal, type AuthRouteOptions } from '../auth/plugin.js';
 import {
   deviceTokensRepository,
+  isLiveTokenConflict,
   type RegisteredDeviceTokenRow,
 } from '../db/repositories/deviceTokensRepository.js';
 import { ApiError } from '../lib/errors.js';
@@ -25,6 +26,13 @@ import type { Equal, Expect } from '../contracts/typeAsserts.js';
  * staff device has a token to register. When the portal app ships, a
  * `staff_device_tokens` surface (or a `principal_kind` column here) is the
  * extension point — not a widening of this owner-only route.
+ *
+ * From wire 9.2.0 (O-MSG-LIVE; A2 OH1; `PostDeviceTokensRequest`'s doc), a
+ * token has one live row whoever's it is. The POST expires every OTHER
+ * family's live row for the token before its upsert, so a phone that changes
+ * family never shows the last family's messages; the DELETE expires every live
+ * row holding the token, whoever's (holding the token string is holding the
+ * device). The app sends one or the other on every change of signed-in user.
  *
  * Wire shape is client-friendly, mapped from the schema columns in
  * `toDeviceTokenWire`: request `token` ↔ column `expo_push_token`, response
@@ -65,12 +73,19 @@ export function registerDeviceTokensRoute(app: FastifyInstance, opts: AuthRouteO
 
   // --- POST /device-tokens ---------------------------------------------
   //
-  // UPSERT by (owner_id, expo_push_token): registering a token the owner
-  // already has live re-touches the existing row (idempotent at the DB
-  // layer) rather than inserting a duplicate. `withMutation` adds the
-  // request-level idempotency replay on top, so a retried POST with the
-  // same Idempotency-Key returns the stored 201 without re-running the
-  // upsert.
+  // Expire every OTHER family's live row for this token, then UPSERT by
+  // (owner_id, expo_push_token): registering a token the owner already has
+  // live re-touches the existing row (idempotent at the DB layer) rather than
+  // inserting a duplicate. `withMutation` adds the request-level idempotency
+  // replay on top, so a retried POST with the same Idempotency-Key returns the
+  // stored 201 without re-running either statement.
+  //
+  // A concurrent registration of the same token by another family can commit
+  // between our expire and our insert: our insert is then a 23505 on the
+  // live-token index, and the transaction is dead (LR11). So the whole
+  // mutation is re-run ONCE, on a fresh transaction, outside the failed one:
+  // its expire now sees the other family's committed row. The retry keys on
+  // that constraint name alone; any other error, or a second 23505, propagates.
   app.post('/device-tokens', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
     requireOwner(principal, 'register a device token');
@@ -79,22 +94,35 @@ export function registerDeviceTokensRoute(app: FastifyInstance, opts: AuthRouteO
 
     // cache-noop: device_tokens isn't in the §3 cache map (only the
     // scheduler reads them, never a cached owner-facing read).
-    const outcome = await withMutation<DeviceTokenWire>(
-      {
-        principal,
-        idempotencyKey,
-        endpoint: 'POST /device-tokens',
-        requestHash: hashRequestBody({ ownerId: principal.ownerId, token, platform }),
-      },
-      async (tx) => {
-        const row = await deviceTokensRepository.upsert(tx, {
-          ownerId: principal.ownerId,
-          token,
-          platform,
-        });
-        return { status: 201, body: toDeviceTokenWire(row) };
-      },
-    );
+    const register = (): Promise<{ status: number; body: DeviceTokenWire }> =>
+      withMutation<DeviceTokenWire>(
+        {
+          principal,
+          idempotencyKey,
+          endpoint: 'POST /device-tokens',
+          requestHash: hashRequestBody({ ownerId: principal.ownerId, token, platform }),
+        },
+        async (tx) => {
+          await deviceTokensRepository.expireOtherOwnersLiveToken(tx, {
+            ownerId: principal.ownerId,
+            token,
+          });
+          const row = await deviceTokensRepository.upsert(tx, {
+            ownerId: principal.ownerId,
+            token,
+            platform,
+          });
+          return { status: 201, body: toDeviceTokenWire(row) };
+        },
+      );
+
+    let outcome: { status: number; body: DeviceTokenWire };
+    try {
+      outcome = await register();
+    } catch (err) {
+      if (!isLiveTokenConflict(err)) throw err;
+      outcome = await register();
+    }
 
     reply.code(outcome.status);
     return outcome.body;
@@ -102,9 +130,10 @@ export function registerDeviceTokensRoute(app: FastifyInstance, opts: AuthRouteO
 
   // --- DELETE /device-tokens/:token ------------------------------------
   //
-  // Soft-expire the token (set `expired_at`); 204 on success, 404 when the
-  // token isn't a live row for this owner. Missing + not-yours collapse to
-  // 404 — same enumeration-defense shape as DELETE /payment-methods/:id.
+  // Soft-expire EVERY live row holding the token, whoever's (wire 9.2.0): 204
+  // if any was expired, 404 if none was (never registered, or already
+  // expired). The answer says only whether this device was live somewhere —
+  // which the caller, holding the token, already knows; it names no family.
   app.delete('/device-tokens/:token', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
     requireOwner(principal, 'unregister a device token');
@@ -120,11 +149,8 @@ export function registerDeviceTokensRoute(app: FastifyInstance, opts: AuthRouteO
         requestHash: hashRequestBody({ ownerId: principal.ownerId, token }),
       },
       async (tx) => {
-        const expired = await deviceTokensRepository.softExpireByToken(tx, {
-          ownerId: principal.ownerId,
-          token,
-        });
-        if (expired === undefined) {
+        const expired = await deviceTokensRepository.softExpireByToken(tx, { token });
+        if (expired === 0) {
           // No token value in the message — enumeration defense + it's PII.
           throw new ApiError('not_found', 'device token not found');
         }

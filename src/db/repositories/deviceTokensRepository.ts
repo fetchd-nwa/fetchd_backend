@@ -1,4 +1,4 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { deviceTokens } from '../schema/schema.js';
 import type { Tx } from '../tx.js';
@@ -21,7 +21,33 @@ type Runner = Tx | typeof db;
  * `expired_at IS NULL` is the live-token filter (the partial unique index
  * `device_tokens_uidx` enforces "one live row per (owner, expo_push_token)";
  * a revoked token can be re-registered without UNIQUE collision).
+ *
+ * From wire 9.2.0 (O-MSG-LIVE; A2 OH1; `PostDeviceTokensRequest`'s doc), a token
+ * has ONE live row whoever's it is: rs3 M5.30's partial unique index
+ * {@link DEVICE_TOKENS_LIVE_TOKEN_INDEX} on `(expo_push_token) WHERE expired_at
+ * IS NULL`. A phone that changes family stops being the last family's device:
+ * registering expires every OTHER owner's live row for the token
+ * (`expireOtherOwnersLiveToken`, before `upsert`), and the DELETE expires every
+ * live row holding it (`softExpireByToken`).
  */
+
+/**
+ * rs3 M5.30's one-live-row-per-token index. `POST /device-tokens` re-runs its
+ * mutation once on a 23505 naming THIS constraint and no other (LR11): a
+ * concurrent registration of the same token by another family.
+ */
+export const DEVICE_TOKENS_LIVE_TOKEN_INDEX = 'device_tokens_live_token_uidx';
+
+/**
+ * A unique violation on {@link DEVICE_TOKENS_LIVE_TOKEN_INDEX}, matched by constraint
+ * name (LR11, the Opus seat's note): any other 23505 is a different story and keeps
+ * failing the request. drizzle 0.36 rethrows the driver's error unwrapped.
+ */
+export function isLiveTokenConflict(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const record = err as { code?: unknown; constraint?: unknown };
+  return record.code === '23505' && record.constraint === DEVICE_TOKENS_LIVE_TOKEN_INDEX;
+}
 
 export type DevicePlatform = 'ios' | 'android';
 
@@ -117,28 +143,44 @@ export const deviceTokensRepository = {
   },
 
   /**
-   * Revoke a live token: set `expired_at = now()`. Scoped by owner so a
-   * token can only be revoked by its registrant. Returns the row if it was
-   * live + owned by this principal; undefined for the not-found / not-yours
-   * / already-revoked cases (the route maps all three to 404 — device
-   * tokens don't enumerate across owners).
+   * Expire every OTHER owner's live row holding `token` (A2 OH1). Runs inside the
+   * registration's transaction, before `upsert`, so the phone's new family is the
+   * only one it pushes to. The registering owner's own live row is left for
+   * `upsert` to touch (its `registered_at` stays the first registration's).
+   * Returns how many rows it expired.
    */
-  async softExpireByToken(
+  async expireOtherOwnersLiveToken(
     tx: Tx,
     args: { ownerId: string; token: string },
-  ): Promise<DeviceTokenRow | undefined> {
-    const [row] = await tx
+  ): Promise<number> {
+    const rows = await tx
       .update(deviceTokens)
       .set({ expiredAt: sql`now()` })
       .where(
         and(
-          eq(deviceTokens.ownerId, args.ownerId),
           eq(deviceTokens.expoPushToken, args.token),
+          ne(deviceTokens.ownerId, args.ownerId),
           isNull(deviceTokens.expiredAt),
         ),
       )
-      .returning(DEVICE_TOKEN_PROJECTION);
-    if (!row) return undefined;
-    return { ...row, platform: row.platform as DevicePlatform };
+      .returning({ id: deviceTokens.id });
+    return rows.length;
+  },
+
+  /**
+   * Revoke a token: set `expired_at = now()` on EVERY live row holding it,
+   * whoever's (wire 9.2.0, `PostDeviceTokensRequest`'s doc; the Fable seat's last
+   * read M1: holding the token string is holding the device). The app sends this
+   * on a sign-in with push off, so the phone's previous family stops receiving
+   * pushes too. Returns how many rows it expired; the route answers 204 when that
+   * is at least one and 404 when it is none (never held, or already expired).
+   */
+  async softExpireByToken(tx: Tx, args: { token: string }): Promise<number> {
+    const rows = await tx
+      .update(deviceTokens)
+      .set({ expiredAt: sql`now()` })
+      .where(and(eq(deviceTokens.expoPushToken, args.token), isNull(deviceTokens.expiredAt)))
+      .returning({ id: deviceTokens.id });
+    return rows.length;
   },
 };
