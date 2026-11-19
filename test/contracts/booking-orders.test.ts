@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, afterEach, beforeEach, mock, test } from 'node:test';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type {
   AfterSchoolFullDetails,
   AlreadyBookedDetails,
@@ -16,6 +16,7 @@ import type {
 } from '../../src/contracts/wire.js';
 import { MAX_DATES_PER_PART, MAX_DOG_DATES_PER_ORDER } from '../../src/contracts/wire.js';
 import { db } from '../../src/db/client.js';
+import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';
 import { dayCapacityRepository } from '../../src/db/repositories/dayCapacityRepository.js';
 import {
   bookingDogs,
@@ -27,6 +28,7 @@ import {
 } from '../../src/db/schema/schema.js';
 import { insufficientCapacityError } from '../../src/lib/bookingErrors.js';
 import { redisCheckThrottleStore } from '../../src/lib/orderCheckThrottle.js';
+import { registerStaffCreditsRoute } from '../../src/routes/staffCredits.js';
 import { at, makeClock } from './_checkinFixture.js';
 import {
   D,
@@ -59,13 +61,16 @@ import {
   restoreDaySeeds,
   setCampusSettings,
 } from './_dayFixture.js';
+import { FIXTURE_IDS } from './_fixture.js';
 import {
+  FIXTURE_MANAGER_PRINCIPAL,
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
+  makeContractApp,
   makeLogCapture,
   registerFixtureHooks,
 } from './_harness.js';
-import { plantLot, poolBalance, waitForBlockedBackends } from './_poolFixture.js';
+import { PLANTED, plantLot, poolBalance, waitForBlockedBackends } from './_poolFixture.js';
 
 /**
  * `POST /booking-orders` and its check, patch (A) of plan one-off O-CREDITS (wire 9.1.0;
@@ -406,7 +411,13 @@ test(
       answers.map((r) => r.body).join('\n'),
     );
     const loser = answers.find((r) => r.statusCode === 422)!;
-    refused<CreditsShortDetails>(loser, 'credits_short');
+    const lost = refused<CreditsShortDetails>(loser, 'credits_short');
+    // The loser's counts are read under the pool lock, after the winner's debits (review r1,
+    // Fable L1, Opus L2): a read taken before the lock would say 3, the pool before either.
+    assert.deepEqual(lost.draws, [
+      { location: 'bentonville', mode: 'daycare', tier: 'regular', balance: 0, draw: 0, short: 3 },
+    ]);
+    assert.equal(lost.pools[0]?.balance, 0, loser.body);
     const winner = answers.find((r) => r.statusCode === 201)!;
     assert.equal((winner.json() as PostBookingOrdersResponse).sessions.length, 3);
     const shares = await db
@@ -416,6 +427,77 @@ test(
     assert.equal(shares.length, 3, 'one dog has all three days, the other none');
     assert.equal(new Set(shares.map((s) => s.dogId)).size, 1);
     assert.equal(await careBalance(), 0);
+  },
+);
+
+test(
+  'B9b (review r1, Fable L1, Opus L2): a desk grant of 2 on the real staff route holds the day care pool while the check waits on it; once it commits, the check reads `balance` under the lock: {3, 3, 0}, never the 1 she held before the grant',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const lola = await createBookableDog(created);
+    await care({ credits: 1 });
+    const { app, clock } = orderApp();
+    const desk = makeContractApp(FIXTURE_MANAGER_PRINCIPAL);
+    registerStaffCreditsRoute(desk.app, { authenticate: desk.authenticate, now: clock.now });
+
+    // The grant stops after its lot is written: inside its transaction, under its pool lock.
+    const addHandLot = creditLedgerRepository.addHandLot.bind(creditLedgerRepository);
+    let grantPid = 0;
+    let written!: () => void;
+    const inside = new Promise<void>((resolve) => (written = resolve));
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    mock.method(
+      creditLedgerRepository,
+      'addHandLot',
+      async (tx: Parameters<typeof addHandLot>[0], args: Parameters<typeof addHandLot>[1]) => {
+        await addHandLot(tx, args);
+        const { rows } = await tx.execute(sql`SELECT pg_backend_pid() AS pid`);
+        grantPid = (rows[0] as { pid: number }).pid;
+        written();
+        await gate;
+      },
+    );
+
+    let granting: Promise<Awaited<ReturnType<typeof check>>>;
+    let checking: Promise<Awaited<ReturnType<typeof check>>>;
+    try {
+      granting = desk.app.inject({
+        method: 'POST',
+        url: `/staff/owners/${FIXTURE_IDS.ownerId}/credit-adjustments`,
+        headers: { 'idempotency-key': `b9b-${randomUUID()}` },
+        payload: {
+          kind: 'add',
+          location: 'bentonville',
+          mode: 'daycare',
+          tier: 'regular',
+          credits: 2,
+          expires_at: ENDS_31_DEC,
+          note: `${PLANTED}: B9b desk grant`,
+        },
+      });
+      const first = await Promise.race([
+        inside.then(() => 'written'),
+        granting.then(
+          () => 'ended',
+          () => 'ended',
+        ),
+      ]);
+      assert.equal(first, 'written', 'the grant stopped inside its transaction');
+      assert.equal(await careBalance(), 1, 'the grant has not committed');
+      checking = check(app, { parts: [part({ dogs: [lola], dates: MON_TO_WED })] });
+      assert.equal(await untilBlockedBy(grantPid, checking), true, 'the check waits on the grant');
+    } finally {
+      open();
+    }
+    const granted = await granting;
+    assert.equal(granted.statusCode, 201, granted.body);
+    const res = await checking;
+    assert.equal(res.statusCode, 200, res.body);
+    assert.deepEqual((res.json() as PostBookingOrdersCheckResponse).draws, [
+      { location: 'bentonville', mode: 'daycare', tier: 'regular', balance: 3, draw: 3, short: 0 },
+    ]);
+    assert.equal(await careBalance(), 3);
   },
 );
 
@@ -1121,6 +1203,43 @@ test(
       [await poolBalance(FAY_SCHOOL), await poolBalance(BEN_SCHOOL)],
       [fayBefore + 2, 0],
     );
+  },
+);
+
+test(
+  'BA9 (review r1, Opus L1): two programs at one campus, Bentonville day school 9 and day care 1; Lola at school Mon and in day care Tue-Wed: each `balance` is its own program’s, school {9, 1, 0} and day care {1, 1, 1}; with a second day care credit it books, and each pool holds `balance − draw` (check = POST)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const lola = await createBookableDog(created);
+    await plantLot({ credits: 9, expiresAt: ENDS_31_DEC, ...BEN_SCHOOL });
+    await care({ credits: 1 });
+    const { app } = orderApp();
+    const body = {
+      parts: [
+        part({ category: 'day-school', dogs: [lola], dates: [D.MON] }),
+        part({ dogs: [lola], dates: [D.TUE, D.WED] }),
+      ],
+    };
+    const BEN_CARE = { location: 'bentonville', mode: 'daycare' } as const;
+
+    const short = refused<CreditsShortDetails>(await checkThenPost(app, body), 'credits_short');
+    assert.deepEqual(short.draws, [
+      { ...BEN_SCHOOL, tier: 'regular', balance: 9, draw: 1, short: 0 },
+      { ...BEN_CARE, tier: 'regular', balance: 1, draw: 1, short: 1 },
+    ]);
+    assert.deepEqual(
+      short.pools.map((p) => [p.location, p.mode, p.balance, p.shortfall]),
+      [['bentonville', 'daycare', 1, 1]],
+    );
+
+    await care({ credits: 1 });
+    const booked = await checkThenPostBoth(app, body);
+    assert.equal(booked.posted.statusCode, 201, booked.posted.body);
+    assert.deepEqual(checkDraws(booked.checked), [
+      { ...BEN_SCHOOL, tier: 'regular', balance: 9, draw: 1, short: 0 },
+      { ...BEN_CARE, tier: 'regular', balance: 2, draw: 2, short: 0 },
+    ]);
+    assert.deepEqual([await poolBalance(BEN_SCHOOL), await careBalance()], [8, 0]);
   },
 );
 
