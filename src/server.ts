@@ -53,7 +53,8 @@ import { registerUploadsSignRoute } from './routes/uploadsSign.js';
 import { registerVetsRoute } from './routes/vets.js';
 import { registerWelcomeDogsRoute } from './routes/welcomeDogs.js';
 import { registerWorkersTickRoute } from './routes/workersTick.js';
-import { registerRealtimeRoute } from './realtime/server.js';
+import { deliveredAckSink } from './realtime/delivered.js';
+import { decorateRealtime, registerRealtimeRoute } from './realtime/server.js';
 
 /**
  * Builds the Fastify app and registers routes. Kept separate from the boot
@@ -120,6 +121,11 @@ export function buildApp(): FastifyInstance {
   // and the allow header rides every response to an allow-listed origin —
   // a 401/403 included, or the browser hides the refusal from the portal.
   registerCors(app, env.PORTAL_ORIGIN);
+  // 9.2.0 (pass 3 item 5, MB27 Q6): the live channel's hub, before any route, so a publishing
+  // route reads its bus at registration and throws there if it is missing, never a silent
+  // no-op at request time. The ack sink is the *Delivered* stamp (no default: memory "prove the
+  // alarm channel"). `GET /realtime` itself is registered last, below.
+  decorateRealtime(app, { onAck: deliveredAckSink });
   registerHealthRoute(app); // [public] — no auth guard
   registerHealthWatchdogRoute(app); // [public] — Day-20 scheduler + pager watchdog; NOT /health
   registerWelcomeDogsRoute(app); // [public] — pre-login welcome gallery

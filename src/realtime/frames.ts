@@ -1,12 +1,12 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, isNull, lt, max, sql } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
 import { db } from '../db/client.js';
 import { livePrincipal } from '../db/repositories/staffRepository.js';
-import { staff, threads } from '../db/schema/schema.js';
+import { messages, staff, threads } from '../db/schema/schema.js';
 import type { MirrorPrincipal } from '../auth/mirror.js';
-import type { RealtimeCloseCode, RealtimeServerFrameWire } from '../contracts/wire.js';
+import type { MessageWire, RealtimeCloseCode, RealtimeServerFrameWire } from '../contracts/wire.js';
 import { REALTIME_CLOSE_CODES } from '../contracts/wire.js';
-import type { BusEvent, ChannelTarget } from './bus.js';
+import type { Audience, BusEvent, ChannelTarget } from './bus.js';
 
 /**
  * Delivery, per audience (9.2.0; design §3 rule 7, A2 OM2, OM3, OL1, OL9; brief LR7, LR14,
@@ -30,8 +30,16 @@ import type { BusEvent, ChannelTarget } from './bus.js';
  *   4. **The frame, per audience.** A family hears staff typing exactly as `{type: 'typing',
  *      thread_id, from: 'school'}` (OL1; her answer 2); staff hear `from: 'owner'`, or `from:
  *      'staff'` with the colleague's `staff_id` and first name, never their own.
- *   `message.created`, `receipt` and `staff.read` are built at integration (pass 3 proper),
- *   through `wireManyMessages`, on the same path.
+ *   5. **Messages and receipts (pass 3 item 1).** `message.created`: the row is read bound to
+ *      its thread (`m.id = $message_id AND m.thread_id = $thread_id`, LR14), live, in a live
+ *      thread; else no frame (OL9: one debug line; a message of ANOTHER thread is a forged or
+ *      misrouted event: one error line). `prev_seq` is the highest LIVE `seq` below it, `null`
+ *      when none (B7). `message` is the element the reader's own GET returns, from the
+ *      injected `messageElement` builder, per audience; there is NO default builder (MB27 Q6):
+ *      without one nothing of the message is built, one error line is logged and the sockets
+ *      are told to `resync`. `receipt` reaches only the side whose messages they are, and
+ *      `staff.read` staff only: either on the wrong channel is a routing fault (one error
+ *      line, nothing sent).
  */
 
 /** What delivery needs from a local socket. */
@@ -42,10 +50,38 @@ export interface FrameSocket {
   close(code: RealtimeCloseCode): void;
 }
 
+/** A message row as the frame builder reads it: the whole `messages` row, a superset of what
+ *  the GETs' element builder takes. */
+export type MessageElementRow = typeof messages.$inferSelect;
+
+/**
+ * The one seam of `message.created` (pass 3 item 1): the `message` element the reader's own
+ * `GET …/messages` returns for this row, built for `audience` (a family's never carries
+ * `reach`). Phase F wires it to the function both GETs call; tests inject one. There is no
+ * default (MB27 Q6).
+ */
+export type MessageElementFor = (
+  row: MessageElementRow,
+  audience: Audience,
+) => Promise<MessageWire>;
+
+/** A live message bound to its thread, with B7's `prev_seq`. */
+export interface MessageForFrame {
+  row: MessageElementRow;
+  prevSeq: number | null;
+}
+
 export interface DeliveryDeps {
   livePrincipals(principals: readonly MirrorPrincipal[]): Promise<MirrorPrincipal[]>;
   threadOwner(threadId: string): Promise<string | null>;
   staffFirstName(staffId: string): Promise<string | null>;
+  /** LR14 + OL9 + B7: the message bound to its thread, live, in a live thread. */
+  messageForFrame(messageId: string, threadId: string): Promise<MessageForFrame | null>;
+  /** The thread a message is in, live or not (`null`: none). Read only to tell a forged or
+   *  misrouted event (error) from one that no longer reads (debug); it never decides delivery. */
+  threadOfMessage(messageId: string): Promise<string | null>;
+  /** No default (MB27 Q6). */
+  messageElement?: MessageElementFor;
   log: FastifyBaseLogger;
 }
 
@@ -108,13 +144,113 @@ export async function staffFirstNameOf(staffId: string): Promise<string | null> 
   return row.name.trim().split(/\s+/)[0] ?? null;
 }
 
+/**
+ * LR14's read: `WHERE m.id = $message_id AND m.thread_id = $thread_id`, the message live and
+ * its thread live (OL9). B7: `prev_seq` is the highest live `seq` below it in that thread.
+ */
+export async function messageForFrameOf(
+  messageId: string,
+  threadId: string,
+): Promise<MessageForFrame | null> {
+  const [found] = await db
+    .select({ message: messages })
+    .from(messages)
+    .innerJoin(threads, and(eq(threads.id, messages.threadId), isNull(threads.expiredAt)))
+    .where(
+      and(eq(messages.id, messageId), eq(messages.threadId, threadId), isNull(messages.expiredAt)),
+    )
+    .limit(1);
+  if (found === undefined) return null;
+  const row = found.message;
+  const [previous] = await db
+    .select({ seq: max(messages.threadSeq) })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.threadId, row.threadId),
+        lt(messages.threadSeq, row.threadSeq),
+        isNull(messages.expiredAt),
+      ),
+    );
+  const prevSeq = previous?.seq;
+  return { row, prevSeq: prevSeq === null || prevSeq === undefined ? null : Number(prevSeq) };
+}
+
+/** The thread a message is in, expired or not; `null` when there is no such message. */
+export async function threadOfMessageOf(messageId: string): Promise<string | null> {
+  const [row] = await db
+    .select({ threadId: messages.threadId })
+    .from(messages)
+    .where(eq(messages.id, messageId))
+    .limit(1);
+  return row?.threadId ?? null;
+}
+
 export const defaultDeliveryDeps = {
   livePrincipals: livePrincipalsAmong,
   threadOwner: threadOwnerOf,
   staffFirstName: staffFirstNameOf,
-} satisfies Omit<DeliveryDeps, 'log'>;
+  messageForFrame: messageForFrameOf,
+  threadOfMessage: threadOfMessageOf,
+} satisfies Omit<DeliveryDeps, 'log' | 'messageElement'>;
 
 type FrameFor = (socket: FrameSocket) => RealtimeServerFrameWire | null;
+
+type CreatedEvent = Extract<BusEvent, { kind: 'message.created' }>;
+type ReceiptEvent = Extract<BusEvent, { kind: 'receipt' }>;
+
+function receiptFrame(event: ReceiptEvent): FrameFor {
+  const frame: RealtimeServerFrameWire = {
+    type: 'receipt',
+    thread_id: event.thread_id,
+    state: event.state,
+    up_to_seq: event.up_to_seq,
+    at: event.at,
+  };
+  return () => frame;
+}
+
+/** `message.created` for one audience: the bound live row, `prev_seq`, the injected element. */
+async function messageFrame(
+  event: CreatedEvent,
+  audience: Audience,
+  deps: DeliveryDeps,
+): Promise<FrameFor | null> {
+  const build = deps.messageElement;
+  if (build === undefined) {
+    // MB27 Q6: never an element built some other way. The sockets refetch over HTTP.
+    deps.log.error(
+      { kind: event.kind, thread_id: event.thread_id, audience },
+      'realtime: no message element builder is wired, so no message.created frame is built; its sockets told to resync',
+    );
+    const resync: RealtimeServerFrameWire = { type: 'resync' };
+    return () => resync;
+  }
+  const found = await deps.messageForFrame(event.message_id, event.thread_id);
+  if (found === null) {
+    const home = await deps.threadOfMessage(event.message_id);
+    if (home !== null && home !== event.thread_id) {
+      deps.log.error(
+        { kind: event.kind, thread_id: event.thread_id, audience },
+        'realtime routing fault: a message.created names a message of another thread; nothing sent',
+      );
+    } else {
+      deps.log.debug(
+        { thread_id: event.thread_id, message_id: event.message_id },
+        'realtime: message no longer reads; no frame (OL9)',
+      );
+    }
+    return null;
+  }
+  const message = await build(found.row, audience);
+  const frame: RealtimeServerFrameWire = {
+    type: 'message.created',
+    thread_id: event.thread_id,
+    prev_seq: found.prevSeq,
+    message,
+  };
+  return () => frame;
+}
 
 /** Build the frame for one audience, or `null` to send nothing. */
 async function frameFor(
@@ -123,8 +259,14 @@ async function frameFor(
   deps: DeliveryDeps,
 ): Promise<FrameFor | null> {
   if (target.audience === 'owner') {
-    // A staff-audience kind on an owner channel is a routing bug (LR14).
-    if (event.kind === 'bell.changed' || (event.kind === 'typing' && event.from === 'owner')) {
+    // A staff-audience kind on an owner channel is a routing bug (LR14): `bell.changed`,
+    // `staff.read`, the school's receipt and an owner's own typing.
+    if (
+      event.kind === 'bell.changed' ||
+      event.kind === 'staff.read' ||
+      (event.kind === 'receipt' && event.side === 'staff') ||
+      (event.kind === 'typing' && event.from === 'owner')
+    ) {
       deps.log.error(
         { kind: event.kind, thread_id: event.thread_id },
         'realtime routing fault: a staff-audience event arrived on an owner channel; nothing sent',
@@ -147,16 +289,30 @@ async function frameFor(
       );
       return null;
     }
-    if (event.kind === 'typing') {
-      const frame: RealtimeServerFrameWire = {
-        type: 'typing',
-        thread_id: event.thread_id,
-        from: 'school',
-      };
-      return () => frame;
+    switch (event.kind) {
+      case 'typing': {
+        const frame: RealtimeServerFrameWire = {
+          type: 'typing',
+          thread_id: event.thread_id,
+          from: 'school',
+        };
+        return () => frame;
+      }
+      case 'message.created':
+        return messageFrame(event, 'owner', deps);
+      case 'receipt':
+        return receiptFrame(event);
+      case 'thread.changed': {
+        const frame: RealtimeServerFrameWire = {
+          type: 'thread.changed',
+          thread_id: event.thread_id,
+        };
+        return () => frame;
+      }
+      default:
+        // Refused above; never reached.
+        return null;
     }
-    const frame: RealtimeServerFrameWire = { type: 'thread.changed', thread_id: event.thread_id };
-    return () => frame;
   }
 
   switch (event.kind) {
@@ -190,6 +346,28 @@ async function frameFor(
     }
     case 'bell.changed': {
       const frame: RealtimeServerFrameWire = { type: 'bell.changed' };
+      return () => frame;
+    }
+    case 'message.created':
+      return messageFrame(event, 'staff', deps);
+    case 'receipt': {
+      // The family's receipt is hers alone ("sent only to the side whose messages they are").
+      if (event.side !== 'staff') {
+        deps.log.error(
+          { kind: event.kind, thread_id: event.thread_id },
+          'realtime routing fault: an owner-audience event arrived on the staff channel; nothing sent',
+        );
+        return null;
+      }
+      return receiptFrame(event);
+    }
+    case 'staff.read': {
+      const frame: RealtimeServerFrameWire = {
+        type: 'staff.read',
+        thread_id: event.thread_id,
+        staff_id: event.staff_id,
+        message_ids: event.message_ids,
+      };
       return () => frame;
     }
   }

@@ -155,7 +155,7 @@ test('FM2-c: a client that never answers the close plus a stalled push: the push
 
 test('FM2-c: when app.close() itself rejects, the stalled push is still waited for before closeDb (the drain is concurrent, not after it)', async () => {
   const app = Fastify({ logger: false });
-  registerRealtimeRoute(app, { verify: testVerify, bypassEnabled: true });
+  registerRealtimeRoute(app, { verify: testVerify, bypassEnabled: true, onAck: () => undefined });
   app.addHook('onClose', async () => {
     throw new Error('a plugin failed to close (test)');
   });
@@ -206,7 +206,7 @@ interface HeldRequest {
 
 async function appWithHeldRequest(beforeReply: () => void = () => undefined): Promise<HeldRequest> {
   const app = Fastify({ logger: false });
-  registerRealtimeRoute(app, { verify: testVerify, bypassEnabled: true });
+  registerRealtimeRoute(app, { verify: testVerify, bypassEnabled: true, onAck: () => undefined });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;

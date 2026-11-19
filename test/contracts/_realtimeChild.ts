@@ -25,7 +25,8 @@ async function main(): Promise<void> {
     const { registerRealtimeRoute } = await import('../../src/realtime/server.js');
     process.stdout.write(`BYPASS ${String(bypassHeaderEnabled)}\n`);
     const app = Fastify({ logger: false });
-    registerRealtimeRoute(app);
+    // Every default but the ack sink, which has none (MB27 Q6): the dev arm's gate is the subject.
+    registerRealtimeRoute(app, { onAck: () => undefined });
     await app.listen({ port: 0, host: '127.0.0.1' });
     const address = app.server.address();
     const port = typeof address === 'object' && address !== null ? address.port : 0;

@@ -27,6 +27,7 @@ import {
   type BusOptions,
   type BusState,
   type ChannelTarget,
+  type ThreadPublisher,
 } from './bus.js';
 import {
   defaultDeliveryDeps,
@@ -34,6 +35,7 @@ import {
   threadOwnerOf,
   type DeliveryDeps,
   type FrameSocket,
+  type MessageElementFor,
 } from './frames.js';
 
 /**
@@ -60,8 +62,9 @@ import {
  * at warn, and counted; three in a minute close 4403 (CR4). `typing` and `ack` each re-resolve
  * the principal before the thread check (as HTTP checks it). `typing` is relayed at most once a
  * second; `ack` is coalesced to the highest `up_to_seq` per thread, at most one a second, and
- * handed to the injected `onAck` (integration wires *Delivered* there; this file writes no SQL
- * for it).
+ * handed to the injected `onAck` with the bus (`buildApp()` wires *Delivered* there,
+ * `delivered.ts`; this file writes no SQL for it). There is no default sink: a hub without one
+ * is refused at construction (MB27 Q6).
  * **Timers:** every 25 s the principal is re-resolved by id (gone or role changed: 4403; the
  * read throwing: 1011, FH1-b); 60 s with no inbound frame ends the socket (`terminate()`, LR13).
  * **Limits:** frames ≤ 16 KB (1009); 5 sockets per family, 20 per staffer, the next evicting the
@@ -134,15 +137,14 @@ export const REALTIME_LIMITS: Readonly<RealtimeLimits> = {
   closeGraceMs: 1_000,
 };
 
+/** Where an `ack` that passed its checks goes, with the bus to publish its `receipt` on. The
+ *  serving app's is `delivered.ts`'s `deliveredAckSink`. */
 export type AckSink = (
   principal: MirrorPrincipal,
   threadId: string,
   upToSeq: number,
+  publisher: ThreadPublisher,
 ) => void | Promise<void>;
-
-/** Until integration wires the *Delivered* stamp (brief B2, B10), an `ack` that passes its
- *  checks ends here. */
-const noAckSink: AckSink = () => undefined;
 
 export interface RealtimeOptions {
   verify?: (token: string) => Promise<VerifiedToken>;
@@ -154,8 +156,13 @@ export interface RealtimeOptions {
   ownsThread?: (threadId: string, ownerId: string) => Promise<boolean>;
   /** The staff thread check (a live thread, as `existsLive`), returning its `owner_id`. */
   threadOwner?: (threadId: string) => Promise<string | null>;
-  delivery?: Partial<Omit<DeliveryDeps, 'log'>>;
-  onAck?: AckSink;
+  delivery?: Partial<Omit<DeliveryDeps, 'log' | 'messageElement'>>;
+  /** Required, with no default (MB27 Q6; memory "prove the alarm channel"): a hub without an
+   *  ack sink is refused at construction, never a silent no-op. */
+  onAck: AckSink;
+  /** The `message.created` element builder (`frames.ts`). No default: without one a hub builds
+   *  no `message.created` frame, and `threadPublisherFor` refuses to hand it to a route. */
+  messageElement?: MessageElementFor;
   clock?: RealtimeClock;
   limits?: Partial<RealtimeLimits>;
   bus?: Partial<Omit<BusOptions, 'log'>>;
@@ -634,7 +641,7 @@ class Connection implements FrameSocket {
       return;
     }
     try {
-      await this.hub.deps.onAck(this.principal, threadId, upToSeq);
+      await this.hub.deps.onAck(this.principal, threadId, upToSeq, this.hub.bus);
     } catch (err) {
       this.hub.log.warn(
         { err_message: errMessage(err), thread_id: threadId },
@@ -659,6 +666,8 @@ interface HubDeps {
 export interface RealtimeHub {
   readonly prefix: string;
   readonly bus: RealtimeBus;
+  /** Whether a `message.created` element builder is wired (`threadPublisherFor` requires it). */
+  readonly buildsMessageFrames: boolean;
   /** Open the bus's Redis connections (the API does it after `listen`, `index.ts`). */
   startBus(): void;
   busState(): BusState;
@@ -675,6 +684,7 @@ export interface RealtimeHub {
 class Hub implements RealtimeHub {
   readonly prefix: string;
   readonly bus: RealtimeBus;
+  readonly buildsMessageFrames: boolean;
   readonly limits: RealtimeLimits;
   readonly clock: RealtimeClock;
   readonly deps: HubDeps;
@@ -690,6 +700,13 @@ class Hub implements RealtimeHub {
     readonly log: FastifyBaseLogger,
     opts: RealtimeOptions,
   ) {
+    if (typeof opts.onAck !== 'function') {
+      throw new Error(
+        'realtime: no ack sink was given. There is no default: buildApp() passes the Delivered ' +
+          'stamp (deliveredAckSink); a test app passes its own (MB27 Q6, "prove the alarm channel").',
+      );
+    }
+    this.buildsMessageFrames = opts.messageElement !== undefined;
     this.limits = { ...REALTIME_LIMITS, ...opts.limits };
     this.clock = opts.clock ?? systemClock;
     this.prefix = opts.bus?.prefix ?? resolveChannelPrefix();
@@ -701,8 +718,13 @@ class Hub implements RealtimeHub {
       ownsThread:
         opts.ownsThread ?? ((threadId, ownerId) => threadsRepository.ownsThread(threadId, ownerId)),
       threadOwner: opts.threadOwner ?? threadOwnerOf,
-      onAck: opts.onAck ?? noAckSink,
-      delivery: { ...defaultDeliveryDeps, ...opts.delivery, log },
+      onAck: opts.onAck,
+      delivery: {
+        ...defaultDeliveryDeps,
+        ...opts.delivery,
+        ...(opts.messageElement === undefined ? {} : { messageElement: opts.messageElement }),
+        log,
+      },
     };
     this.bus = new RealtimeBus(
       { ...opts.bus, prefix: this.prefix, log },
@@ -835,16 +857,42 @@ declare module 'fastify' {
 }
 
 /**
- * Register `@fastify/websocket` and `GET /realtime` on `app`, decorate `app.realtime`, and return
- * the hub. The bus is not started here (no Redis connection at build time): the API starts it
- * after `listen`, and a test starts it when it needs one.
+ * Build the hub and decorate `app.realtime` with it (pass 3 item 5). `buildApp()` calls this
+ * before any route registers, so a publishing route reads its bus at registration
+ * (`publish.ts`), and passes the *Delivered* sink here. A hub with no `onAck` is refused (no
+ * default). The socket route is `registerRealtimeRoute`'s.
  */
-export function registerRealtimeRoute(
-  app: FastifyInstance,
-  opts: RealtimeOptions = {},
-): RealtimeHub {
+export function decorateRealtime(app: FastifyInstance, opts: RealtimeOptions): RealtimeHub {
   const hub = new Hub(opts.log ?? app.log, opts);
   app.decorate('realtime', hub);
+  return hub;
+}
+
+/**
+ * Register `@fastify/websocket` and `GET /realtime` on `app` and return the hub it serves. On an
+ * app `decorateRealtime` already decorated (`buildApp()`), that hub, and `opts` must be absent;
+ * otherwise (a bare test app) it decorates one from `opts` first. The bus is not started here
+ * (no Redis connection at build time): the API starts it after `listen`, and a test starts it
+ * when it needs one.
+ */
+export function registerRealtimeRoute(app: FastifyInstance, opts?: RealtimeOptions): RealtimeHub {
+  let hub: Hub;
+  if (app.hasDecorator('realtime')) {
+    if (opts !== undefined) {
+      throw new Error(
+        'realtime: app.realtime is already decorated; its options belong to decorateRealtime',
+      );
+    }
+    const existing: unknown = app.realtime;
+    if (!(existing instanceof Hub)) {
+      throw new Error(
+        'realtime: app.realtime is not a realtime hub, so GET /realtime cannot serve it',
+      );
+    }
+    hub = existing;
+  } else {
+    hub = decorateRealtime(app, opts ?? ({} as RealtimeOptions)) as Hub;
+  }
 
   void app.register(fastifyWebsocket, {
     options: { maxPayload: hub.limits.maxFrameBytes },

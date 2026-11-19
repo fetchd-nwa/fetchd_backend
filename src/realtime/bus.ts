@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Redis } from 'ioredis';
 import { z } from 'zod';
+import { MAX_MESSAGE_SEQ, type MessageReceiptState } from '../contracts/wire.js';
 import { env } from '../env.js';
 import { redis as sharedRedis } from '../redis.js';
 import type { MirrorPrincipal } from '../auth/mirror.js';
@@ -80,18 +81,36 @@ export function channelsForThread(
   return channels;
 }
 
-/** An event as a caller names it: the thread's ids are added from the row. */
+/** A receipt's step on the bus: the contract's `receipt` frame never carries `sent`. */
+export type ReceiptStep = Exclude<MessageReceiptState, 'sent'>;
+
+/** The most message ids one `staff.read` carries (`PostStaffThreadsReadRequest`'s 1–500). */
+export const MAX_STAFF_READ_IDS = 500;
+
+/**
+ * An event as a caller names it: the thread's ids are added from the row. Ids, integers and
+ * one instant only (H4): never text, a name or a URL.
+ *   · `message.created`: the message's id and `seq`; every frame is built per audience from the
+ *     row (`frames.ts`).
+ *   · `receipt`: the messages of `side` (`owner`: the family's; `staff`: the school's) were
+ *     `delivered` or `read` up to `up_to_seq`, at `at` (ISO-8601). Heard ONLY by that side.
+ *   · `staff.read`: the staffer `staff_id` read these family messages (1–500 ids). Staff only.
+ */
 export type BusEventInput =
   | { kind: 'typing'; from: 'owner' }
   | { kind: 'typing'; from: 'staff'; staff_id: string }
   | { kind: 'thread.changed' }
-  | { kind: 'bell.changed' };
+  | { kind: 'bell.changed' }
+  | { kind: 'message.created'; message_id: string; seq: number }
+  | { kind: 'receipt'; side: Audience; state: ReceiptStep; up_to_seq: number; at: string }
+  | { kind: 'staff.read'; staff_id: string; message_ids: string[] };
 
 /** An event as it travels: ids only. */
 export type BusEvent = BusEventInput & { thread_id: string; owner_id: string };
 
 /** Who may hear each kind. A caller may narrow this (a `thread.changed` for one side), never
- *  widen it: `bell.changed` and an owner's typing never go to an owner channel. */
+ *  widen it: `bell.changed`, `staff.read`, an owner's typing and the school's receipt never go
+ *  to an owner channel, and the family's receipt never goes to the staff channel. */
 export function audiencesFor(event: BusEventInput): readonly Audience[] {
   switch (event.kind) {
     case 'typing':
@@ -100,10 +119,17 @@ export function audiencesFor(event: BusEventInput): readonly Audience[] {
       return ['owner', 'staff'];
     case 'bell.changed':
       return ['staff'];
+    case 'message.created':
+      return ['owner', 'staff'];
+    case 'receipt':
+      return [event.side];
+    case 'staff.read':
+      return ['staff'];
   }
 }
 
 const uuid = z.string().uuid();
+const seq = z.number().int().min(0).max(MAX_MESSAGE_SEQ);
 const busEventSchema = z.union([
   z
     .object({
@@ -130,6 +156,38 @@ const busEventSchema = z.union([
   z
     .object({ v: z.literal(1), kind: z.literal('bell.changed'), thread_id: uuid, owner_id: uuid })
     .strict(),
+  z
+    .object({
+      v: z.literal(1),
+      kind: z.literal('message.created'),
+      thread_id: uuid,
+      owner_id: uuid,
+      message_id: uuid,
+      seq,
+    })
+    .strict(),
+  z
+    .object({
+      v: z.literal(1),
+      kind: z.literal('receipt'),
+      thread_id: uuid,
+      owner_id: uuid,
+      side: z.enum(['owner', 'staff']),
+      state: z.enum(['delivered', 'read']),
+      up_to_seq: seq,
+      at: z.string().datetime({ offset: true }),
+    })
+    .strict(),
+  z
+    .object({
+      v: z.literal(1),
+      kind: z.literal('staff.read'),
+      thread_id: uuid,
+      owner_id: uuid,
+      staff_id: uuid,
+      message_ids: z.array(uuid).min(1).max(MAX_STAFF_READ_IDS),
+    })
+    .strict(),
 ]);
 
 const probeSchema = z
@@ -150,6 +208,16 @@ function parseChannel(prefix: string, channel: string): ChannelTarget | { probe:
   }
   if (rest.startsWith('probe:')) return { probe: rest.slice('probe:'.length) };
   return null;
+}
+
+/** What a publishing route holds (`publish.ts`'s `threadPublisherFor`): the bus, and in a bare
+ *  test app the recording bus `withTestBus` decorates. */
+export interface ThreadPublisher {
+  publishForThread(
+    row: { id: string; owner_id: string },
+    event: BusEventInput,
+    only?: readonly Audience[],
+  ): void;
 }
 
 /** The one publish method the bus needs; an ioredis client satisfies it. */
@@ -195,7 +263,7 @@ function errSummary(err: unknown): Record<string, unknown> {
   return err instanceof Error ? { err_message: err.message } : { err_message: String(err) };
 }
 
-export class RealtimeBus {
+export class RealtimeBus implements ThreadPublisher {
   readonly prefix: string;
   readonly instanceId: string;
   private readonly log: FastifyBaseLogger;

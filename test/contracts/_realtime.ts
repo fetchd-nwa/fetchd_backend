@@ -1,4 +1,5 @@
 import './_realtimePrefix.js';
+import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import net from 'node:net';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -9,7 +10,11 @@ import { env } from '../../src/env.js';
 import { makeVerifyAccessToken } from '../../src/auth/jwks.js';
 import { registerAuth } from '../../src/auth/plugin.js';
 import { db } from '../../src/db/client.js';
+import type { MessageWire } from '../../src/contracts/wire.js';
+import { pgTimestampToIso } from '../../src/lib/pgTimestamp.js';
+import type { Audience, BusEventInput } from '../../src/realtime/bus.js';
 import {
+  decorateRealtime,
   registerRealtimeRoute,
   type RealtimeClock,
   type RealtimeHub,
@@ -215,17 +220,23 @@ export interface RealtimeTestApp {
  * A listening app (port 0, 127.0.0.1) with `GET /realtime`, a plain `GET /test-http` route, and a
  * log captured at trace. The HTTP verifier on the local key set and the bypass ON are the
  * defaults; every `RealtimeOptions` key can be overridden. `startBus` opens the bus and, unless
- * `waitLive: false`, waits for `live`.
+ * `waitLive: false`, waits for `live`. The ack sink defaults to a test no-op here, in a test
+ * helper only (`src/` has no default: MB27 Q6); a row about acks passes its own or the real one.
  */
 export async function startRealtimeApp(
-  opts: RealtimeOptions & { startBus?: boolean; waitLive?: boolean } = {},
+  opts: Partial<RealtimeOptions> & { startBus?: boolean; waitLive?: boolean } = {},
 ): Promise<RealtimeTestApp> {
   const logs = makeLogCapture();
   const app = Fastify({ logger: { level: 'trace', stream: logs.stream } });
   registerAuth(app);
   app.get('/test-http', async () => ({ ok: true }));
   const { startBus, waitLive, ...realtime } = opts;
-  const hub = registerRealtimeRoute(app, { verify: testVerify, bypassEnabled: true, ...realtime });
+  const hub = registerRealtimeRoute(app, {
+    verify: testVerify,
+    bypassEnabled: true,
+    onAck: () => undefined,
+    ...realtime,
+  });
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   if (address === null || typeof address === 'string') throw new Error('no port');
@@ -454,4 +465,140 @@ export async function setStaffRole(
   role: 'owner' | 'manager' | 'trainer',
 ): Promise<void> {
   await db.execute(sql`UPDATE staff SET role = ${role}::staff_role WHERE id = ${id}`);
+}
+
+// ---- planted threads and messages (pass 3 phase R) ---------------------------------------------
+// Raw inserts, as `seedOwnerB` plants its rows (no route, no `_messaging.ts`). `thread_seq` is
+// the trigger's (rs3 M5.29). A planted thread names a participant, so it is never the family's
+// one live school thread on its topic (`threads_owner_school_topic_uidx`).
+
+/** A live thread of `ownerId`'s with `participantStaffId` (default Donavan, a trainer). */
+export async function plantThread(
+  ownerId: string,
+  participantStaffId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+): Promise<string> {
+  const id = randomUUID();
+  await db.execute(sql`
+    INSERT INTO threads (id, owner_id, participant_staff_id, category, title, sub_text)
+    VALUES (${id}, ${ownerId}, ${participantStaffId}, 'sessions', 'Realtime planted thread', 'phase R')`);
+  return id;
+}
+
+export type PlantedSender = { kind: 'owner'; id: string } | { kind: 'staff'; id: string };
+
+export interface PlantedMessage {
+  id: string;
+  seq: number;
+}
+
+/** One message in `threadId`; `expired` plants it expired, `deliveredAt` pre-stamps it. */
+export async function plantMessage(
+  threadId: string,
+  sender: PlantedSender,
+  opts: { expired?: boolean; deliveredAt?: string } = {},
+): Promise<PlantedMessage> {
+  const ownerId = sender.kind === 'owner' ? sender.id : null;
+  const staffId = sender.kind === 'staff' ? sender.id : null;
+  const result = await db.execute(sql`
+    INSERT INTO messages (thread_id, sender_kind, sender_owner_id, sender_staff_id, text, expired_at,
+                          delivered_at)
+    VALUES (${threadId}, ${sender.kind}::sender_kind, ${ownerId}::uuid, ${staffId}::uuid,
+            'planted (phase R)', ${opts.expired === true ? sql`now()` : sql`NULL`},
+            ${opts.deliveredAt ?? null}::timestamptz)
+    RETURNING id::text AS id, thread_seq AS seq`);
+  const row = (result.rows as Array<{ id: string; seq: number | string }>)[0]!;
+  return { id: row.id, seq: Number(row.seq) };
+}
+
+/** Each message's `delivered_at` in ISO-8601 UTC to the millisecond, as `toISOString()` writes
+ *  it (both truncate the microseconds), or null. */
+export async function deliveredAtOf(ids: readonly string[]): Promise<Map<string, string | null>> {
+  const result = await db.execute(sql`
+    SELECT id::text AS id,
+           to_char(delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at
+      FROM messages WHERE id = ANY(${sql.param([...ids])}::uuid[])`);
+  return new Map(
+    (result.rows as Array<{ id: string; at: string | null }>).map((r) => [r.id, r.at] as const),
+  );
+}
+
+/** The database clock now, as an epoch-millisecond number (window bounds come from here). */
+export async function dbNowMs(): Promise<number> {
+  const result = await db.execute(
+    sql`SELECT (extract(epoch FROM clock_timestamp()) * 1000)::float8 AS ms`,
+  );
+  return Number((result.rows as Array<{ ms: number | string }>)[0]!.ms);
+}
+
+/** Delete planted threads (their messages cascade). */
+export async function removeThreads(ids: readonly string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await db.execute(sql`DELETE FROM threads WHERE id = ANY(${sql.param([...ids])}::uuid[])`);
+}
+
+/** What a recording message-element builder was asked for. */
+export interface ElementCall {
+  messageId: string;
+  threadId: string;
+  audience: 'owner' | 'staff';
+}
+
+/**
+ * A recording stand-in for the GET element builder (phase F wires the real one): it answers
+ * with the real `MessageWire` shape after a real delay, its `text` naming the audience it was
+ * built for, so a test can tell an owner-built element from a staff-built one.
+ */
+export function recordingElement(
+  calls: ElementCall[] = [],
+  delayMs = 15,
+): (
+  row: { id: string; threadId: string; threadSeq: number; sentAt: string },
+  audience: 'owner' | 'staff',
+) => Promise<MessageWire> {
+  return async (row, audience) => {
+    calls.push({ messageId: row.id, threadId: row.threadId, audience });
+    await sleep(delayMs);
+    return {
+      id: row.id,
+      thread_id: row.threadId,
+      sender_id: '00000000-0000-4000-8000-000000000000',
+      text: `element for ${audience}`,
+      sent_at: pgTimestampToIso(row.sentAt),
+      is_read: false,
+      seq: row.threadSeq,
+    };
+  };
+}
+
+// ---- item 5: the recording bus a bare test app decorates ---------------------------------------
+
+export interface PublishedEvent {
+  row: { id: string; owner_id: string };
+  event: BusEventInput;
+  only: readonly Audience[] | undefined;
+}
+
+/**
+ * Decorate a bare test app's `app.realtime` (pass 3 item 5; the one helper, MB27 Q6), as
+ * `buildApp()` does, with a hub whose bus RECORDS each publish and sends nothing (it is never
+ * started, so no Redis connection). Call it before registering the routes under test, which
+ * read their bus at registration (`threadPublisherFor`). Its ack sink is a test no-op and its
+ * element builder `recordingElement()`, unless given.
+ */
+export function withTestBus(
+  app: FastifyInstance,
+  opts: Partial<RealtimeOptions> = {},
+): { hub: RealtimeHub; published: PublishedEvent[] } {
+  const hub = decorateRealtime(app, {
+    verify: testVerify,
+    bypassEnabled: true,
+    onAck: () => undefined,
+    messageElement: recordingElement(),
+    ...opts,
+  });
+  const published: PublishedEvent[] = [];
+  hub.bus.publishForThread = (row, event, only) => {
+    published.push({ row, event, only });
+  };
+  return { hub, published };
 }
