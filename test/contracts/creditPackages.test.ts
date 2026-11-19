@@ -70,7 +70,7 @@ test(
 );
 
 test(
-  'CRED-U07: the two campuses list the ten seeded rows, every one complete and buyable',
+  'CRED-U07: the two campuses list the twelve seeded rows, every one complete and buyable (Fayetteville day care since her #40, M5.34)',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
@@ -86,12 +86,13 @@ test(
       rows.push(...(res.json() as CreditPackageWire[]));
     }
     const seeded = rows.filter((r) => CATALOG_SEED_KEYS.includes(r.key));
-    assert.equal(seeded.length, 10);
+    assert.equal(seeded.length, 12);
     assert.deepEqual(new Set(seeded.map((r) => r.expiry_months)), new Set([1]));
     assert.deepEqual(
       seeded.filter((r) => r.single_day).map((r) => [r.key, r.price_cents, r.credits]),
       [
         ['single-day-school-fayetteville', 6000, 1],
+        ['single-day-daycare-fayetteville', 3500, 1],
         ['single-day-school-bentonville', 6000, 1],
         ['single-day-daycare-bentonville', 3500, 1],
       ],
@@ -100,10 +101,17 @@ test(
       seeded.filter((r) => r.tier === 'alumni').map((r) => [r.key, r.location, r.mode]),
       [['daycare-alumni-10-bentonville', 'bentonville', 'daycare']],
     );
-    assert.equal(
-      rows.some((r) => r.mode === 'daycare' && r.location === 'fayetteville'),
-      false,
-      'no daycare pack sells at Fayetteville',
+    // Until 549c14e no day care pack sold at Fayetteville; her #40 (M5.34) sells it as
+    // Bentonville does, with no alumni row there.
+    assert.deepEqual(
+      rows
+        .filter((r) => r.mode === 'daycare' && r.location === 'fayetteville')
+        .map((r) => [r.key, r.tier, r.credits, r.price_cents]),
+      [
+        ['single-day-daycare-fayetteville', 'regular', 1, 3500],
+        ['daycare-10-fayetteville', 'regular', 10, 35000],
+      ],
+      'Fayetteville day care sells its single day and its 10-pack, no alumni row',
     );
   },
 );

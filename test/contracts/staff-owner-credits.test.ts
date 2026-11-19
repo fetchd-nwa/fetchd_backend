@@ -427,16 +427,87 @@ test(
   },
 );
 
+// Her #40 (M5.34): the seed sells day care at Fayetteville too, so every campus and program
+// has a live row and the refusal below needs a program closed first. Until 549c14e this test
+// used Fayetteville day care as the program no row sells.
+const FAYETTEVILLE_CARE_KEYS = ['daycare-10-fayetteville', 'single-day-daycare-fayetteville'];
+const fayettevilleCare = (tier: 'regular' | 'alumni') =>
+  addBody({
+    location: 'fayetteville',
+    mode: 'daycare',
+    tier,
+    note: 'pool-fixture: #40 Fayetteville day care',
+  });
+
 test(
-  'add: a campus and program no package row sells is 422 pool_not_bookable',
+  'add: a campus and program no package row sells is 422 pool_not_bookable (Fayetteville day care with both its rows closed)',
   SKIP_WHEN_NO_DB,
   async () => {
-    const res = await adjust(
-      staffApp(),
-      addBody({ location: 'fayetteville', mode: 'daycare', tier: 'regular' }),
+    await db
+      .update(creditPackages)
+      .set({ effectiveTo: sql`${creditPackages.effectiveFrom}` })
+      .where(inArray(creditPackages.key, FAYETTEVILLE_CARE_KEYS));
+    try {
+      const res = await adjust(staffApp(), fayettevilleCare('regular'));
+      assert.equal(res.statusCode, 422, res.body);
+      assert.equal(errorCode(res), 'pool_not_bookable');
+    } finally {
+      await db
+        .update(creditPackages)
+        .set({ effectiveTo: null })
+        .where(inArray(creditPackages.key, FAYETTEVILLE_CARE_KEYS));
+    }
+  },
+);
+
+test(
+  '#40: Fayetteville day care is sold (M5.34), so a regular add there is 201 into that pool',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const res = await adjust(staffApp(), fayettevilleCare('regular'));
+    assert.equal(res.statusCode, 201, res.body);
+    const pool = res.json() as StaffCreditPoolWire;
+    assert.deepEqual(
+      [pool.location, pool.mode, pool.tier, pool.balance],
+      ['fayetteville', 'daycare', 'regular', 2],
     );
-    assert.equal(res.statusCode, 422, res.body);
-    assert.equal(errorCode(res), 'pool_not_bookable');
+  },
+);
+
+test(
+  '#40: alumni credits stay Bentonville-only (553 (b), her 704 (3)): an alumni add to Fayetteville day care is 422 pool_not_bookable and writes nothing, with an alumni dog on the account, while Bentonville day care takes it',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const dogId = await createBookableDog(createdDogs);
+    await db.update(dogs).set({ isAlumni: true }).where(eq(dogs.id, dogId));
+    const fayettevilleAlumniRows = async () =>
+      (
+        await db
+          .select({ id: creditLedger.id })
+          .from(creditLedger)
+          .where(
+            and(
+              eq(creditLedger.ownerId, OWNER),
+              eq(creditLedger.location, 'fayetteville'),
+              eq(creditLedger.mode, 'daycare'),
+              eq(creditLedger.tier, 'alumni'),
+            ),
+          )
+      ).length;
+    try {
+      const res = await adjust(staffApp(), fayettevilleCare('alumni'));
+      assert.equal(res.statusCode, 422, res.body);
+      assert.equal(errorCode(res), 'pool_not_bookable');
+      assert.equal(await fayettevilleAlumniRows(), 0, 'no lot');
+
+      const bentonville = await adjust(
+        staffApp(),
+        addBody({ location: 'bentonville', mode: 'daycare', tier: 'alumni' }),
+      );
+      assert.equal(bentonville.statusCode, 201, bentonville.body);
+    } finally {
+      await db.update(dogs).set({ isAlumni: false }).where(eq(dogs.id, dogId));
+    }
   },
 );
 

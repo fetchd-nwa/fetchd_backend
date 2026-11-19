@@ -27,10 +27,15 @@ const M525_PATH = path.join(
   'rs2',
   'M5.25_alumni_pack_bentonville_daycare.sql',
 );
-/** The ten keys M4.06 writes: the live seed keys, with the Fayetteville alumni pack M5.25
- *  closed in place of the Bentonville one it opened. */
+/** M5.34 (plan one-off O-BUGS3, her #40) the one after it: two Fayetteville day care rows. */
+const M534_PATH = path.join(REPO_ROOT, 'migrations', 'rs6', 'M5.34_fayetteville_day_care.sql');
+const M534_KEYS = ['daycare-10-fayetteville', 'single-day-daycare-fayetteville'];
+/** The ten keys M4.06 writes: the live seed keys but M5.34's two, with the Fayetteville
+ *  alumni pack M5.25 closed in place of the Bentonville one it opened. */
 const M406_KEYS = [
-  ...CATALOG_SEED_KEYS.filter((key) => key !== 'daycare-alumni-10-bentonville'),
+  ...CATALOG_SEED_KEYS.filter(
+    (key) => key !== 'daycare-alumni-10-bentonville' && !M534_KEYS.includes(key),
+  ),
   'school-alumni-10-fayetteville',
 ];
 const stepBytes = (name: string): Buffer =>
@@ -146,14 +151,18 @@ test(
 );
 
 test(
-  "M4.06: its bytes run twice in a rolled-back transaction find exactly its ten rows; with M5.25 after them, equal to schema.sql's and the volume's",
+  "M4.06: its bytes run twice in a rolled-back transaction find exactly its ten rows; with M5.25 and M5.34 after them, equal to schema.sql's and the volume's",
   SKIP_WHEN_NO_DB,
   async () => {
     await withClient(async (client) => {
       const keys = [M406_KEYS];
-      const withM525 = [[...M406_KEYS, 'daycare-alumni-10-bentonville']];
+      const withM525 = [[...M406_KEYS, 'daycare-alumni-10-bentonville', ...M534_KEYS]];
       const volume = (await client.query(CATALOG_ROWS, withM525)).rows;
-      assert.equal(volume.length, 11, "the volume holds M4.06's ten rows and M5.25's one");
+      assert.equal(
+        volume.length,
+        13,
+        "the volume holds M4.06's ten rows, M5.25's one and M5.34's two",
+      );
 
       await client.query(`DELETE FROM credit_packages WHERE key = ANY($1)`, withM525);
       assert.equal((await client.query(CATALOG_ROWS, keys)).rows.length, 0, 'the rows are removed');
@@ -298,10 +307,12 @@ test(
         ],
       ]);
 
-      // M5.25 next: the Fayetteville alumni pack closed, the Bentonville one opened.
+      // M5.25 next: the Fayetteville alumni pack closed, the Bentonville one opened; then
+      // M5.34: Fayetteville day care's 10-pack and single day.
       await client.query(fs.readFileSync(M525_PATH, 'utf8'));
+      await client.query(fs.readFileSync(M534_PATH, 'utf8'));
       const fromSteps = (await client.query(CATALOG_ROWS, withM525)).rows;
-      assert.equal(fromSteps.length, 11, 'M4.06 then M5.25 leave eleven rows');
+      assert.equal(fromSteps.length, 13, 'M4.06, M5.25 then M5.34 leave thirteen rows');
 
       await client.query(`DELETE FROM credit_packages WHERE key = ANY($1)`, withM525);
       const statements = seedStatementsIn(fs.readFileSync(SCHEMA_PATH, 'utf8'));

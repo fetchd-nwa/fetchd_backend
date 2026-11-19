@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { afterEach, test } from 'node:test';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { bookingDogs, cohorts, creditLedger, pendingRequests } from '../../src/db/schema/schema.js';
 import { registerBookingsRoute } from '../../src/routes/bookings.js';
@@ -106,41 +106,62 @@ async function debits(dogId: string): Promise<number> {
 
 // ── program_not_offered (DAY-U04) ────────────────────────────────────────────
 
+/** Fayetteville's `day-care.offered`, alone, so the request services stay as this file set them. */
+async function setFayettevilleDayCareOffered(offered: boolean): Promise<void> {
+  await db.execute(sql`
+    UPDATE day_program_settings
+       SET offerings = jsonb_set(offerings, '{day-care,offered}', ${JSON.stringify(offered)}::jsonb)
+     WHERE location = 'fayetteville'`);
+}
+
+// Until 549c14e the seed left day care off at Fayetteville, and this test read the refusal
+// there as seeded. Her #40 (M5.34) offers it, so no day program is off as seeded: the test
+// switches Fayetteville's day care off in settings, as staff would, to read the same refusal.
 test(
-  'daycare at Fayetteville: 422 program_not_offered, no row, no debit',
+  'daycare at Fayetteville switched off in settings: 422 program_not_offered, no row, no debit',
   SKIP_WHEN_NO_DB,
   async () => {
     const app = appAt(FIXTURE_NOW);
     const dogId = await createFundedDog(createdDogIds);
-    const res = await book(app, {
-      category: 'day-care',
-      location: 'fayetteville',
-      lead_dog_id: dogId,
-      dates: ['2026-06-16'],
-    });
-    assert.equal(res.statusCode, 422, res.body);
-    assert.equal(res.code, 'program_not_offered');
-    assert.equal(await bookedRows(dogId), 0);
-    assert.equal(await debits(dogId), 0);
+    await setFayettevilleDayCareOffered(false);
+    try {
+      const res = await book(app, {
+        category: 'day-care',
+        location: 'fayetteville',
+        lead_dog_id: dogId,
+        dates: ['2026-06-16'],
+      });
+      assert.equal(res.statusCode, 422, res.body);
+      assert.equal(res.code, 'program_not_offered');
+      assert.equal(await bookedRows(dogId), 0);
+      assert.equal(await debits(dogId), 0);
+    } finally {
+      await setFayettevilleDayCareOffered(true);
+    }
   },
 );
 
-test('daycare at Bentonville, and day school at both, are offered', SKIP_WHEN_NO_DB, async () => {
-  const app = appAt(FIXTURE_NOW);
-  for (const [category, location] of [
-    ['day-care', 'bentonville'],
-    ['day-school', 'bentonville'],
-    ['day-school', 'fayetteville'],
-  ] as const) {
-    const res = await book(app, {
-      category,
-      location,
-      lead_dog_id: await createFundedDog(createdDogIds),
-      dates: ['2026-06-16'],
-    });
-    assert.equal(res.statusCode, 201, `${category} at ${location}: ${res.body}`);
-  }
-});
+test(
+  'day care and day school are offered at both campuses (day care at Fayetteville since her #40, M5.34)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const app = appAt(FIXTURE_NOW);
+    for (const [category, location] of [
+      ['day-care', 'bentonville'],
+      ['day-care', 'fayetteville'],
+      ['day-school', 'bentonville'],
+      ['day-school', 'fayetteville'],
+    ] as const) {
+      const res = await book(app, {
+        category,
+        location,
+        lead_dog_id: await createFundedDog(createdDogIds),
+        dates: ['2026-06-16'],
+      });
+      assert.equal(res.statusCode, 201, `${category} at ${location}: ${res.body}`);
+    }
+  },
+);
 
 // ── same_day_cutoff_passed (DAY-U10, ruling (c)) ─────────────────────────────
 
@@ -343,13 +364,19 @@ test(
   async () => {
     const app = appAt(at('2026-06-02T15:00:00Z'));
     const dogId = await createFundedDog(createdDogIds);
-    const notOffered = await book(app, {
-      category: 'day-care',
-      location: 'fayetteville',
-      lead_dog_id: dogId,
-      dates: [TODAY, '2026-12-01'],
-    });
-    assert.equal(notOffered.code, 'program_not_offered');
+    // Fayetteville day care, switched off in settings: off as seeded until her #40 (M5.34).
+    await setFayettevilleDayCareOffered(false);
+    try {
+      const notOffered = await book(app, {
+        category: 'day-care',
+        location: 'fayetteville',
+        lead_dog_id: dogId,
+        dates: [TODAY, '2026-12-01'],
+      });
+      assert.equal(notOffered.code, 'program_not_offered');
+    } finally {
+      await setFayettevilleDayCareOffered(true);
+    }
 
     const beyond = await book(app, { lead_dog_id: dogId, dates: [TODAY, '2026-12-01'] });
     assert.equal(beyond.code, 'beyond_booking_horizon');

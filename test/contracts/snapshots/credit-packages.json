@@ -58,5 +58,29 @@
     "is_popular": true,
     "single_day": false,
     "expiry_months": 1
+  },
+  {
+    "key": "single-day-daycare-fayetteville",
+    "location": "fayetteville",
+    "mode": "daycare",
+    "tier": "regular",
+    "credits": 1,
+    "price_cents": 3500,
+    "label": "Single Day Care Day · Fayetteville",
+    "is_popular": false,
+    "single_day": true,
+    "expiry_months": 1
+  },
+  {
+    "key": "daycare-10-fayetteville",
+    "location": "fayetteville",
+    "mode": "daycare",
+    "tier": "regular",
+    "credits": 10,
+    "price_cents": 35000,
+    "label": "Fayetteville Day Care Package",
+    "is_popular": false,
+    "single_day": false,
+    "expiry_months": 1
   }
 ]

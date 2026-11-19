@@ -1271,6 +1271,9 @@ INSERT INTO day_program_settings (
 -- M5.24 (P49; wire 9.0.0; build DECISIONS 393): private-lesson and board-and-train are
 -- offered and shown at both campuses; boarding stays off, opened per family on Shanthi's
 -- switch. `rs1-steps.test.ts` holds this seed equal to the step's own result.
+-- M5.34 (plan one-off O-BUGS3, her bug #40; DECISIONS 677 (1), 704): day care is offered
+-- and shown at Fayetteville too; its 15 daily places are the campus's one count, shared
+-- with day school. `rs6-steps.test.ts` holds this seed equal to M5.24 then M5.34.
 INSERT INTO day_program_settings (
   location, offerings, open_weekdays_list, daily_capacity_dogs,
   dropoff_open_time, dropoff_close_time, pickup_open_time, pickup_close_time,
@@ -1279,7 +1282,7 @@ INSERT INTO day_program_settings (
 ) VALUES (
   'fayetteville',
   '{"day-school": {"offered": true, "client_visible": true, "name": null, "description": null},
-    "day-care": {"offered": false, "client_visible": false, "name": null, "description": null},
+    "day-care": {"offered": true, "client_visible": true, "name": null, "description": null},
     "group-class": {"offered": true, "client_visible": true, "name": null, "description": null},
     "evaluation": {"offered": true, "client_visible": true, "name": null, "description": null},
     "private-lesson": {"offered": true, "client_visible": true, "name": null, "description": null},
@@ -1694,11 +1697,16 @@ CREATE TABLE credit_packages (
 -- day) and "Alumni Bentonville 10 Visits" live at Bentonville day care. Reference data, so
 -- the test volume carries them too; the fingerprint reads no rows, so the rehearsal's row
 -- check, test/contracts/lg4-p18-steps.test.ts and rs2-steps.test.ts prove the steps agree.
+-- M5.34 (plan one-off O-BUGS3, her bug #40; DECISIONS 704): Fayetteville day care sold as
+-- Bentonville's, a 10-pack at $350.00 and a single day at $35.00; no alumni row there
+-- (alumni credits stay Bentonville-only, 553 (b)). rs6-steps.test.ts holds the step equal.
 INSERT INTO credit_packages (key, location, mode, tier, credits, price_cents, label, is_popular, single_day, expiry_months, effective_from, effective_to) VALUES
   ('school-2x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 8, 45600, 'Fayetteville 2x Weekly', false, false, 1, '2026-01-01', NULL),
   ('school-3x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 12, 64800, 'Fayetteville 3x Weekly', true, false, 1, '2026-01-01', NULL),
   ('school-alumni-10-fayetteville', 'fayetteville', 'school', 'alumni', 10, 32000, 'Alumni Fayetteville 10 Visits', false, false, 1, '2026-01-01', '2026-01-01'),
   ('single-day-school-fayetteville', 'fayetteville', 'school', 'regular', 1, 6000, 'Single Day School Day · Fayetteville', false, true, 1, '2026-01-01', NULL),
+  ('daycare-10-fayetteville', 'fayetteville', 'daycare', 'regular', 10, 35000, 'Fayetteville Day Care Package', false, false, 1, '2026-01-01', NULL),
+  ('single-day-daycare-fayetteville', 'fayetteville', 'daycare', 'regular', 1, 3500, 'Single Day Care Day · Fayetteville', false, true, 1, '2026-01-01', NULL),
   ('school-2x-weekly-bentonville', 'bentonville', 'school', 'regular', 8, 45600, 'Bentonville 2x Weekly', false, false, 1, '2026-01-01', NULL),
   ('school-3x-weekly-bentonville', 'bentonville', 'school', 'regular', 12, 64800, 'Bentonville 3x Weekly', true, false, 1, '2026-01-01', NULL),
   ('school-5x-weekly-bentonville', 'bentonville', 'school', 'regular', 20, 102000, 'Bentonville 5x Weekly', false, false, 1, '2026-01-01', NULL),

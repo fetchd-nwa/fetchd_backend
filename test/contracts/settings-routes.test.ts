@@ -194,7 +194,8 @@ describe('GET /settings — the owner document', SKIP_WHEN_NO_DB, () => {
     const doc = (
       await appAs(FIXTURE_OWNER_PRINCIPAL).inject({ method: 'GET', url: '/settings' })
     ).json<OwnerSettingsWire>();
-    assert.equal(doc.offerings.fayetteville['day-care'].offered, false);
+    // Her #40 (M5.34): day care is offered at Fayetteville too (false until 549c14e).
+    assert.equal(doc.offerings.fayetteville['day-care'].offered, true);
     assert.equal(doc.offerings.bentonville['day-care'].offered, true);
     for (const service of ['boarding', 'board-and-train', 'private-lesson'] as const) {
       assert.equal(doc.offerings.fayetteville[service].offered, false);

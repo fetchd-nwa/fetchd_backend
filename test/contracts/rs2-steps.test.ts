@@ -174,13 +174,14 @@ test("M5.25 parses as a step that runs inside the runner's transaction", () => {
 });
 
 test(
-  "B21: the step equals the seed: from M4.06's catalog, its text leaves the eleven rows schema.sql seeds (the Fayetteville pack closed, the Bentonville pack live at $320.00 for 10)",
+  "B21: the step equals the seed: from M4.06's catalog, its text leaves the rows schema.sql seeds (the Fayetteville pack closed, the Bentonville pack live at $320.00 for 10; M5.34's two Fayetteville day care rows untouched)",
   SKIP_WHEN_NO_DB,
   async () => {
     const keys = [[...CATALOG_SEED_KEYS, OLD]];
     await withClient(async (client) => {
       const seeded = (await client.query(CATALOG_ROWS, keys)).rows;
-      assert.equal(seeded.length, 11, 'the volume holds the ten live rows and the closed one');
+      // Twelve live since M5.34 (her #40) added Fayetteville day care's two; M5.25 moves none of them.
+      assert.equal(seeded.length, 13, 'the volume holds the twelve live rows and the closed one');
       await beforeTheStep(client);
       await client.query(STEP.toString('utf8'));
       assert.deepEqual(

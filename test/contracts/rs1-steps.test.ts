@@ -26,6 +26,8 @@ const stepBytes = (name: string): Buffer => fs.readFileSync(path.join(STEPS, nam
 const M520 = 'M5.20_notification_request_approved.sql';
 const M523 = 'M5.23_stale_bt_requests.sql';
 const M524 = 'M5.24_offer_private_and_bt.sql';
+/** M5.34 (plan one-off O-BUGS3, her #40): the next step to move these documents. */
+const M534_PATH = path.join(REPO_ROOT, 'migrations', 'rs6', 'M5.34_fayetteville_day_care.sql');
 
 async function withClient(run: (client: pg.Client) => Promise<void>): Promise<void> {
   const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
@@ -156,7 +158,7 @@ test('M5.24 runs inside a transaction', () => {
 });
 
 test(
-  "M5.24 seed equals step: from the pre-M5.24 documents, the step's own text leaves both campuses exactly as schema.sql seeds them, boarding off",
+  "M5.24 seed equals step: from the pre-M5.24 documents, the step's own text, then M5.34's (day care at Fayetteville, her #40), leave both campuses exactly as schema.sql seeds them, boarding off",
   SKIP_WHEN_NO_DB,
   async () => {
     await withClient(async (client) => {
@@ -167,6 +169,11 @@ test(
         ]);
       }
       await client.query(stepBytes(M524).toString('utf8'));
+      const afterM524 = await client.query<{ offerings: OfferingsDocument }>(
+        `SELECT offerings FROM day_program_settings WHERE location = 'fayetteville'`,
+      );
+      assert.deepEqual(afterM524.rows[0]?.offerings['day-care'], off, 'M5.24 leaves day care alone');
+      await client.query(fs.readFileSync(M534_PATH, 'utf8'));
       const { rows } = await client.query<{ location: string; offerings: OfferingsDocument }>(
         `SELECT location, offerings FROM day_program_settings
           WHERE location IN ('fayetteville', 'bentonville') ORDER BY location`,

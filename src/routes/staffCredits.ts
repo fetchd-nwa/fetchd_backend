@@ -198,6 +198,10 @@ async function poolsOf(
  * The refusals of a pool no v1 booking can draw from (design §2.4:3088-3089). Alumni credits
  * pay for day care only (her 553; M5.25), and the order route refuses an alumni dog at day
  * school (R7, `alumni_no_day_school`), so an alumni day-school pool at either campus is one.
+ * And they are Bentonville-only (553 (b), kept by her #40 answer, 704 (3)): since M5.34 sells
+ * day care at Fayetteville, the first check no longer refuses an alumni Fayetteville day care
+ * add, and an alumni dog's Fayetteville day would draw from that pool first. So an alumni
+ * pool is bookable only where an alumni pack sells.
  */
 async function assertPoolBookable(tx: Tx, pool: CreditPool, today: string): Promise<void> {
   const rows = await creditPackagesRepository.findLiveForProgram(tx, {
@@ -210,6 +214,12 @@ async function assertPoolBookable(tx: Tx, pool: CreditPool, today: string): Prom
   }
   if (pool.tier === 'alumni' && pool.mode === 'school') {
     throw new ApiError('pool_not_bookable', 'alumni credits pay for day care only');
+  }
+  if (pool.tier === 'alumni' && !rows.some((row) => row.tier === 'alumni')) {
+    throw new ApiError(
+      'pool_not_bookable',
+      `no alumni package sells ${pool.mode} at ${pool.location}`,
+    );
   }
   if (pool.tier === 'alumni' && !(await dogsRepository.ownerHasAlumniDog(tx, pool.ownerId))) {
     throw new ApiError('pool_not_bookable', 'this account has no alumni dog');
