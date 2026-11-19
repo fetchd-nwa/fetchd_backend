@@ -7,7 +7,9 @@ import type { Tx } from './tx.js';
  *
  *   request-key claim
  *     → dog, every dog ascending (`withDogLocks`)
- *       → `(campus, date)` capacity locks, every date ascending (or the run lock)
+ *       → `(campus, date)` capacity locks, every key ascending (or the run lock)
+ *         → dog rows, `FOR SHARE`, ascending id (the order's alumni read,
+ *           `dogsRepository.alumniAmong`; it takes nothing below but the pools)
  *         → cohort, `FOR NO KEY UPDATE` (enrollment and the withdraw)
  *           → charge (the order's)
  *             → the invoice the charge settles
@@ -24,6 +26,15 @@ import type { Tx } from './tx.js';
  * `lockPools` calls in one transaction are two orders, so a settle takes the pool it grants
  * into with the pools its order debited, because a cancel's return follows it in the same
  * transaction, and an alumni top-up's tx1 holds alumni on its way to regular.
+ *
+ * `POST /booking-orders` (9.1.0; designs/credits-joint-booking.md §3.2, §11 L2) takes
+ * claim → advisory `dog:` → capacity → dog rows `FOR SHARE` → pools, and nothing else: no
+ * cohort, charge, invoice or booking row. `FOR SHARE` is there so a staff alumni grant
+ * (`lockForAlumniUpdate`, `FOR NO KEY UPDATE`) and the order serialise on the flag the order
+ * reads. Against the board's verbs (below: booking row → dog row → pool) there is no cycle:
+ * the order takes its dog rows before any pool and never asks for a booking row, and a verb
+ * that holds a dog row takes nothing after it but a pool, which the order then waits on
+ * only once the verb has left. Pinned on real connections by `checkin-lock-order.test.ts`.
  *
  * The board's verbs (P20, `lib/checkinVerbs.ts`) and the one-dog cancel take claim →
  * (the order's charge, on a top-up day: the cancel only) → the booking row (`lockById`,
@@ -66,8 +77,10 @@ import type { Tx } from './tx.js';
  *
  * `dogs` and `bookings` are parents the same re-check reaches. A settle asks `KEY SHARE`
  * of the dog twice, on the charge insert and on the second `UPDATE` of its invoice, and
- * the one row lock on a dog, `dogsRepository.lockForAlumniUpdate`, is `FOR NO KEY UPDATE`
- * and wants nothing after it, so there is no wait. A class invoice's charge names
+ * the row locks on a dog are two kinds, neither in conflict with `KEY SHARE`:
+ * `FOR NO KEY UPDATE` (`dogsRepository.lockForAlumniUpdate`, which wants nothing after
+ * it, and the board's `checkinEventsRepository.lockDogClock`) and the order's `FOR SHARE`
+ * (`dogsRepository.alumniAmong`, which wants only the pools after it), so there is no wait. A class invoice's charge names
  * `booking_id` too, which is safe only because the withdraw writes those rows with a
  * plain `UPDATE` and a per-booking cancel refuses class rows. A board-train invoice's
  * charge names it as well, against `lockById`'s `FOR UPDATE`, and that is a wait and not
@@ -307,6 +320,25 @@ export async function withCapacityLocks<T>(
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtext(${`capacity:${location}:${date}`}))`,
     );
+  }
+  return fn();
+}
+
+/**
+ * {@link withCapacityLocks} across campuses (9.1.0, `POST /booking-orders`): every
+ * `(location, date)` pair's `capacity:<location>:<date>` lock, sorted by that key string, so
+ * two orders whose parts name the campuses in opposite body order still take one total
+ * order, and a one-campus holder (its dates ascending) takes a subset of it in the same
+ * order. Repeated pairs are taken once.
+ */
+export async function withCapacityLocksAcross<T>(
+  tx: Tx,
+  pairs: readonly { location: LocationKey; date: string }[],
+  fn: () => Promise<T>,
+): Promise<T> {
+  const keys = [...new Set(pairs.map((pair) => `capacity:${pair.location}:${pair.date}`))].sort();
+  for (const key of keys) {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${key}))`);
   }
   return fn();
 }

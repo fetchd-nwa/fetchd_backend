@@ -7,6 +7,7 @@ import { registerAuthWebhook } from './routes/authWebhook.js';
 import { registerAgreementsRoute } from './routes/agreements.js';
 import { registerAnnouncementsRoute } from './routes/announcements.js';
 import { registerAvailabilityRoute } from './routes/availability.js';
+import { registerBookingOrdersRoute } from './routes/bookingOrders.js';
 import { registerBookingsRoute } from './routes/bookings.js';
 import { registerCreditPackagesRoute } from './routes/creditPackages.js';
 import { registerCreditsRoute } from './routes/credits.js';
@@ -129,6 +130,7 @@ export function buildApp(): FastifyInstance {
   registerRequiredVaccinesRoute(app); // [auth]
   registerAgreementsRoute(app); // [auth]
   registerBookingsRoute(app); // [auth]
+  registerBookingOrdersRoute(app); // [owner] — a whole Confirm, all or none; its check (9.1.0)
   registerEnrollmentsRoute(app); // [auth] — group-class enrollment (owner-only)
   registerAvailabilityRoute(app); // [auth] — catalog (owner + staff)
   registerCreditsRoute(app); // [auth] — owner-only (per-dog)

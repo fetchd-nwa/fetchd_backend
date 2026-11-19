@@ -5,8 +5,9 @@ import { pool } from '../../src/db/pool.js';
 import { createBookableDog, removeDogs } from './_dayFixture.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import { FIXTURE_STAFF_PRINCIPAL, SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
-import { clearPlantedPools, plantLot } from './_poolFixture.js';
+import { clearPlantedPools, plantLot, waitForBlockedBackends } from './_poolFixture.js';
 import { at, boardApp, createSession, makeClock, removeSessions, verb } from './_checkinFixture.js';
+import { advisoryIsFree, clearOrderWorld, orderApp, part, post } from './_bookingOrderFixture.js';
 
 /**
  * The board's one new lock edge, on real connections (`db/locks.ts`): a verb takes the
@@ -19,6 +20,7 @@ registerFixtureHooks();
 const dogs: string[] = [];
 const sessions: string[] = [];
 afterEach(async () => {
+  await clearOrderWorld();
   await removeSessions(sessions.splice(0));
   await clearPlantedPools();
 });
@@ -145,5 +147,92 @@ test(
       await release(poolLock);
     }
     assert.equal((await back).statusCode, 200);
+  },
+);
+
+// ── The order's edge (9.1.0, O-CREDITS §11 L2): advisory `dog:` → capacity → dog rows
+// `FOR SHARE` → pools. `POST /booking-orders` reads the alumni flags under a row lock so a
+// staff grant serialises with it, and takes those rows before any pool.
+
+const ORDER_DAY = '2037-11-23';
+const ORDER_CLOCK = at('2037-11-18', '12:00');
+
+test(
+  "an order holds its dogs' rows `FOR SHARE` and its capacity key while it waits on the pool (dog rows before pool)",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const dogId = await createBookableDog(dogs);
+    await plantLot({ credits: 1, expiresAt: '2037-12-31T18:00:00.000Z' });
+    const { app } = orderApp({ clock: makeClock(ORDER_CLOCK) });
+
+    const alumniPool = `pool:${FIXTURE_IDS.ownerId}:bentonville:school:alumni`;
+    const poolLock = await hold('SELECT pg_advisory_xact_lock(hashtext($1))', [alumniPool]);
+    const ordering = post(app, {
+      parts: [part({ category: 'day-school', dogs: [dogId], dates: [ORDER_DAY] })],
+    });
+    try {
+      const waiting = await untilBlockedBy(poolLock.pid);
+      assert.match(waiting, /pg_advisory_xact_lock/, 'the order waits on the pool');
+      assert.equal(
+        await rowIsFree('SELECT 1 FROM dogs WHERE id = $1 FOR NO KEY UPDATE NOWAIT', [dogId]),
+        false,
+        "and already holds the dog's row",
+      );
+      assert.equal(
+        await advisoryIsFree(`capacity:bentonville:${ORDER_DAY}`),
+        false,
+        'and its capacity key',
+      );
+    } finally {
+      await release(poolLock);
+    }
+    assert.equal((await ordering).statusCode, 201);
+  },
+);
+
+test(
+  'an order and a re-check-in owed a credit, one dog and one pool, queued behind a held pool: both finish, no cycle (the order never asks for a booking row)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const dogId = await createBookableDog(dogs);
+    const lotId = await plantLot({ credits: 2, expiresAt: at('2027-06-01', '12:00') });
+    await plantLot({ credits: 1, expiresAt: '2037-12-31T18:00:00.000Z' });
+    const { bookingId } = await createSession({
+      dogIds: [dogId],
+      date: DAY,
+      lotId,
+      ledger: sessions,
+    });
+    const clock = makeClock(at(DAY, '07:35'));
+    const board = boardApp(FIXTURE_STAFF_PRINCIPAL, clock);
+    assert.equal((await verb(board, { bookingId, dogId, verb: 'check-in' })).statusCode, 200);
+    clock.set(at(DAY, '11:00'));
+    const early = await verb(board, {
+      bookingId,
+      dogId,
+      verb: 'check-out',
+      body: { reissue_credit: true },
+    });
+    assert.equal(early.statusCode, 200, early.body);
+    clock.set(at(DAY, '14:30'));
+    const { app } = orderApp({ clock: makeClock(ORDER_CLOCK) });
+
+    const regularPool = `pool:${FIXTURE_IDS.ownerId}:bentonville:school:regular`;
+    const poolLock = await hold('SELECT pg_advisory_xact_lock(hashtext($1))', [regularPool]);
+    let ordering: ReturnType<typeof post> | undefined;
+    let back: ReturnType<typeof verb> | undefined;
+    try {
+      ordering = post(app, {
+        parts: [part({ category: 'day-school', dogs: [dogId], dates: [ORDER_DAY] })],
+      });
+      await untilBlockedBy(poolLock.pid);
+      back = verb(board, { bookingId, dogId, verb: 'check-in' });
+      await waitForBlockedBackends(2);
+    } finally {
+      await release(poolLock);
+    }
+    const [ordered, checkedIn] = await Promise.all([ordering, back]);
+    assert.equal(ordered!.statusCode, 201, ordered!.body);
+    assert.equal(checkedIn!.statusCode, 200, checkedIn!.body);
   },
 );

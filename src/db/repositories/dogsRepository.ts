@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import {
   dogs,
@@ -362,6 +362,26 @@ async function allAlumni(runner: Runner, dogIds: readonly string[]): Promise<boo
   return rows.length === dogIds.length && rows.every((row) => row.isAlumni);
 }
 
+/**
+ * Which of these dogs are alumni, read `FOR SHARE` in ascending id order (9.1.0,
+ * `POST /booking-orders`; design §3.2 step 4, §11 L2). The staff alumni write takes the dog
+ * row `FOR NO KEY UPDATE` (`lockForAlumniUpdate`), not the advisory `dog:` key, so without
+ * this lock an order could book on a flag a concurrent grant had just changed. `FOR SHARE`
+ * conflicts with `NO KEY UPDATE`, so the two serialise, and not with the `KEY SHARE` an FK
+ * re-check takes. Its place in the lock order is `db/locks.ts`'s: after the capacity locks,
+ * before the pools. Under the order's own transaction.
+ */
+async function alumniAmong(tx: Tx, dogIds: readonly string[]): Promise<Set<string>> {
+  if (dogIds.length === 0) return new Set();
+  const rows = await tx
+    .select({ id: dogs.id, isAlumni: dogs.isAlumni })
+    .from(dogs)
+    .where(inArray(dogs.id, [...dogIds]))
+    .orderBy(asc(dogs.id))
+    .for('share');
+  return new Set(rows.filter((row) => row.isAlumni).map((row) => row.id));
+}
+
 /** Does this account hold a live alumni dog, so an alumni credit could pay for something? */
 async function ownerHasAlumniDog(runner: Runner, ownerId: string): Promise<boolean> {
   const [row] = await runner
@@ -565,6 +585,7 @@ export const dogsRepository = {
   lockForAlumniUpdate,
   findLiveAlumniStatus,
   allAlumni,
+  alumniAmong,
   ownerHasAlumniDog,
   markAlumni,
   findAllLiveForStaff,

@@ -280,8 +280,9 @@ function pickPoolKey({ location, mode, tier }: CreditPool) {
   return { location, mode, tier };
 }
 
-/** DAY-U04: `offerings[category].offered`, the service's one store, at this campus. */
-function assertProgramOffered(
+/** DAY-U04: `offerings[category].offered`, the service's one store, at this campus. Also each
+ *  part's first refusal on `POST /booking-orders` (`createDayProgramOrder.ts`). */
+export function assertProgramOffered(
   campus: DayProgramCampusSettingsWire,
   category: DayProgramCategory,
 ): void {
@@ -292,10 +293,14 @@ function assertProgramOffered(
 /**
  * DAY-U10, DAY-07: refused when a date is today in Chicago and `now` is at or past
  * the cutoff's wall-clock instant, so 07:29:59 books and 07:30:00 does not. Owners
- * only (DAY-08), and this path is owner-only: `POST /bookings` is the one
- * day-program create, and P26's walk-in does not call this.
+ * only (DAY-08), and this path is owner-only: `POST /bookings` and, from 9.1.0,
+ * `POST /booking-orders` are the day-program creates, and P26's walk-in does not call this.
  */
-function assertBeforeSameDayCutoff(dates: readonly string[], now: Date, cutoffTime: string): void {
+export function assertBeforeSameDayCutoff(
+  dates: readonly string[],
+  now: Date,
+  cutoffTime: string,
+): void {
   const today = bucketChicagoToday(now);
   if (!dates.includes(today)) return;
   if (now.getTime() < chicagoTimeOnDate(today, cutoffTime).getTime()) return;

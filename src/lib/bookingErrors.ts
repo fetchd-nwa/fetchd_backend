@@ -4,6 +4,7 @@ import type {
   AlreadyBookedConflict,
   AlreadyEnrolledDetails,
   AlreadyRequestedDetails,
+  AlumniCreditsShortDetails,
   CapacityGap,
   ChargeBlocker,
   CohortFullDetails,
@@ -12,6 +13,8 @@ import type {
   EnrollmentDogResultWire,
   EvaluationGap,
   InsufficientCreditsDetails,
+  LocationKey,
+  PoolShortWire,
   UnpassedEvaluationStatus,
   VaccineGap,
 } from '../contracts/wire.js';
@@ -146,11 +149,14 @@ export function insufficientCreditsError(args: {
 export function creditExpiredBeforeDateError(args: {
   expiresAt: string;
   dates: readonly string[];
+  /** `POST /booking-orders` only (9.1.0): the campus of `dates`. `POST /bookings` omits it. */
+  location?: LocationKey;
 }): ApiError {
   return new ApiError('credit_expired_before_date', `No credit reaches ${args.dates.join(', ')}.`, {
     kind: 'credit_expired_before_date',
     expires_at: args.expiresAt,
     dates: [...args.dates],
+    ...(args.location !== undefined ? { location: args.location } : {}),
   });
 }
 
@@ -171,11 +177,74 @@ export function afterSchoolFullError(gap: {
   date: string;
   capacity: number;
   booked: number;
+  /** `POST /booking-orders` only (9.1.0): the campus of `date`. `POST /bookings` omits it. */
+  location?: LocationKey;
 }): ApiError {
   return new ApiError(
     'after_school_full',
     `${gap.date}'s after-school session is full (${gap.booked} of ${gap.capacity} places taken).`,
     { kind: 'after_school_full', ...gap },
+  );
+}
+
+/**
+ * `credits_short` (9.1.0; `CreditsShortDetails`): regular credits do not cover every day the
+ * order pays from them. One entry per short regular pool, every campus and program at once,
+ * in `LOCATIONS` then `BOOKING_MODES` order (the caller's).
+ */
+export function creditsShortError(pools: readonly PoolShortWire<'regular'>[]): ApiError {
+  if (pools.length === 0) throw new Error('creditsShortError: pools must be non-empty');
+  const short = pools.reduce((sum, pool) => sum + pool.shortfall, 0);
+  return new ApiError('credits_short', `Not enough credits: ${short} short.`, {
+    kind: 'credits_short',
+    pools: pools.map((pool) => ({
+      ...pool,
+      dog_ids: [...pool.dog_ids],
+      short_dates: [...pool.short_dates],
+    })),
+  });
+}
+
+/**
+ * `alumni_credits_short` (9.1.0; `AlumniCreditsShortDetails`, design Amendment A1): an alumni
+ * dog's askable days that her consent does not cover. One entry per such alumni pool.
+ */
+export function alumniCreditsShortError(
+  pools: readonly AlumniCreditsShortDetails['pools'][number][],
+): ApiError {
+  if (pools.length === 0) throw new Error('alumniCreditsShortError: pools must be non-empty');
+  const short = pools.reduce((sum, pool) => sum + pool.shortfall, 0);
+  return new ApiError(
+    'alumni_credits_short',
+    `${short} alumni day(s) need an answer: buy alumni credits, or use regular credits.`,
+    {
+      kind: 'alumni_credits_short',
+      pools: pools.map((pool) => ({
+        ...pool,
+        dog_ids: [...pool.dog_ids],
+        short_dates: [...pool.short_dates],
+      })),
+    },
+  );
+}
+
+/** `alumni_no_day_school` (9.1.0; her #25): the first refusing part's alumni dogs. */
+export function alumniNoDaySchoolError(dogIds: readonly string[]): ApiError {
+  if (dogIds.length === 0) throw new Error('alumniNoDaySchoolError: dogIds must be non-empty');
+  return new ApiError(
+    'alumni_no_day_school',
+    dogIds.length === 1
+      ? 'This dog is alumni and cannot book day school.'
+      : 'These dogs are alumni and cannot book day school.',
+    { kind: 'alumni_no_day_school', dog_ids: [...dogIds] },
+  );
+}
+
+/** `rate_limited` (9.1.0), 429, no `details`: the check's per-owner minute is spent. */
+export function rateLimitedError(limit: number): ApiError {
+  return new ApiError(
+    'rate_limited',
+    `More than ${limit} checks in one minute: wait, then ask again.`,
   );
 }
 

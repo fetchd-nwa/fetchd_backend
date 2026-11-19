@@ -70,6 +70,40 @@ export interface PickerResult {
 }
 
 /**
+ * The picker's one loop, generalised to a list of slots (9.1.0; designs/credits-joint-booking.md
+ * §3.2 step 8): `passes` are paid in order, every slot of one before any of the next, each slot
+ * from the soonest-expiring lot that still has a credit and pays its date. `lots` must be
+ * soonest-expiring first. A slot no lot pays is `unpaid`, in the order it was visited, and
+ * keeps whatever else the caller put on it.
+ */
+export function assignSlots<S extends CreditSlot>(args: {
+  passes: readonly (readonly S[])[];
+  lots: readonly PickerLot[];
+}): { paid: (S & { lotId: string })[]; unpaid: S[]; leftover: Map<string, number> } {
+  const leftover = new Map(args.lots.map((lot) => [lot.id, lot.remaining]));
+  const paysDate = new Map(args.lots.map((lot) => [lot.id, new Set(lot.paysDates)]));
+  const payingLot = (date: string): string | undefined =>
+    args.lots.find(
+      (lot) => (leftover.get(lot.id) ?? 0) > 0 && paysDate.get(lot.id)?.has(date) === true,
+    )?.id;
+
+  const paid: (S & { lotId: string })[] = [];
+  const unpaid: S[] = [];
+  for (const pass of args.passes) {
+    for (const slot of pass) {
+      const lotId = payingLot(slot.date);
+      if (lotId === undefined) {
+        unpaid.push(slot);
+        continue;
+      }
+      leftover.set(lotId, (leftover.get(lotId) ?? 0) - 1);
+      paid.push({ ...slot, lotId });
+    }
+  }
+  return { paid, unpaid, leftover };
+}
+
+/**
  * `lots` must be soonest-expiring first, and `dates` ascending: the caller's read is both.
  * `beyondReach` is the dates a credit bought today cannot pay.
  */
@@ -79,34 +113,19 @@ export function assignCredits(args: {
   lots: readonly PickerLot[];
   beyondReach: ReadonlySet<string>;
 }): PickerResult {
-  const leftover = new Map(args.lots.map((lot) => [lot.id, lot.remaining]));
-  const paysDate = new Map(args.lots.map((lot) => [lot.id, new Set(lot.paysDates)]));
-  const payingLot = (date: string): string | undefined =>
-    args.lots.find(
-      (lot) => (leftover.get(lot.id) ?? 0) > 0 && paysDate.get(lot.id)?.has(date) === true,
-    )?.id;
-
-  const paid: PaidSlot[] = [];
-  const unpaid: CreditSlot[] = [];
-  const pass = (dates: readonly string[]): void => {
-    for (const date of dates) {
-      for (const dogId of args.dogIds) {
-        const lotId = payingLot(date);
-        if (lotId === undefined) {
-          unpaid.push({ date, dogId });
-          continue;
-        }
-        leftover.set(lotId, (leftover.get(lotId) ?? 0) - 1);
-        paid.push({ date, dogId, lotId });
-      }
-    }
-  };
-  pass(args.dates.filter((date) => args.beyondReach.has(date)));
-  pass(args.dates.filter((date) => !args.beyondReach.has(date)));
+  const slotsOn = (dates: readonly string[]): CreditSlot[] =>
+    dates.flatMap((date) => args.dogIds.map((dogId) => ({ date, dogId })));
+  const { paid, unpaid, leftover } = assignSlots({
+    passes: [
+      slotsOn(args.dates.filter((date) => args.beyondReach.has(date))),
+      slotsOn(args.dates.filter((date) => !args.beyondReach.has(date))),
+    ],
+    lots: args.lots,
+  });
 
   const byDate = (a: CreditSlot, b: CreditSlot): number => a.date.localeCompare(b.date);
   return {
-    paid,
+    paid: paid.map(({ date, dogId, lotId }) => ({ date, dogId, lotId })),
     short: unpaid.filter((slot) => !args.beyondReach.has(slot.date)).sort(byDate),
     unreachable: unpaid.filter((slot) => args.beyondReach.has(slot.date)).sort(byDate),
     leftover,
@@ -118,7 +137,7 @@ export function assignCredits(args: {
  * is the latest expiry among the lots with credits left, none of which paid the date.
  */
 export function shortReason(
-  result: PickerResult,
+  result: Pick<PickerResult, 'leftover'>,
   lots: readonly PickerLot[],
 ): {
   reason: 'no_credit' | 'credits_expire_first';
