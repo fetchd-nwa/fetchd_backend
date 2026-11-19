@@ -20,8 +20,10 @@ import {
  * MSG-U04's signature (S45; design §2.9:4554, answer 22; wire 9.2.0 `MessageWire.sender_name`
  * doc): a staff reply in a SCHOOL-addressed thread is signed with the replying staffer's first
  * name while `msg.reply_signature_mode` is `staffer_first_name` (the seed), or with the
- * school's name, *NWA School for Dogs*, under `school_name`; the same on both sides. A reply in
- * a trainer-addressed thread keeps the name it always had.
+ * school's name, *NWA School for Dogs*, under `school_name`. The mode is the FAMILY's view only
+ * (A6, the Fable pass-1 audit's L2, ruled by her answer 2, DECISIONS 589: "no staff names on her
+ * side, staff see each other's"): staff always read the replier's first name. A reply in a
+ * trainer-addressed thread keeps the name it always had.
  */
 
 registerFixtureHooks();
@@ -77,19 +79,26 @@ describe('MSG-U04: a reply in a school thread is signed per msg.reply_signature_
     },
   );
 
-  test('school_name: the school’s name, from the system row', SKIP_WHEN_NO_DB, async () => {
-    await plantRivers();
-    const school = await readSchoolAccount();
-    await db.execute(sql`UPDATE messaging_settings SET reply_signature_mode = 'school_name'`);
-    const owner = ownerApp();
-    const start = await startThread(owner, { category: 'billing', text: 'A question' });
-    const threadId = (start.json() as { thread: { id: string } }).thread.id;
-    const reply = await staffReply(staffApp(RIVERS_PRINCIPAL), threadId, { text: 'An answer' });
-    assert.equal(reply.statusCode, 201, reply.body);
-    assert.equal((reply.json() as Msg).sender_name, school.name);
-    const hers = await getJson<Msg[]>(owner, `/threads/${threadId}/messages`);
-    assert.equal(hers.find((m) => m.text === 'An answer')?.sender_name, 'NWA School for Dogs');
-  });
+  test(
+    'school_name (A6): the family reads the school’s name, from the system row; staff read the replier’s first name',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      await plantRivers();
+      const school = await readSchoolAccount();
+      await db.execute(sql`UPDATE messaging_settings SET reply_signature_mode = 'school_name'`);
+      const owner = ownerApp();
+      const start = await startThread(owner, { category: 'billing', text: 'A question' });
+      const threadId = (start.json() as { thread: { id: string } }).thread.id;
+      const reply = await staffReply(staffApp(RIVERS_PRINCIPAL), threadId, { text: 'An answer' });
+      assert.equal(reply.statusCode, 201, reply.body);
+      assert.equal((reply.json() as Msg).sender_name, 'Rachel', 'the staff 201 names her');
+      const hers = await getJson<Msg[]>(owner, `/threads/${threadId}/messages`);
+      assert.equal(hers.find((m) => m.text === 'An answer')?.sender_name, school.name);
+      assert.equal(school.name, 'NWA School for Dogs');
+      const theirs = await getJson<Msg[]>(staffApp(), `/staff/threads/${threadId}/messages`);
+      assert.equal(theirs.find((m) => m.text === 'An answer')?.sender_name, 'Rachel');
+    },
+  );
 
   test(
     'a reply in a trainer-addressed thread keeps the staffer’s name, whatever the mode',

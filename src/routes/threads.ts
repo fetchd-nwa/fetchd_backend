@@ -5,8 +5,11 @@ import type { IdempotencyOutcome } from '../db/idempotency.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
 import { ApiError } from '../lib/errors.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
+import { MAX_MESSAGE_SEQ } from '../contracts/wire.js';
 import type {
+  GetThreadsMessagesQuery,
   PostThreadsMessagesRequest,
+  PostThreadsReadRequest,
   PostThreadsRequest,
   PostThreadsResponse,
   ThreadCategory,
@@ -24,6 +27,8 @@ import { staffRepository } from '../db/repositories/staffRepository.js';
 import { threadsRepository } from '../db/repositories/threadsRepository.js';
 import { threadCategory } from '../db/schema/schema.js';
 import { hasRepeats, isClientMessageIdViolation } from '../lib/clientMessageId.js';
+import { afterSeqQuerySchema, parseAfterSeqQuery } from '../lib/messageSeq.js';
+import { NO_NUL, TOPIC_LABEL, threadPreview } from '../lib/messageText.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
 import { uuidId } from '../lib/uuidId.js';
@@ -77,7 +82,7 @@ function hasTextOrAttachment(body: { text?: string; attachment_media_ids?: strin
 // `text` is optional so an attachment-only message is valid (stored as text='').
 const messageBodySchema = z
   .object({
-    text: z.string().trim().max(MAX_MESSAGE_LEN).optional(),
+    text: z.string().trim().max(MAX_MESSAGE_LEN).refine(NO_NUL.check, NO_NUL.message).optional(),
     attachment_media_ids: z.array(uuidId()).max(MAX_ATTACHMENTS_PER_MESSAGE).optional(),
     // 9.2.0 (W2): the sender's own id for this logical message.
     client_message_id: uuidId().optional(),
@@ -107,9 +112,15 @@ export type PostThreadsMessagesBodyConformance = Expect<
 const startBodySchema = z
   .object({
     category: z.enum(threadCategory.enumValues),
-    subtopic: z.string().trim().min(1).max(MAX_SUBTOPIC_LEN).optional(),
+    subtopic: z
+      .string()
+      .trim()
+      .min(1)
+      .max(MAX_SUBTOPIC_LEN)
+      .refine(NO_NUL.check, NO_NUL.message)
+      .optional(),
     dog_ids: z.array(uuidId()).max(MAX_DOGS_PER_START).optional(),
-    text: z.string().trim().max(MAX_MESSAGE_LEN).optional(),
+    text: z.string().trim().max(MAX_MESSAGE_LEN).refine(NO_NUL.check, NO_NUL.message).optional(),
     attachment_media_ids: z.array(uuidId()).max(MAX_ATTACHMENTS_PER_MESSAGE).optional(),
     client_message_id: uuidId().optional(),
   })
@@ -127,13 +138,23 @@ export type PostThreadsBodyConformance = Expect<
   Equal<z.input<typeof startBodySchema>, PostThreadsRequest>
 >;
 
-/** A school thread's `title`: the topic's label, as the compose wizard names it. */
-const TOPIC_LABEL: Record<ThreadCategory, string> = {
-  sessions: 'Sessions',
-  billing: 'Billing',
-  enrollment: 'Enrollment',
-  other: 'Other',
-};
+/** Zod ↔ wire pin for the list query (§5.1.3; the schema is `lib/messageSeq.ts`'s). */
+export type GetThreadsMessagesQueryConformance = Expect<
+  Equal<z.input<typeof afterSeqQuerySchema>, GetThreadsMessagesQuery>
+>;
+
+/**
+ * `POST /threads/:id/read`'s optional body (9.2.0 `PostThreadsReadRequest`, W5; mechanic 17):
+ * absent, or `{}`, as before; `up_to_seq` an integer from 0 to `MAX_MESSAGE_SEQ`; `.strict()`.
+ */
+const readBodySchema = z
+  .object({ up_to_seq: z.number().int().min(0).max(MAX_MESSAGE_SEQ).optional() })
+  .strict();
+
+/** Zod ↔ wire pin for the read body (§5.1.3). */
+export type PostThreadsReadBodyConformance = Expect<
+  Equal<z.input<typeof readBodySchema>, PostThreadsReadRequest>
+>;
 
 export interface ThreadsRouteOpts extends AuthRouteOptions {
   /** Override the R2 client (contract tests inject the stub for URL signing). */
@@ -236,11 +257,15 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
       if (principal.kind !== 'owner') {
         throw new ApiError('not_found', `thread ${id} not found`);
       }
+      const afterSeq = parseAfterSeqQuery(request.query);
       const owns = await threadsRepository.ownsThread(id, principal.ownerId);
       if (!owns) {
         throw new ApiError('not_found', `thread ${id} not found`);
       }
-      const rows = await messagesRepository.findLiveByThread(id);
+      const rows = await messagesRepository.findLiveByThread(
+        id,
+        afterSeq !== undefined ? { afterSeq } : {},
+      );
       return wireManyMessages(rows, r2, 'owner');
     },
   );
@@ -249,12 +274,16 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
   // Mark the thread's owner-facing messages read (clears `unread_count`).
   // Idempotent, owner-only, 204 No Content. The owner app fires this on open;
   // a missing endpoint here is what caused the chat-screen mark-read retry loop.
+  // 9.2.0 (W5, B10): an optional `{up_to_seq}` reads only the school's messages at or below
+  // it, the newest she rendered; the key's hash covers it (CR34); the thread row is locked
+  // first (L4); a read stamps *Delivered* too.
   app.post('/threads/:id/read', { preHandler: [authHook] }, async (request, reply) => {
     const principal = requirePrincipal(request);
     const { id } = parseUuidParam(request.params);
     if (principal.kind !== 'owner') {
       throw new ApiError('not_found', `thread ${id} not found`);
     }
+    const upToSeq = parseReadBody(request.body);
     const owns = await threadsRepository.ownsThread(id, principal.ownerId);
     if (!owns) {
       throw new ApiError('not_found', `thread ${id} not found`);
@@ -266,10 +295,14 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
         principal,
         idempotencyKey,
         endpoint: 'POST /threads/:id/read',
-        requestHash: hashRequestBody({ threadId: id }),
+        // An absent `up_to_seq` hashes exactly as the 9.1.0 body did.
+        requestHash: hashRequestBody(
+          upToSeq === undefined ? { threadId: id } : { threadId: id, upToSeq },
+        ),
       },
       async (tx) => {
-        await messagesRepository.markThreadReadForOwner(tx, id);
+        await threadsRepository.lockLive(tx, id);
+        await messagesRepository.markThreadReadForOwner(tx, id, upToSeq);
         return { status: 204, body: null };
       },
     );
@@ -353,7 +386,12 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
       throw err;
     }
 
-    const wire = await ownerWire(outcome.body);
+    // A8: a replay answers the message as it is now, so a key stored by code from before 9.2.0
+    // (a row with no `seq`) still answers with one.
+    const answered = outcome.replayed
+      ? ((await messagesRepository.findById(outcome.body.id)) ?? outcome.body)
+      : outcome.body;
+    const wire = await ownerWire(answered);
     reply.code(outcome.status);
     return wire;
   });
@@ -493,19 +531,6 @@ async function validateOwnerAttachments(
   return ordered;
 }
 
-/**
- * Thread-list preview line. Uses the message body when present; for an
- * attachment-only message, a media summary ("Photo" / "Video" / "N attachments")
- * so the threads list isn't blank.
- */
-function threadPreview(text: string, attachments: MediaAssetRow[]): string {
-  if (text !== '') return text;
-  if (attachments.length === 1) {
-    return attachments[0]?.kind === 'video' ? 'Video' : 'Photo';
-  }
-  return `${attachments.length} attachments`;
-}
-
 // ---- body parsing --------------------------------------------------------
 
 function parseMessageBody(body: unknown): {
@@ -524,6 +549,14 @@ function parseMessageBody(body: unknown): {
     attachmentMediaIds: parsed.data.attachment_media_ids ?? [],
     clientMessageId: parsed.data.client_message_id ?? null,
   };
+}
+
+function parseReadBody(body: unknown): number | undefined {
+  const parsed = readBodySchema.safeParse(body ?? {});
+  if (!parsed.success) {
+    throw new ApiError('bad_request', `invalid body: ${formatZodIssues(parsed.error)}`);
+  }
+  return parsed.data.up_to_seq;
 }
 
 function parseStartBody(body: unknown): {

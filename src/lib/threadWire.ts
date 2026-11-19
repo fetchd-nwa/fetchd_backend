@@ -2,7 +2,9 @@ import { assertNever } from './assertNever.js';
 import { pgTimestampToIso } from './pgTimestamp.js';
 import { senderKind } from '../db/schema/schema.js';
 import type {
+  MessageReceiptWire,
   StaffRole,
+  StaffThreadWire,
   ThreadCategory,
   ThreadParticipantWire,
   ThreadWire,
@@ -48,6 +50,7 @@ export type {
   ThreadCategory,
   ThreadParticipantWire,
   ThreadWire,
+  StaffThreadWire,
   MessageAttachmentWire,
   MessageWire,
 };
@@ -87,6 +90,8 @@ export interface MessageRowForWire {
   threadSeq: number;
   /** rs3 M5.30: the sender's own id for the send, or null when it carried none. */
   clientMessageId: string | null;
+  /** rs3 M5.30 (W3): the first delivery to the other side (an ack or a read), or null. */
+  deliveredAt: string | null;
 }
 
 /**
@@ -164,6 +169,7 @@ export function toMessageWire(
   senderName: string | null,
   attachments: MessageAttachmentWire[],
   audience: MessageAudience,
+  firstStaffReadAt: string | null = null,
 ): MessageWire {
   const senderId = flattenMessageSenderId(row);
   const wire: MessageWire = {
@@ -184,7 +190,52 @@ export function toMessageWire(
   if (row.clientMessageId !== null && row.senderKind === audience) {
     wire.client_message_id = row.clientMessageId;
   }
+  const receipt = receiptOf(row, audience, firstStaffReadAt);
+  if (receipt !== undefined) wire.receipt = receipt;
   return wire;
+}
+
+/**
+ * `MessageWire.receipt` (9.2.0, W3; contract-notes mechanics 9, 10): only on a message from the
+ * reader's OWN side (hers on her routes; the school's, every staffer's, on the staff routes). The
+ * step and its instant: `read` at the first read (on a family's message the EARLIEST staffer's
+ * read, `message_staff_reads`, passed in as `firstStaffReadAt`; on the school's, her own
+ * `read_at`), else `delivered` at the first delivery, else `sent` at `sent_at`. Her side never
+ * learns who read it.
+ */
+export function receiptOf(
+  row: MessageRowForWire,
+  audience: MessageAudience,
+  firstStaffReadAt: string | null,
+): MessageReceiptWire | undefined {
+  if (row.senderKind !== audience) return undefined;
+  const readAt = audience === 'owner' ? firstStaffReadAt : row.readAt;
+  if (readAt !== null) return { state: 'read', at: pgTimestampToIso(readAt) };
+  if (row.deliveredAt !== null)
+    return { state: 'delivered', at: pgTimestampToIso(row.deliveredAt) };
+  return { state: 'sent', at: pgTimestampToIso(row.sentAt) };
+}
+
+/**
+ * `GET /staff/threads`' row (9.2.0 `StaffThreadWire`, S46): the thread as `toThreadWire` emits
+ * it, plus the family and the CALLER's read state (both pre-resolved by `wireManyStaffThreads`).
+ */
+export function toStaffThreadWire(
+  thread: ThreadWire,
+  extra: {
+    ownerId: string;
+    ownerName: string;
+    addressedToMe: boolean;
+    staffUnreadCount: number;
+  },
+): StaffThreadWire {
+  return {
+    ...thread,
+    owner_id: extra.ownerId,
+    owner_name: extra.ownerName,
+    addressed_to_me: extra.addressedToMe,
+    staff_unread_count: extra.staffUnreadCount,
+  };
 }
 
 /**

@@ -28,7 +28,10 @@ const TRAINER_PROJECTION = {
  * `livePrincipal(staff) = live AND NOT is_system_account` (design §2.9:4554, S45; rs3 M5.26): the
  * default staff read. The school's system row, *NWA School for Dogs*, is a thread participant
  * and nothing else: never a principal, never on a roster, pick list or responder choice, never a
- * trainer. The one read that resolves it is `findParticipantsByIds` (a participant is history).
+ * trainer. Every serving read of staff names excludes it (`findNamesByIds` through this predicate,
+ * `findAnyNamesByIds` by `NOT is_system_account`; pass-1 audits, Fable M3 and the Opus seat's M1),
+ * so a row that names it (a report's trainer, a request's preference) reads as naming nobody. The
+ * one read that resolves it is `findParticipantsByIds`: a school thread's participant is the school.
  */
 export function livePrincipal(): SQL {
   return and(live(staff), eq(staff.isSystemAccount, false)) as SQL;
@@ -53,14 +56,15 @@ export const staffRepository = {
    * expired trainer's bookings keep the staff_id reference in the audit
    * trail, but the displayed name disappears from the live wire — the
    * route maps NULL/missing to "no trainer" per the §B optional-omit
-   * convention).
+   * convention). Never the school's system row (`livePrincipal`): it is no person, so a
+   * report naming it as trainer shows no trainer, as one naming a departed staffer does.
    */
   async findNamesByIds(ids: string[]): Promise<{ id: string; name: string }[]> {
     if (ids.length === 0) return [];
     return db
       .select({ id: staff.id, name: staff.name })
       .from(staff)
-      .where(and(inArray(staff.id, ids), live(staff)));
+      .where(and(inArray(staff.id, ids), livePrincipal()));
   },
 
   /**
@@ -144,7 +148,8 @@ export const staffRepository = {
    * Names for a batch of staff ids, EXPIRED staff included (P49, wire 9.0.0): what staff
    * approved (`PendingRequestWire.approved_trainer`), whom a family asked for
    * (`StaffRequestWire.preferred_trainer`) and a booked service's trainer
-   * (`StaffServiceBookingWire.trainer`) stay facts after she leaves.
+   * (`StaffServiceBookingWire.trainer`) stay facts after she leaves. Never the school's
+   * system row (S45): it was never a person, so an id naming it reads as naming nobody.
    */
   async findAnyNamesByIds(
     ids: readonly string[],
@@ -155,8 +160,23 @@ export const staffRepository = {
     const rows = await runner
       .select({ id: staff.id, name: staff.name })
       .from(staff)
-      .where(inArray(staff.id, unique));
+      .where(and(inArray(staff.id, unique), eq(staff.isSystemAccount, false)));
     return new Map(rows.map((r) => [r.id, r.name] as const));
+  },
+
+  /**
+   * Whether `id` names a staffer: a `staff` row that is not the school's system row, live or
+   * since expired (orchestrator ruling MB32). `POST /staff/reports` refuses any other
+   * `trainer_staff_id`: one that names no row (a 23503 that paged), and the system row, which is
+   * never a trainer (S45). A departed staffer stays acceptable: a report about her session is true.
+   */
+  async isStaffMember(runner: Runner, id: string): Promise<boolean> {
+    const [row] = await runner
+      .select({ id: staff.id })
+      .from(staff)
+      .where(and(eq(staff.id, id), eq(staff.isSystemAccount, false)))
+      .limit(1);
+    return row !== undefined;
   },
 
   /**

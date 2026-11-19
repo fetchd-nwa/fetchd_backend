@@ -1,6 +1,11 @@
+import { ownersRepository } from '../db/repositories/ownersRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
-import { threadsRepository, type ThreadRow } from '../db/repositories/threadsRepository.js';
+import {
+  threadsRepository,
+  type StaffThreadRow,
+  type ThreadRow,
+} from '../db/repositories/threadsRepository.js';
 import {
   messagesRepository,
   type MessageAttachmentRow,
@@ -8,12 +13,15 @@ import {
 import type { R2Client } from './r2.js';
 import {
   toMessageWire,
+  toStaffThreadWire,
   toThreadWire,
   type MessageAttachmentWire,
   type MessageAudience,
   type MessageRowForWire,
   type MessageWire,
   type ResolvedParticipant,
+  type StaffRoleValue,
+  type StaffThreadWire,
   type ThreadWire,
 } from './threadWire.js';
 
@@ -60,19 +68,13 @@ export async function wireManyThreads(rows: ThreadRow[]): Promise<ThreadWire[]> 
 
 /**
  * Denormalize a batch of message rows into wire shapes for one `audience` (the
- * family's routes or staff's: `client_message_id` rides the sender's side only,
+ * family's routes or staff's: `client_message_id` and `receipt` ride the sender's side only,
  * `threadWire.toMessageWire`). One batched staff-name lookup feeds the
  * polymorphic-sender flattening (owner-sent messages omit `sender_name` per
  * `lib/threadWire.toMessageWire`); one batched attachment lookup + parallel URL
- * signing feeds the per-message media list. `r2` is injected so contract tests
- * substitute the in-memory stub.
- *
- * The signature (S45, MSG-U04; design §2.9:4554, answer 22; 9.2.0
- * `MessageWire.sender_name`): a staff message in a SCHOOL-addressed thread is
- * signed with the staffer's first name while `msg.reply_signature_mode` is
- * `staffer_first_name`, or with the school's name (the system row's) under
- * `school_name`. Elsewhere a staff message keeps the staffer's name. Read only
- * when the batch holds a staff message.
+ * signing feeds the per-message media list; for the family, one batched read of the school's
+ * first reads feeds her receipts. `r2` is injected so contract tests substitute the in-memory
+ * stub.
  */
 export async function wireManyMessages(
   rows: MessageRowForWire[],
@@ -80,30 +82,111 @@ export async function wireManyMessages(
   audience: MessageAudience,
 ): Promise<MessageWire[]> {
   if (rows.length === 0) return [];
+  const herMessageIds =
+    audience === 'owner' ? rows.filter((m) => m.senderKind === 'owner').map((m) => m.id) : [];
+  const [senderNames, attachmentRows, firstStaffReads] = await Promise.all([
+    staffSenderNames(rows, audience),
+    messagesRepository.findAttachmentsByMessageIds(rows.map((r) => r.id)),
+    messagesRepository.findFirstStaffReads(herMessageIds),
+  ]);
+  const attachmentsByMessage = await signAttachmentsByMessage(attachmentRows, r2);
+
+  return rows.map((row) =>
+    toMessageWire(
+      row,
+      senderNames.get(row.id) ?? null,
+      attachmentsByMessage.get(row.id) ?? [],
+      audience,
+      firstStaffReads.get(row.id) ?? null,
+    ),
+  );
+}
+
+/**
+ * `MessageWire.sender_name` of each STAFF message in a batch, as `audience` reads it (owner
+ * messages carry none). The signature (S45, MSG-U04; design §2.9:4554, answer 22): a staff
+ * message in a SCHOOL-addressed thread is signed with the staffer's first name, or, for the
+ * FAMILY only, with the school's name (the system row's) while `msg.reply_signature_mode` is
+ * `school_name`: staff always read each other's first name (A6; her answer 2, DECISIONS 589:
+ * "no staff names on her side, staff see each other's"). Elsewhere a staff message keeps the
+ * staffer's name. The push's title is the family's reading of it ("the push title follows it").
+ */
+export async function staffSenderNames(
+  rows: ReadonlyArray<Pick<MessageRowForWire, 'id' | 'threadId' | 'senderKind' | 'senderStaffId'>>,
+  audience: MessageAudience,
+): Promise<Map<string, string | null>> {
   const staffRows = rows.filter((m) => m.senderKind === 'staff');
+  if (staffRows.length === 0) return new Map();
   const staffSenderIds = [
     ...new Set(staffRows.map((m) => m.senderStaffId).filter((v): v is string => v !== null)),
   ];
-  const [staffNameRows, attachmentRows, signature] = await Promise.all([
+  const [staffNameRows, signature] = await Promise.all([
     staffRepository.findNamesByIds(staffSenderIds),
-    messagesRepository.findAttachmentsByMessageIds(rows.map((r) => r.id)),
-    staffRows.length === 0
-      ? Promise.resolve(undefined)
-      : schoolSignature([...new Set(staffRows.map((m) => m.threadId))]),
+    schoolSignature([...new Set(staffRows.map((m) => m.threadId))]),
   ]);
   const staffNamesById = new Map(staffNameRows.map((s) => [s.id, s.name] as const));
-  const attachmentsByMessage = await signAttachmentsByMessage(attachmentRows, r2);
-
-  return rows.map((row) => {
-    let senderName: string | null = null;
-    if (row.senderKind === 'staff' && row.senderStaffId !== null) {
-      senderName = staffNamesById.get(row.senderStaffId) ?? null;
-      if (signature !== undefined && signature.schoolThreadIds.has(row.threadId)) {
-        senderName =
-          signature.mode === 'school_name' ? signature.schoolName : firstName(senderName);
-      }
+  const names = new Map<string, string | null>();
+  for (const row of staffRows) {
+    let name = row.senderStaffId === null ? null : (staffNamesById.get(row.senderStaffId) ?? null);
+    if (signature.schoolThreadIds.has(row.threadId)) {
+      name =
+        audience === 'owner' && signature.mode === 'school_name'
+          ? signature.schoolName
+          : firstName(name);
     }
-    return toMessageWire(row, senderName, attachmentsByMessage.get(row.id) ?? [], audience);
+    names.set(row.id, name);
+  }
+  return names;
+}
+
+/** Who reads the staff routes: the caller's mirror row and its role (never a client's claim). */
+export interface StaffReader {
+  staffId: string;
+  role: StaffRoleValue;
+}
+
+/**
+ * `StaffThreadWire.addressed_to_me` (S46; signed design §2.9:4554, question 72, MSG-37): a
+ * school thread for every owner- and manager-role staffer; her own thread for its participant; a
+ * departed participant's thread for the owner and manager roles. The bell reads the same rule.
+ */
+export function isAddressedTo(row: StaffThreadRow, reader: StaffReader): boolean {
+  const desk = reader.role === 'owner' || reader.role === 'manager';
+  if (row.addressedToSchool) return desk;
+  if (row.participantStaffId === reader.staffId) return true;
+  return row.participantExpired && desk;
+}
+
+/**
+ * Batched denormalization for the staff routes (9.2.0 `StaffThreadWire`, S46): `wireManyThreads`
+ * plus the family (`owner_name` is the name a staff read prints: her name, or her email when it
+ * is blank) and the reader's own `addressed_to_me` and `staff_unread_count`.
+ */
+export async function wireManyStaffThreads(
+  rows: StaffThreadRow[],
+  reader: StaffReader,
+): Promise<StaffThreadWire[]> {
+  if (rows.length === 0) return [];
+  const [wires, unread, families] = await Promise.all([
+    wireManyThreads(rows),
+    threadsRepository.findStaffUnreadCounts(
+      rows.map((r) => r.id),
+      reader.staffId,
+    ),
+    ownersRepository.findNamesByIds(rows.map((r) => r.ownerId)),
+  ]);
+  return rows.map((row, i) => {
+    const wire = wires[i];
+    const family = families.get(row.ownerId);
+    if (wire === undefined || family === undefined) {
+      throw new Error(`thread ${row.id}: failed to build the staff wire shape`);
+    }
+    return toStaffThreadWire(wire, {
+      ownerId: row.ownerId,
+      ownerName: family.name,
+      addressedToMe: isAddressedTo(row, reader),
+      staffUnreadCount: unread.get(row.id) ?? 0,
+    });
   });
 }
 

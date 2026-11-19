@@ -219,6 +219,16 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
           if (ownerId === undefined) {
             throw new ApiError('not_found', `dog ${body.dog_id} not found`);
           }
+          // MB32 (S45; pass-1 audits, Fable M3, the Opus seat's M1): a named trainer must be a
+          // staffer, live or since departed. An id naming no row was a 23503 and a 500 that
+          // paged; the school's system row is never a trainer. Both are refused alike, before
+          // anything is written. Omitted, the trainer is the author (a live staffer).
+          if (
+            body.trainer_staff_id !== undefined &&
+            !(await staffRepository.isStaffMember(tx, body.trainer_staff_id))
+          ) {
+            throw new ApiError('invalid_payload', 'trainer_staff_id names no staff member');
+          }
 
           const { id } = await reportsRepository.create(tx, {
             dogId: body.dog_id,

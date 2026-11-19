@@ -6,7 +6,11 @@
     "text": "Hey — wanted to follow up on Waffles & Lola from Tuesday. Is Friday morning open?",
     "sent_at": "2026-05-19T13:00:00.000Z",
     "is_read": true,
-    "seq": 1
+    "seq": 1,
+    "receipt": {
+      "state": "sent",
+      "at": "2026-05-19T13:00:00.000Z"
+    }
   },
   {
     "id": "22222222-2222-4222-8222-aaaaaaaaaaa2",
@@ -25,7 +29,11 @@
     "text": "Yes — both. Lola is the bigger leash-reactivity question right now.",
     "sent_at": "2026-05-19T13:20:00.000Z",
     "is_read": true,
-    "seq": 3
+    "seq": 3,
+    "receipt": {
+      "state": "sent",
+      "at": "2026-05-19T13:20:00.000Z"
+    }
   },
   {
     "id": "22222222-2222-4222-8222-aaaaaaaaaaa4",

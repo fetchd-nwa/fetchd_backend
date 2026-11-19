@@ -6,8 +6,15 @@ import type { Principal } from '../../src/auth/principal.js';
 import { db } from '../../src/db/client.js';
 import { registerStaffThreadsRoute } from '../../src/routes/staffThreads.js';
 import { registerThreadsRoute } from '../../src/routes/threads.js';
+import type { ExpoPushClient } from '../../src/lib/expoPush.js';
 import { FIXTURE_IDS } from './_fixture.js';
-import { FIXTURE_OWNER_PRINCIPAL, FIXTURE_STAFF_PRINCIPAL, makeContractApp } from './_harness.js';
+import {
+  FIXTURE_OWNER_PRINCIPAL,
+  FIXTURE_STAFF_PRINCIPAL,
+  makeContractApp,
+  type LogCapture,
+} from './_harness.js';
+import { makeExpoPushStub } from './_expoPushStub.js';
 import { waitForBlockedBackends } from './_poolFixture.js';
 import { makeR2Stub, type R2Stub } from './_r2Stub.js';
 
@@ -23,18 +30,25 @@ export type AnyApp = FastifyInstance;
 export function ownerApp(
   principal: Principal = FIXTURE_OWNER_PRINCIPAL,
   r2: R2Stub = makeR2Stub(),
+  capture?: LogCapture,
 ) {
-  const { app, authenticate } = makeContractApp(principal);
+  const { app, authenticate } = makeContractApp(principal, capture);
   registerThreadsRoute(app, { authenticate, r2 });
   return app;
 }
 
+/**
+ * The staff routes. The direct push (pass 2, `lib/messageNotice.ts`) always goes to an Expo stub
+ * here, never to Expo itself: a test that needs to see the pushes passes its own stub.
+ */
 export function staffApp(
   principal: Principal = FIXTURE_STAFF_PRINCIPAL,
   r2: R2Stub = makeR2Stub(),
+  expoPush: ExpoPushClient = makeExpoPushStub(),
+  capture?: LogCapture,
 ) {
-  const { app, authenticate } = makeContractApp(principal);
-  registerStaffThreadsRoute(app, { authenticate, r2 });
+  const { app, authenticate } = makeContractApp(principal, capture);
+  registerStaffThreadsRoute(app, { authenticate, r2, expoPush });
   return app;
 }
 
@@ -72,6 +86,31 @@ export function staffReply(
   key?: string,
 ) {
   return postJson(app, `/staff/threads/${threadId}/messages`, payload, key);
+}
+
+/** `POST /staff/threads` (S46): a staffer starts, or continues, her conversation with a family. */
+export function staffStart(app: AnyApp, payload: Record<string, unknown>, key?: string) {
+  return postJson(app, '/staff/threads', payload, key);
+}
+
+/** `POST /staff/threads/:id/read` (S46): the family messages the portal rendered. */
+export function staffRead(app: AnyApp, threadId: string, messageIds: string[], key?: string) {
+  return postJson(app, `/staff/threads/${threadId}/read`, { message_ids: messageIds }, key);
+}
+
+/** `POST /threads/:id/read` (W5): no body (as the 9.1.0 app sends it), or `{up_to_seq}`. */
+export function ownerRead(
+  app: AnyApp,
+  threadId: string,
+  body?: Record<string, unknown>,
+  key: string = `read-${randomUUID()}`,
+): Promise<LightMyRequestResponse> {
+  return app.inject({
+    method: 'POST',
+    url: `/threads/${threadId}/read`,
+    headers: { 'idempotency-key': key },
+    ...(body !== undefined ? { payload: body } : {}),
+  });
 }
 
 export async function getJson<T>(app: AnyApp, url: string): Promise<T> {
@@ -169,4 +208,21 @@ export async function removeMessagesExcept(
   await db.execute(
     sql`DELETE FROM messages WHERE thread_id = ${threadId} AND NOT (id = ANY(${sql.param([...keep])}::uuid[]))`,
   );
+}
+
+/**
+ * What a staff message to a PLANTED family leaves that names a fixture staffer: the staff messages
+ * in her threads, her feed rows (`notifications.sender_staff_id`) and the threads a staffer started
+ * with her. Removed after each
+ * test, because the fixture's teardown deletes its staff before a file's own `after` removes the
+ * planted families.
+ */
+export async function removePlantedStaffTraces(): Promise<void> {
+  await db.execute(sql`
+    DELETE FROM messages m USING threads t
+     WHERE t.id = m.thread_id AND t.owner_id <> ${FIXTURE_IDS.ownerId} AND m.sender_kind = 'staff'`);
+  await db.execute(sql`
+    DELETE FROM notifications WHERE owner_id <> ${FIXTURE_IDS.ownerId} AND sender_staff_id IS NOT NULL`);
+  await db.execute(sql`
+    DELETE FROM threads WHERE owner_id <> ${FIXTURE_IDS.ownerId} AND NOT addressed_to_school`);
 }

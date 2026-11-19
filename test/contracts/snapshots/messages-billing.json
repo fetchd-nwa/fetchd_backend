@@ -6,7 +6,11 @@
     "text": "Hi — was the Group Manners 1 charge for both dogs or just Waffles?",
     "sent_at": "2026-05-10T16:30:00.000Z",
     "is_read": true,
-    "seq": 1
+    "seq": 1,
+    "receipt": {
+      "state": "sent",
+      "at": "2026-05-10T16:30:00.000Z"
+    }
   },
   {
     "id": "22222222-2222-4222-8222-aaaaaaaaaaa7",

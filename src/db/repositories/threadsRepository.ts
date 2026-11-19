@@ -1,6 +1,6 @@
 import { and, asc, count, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { messages, threadDogs, threads } from '../schema/schema.js';
+import { messageStaffReads, messages, staff, threadDogs, threads } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import type { Tx } from '../tx.js';
 import type { ThreadCategory, ThreadRowForWire } from '../../lib/threadWire.js';
@@ -16,6 +16,16 @@ import type { ThreadCategory, ThreadRowForWire } from '../../lib/threadWire.js';
 
 export type ThreadRow = ThreadRowForWire;
 
+/**
+ * A thread as the staff routes read it (S46): the row plus its family, whether it is a school
+ * thread, and whether its participant has left (`addressed_to_me`'s three arms).
+ */
+export type StaffThreadRow = ThreadRow & {
+  ownerId: string;
+  addressedToSchool: boolean;
+  participantExpired: boolean;
+};
+
 const THREAD_PROJECTION = {
   id: threads.id,
   category: threads.category,
@@ -25,6 +35,13 @@ const THREAD_PROJECTION = {
   lastMessage: threads.lastMessage,
   lastMessageAt: threads.lastMessageAt,
   lastSeq: threads.lastSeq,
+} as const;
+
+const STAFF_THREAD_PROJECTION = {
+  ...THREAD_PROJECTION,
+  ownerId: threads.ownerId,
+  addressedToSchool: threads.addressedToSchool,
+  participantExpired: sql<boolean>`(${staff.expiredAt} IS NOT NULL)`,
 } as const;
 
 export const threadsRepository = {
@@ -269,6 +286,117 @@ export const threadsRepository = {
       threadId: r.threadId,
       unreadCount: typeof r.unreadCount === 'string' ? Number(r.unreadCount) : r.unreadCount,
     }));
+  },
+
+  /**
+   * `GET /staff/threads` (S46): every live thread, newest `last_message_at` first, with what the
+   * staff wire adds (`StaffThreadRow`).
+   */
+  async findLiveForStaff(): Promise<StaffThreadRow[]> {
+    return db
+      .select(STAFF_THREAD_PROJECTION)
+      .from(threads)
+      .leftJoin(staff, eq(staff.id, threads.participantStaffId))
+      .where(live(threads))
+      .orderBy(desc(threads.lastMessageAt));
+  },
+
+  /**
+   * One thread as the staff routes read it, expired or not (a `client_message_id` repeat on
+   * `POST /staff/threads` answers with the stored pair, whatever has happened to it since).
+   */
+  async findOneForStaff(id: string): Promise<StaffThreadRow | undefined> {
+    const [row] = await db
+      .select(STAFF_THREAD_PROJECTION)
+      .from(threads)
+      .leftJoin(staff, eq(staff.id, threads.participantStaffId))
+      .where(eq(threads.id, id))
+      .limit(1);
+    return row;
+  },
+
+  /**
+   * `staff_unread_count` per thread for ONE staffer (S46, MSG-U17): the family's live messages
+   * with no `message_staff_reads` row for her. A reply is not a read (MB27 Q4). Zero is absent.
+   */
+  async findStaffUnreadCounts(
+    threadIds: readonly string[],
+    staffId: string,
+  ): Promise<Map<string, number>> {
+    if (threadIds.length === 0) return new Map();
+    const rows = await db
+      .select({ threadId: messages.threadId, n: count(messages.id) })
+      .from(messages)
+      .leftJoin(
+        messageStaffReads,
+        and(eq(messageStaffReads.messageId, messages.id), eq(messageStaffReads.staffId, staffId)),
+      )
+      .where(
+        and(
+          inArray(messages.threadId, [...threadIds]),
+          eq(messages.senderKind, 'owner'),
+          live(messages),
+          isNull(messageStaffReads.messageId),
+        ),
+      )
+      .groupBy(messages.threadId);
+    return new Map(rows.map((r) => [r.threadId, Number(r.n)] as const));
+  },
+
+  /**
+   * Lock a live thread's row for the rest of the transaction (L4: the reads lock the thread row
+   * first, so a read, an ack and a send on one thread serialize and never deadlock). Its
+   * `owner_id`, or `undefined` when it is missing or expired.
+   */
+  async lockLive(tx: Tx, id: string): Promise<string | undefined> {
+    const [row] = await tx
+      .select({ ownerId: threads.ownerId })
+      .from(threads)
+      .where(and(eq(threads.id, id), live(threads)))
+      .limit(1)
+      .for('update');
+    return row?.ownerId;
+  },
+
+  /**
+   * `POST /staff/threads` (S46, MSG-U13; signed design §2.9:4555): the staffer's OWN live
+   * thread with this family on this topic, continued by lookup, or a new one (MSG-U13's
+   * "own thread per staffer", no unique index: one staffer racing herself may duplicate,
+   * tolerated). A school thread is never hers: its participant is the system row.
+   */
+  async findOrCreateStaffThread(
+    tx: Tx,
+    args: { ownerId: string; category: ThreadCategory; staffId: string; title: string },
+  ): Promise<string> {
+    const [existing] = await tx
+      .select({ id: threads.id })
+      .from(threads)
+      .where(
+        and(
+          eq(threads.ownerId, args.ownerId),
+          eq(threads.category, args.category),
+          eq(threads.participantStaffId, args.staffId),
+          eq(threads.addressedToSchool, false),
+          live(threads),
+        ),
+      )
+      .orderBy(desc(threads.lastMessageAt))
+      .limit(1);
+    if (existing !== undefined) return existing.id;
+    const [created] = await tx
+      .insert(threads)
+      .values({
+        ownerId: args.ownerId,
+        participantStaffId: args.staffId,
+        category: args.category,
+        title: args.title,
+        subText: '',
+      })
+      .returning({ id: threads.id });
+    if (created === undefined) {
+      throw new Error('threadsRepository.findOrCreateStaffThread: INSERT returned no row');
+    }
+    return created.id;
   },
 
   /**

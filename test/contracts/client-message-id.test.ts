@@ -328,7 +328,7 @@ describe('W2: client_message_id on the owner send and the staff reply', () => {
   });
 
   test(
-    'the staff reply’s three schema keys parse (CR18); until pass 2 a reply without text keeps its 422 and a staff attachment is refused 422',
+    'the staff reply’s three schema keys parse (CR18); a reply with neither text nor an attachment keeps its 422; an attachment naming nothing is 404 (W6 lifts MB13 L5)',
     SKIP_WHEN_NO_DB,
     async () => {
       await rememberFixture();
@@ -348,9 +348,48 @@ describe('W2: client_message_id on the owner send and the staff reply', () => {
         text: 'a photo',
         attachment_media_ids: [randomUUID()],
       });
-      assert.equal(photo.statusCode, 422, photo.body);
+      assert.equal(photo.statusCode, 404, photo.body);
+      assert.equal(photo.json().error.code, 'not_found');
       const unknown = await staffReply(staff, FIXTURE_IDS.thread1Id, { text: 'x', closure: true });
       assert.equal(unknown.statusCode, 422, unknown.body);
+    },
+  );
+
+  // A5 (the Fable pass-1 audit's L1): the staff reply checks its thread BEFORE the
+  // client_message_id lookup, as the owner verb does, so a used id never answers for a thread that
+  // does not exist (it was 409) or one that has expired (it was 200 with the stored message).
+  test(
+    'A5: a used client_message_id on a thread that does not exist, or has expired, is 404 like any reply there',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      await rememberFixture();
+      const staff = staffApp();
+      const cmid = randomUUID();
+      const first = await staffReply(staff, FIXTURE_IDS.thread2Id, {
+        text: 'stored',
+        client_message_id: cmid,
+      });
+      assert.equal(first.statusCode, 201, first.body);
+      const nowhere = await staffReply(staff, randomUUID(), {
+        text: 'stored',
+        client_message_id: cmid,
+      });
+      assert.equal(nowhere.statusCode, 404, nowhere.body);
+      assert.equal(nowhere.json().error.code, 'not_found');
+      await db.execute(
+        sql`UPDATE threads SET expired_at = now() WHERE id = ${FIXTURE_IDS.thread2Id}`,
+      );
+      try {
+        const expired = await staffReply(staff, FIXTURE_IDS.thread2Id, {
+          text: 'stored',
+          client_message_id: cmid,
+        });
+        assert.equal(expired.statusCode, 404, expired.body);
+      } finally {
+        await db.execute(
+          sql`UPDATE threads SET expired_at = NULL WHERE id = ${FIXTURE_IDS.thread2Id}`,
+        );
+      }
     },
   );
 });
