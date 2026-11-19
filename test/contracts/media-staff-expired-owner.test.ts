@@ -19,8 +19,12 @@ import { makeR2Stub, type R2Stub } from './_r2Stub.js';
  * that thread does (O-MSG-LIVE p2a fix 1, F3; the audit's L4). Both routes resolve the thread
  * through ONE function, `threadsRepository.findOwnerById` (the thread live, nothing about its
  * owner): `POST /staff/threads/:id/messages` and the `message-attachment` arm of
- * `POST /media/upload`. The rule is the reply's; the upload adds no second one. If the reply's
- * check ever changes, this goes red until the upload follows it (or the reverse).
+ * `POST /media/upload`. The rule is the reply's; the upload adds no second one.
+ *
+ * Both are pinned to 201 by name, not merely to each other: an equality pin stays green when both
+ * calls fail for one shared, unrelated reason (executed in p2a fix 2: with the Idempotency-Key
+ * dropped from both, the reply and the upload each answered 400 and the old pin passed). If the
+ * reply's rule is ever changed on purpose, this goes red, and both expectations move together.
  *
  * Executed here, not read: the Parkers' account is expired and their thread is still live.
  */
@@ -132,9 +136,7 @@ async function expiredFamilyCase(t: TestContext): Promise<void> {
   });
 
   t.diagnostic(`staff reply ${reply.statusCode}; staff upload ${upload.statusCode}`);
-  assert.equal(
-    upload.statusCode,
-    reply.statusCode,
-    `the upload must answer as the reply does: reply ${reply.statusCode} ${reply.body}; upload ${upload.statusCode} ${upload.body}`,
-  );
+  const both = `reply ${reply.statusCode} ${reply.body}; upload ${upload.statusCode} ${upload.body}`;
+  assert.equal(reply.statusCode, 201, `the staff reply in the expired family's live thread is accepted (201): ${both}`);
+  assert.equal(upload.statusCode, 201, `the upload must answer as the reply does (201): ${both}`);
 }
