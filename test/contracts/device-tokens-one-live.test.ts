@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomInt, randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
+import type { LightMyRequestResponse } from 'fastify';
 import { eq } from 'drizzle-orm';
 import pg from 'pg';
 import { db } from '../../src/db/client.js';
@@ -64,7 +65,7 @@ function freshToken(): string {
   return `ExponentPushToken[${randomUUID()}]`;
 }
 
-function register(principal: Principal, token: string): ReturnType<ReturnType<typeof appFor>['inject']> {
+function register(principal: Principal, token: string): Promise<LightMyRequestResponse> {
   return appFor(principal).inject({
     method: 'POST',
     url: '/device-tokens',
@@ -73,7 +74,7 @@ function register(principal: Principal, token: string): ReturnType<ReturnType<ty
   });
 }
 
-function unregister(principal: Principal, token: string): ReturnType<ReturnType<typeof appFor>['inject']> {
+function unregister(principal: Principal, token: string): Promise<LightMyRequestResponse> {
   return appFor(principal).inject({
     method: 'DELETE',
     url: `/device-tokens/${encodeURIComponent(token)}`,

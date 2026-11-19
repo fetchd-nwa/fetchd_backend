@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
+import type { LightMyRequestResponse } from 'fastify';
 import { and, count, eq } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { mediaAssets, mediaDerivativeJobs, owners, threads } from '../../src/db/schema/schema.js';
@@ -126,7 +127,7 @@ function upload(
   app: ReturnType<typeof staffApp>,
   query: string,
   opts: { contentType?: string; key?: string; bytes?: Buffer } = {},
-): ReturnType<ReturnType<typeof staffApp>['inject']> {
+): Promise<LightMyRequestResponse> {
   return app.inject({
     method: 'POST',
     url: `/media/upload?${query}`,
@@ -138,7 +139,7 @@ function upload(
   });
 }
 
-function del(app: ReturnType<typeof staffApp>, id: string): ReturnType<ReturnType<typeof staffApp>['inject']> {
+function del(app: ReturnType<typeof staffApp>, id: string): Promise<LightMyRequestResponse> {
   return app.inject({
     method: 'DELETE',
     url: `/media/${id}`,
