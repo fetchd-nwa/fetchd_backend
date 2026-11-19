@@ -62,7 +62,7 @@ const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 const DEV_OWNER_RE = new RegExp(`^owner:(${UUID_RE.source})$`, 'i');
 const DEV_STAFF_RE = new RegExp(`^staff:(${UUID_RE.source}):([a-z-]+)$`, 'i');
 
-function parseDevPrincipal(headerValue: string): Principal {
+export function parseDevPrincipal(headerValue: string): Principal {
   const ownerMatch = DEV_OWNER_RE.exec(headerValue);
   if (ownerMatch) {
     return { kind: 'owner', ownerId: ownerMatch[1]!, supabaseUid: DEV_BYPASS_SUPABASE_UID };

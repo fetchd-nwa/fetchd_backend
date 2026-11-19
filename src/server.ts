@@ -53,6 +53,7 @@ import { registerUploadsSignRoute } from './routes/uploadsSign.js';
 import { registerVetsRoute } from './routes/vets.js';
 import { registerWelcomeDogsRoute } from './routes/welcomeDogs.js';
 import { registerWorkersTickRoute } from './routes/workersTick.js';
+import { registerRealtimeRoute } from './realtime/server.js';
 
 /**
  * Builds the Fastify app and registers routes. Kept separate from the boot
@@ -169,6 +170,7 @@ export function buildApp(): FastifyInstance {
   registerUploadsSignRoute(app); // [auth] — Day-17 presigned R2 PUT
   registerMediaRoute(app); // [auth] — Day-17 register/read/soft-expire media
   registerWorkersTickRoute(app); // [public, signed] — Day-16 scheduler trigger
+  registerRealtimeRoute(app); // [owner|staff] — GET /realtime, the live channel (9.2.0); auth is its first frame
 
   return app;
 }

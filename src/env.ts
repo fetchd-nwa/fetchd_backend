@@ -94,6 +94,20 @@ const envSchema = z
     // Redis — server-side cache + rate limit + sessions.
     REDIS_URL: z.string().url(),
 
+    // 9.2.0 (P45; design A2 FL6): the realtime bus's channel prefix, `rt:<prefix>:…`. Redis
+    // pub/sub ignores the db index, so two deployments or two test runs sharing one Redis must
+    // never share a prefix. It wins over RAILWAY_ENVIRONMENT_NAME (which Railway sets on every
+    // deployment), and `local` is used when neither is set (`src/realtime/bus.ts`
+    // `resolveChannelPrefix`). Optional; empty means unset.
+    REALTIME_CHANNEL_PREFIX: z
+      .string()
+      .optional()
+      .transform((v) => (v !== undefined && v.trim().length > 0 ? v.trim() : undefined)),
+    RAILWAY_ENVIRONMENT_NAME: z
+      .string()
+      .optional()
+      .transform((v) => (v !== undefined && v.trim().length > 0 ? v.trim() : undefined)),
+
     // Supabase Auth — JWKS verify (Day-0 lock #2). Wired Day 2a.
     SUPABASE_JWKS_URL: z.string().url(),
     SUPABASE_JWT_AUD: z.string().min(1),

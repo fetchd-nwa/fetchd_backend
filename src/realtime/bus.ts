@@ -1,0 +1,484 @@
+import { randomUUID } from 'node:crypto';
+import type { FastifyBaseLogger } from 'fastify';
+import type { Redis } from 'ioredis';
+import { z } from 'zod';
+import { env } from '../env.js';
+import { redis as sharedRedis } from '../redis.js';
+import type { MirrorPrincipal } from '../auth/mirror.js';
+
+/**
+ * The realtime bus (9.2.0; design §3 rules 2 and 7, §4 "No silent staleness", A2 FL5, FL6, OL10,
+ * brief LR5, LR17): Redis pub/sub between API instances.
+ *
+ * · **The server picks what a socket hears.** An owner hears `rt:<prefix>:owner:<owners.id>`; a
+ *   live staffer (never the system row) hears `rt:<prefix>:staff` (`channelsFor`). There is no
+ *   subscribe frame.
+ * · **One publish choke point**, `publishForThread(row, event)`: the channels come from the
+ *   committed thread row's `owner_id` (`channelsForThread`), and the payload's `owner_id` and
+ *   `thread_id` are copied from that row, never from a caller's argument. This file is the
+ *   only one allowed to call `.publish(` (ESLint `no-restricted-properties`), and its
+ *   publisher connection is never exported.
+ * · **Ids only, never content** (H4): a payload is `{v, kind, thread_id, owner_id, …ids}`. No
+ *   text, no names, no URLs; each instance builds every frame itself, per audience
+ *   (`frames.ts`).
+ * · **`live` means vouched for** (FL5): the subscriber is subscribed AND a probe this instance
+ *   published came back through it. Until then, and after any publish failure or subscriber
+ *   loss, the state is `degraded` and every local socket polls. After a subscriber reconnect,
+ *   every local socket is told `resync`, then `live` once a fresh probe returns.
+ * · **Total and quiet**: `publishForThread` never throws and never rejects; every listener body
+ *   is one `try/catch` (LR5); bus trouble is logged once per state change, never per event
+ *   (OL10), at warn, below the pager's level-50 tap.
+ */
+
+export type Audience = 'owner' | 'staff';
+export type BusState = 'degraded' | 'live';
+
+/** FL6's order: the named override, then Railway's environment name, then `local`. */
+export function resolveChannelPrefix(
+  source: { REALTIME_CHANNEL_PREFIX?: string; RAILWAY_ENVIRONMENT_NAME?: string } = env,
+): string {
+  return source.REALTIME_CHANNEL_PREFIX ?? source.RAILWAY_ENVIRONMENT_NAME ?? 'local';
+}
+
+export function ownerChannel(prefix: string, ownerId: string): string {
+  return `rt:${prefix}:owner:${ownerId}`;
+}
+
+export function staffChannel(prefix: string): string {
+  return `rt:${prefix}:staff`;
+}
+
+function probeChannel(prefix: string, instanceId: string): string {
+  return `rt:${prefix}:probe:${instanceId}`;
+}
+
+/** `*`, `?`, `[`, `]` and `\` are glob syntax in PSUBSCRIBE: a prefix carrying one would match
+ *  other deployments' channels. */
+function escapeGlob(text: string): string {
+  return text.replace(/[*?[\]\\]/g, (c) => `\\${c}`);
+}
+
+/** The instance's one PSUBSCRIBE pattern. */
+export function channelPattern(prefix: string): string {
+  return `rt:${escapeGlob(prefix)}:*`;
+}
+
+/** What a principal's socket hears: derived by the server, never named by the client. */
+export function channelsFor(principal: MirrorPrincipal, prefix: string): string[] {
+  return principal.kind === 'owner' ? [ownerChannel(prefix, principal.id)] : [staffChannel(prefix)];
+}
+
+/** The channels an event about this thread goes to, from the committed row's `owner_id`. */
+export function channelsForThread(
+  row: { owner_id: string },
+  audiences: readonly Audience[],
+  prefix: string,
+): string[] {
+  const channels: string[] = [];
+  if (audiences.includes('owner')) channels.push(ownerChannel(prefix, row.owner_id));
+  if (audiences.includes('staff')) channels.push(staffChannel(prefix));
+  return channels;
+}
+
+/** An event as a caller names it: the thread's ids are added from the row. */
+export type BusEventInput =
+  | { kind: 'typing'; from: 'owner' }
+  | { kind: 'typing'; from: 'staff'; staff_id: string }
+  | { kind: 'thread.changed' }
+  | { kind: 'bell.changed' };
+
+/** An event as it travels: ids only. */
+export type BusEvent = BusEventInput & { thread_id: string; owner_id: string };
+
+/** Who may hear each kind. A caller may narrow this (a `thread.changed` for one side), never
+ *  widen it: `bell.changed` and an owner's typing never go to an owner channel. */
+export function audiencesFor(event: BusEventInput): readonly Audience[] {
+  switch (event.kind) {
+    case 'typing':
+      return event.from === 'owner' ? ['staff'] : ['owner', 'staff'];
+    case 'thread.changed':
+      return ['owner', 'staff'];
+    case 'bell.changed':
+      return ['staff'];
+  }
+}
+
+const uuid = z.string().uuid();
+const busEventSchema = z.union([
+  z
+    .object({
+      v: z.literal(1),
+      kind: z.literal('typing'),
+      thread_id: uuid,
+      owner_id: uuid,
+      from: z.literal('owner'),
+    })
+    .strict(),
+  z
+    .object({
+      v: z.literal(1),
+      kind: z.literal('typing'),
+      thread_id: uuid,
+      owner_id: uuid,
+      from: z.literal('staff'),
+      staff_id: uuid,
+    })
+    .strict(),
+  z
+    .object({ v: z.literal(1), kind: z.literal('thread.changed'), thread_id: uuid, owner_id: uuid })
+    .strict(),
+  z
+    .object({ v: z.literal(1), kind: z.literal('bell.changed'), thread_id: uuid, owner_id: uuid })
+    .strict(),
+]);
+
+const probeSchema = z
+  .object({ v: z.literal(1), kind: z.literal('probe'), instance: z.string(), nonce: z.string() })
+  .strict();
+
+/** Which audience a channel is, read back from its name. */
+export type ChannelTarget = { audience: 'owner'; ownerId: string } | { audience: 'staff' };
+
+function parseChannel(prefix: string, channel: string): ChannelTarget | { probe: string } | null {
+  const root = `rt:${prefix}:`;
+  if (!channel.startsWith(root)) return null;
+  const rest = channel.slice(root.length);
+  if (rest === 'staff') return { audience: 'staff' };
+  if (rest.startsWith('owner:')) {
+    const ownerId = rest.slice('owner:'.length);
+    return uuid.safeParse(ownerId).success ? { audience: 'owner', ownerId } : null;
+  }
+  if (rest.startsWith('probe:')) return { probe: rest.slice('probe:'.length) };
+  return null;
+}
+
+/** The one publish method the bus needs; an ioredis client satisfies it. */
+export interface PublisherLike {
+  publish(channel: string, message: string): Promise<unknown>;
+  on(event: 'error' | 'ready', listener: (...args: unknown[]) => void): unknown;
+  disconnect(): void;
+}
+
+export interface BusHandlers {
+  /** A parsed event for a channel this instance hears. Called synchronously from the
+   *  subscriber's listener; the handler must not throw (the hub queues the delivery). */
+  onEvent(target: ChannelTarget, event: BusEvent): void;
+  /** The state changed (`degraded` ↔ `live`). */
+  onState(state: BusState): void;
+  /** The subscriber reconnected: events may have been missed. */
+  onResync(): void;
+}
+
+export interface BusOptions {
+  prefix: string;
+  log: FastifyBaseLogger;
+  /** The client the bus duplicates its two connections from. Default: the shared client
+   *  (`src/redis.ts`), whose `lazyConnect: true` and `maxRetriesPerRequest: 1` each duplicate
+   *  inherits unless overridden (FL6). */
+  base?: Redis;
+  instanceId?: string;
+  /** Test seam: the publisher (default `base.duplicate({maxRetriesPerRequest: 1})`). */
+  createPublisher?: (base: Redis) => PublisherLike;
+  /** The subscriber's reconnect backoff (default: 200 ms a try, capped at 2 s). */
+  retryStrategy?: (times: number) => number | null;
+  /** How long a probe may take before another is sent while `degraded` (default 1 s). */
+  probeRetryMs?: number;
+}
+
+const DEFAULT_PROBE_RETRY_MS = 1000;
+
+function subscriberBackoff(times: number): number {
+  return Math.min(times * 200, 2000);
+}
+
+function errSummary(err: unknown): Record<string, unknown> {
+  return err instanceof Error ? { err_message: err.message } : { err_message: String(err) };
+}
+
+export class RealtimeBus {
+  readonly prefix: string;
+  readonly instanceId: string;
+  private readonly log: FastifyBaseLogger;
+  private state: BusState = 'degraded';
+  private publisher: PublisherLike | undefined;
+  private subscriber: Redis | undefined;
+  private started = false;
+  private stopped = false;
+  private subscribed = false;
+  private subscriberEverReady = false;
+  private subscriberFailing = false;
+  private publisherFailing = false;
+  private pendingProbe: string | undefined;
+  private probeTimer: NodeJS.Timeout | undefined;
+
+  constructor(
+    private readonly opts: BusOptions,
+    private readonly handlers: BusHandlers,
+  ) {
+    this.prefix = opts.prefix;
+    this.instanceId = opts.instanceId ?? randomUUID();
+    this.log = opts.log;
+  }
+
+  get current(): BusState {
+    return this.state;
+  }
+
+  /** Open the two connections. Idempotent; the API calls it after `listen` (`index.ts`). */
+  start(): void {
+    if (this.started || this.stopped) return;
+    this.started = true;
+    const base = this.opts.base ?? sharedRedis;
+
+    const publisher = (
+      this.opts.createPublisher ?? ((b: Redis) => b.duplicate({ maxRetriesPerRequest: 1 }))
+    )(base);
+    this.publisher = publisher;
+    // LR17: without a listener ioredis prints "[ioredis] Unhandled error event" on every
+    // reconnect attempt. Once per state change, at warn.
+    publisher.on('error', (err) => {
+      try {
+        if (this.publisherFailing || this.stopped) return;
+        this.publisherFailing = true;
+        this.log.warn(
+          errSummary(err),
+          'realtime publisher: Redis connection error (logged once until it recovers)',
+        );
+      } catch {
+        // a listener body never throws (LR5)
+      }
+    });
+    publisher.on('ready', () => {
+      try {
+        if (!this.publisherFailing) return;
+        this.publisherFailing = false;
+        this.log.info('realtime publisher: Redis connection back');
+      } catch {
+        // a listener body never throws (LR5)
+      }
+    });
+
+    // FL6: its own connection, connecting now, never giving up on a command, with a capped
+    // backoff. Resubscribed by hand on every `ready`, so the probe follows the PSUBSCRIBE.
+    const subscriber = base.duplicate({
+      lazyConnect: false,
+      maxRetriesPerRequest: null,
+      autoResubscribe: false,
+      retryStrategy: this.opts.retryStrategy ?? subscriberBackoff,
+    });
+    this.subscriber = subscriber;
+    subscriber.on('error', (err: unknown) => {
+      try {
+        if (this.subscriberFailing || this.stopped) return;
+        this.subscriberFailing = true;
+        this.log.warn(
+          errSummary(err),
+          'realtime subscriber: Redis connection error (logged once until it recovers)',
+        );
+      } catch {
+        // a listener body never throws (LR5)
+      }
+    });
+    subscriber.on('ready', () => {
+      try {
+        this.onSubscriberReady();
+      } catch (err) {
+        this.quietWarn(err, 'realtime subscriber: ready handler failed');
+      }
+    });
+    subscriber.on('close', () => {
+      try {
+        if (this.stopped) return;
+        this.subscribed = false;
+        this.pendingProbe = undefined;
+        this.setState('degraded', 'subscriber connection lost');
+      } catch (err) {
+        this.quietWarn(err, 'realtime subscriber: close handler failed');
+      }
+    });
+    subscriber.on('pmessage', (_pattern: string, channel: string, message: string) => {
+      // LR5: one try/catch per event; a bad payload never escapes into ioredis's parser.
+      try {
+        this.onMessage(channel, message);
+      } catch (err) {
+        this.quietWarn(err, 'realtime bus: an event could not be handled and was dropped');
+      }
+    });
+  }
+
+  /**
+   * Publish an event about one thread. Total: never throws, never rejects. A failure turns the
+   * instance `degraded` (one warn line per state change) and re-probes.
+   */
+  publishForThread(
+    row: { id: string; owner_id: string },
+    event: BusEventInput,
+    only?: readonly Audience[],
+  ): void {
+    try {
+      const allowed = audiencesFor(event);
+      const audiences = only === undefined ? allowed : allowed.filter((a) => only.includes(a));
+      const payload = JSON.stringify({ v: 1, ...event, thread_id: row.id, owner_id: row.owner_id });
+      for (const channel of channelsForThread(row, audiences, this.prefix)) {
+        this.send(channel, payload);
+      }
+    } catch (err) {
+      this.publishFailed(err);
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
+    try {
+      this.publisher?.disconnect();
+    } catch {
+      // closing anyway
+    }
+    try {
+      this.subscriber?.disconnect();
+    } catch {
+      // closing anyway
+    }
+  }
+
+  private send(channel: string, payload: string): void {
+    const publisher = this.publisher;
+    if (publisher === undefined || this.stopped) {
+      this.publishFailed(new Error('realtime bus not started'));
+      return;
+    }
+    try {
+      publisher.publish(channel, payload).then(undefined, (err: unknown) => {
+        this.publishFailed(err);
+      });
+    } catch (err) {
+      this.publishFailed(err);
+    }
+  }
+
+  private publishFailed(err: unknown): void {
+    try {
+      if (this.stopped) return;
+      if (this.state === 'live') {
+        this.setState('degraded', 'publish failed', err);
+        this.scheduleProbe();
+      }
+      // Already degraded: silent (OL10); the probe loop is running.
+    } catch {
+      // never throws (publish is total)
+    }
+  }
+
+  private onSubscriberReady(): void {
+    if (this.stopped || this.subscriber === undefined) return;
+    const reconnect = this.subscriberEverReady;
+    this.subscriberEverReady = true;
+    if (this.subscriberFailing) {
+      this.subscriberFailing = false;
+      this.log.info('realtime subscriber: Redis connection back');
+    }
+    if (reconnect) this.handlers.onResync();
+    this.subscriber.psubscribe(channelPattern(this.prefix)).then(
+      () => {
+        if (this.stopped) return;
+        this.subscribed = true;
+        this.probe();
+      },
+      (err: unknown) => {
+        this.quietWarn(err, 'realtime subscriber: PSUBSCRIBE failed; retried on reconnect');
+      },
+    );
+  }
+
+  private probe(): void {
+    if (this.stopped || !this.subscribed) return;
+    if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
+    const nonce = randomUUID();
+    this.pendingProbe = nonce;
+    this.send(
+      probeChannel(this.prefix, this.instanceId),
+      JSON.stringify({ v: 1, kind: 'probe', instance: this.instanceId, nonce }),
+    );
+    this.probeTimer = setTimeout(() => {
+      try {
+        if (this.state === 'degraded' && this.pendingProbe === nonce) this.probe();
+      } catch (err) {
+        this.quietWarn(err, 'realtime bus: probe retry failed');
+      }
+    }, this.opts.probeRetryMs ?? DEFAULT_PROBE_RETRY_MS);
+    this.probeTimer.unref();
+  }
+
+  private scheduleProbe(): void {
+    if (this.stopped) return;
+    if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
+    this.probeTimer = setTimeout(() => {
+      try {
+        this.probe();
+      } catch (err) {
+        this.quietWarn(err, 'realtime bus: probe failed');
+      }
+    }, this.opts.probeRetryMs ?? DEFAULT_PROBE_RETRY_MS);
+    this.probeTimer.unref();
+  }
+
+  private onMessage(channel: string, message: string): void {
+    if (this.stopped) return;
+    const target = parseChannel(this.prefix, channel);
+    if (target === null) return;
+    let body: unknown;
+    try {
+      body = JSON.parse(message);
+    } catch {
+      this.log.warn(
+        { channel_kind: 'audience' in target ? target.audience : 'probe' },
+        'realtime bus: a payload that is not JSON was dropped',
+      );
+      return;
+    }
+    if ('probe' in target) {
+      if (target.probe !== this.instanceId) return; // another instance's probe
+      const probe = probeSchema.safeParse(body);
+      if (probe.success && probe.data.nonce === this.pendingProbe) {
+        this.pendingProbe = undefined;
+        this.setState('live', 'probe returned');
+      }
+      return;
+    }
+    const parsed = busEventSchema.safeParse(body);
+    if (!parsed.success) {
+      this.log.warn(
+        { channel_kind: target.audience },
+        'realtime bus: a payload of no known shape was dropped',
+      );
+      return;
+    }
+    const { v: version, ...event } = parsed.data;
+    if (version !== 1) return;
+    this.handlers.onEvent(target, event);
+  }
+
+  private setState(next: BusState, reason: string, err?: unknown): void {
+    if (this.state === next) return;
+    this.state = next;
+    if (next === 'degraded') {
+      this.log.warn(
+        { reason, ...(err === undefined ? {} : errSummary(err)) },
+        'realtime bus degraded: live delivery is not vouched for, sockets poll',
+      );
+    } else {
+      this.log.info({ reason }, 'realtime bus live');
+    }
+    this.handlers.onState(next);
+  }
+
+  private quietWarn(err: unknown, msg: string): void {
+    try {
+      this.log.warn(errSummary(err), msg);
+    } catch {
+      // never throws
+    }
+  }
+}

@@ -3,6 +3,8 @@ import { buildApp } from './server.js';
 import { closeDb } from './db/pool.js';
 import { flushObservability, initObservability } from './lib/observability.js';
 import { closeRedis } from './redis.js';
+import { drainInFlight } from './realtime/settle.js';
+import { runShutdown } from './realtime/shutdown.js';
 
 /**
  * Boot entrypoint. Importing `env` runs the Zod env contract first — a missing
@@ -20,22 +22,28 @@ const app = buildApp();
 
 logBootEnvBanner();
 
+let shuttingDown = false;
+
+// 9.2.0 (brief LR9): `app.close()` (its `preClose` sends 1012 to every socket and terminates any
+// still open after 1 s) runs concurrently with the drain of the in-flight pushes; `closeDb`
+// after both; the whole sequence bounded at 12 s, under `railway.json`'s 15 s drain
+// (`src/realtime/shutdown.ts`).
 async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   app.log.info({ signal }, 'shutting down');
-  try {
-    await app.close();
-    await closeDb();
-    closeRedis();
-    // Drain the pager last: an alarm raised while draining (a failed
-    // close, a worker still finishing) must leave the process before
-    // `process.exit` discards it.
-    await flushObservability();
-    process.exit(0);
-  } catch (err) {
-    app.log.error({ err }, 'error during shutdown');
-    await flushObservability();
-    process.exit(1);
-  }
+  const exitCode = await runShutdown({
+    closeApp: () => app.close(),
+    drain: drainInFlight,
+    closeDb,
+    closeRedis,
+    log: app.log,
+  });
+  // Drain the pager last: an alarm raised while draining (a failed
+  // close, a worker still finishing) must leave the process before
+  // `process.exit` discards it.
+  await flushObservability();
+  process.exit(exitCode);
 }
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
@@ -51,6 +59,10 @@ try {
   await flushObservability();
   process.exit(1);
 }
+
+// 9.2.0: the realtime bus connects only once the server is up (no Redis connection at build
+// time). A Redis that is down leaves it `degraded`, retrying; it never stops the boot.
+app.realtime.startBus();
 
 // Day-20 paging smoke. The ONLY proof that a deployed process reaches a human
 // — the real entry point, not a harness (the 2026-08-24 lesson: an alarm

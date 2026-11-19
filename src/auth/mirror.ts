@@ -1,8 +1,8 @@
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { livePrincipal } from '../db/repositories/staffRepository.js';
 import { owners, staff } from '../db/schema/schema.js';
-import type { Principal } from './principal.js';
+import type { Principal, StaffRole } from './principal.js';
 import { ApiError } from '../lib/errors.js';
 
 /**
@@ -64,4 +64,41 @@ export async function isSystemStaffId(staffId: string): Promise<boolean> {
     .where(and(eq(staff.id, staffId), eq(staff.isSystemAccount, true)))
     .limit(1);
   return row !== undefined;
+}
+
+/** A live mirror row, read by its own id (9.2.0): an owner, or a staffer with the row's role. */
+export type MirrorPrincipal =
+  | { kind: 'owner'; id: string }
+  | { kind: 'staff'; id: string; role: StaffRole };
+
+/**
+ * Resolve a mirror row by its id, never by uid (9.2.0; design A2 OM5): the realtime socket's
+ * re-resolve on every heartbeat, before every inbound `typing`/`ack`, and at the end of both auth
+ * arms. By id because the dev arm's principal carries the literal uid `'dev-bypass'`
+ * (`plugin.ts`), so a by-uid read would close a live dev socket for the wrong reason.
+ *
+ * Owners by live id; staff by live id and NOT the school's system row (*NWA School for Dogs*,
+ * rs3 M5.26), so this one read refuses an expired row and the system row on both arms. It never
+ * selects `supabase_uid` (the system row's is NULL). The staff filter is a raw fragment, `NOT
+ * is_system_account`, until integration swaps it for `livePrincipal()` (pass 1's
+ * `staffRepository.ts`). `null` means: not a principal (the socket closes 4403).
+ */
+export async function resolvePrincipalById(ref: {
+  kind: 'owner' | 'staff';
+  id: string;
+}): Promise<MirrorPrincipal | null> {
+  if (ref.kind === 'owner') {
+    const [row] = await db
+      .select({ id: owners.id })
+      .from(owners)
+      .where(and(eq(owners.id, ref.id), isNull(owners.expiredAt)))
+      .limit(1);
+    return row ? { kind: 'owner', id: row.id } : null;
+  }
+  const [row] = await db
+    .select({ id: staff.id, role: staff.role })
+    .from(staff)
+    .where(and(eq(staff.id, ref.id), isNull(staff.expiredAt), sql`NOT is_system_account`))
+    .limit(1);
+  return row ? { kind: 'staff', id: row.id, role: row.role } : null;
 }
