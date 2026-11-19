@@ -12,6 +12,61 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [9.2.0-pre.2] — 2026-11-19
+
+ADDITIVE. Plan one-off O-BUGS3, her #33 (`PLAYGROUND-BUGS.md:41`) and her "default" to its
+question (build DECISIONS 671, 702(1), 704; Blocked #56 closed). Her words: "also the curriculum
+progress should be all green and it should say: Alumni on [insert date]". The owner's dog now
+carries the day she became alumni: the fifth level's record date, which the server has stored
+since §J.3 (`dog_completed_programs.completed_at`) and never sent (DECISIONS 671's correction).
+Not a design section (design_label none). Build label 9.2.0-pre.2, the second pre-release
+counter toward 9.2.0 (`designs/review-after-count.md` §1.1; DECISIONS 684, 695, 702(1)): it takes
+no minor and moves no planned label. It reads 9.2.0-pre.1 (O-AFTERCOUNT) and applies on top of
+it. One optional field on a response; nothing is removed, renamed or retyped, so a 9.2.0-pre.1
+client reads 9.2.0-pre.2 unchanged, and a 9.2.0-pre.2 client reading an older server finds the
+field absent and shows "Alumni" alone. No request, route, refusal, idempotent replay or stored
+row changes; no migration. Contract-first: no route returns `alumni_at` until O-BUGS3's #33
+backend unit lands it. Resync both clients (`npm run sync:contracts` in mobile and portal).
+The field is optional, so it adds no `tsc` error: drafted on 9.2.0-pre.1's contract without
+its backend, the backend's `typecheck` and `typecheck:tests` fail exactly as at 9.2.0-pre.1
+(the same 3 errors in 2 files, which O-AFTERCOUNT's backend closes in its push) and add none;
+`wire.ts` itself has no error. The clients were not run against it. Messaging's planned
+9.2.0 (P45 with O-MSG-LIVE) takes this step back with 9.2.0-pre.1, by the note's §1.2: `[9.2.0]`
+goes above this entry and says it includes 9.2.0-pre.1 (O-AFTERCOUNT) and 9.2.0-pre.2
+(O-BUGS3), and the header hunk resolves to 9.2.0 with all three paragraphs kept.
+
+### Added
+
+- `DogWire.alumni_at?: string`: when the dog became alumni, the latest `completed_at` among
+  her five live `dog_completed_programs` rows (the record that made five, when `is_alumni` was
+  set). A level un-recorded and recorded again moves it to the new record's date when that is
+  now the latest.
+  - An ISO-8601 instant (`pgTimestampToIso`), never Postgres's text, which the owner app's
+    Hermes reads as an Invalid Date (build DECISIONS 489). A client takes the day it shows in
+    America/Chicago. The backend test asserts the exact ISO form by regex
+    (`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`), because V8 accepts Postgres text and
+    only Hermes refuses it.
+  - Omit-on-null: present only when `is_alumni` is true and each of the five levels has a live
+    record. Absent for an imported alumni dog with no level records, and for an alumni dog with
+    a level un-recorded since (`is_alumni` is never cleared); the app shows "Alumni" alone.
+  - On every route that emits `DogWire` (`toDogWire`): `GET /dogs`, `GET /dogs/:id`, and the
+    `POST /dogs` / `PATCH /dogs/:id` responses.
+  - What reads it: the owner app's Day School page, "Curriculum progress" (mobile
+    `dog-profile/[dogId]/[program].tsx`, `CurriculumCard`). For an alumni dog all five levels
+    show green (from `is_alumni`, not this field), with "Alumni on {date}" when the field is
+    present.
+  - Owner-only: no staff shape gains it. `StaffDogWire` carries no alumni flag, and
+    `CompletedProgramsWire` already dates every live level.
+
+### Changed
+
+- `WIRE_CONTRACT_VERSION` `'9.2.0-pre.1'` → `'9.2.0-pre.2'`.
+
+### Documentation
+
+- The landing-group note names 9.2.0-pre.2, the second counter toward 9.2.0.
+- `DogWire`'s date conventions name `alumni_at` as an ISO-8601 instant.
+
 ## [9.2.0-pre.1] — 2026-11-19
 
 ADDITIVE. Plan one-off O-AFTERCOUNT, her #37 (`PLAYGROUND-BUGS.md:45`) and ruling 677(2)

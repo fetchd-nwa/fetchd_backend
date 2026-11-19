@@ -89,8 +89,13 @@
  * 684-686, 693). It is a pre-release counter toward 9.2.0, which takes it back when
  * it lands (the note's §1.1-§1.2). It takes no minor, so no label above moves, and
  * a contract landed before 9.2.0 is 9.2.0-pre.2.
+ * 9.2.0-pre.2 (plan one-off O-BUGS3, additive): when an owner's dog became alumni,
+ * the fifth Day School level's record date, so her app can say "Alumni on [date]"
+ * (`DogWire.alumni_at`; her #33, build DECISIONS 671, 702(1), 704). It is the
+ * second pre-release counter toward 9.2.0, which takes it back with 9.2.0-pre.1
+ * (the note's §1.2). It takes no minor either, so no label above moves.
  */
-export const WIRE_CONTRACT_VERSION = '9.2.0-pre.1';
+export const WIRE_CONTRACT_VERSION = '9.2.0-pre.2';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -4311,7 +4316,8 @@ export interface FeedingWire {
  *     Deciding it is a named out-of-scope design item (§17).
  *   - Date conventions: `spay_neuter_planned_on` and `last_seen_on` are
  *     `YYYY-MM-DD`; `evaluation_date` is ISO timestamptz
- *     (dogs-evaluations.md :135).
+ *     (dogs-evaluations.md :135); `alumni_at` is an ISO-8601 instant
+ *     (9.2.0-pre.2).
  */
 export interface DogWire {
   id: string;
@@ -4327,6 +4333,31 @@ export interface DogWire {
   boarding_enabled: boolean;
   /** Stored — the dog reached all 5 day-school curriculum completions. */
   is_alumni: boolean;
+  /**
+   * 9.2.0-pre.2 (plan one-off O-BUGS3; her #33: "the curriculum progress should be all green
+   * and it should say: Alumni on [insert date]"; build DECISIONS 671, 702(1), 704): when this
+   * dog became alumni, the fifth level's record date. It is the latest `completed_at` among the
+   * dog's five live `dog_completed_programs` rows: the record that made five, which is when
+   * `is_alumni` was set. A level un-recorded and recorded again moves it to the new record's
+   * date when that record is now the latest.
+   *   - An ISO-8601 instant (`pgTimestampToIso`, `…THH:MM:SS.mmmZ`), never Postgres's text
+   *     (`2026-11-19 16:03:12.48+00`), which the owner app's Hermes reads as an Invalid Date
+   *     (build DECISIONS 489). A client takes the day it shows from this instant in
+   *     America/Chicago, never from the UTC date in the text.
+   *   - Omit-on-null: present only when `is_alumni` is true and each of the five levels has a
+   *     live record. Absent for an imported alumni dog with no level records, and for an alumni
+   *     dog with a level un-recorded since (`is_alumni` is never cleared). The app then shows
+   *     "Alumni" alone.
+   *   - Every route that emits this shape carries it (`toDogWire`): `GET /dogs`,
+   *     `GET /dogs/:id`, and the `POST /dogs` / `PATCH /dogs/:id` responses, so a saved edit
+   *     does not drop the date.
+   *   - Owner-only. No staff shape carries it: `StaffDogWire` has no alumni flag, and
+   *     `CompletedProgramsWire` already dates every live level.
+   * The five levels' green on the app reads `is_alumni`, not this field. Optional, so a
+   * client older than 9.2.0-pre.2 ignores it, and a newer client reading an older server sees
+   * it absent and shows "Alumni" alone.
+   */
+  alumni_at?: string;
   evaluation_date?: string;
   /** Omit-on-EMPTY (not just null): an empty completion list omits the key
    *  entirely (`lib/dogWire.ts:114`). */
