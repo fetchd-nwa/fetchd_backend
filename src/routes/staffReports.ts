@@ -419,7 +419,8 @@ export function registerStaffReportsRoute(app: FastifyInstance, opts: AuthRouteO
 /**
  * Re-read a report in-tx and emit its §B wire shape, resolving the trainer
  * name. Shared by POST + PATCH so both return the same shape the owner
- * reads back.
+ * reads back. The name is read on `tx` too: a pooled read here waits for a second connection
+ * while the transaction holds its first, and ten reports at once hold all ten (pass 2 fix 1, M1).
  */
 async function wireOneReport(
   tx: Parameters<typeof reportsRepository.findByIdInTx>[0],
@@ -429,7 +430,7 @@ async function wireOneReport(
   if (row === undefined) {
     throw new Error(`staff report ${id}: row vanished before re-fetch`);
   }
-  const trainerName = await staffRepository.resolveTrainerNames([row]);
+  const trainerName = await staffRepository.resolveTrainerNames([row], tx);
   return toReportWire(row, trainerName(row.trainerStaffId));
 }
 

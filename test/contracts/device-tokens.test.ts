@@ -11,7 +11,9 @@ import {
   FIXTURE_STAFF_PRINCIPAL,
   SKIP_WHEN_NO_DB,
   makeContractApp,
+  makeLogCapture,
   registerFixtureHooks,
+  type LogCapture,
 } from './_harness.js';
 import type { Principal } from '../../src/auth/principal.js';
 
@@ -232,6 +234,76 @@ test('POST /device-tokens — invalid platform → 400', SKIP_WHEN_NO_DB, async 
   });
   assert.equal(res.statusCode, 400);
 });
+
+// M2 (the Fable pass-2 seat; ruling MB41): Postgres refuses U+0000 in a `text` value (22021), so a
+// NUL in a token reached the pager as a 500 from any signed-in family. Refused at the schema with
+// A1's `NO_NUL`, a 400 `bad_request` like any other schema failure here.
+
+/** The app with every log line it writes captured, so a test can see what reaches the pager. */
+function buildCapturedApp(): {
+  app: ReturnType<typeof makeContractApp>['app'];
+  capture: LogCapture;
+} {
+  const capture = makeLogCapture();
+  const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL, capture);
+  registerDeviceTokensRoute(app, { authenticate });
+  return { app, capture };
+}
+
+function pagerLines(capture: LogCapture): Array<Record<string, unknown>> {
+  return capture.lines.filter((line) => Number(line['level'] ?? 0) >= 50);
+}
+
+async function fixtureTokenRows(): Promise<number> {
+  const rows = await db
+    .select({ id: deviceTokens.id })
+    .from(deviceTokens)
+    .where(eq(deviceTokens.ownerId, FIXTURE_IDS.ownerId));
+  return rows.length;
+}
+
+test(
+  'POST /device-tokens — a NUL in the token → 400 bad_request, nothing stored, nothing paged (M2)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const before = await fixtureTokenRows();
+    const { app, capture } = buildCapturedApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/device-tokens',
+      headers: { 'idempotency-key': `dt-nul-${randomUUID()}` },
+      payload: { token: `ExponentPushToken[a\u0000${randomUUID()}]`, platform: 'ios' },
+    });
+    assert.equal(res.statusCode, 400, res.body);
+    const { error } = res.json() as { error: { code: string; message: string } };
+    assert.equal(error.code, 'bad_request');
+    assert.match(error.message, /NUL/);
+    assert.deepEqual(pagerLines(capture), [], 'nothing at the pager’s level');
+    assert.equal(await fixtureTokenRows(), before, 'nothing stored');
+  },
+);
+
+test(
+  'DELETE /device-tokens/:token — a NUL in the token → 400 bad_request, nothing expired, nothing paged (M2)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const live = `ExponentPushToken[a${randomUUID()}]`;
+    await seedLiveToken(live);
+    const { app, capture } = buildCapturedApp();
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/device-tokens/${encodeURIComponent(live.replace('[a', '[a\u0000'))}`,
+      headers: { 'idempotency-key': `dt-del-nul-${randomUUID()}` },
+    });
+    assert.equal(res.statusCode, 400, res.body);
+    const { error } = res.json() as { error: { code: string; message: string } };
+    assert.equal(error.code, 'bad_request');
+    assert.match(error.message, /NUL/);
+    assert.deepEqual(pagerLines(capture), [], 'nothing at the pager’s level');
+    assert.equal(await liveRowCount(live), 1, 'the live token beside it is untouched');
+    await cleanup(live);
+  },
+);
 
 // ──────────────────────────────────────────────────────────────────────────
 // DELETE /device-tokens/:token

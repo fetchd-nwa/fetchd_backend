@@ -4,15 +4,26 @@ import { after, afterEach, describe, test } from 'node:test';
 import { sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import type { Principal } from '../../src/auth/principal.js';
+import { MAX_MESSAGE_SEQ } from '../../src/contracts/wire.js';
 import { FIXTURE_IDS } from './_fixture.js';
-import { SKIP_WHEN_NO_DB, plantFamily, registerFixtureHooks, removeFamilies } from './_harness.js';
+import {
+  FIXTURE_MANAGER_PRINCIPAL,
+  SKIP_WHEN_NO_DB,
+  plantFamily,
+  registerFixtureHooks,
+  removeFamilies,
+} from './_harness.js';
 import {
   getJson,
   messageRows,
   ownerApp,
+  ownerRead,
   ownerSend,
   removeMessagesExcept,
+  removePlantedStaffTraces,
   removeSchoolThreads,
+  staffApp,
+  staffReply,
   startThread,
 } from './_messaging.js';
 
@@ -25,11 +36,17 @@ import {
  *   · A family's `client_message_id` is looked up among HER OWN messages only
  *     (`messagesRepository.findByOwnerClientMessageId`'s sender filter; A2 OL2: unique per
  *     sender). Two families who mint one id each get their own message back, on both owner verbs.
+ *   · A family's read (`POST /threads/:id/read`) marks only HER thread's messages
+ *     (`messagesRepository.markThreadReadForOwner`'s thread filter; the Opus pass-2 seat's M1).
+ *     Unpinned, the Hendersons opening their thread reads Allison's school message: her unread
+ *     count drops, her message is stamped *Delivered* and *Read*, and the desk sees *Read*.
  */
 
 registerFixtureHooks();
 let keep: string[] = [];
 afterEach(async () => {
+  // What a staff reply to a planted family leaves that names a fixture staffer (the read test).
+  await removePlantedStaffTraces();
   await removeSchoolThreads();
   if (keep.length > 0) await removeMessagesExcept(FIXTURE_IDS.thread1Id, keep);
 });
@@ -151,6 +168,68 @@ describe('two families: each start and each client_message_id stays in its own f
         sql`SELECT count(*)::int AS n FROM messages WHERE client_message_id IN (${sendId}, ${startId})`,
       );
       assert.equal(rows[0]?.n, 4);
+    },
+  );
+});
+
+describe('two families: one family’s read never moves the other’s messages', () => {
+  test(
+    'the Hendersons open their thread (no body, then up_to_seq MAX): Allison’s unread school message keeps its unread count, read and Delivered stamps and receipt',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const amber = staffApp(FIXTURE_MANAGER_PRINCIPAL);
+      const aStart = await startThread(ownerApp(), { category: 'other', text: 'Allison asks' });
+      assert.equal(aStart.statusCode, 201, aStart.body);
+      const aThread = (aStart.json() as Pair).thread.id;
+      const aReply = await staffReply(amber, aThread, { text: 'for Allison' });
+      assert.equal(aReply.statusCode, 201, aReply.body);
+      const aSchool = (aReply.json() as Msg).id;
+
+      const family = await plantFamily();
+      const theirs = ownerApp(family.principal);
+      const bStart = await startThread(theirs, { category: 'other', text: 'Hendersons ask' });
+      assert.equal(bStart.statusCode, 201, bStart.body);
+      const bThread = (bStart.json() as Pair).thread.id;
+      const bReply = await staffReply(amber, bThread, { text: 'for the Hendersons' });
+      assert.equal(bReply.statusCode, 201, bReply.body);
+
+      const unreadOf = async (threadId: string): Promise<number | undefined> =>
+        (await getJson<Array<{ id: string; unread_count: number }>>(ownerApp(), '/threads')).find(
+          (t) => t.id === threadId,
+        )?.unread_count;
+      const stampsOf = async (id: string) => {
+        const { rows } = await db.execute<{ read: string | null; delivered: string | null }>(
+          sql`SELECT read_at::text AS read, delivered_at::text AS delivered FROM messages WHERE id = ${id}`,
+        );
+        return rows[0];
+      };
+      assert.equal(await unreadOf(aThread), 1, 'before: Allison has one unread school message');
+      assert.deepEqual(await stampsOf(aSchool), { read: null, delivered: null });
+
+      // The 9.1.0 app's read (no body), then 9.2.0's, as far as it can reach.
+      assert.equal((await ownerRead(theirs, bThread)).statusCode, 204);
+      assert.equal(
+        (await ownerRead(theirs, bThread, { up_to_seq: MAX_MESSAGE_SEQ })).statusCode,
+        204,
+      );
+
+      // Their own message was read (the read works), and Allison's moved not at all.
+      assert.notEqual((await stampsOf((bReply.json() as Msg).id))?.read, null);
+      assert.equal(await unreadOf(aThread), 1, 'Allison’s unread count moved');
+      assert.deepEqual(
+        await stampsOf(aSchool),
+        { read: null, delivered: null },
+        'Allison’s message stamped Read or Delivered by the Hendersons’ read',
+      );
+      const desk = await getJson<Array<{ id: string; receipt?: { state: string } }>>(
+        amber,
+        `/staff/threads/${aThread}/messages`,
+      );
+      assert.equal(
+        desk.find((m) => m.id === aSchool)?.receipt?.state,
+        'sent',
+        'the desk sees Allison’s receipt moved',
+      );
     },
   );
 });

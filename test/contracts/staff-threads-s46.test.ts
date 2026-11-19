@@ -468,4 +468,55 @@ describe('GET /staff/notifications/summary → StaffBellWire', () => {
       assert.ok(after.fayetteville.pending_requests >= 1);
     },
   );
+
+  test(
+    'a family with no campus counts on BOTH campuses, her unread thread and her request alike; given a campus, she counts once, on hers (the Opus pass-2 seat’s M2; default pending her answer)',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const before = (await bell(FIXTURE_MANAGER_PRINCIPAL)).by_location;
+      const family = await plantFamily('The Campusless');
+      await db.execute(sql`UPDATE owners SET location = NULL WHERE id = ${family.ownerId}`);
+      const start = await startThread(ownerApp(family.principal), {
+        category: 'billing',
+        text: 'Is my invoice right?',
+      });
+      assert.equal(start.statusCode, 201, start.body);
+      plantedRequests.push(
+        await plantRequest({
+          category: 'boarding',
+          ownerId: family.ownerId,
+          dogIds: [family.dogId],
+        }),
+      );
+      const counts = (b: Bell['by_location']) =>
+        (['fayetteville', 'bentonville'] as const).map((campus) => [
+          campus,
+          b[campus].unread_client_threads - before[campus].unread_client_threads,
+          b[campus].pending_requests - before[campus].pending_requests,
+        ]);
+
+      const noCampus = (await bell(FIXTURE_MANAGER_PRINCIPAL)).by_location;
+      assert.deepEqual(
+        counts(noCampus),
+        [
+          ['fayetteville', 1, 1],
+          ['bentonville', 1, 1],
+        ],
+        'with no campus she rings both desks: one unread thread and one request on each',
+      );
+
+      await db.execute(
+        sql`UPDATE owners SET location = 'bentonville' WHERE id = ${family.ownerId}`,
+      );
+      const hers = (await bell(FIXTURE_MANAGER_PRINCIPAL)).by_location;
+      assert.deepEqual(
+        counts(hers),
+        [
+          ['fayetteville', 0, 0],
+          ['bentonville', 1, 1],
+        ],
+        'with a campus she counts once, on hers',
+      );
+    },
+  );
 });

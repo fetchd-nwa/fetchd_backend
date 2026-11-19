@@ -13,7 +13,10 @@ import { isAddressedTo, type StaffReader } from './wireManyThreads.js';
  *     `staff_unread_count`), so a read clears only the reader's bell (question 72);
  *   · `pending_requests`: live `submitted` requests, the read behind
  *     `GET /staff/requests?status=submitted` (`requestsRepository.findLive`, A2.3).
- * A family with no campus counts on neither. Nothing about money (RULING §10 item 8).
+ * A family with no campus (`owners.location` NULL) counts on BOTH campuses, threads and requests
+ * alike: a family with no campus belongs to either (her precedent, DECISIONS 494 (f); the Opus
+ * pass-2 seat's M2, default ruled in MB42, pending her answer). A sum over both campuses counts
+ * her twice. Nothing about money (RULING §10 item 8).
  */
 export async function staffBell(reader: StaffReader): Promise<StaffBellWire> {
   const [threads, submitted] = await Promise.all([
@@ -33,15 +36,17 @@ export async function staffBell(reader: StaffReader): Promise<StaffBellWire> {
   const by = Object.fromEntries(
     LOCATIONS.map((l) => [l, { unread_client_threads: 0, pending_requests: 0 }]),
   ) as StaffBellWire['by_location'];
-  const campusOf = (ownerId: string): LocationKey | null => families.get(ownerId)?.location ?? null;
+  // MB42's default, pending her answer: no campus → both. Counting her on neither is `[]` here.
+  const campusesOf = (ownerId: string): readonly LocationKey[] => {
+    const campus = families.get(ownerId)?.location ?? null;
+    return campus === null ? LOCATIONS : [campus];
+  };
   for (const thread of threads) {
     if (!isAddressedTo(thread, reader) || (unread.get(thread.id) ?? 0) === 0) continue;
-    const campus = campusOf(thread.ownerId);
-    if (campus !== null) by[campus].unread_client_threads += 1;
+    for (const campus of campusesOf(thread.ownerId)) by[campus].unread_client_threads += 1;
   }
   for (const request of submitted) {
-    const campus = campusOf(request.ownerId);
-    if (campus !== null) by[campus].pending_requests += 1;
+    for (const campus of campusesOf(request.ownerId)) by[campus].pending_requests += 1;
   }
   return { by_location: by };
 }

@@ -58,10 +58,15 @@ export const staffRepository = {
    * route maps NULL/missing to "no trainer" per the §B optional-omit
    * convention). Never the school's system row (`livePrincipal`): it is no person, so a
    * report naming it as trainer shows no trainer, as one naming a departed staffer does.
+   * `runner`: a caller inside a transaction passes its own (a pooled read there waits for a
+   * second connection while holding one; O-MSG-LIVE pass 2 fix 1, M1).
    */
-  async findNamesByIds(ids: string[]): Promise<{ id: string; name: string }[]> {
+  async findNamesByIds(
+    ids: string[],
+    runner: Runner = db,
+  ): Promise<{ id: string; name: string }[]> {
     if (ids.length === 0) return [];
-    return db
+    return runner
       .select({ id: staff.id, name: staff.name })
       .from(staff)
       .where(and(inArray(staff.id, ids), livePrincipal()));
@@ -76,16 +81,18 @@ export const staffRepository = {
    * both did this dance inline. Day-7 events (organizer staff) and
    * Day-12 report mutations (author staff) will reuse. Returns `null`
    * for unknown ids (soft-expired staff, structurally missing rows) —
-   * matches the optional-omit `trainer?` convention.
+   * matches the optional-omit `trainer?` convention. `runner`: a caller inside a transaction
+   * passes its own (`staffReports.ts` `wireOneReport`; pass 2 fix 1, M1).
    */
   async resolveTrainerNames<T extends { trainerStaffId: string | null }>(
     rows: readonly T[],
+    runner: Runner = db,
   ): Promise<(id: string | null) => string | null> {
     const ids = [
       ...new Set(rows.map((r) => r.trainerStaffId).filter((v): v is string => v !== null)),
     ];
     if (ids.length === 0) return () => null;
-    const staffRows = await staffRepository.findNamesByIds(ids);
+    const staffRows = await staffRepository.findNamesByIds(ids, runner);
     const namesById = new Map(staffRows.map((s) => [s.id, s.name] as const));
     return (id) => (id === null ? null : (namesById.get(id) ?? null));
   },
@@ -104,9 +111,7 @@ export const staffRepository = {
    * design gives this read to MSG-U03 (P31); it is pulled forward because P02
    * ships `--expire`.
    */
-  async findParticipantsByIds(
-    ids: string[],
-  ): Promise<
+  async findParticipantsByIds(ids: string[]): Promise<
     {
       id: string;
       name: string;

@@ -233,4 +233,71 @@ describe('B12, the staff half: whose media a staff reply may carry', () => {
       assert.equal(res.json().error.code, 'invalid_payload');
     },
   );
+
+  test(
+    'the order (MB37 (7)): another family’s wrong-purpose upload is 404 with the body an unknown id gets, never 422; only this family’s staff upload reaches the purpose check',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const family = await plantFamily();
+      const purposed = async (
+        plant: (ownerId: string) => Promise<string>,
+        ownerId: string,
+        purpose: string,
+        expired = false,
+      ): Promise<string> => {
+        const id = await plant(ownerId);
+        planted.push(id);
+        await db.execute(sql`
+          UPDATE media_assets SET purpose = ${purpose},
+                 expired_at = ${expired ? sql`now()` : sql`NULL`}
+           WHERE id = ${id}`);
+        return id;
+      };
+      const theirStaffWrong = await purposed(plantStaffMedia, family.ownerId, 'report-photo');
+      const theirOwnWrong = await purposed(plantOwnerMedia, family.ownerId, 'dog-profile');
+      const theirExpiredWrong = await purposed(
+        plantStaffMedia,
+        family.ownerId,
+        'report-video',
+        true,
+      );
+      const hersWrong = await purposed(plantOwnerMedia, FIXTURE_IDS.ownerId, 'owner-avatar');
+      const oursWrong = await purposed(plantStaffMedia, FIXTURE_IDS.ownerId, 'report-photo');
+      const nobody = randomUUID();
+
+      /** A 404's error with its id replaced, so two refusals can be compared word for word. */
+      const refusal = async (ids: string[], named: string) => {
+        const res = await staffReply(staffApp(), T1, { text: 'look', attachment_media_ids: ids });
+        const { error } = res.json() as { error: { code: string; message: string } };
+        return {
+          status: res.statusCode,
+          error: { ...error, message: error.message.replaceAll(named, '<id>') },
+        };
+      };
+      const before = (await messageRows(T1)).length;
+      const unknown = await refusal([nobody], nobody);
+      assert.deepEqual(unknown.status, 404);
+      for (const [name, ids, named] of [
+        ['another family’s staff upload, wrong purpose', [theirStaffWrong], theirStaffWrong],
+        ['another family’s own upload, wrong purpose', [theirOwnWrong], theirOwnWrong],
+        [
+          'another family’s expired staff upload, wrong purpose',
+          [theirExpiredWrong],
+          theirExpiredWrong,
+        ],
+        ['this family’s own upload, wrong purpose', [hersWrong], hersWrong],
+        [
+          'another family’s first, then ours with the wrong purpose',
+          [theirStaffWrong, oursWrong],
+          theirStaffWrong,
+        ],
+      ] as const) {
+        assert.deepEqual(await refusal([...ids], named), unknown, name);
+      }
+      const ours = await refusal([oursWrong], oursWrong);
+      assert.equal(ours.status, 422, 'this family’s staff upload, wrong purpose');
+      assert.equal(ours.error.code, 'invalid_payload');
+      assert.equal((await messageRows(T1)).length, before, 'nothing stored');
+    },
+  );
 });

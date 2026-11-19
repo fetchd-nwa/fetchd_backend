@@ -116,19 +116,29 @@ async function readNoticeMessage(
  * (`MessageWire.sender_name`, "the push title follows it"): in a school thread the staffer's
  * first name, or the school's name under `school_name` (MSG-U04, answer 22); elsewhere the
  * staffer's name. When no name reads (her row expired in between), the school's own name.
+ *
+ * Every read runs on `runner`: inside the send, the notice's savepoint, never the pool. A pooled
+ * read there waits for a second connection while the send holds its first, and ten such sends in
+ * one thread hold all ten (each queued on the thread's row lock): the whole API hangs (pass 2
+ * fix 1, M1). After commit, the pool.
  */
-async function senderNameOf(message: NoticeMessage): Promise<string> {
-  const names = await staffSenderNames([message], 'owner');
+async function senderNameOf(message: NoticeMessage, runner: Runner): Promise<string> {
+  const names = await staffSenderNames([message], 'owner', runner);
   const name = names.get(message.id) ?? null;
   if (name !== null && name !== '') return name;
-  const school = await staffRepository.findSchoolAccount();
+  const school = await staffRepository.findSchoolAccount(runner);
   return school?.name ?? FEED_TITLE;
 }
 
-/** Her words cut at 140, or, for a reply that is only attachments, *Amber sent a photo*. */
+/**
+ * Her words cut at 140, or, for a reply that is only attachments, *Amber sent a photo*. The cut
+ * counts code points, never UTF-16 units, so it never splits an emoji into a lone surrogate:
+ * 137 and *…* (pass 2 fix 1, L1).
+ */
 export function noticeBody(text: string, attachmentCount: number, senderName: string): string {
   if (text === '' && attachmentCount > 0) return `${senderName} sent a photo`;
-  return text.length > MAX_BODY ? `${text.slice(0, MAX_BODY - 3)}…` : text;
+  const points = [...text];
+  return points.length > MAX_BODY ? `${points.slice(0, MAX_BODY - 3).join('')}…` : text;
 }
 
 /**
@@ -151,7 +161,7 @@ export async function prepareStaffMessageNotice(
       }
       const body =
         message.text === '' && message.attachmentCount > 0
-          ? noticeBody('', message.attachmentCount, await senderNameOf(message))
+          ? noticeBody('', message.attachmentCount, await senderNameOf(message, sp))
           : noticeBody(message.text, message.attachmentCount, '');
       const feed = await notificationsRepository.enqueue(sp, {
         ownerId: args.ownerId,
@@ -250,7 +260,7 @@ export async function sendStaffMessagePush(
   }
 
   const [title, badge] = await Promise.all([
-    senderNameOf(message),
+    senderNameOf(message, db),
     unreadSchoolMessages(message.ownerId),
   ]);
   const body = noticeBody(message.text, message.attachmentCount, title);

@@ -8,6 +8,7 @@ import {
 } from '../db/repositories/deviceTokensRepository.js';
 import { ApiError } from '../lib/errors.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { NO_NUL } from '../lib/messageText.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 import { requireOwner } from '../lib/principalNarrows.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
@@ -49,9 +50,16 @@ import type { Equal, Expect } from '../contracts/typeAsserts.js';
 // so a hostile client can't push arbitrarily large strings into `text`.
 const DEVICE_TOKEN_MAX_LEN = 512;
 
+// A NUL in a token is refused here, a 400 like any other schema failure: Postgres refuses U+0000
+// in `text` (22021), which was a 500 at the pager's level from any signed-in family (O-MSG-LIVE
+// pass 2 fix 1, M2; A1's `NO_NUL`, on both verbs).
 const postBodySchema = z
   .object({
-    token: z.string().min(1, 'token must not be empty').max(DEVICE_TOKEN_MAX_LEN),
+    token: z
+      .string()
+      .min(1, 'token must not be empty')
+      .max(DEVICE_TOKEN_MAX_LEN)
+      .refine(NO_NUL.check, NO_NUL.message),
     platform: z.enum(['ios', 'android']),
   })
   .strict();
@@ -65,7 +73,7 @@ export type PostDeviceTokensBodyConformance = Expect<
 >;
 
 const tokenParamSchema = z.object({
-  token: z.string().min(1).max(DEVICE_TOKEN_MAX_LEN),
+  token: z.string().min(1).max(DEVICE_TOKEN_MAX_LEN).refine(NO_NUL.check, NO_NUL.message),
 });
 
 export function registerDeviceTokensRoute(app: FastifyInstance, opts: AuthRouteOptions = {}): void {

@@ -5,6 +5,8 @@ import { live } from '../softExpire.js';
 import type { Tx } from '../tx.js';
 import type { ThreadCategory, ThreadRowForWire } from '../../lib/threadWire.js';
 
+type Runner = Tx | typeof db;
+
 /**
  * Data-access seam for `threads` (+ `thread_dogs` + a `messages`-derived
  * unread-count). Day-7a addition; mirrors `bookingsRepository` /
@@ -196,11 +198,12 @@ export const threadsRepository = {
 
   /**
    * Which of `threadIds` are school-addressed (MSG-U04's signature reads it). Expired
-   * threads included: a message keeps the signature of the thread it was sent in.
+   * threads included: a message keeps the signature of the thread it was sent in. `runner`: a
+   * caller inside a transaction passes its own (pass 2 fix 1, M1).
    */
-  async findSchoolThreadIds(threadIds: readonly string[]): Promise<string[]> {
+  async findSchoolThreadIds(threadIds: readonly string[], runner: Runner = db): Promise<string[]> {
     if (threadIds.length === 0) return [];
-    const rows = await db
+    const rows = await runner
       .select({ id: threads.id })
       .from(threads)
       .where(and(inArray(threads.id, [...threadIds]), eq(threads.addressedToSchool, true)));

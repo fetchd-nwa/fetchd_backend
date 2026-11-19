@@ -1,3 +1,5 @@
+import type { db } from '../db/client.js';
+import type { Tx } from '../db/tx.js';
 import { ownersRepository } from '../db/repositories/ownersRepository.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { staffRepository } from '../db/repositories/staffRepository.js';
@@ -24,6 +26,8 @@ import {
   type StaffThreadWire,
   type ThreadWire,
 } from './threadWire.js';
+
+type Runner = Tx | typeof db;
 
 // Message attachment GET URLs are signed short: the open thread polls every 4s
 // (see useMessages THREAD_POLL_MS), well inside this TTL, so a refresh always
@@ -110,10 +114,15 @@ export async function wireManyMessages(
  * `school_name`: staff always read each other's first name (A6; her answer 2, DECISIONS 589:
  * "no staff names on her side, staff see each other's"). Elsewhere a staff message keeps the
  * staffer's name. The push's title is the family's reading of it ("the push title follows it").
+ *
+ * `runner`: every read runs on it (the pool when absent). A caller inside a transaction passes
+ * its own: the staff message notice reads the name inside the send's savepoint, and a pooled read
+ * there would wait for a second connection while holding one (pass 2 fix 1, M1).
  */
 export async function staffSenderNames(
   rows: ReadonlyArray<Pick<MessageRowForWire, 'id' | 'threadId' | 'senderKind' | 'senderStaffId'>>,
   audience: MessageAudience,
+  runner?: Runner,
 ): Promise<Map<string, string | null>> {
   const staffRows = rows.filter((m) => m.senderKind === 'staff');
   if (staffRows.length === 0) return new Map();
@@ -121,8 +130,8 @@ export async function staffSenderNames(
     ...new Set(staffRows.map((m) => m.senderStaffId).filter((v): v is string => v !== null)),
   ];
   const [staffNameRows, signature] = await Promise.all([
-    staffRepository.findNamesByIds(staffSenderIds),
-    schoolSignature([...new Set(staffRows.map((m) => m.threadId))]),
+    staffRepository.findNamesByIds(staffSenderIds, runner),
+    schoolSignature([...new Set(staffRows.map((m) => m.threadId))], runner),
   ]);
   const staffNamesById = new Map(staffNameRows.map((s) => [s.id, s.name] as const));
   const names = new Map<string, string | null>();
@@ -190,16 +199,22 @@ export async function wireManyStaffThreads(
   });
 }
 
-/** The school threads among `threadIds`, the signature mode and the school's own name. */
-async function schoolSignature(threadIds: string[]): Promise<{
+/**
+ * The school threads among `threadIds`, the signature mode and the school's own name, each read
+ * on `runner` (the pool when absent).
+ */
+async function schoolSignature(
+  threadIds: string[],
+  runner?: Runner,
+): Promise<{
   schoolThreadIds: Set<string>;
   mode: 'staffer_first_name' | 'school_name';
   schoolName: string | null;
 }> {
   const [schoolThreadIds, mode, school] = await Promise.all([
-    threadsRepository.findSchoolThreadIds(threadIds),
-    settingsRepository.replySignatureMode(),
-    staffRepository.findSchoolAccount(),
+    threadsRepository.findSchoolThreadIds(threadIds, runner),
+    settingsRepository.replySignatureMode(runner),
+    staffRepository.findSchoolAccount(runner),
   ]);
   return { schoolThreadIds: new Set(schoolThreadIds), mode, schoolName: school?.name ?? null };
 }

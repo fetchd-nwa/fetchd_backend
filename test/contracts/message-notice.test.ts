@@ -27,6 +27,7 @@ import {
 } from './_harness.js';
 import { makeExpoPushStub, type ExpoPushStub } from './_expoPushStub.js';
 import {
+  getJson,
   ownerApp,
   ownerSend,
   plantStaffMedia,
@@ -113,6 +114,21 @@ async function giveToken(
 
 function sent(stub: ExpoPushStub): ExpoPushMessage[] {
   return stub.calls.flatMap((c) => c.messages);
+}
+
+/** The stub behind a real delay: Expo answers in tens of milliseconds, never in the same tick. */
+function slowed(stub: ExpoPushStub, ms = 40): ExpoPushClient {
+  return {
+    async sendBatch(messages) {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return stub.sendBatch(messages);
+    },
+  };
+}
+
+/** `String.prototype.isWellFormed` (ES2024; the tree's lib is ES2022): no lone surrogate. */
+function wellFormed(text: string): boolean {
+  return (text as unknown as { isWellFormed(): boolean }).isWellFormed();
 }
 
 async function claimOf(
@@ -360,6 +376,95 @@ describe('the push itself (A1.2, FM1, FL3)', () => {
   );
 
   test(
+    'her answer 4 (M3): the badge is her unread school messages only: two unread school messages, one unread notice and one message of her own give 2, as her Messages tab counts',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const stub = makeExpoPushStub();
+      await giveToken(family.ownerId);
+      const noticeId = randomUUID();
+      await db.execute(sql`
+        INSERT INTO notifications (id, owner_id, type, title, body)
+        VALUES (${noticeId}, ${family.ownerId}, 'announcement', 'Closed Friday',
+                'The school is closed on Friday.')`);
+      let ownId: string | undefined;
+      try {
+        const own = await ownerSend(ownerApp(family.principal), threadId, { text: 'her own' });
+        assert.equal(own.statusCode, 201, own.body);
+        ownId = (own.json() as Msg).id;
+        const app = AMBER_APP(slowed(stub));
+        assert.equal((await staffReply(app, threadId, { text: 'one' })).statusCode, 201);
+        await settle();
+        assert.equal((await staffReply(app, threadId, { text: 'two' })).statusCode, 201);
+        await settle();
+        assert.deepEqual(
+          sent(stub).map((p) => p.badge),
+          [1, 2],
+          'the badge counts her unread school messages: not the notice, not her own message',
+        );
+        const tab = await getJson<Array<{ unread_count: number }>>(
+          ownerApp(family.principal),
+          '/threads',
+        );
+        assert.equal(
+          tab.reduce((n, t) => n + t.unread_count, 0),
+          2,
+          'her Messages tab counts the same 2',
+        );
+      } finally {
+        await db.execute(sql`DELETE FROM notifications WHERE id = ${noticeId}`);
+        if (ownId !== undefined) await db.execute(sql`DELETE FROM messages WHERE id = ${ownId}`);
+      }
+    },
+  );
+
+  test(
+    'L1: the 140 cut counts code points, never UTF-16 units: no emoji is cut in half, in the push or the feed row',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const stub = makeExpoPushStub();
+      await giveToken(family.ownerId);
+      const app = AMBER_APP(slowed(stub));
+      const cases: Array<[text: string, body: string]> = [
+        // 139 code points (142 UTF-16 units): under 140, so nothing is cut.
+        [`${'x'.repeat(136)}😀😀😀`, `${'x'.repeat(136)}😀😀😀`],
+        // 71 emoji: 71 code points, 142 units: nothing is cut.
+        ['😀'.repeat(71), '😀'.repeat(71)],
+        // 141 emoji: cut to 137 code points and the ellipsis.
+        ['😀'.repeat(141), `${'😀'.repeat(137)}…`],
+        // Exactly 140, then 141, plain letters.
+        ['y'.repeat(140), 'y'.repeat(140)],
+        ['z'.repeat(141), `${'z'.repeat(137)}…`],
+      ];
+      for (const [text] of cases) {
+        assert.equal((await staffReply(app, threadId, { text })).statusCode, 201);
+        await settle();
+      }
+      const bodies = sent(stub).map((p) => p.body);
+      for (const body of bodies) {
+        assert.ok(wellFormed(body), `a lone surrogate in the push body ${JSON.stringify(body)}`);
+      }
+      assert.deepEqual(
+        bodies.map((b) => [...b].length),
+        [139, 71, 138, 140, 138],
+        'code points per push body',
+      );
+      assert.deepEqual(
+        bodies,
+        cases.map(([, body]) => body),
+      );
+      const feed = (await feedRowsFor(family.ownerId)).slice(0, cases.length).reverse();
+      for (const row of feed) {
+        assert.equal(row.body.includes('�'), false, `U+FFFD in the feed row ${row.body}`);
+      }
+      assert.deepEqual(
+        feed.map((f) => f.body),
+        cases.map(([, body]) => body),
+        'the feed row holds the same words as the push',
+      );
+    },
+  );
+
+  test(
     'POST /staff/threads notifies the same way: reach on its 201, one push',
     SKIP_WHEN_NO_DB,
     async () => {
@@ -504,6 +609,81 @@ describe('at most once, never awaited, nothing escapes (A-B1, A-B2, A-B4, A-B5, 
       await settle();
     }
   });
+
+  test(
+    'A-B4 on POST /staff/threads (L4): the 201 does not wait for a stalled Expo',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      let release: () => void = () => undefined;
+      let pending = true;
+      const stalled: ExpoPushClient = {
+        async sendBatch(messages) {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          pending = false;
+          return messages.map(() => ({ status: 'ok' as const }));
+        },
+      };
+      await giveToken(family.ownerId);
+      const start = staffStart(AMBER_APP(stalled), {
+        owner_id: family.ownerId,
+        category: 'billing',
+        text: 'while Expo stalls',
+      });
+      const res = await Promise.race([
+        start,
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 3000)),
+      ]);
+      try {
+        assert.notEqual(res, 'timeout', 'the 201 waited for Expo');
+        assert.equal((res as Awaited<typeof start>).statusCode, 201);
+        assert.equal(pending, true, 'Expo was still stalled when the 201 arrived');
+      } finally {
+        // Let the stalled push reach Expo, then finish.
+        for (let i = 0; i < 100 && pending; i += 1) {
+          release();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        await start;
+        await settle();
+      }
+    },
+  );
+
+  test(
+    'M3: Expo refusing a ticket: one sendBatch, the claim 0/1, one warn, no level-50 line; a key replay sends nothing more',
+    SKIP_WHEN_NO_DB,
+    async () => {
+      const stub = makeExpoPushStub();
+      const token = await giveToken(family.ownerId);
+      stub.setNextBatchTickets([
+        {
+          status: 'error',
+          message: `"${token}" is not a registered push notification recipient`,
+          details: { error: 'DeviceNotRegistered' },
+        },
+      ]);
+      const capture = makeLogCapture();
+      const app = AMBER_APP(slowed(stub), capture);
+      const key = `refused-${randomUUID()}`;
+      const res = await staffReply(app, threadId, { text: 'Expo refuses this one' }, key);
+      assert.equal(res.statusCode, 201, res.body);
+      await settle();
+      const again = await staffReply(app, threadId, { text: 'Expo refuses this one' }, key);
+      assert.equal(again.statusCode, 201, again.body);
+      await settle();
+      assert.equal(
+        stub.calls.length,
+        1,
+        'one sendBatch: no second attempt, and the replay sends nothing',
+      );
+      const claim = await claimOf((res.json() as Msg).id);
+      assert.deepEqual([claim?.tickets_ok, claim?.tickets_error], [0, 1]);
+      assert.equal(warnLines(capture, 'Expo refused some tickets').length, 1);
+      assert.deepEqual(pagerLines(capture), []);
+    },
+  );
 
   test(
     'A-B5: a family’s message pushes nothing, and sendStaffMessagePush refuses one',
@@ -687,18 +867,17 @@ describe('the boot count (FM2, LR5)', () => {
       await db.execute(
         sql`UPDATE message_pushes SET claimed_at = now() - interval '2 minutes' WHERE message_id = ${stamped}`,
       );
+      // N3: the boot count logs through a real app logger (pino, as pass 3's call after `listen`
+      // hands it `app.log`), and that logger writes into the capture the asserts read.
       const capture = makeLogCapture();
-      const lines: Array<{ level: string; obj: Record<string, unknown>; msg: string }> = [];
-      const log = {
-        info: (obj: Record<string, unknown>, msg: string) =>
-          lines.push({ level: 'info', obj, msg }),
-        warn: (obj: Record<string, unknown>, msg: string) =>
-          lines.push({ level: 'warn', obj, msg }),
-      };
-      assert.equal(await reportLostStaffMessagePushes(log), 1);
-      assert.equal(lines.length, 1, 'one line');
-      assert.equal(lines[0]?.obj['lostPushes'], 1);
-      assert.equal(capture.lines.length, 0);
+      const { app: logged } = makeContractApp(FIXTURE_MANAGER_PRINCIPAL, capture);
+      assert.equal(await reportLostStaffMessagePushes(logged.log), 1);
+      assert.deepEqual(pagerLines(capture), [], 'nothing at the pager’s level');
+      assert.deepEqual(
+        capture.lines.map((l) => [l['level'], l['lostPushes'], l['msg']]),
+        [[40, 1, 'boot: staff message pushes claimed over a minute ago and never sent']],
+        'one line: a warn carrying the count',
+      );
     },
   );
 
