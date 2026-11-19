@@ -83,8 +83,14 @@
  * under DECISIONS 418's rule P51, the bill at the end of those two services, moves
  * to 9.2.0, and S42 (design 7.1.0), once build 6.2.0, then 6.5.0, then 9.2.0, now
  * ships as build 9.3.0; both are provisional until their contract steps.
+ * 9.2.0-pre.1 (plan one-off O-AFTERCOUNT, additive): each pool's draw, from the
+ * server, on the order check's 200 and on the order's three credit refusals
+ * (`PoolDrawWire`; designs/review-after-count.md; her #37, build DECISIONS 677(2),
+ * 684-686, 693). It is a pre-release counter toward 9.2.0, which takes it back when
+ * it lands (the note's §1.1-§1.2). It takes no minor, so no label above moves, and
+ * a contract landed before 9.2.0 is 9.2.0-pre.2.
  */
-export const WIRE_CONTRACT_VERSION = '9.1.0';
+export const WIRE_CONTRACT_VERSION = '9.2.0-pre.1';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -613,6 +619,44 @@ export interface PoolShortWire<T extends CreditTier> {
 }
 
 /**
+ * What one order does to one of the owner's pools at this moment (9.2.0-pre.1, plan one-off
+ * O-AFTERCOUNT; designs/review-after-count.md §1; her #37 and build DECISIONS 677(2): "the
+ * credits should go down so i know how many ive used"). Read in the order's transaction under
+ * its pool locks, before any write, from the plan the order would write. One entry per pool the
+ * order touches, for each campus and program in `LOCATIONS` then `BOOKING_MODES` order: its
+ * regular pool, then its alumni pool when one of the order's alumni dogs has days there.
+ *   - `balance`: the pool's live balance before the order, the number `GET /credits` reads. A
+ *     pool with no live lot has no balance row and still gets its entry, with `balance` 0.
+ *   - `draw`: how many of its credits the order spends now, ≥ 0. Once booked, the pool holds
+ *     exactly `balance − draw`. On a refusal, what the plan pays from this pool so far. On the
+ *     check's 200, this pool's `plan` counts summed.
+ *   - `short`: how many more credits this pool needs for its days, ≥ 0; 0 on a 200.
+ *       - A regular pool's equals its `credits_short` `shortfall`, counted even when another
+ *         refusal answers first.
+ *       - An alumni pool's is its askable days (`PostBookingOrdersRequest`) less those her
+ *         `alumni_on_regular` consent sent to the regular pool. That differs from
+ *         `AlumniCreditsShortDetails.pools[].shortfall`, which counts every askable day.
+ *   - `expires_at`: present only when `short` ≥ 1 and her lots of this pool expire before the
+ *     short days. It is the latest expiry among the lots with credits left, ISO-8601, as on
+ *     `PoolShortWire.short_dates`.
+ * Σ `draw` + Σ `short` equals the order's dog-dates on the check's 200, on `credits_short` and
+ * on `alumni_credits_short`. On `credit_expired_before_date` it is less, by every dog-day no
+ * credit can reach, at any campus; such a day is in no entry. Never infer a draw or a shortage
+ * from the days picked: a lot pays only the dates it reaches.
+ */
+export interface PoolDrawWire {
+  location: LocationKey;
+  mode: BookingMode;
+  tier: CreditTier;
+  balance: number;
+  /** ≥ 0. Read this, never a subtraction from the days picked. */
+  draw: number;
+  /** ≥ 0; 0 on a 200. */
+  short: number;
+  expires_at?: string;
+}
+
+/**
  * Day-program capacity exhaustion for one (location, date): one cap, combined
  * across day school and daycare, so no mode (4.0.0-lg3.1; `DayCapacityWire`).
  * `openings_remaining` is the number of seats still free at the moment the
@@ -815,6 +859,11 @@ export interface CreditExpiredBeforeDateDetails {
   /** 9.1.0: the campus of `dates`. Always present on `POST /booking-orders`; omitted on
    *  `POST /bookings`. */
   location?: LocationKey;
+  /** 9.2.0-pre.1: every pool of the order as its plan left it (`PoolDrawWire`). Always present
+   *  on `POST /booking-orders`, on the POST's refusal and on its check's alike; omitted on
+   *  `POST /bookings`, which plans no order. Here Σ `draw` + Σ `short` falls short of the
+   *  order's dog-dates by every dog-day no credit can reach, at any campus. */
+  draws?: PoolDrawWire[];
 }
 
 /**
@@ -1099,6 +1148,9 @@ export interface RequestStayConflictDetails {
 export interface CreditsShortDetails {
   kind: 'credits_short';
   pools: PoolShortWire<'regular'>[];
+  /** 9.2.0-pre.1: every pool of the order at this refusal, short or not (`PoolDrawWire`).
+   *  `pools` stays the refusal's own list. */
+  draws: PoolDrawWire[];
 }
 
 /**
@@ -1129,6 +1181,10 @@ export interface CreditsShortDetails {
 export interface AlumniCreditsShortDetails {
   kind: 'alumni_credits_short';
   pools: (PoolShortWire<'alumni'> & { package_key: string; consentable: number })[];
+  /** 9.2.0-pre.1: every pool of the order at this refusal, short or not (`PoolDrawWire`).
+   *  `pools` stays the refusal's own list. `pools[].shortfall` counts every askable day;
+   *  `draws[].short` does not count the days her consent sent to the regular pool. */
+  draws: PoolDrawWire[];
 }
 
 /**
@@ -2630,6 +2686,9 @@ export interface PostBookingOrdersResponse extends PostBookingsResponse {
 export interface PostBookingOrdersCheckResponse {
   bookable: true;
   plan: DogCreditPlanWire[];
+  /** 9.2.0-pre.1: each pool's draw if the order books now (`PoolDrawWire`); every `short` is
+   *  0. */
+  draws: PoolDrawWire[];
 }
 
 // ---- (a) domain-local value tuples -----------------------------------------

@@ -12,6 +12,77 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [9.2.0-pre.1] — 2026-11-19
+
+ADDITIVE. Plan one-off O-AFTERCOUNT, her #37 (`PLAYGROUND-BUGS.md:45`) and ruling 677(2)
+(build DECISIONS 677, 680), designed in `designs/review-after-count.md` (revision 1,
+`0ce7aee79954ac3e`), adopted after two Fable reads (DECISIONS 684-686, 693;
+`units/O-AFTERCOUNT/reviews/note-fable-r1.md`, `note-fable-r2.md`). Her words: "the picture
+shows the 10 alumni credits does not go down even though waffles has 4 booked", then "well the
+credits should go down so i know how many ive used? like normal". The server now says, pool by
+pool, what an order spends and what it still lacks, on the check's 200 and on all three of the
+order's credit refusals, so the review reads "10 → 6 after this booking" beside "−3 day care
+credits" from the server's numbers and never from the days picked. Not a design section
+(design_label none). Build label 9.2.0-pre.1 (version (c), DECISIONS 684; the note §1.1): a
+pre-release counter toward 9.2.0, so it takes no minor and moves no planned label; a contract
+landed before 9.2.0 is 9.2.0-pre.2, and each entry names its unit. It reads 9.1.0 (O-CREDITS).
+Every addition is a new type, a new field on a response or an optional field; nothing is
+removed, renamed or retyped, so a 9.1.0 client reads 9.2.0-pre.1 unchanged. A 422 stores
+nothing on its key and a stored 201 does not change, so no replay differs. Lot choice, locks,
+the refusal order, `pools`, `consentable`, `package_key` and `POST /bookings` are unchanged.
+Contract-first: no route returns `draws` until O-AFTERCOUNT's backend unit lands it. Resync both
+clients (`npm run sync:contracts` in mobile and portal). Against this copy the backend's
+`typecheck` and `typecheck:tests` each fail 3 times in 2 files, the same 3, each the builder's
+to close: `lib/bookingErrors.ts:198` and `:220` (the `credits_short` and `alumni_credits_short`
+builders, until they take `draws`) and `routes/bookingOrders.ts:153` (the check's 200, until the
+core returns `draws` with `plan`). `wire.ts` itself has no error, and at 9.1.0 both steps are
+clean. The clients were not run against it. Messaging's planned 9.2.0 (P45 with O-MSG-LIVE) takes this step back by the note's §1.2:
+`[9.2.0]` goes above this entry and says it includes 9.2.0-pre.1 (O-AFTERCOUNT).
+
+### Added
+
+- `PoolDrawWire {location, mode, tier, balance, draw, short, expires_at?}` (§1a): what one
+  order does to one of the owner's pools at that moment, read in the order's transaction under
+  its pool locks, before any write, from the plan the order would write. One entry per pool the
+  order touches, for each campus and program in `LOCATIONS` then `BOOKING_MODES` order: its
+  regular pool, then its alumni pool when one of the order's alumni dogs has days there.
+  - `balance`: the pool's live balance before the order, the number `GET /credits` reads. A
+    pool with no live lot has no balance row and still gets its entry, with `balance` 0.
+  - `draw`: the credits the order spends from it now, ≥ 0. Once booked the pool holds exactly
+    `balance − draw`. On a refusal, what the plan pays from it so far; on the check's 200, this
+    pool's `plan` counts summed.
+  - `short`: the credits it still needs for its days, ≥ 0; 0 on a 200. A regular pool's equals
+    its `credits_short` `shortfall`, counted even when another refusal answers first. An alumni
+    pool's is its askable days less those her `alumni_on_regular` consent sent to the regular
+    pool, so it differs from `AlumniCreditsShortDetails.pools[].shortfall`, which counts every
+    askable day.
+  - `expires_at?`: present only when `short` ≥ 1 and her lots of this pool expire before the
+    short days: the latest expiry among the lots with credits left, as on
+    `PoolShortWire.short_dates`.
+
+  Σ `draw` + Σ `short` equals the order's dog-dates on the check's 200, `credits_short` and
+  `alumni_credits_short`. On `credit_expired_before_date` it is less, by every dog-day no credit
+  can reach, at any campus.
+- `PostBookingOrdersCheckResponse.draws: PoolDrawWire[]` (required): each pool's draw if the
+  order books now; every `short` is 0.
+- `CreditsShortDetails.draws` and `AlumniCreditsShortDetails.draws` (`PoolDrawWire[]`,
+  required): every pool of the order at that refusal, short or not, from `POST /booking-orders`
+  and from its check. `pools` stays the refusal's own list.
+- `CreditExpiredBeforeDateDetails.draws?` (optional, on `location?`'s pattern): every pool of
+  the order as its plan left it. Always present on `POST /booking-orders`, on the POST's refusal
+  and on its check's alike; omitted on `POST /bookings`, which plans no order.
+
+No `draws` rides a refusal before the credit plan (auth through `after_school_full`), nor the
+POST's 201: Confirmed reads balances after booking.
+
+### Changed
+
+- `WIRE_CONTRACT_VERSION` `'9.1.0'` → `'9.2.0-pre.1'`.
+
+### Documentation
+
+- The landing-group note names 9.2.0-pre.1, a counter toward 9.2.0 that 9.2.0 takes back.
+
 ## [9.1.0] — 2026-11-18
 
 ADDITIVE. Plan one-off O-CREDITS, her follow-up round (build DECISIONS 540-542, 553, 562;
