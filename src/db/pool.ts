@@ -41,8 +41,9 @@ export const pool = new pg.Pool({
  *     client checked out at the time (a transaction, idle between statements or
  *     with a statement running), which pg-pool's idle listener does not cover.
  * A query running when its connection dies still rejects to its caller exactly
- * as before: node-postgres fails it with the server's error, and neither
- * listener touches it.
+ * as before, and neither listener touches it: a bare query fails with the
+ * server's error (57P01), and a drizzle transaction (`withActor`) with
+ * "Connection terminated unexpectedly", its rollback's error on the dead client.
  *
  * The pool has no request in scope, so it logs as `withMutation` does
  * (`mutation.ts`): one tagged line written to stderr. It never passes through
