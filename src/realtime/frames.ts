@@ -1,6 +1,7 @@
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import type { FastifyBaseLogger } from 'fastify';
 import { db } from '../db/client.js';
+import { livePrincipal } from '../db/repositories/staffRepository.js';
 import { staff, threads } from '../db/schema/schema.js';
 import type { MirrorPrincipal } from '../auth/mirror.js';
 import type { RealtimeCloseCode, RealtimeServerFrameWire } from '../contracts/wire.js';
@@ -53,8 +54,10 @@ function principalKey(p: { kind: string; id: string }): string {
 }
 
 /**
- * OM2's one query (LR16: with the role). Raw fragment, listed for integration: `NOT
- * is_system_account`, to become pass 1's `livePrincipal()`.
+ * OM2's one query (LR16: with the role). Staff are filtered by `livePrincipal()`
+ * (`staffRepository.ts`: live AND NOT the school's system row, rs3 M5.26). Its columns render
+ * qualified by the table's own name (`"staff"."expired_at"`), so the staff arm reads `staff`
+ * unaliased.
  */
 export async function livePrincipalsAmong(
   principals: readonly MirrorPrincipal[],
@@ -69,9 +72,9 @@ export async function livePrincipalsAmong(
       FROM owners o
      WHERE o.id = ANY(${sql.param(ownerIds)}::uuid[]) AND o.expired_at IS NULL
     UNION ALL
-    SELECT 'staff' AS kind, s.id::text AS id, s.role::text AS role
-      FROM staff s
-     WHERE s.id = ANY(${sql.param(staffIds)}::uuid[]) AND s.expired_at IS NULL AND NOT is_system_account
+    SELECT 'staff' AS kind, staff.id::text AS id, staff.role::text AS role
+      FROM staff
+     WHERE staff.id = ANY(${sql.param(staffIds)}::uuid[]) AND ${livePrincipal()}
   `);
   const rows = result.rows as Array<{ kind: string; id: string; role: string | null }>;
   return rows.map((row): MirrorPrincipal => {

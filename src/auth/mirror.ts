@@ -1,4 +1,4 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { livePrincipal } from '../db/repositories/staffRepository.js';
 import { owners, staff } from '../db/schema/schema.js';
@@ -77,11 +77,10 @@ export type MirrorPrincipal =
  * arms. By id because the dev arm's principal carries the literal uid `'dev-bypass'`
  * (`plugin.ts`), so a by-uid read would close a live dev socket for the wrong reason.
  *
- * Owners by live id; staff by live id and NOT the school's system row (*NWA School for Dogs*,
- * rs3 M5.26), so this one read refuses an expired row and the system row on both arms. It never
- * selects `supabase_uid` (the system row's is NULL). The staff filter is a raw fragment, `NOT
- * is_system_account`, until integration swaps it for `livePrincipal()` (pass 1's
- * `staffRepository.ts`). `null` means: not a principal (the socket closes 4403).
+ * Owners by live id; staff by id through `livePrincipal()` (`staffRepository.ts`: live AND NOT
+ * the school's system row, *NWA School for Dogs*, rs3 M5.26), so this one read refuses an
+ * expired row and the system row on both arms. It never selects `supabase_uid` (the system
+ * row's is NULL). `null` means: not a principal (the socket closes 4403).
  */
 export async function resolvePrincipalById(ref: {
   kind: 'owner' | 'staff';
@@ -98,7 +97,7 @@ export async function resolvePrincipalById(ref: {
   const [row] = await db
     .select({ id: staff.id, role: staff.role })
     .from(staff)
-    .where(and(eq(staff.id, ref.id), isNull(staff.expiredAt), sql`NOT is_system_account`))
+    .where(and(eq(staff.id, ref.id), livePrincipal()))
     .limit(1);
   return row ? { kind: 'staff', id: row.id, role: row.role } : null;
 }
