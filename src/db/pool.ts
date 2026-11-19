@@ -26,6 +26,52 @@ export const pool = new pg.Pool({
   ssl: buildSsl(),
 });
 
+/**
+ * A pooled connection that dies is a warn: never a crash, never a page (O-MSG-LIVE
+ * p2a fix 1; brief LR5, "nothing un-awaited can exit the process").
+ *
+ * When the server closes a connection (Supabase restarts, fails over, or reaps
+ * it), node-postgres emits `error` on the CLIENT, and pg-pool re-emits it on the
+ * POOL when that client sat idle. An `error` event nobody listens to is an
+ * uncaught exception, and the process exits 1 (executed: the p2a audit's pool
+ * probe, exit 1 within 6 ms of `pg_terminate_backend`). So two listeners:
+ *   - the pool's, for an idle client: pg-pool has already dropped it, and the
+ *     next query opens a fresh connection;
+ *   - every client's own, attached as it connects and never removed, for a
+ *     client checked out at the time (a transaction, idle between statements or
+ *     with a statement running), which pg-pool's idle listener does not cover.
+ * A query running when its connection dies still rejects to its caller exactly
+ * as before: node-postgres fails it with the server's error, and neither
+ * listener touches it.
+ *
+ * The pool has no request in scope, so it logs as `withMutation` does
+ * (`mutation.ts`): one tagged line written to stderr. It never passes through
+ * pino, so it can never reach the level-50 pager tap (`server.ts`'s
+ * `alarmForwardingHooks`). One line per lost connection: an idle client's error
+ * reaches both listeners, and a checked-out one emits twice (the server's error,
+ * then "Connection terminated unexpectedly" as the socket closes).
+ */
+const reportedClients = new WeakSet<object>();
+
+function warnConnectionLost(client: object, err: Error): void {
+  if (reportedClients.has(client)) return;
+  reportedClients.add(client);
+  const code = (err as { code?: unknown }).code;
+  const reason = `${typeof code === 'string' ? `${code} ` : ''}${err.message}`.replace(/\s+/g, ' ');
+  try {
+    process.stderr.write(
+      `[pool] warn: a postgres connection was lost (${reason}); the pool opens a fresh one on the next query\n`,
+    );
+  } catch {
+    // stderr is gone; the pool recovers without the line.
+  }
+}
+
+pool.on('error', (err, client) => warnConnectionLost(client, err));
+pool.on('connect', (client) => {
+  client.on('error', (err) => warnConnectionLost(client, err));
+});
+
 export async function pingDb(): Promise<void> {
   await pool.query('SELECT 1');
 }
