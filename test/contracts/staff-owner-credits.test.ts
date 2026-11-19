@@ -442,7 +442,8 @@ test(
 
 test('add: the alumni tier needs an alumni dog on the account', SKIP_WHEN_NO_DB, async () => {
   const dogId = await createBookableDog(createdDogs);
-  const alumni = addBody({ location: 'fayetteville', tier: 'alumni' });
+  // Bentonville day care: the one program alumni credits pay for (her 553; M5.25).
+  const alumni = addBody({ location: 'bentonville', mode: 'daycare', tier: 'alumni' });
   const refused = await adjust(staffApp(), alumni);
   assert.equal(refused.statusCode, 422, refused.body);
   assert.equal(errorCode(refused), 'pool_not_bookable');
@@ -451,8 +452,43 @@ test('add: the alumni tier needs an alumni dog on the account', SKIP_WHEN_NO_DB,
   const res = await adjust(staffApp(), alumni);
   assert.equal(res.statusCode, 201, res.body);
   assert.equal((res.json() as StaffCreditPoolWire).tier, 'alumni');
+  assert.equal((res.json() as StaffCreditPoolWire).mode, 'daycare');
   await db.update(dogs).set({ isAlumni: false }).where(eq(dogs.id, dogId));
 });
+
+test(
+  'add: alumni credits pay day care only (her 553), so an alumni-tier add to day school at either campus is 422 pool_not_bookable and writes nothing, with an alumni dog on the account',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const dogId = await createBookableDog(createdDogs);
+    await db.update(dogs).set({ isAlumni: true }).where(eq(dogs.id, dogId));
+    const alumniSchoolRows = async (location: 'fayetteville' | 'bentonville') =>
+      (
+        await db
+          .select({ id: creditLedger.id })
+          .from(creditLedger)
+          .where(
+            and(
+              eq(creditLedger.ownerId, OWNER),
+              eq(creditLedger.location, location),
+              eq(creditLedger.mode, 'school'),
+              eq(creditLedger.tier, 'alumni'),
+            ),
+          )
+      ).length;
+    try {
+      for (const location of ['fayetteville', 'bentonville'] as const) {
+        const before = await alumniSchoolRows(location);
+        const res = await adjust(staffApp(), addBody({ location, mode: 'school', tier: 'alumni' }));
+        assert.equal(res.statusCode, 422, `${location}: ${res.body}`);
+        assert.equal(errorCode(res), 'pool_not_bookable');
+        assert.equal(await alumniSchoolRows(location), before, `${location}: no lot`);
+      }
+    } finally {
+      await db.update(dogs).set({ isAlumni: false }).where(eq(dogs.id, dogId));
+    }
+  },
+);
 
 test('an unknown owner is 404 on the read and on a write', SKIP_WHEN_NO_DB, async () => {
   const stranger = randomUUID();

@@ -1689,20 +1689,23 @@ CREATE TABLE credit_packages (
   created_at     timestamptz NOT NULL DEFAULT now(),
   UNIQUE (key, effective_from)
 );
--- M4.06: the ten rows of the catalog, the same statement as the step file. Reference
--- data, so the test volume carries them too; the fingerprint reads no rows, so the
--- rehearsal's row check and test/contracts/lg4-p18-steps.test.ts prove the two agree.
-INSERT INTO credit_packages (key, location, mode, tier, credits, price_cents, label, is_popular, single_day, expiry_months, effective_from) VALUES
-  ('school-2x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 8, 45600, 'Fayetteville 2x Weekly', false, false, 1, '2026-01-01'),
-  ('school-3x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 12, 64800, 'Fayetteville 3x Weekly', true, false, 1, '2026-01-01'),
-  ('school-alumni-10-fayetteville', 'fayetteville', 'school', 'alumni', 10, 32000, 'Alumni Fayetteville 10 Visits', false, false, 1, '2026-01-01'),
-  ('single-day-school-fayetteville', 'fayetteville', 'school', 'regular', 1, 6000, 'Single Day School Day · Fayetteville', false, true, 1, '2026-01-01'),
-  ('school-2x-weekly-bentonville', 'bentonville', 'school', 'regular', 8, 45600, 'Bentonville 2x Weekly', false, false, 1, '2026-01-01'),
-  ('school-3x-weekly-bentonville', 'bentonville', 'school', 'regular', 12, 64800, 'Bentonville 3x Weekly', true, false, 1, '2026-01-01'),
-  ('school-5x-weekly-bentonville', 'bentonville', 'school', 'regular', 20, 102000, 'Bentonville 5x Weekly', false, false, 1, '2026-01-01'),
-  ('single-day-school-bentonville', 'bentonville', 'school', 'regular', 1, 6000, 'Single Day School Day · Bentonville', false, true, 1, '2026-01-01'),
-  ('daycare-10-bentonville', 'bentonville', 'daycare', 'regular', 10, 35000, 'Bentonville Day Care Package', false, false, 1, '2026-01-01'),
-  ('single-day-daycare-bentonville', 'bentonville', 'daycare', 'regular', 1, 3500, 'Single Day Care Day · Bentonville', false, true, 1, '2026-01-01')
+-- M4.06: the ten rows of the catalog; then M5.25 (plan one-off O-CREDITS, her 553 (b)):
+-- the Fayetteville day-school alumni pack closed (`effective_to = effective_from`, no live
+-- day) and "Alumni Bentonville 10 Visits" live at Bentonville day care. Reference data, so
+-- the test volume carries them too; the fingerprint reads no rows, so the rehearsal's row
+-- check, test/contracts/lg4-p18-steps.test.ts and rs2-steps.test.ts prove the steps agree.
+INSERT INTO credit_packages (key, location, mode, tier, credits, price_cents, label, is_popular, single_day, expiry_months, effective_from, effective_to) VALUES
+  ('school-2x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 8, 45600, 'Fayetteville 2x Weekly', false, false, 1, '2026-01-01', NULL),
+  ('school-3x-weekly-fayetteville', 'fayetteville', 'school', 'regular', 12, 64800, 'Fayetteville 3x Weekly', true, false, 1, '2026-01-01', NULL),
+  ('school-alumni-10-fayetteville', 'fayetteville', 'school', 'alumni', 10, 32000, 'Alumni Fayetteville 10 Visits', false, false, 1, '2026-01-01', '2026-01-01'),
+  ('single-day-school-fayetteville', 'fayetteville', 'school', 'regular', 1, 6000, 'Single Day School Day · Fayetteville', false, true, 1, '2026-01-01', NULL),
+  ('school-2x-weekly-bentonville', 'bentonville', 'school', 'regular', 8, 45600, 'Bentonville 2x Weekly', false, false, 1, '2026-01-01', NULL),
+  ('school-3x-weekly-bentonville', 'bentonville', 'school', 'regular', 12, 64800, 'Bentonville 3x Weekly', true, false, 1, '2026-01-01', NULL),
+  ('school-5x-weekly-bentonville', 'bentonville', 'school', 'regular', 20, 102000, 'Bentonville 5x Weekly', false, false, 1, '2026-01-01', NULL),
+  ('single-day-school-bentonville', 'bentonville', 'school', 'regular', 1, 6000, 'Single Day School Day · Bentonville', false, true, 1, '2026-01-01', NULL),
+  ('daycare-10-bentonville', 'bentonville', 'daycare', 'regular', 10, 35000, 'Bentonville Day Care Package', false, false, 1, '2026-01-01', NULL),
+  ('single-day-daycare-bentonville', 'bentonville', 'daycare', 'regular', 1, 3500, 'Single Day Care Day · Bentonville', false, true, 1, '2026-01-01', NULL),
+  ('daycare-alumni-10-bentonville', 'bentonville', 'daycare', 'alumni', 10, 32000, 'Alumni Bentonville 10 Visits', false, false, 1, '2026-01-01', NULL)
 ON CONFLICT (key, effective_from) DO NOTHING;
 
 CREATE TABLE credit_ledger (

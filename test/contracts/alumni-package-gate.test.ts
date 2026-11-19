@@ -35,14 +35,14 @@ import { makeStripeStub } from './_stripeStub.js';
 
 /**
  * ALUM-U11 (design §2.4:3060-3069; wire 5.0.0 `CreditPackageWire.withheld_reason`,
- * `AlumniPackageIneligibleDetails`): the Alumni Fayetteville 10 Visits row sells only to
+ * `AlumniPackageIneligibleDetails`): the Alumni Bentonville 10 Visits row sells only to
  * a household with a live dog `is_alumni`. The gate is the household's, never a dog's: no
  * dog is named on a purchase. The list says so ahead of time, per owner and after the
  * shared catalog cache; the purchase refuses it before any order opens.
  *
- * The catalog is the seed's (M4.06): at Fayetteville, two tiers, the regular 2x, 3x and
- * single day beside the alumni 10 (P19 `brief_must_say` item 12). The fixture's two
- * `test-school-*` rows ride along and are regular.
+ * The catalog is the seed's (M4.06, then M5.25, which moved the alumni pack to Bentonville
+ * day care; her 553 (b)): at Bentonville, two tiers, the regular school packs, the Day Care
+ * Package and the two single days beside the alumni 10 (P19 `brief_must_say` item 12).
  *
  * Opus cut-fix1 L4 (build DECISIONS 206(e)) closes here: the phone cannot refuse a sale
  * over an alumni change it has not read, so the server reads the household on every
@@ -51,9 +51,9 @@ import { makeStripeStub } from './_stripeStub.js';
 
 registerFixtureHooks();
 
-const ALUMNI = 'school-alumni-10-fayetteville';
+const ALUMNI = 'daycare-alumni-10-bentonville';
 const OWNER = FIXTURE_IDS.ownerId;
-const FAYETTEVILLE_SEED = CATALOG_SEED_KEYS.filter((key) => key.endsWith('-fayetteville'));
+const BENTONVILLE_SEED = CATALOG_SEED_KEYS.filter((key) => key.endsWith('-bentonville'));
 
 const plantedDogs: string[] = [];
 const plantedOwners: string[] = [];
@@ -109,7 +109,7 @@ async function plantOwner(): Promise<OwnerPrincipal> {
 async function catalogAs(principal: Principal): Promise<CreditPackageWire[]> {
   const { app, authenticate } = makeContractApp(principal);
   registerCreditPackagesRoute(app, { authenticate, now: FIXTURE_NOW });
-  const res = await app.inject({ method: 'GET', url: '/credit-packages?location=fayetteville' });
+  const res = await app.inject({ method: 'GET', url: '/credit-packages?location=bentonville' });
   assert.equal(res.statusCode, 200, res.body);
   return res.json() as CreditPackageWire[];
 }
@@ -188,14 +188,17 @@ test(
   async () => {
     const rows = await catalogAs(FIXTURE_OWNER_PRINCIPAL);
     assert.deepEqual(
-      rows.filter((r) => FAYETTEVILLE_SEED.includes(r.key)).map((r) => [r.key, r.tier]),
+      rows.filter((r) => BENTONVILLE_SEED.includes(r.key)).map((r) => [r.key, r.tier]),
       [
-        ['single-day-school-fayetteville', 'regular'],
-        ['school-2x-weekly-fayetteville', 'regular'],
-        ['school-alumni-10-fayetteville', 'alumni'],
-        ['school-3x-weekly-fayetteville', 'regular'],
+        ['single-day-school-bentonville', 'regular'],
+        ['school-2x-weekly-bentonville', 'regular'],
+        ['school-3x-weekly-bentonville', 'regular'],
+        ['school-5x-weekly-bentonville', 'regular'],
+        ['single-day-daycare-bentonville', 'regular'],
+        ['daycare-10-bentonville', 'regular'],
+        ['daycare-alumni-10-bentonville', 'alumni'],
       ],
-      'the seed catalog at Fayetteville: two tiers',
+      'the seed catalog at Bentonville: two tiers',
     );
     assert.deepEqual(withheld(rows), [[ALUMNI, 'alumni-only']]);
     // The row is still listed, whole: the app greys it, and the price stays exact.
@@ -221,12 +224,12 @@ test(
   async () => {
     assert.deepStrictEqual(
       await catalogAs(FIXTURE_STAFF_PRINCIPAL),
-      loadSnapshot('credit-packages'),
+      loadSnapshot('credit-packages-bentonville'),
     );
     await plantDog(OWNER, true);
     assert.deepStrictEqual(
       await catalogAs(FIXTURE_STAFF_PRINCIPAL),
-      loadSnapshot('credit-packages'),
+      loadSnapshot('credit-packages-bentonville'),
     );
   },
 );
@@ -238,7 +241,7 @@ test(
     await redis.flushdb();
     const householdB = await plantOwner();
     await plantDog(householdB.ownerId, true);
-    const cacheKey = creditPackagesCacheKey('fayetteville', bucketChicagoToday(FIXTURE_NOW()));
+    const cacheKey = creditPackagesCacheKey('bentonville', bucketChicagoToday(FIXTURE_NOW()));
 
     // A has no alumni dog, and her read is the one that fills the cache.
     assert.deepEqual(withheld(await catalogAs(FIXTURE_OWNER_PRINCIPAL)), [[ALUMNI, 'alumni-only']]);
@@ -249,7 +252,7 @@ test(
     assert.deepEqual(withheld(await catalogAs(householdB)), [], 'B is alumni: nothing withheld');
     assert.deepStrictEqual(
       await catalogAs(FIXTURE_STAFF_PRINCIPAL),
-      loadSnapshot('credit-packages'),
+      loadSnapshot('credit-packages-bentonville'),
       'staff read the rows bare',
     );
     assert.deepEqual(withheld(await catalogAs(FIXTURE_OWNER_PRINCIPAL)), [[ALUMNI, 'alumni-only']]);

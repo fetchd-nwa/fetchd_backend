@@ -59,7 +59,13 @@ test(
     if (res.statusCode !== 200) {
       throw new Error(`/credit-packages returned ${res.statusCode}: ${res.body}`);
     }
-    assert.deepStrictEqual(res.json(), loadSnapshot('credit-packages-bentonville'));
+    // The shared rows, bare, as Fayetteville's snapshot is; this household has no alumni dog,
+    // so its read withholds the alumni pack (ALUM-U11), which M5.25 put at Bentonville.
+    const bare = loadSnapshot('credit-packages-bentonville') as CreditPackageWire[];
+    assert.deepStrictEqual(
+      res.json(),
+      bare.map((row) => (row.tier === 'alumni' ? { ...row, withheld_reason: 'alumni-only' } : row)),
+    );
   },
 );
 
@@ -92,7 +98,7 @@ test(
     );
     assert.deepEqual(
       seeded.filter((r) => r.tier === 'alumni').map((r) => [r.key, r.location, r.mode]),
-      [['school-alumni-10-fayetteville', 'fayetteville', 'school']],
+      [['daycare-alumni-10-bentonville', 'bentonville', 'daycare']],
     );
     assert.equal(
       rows.some((r) => r.mode === 'daycare' && r.location === 'fayetteville'),

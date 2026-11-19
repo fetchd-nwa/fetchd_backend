@@ -375,26 +375,28 @@ test(
     const { app } = buildApp();
     const dogId = await createBookableDog(createdDogs);
     await db.update(dogs).set({ isAlumni: true }).where(eq(dogs.id, dogId));
+    // M5.25: the alumni pack sells at Bentonville day care, so the alumni pool is there.
     const alumniLot = await plantLot({
       credits: 1,
       expiresAt: FIXTURE_LOT_EXPIRES_AT,
-      location: 'fayetteville',
+      location: 'bentonville',
+      mode: 'daycare',
       tier: 'alumni',
     });
     const dates = weekdays(2);
     const payment = { kind: 'credits', tier: 'alumni' };
-    const where = { location: 'fayetteville' };
+    const where = { location: 'bentonville', category: 'day-care' };
 
     const details = insufficient(await post(app, bodyFor(dogId, dates, payment, where)));
-    assert.equal(details.top_up_offer?.package_key, 'single-day-school-fayetteville');
-    assert.equal(details.alternative_package_key, 'school-alumni-10-fayetteville');
+    assert.equal(details.top_up_offer?.package_key, 'single-day-daycare-bentonville');
+    assert.equal(details.alternative_package_key, 'daycare-alumni-10-bentonville');
     assert.deepEqual(details.gaps, [
-      { location: 'fayetteville', mode: 'school', tier: 'alumni', balance: 1, required: 2 },
+      { location: 'bentonville', mode: 'daycare', tier: 'alumni', balance: 1, required: 2 },
     ]);
 
     const res = await post(
       app,
-      bodyFor(dogId, dates, { ...topUp(1, 6_000), tier: 'alumni' }, where),
+      bodyFor(dogId, dates, { ...topUp(1, 3_500), tier: 'alumni' }, where),
     );
     assert.equal(res.statusCode, 201, res.body);
 
@@ -530,18 +532,20 @@ test(
   async () => {
     const { app, stripe } = buildApp();
     const dogId = await dogWithCredits(0);
-    const key = 'school-alumni-10-fayetteville';
+    // M5.25: the live alumni row of a campus is Bentonville day care's.
+    const key = 'daycare-alumni-10-bentonville';
     const [row] = await db.select().from(creditPackages).where(eq(creditPackages.key, key));
     assert.ok(row);
     const details = insufficient(
       await post(
         app,
         bodyFor(dogId, weekdays(6), topUp(1, row.priceCents, { package_key: key }), {
-          location: 'fayetteville',
+          location: 'bentonville',
+          category: 'day-care',
         }),
       ),
     );
-    assert.equal(details.shortfall, 2, 'the fixture holds 4 Fayetteville credits');
+    assert.equal(details.shortfall, 4, 'the fixture holds 2 Bentonville day care credits');
     await assertNothingCharged(dogId);
     assert.equal(stripe.calls.length, 0);
   },

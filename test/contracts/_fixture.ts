@@ -259,12 +259,13 @@ export const EVALUATION_RATE_SEED_IDS = [
   'e7a10000-0000-4000-8000-000000000002',
 ];
 
-/** M4.06's ten keys, the rows schema.sql seeds into `credit_packages`, and the
- *  `effective_from` every one of them carries. */
+/** The ten LIVE keys schema.sql seeds into `credit_packages` (M4.06's, with M5.25's
+ *  Bentonville alumni pack in place of the Fayetteville one it closed), and the
+ *  `effective_from` every one of them carries. The closed Fayetteville row is not here, so
+ *  `resetCatalogSeed` leaves it closed. */
 export const CATALOG_SEED_KEYS = [
   'school-2x-weekly-fayetteville',
   'school-3x-weekly-fayetteville',
-  'school-alumni-10-fayetteville',
   'single-day-school-fayetteville',
   'school-2x-weekly-bentonville',
   'school-3x-weekly-bentonville',
@@ -272,11 +273,12 @@ export const CATALOG_SEED_KEYS = [
   'single-day-school-bentonville',
   'daycare-10-bentonville',
   'single-day-daycare-bentonville',
+  'daycare-alumni-10-bentonville',
 ];
 export const CATALOG_SEED_EFFECTIVE_FROM = '2026-01-01';
 
 /**
- * M4.06's ten rows stay across files, as M3.05's two rates do. A test that edits one's
+ * The ten live seed rows stay across files, as M3.05's two rates do. A test that edits one's
  * months opens a successor, or closes the seed row, so the successor goes and the seed
  * row comes back open at its seed. A missing one stays missing, so the suite says so.
  */

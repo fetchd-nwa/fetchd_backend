@@ -194,7 +194,11 @@ async function poolsOf(
   return pools.sort(byPool);
 }
 
-/** The refusals of a pool no v1 booking can draw from (design §2.4:3088-3089). */
+/**
+ * The refusals of a pool no v1 booking can draw from (design §2.4:3088-3089). Alumni credits
+ * pay for day care only (her 553; M5.25), and the order route refuses an alumni dog at day
+ * school (R7, `alumni_no_day_school`), so an alumni day-school pool at either campus is one.
+ */
 async function assertPoolBookable(tx: Tx, pool: CreditPool, today: string): Promise<void> {
   const rows = await creditPackagesRepository.findLiveForProgram(tx, {
     location: pool.location,
@@ -203,6 +207,9 @@ async function assertPoolBookable(tx: Tx, pool: CreditPool, today: string): Prom
   });
   if (rows.length === 0) {
     throw new ApiError('pool_not_bookable', `no package sells ${pool.mode} at ${pool.location}`);
+  }
+  if (pool.tier === 'alumni' && pool.mode === 'school') {
+    throw new ApiError('pool_not_bookable', 'alumni credits pay for day care only');
   }
   if (pool.tier === 'alumni' && !(await dogsRepository.ownerHasAlumniDog(tx, pool.ownerId))) {
     throw new ApiError('pool_not_bookable', 'this account has no alumni dog');

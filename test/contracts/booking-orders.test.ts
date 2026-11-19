@@ -482,7 +482,7 @@ test(
 // ── B12: the bounds ─────────────────────────────────────────────────────────────
 
 test(
-  'B12: each bound is `invalid_payload` (a dog on one date in two parts, too many parts, 151 dog-dates, 6 dogs, a pool consented twice); 31 dates in a part is 400; a staff principal is 403',
+  'B12: each bound is `invalid_payload` (a dog on one date in two parts, at one campus or at two with nothing written, too many parts, 151 dog-dates, 6 dogs, a pool consented twice); 31 dates in a part is 400; a staff principal is 403',
   SKIP_WHEN_NO_DB,
   async () => {
     const { app } = orderApp();
@@ -511,6 +511,37 @@ test(
       }),
       'invalid_payload',
     );
+
+    // The same bound across two campuses (fix 1, the Opus seat's L1): a real dog with a
+    // credit at each pool, so that only this bound stands between the order and a booking
+    // at both campuses, two credits spent for one day. Nothing is written at either.
+    const realLola = await createBookableDog(created);
+    await care({ credits: 1 });
+    await plantLot({
+      credits: 1,
+      expiresAt: ENDS_31_DEC,
+      location: 'fayetteville',
+      mode: 'school',
+    });
+    const fayBefore = await poolBalance({ location: 'fayetteville', mode: 'school' });
+    const twoCampusesBefore = await rowCounts();
+    refused(
+      await post(app, {
+        parts: [
+          part({ dogs: [realLola], dates: [D.MON] }),
+          part({
+            category: 'day-school',
+            location: 'fayetteville',
+            dogs: [realLola],
+            dates: [D.MON],
+          }),
+        ],
+      }),
+      'invalid_payload',
+    );
+    assert.deepEqual(await rowCounts(), twoCampusesBefore, 'nothing at either campus');
+    assert.equal(await careBalance(), 1);
+    assert.equal(await poolBalance({ location: 'fayetteville', mode: 'school' }), fayBefore);
 
     const one = dog();
     refused(

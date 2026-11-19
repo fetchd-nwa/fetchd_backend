@@ -96,12 +96,12 @@ test(
     const { owner, staff } = buildApp();
     const edit = await staff.inject({
       method: 'PATCH',
-      url: '/staff/credit-packages/school-alumni-10-fayetteville',
+      url: '/staff/credit-packages/daycare-alumni-10-bentonville',
       headers: { 'idempotency-key': `stamp-edit-${randomUUID()}` },
       payload: { expiry_months: 3 },
     });
     assert.equal(edit.statusCode, 200, edit.body);
-    assert.equal(await stampOf(owner, 'school-alumni-10-fayetteville'), THREE_MONTHS_ON);
+    assert.equal(await stampOf(owner, 'daycare-alumni-10-bentonville'), THREE_MONTHS_ON);
   },
 );
 

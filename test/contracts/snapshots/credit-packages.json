@@ -36,18 +36,6 @@
     "expiry_months": 1
   },
   {
-    "key": "school-alumni-10-fayetteville",
-    "location": "fayetteville",
-    "mode": "school",
-    "tier": "alumni",
-    "credits": 10,
-    "price_cents": 32000,
-    "label": "Alumni Fayetteville 10 Visits",
-    "is_popular": false,
-    "single_day": false,
-    "expiry_months": 1
-  },
-  {
     "key": "test-school-10",
     "location": "fayetteville",
     "mode": "school",

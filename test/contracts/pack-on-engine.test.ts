@@ -512,7 +512,7 @@ test('the alumni row lands in the alumni pool', SKIP_WHEN_NO_DB, async (t) => {
   await createAlumniDog(alumniDogs);
   t.after(() => removeDogs(alumniDogs));
   const { app } = buildApp();
-  const res = await buy(app, 'school-alumni-10-fayetteville');
+  const res = await buy(app, 'daycare-alumni-10-bentonville');
   assert.equal(res.statusCode, 201, res.body);
   const [lot] = await purchaseLots();
   assert.equal(lot?.tier, 'alumni');
