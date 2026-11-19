@@ -12,6 +12,89 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [9.1.0] — 2026-11-18
+
+ADDITIVE. Plan one-off O-CREDITS, her follow-up round (build DECISIONS 540-542, 553, 562;
+her #20-#23 and #25, `PLAYGROUND-BUGS.md:28-33`), designed in
+`designs/credits-joint-booking.md` (§3.1, and Amendment A1, DECISIONS 573), adopted after two
+Fable reads (DECISIONS 555, 561, 563); this contract revised after Fable's and the Opus
+adversary's reads and re-reads (DECISIONS 571, 573, 577, 578). Her words: "i want one alumni credit to one dog and one
+normal day care credit for the other dog / i dont want the owners to even have to think about
+it" (541); "dont book both dogs until either all credits are satisfied, or i remove enough
+classes" (#23). A whole Confirm of day school and day care is booked in one transaction or not
+at all, the server picks each dog's credit (alumni first for an alumni dog, never for another
+dog), and she is asked one question only when the answer changes what she pays. Not a design
+section (design_label none). Build label 9.1.0: the next minor at its landing (DECISIONS 418's
+rule), so P51 moves to 9.2.0 and S42/P31 to 9.3.0, both provisional. It reads 9.0.0 (P49).
+Every addition is a new route, a new type or constant, an optional field, or a new member of an
+error union a client reads as `Partial`, so a 9.0.0 client reads 9.1.0 unchanged.
+`POST /bookings` is unchanged. Contract-first: the routes and codes do not exist until
+O-CREDITS' backend lands them. Resync both clients (`npm run sync:contracts` in mobile and
+portal).
+
+### Added
+
+- `POST /booking-orders` `[owner]`, Idempotency-Key → 201 `PostBookingOrdersResponse`
+  (`PostBookingsResponse` + `plan: DogCreditPlanWire[]`; `order.charge_status` always
+  `'none'`).
+  - Body: `PostBookingOrdersRequest {parts: BookingOrderPart[], alumni_on_regular?:
+    {location, mode, count}[]}`, where `BookingOrderPart = Omit<PostBookingsRequest,
+    'payment'>`, so a part carries no `tier` and no `top_up`.
+  - One transaction books every part at every campus, or none; any refusal writes nothing. It
+    charges nothing.
+  - Bounds: `day.max_dogs_per_booking_count` dogs across parts; dogs × 2 × 2 parts (parse
+    ceiling 100); `MAX_DOG_DATES_PER_ORDER` dog-dates; `MAX_DATES_PER_PART` dates a part; no dog
+    on one date in two parts.
+  - The server picks each dog's credit. An alumni dog's days that no alumni lot pays are paid
+    from regular credits without asking, unless a live, reaching, cheaper alumni row makes them
+    askable (her 562 (a)).
+  - Askable days need `alumni_on_regular` with `count` equal to the `consentable` she was
+    shown, and only those days are paid from regular credits (Amendment A1).
+  - Refusal order: auth, parse and bounds, ownership; per part the campus, the clock, the
+    gates and `alumni_no_day_school`; `already_booked`; `insufficient_capacity` and
+    `after_school_full`; then `credit_expired_before_date`, `alumni_credits_short` and
+    `credits_short`.
+- `POST /booking-orders/check` `[owner]`: the same body, no key, writes nothing → 200
+  `PostBookingOrdersCheckResponse {bookable: true, plan}`, or exactly the POST's refusal. More
+  than 60 checks per owner per minute → 429 `rate_limited`, checked before the body is
+  validated. The limiter fails open, and logs when it does.
+- `DogCreditPlanWire {dog_id, location, mode, tier, count}`: what an order spends, per dog and
+  pool, read from the debits (the POST) or from the rolled-back run (the check).
+- `PoolShortWire<T extends CreditTier>` (§1a): one pool short across the whole order,
+  `{location, mode, tier: T, balance, required, shortfall, dog_ids, short_dates: {date, dog_id,
+  reason, expires_at?}[]}`.
+- `ApiErrorCode` gains its 56th to 59th thrown codes, appended after `'refund_in_flight'` (in
+  `API_ERROR_CODES` and `API_ERROR_STATUS`):
+  - `'credits_short'` (422): `CreditsShortDetails {kind, pools: PoolShortWire<'regular'>[]}`;
+  - `'alumni_credits_short'` (422): `AlumniCreditsShortDetails {kind, pools:
+    (PoolShortWire<'alumni'> & {package_key, consentable})[]}`. `package_key` is the smallest
+    live alumni row by `credits` that is cheaper and reaches the dates, ties by `key`
+    (DECISIONS 577);
+  - `'alumni_no_day_school'` (422): `AlumniNoDaySchoolDetails {kind, dog_ids}`;
+  - `'rate_limited'` (429): no `details`. It is the first 429 on the wire.
+
+  The three detail arms join `ApiErrorDetailWire`.
+- `AfterSchoolFullDetails.location?` and `CreditExpiredBeforeDateDetails.location?` (optional):
+  the campus of the refusal. Both are always present on `POST /booking-orders` and omitted on
+  `POST /bookings`, so a two-campus order names its campus.
+- `MAX_DATES_PER_PART` (30) and `MAX_DOG_DATES_PER_ORDER` (150), exported so that the phone's
+  pre-check and the server share them.
+- `PostBookingOrdersErrorDetails` and its runtime twin `POST_BOOKING_ORDERS_ERROR_DETAIL_KINDS`
+  (11 arms, in the order the route meets them), pinned in §16 (WC-A1).
+
+### Documentation
+
+- `PostBookingsRequest`: from 9.1.0 the owner app books through `POST /booking-orders`. This
+  route is unchanged for older builds and the dormant `top_up`. It applies neither alumni-first
+  nor `alumni_no_day_school`, and its owner use is to be refused at the next breaking build
+  version (plan label 10.0.0, P36; DECISIONS 561).
+- `CreditExpiredBeforeDateDetails` gives its meaning on the order route: one campus per
+  refusal, the pool that would pay the day, and askable alumni days left to the question.
+  `AfterSchoolFullDetails` names the order route as its second emitter.
+- The landing-group note names 9.1.0, P51's 9.2.0 and S42's 9.3.0.
+- The note in bookings §(a) no longer counts its tuples (it said "the two per-endpoint 422
+  aliases").
+
 ## [9.0.0] — 2026-11-16
 
 BREAKING. The fix phase Allison ordered first (build DECISIONS 396, 402); plan unit P49,

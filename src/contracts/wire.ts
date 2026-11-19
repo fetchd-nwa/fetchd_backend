@@ -76,11 +76,15 @@
  * places and the after-school removal; 9.0.0 (P49, breaking), private lessons
  * and Board & Train bookable with staff approval and $0 moving (build DECISIONS
  * 393, 413, 414, 418; a breaking fix-phase step skips 7.0.0 and 8.0.0, which are
- * design labels). P51, the bill at the end of those two services, takes 9.1.0,
- * and S42 (design 7.1.0), once build 6.2.0 and then 6.5.0, now ships as build
- * 9.2.0; both are provisional until their contract steps.
+ * design labels). 9.1.0 (plan one-off O-CREDITS, additive): a whole Confirm of
+ * day school and day care booked all or none, each dog's credit picked by the
+ * server (`POST /booking-orders`; designs/credits-joint-booking.md; build
+ * DECISIONS 541, 542, 553, 561-563). It took the next minor at its landing, so
+ * under DECISIONS 418's rule P51, the bill at the end of those two services, moves
+ * to 9.2.0, and S42 (design 7.1.0), once build 6.2.0, then 6.5.0, then 9.2.0, now
+ * ships as build 9.3.0; both are provisional until their contract steps.
  */
-export const WIRE_CONTRACT_VERSION = '9.0.0';
+export const WIRE_CONTRACT_VERSION = '9.1.0';
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -239,6 +243,15 @@ export const WIRE_CONTRACT_VERSION = '9.0.0';
  * `details`: the code is the whole signal. The refund routes (§ refunds) say
  * which each answers. `'instrument_mismatch'` is typed here and thrown by no
  * route until build 11.1.0 (design 6.1.0), when a charge can be paid by hand.
+ *
+ * 9.1.0 appends four thrown codes, the 56th to the 59th, after
+ * `'refund_in_flight'` — appended, never inserted (designs/credits-joint-booking.md
+ * §3.1; plan one-off O-CREDITS): `'credits_short'`, `'alumni_credits_short'` and
+ * `'alumni_no_day_school'`, each 422 with `details` (`CreditsShortDetails`,
+ * `AlumniCreditsShortDetails`, `AlumniNoDaySchoolDetails`), and `'rate_limited'`,
+ * 429, no `details`: the first 429 on the wire. `POST /booking-orders` and
+ * `POST /booking-orders/check` are their routes (`PostBookingOrdersRequest`); no
+ * other route throws them.
  */
 export type ApiErrorCode =
   | 'unauthenticated' // missing/malformed Authorization header or bad token
@@ -296,7 +309,11 @@ export type ApiErrorCode =
   | 'instrument_unavailable' // refund blocked — cash or check, before a charge can be paid by hand (6.0.0)
   | 'instrument_mismatch' // refund blocked — the instrument does not match how the charge was paid (6.0.0; thrown from build 11.1.0)
   | 'refund_superseded' // retry or close blocked — a later retry in the refund's chain carries it (6.0.0)
-  | 'refund_in_flight'; // retry or close blocked — a refund on the same payment is still pending (6.0.0)
+  | 'refund_in_flight' // retry or close blocked — a refund on the same payment is still pending (6.0.0)
+  | 'credits_short' // order blocked — regular credits do not cover every dog's days, counted across the order (9.1.0)
+  | 'alumni_credits_short' // order blocked — an alumni dog's days need her answer: buy the cheaper alumni pack, or use regular credits (9.1.0)
+  | 'alumni_no_day_school' // order blocked — an alumni dog on a day-school part (9.1.0)
+  | 'rate_limited'; // check blocked — more than 60 `POST /booking-orders/check` calls by one owner in one minute (9.1.0)
 
 export const API_ERROR_CODES = [
   'unauthenticated',
@@ -355,6 +372,10 @@ export const API_ERROR_CODES = [
   'instrument_mismatch',
   'refund_superseded',
   'refund_in_flight',
+  'credits_short',
+  'alumni_credits_short',
+  'alumni_no_day_school',
+  'rate_limited',
 ] as const satisfies readonly [ApiErrorCode, ...ApiErrorCode[]];
 
 /**
@@ -474,6 +495,15 @@ export const API_ERROR_STATUS = {
   instrument_mismatch: 422,
   refund_superseded: 409,
   refund_in_flight: 409,
+  // 9.1.0 (new codes, so their statuses are set in the same bump): three
+  // well-formed orders refused by the credits they would spend or by her rule
+  // that an alumni dog cannot book day school, the family of
+  // `insufficient_credits`, 422; and the check's throttle, 429, the one status
+  // that says "too many requests" (designs/credits-joint-booking.md §3.1, §3.2).
+  credits_short: 422,
+  alumni_credits_short: 422,
+  alumni_no_day_school: 422,
+  rate_limited: 429,
 } as const satisfies Record<ApiErrorCode, number>;
 
 /**
@@ -535,6 +565,51 @@ export interface CreditGap {
   tier: CreditTier;
   balance: number;
   required: number;
+}
+
+/**
+ * One pool short on `POST /booking-orders`, counted across the WHOLE order (9.1.0;
+ * designs/credits-joint-booking.md §3.1, §3.2 step 8): the owner's pool of one campus,
+ * program and tier, never a dog. The item of `CreditsShortDetails` (`T` `'regular'`) and of
+ * `AlumniCreditsShortDetails` (`T` `'alumni'`), so `tier` is a literal on each arm.
+ *   - `balance`: the pool's live balance before the order, as `CreditGap.balance`.
+ *   - `required`: the order's days this pool would pay if it held enough, one per dog per
+ *     date. A regular pool's: every day of a dog that is not alumni at this campus and
+ *     program, plus the alumni dogs' days paid from it (`PostBookingOrdersRequest`). An
+ *     alumni pool's: every day of the alumni dogs at this campus and program.
+ *   - `shortfall`: how many credits are missing, ≥ 1. A regular pool's counts every day it
+ *     leaves unpaid; an alumni pool's counts only its askable days, the ones the alumni
+ *     question is about (`AlumniCreditsShortDetails`). A lot pays a date only while it
+ *     reaches that date, so the pool can be short with `balance` at `required`: read
+ *     `shortfall`, never a subtraction of the two.
+ *   - `dog_ids`: every dog with a short day in this pool, in the order's dog order.
+ *   - `short_dates`: one entry per missing credit, so its length is `shortfall`: ascending
+ *     by `date`, and within a date in the order slots are paid (below). `dog_id` is the dog
+ *     the credit is missing for. `reason` and `expires_at` read as on
+ *     `InsufficientCreditsDetails.short_dates`: `'credits_expire_first'` when her lots of
+ *     this pool die before the date, with `expires_at` (ISO-8601) the latest expiry among
+ *     those that had credits left: "Yours expire Tue 24 Nov".
+ * Who is named short (design §3.2, N2): slots run date ascending; within a date, the dogs
+ * that are not alumni first, then the alumni dogs' days paid from the regular pool, each in
+ * the order's dog order; a lot pays the soonest-expiring first. So the days named short are
+ * the last dogs' on the latest dates.
+ */
+export interface PoolShortWire<T extends CreditTier> {
+  location: LocationKey;
+  mode: BookingMode;
+  tier: T;
+  balance: number;
+  required: number;
+  /** ≥ 1. Read this, never `balance − required`. */
+  shortfall: number;
+  /** Dogs with a short day, in the order's dog order. */
+  dog_ids: string[];
+  short_dates: {
+    date: string;
+    dog_id: string;
+    reason: 'no_credit' | 'credits_expire_first';
+    expires_at?: string;
+  }[];
 }
 
 /**
@@ -719,11 +794,27 @@ export interface InsufficientCreditsDetails {
  * Never emitted while `cred.expiry_enforced_enabled` is false or
  * `cred.booking_outlives_lot_expiry_enabled` is true: a credit bought today then
  * reaches every date (design §2.4:2904, :2918).
+ *
+ * On `POST /booking-orders` (9.1.0; designs/credits-joint-booking.md §3.2 step 8) the
+ * same shape is the first of the order's credit refusals, before `alumni_credits_short`
+ * and `credits_short`, so nothing is sold for an order a purchase cannot complete. A day
+ * is named when no lot of the pool that would pay it pays it, and a credit of that pool
+ * bought now would not reach it: for a dog that is not alumni, and for an alumni dog's day
+ * paid from the regular pool, the regular single-day row's reach. An askable alumni day
+ * (`PostBookingOrdersRequest`) is never named here: the alumni question names it.
+ * `location` names the one campus the refusal is about, always present on this route (a
+ * `POST /bookings` body names one campus, so that route omits it): the first in
+ * `LOCATIONS` order with such a day. `dates` lists every such date there, ascending,
+ * without repeats, and `expires_at` is that campus's value, read as above. Another
+ * campus's days are named on the next try.
  */
 export interface CreditExpiredBeforeDateDetails {
   kind: 'credit_expired_before_date';
   expires_at: string;
   dates: string[];
+  /** 9.1.0: the campus of `dates`. Always present on `POST /booking-orders`; omitted on
+   *  `POST /bookings`. */
+  location?: LocationKey;
 }
 
 /**
@@ -962,12 +1053,19 @@ export interface NoShowTooEarlyDetails {
  * for `insufficient_capacity`. `date` is the first such date in date order,
  * `YYYY-MM-DD`. The order is refused whole: nothing is booked, debited or
  * charged. Untick a dog on that date and send again.
+ *
+ * From 9.1.0 `POST /booking-orders` answers it too, counted with every part of the order at
+ * that campus and date, before any credit refusal (`PostBookingOrdersErrorDetails`), and
+ * names the campus in `location`, so a two-campus order says which.
  */
 export interface AfterSchoolFullDetails {
   kind: 'after_school_full';
   date: string;
   capacity: number;
   booked: number;
+  /** 9.1.0: the campus of `date`. Always present on `POST /booking-orders`; omitted on
+   *  `POST /bookings`, whose body names one campus. */
+  location?: LocationKey;
 }
 
 /**
@@ -988,6 +1086,67 @@ export interface RequestStayConflictDetails {
 }
 
 /**
+ * Rides code `credits_short` (422) — `kind` equals `code`. New 9.1.0
+ * (designs/credits-joint-booking.md §3.1, §3.2 step 8; her #21, #22, #23). Emitted by
+ * `POST /booking-orders` and its check, last of the order's refusals: regular credits do
+ * not cover every day the order pays from them. `pools` has one entry per short regular
+ * pool, every campus and program of the order (`PoolShortWire<'regular'>`), in `LOCATIONS`
+ * then `BOOKING_MODES` order. Each `shortfall` is that pool's whole shortfall across every
+ * dog and part, so a shop opened from it starts at the number she needs. Atomic: nothing is
+ * written at any campus. She buys credits and the app checks again, or she changes the
+ * booking. There is no top-up: this route charges nothing.
+ */
+export interface CreditsShortDetails {
+  kind: 'credits_short';
+  pools: PoolShortWire<'regular'>[];
+}
+
+/**
+ * Rides code `alumni_credits_short` (422) — `kind` equals `code`. New 9.1.0
+ * (designs/credits-joint-booking.md §3.2 step 8 and Amendment A1; her 541, 542 answer 1,
+ * 562 (a); build DECISIONS 573). Emitted by `POST /booking-orders` and its check when an
+ * alumni dog has askable days (`PostBookingOrdersRequest`) that her consent does not cover.
+ * `pools` has one entry per such alumni pool, in `LOCATIONS` then `BOOKING_MODES` order:
+ *   - `shortfall`: every askable day of the pool.
+ *   - `consentable`: how many of those days a regular credit could pay, 0..`shortfall`. A
+ *     day counts when the regular pass, run as if every askable day joined it, pays it, or
+ *     leaves it short on a date that a regular single day bought now would reach. It equals
+ *     `shortfall` whenever expiry does not bind, and at the seed, where both rows give one
+ *     month. Her "Use a day care credit" sends it back as `alumni_on_regular[].count`, and
+ *     only those days are then paid from the regular pool.
+ *
+ *     The other `shortfall − consentable` days, if there are any, still need alumni
+ *     credits. With her consent matching, the order answers this refusal again with the
+ *     same two numbers, and the app offers only "Buy alumni credits (cheaper)" for those
+ *     days. At `consentable: 0` it offers only that.
+ *   - `package_key`: the pack "Buy alumni credits (cheaper)" opens on: the smallest live
+ *     alumni row of that campus and program by `credits` that is cheaper and reaches the
+ *     dates, ties by `key` (build DECISIONS 577). Cheaper means a lower price per credit than
+ *     the regular single day there, and the dates are the pool's askable dates. The client
+ *     reads its name and price from that key's `GET /credit-packages` row, never a rate.
+ * Before `credits_short`, after `credit_expired_before_date`. Atomic.
+ */
+export interface AlumniCreditsShortDetails {
+  kind: 'alumni_credits_short';
+  pools: (PoolShortWire<'alumni'> & { package_key: string; consentable: number })[];
+}
+
+/**
+ * Rides code `alumni_no_day_school` (422) — `kind` equals `code`. New 9.1.0
+ * (designs/credits-joint-booking.md §1 item 7, §3.2 step 5; her #25: "This dog is alumni and
+ * can't book day school"). Emitted by `POST /booking-orders` and its check when a
+ * `'day-school'` part carries a dog whose `DogWire.is_alumni` is true. `dog_ids` lists every
+ * such dog of the first part that refuses, in that part's dog order. Atomic: the whole order
+ * is refused; the app takes the dog off day school and sends the rest again. A day-school
+ * booking made before the dog became alumni stands, and `POST /bookings` does not apply this
+ * rule (`PostBookingsRequest`).
+ */
+export interface AlumniNoDaySchoolDetails {
+  kind: 'alumni_no_day_school';
+  dog_ids: string[];
+}
+
+/**
  * Every `details` payload the API can emit, closed. Provably complete at
  * 1.13.0 by full construction-site sweep, and kept complete by the fold-in:
  * `ApiError`'s constructor takes exactly this union, so a future route
@@ -1001,7 +1160,9 @@ export interface RequestStayConflictDetails {
  * emitted until its predicate landed at 5.0.0-lg4.2. 5.0.0 appends
  * `AlumniPackageIneligibleDetails` (ALUM-U11). 6.0.0-lg5.1 appends the four
  * board and cancel arms (DAY-U29, DAY-U33, CXL-U09). 6.0.0-lg5.2 appends
- * `AfterSchoolFullDetails` (DAY-U43).
+ * `AfterSchoolFullDetails` (DAY-U43). 9.1.0 appends `CreditsShortDetails`,
+ * `AlumniCreditsShortDetails` and `AlumniNoDaySchoolDetails` (`POST /booking-orders`),
+ * contract-first: no route emits them until O-CREDITS' backend lands.
  */
 export type ApiErrorDetailWire =
   | PaymentRequiredDetails
@@ -1028,7 +1189,10 @@ export type ApiErrorDetailWire =
   | SessionNotTodayDetails
   | NoShowTooEarlyDetails
   | AfterSchoolFullDetails
-  | RequestStayConflictDetails;
+  | RequestStayConflictDetails
+  | CreditsShortDetails
+  | AlumniCreditsShortDetails
+  | AlumniNoDaySchoolDetails;
 
 // ============================================================================
 // §2 · shared enums + value tuples (orchestrator-owned)
@@ -2427,8 +2591,49 @@ export interface PostBookingsResponse {
   sessions: BookingWire[];
 }
 
+/**
+ * What one order spends, per dog and pool (9.1.0; designs/credits-joint-booking.md §3.1, M6):
+ * `count` credits of the owner's pool `(location, mode, tier)` spent for `dog_id`. The
+ * server's pick, which the phone never guesses: a Confirmed screen and a review read it
+ * ("Waffles: 1 alumni credit, 2 day care credits"). On `POST /booking-orders`' 201 it is read
+ * from the debits just written; on `POST /booking-orders/check`'s 200 it is what the POST
+ * would write at that moment. One entry per dog and pool with `count` ≥ 1, in the order's
+ * dog order, then `LOCATIONS`, `BOOKING_MODES` and `CREDIT_TIERS` order, so a check and the
+ * POST that follows it compare equal. The counts sum to the order's dog-dates. It is the
+ * answer at booking, never re-read: a later cancel returns each credit to its own lot
+ * (per debit), which this does not show.
+ */
+export interface DogCreditPlanWire {
+  dog_id: string;
+  location: LocationKey;
+  mode: BookingMode;
+  tier: CreditTier;
+  count: number;
+}
+
+/**
+ * `POST /booking-orders` 201 body (9.1.0): `PostBookingsResponse`'s shape, one `order` for
+ * the whole Confirm and every session of every part in `sessions` (each with `order_id` =
+ * `order.id`, ascending by `scheduled_at`, ties in part order), plus `plan`.
+ * `order.charge_status` is always `'none'`: the route charges nothing. A same-key replay
+ * returns this body as stored, `plan` included.
+ */
+export interface PostBookingOrdersResponse extends PostBookingsResponse {
+  plan: DogCreditPlanWire[];
+}
+
+/**
+ * `POST /booking-orders/check` 200 body (9.1.0): the order would book now, and `plan` is
+ * what it would spend. Advisory: the POST checks everything again under its locks. A check
+ * that would refuse answers the POST's refusal instead, never a 200 with `bookable: false`.
+ */
+export interface PostBookingOrdersCheckResponse {
+  bookable: true;
+  plan: DogCreditPlanWire[];
+}
+
 // ---- (a) domain-local value tuples -----------------------------------------
-// Runtime arm lists for the two per-endpoint 422 aliases below (§2.1(d)). They
+// Runtime arm lists for the per-endpoint 422 aliases below (§2.1(d)). They
 // exist because a type alias cannot be asserted in the backend's `test/` tree —
 // it runs type-ERASED (designs/wire-contract-completion.md §14.5) — so the
 // §3.5 "provoke an arm, parse the envelope as the alias" pin needs a runtime
@@ -2465,6 +2670,38 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
   PostRequestsErrorDetails['kind'],
   ...PostRequestsErrorDetails['kind'][],
 ];
+
+/** Every `details.kind` `POST /booking-orders` and `POST /booking-orders/check` can refuse
+ *  with, each 422 — the runtime twin of `PostBookingOrdersErrorDetails`, in the order the
+ *  order meets them (designs/credits-joint-booking.md §3.1 "Refusal order", §3.2). New
+ *  9.1.0. */
+export const POST_BOOKING_ORDERS_ERROR_DETAIL_KINDS = [
+  'payment_required',
+  'evaluation_required',
+  'vaccine_missing',
+  'agreement_unsigned',
+  'alumni_no_day_school',
+  'already_booked',
+  'insufficient_capacity',
+  'after_school_full',
+  'credit_expired_before_date',
+  'alumni_credits_short',
+  'credits_short',
+] as const satisfies readonly [
+  PostBookingOrdersErrorDetails['kind'],
+  ...PostBookingOrdersErrorDetails['kind'][],
+];
+
+/**
+ * `POST /booking-orders`' two size bounds (9.1.0; designs/credits-joint-booking.md §3.1
+ * "Bounds"), exported so that the phone's pre-check (§11 L3) and the server read one number.
+ * Each part takes 1..`MAX_DATES_PER_PART` dates, the same 30 that `POST /bookings` takes by
+ * its parse; more is 400 `bad_request`. A whole order holds at most
+ * `MAX_DOG_DATES_PER_ORDER` dog-dates, each dog's day counting as one; more is 422
+ * `invalid_payload`.
+ */
+export const MAX_DATES_PER_PART = 30;
+export const MAX_DOG_DATES_PER_ORDER = 150;
 
 // ---- (c) request bodies + query shapes -------------------------------------
 
@@ -2554,6 +2791,14 @@ export const POST_REQUESTS_ERROR_DETAIL_KINDS = [
  * CRED-U10). The server picks no pool. When two fit, the app asks her and sends
  * `tier` (CRED-20).
  *
+ * From 9.1.0 the owner app books through `POST /booking-orders`
+ * (`PostBookingOrdersRequest`), where the server picks each dog's credit and a Confirm
+ * books all or nothing (designs/credits-joint-booking.md §3.4). This route is unchanged
+ * for older app builds and the dormant `top_up`: it does not apply the order's alumni-first
+ * pick or `alumni_no_day_school`. Its owner use is to be refused at the next breaking build
+ * version (plan label 10.0.0, P36; build DECISIONS 561). Its 30-date cap is the same number
+ * the wire exports as `MAX_DATES_PER_PART`.
+ *
  * `payment.top_up` buys the missing credits inside this request (design
  * §2.3:2613-2630, §2.7:4061-4092; PAY-U09). The client answers the 422's
  * `top_up_offer` by re-sending the same body with `top_up` under a fresh
@@ -2610,6 +2855,112 @@ export interface PostBookingsRequest {
     };
   };
 }
+
+/**
+ * `POST /booking-orders` body `[owner]` (9.1.0; plan one-off O-CREDITS;
+ * designs/credits-joint-booking.md §3.1-§3.2; her #20-#23, #25 and build DECISIONS 541, 542,
+ * 553, 562). One Confirm of day school and day care, every dog, campus and date of it, in
+ * ONE transaction: it books every part or none (her #23, "dont book both dogs until either
+ * all credits are satisfied, or i remove enough classes"). Any refusal refuses the whole
+ * order at every campus and writes nothing: no booking, debit, order, reminder or stored
+ * answer. It charges nothing and has no payment arm: she buys credits first
+ * (`POST /credit-packages/:key/purchase`), then sends the order. `Idempotency-Key` is
+ * required (§0 conventions); the transaction runs under `withMutation` with the owner as
+ * its actor. Response: 201 `PostBookingOrdersResponse`.
+ *
+ * Each part is one campus, one program and one date set, with every dog on those dates:
+ * `PostBookingsRequest` without `payment` (`BookingOrderPart`), parsed and checked by that
+ * route's own rules. The part is `.strict()`, so a part carrying `payment` is 400
+ * `bad_request`. Its dates are 1..`MAX_DATES_PER_PART` (30) by the parse, so 31 is 400. The
+ * lead is not repeated, the dates are distinct and today-or-later in America/Chicago, and
+ * the `after_school` ticks are checked as on that route.
+ *
+ * Order-wide bounds, each 422 `invalid_payload`:
+ *   - at most `day.max_dogs_per_booking_count` distinct dogs across all parts (seeded 5);
+ *   - at most (distinct dogs) × 2 campuses × 2 programs parts (20 at the seed);
+ *   - at most `MAX_DOG_DATES_PER_ORDER` (150) dog-dates in all, each dog's day counting as
+ *     one;
+ *   - no dog on one date in two parts;
+ *   - at most one `alumni_on_regular` entry per `(location, mode)`.
+ * Two more limits belong to the parse, so they answer 400 `bad_request`, not 422: `parts`
+ * must hold 1..100 entries (a hostile-body ceiling only), and each `alumni_on_regular`
+ * `count` must be a positive integer.
+ * "The order's dog order" is the order in which dogs first appear in the body: the first
+ * part's lead, its `additional_dog_ids` in order, then each later part's dogs not yet named.
+ *
+ * **The server picks each dog's credit** (her 541, 542; overriding CRED-20, which the old
+ * route's `payment.tier` serves). For each campus and program, an alumni dog
+ * (`DogWire.is_alumni`, read under a row lock so a concurrent staff grant serialises with
+ * the order) spends that campus and program's alumni pool first; a dog that is not alumni
+ * never spends alumni credits. A lot pays only the dates it reaches (`lot_pays_date`), the
+ * soonest-expiring first, as `POST /bookings` does.
+ *
+ * An alumni dog's day that no alumni lot pays is paid from the regular pool of that campus
+ * and program **without asking**, unless it is *askable* (her 562 (a); design N1). It is
+ * askable when some live alumni row of that campus and program costs less per credit than
+ * the live regular single-day row there, and a credit of that alumni row, bought now, would
+ * reach the date (that row's own `expiry_months` from now, while expiry binds). With no live
+ * single row there, no day is askable.
+ *
+ * Askable days are paid from the regular pool **only with her consent**, and only the ones
+ * a regular credit could pay (`AlumniCreditsShortDetails.consentable`; design Amendment A1,
+ * build DECISIONS 573). Consent is an `alumni_on_regular` entry for that `(location, mode)`
+ * whose `count` equals `consentable`; without it the order answers 422
+ * `alumni_credits_short`. An entry is read like this:
+ *   - A `count` that differs from a non-zero `consentable` is refused afresh with the new
+ *     numbers.
+ *   - An entry for a pool whose `consentable` is 0 is ignored, so no refusal says
+ *     `shortfall: 0`. That covers alumni credits that arrived after her yes, a pool not in
+ *     the order, and askable days no regular credit could pay.
+ *   - Askable days beyond `consentable` always need alumni credits.
+ * Every regular credit spent on an alumni dog is therefore one she agreed to, on the number
+ * she saw, or one no cheaper credit could replace.
+ *
+ * Refusals, in this order (design §3.1 "Refusal order"; nothing is sold for an order that
+ * would still fail on something a purchase cannot fix):
+ *   1. Auth (a staff principal is 403 `forbidden`), then 400 `bad_request` (the key, the
+ *      parse), then the bounds above (422 `invalid_payload`), then 404 `not_found` for a dog
+ *      not hers.
+ *   2. Each part in body order, as on `POST /bookings`: `program_not_offered`, a past date
+ *      (`invalid_payload`), `beyond_booking_horizon`, `same_day_cutoff_passed` (campus before
+ *      clock, DECISIONS 128(b)); then the gates (`payment_required`, `evaluation_required`,
+ *      `vaccine_missing`, `agreement_unsigned`); then `alumni_no_day_school`
+ *      (`AlumniNoDaySchoolDetails`).
+ *   3. `already_booked`: a dog against his live sessions.
+ *   4. `insufficient_capacity` and `after_school_full`, for every `(campus, date)` with the
+ *      order's dogs there summed, under the order's capacity locks; each names its campus.
+ *   5. The credit plan: `credit_expired_before_date` (one campus, `location`), then
+ *      `alumni_credits_short`, then `credits_short` (`CreditsShortDetails`), the last two
+ *      naming every pool of the order at once.
+ * `insufficient_capacity`, `after_school_full` and the gate arms (with empty arrays, from the
+ * trigger floor) can also answer at the insert, and still nothing stands.
+ * `PostBookingOrdersErrorDetails` lists the arms with `details`.
+ *
+ * A booking row may hold one dog on alumni credits and another on regular: each debit names
+ * its own lot and tier, and a cancel returns each to its own lot. `POST /bookings` is
+ * unchanged (`PostBookingsRequest`).
+ *
+ * **`POST /booking-orders/check`** `[owner]`: the same body, no `Idempotency-Key` (none is
+ * read), writes nothing. It runs the POST's whole transaction and rolls it back, so it
+ * answers 200 `PostBookingOrdersCheckResponse` or exactly the POST's refusal for that body
+ * at that moment. It is advisory; the POST decides. More than 60 checks by one owner in one
+ * clock minute answer 429 `rate_limited`, no `details`. The throttle runs after auth and
+ * before the body is validated. If the limiter cannot be reached, the check answers as if
+ * under it, and the server logs that it did. A 429 says nothing about the order: wait, then
+ * ask again.
+ */
+export interface PostBookingOrdersRequest {
+  /** Each part is one campus, one program and one date set, with every dog on those dates
+   *  (bounds above). */
+  parts: BookingOrderPart[];
+  /** Her "Use a day care credit": one entry per pool the question named, with that pool's
+   *  `consentable`. */
+  alumni_on_regular?: { location: LocationKey; mode: BookingMode; count: number }[];
+}
+
+/** One part of `PostBookingOrdersRequest`: a `POST /bookings` body with no `payment`, so no
+ *  `tier` and no `top_up` (9.1.0). */
+export type BookingOrderPart = Omit<PostBookingsRequest, 'payment'>;
 
 /**
  * `POST /requests` body — the owner-side request submission for the three
@@ -3277,6 +3628,38 @@ export type PostBookingsErrorDetails =
   | InsufficientCapacityDetails
   | AfterSchoolFullDetails
   | PaymentFailedDetails;
+
+/**
+ * Every `details` arm `POST /booking-orders` and `POST /booking-orders/check` can refuse
+ * with, each 422 (9.1.0; designs/credits-joint-booking.md §3.1, §3.2), in the order the order
+ * meets them (`PostBookingOrdersRequest`):
+ *   1-4. `payment_required`, `evaluation_required`, `vaccine_missing`,
+ *        `agreement_unsigned` — `checkBookingGates`, per part. Each may also arrive from
+ *        the DB trigger floor with EMPTY arrays.
+ *   5. `alumni_no_day_school` — per part, after its gates.
+ *   6. `already_booked` — each dog against his live sessions.
+ *   7. `insufficient_capacity` — the capacity pre-pass, then the insert-time floor.
+ *   8. `after_school_full` — the same, for the after-school ticks.
+ *   9. `credit_expired_before_date` — the credit plan's first refusal, one campus.
+ *  10. `alumni_credits_short` — askable alumni days her consent does not cover.
+ *  11. `credits_short` — regular credits short.
+ * There is no `payment_failed` and no `insufficient_credits`: the route charges nothing and
+ * carries no `top_up`. Its other refusals carry no `details`: `invalid_payload`,
+ * `program_not_offered`, `beyond_booking_horizon`, `same_day_cutoff_passed`, and the
+ * check's 429 `rate_limited`.
+ */
+export type PostBookingOrdersErrorDetails =
+  | PaymentRequiredDetails
+  | EvaluationRequiredDetails
+  | VaccineMissingDetails
+  | AgreementUnsignedDetails
+  | AlumniNoDaySchoolDetails
+  | AlreadyBookedDetails
+  | InsufficientCapacityDetails
+  | AfterSchoolFullDetails
+  | CreditExpiredBeforeDateDetails
+  | AlumniCreditsShortDetails
+  | CreditsShortDetails;
 
 /**
  * Every `details` arm `POST /requests` can 422 with (digest bookings/L).
@@ -8565,6 +8948,13 @@ export type WireTupleConformance = [
   >,
   Expect<
     Equal<(typeof POST_REQUESTS_ERROR_DETAIL_KINDS)[number], PostRequestsErrorDetails['kind']>
+  >,
+  // 9.1.0 (§ bookings): `POST /booking-orders`' arm-kind tuple, the same WC-A1 pin.
+  Expect<
+    Equal<
+      (typeof POST_BOOKING_ORDERS_ERROR_DETAIL_KINDS)[number],
+      PostBookingOrdersErrorDetails['kind']
+    >
   >,
   // 2.0.0-lg1.1 (§ settings): the domain tuple, then the key-set pins.
   Expect<Equal<(typeof SETTINGS_DOMAINS)[number], SettingsDomain>>,
