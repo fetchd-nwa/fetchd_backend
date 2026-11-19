@@ -17,6 +17,7 @@ import {
   type BookingMode,
   type CreditTier,
   type LocationKey,
+  type PoolDrawWire,
   type PoolShortWire,
 } from '../contracts/wire.js';
 import {
@@ -72,6 +73,17 @@ import { pgTimestampToDate, pgTimestampToIso } from './pgTimestamp.js';
  * Refusals, across every group at once: `credit_expired_before_date` (the regular pass's
  * unpaid days beyond the single's reach, one campus), then `alumni_credits_short` (askable
  * days her consent does not cover), then `credits_short`.
+ *
+ * **Each pool's draw** (9.2.0-pre.1, plan one-off O-AFTERCOUNT; `PoolDrawWire`;
+ * designs/review-after-count.md §3; her #37: "the credits should go down so i know how many
+ * ive used"). Once every group is planned, and before the first refusal is thrown, one grouped
+ * read of her balances (`ownerBalances`, under the pool locks above, before any write) gives
+ * every pool its `balance`, for `pools` and `draws` alike. Per group, in `LOCATIONS` then
+ * `BOOKING_MODES` order: the regular pool, whose `draw` is the regular pass's paid days and
+ * whose `short` is its short days (never its unreachable ones); then, when an alumni dog has
+ * days there, the alumni pool, whose `draw` is the alumni pass's paid days and whose `short`
+ * is the askable days her consent did not join. Every refusal and the plan carry the same
+ * `draws`; nothing about lot choice, locks or the refusal order changes.
  */
 
 export interface OrderSlot {
@@ -286,7 +298,8 @@ const distinct = <T>(values: readonly T[]): T[] => [...new Set(values)];
 
 /**
  * The plan of a whole order, under its locks, or the first credit refusal. Answers every
- * paid day with its lot and tier.
+ * paid day with its lot and tier, and each pool's draw (`draws`, 9.2.0-pre.1), which every
+ * credit refusal carries too.
  */
 export async function planOrderCredits(
   tx: Tx,
@@ -298,7 +311,7 @@ export async function planOrderCredits(
     consent: ReadonlyMap<string, number>;
     now: Date;
   },
-): Promise<OrderPaidSlot[]> {
+): Promise<{ paid: OrderPaidSlot[]; draws: PoolDrawWire[] }> {
   const groups = groupsOf(args.parts);
   const poolOf = (group: Group, tier: CreditTier): CreditPool => ({
     ownerId: args.ownerId,
@@ -347,6 +360,46 @@ export async function planOrderCredits(
     planned.push({ group, plan, alumniLots, regularLots });
   }
 
+  // Her balances, once, grouped: under the pool locks, before any throw and any write, so no
+  // pool reads the order's own debits. A pool with no live lot has no row and reads 0.
+  const balances = await creditLedgerRepository.ownerBalances(tx, args.ownerId);
+  const balanceOf = (group: Group, tier: CreditTier): number =>
+    balances.find(
+      (row) => row.location === group.location && row.mode === group.mode && row.tier === tier,
+    )?.balance ?? 0;
+  const drawOf = (
+    group: Group,
+    tier: CreditTier,
+    counts: { draw: number; short: number; why: () => ReturnType<typeof shortReason> },
+  ): PoolDrawWire => {
+    const expiresAt = counts.short > 0 ? counts.why().expiresAt : undefined;
+    return {
+      location: group.location,
+      mode: group.mode,
+      tier,
+      balance: balanceOf(group, tier),
+      draw: counts.draw,
+      short: counts.short,
+      ...(expiresAt !== undefined ? { expires_at: pgTimestampToIso(expiresAt) } : {}),
+    };
+  };
+  const draws: PoolDrawWire[] = planned.flatMap(({ group, plan, alumniLots, regularLots }) => [
+    drawOf(group, 'regular', {
+      draw: plan.paid.filter((slot) => slot.tier === 'regular').length,
+      short: plan.short.length,
+      why: () => shortReason({ leftover: plan.regularLeftover }, regularLots),
+    }),
+    ...(plan.alumniRequired > 0
+      ? [
+          drawOf(group, 'alumni', {
+            draw: plan.paid.filter((slot) => slot.tier === 'alumni').length,
+            short: plan.askable.length - plan.joined,
+            why: () => shortReason({ leftover: plan.alumniLeftover }, alumniLots),
+          }),
+        ]
+      : []),
+  ]);
+
   const dogIdsOf = (slots: readonly OrderSlot[]): string[] =>
     distinct(slots.map((slot) => slot.dogId)).sort(
       (a, b) => (dogRank.get(a) ?? 0) - (dogRank.get(b) ?? 0),
@@ -381,6 +434,7 @@ export async function planOrderCredits(
       expiresAt: (latest ?? args.now).toISOString(),
       dates: distinct(here.flatMap((p) => p.plan.unreachable.map((slot) => slot.date))).sort(),
       location,
+      draws,
     });
   }
 
@@ -392,7 +446,7 @@ export async function planOrderCredits(
       location: group.location,
       mode: group.mode,
       tier: 'alumni',
-      balance: await creditLedgerRepository.poolBalanceInTx(tx, poolOf(group, 'alumni')),
+      balance: balanceOf(group, 'alumni'),
       required: plan.alumniRequired,
       shortfall: plan.askable.length,
       dog_ids: dogIdsOf(plan.askable),
@@ -404,7 +458,7 @@ export async function planOrderCredits(
       consentable: plan.consentable,
     });
   }
-  if (alumniPools.length > 0) throw alumniCreditsShortError(alumniPools);
+  if (alumniPools.length > 0) throw alumniCreditsShortError(alumniPools, draws);
 
   // 3. credits_short: every regular pool the regular pass leaves short.
   const regularPools: PoolShortWire<'regular'>[] = [];
@@ -414,7 +468,7 @@ export async function planOrderCredits(
       location: group.location,
       mode: group.mode,
       tier: 'regular',
-      balance: await creditLedgerRepository.poolBalanceInTx(tx, poolOf(group, 'regular')),
+      balance: balanceOf(group, 'regular'),
       required: plan.regularRequired,
       shortfall: plan.short.length,
       dog_ids: dogIdsOf(plan.short),
@@ -424,7 +478,7 @@ export async function planOrderCredits(
       ),
     });
   }
-  if (regularPools.length > 0) throw creditsShortError(regularPools);
+  if (regularPools.length > 0) throw creditsShortError(regularPools, draws);
 
-  return planned.flatMap(({ plan }) => plan.paid);
+  return { paid: planned.flatMap(({ plan }) => plan.paid), draws };
 }

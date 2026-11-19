@@ -14,6 +14,7 @@ import type {
   EvaluationGap,
   InsufficientCreditsDetails,
   LocationKey,
+  PoolDrawWire,
   PoolShortWire,
   UnpassedEvaluationStatus,
   VaccineGap,
@@ -151,13 +152,22 @@ export function creditExpiredBeforeDateError(args: {
   dates: readonly string[];
   /** `POST /booking-orders` only (9.1.0): the campus of `dates`. `POST /bookings` omits it. */
   location?: LocationKey;
+  /** `POST /booking-orders` only (9.2.0-pre.1): every pool of the order as its plan left it.
+   *  `POST /bookings` plans no order and omits it. */
+  draws?: readonly PoolDrawWire[];
 }): ApiError {
   return new ApiError('credit_expired_before_date', `No credit reaches ${args.dates.join(', ')}.`, {
     kind: 'credit_expired_before_date',
     expires_at: args.expiresAt,
     dates: [...args.dates],
     ...(args.location !== undefined ? { location: args.location } : {}),
+    ...(args.draws !== undefined ? { draws: copyDraws(args.draws) } : {}),
   });
+}
+
+/** `draws` (9.2.0-pre.1; `PoolDrawWire`), each entry copied so no caller's array rides out. */
+function copyDraws(draws: readonly PoolDrawWire[]): PoolDrawWire[] {
+  return draws.map((entry) => ({ ...entry }));
 }
 
 export function insufficientCapacityError(gap: CapacityGap): ApiError {
@@ -190,9 +200,13 @@ export function afterSchoolFullError(gap: {
 /**
  * `credits_short` (9.1.0; `CreditsShortDetails`): regular credits do not cover every day the
  * order pays from them. One entry per short regular pool, every campus and program at once,
- * in `LOCATIONS` then `BOOKING_MODES` order (the caller's).
+ * in `LOCATIONS` then `BOOKING_MODES` order (the caller's). `draws` (9.2.0-pre.1) is every pool
+ * of the order at this refusal, short or not, in the caller's order.
  */
-export function creditsShortError(pools: readonly PoolShortWire<'regular'>[]): ApiError {
+export function creditsShortError(
+  pools: readonly PoolShortWire<'regular'>[],
+  draws: readonly PoolDrawWire[],
+): ApiError {
   if (pools.length === 0) throw new Error('creditsShortError: pools must be non-empty');
   const short = pools.reduce((sum, pool) => sum + pool.shortfall, 0);
   return new ApiError('credits_short', `Not enough credits: ${short} short.`, {
@@ -202,15 +216,18 @@ export function creditsShortError(pools: readonly PoolShortWire<'regular'>[]): A
       dog_ids: [...pool.dog_ids],
       short_dates: [...pool.short_dates],
     })),
+    draws: copyDraws(draws),
   });
 }
 
 /**
  * `alumni_credits_short` (9.1.0; `AlumniCreditsShortDetails`, design Amendment A1): an alumni
- * dog's askable days that her consent does not cover. One entry per such alumni pool.
+ * dog's askable days that her consent does not cover. One entry per such alumni pool. `draws`
+ * (9.2.0-pre.1) is every pool of the order at this refusal, short or not, in the caller's order.
  */
 export function alumniCreditsShortError(
   pools: readonly AlumniCreditsShortDetails['pools'][number][],
+  draws: readonly PoolDrawWire[],
 ): ApiError {
   if (pools.length === 0) throw new Error('alumniCreditsShortError: pools must be non-empty');
   const short = pools.reduce((sum, pool) => sum + pool.shortfall, 0);
@@ -224,6 +241,7 @@ export function alumniCreditsShortError(
         dog_ids: [...pool.dog_ids],
         short_dates: [...pool.short_dates],
       })),
+      draws: copyDraws(draws),
     },
   );
 }

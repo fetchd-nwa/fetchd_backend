@@ -10,6 +10,8 @@ import type {
   CreditExpiredBeforeDateDetails,
   CreditsShortDetails,
   InsufficientCapacityDetails,
+  PoolDrawWire,
+  PostBookingOrdersCheckResponse,
   PostBookingOrdersResponse,
 } from '../../src/contracts/wire.js';
 import { MAX_DATES_PER_PART, MAX_DOG_DATES_PER_ORDER } from '../../src/contracts/wire.js';
@@ -33,6 +35,7 @@ import {
   buy,
   check,
   checkThenPost,
+  checkThenPostBoth,
   clearOrderWorld,
   createOtherOwner,
   dropFixtureBentonvilleCare,
@@ -195,6 +198,17 @@ test(
             { date: D.MON2, dog_id: biscuit, reason: 'no_credit' },
             { date: D.TUE2, dog_id: biscuit, reason: 'no_credit' },
           ],
+        },
+      ],
+      // O-AFTERCOUNT (9.2.0-pre.1; the note §3's pin edit): the pool's draw beside its shortage.
+      draws: [
+        {
+          location: 'bentonville',
+          mode: 'daycare',
+          tier: 'regular',
+          balance: 1,
+          draw: 1,
+          short: 5,
         },
       ],
     });
@@ -650,6 +664,20 @@ test(
         expires_at: endsTue,
         dates: [D.WED_30_DEC],
         location: 'bentonville',
+        // O-AFTERCOUNT (9.2.0-pre.1, M1): the plan as it stood. Mon and Tue are paid, Wed is
+        // short with her credits expiring first, and Wed 30 Dec, which no credit reaches, is in
+        // no entry (3 of 4 dog-dates).
+        draws: [
+          {
+            location: 'bentonville',
+            mode: 'daycare',
+            tier: 'regular',
+            balance: 3,
+            draw: 2,
+            short: 1,
+            expires_at: endsTue,
+          },
+        ],
       },
     );
   },
@@ -955,6 +983,144 @@ test(
       .from(bookings)
       .where(eq(bookings.id, session!));
     assert.equal(rows.length, 1);
+  },
+);
+
+// ── O-AFTERCOUNT (wire 9.2.0-pre.1): each pool's draw ───────────────────────────────
+// designs/review-after-count.md §4 BA5-BA7; her #37 and ruling 677(2): "the credits should go
+// down so i know how many ive used". Every case here also runs `checkThenPost`'s own pins:
+// the Σ invariant on a credit refusal (L4) and, on a 201, balance − draw once booked (BA7).
+
+const FAY_SCHOOL = { location: 'fayetteville', mode: 'school' } as const;
+const BEN_SCHOOL = { location: 'bentonville', mode: 'school' } as const;
+/** Lola's two-campus day school order, the Bentonville part first in the body. */
+const twoCampusSchool = (lola: string) => ({
+  parts: [
+    part({ category: 'day-school', dogs: [lola], dates: ['2037-12-09', '2037-12-10'] }),
+    part({
+      category: 'day-school',
+      location: 'fayetteville',
+      dogs: [lola],
+      dates: ['2037-12-07', '2037-12-08'],
+    }),
+  ],
+});
+
+function checkDraws(res: { statusCode: number; body: string; json(): unknown }): PoolDrawWire[] {
+  assert.equal(res.statusCode, 200, res.body);
+  return (res.json() as PostBookingOrdersCheckResponse).draws;
+}
+
+test(
+  'BA5 (two campuses, L1): Lola day school at Bentonville Wed 9-Thu 10 Dec and Fayetteville Mon 7-Tue 8, Bentonville first in the body: `draws` names Fayetteville first, its `balance` counts the live lot that pays none of these dates, and Bentonville is short 2 (check = POST)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const lola = await createBookableDog(created);
+    // The fixture's Fayetteville school lot ends 1 Jan 2036: live now, it pays no 2037 date.
+    const unpaying = await poolBalance(FAY_SCHOOL);
+    assert.ok(unpaying > 0, 'a live Fayetteville school lot that pays none of these dates');
+    await plantLot({ credits: 4, expiresAt: ENDS_31_DEC, ...FAY_SCHOOL });
+    const { app } = orderApp();
+
+    const res = await checkThenPost(app, twoCampusSchool(lola));
+
+    const details = refused<CreditsShortDetails>(res, 'credits_short');
+    assert.deepEqual(
+      details.pools.map((p) => [p.location, p.mode, p.balance, p.shortfall]),
+      [['bentonville', 'school', 0, 2]],
+    );
+    assert.deepEqual(details.draws, [
+      { ...FAY_SCHOOL, tier: 'regular', balance: unpaying + 4, draw: 2, short: 0 },
+      { ...BEN_SCHOOL, tier: 'regular', balance: 0, draw: 0, short: 2 },
+    ]);
+  },
+);
+
+test(
+  'BA6 (absence, by execution): `POST /bookings` answers `credit_expired_before_date`, `insufficient_capacity` and its 201 with no `draws`; `POST /booking-orders` answers a refusal before the credit plan, its 201 and the 201 replayed with no `draws`',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const lola = await createBookableDog(created);
+    const endsTue = at(D.TUE, '17:00').toISOString();
+    await care({ credits: 3, expiresAt: endsTue });
+    const { app } = orderApp();
+    const single = (dates: string[]) =>
+      app.inject({
+        method: 'POST',
+        url: '/bookings',
+        headers: { 'idempotency-key': `ba6-${randomUUID()}` },
+        payload: {
+          payment: { kind: 'credits' },
+          category: 'day-care',
+          location: 'bentonville',
+          lead_dog_id: lola,
+          dates,
+        },
+      });
+    const detailsOf = (res: { statusCode: number; body: string }, code: string): object =>
+      refused<object>(res, code);
+
+    const beyond = detailsOf(await single([D.MON, D.WED_30_DEC]), 'credit_expired_before_date');
+    assert.deepEqual(Object.keys(beyond).sort(), ['dates', 'expires_at', 'kind'], 'no draws');
+
+    // Tue is full; her lot pays Tue, so no credit answer can come first on either route.
+    await db.insert(dayCapacity).values({ location: 'bentonville', date: D.TUE, capacityDogs: 0 });
+    const singleFull = detailsOf(await single([D.TUE]), 'insufficient_capacity');
+    assert.equal('draws' in singleFull, false, JSON.stringify(singleFull));
+    const orderFull = detailsOf(
+      await checkThenPost(app, { parts: [part({ dogs: [lola], dates: [D.MON, D.TUE] })] }),
+      'insufficient_capacity',
+    );
+    assert.equal('draws' in orderFull, false, JSON.stringify(orderFull));
+    await db.delete(dayCapacity).where(eq(dayCapacity.location, 'bentonville'));
+
+    const booked = await single([D.MON]);
+    assert.equal(booked.statusCode, 201, booked.body);
+    assert.equal('draws' in (booked.json() as object), false, booked.body);
+
+    const key = `order-ba6-${randomUUID()}`;
+    const body = { parts: [part({ dogs: [lola], dates: [D.TUE] })] };
+    const first = await post(app, body, key);
+    assert.equal(first.statusCode, 201, first.body);
+    assert.equal('draws' in (first.json() as object), false, first.body);
+    const replay = await post(app, body, key);
+    assert.equal(replay.statusCode, 201, replay.body);
+    assert.deepEqual(replay.json(), first.json(), 'the stored 201, unchanged');
+  },
+);
+
+test(
+  'BA7 (M2, booked pools): case A and two campuses: the check draws each pool, and once the POST books, each pool holds `balance − draw` (case A ends 1 / 2; Fayetteville loses 2, Bentonville ends 0)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { waffles, lola } = await wafflesAndLola();
+    await care({ credits: 5, tier: 'alumni' });
+    await care({ credits: 4 });
+    const { app } = orderApp();
+
+    const caseA = await checkThenPostBoth(app, {
+      parts: [part({ dogs: [waffles, lola], dates: MON_TO_WED })],
+    });
+    assert.equal(caseA.posted.statusCode, 201, caseA.posted.body);
+    assert.deepEqual(checkDraws(caseA.checked), [
+      { location: 'bentonville', mode: 'daycare', tier: 'regular', balance: 4, draw: 3, short: 0 },
+      { location: 'bentonville', mode: 'daycare', tier: 'alumni', balance: 5, draw: 3, short: 0 },
+    ]);
+    assert.deepEqual([await careBalance('regular'), await careBalance('alumni')], [1, 2]);
+
+    const fayBefore = await poolBalance(FAY_SCHOOL);
+    await plantLot({ credits: 4, expiresAt: ENDS_31_DEC, ...FAY_SCHOOL });
+    await plantLot({ credits: 2, expiresAt: ENDS_31_DEC, ...BEN_SCHOOL });
+    const two = await checkThenPostBoth(app, twoCampusSchool(lola));
+    assert.equal(two.posted.statusCode, 201, two.posted.body);
+    assert.deepEqual(checkDraws(two.checked), [
+      { ...FAY_SCHOOL, tier: 'regular', balance: fayBefore + 4, draw: 2, short: 0 },
+      { ...BEN_SCHOOL, tier: 'regular', balance: 2, draw: 2, short: 0 },
+    ]);
+    assert.deepEqual(
+      [await poolBalance(FAY_SCHOOL), await poolBalance(BEN_SCHOOL)],
+      [fayBefore + 2, 0],
+    );
   },
 );
 

@@ -4,6 +4,11 @@ import { after, afterEach, beforeEach, test } from 'node:test';
 import { eq, sql } from 'drizzle-orm';
 import type {
   AlumniCreditsShortDetails,
+  CreditExpiredBeforeDateDetails,
+  CreditsShortDetails,
+  CreditTier,
+  PoolDrawWire,
+  PostBookingOrdersCheckResponse,
   PostBookingOrdersResponse,
 } from '../../src/contracts/wire.js';
 import { db } from '../../src/db/client.js';
@@ -14,7 +19,9 @@ import {
   D,
   buy,
   checkThenPost,
+  checkThenPostBoth,
   clearOrderWorld,
+  dogDatesOf,
   dropFixtureBentonvilleCare,
   orderApp,
   part,
@@ -478,5 +485,201 @@ test(
         { dog_id: lola, location: 'bentonville', mode: 'daycare', tier: 'regular', count: 1 },
       ],
     );
+  },
+);
+
+// ── O-AFTERCOUNT (wire 9.2.0-pre.1): each pool's draw ───────────────────────────────
+// designs/review-after-count.md §2 and §4 BA1-BA4, BA8; her #37 and ruling 677(2): "the credits
+// should go down so i know how many ive used". Every case runs `checkThenPost`, so each also
+// pins check = POST on `draws`, and the Σ invariant on every credit refusal (L4).
+
+/** Her alumni pack as she holds it in her screenshot: 10 credits, ending Fri 18 Dec (680). */
+const ENDS_18_DEC = '2037-12-18T18:00:00.000Z';
+const DEC = {
+  MON_7: '2037-12-07',
+  MON_14: '2037-12-14',
+  TUE_15: '2037-12-15',
+  WED_16: '2037-12-16',
+};
+
+/** One Bentonville day care pool's entry. */
+const careDraw = (
+  tier: CreditTier,
+  balance: number,
+  draw: number,
+  short: number,
+  expiresAt?: string,
+): PoolDrawWire => ({
+  location: 'bentonville',
+  mode: 'daycare',
+  tier,
+  balance,
+  draw,
+  short,
+  ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
+});
+
+/** Her screenshot (#37): Waffles Dec 7, 14, 15, 16; Lola Dec 7, 14, 15. */
+const herScreenshot = (waffles: string, lola: string, wafflesMore: string[] = []) => ({
+  parts: [
+    part({ dogs: [waffles, lola], dates: [DEC.MON_7, DEC.MON_14, DEC.TUE_15] }),
+    part({ dogs: [waffles], dates: [DEC.WED_16, ...wafflesMore] }),
+  ],
+});
+
+test(
+  'BA1 (her screenshot, #37): 10 alumni ending 18 Dec and no day care; Waffles Dec 7, 14, 15, 16 and Lola Dec 7, 14, 15: `credits_short`, with `draws` day care {0, 0, 3} and alumni {10, 4, 0} (check = POST)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { waffles, lola } = await wafflesAndLola();
+    await care({ credits: 10, tier: 'alumni', expiresAt: ENDS_18_DEC });
+    const { app } = orderApp();
+
+    const details = refused<CreditsShortDetails>(
+      await checkThenPost(app, herScreenshot(waffles, lola)),
+      'credits_short',
+    );
+
+    assert.deepEqual(
+      details.pools.map((p) => [p.tier, p.balance, p.required, p.shortfall, p.dog_ids]),
+      [['regular', 0, 3, 3, [lola]]],
+      '`pools` is the refusal’s own list, unchanged',
+    );
+    assert.deepEqual(details.draws, [careDraw('regular', 0, 0, 3), careDraw('alumni', 10, 4, 0)]);
+  },
+);
+
+test(
+  'BA8 (her screenshot plus Waffles Tue 22 Dec, M1): `credit_expired_before_date` at Bentonville for Dec 22 carries BA1’s `draws`; Dec 22 is in no entry, so they sum to 7 of 8 dog-dates (check = POST)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { waffles, lola } = await wafflesAndLola();
+    await care({ credits: 10, tier: 'alumni', expiresAt: ENDS_18_DEC });
+    const { app } = orderApp();
+    const order = herScreenshot(waffles, lola, ['2037-12-22']);
+
+    const details = refused<CreditExpiredBeforeDateDetails>(
+      await checkThenPost(app, order),
+      'credit_expired_before_date',
+    );
+
+    assert.deepEqual([details.location, details.dates], ['bentonville', ['2037-12-22']]);
+    assert.deepEqual(details.draws, [careDraw('regular', 0, 0, 3), careDraw('alumni', 10, 4, 0)]);
+    const sum = (details.draws ?? []).reduce((total, e) => total + e.draw + e.short, 0);
+    assert.deepEqual([sum, dogDatesOf(order)], [7, 8]);
+  },
+);
+
+test(
+  'BA2 (case E): 5 alumni lasting until Tue 24 and 6 day care: the refusal draws day care {6, 3, 0} and alumni {5, 2, 1, expiring Tue 24}; with her yes the check draws {6, 4, 0} and {5, 2, 0}, and once booked she holds 2 / 3',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { waffles, lola } = await wafflesAndLola();
+    const endsTue = at(D.TUE, '17:00').toISOString();
+    await care({ credits: 5, tier: 'alumni', expiresAt: endsTue });
+    await care({ credits: 6, expiresAt: ENDS_10_DEC });
+    const { app } = orderApp();
+    const order = { parts: [part({ dogs: [waffles, lola], dates: MON_TO_WED })] };
+
+    const asked = refused<AlumniCreditsShortDetails>(
+      await checkThenPost(app, order),
+      'alumni_credits_short',
+    );
+    assert.deepEqual(asked.draws, [
+      careDraw('regular', 6, 3, 0),
+      careDraw('alumni', 5, 2, 1, endsTue),
+    ]);
+
+    const yes = await checkThenPostBoth(app, { ...order, alumni_on_regular: consent(1) });
+    assert.equal(yes.posted.statusCode, 201, yes.posted.body);
+    assert.equal(yes.checked.statusCode, 200, yes.checked.body);
+    assert.deepEqual((yes.checked.json() as PostBookingOrdersCheckResponse).draws, [
+      careDraw('regular', 6, 4, 0),
+      careDraw('alumni', 5, 2, 0),
+    ]);
+    assert.deepEqual([await careBalance('regular'), await careBalance('alumni')], [2, 3]);
+  },
+);
+
+test(
+  'BA3 (L1): the pack at 3 months and the single day at 1; Waffles Tue 1 Dec and Tue 5 Jan, holding 0 alumni and 6 day care: `pools[0]` says shortfall 2, consentable 1 before and after her yes, while `draws` moves alumni short 2 → 1 and day care {6, 0, 0} → {6, 1, 0}',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const waffles = await createAlumniDog(created);
+    await care({ credits: 6 });
+    const o = orderApp();
+    await setMonths(o, ALUMNI_PACK, 3);
+    const order = { parts: [part({ dogs: [waffles], dates: [D.TUE2, '2038-01-05'] })] };
+
+    const before = refused<AlumniCreditsShortDetails>(
+      await checkThenPost(o.app, order),
+      'alumni_credits_short',
+    );
+    assert.deepEqual(
+      before.pools.map((p) => [p.shortfall, p.consentable]),
+      [[2, 1]],
+    );
+    assert.deepEqual(before.draws, [careDraw('regular', 6, 0, 0), careDraw('alumni', 0, 0, 2)]);
+
+    const yes = refused<AlumniCreditsShortDetails>(
+      await checkThenPost(o.app, { ...order, alumni_on_regular: consent(1) }),
+      'alumni_credits_short',
+    );
+    assert.deepEqual(
+      yes.pools.map((p) => [p.shortfall, p.consentable]),
+      [[2, 1]],
+      '`pools[].shortfall` still counts every askable day',
+    );
+    assert.deepEqual(yes.draws, [careDraw('regular', 6, 1, 0), careDraw('alumni', 0, 0, 1)]);
+  },
+);
+
+test(
+  'BA4 (short behind the question): 0 / 0, both dogs Mon-Wed: `alumni_credits_short` names only the alumni pool, and `draws` still carries the day care pool short 3 (check = POST)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { waffles, lola } = await wafflesAndLola();
+    const { app } = orderApp();
+
+    const details = refused<AlumniCreditsShortDetails>(
+      await checkThenPost(app, { parts: [part({ dogs: [waffles, lola], dates: MON_TO_WED })] }),
+      'alumni_credits_short',
+    );
+
+    assert.deepEqual(
+      details.pools.map((p) => [p.tier, p.shortfall, p.consentable]),
+      [['alumni', 3, 3]],
+    );
+    assert.deepEqual(details.draws, [careDraw('regular', 0, 0, 3), careDraw('alumni', 0, 0, 3)]);
+  },
+);
+
+test(
+  'L4 (B5 at $350.00, a refusing road): 5 day care credits for 6 dog-dates, the pack not cheaper: `credits_short`, and the day care short 1 is Waffles’ unasked Wed (check = POST, Σ 6)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    const { waffles, lola } = await wafflesAndLola();
+    await care({ credits: 5 });
+    const { app } = orderApp();
+    await db
+      .update(creditPackages)
+      .set({ priceCents: 35000 })
+      .where(eq(creditPackages.key, ALUMNI_PACK));
+    try {
+      const details = refused<CreditsShortDetails>(
+        await checkThenPost(app, { parts: [part({ dogs: [waffles, lola], dates: MON_TO_WED })] }),
+        'credits_short',
+      );
+      assert.deepEqual(
+        details.pools.map((p) => [p.tier, p.balance, p.required, p.shortfall, p.dog_ids]),
+        [['regular', 5, 6, 1, [waffles]]],
+      );
+      assert.deepEqual(details.draws, [careDraw('regular', 5, 5, 1), careDraw('alumni', 0, 0, 0)]);
+    } finally {
+      await db
+        .update(creditPackages)
+        .set({ priceCents: 32000 })
+        .where(eq(creditPackages.key, ALUMNI_PACK));
+    }
   },
 );

@@ -14,6 +14,7 @@ import {
   type DayProgramCampusSettingsWire,
   type DogCreditPlanWire,
   type LocationKey,
+  type PoolDrawWire,
 } from '../contracts/wire.js';
 import { dayProgramConflictsWith } from './bookingConflicts.js';
 import {
@@ -61,7 +62,8 @@ import { sortBookingsByScheduledAt, wireManyBookings } from './wireManyBookings.
  *   8. The writes: one order row, then each part's dates ascending, the capacity and
  *      after-school asserts again as the floor, INSERT, each dog's debit from the lot and
  *      tier the plan gave it, the reminders.
- *   9. The `plan`, read from the debits just written.
+ *   9. The `plan`, read from the debits just written. `draws` (9.2.0-pre.1) is the credit
+ *      plan's, read in step 7 before any write; the check answers it beside the `plan`.
  * Every refusal is a throw, so the transaction writes nothing: no booking, debit, order,
  * reminder or stored answer.
  */
@@ -71,6 +73,9 @@ export interface DayProgramOrderResult {
   /** Every session, ascending by `scheduled_at`, ties in part order. */
   sessions: BookingWire[];
   plan: DogCreditPlanWire[];
+  /** Each pool's draw (`PoolDrawWire`), from the credit plan before any write. Its `draw` is
+   *  its pool's `plan` counts summed. The check answers it; the POST's 201 does not. */
+  draws: PoolDrawWire[];
 }
 
 /** The after-school assert, naming its campus as this route's `after_school_full` does. */
@@ -231,7 +236,7 @@ export async function createDayProgramOrder(
       }
 
       // 7. The credit plan, under the pools of both tiers it touches.
-      const paid = await planOrderCredits(tx, {
+      const { paid, draws } = await planOrderCredits(tx, {
         ownerId: args.ownerId,
         parts: parts.map((part) => ({
           location: part.location,
@@ -317,7 +322,7 @@ export async function createDayProgramOrder(
         viewer: 'owner',
         runner: tx,
       });
-      return { order, sessions, plan };
+      return { order, sessions, plan, draws };
     }),
   );
 }

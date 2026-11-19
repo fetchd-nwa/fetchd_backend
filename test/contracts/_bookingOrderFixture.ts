@@ -8,8 +8,11 @@ import type {
   ApiErrorEnvelope,
   BookingOrderPart,
   DogCreditPlanWire,
+  PoolDrawWire,
+  PostBookingOrdersCheckResponse,
   PostBookingOrdersRequest,
 } from '../../src/contracts/wire.js';
+import { BOOKING_MODES, LOCATIONS } from '../../src/contracts/wire.js';
 import { db } from '../../src/db/client.js';
 import { pool } from '../../src/db/pool.js';
 import {
@@ -32,7 +35,7 @@ import { at, makeClock, type Clock } from './_checkinFixture.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import { FIXTURE_OWNER_PRINCIPAL, makeContractApp, type LogCapture } from './_harness.js';
 import { clearOrderRows } from './_orderFixture.js';
-import { PLANTED, clearPlantedPools } from './_poolFixture.js';
+import { PLANTED, clearPlantedPools, poolBalance } from './_poolFixture.js';
 import { makeStripeStub, type StripeStub } from './_stripeStub.js';
 
 /**
@@ -187,30 +190,152 @@ export async function rowCounts(
   return rows[0] as Record<string, number>;
 }
 
+/** The order's dog-dates, from its body: each part's dogs times its dates. */
+export function dogDatesOf(body: unknown): number {
+  return (body as PostBookingOrdersRequest).parts.reduce(
+    (sum, p) => sum + (1 + (p.additional_dog_ids?.length ?? 0)) * p.dates.length,
+    0,
+  );
+}
+
+const samePool = (
+  a: Pick<PoolDrawWire, 'location' | 'mode' | 'tier'>,
+  b: Pick<PoolDrawWire, 'location' | 'mode' | 'tier'>,
+): boolean => a.location === b.location && a.mode === b.mode && a.tier === b.tier;
+
+/**
+ * The pools `draws` must name, in its order (`PoolDrawWire`): for each campus and program of
+ * the body in `LOCATIONS` then `BOOKING_MODES` order, its regular pool, then its alumni pool
+ * when one of the order's alumni dogs has days there. The flags are read off the dogs' rows.
+ */
+async function poolsOfOrder(
+  body: unknown,
+): Promise<Pick<PoolDrawWire, 'location' | 'mode' | 'tier'>[]> {
+  const { parts } = body as PostBookingOrdersRequest;
+  const dogsOf = (p: BookingOrderPart): string[] => [
+    p.lead_dog_id,
+    ...(p.additional_dog_ids ?? []),
+  ];
+  const rows = await db
+    .select({ id: dogs.id, isAlumni: dogs.isAlumni })
+    .from(dogs)
+    .where(inArray(dogs.id, [...new Set(parts.flatMap(dogsOf))]));
+  const alumni = new Set(rows.filter((row) => row.isAlumni).map((row) => row.id));
+  const modeOf = (p: BookingOrderPart) => (p.category === 'day-school' ? 'school' : 'daycare');
+  const out: Pick<PoolDrawWire, 'location' | 'mode' | 'tier'>[] = [];
+  for (const location of LOCATIONS) {
+    for (const mode of BOOKING_MODES) {
+      const here = parts.filter((p) => p.location === location && modeOf(p) === mode);
+      if (here.length === 0) continue;
+      out.push({ location, mode, tier: 'regular' });
+      if (here.some((p) => dogsOf(p).some((dogId) => alumni.has(dogId)))) {
+        out.push({ location, mode, tier: 'alumni' });
+      }
+    }
+  }
+  return out;
+}
+
+/** What every `draws` holds, wherever it rides: its pools in order, counts ≥ 0, a date only when short. */
+async function assertDrawsShape(draws: PoolDrawWire[] | undefined, body: unknown): Promise<void> {
+  assert.ok(Array.isArray(draws), `draws is present: ${JSON.stringify(draws)}`);
+  assert.deepEqual(
+    draws.map(({ location, mode, tier }) => ({ location, mode, tier })),
+    await poolsOfOrder(body),
+    'one entry per pool of the order, regular before alumni, in LOCATIONS then BOOKING_MODES order',
+  );
+  for (const entry of draws) {
+    for (const count of [entry.balance, entry.draw, entry.short]) {
+      assert.ok(Number.isInteger(count) && count >= 0, JSON.stringify(entry));
+    }
+    if (entry.short === 0) assert.equal(entry.expires_at, undefined, JSON.stringify(entry));
+  }
+}
+
+const drawn = (draws: readonly PoolDrawWire[]): number =>
+  draws.reduce((sum, entry) => sum + entry.draw + entry.short, 0);
+
 /**
  * B8's method on every case it names: the check first, writing nothing, then the POST, which
  * must answer what the check answered (its `plan` for a 201, its body for a refusal).
+ *
+ * O-AFTERCOUNT (wire 9.2.0-pre.1) adds, on every case that comes through here:
+ *   - On a 201 (BA7, M2): the check's `draws` names the order's pools, each `draw` is that
+ *     pool's `plan` counts summed, nothing is short, the draws sum to the order's dog-dates,
+ *     and once the POST books, each pool holds exactly `balance − draw`. The 201 carries none.
+ *   - On `credits_short` and `alumni_credits_short` (L4): Σ `draw` + Σ `short` equals the
+ *     order's dog-dates. On `credit_expired_before_date`: `draws` is present and the sum is
+ *     less, by the dog-days no credit can reach.
+ *   - On any other refusal (one before the credit plan): no `draws`.
  */
-export async function checkThenPost(
+export async function checkThenPostBoth(
   app: FastifyInstance,
   body: unknown,
   key?: string,
-): Promise<Awaited<ReturnType<typeof post>>> {
+): Promise<{
+  checked: Awaited<ReturnType<typeof check>>;
+  posted: Awaited<ReturnType<typeof post>>;
+}> {
   const before = await rowCounts();
   const checked = await check(app, body);
   assert.deepEqual(await rowCounts(), before, 'the check wrote nothing');
   const posted = await post(app, body, key);
   if (posted.statusCode === 201) {
     assert.equal(checked.statusCode, 200, checked.body);
-    assert.deepEqual(checked.json(), {
-      bookable: true,
-      plan: (posted.json() as { plan: DogCreditPlanWire[] }).plan,
-    });
+    const { draws, ...answer } = checked.json() as PostBookingOrdersCheckResponse;
+    const { plan } = posted.json() as { plan: DogCreditPlanWire[] };
+    assert.deepEqual(answer, { bookable: true, plan });
+    assert.equal('draws' in (posted.json() as object), false, 'the 201 carries no draws');
+    await assertDrawsShape(draws, body);
+    for (const entry of draws) {
+      assert.equal(entry.short, 0, `nothing is short on a 200: ${JSON.stringify(entry)}`);
+      const counted = plan.filter((p) => samePool(p, entry)).reduce((sum, p) => sum + p.count, 0);
+      assert.equal(entry.draw, counted, `the draw is the plan's count: ${JSON.stringify(entry)}`);
+      assert.equal(
+        await poolBalance(entry),
+        entry.balance - entry.draw,
+        `once booked the pool holds balance − draw: ${JSON.stringify(entry)}`,
+      );
+    }
+    for (const p of plan) {
+      assert.ok(
+        draws.some((entry) => samePool(p, entry)),
+        `a plan pool has an entry: ${JSON.stringify(p)}`,
+      );
+    }
+    assert.equal(drawn(draws), dogDatesOf(body), 'the draws sum to the order’s dog-dates');
   } else {
     assert.equal(checked.statusCode, posted.statusCode, checked.body);
     assert.deepEqual(checked.json(), posted.json(), 'the check answered the POST’s refusal');
+    const { error } = posted.json() as ApiErrorEnvelope;
+    const details = (error.details ?? {}) as { draws?: PoolDrawWire[] };
+    if (error.code === 'credits_short' || error.code === 'alumni_credits_short') {
+      await assertDrawsShape(details.draws, body);
+      assert.equal(
+        drawn(details.draws ?? []),
+        dogDatesOf(body),
+        `L4: Σ draw + Σ short equals the order's dog-dates on ${error.code}: ${posted.body}`,
+      );
+    } else if (error.code === 'credit_expired_before_date') {
+      await assertDrawsShape(details.draws, body);
+      assert.ok(
+        drawn(details.draws ?? []) < dogDatesOf(body),
+        `L4: on credit_expired_before_date Σ falls short of the dog-dates: ${posted.body}`,
+      );
+    } else {
+      assert.equal('draws' in details, false, `no draws before the credit plan: ${posted.body}`);
+    }
   }
-  return posted;
+  return { checked, posted };
+}
+
+/** {@link checkThenPostBoth}, answering the POST. */
+export async function checkThenPost(
+  app: FastifyInstance,
+  body: unknown,
+  key?: string,
+): Promise<Awaited<ReturnType<typeof post>>> {
+  return (await checkThenPostBoth(app, body, key)).posted;
 }
 
 /** The plan the debits of these bookings spell, counted straight off the ledger. */

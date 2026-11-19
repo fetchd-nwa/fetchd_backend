@@ -8,6 +8,7 @@ import { withActor } from '../db/tx.js';
 import type {
   ApiErrorEnvelope,
   DogCreditPlanWire,
+  PoolDrawWire,
   PostBookingOrdersCheckResponse,
   PostBookingOrdersResponse,
 } from '../contracts/wire.js';
@@ -37,9 +38,11 @@ import { parseOrThrow } from '../lib/zodIssues.js';
  *     and a 201 replays as stored, past any cutoff (DECISIONS 128(a)). A refusal is a throw,
  *     so it rolls the claim back with everything else and the same key can book later.
  *   - The check runs the same core under `withActor`, then throws a private sentinel so
- *     Postgres rolls everything back, and answers with the `plan` it read first. It reads no
- *     key, so it cannot drift from the POST. It is throttled per owner and clock minute
- *     (`lib/orderCheckThrottle.ts`), after auth and before the body is validated.
+ *     Postgres rolls everything back, and answers with the `plan` it read first and each
+ *     pool's `draws` (9.2.0-pre.1, O-AFTERCOUNT). It reads no key, so it cannot drift from
+ *     the POST. It is throttled per owner and clock minute (`lib/orderCheckThrottle.ts`),
+ *     after auth and before the body is validated. The POST's 201 carries no `draws`:
+ *     Confirmed reads balances after booking.
  *   - Post-commit, the POST drops `avail:<campus>:*` for each campus of the order and the
  *     owner's balance cache.
  *
@@ -57,7 +60,10 @@ export interface BookingOrdersRouteOptions extends AuthRouteOptions {
 
 /** The check's rollback: thrown after the core has answered, caught by the check alone. */
 class CheckRollback extends Error {
-  constructor(readonly plan: DogCreditPlanWire[]) {
+  constructor(
+    readonly plan: DogCreditPlanWire[],
+    readonly draws: PoolDrawWire[],
+  ) {
     super('booking-order check: rolled back on purpose');
   }
 }
@@ -147,10 +153,12 @@ export function registerBookingOrdersRoute(
             order,
             now: nowFactory(),
           });
-          throw new CheckRollback(result.plan);
+          throw new CheckRollback(result.plan, result.draws);
         });
       } catch (err) {
-        if (err instanceof CheckRollback) return { bookable: true, plan: err.plan };
+        if (err instanceof CheckRollback) {
+          return { bookable: true, plan: err.plan, draws: err.draws };
+        }
         throw err;
       }
       throw new Error('booking-order check: the core returned without its rollback');
