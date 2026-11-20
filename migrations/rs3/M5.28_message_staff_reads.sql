@@ -18,12 +18,15 @@ CREATE TABLE message_staff_reads (
 CREATE INDEX message_staff_reads_staff_idx ON message_staff_reads (staff_id);
 REVOKE ALL ON message_staff_reads FROM anon, authenticated;
 
--- Item 20 (the messaging take-back; build DECISIONS 770 (a), her default; HANDBACK §4 item 20):
--- the portal already showed every family message that exists now, so each is marked read for
--- every live staffer (live AND NOT the school's system row: `livePrincipal`). A removed staffer
--- gets no row; a message sent after this step is unread until a staffer opens it. `read_at` is
--- this step's time (no earlier staff read of a family message was ever recorded). Production is
--- born clean, so there this inserts nothing; it is for a database migrated forward.
+-- Item 20 (the messaging take-back; build DECISIONS 770 (a), her default, its reason corrected
+-- at 816; HANDBACK §4 item 20): the portal never showed these messages (its messages screen was
+-- hidden until 9.2.0), so no staffer saw one there. Each family message that exists now is
+-- marked read for every live staffer (live AND NOT the school's system row: `livePrincipal`) so
+-- that a database migrated forward does not open with a one-time wall of unread. A removed
+-- staffer gets no row; a message sent after this step is unread until a staffer opens it.
+-- `read_at` is this step's time (no earlier staff read of a family message was ever
+-- recorded). Production is born clean, so there this inserts nothing; it is for a
+-- database migrated forward.
 INSERT INTO message_staff_reads (message_id, staff_id)
 SELECT m.id, s.id
   FROM messages m

@@ -543,12 +543,17 @@ async function rs3Objects(client: pg.Client): Promise<Record<string, unknown>> {
 }
 
 /**
- * Item 20 (the messaging take-back; build DECISIONS 770 (a), her default; HANDBACK §4 item 20): M5.28
- * marks every family message that exists when it runs as read for every live staffer, since the
- * portal already showed them. Without it every old thread rings every bell and her old messages
- * read *Sent*. A removed staffer gets no row, and neither does the school's system row (no
- * person: `livePrincipal`). A message sent after the step is unread. Production is born clean, so
- * there the step inserts nothing. Its own scratch databases, so the harness above keeps its rows.
+ * Item 20 (the messaging take-back; build DECISIONS 770 (a), her default, its reason corrected at
+ * 816; HANDBACK §4 item 20): M5.28 marks every family message that exists when it runs as read for
+ * every live staffer. The portal never showed them (its messages screen was hidden until 9.2.0);
+ * they are marked so a database migrated forward does not open with a one-time wall of unread:
+ * without it every old thread rings every bell and her old messages read *Sent*. An expired
+ * (unsent) one is marked too, as the receipt counts expired messages (`highestStaffReadSeq`; MB66;
+ * the Opus seat's N1 found it unpinned). A removed staffer gets no row, and neither does the
+ * school's system row (no person: `livePrincipal`). A message sent after the step is unread.
+ * Production is born clean, so there the step inserts nothing. Its own scratch databases, so the
+ * harness above keeps its rows. No case here proves an order: `BF_EXPIRED`, the latest `sent_at`,
+ * also has the highest id, so `(sent_at, id)` and `id` agree on it.
  */
 const BF_OWNER = 'a1a1a1a1-0000-4000-8000-0000000000b1';
 const BF_LIVE_1 = 'cccccccc-0000-4000-8000-0000000000b1';
@@ -557,6 +562,7 @@ const BF_REMOVED = 'cccccccc-0000-4000-8000-0000000000b3';
 const BF_THREAD = '10000000-0000-4000-8000-0000000000b1';
 const BF_HERS = '44444444-0000-4000-8000-0000000000b1';
 const BF_STAFF_REPLY = '44444444-0000-4000-8000-0000000000b2';
+const BF_EXPIRED = '44444444-0000-4000-8000-0000000000b3';
 
 describe(
   'M5.28, item 20: family messages from before the step are read for every live staffer',
@@ -591,6 +597,13 @@ describe(
        VALUES ($1, $3, 'owner', $4, NULL, 'before the step', '2026-11-01T09:00:00Z'),
               ($2, $3, 'staff', NULL, $5, 'a reply, before the step', '2026-11-01T10:00:00Z')`,
         [BF_HERS, BF_STAFF_REPLY, BF_THREAD, BF_OWNER, BF_LIVE_1],
+      );
+      // Hers too, and unsent (expired) half an hour later, still before the step.
+      await bf.query(
+        `INSERT INTO messages (id, thread_id, sender_kind, sender_owner_id, sender_staff_id, text, sent_at, expired_at)
+       VALUES ($1, $2, 'owner', $3, NULL, 'unsent, before the step', '2026-11-01T11:00:00Z',
+               '2026-11-01T11:30:00Z')`,
+        [BF_EXPIRED, BF_THREAD, BF_OWNER],
       );
       await bf.query('DELETE FROM audit_log');
 
@@ -648,6 +661,27 @@ describe(
         `SELECT count(*)::int AS n FROM audit_log WHERE table_name = 'message_staff_reads'`,
       );
       assert.equal(audit.rows[0]?.n, 0, 'the backfill wrote audit rows');
+    });
+
+    test('her expired (unsent) message from before the step is read for both live staffers too; the removed staffer and the school get no row', async () => {
+      // Each side of the claim is real: the message is expired, and the removed staffer and the
+      // school's system row (M5.26) are both in `staff`, where a wrong filter would mark them.
+      const msg = await bf.query<{ expired: boolean }>(
+        'SELECT expired_at IS NOT NULL AS expired FROM messages WHERE id = $1',
+        [BF_EXPIRED],
+      );
+      assert.equal(msg.rows[0]?.expired, true, 'the fixture message is not expired');
+      const unmarkable = await bf.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM staff
+          WHERE id = $1 OR (is_system_account AND expired_at IS NULL)`,
+        [BF_REMOVED],
+      );
+      assert.equal(unmarkable.rows[0]?.n, 2, 'the removed staffer or the school row is missing');
+      assert.deepEqual(
+        await readers(bf, BF_EXPIRED),
+        [BF_LIVE_1, BF_LIVE_2],
+        'an expired family message from before the step is not read for exactly the live staffers',
+      );
     });
 
     test('a family message sent after rs3 is unread for both live staffers', async () => {
