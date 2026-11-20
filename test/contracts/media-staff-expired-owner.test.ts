@@ -13,6 +13,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { makeR2Stub, type R2Stub } from './_r2Stub.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * A staff photo in a live thread of an EXPIRED family answers exactly as the staff reply in
@@ -118,6 +119,7 @@ async function expiredFamilyCase(t: TestContext): Promise<void> {
   assert.equal(thread.expiredAt, null, 'precondition: the thread is live');
 
   const staffThreads = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(staffThreads.app);
   registerStaffThreadsRoute(staffThreads.app, { authenticate: staffThreads.authenticate });
   const reply = await staffThreads.app.inject({
     method: 'POST',
@@ -127,6 +129,7 @@ async function expiredFamilyCase(t: TestContext): Promise<void> {
   });
 
   const media = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(media.app);
   registerMediaRoute(media.app, { authenticate: media.authenticate, r2: makeDelayedR2() });
   const upload = await media.app.inject({
     method: 'POST',

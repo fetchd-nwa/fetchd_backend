@@ -41,7 +41,10 @@ import {
 } from '../lib/wireManyThreads.js';
 import { defaultR2Client, type R2Client } from '../lib/r2.js';
 import { uuidId } from '../lib/uuidId.js';
+import { threadPublisherFor } from '../realtime/publish.js';
+import { committedThreadRow } from '../realtime/threadRow.js';
 import { trackInFlight } from '../realtime/settle.js';
+import { pgTimestampToIso } from '../lib/pgTimestamp.js';
 
 /**
  * The staff portal's messaging (Day-19 verb 3; S46 from 9.2.0):
@@ -175,6 +178,8 @@ export function registerStaffThreadsRoute(
   const authHook = resolveAuthHook(opts);
   const r2 = opts.r2 ?? defaultR2Client;
   const expoPush = opts.expoPush ?? defaultExpoPushClient;
+  // 9.2.0 (pass 3 item 2): the live channel, read at registration (throws without one).
+  const bus = threadPublisherFor(app);
 
   /** A staff message as staff read it (its `client_message_id` and `receipt` included). */
   async function staffWire(row: MessageRow): Promise<MessageWire> {
@@ -310,6 +315,7 @@ export function registerStaffThreadsRoute(
 
       // cache-noop: threads/messages aren't in the §3 cache map (reads are
       // uncached); the bell badge recomputes on the owner's next read.
+      const family: { ownerId?: string } = {};
       let outcome: IdempotencyOutcome<StaffSendRecord>;
       try {
         outcome = await withMutation<StaffSendRecord>(
@@ -344,6 +350,7 @@ export function registerStaffThreadsRoute(
               { messageId: row.id, threadId: id, ownerId, senderStaffId: principal.staffId },
               request.log,
             );
+            family.ownerId = ownerId;
             return {
               status: 201,
               body: { row, reach: notice.reach, notificationId: notice.notificationId },
@@ -363,6 +370,17 @@ export function registerStaffThreadsRoute(
         throw err;
       }
 
+      // 9.2.0 (pass 3 item 2, MB27 Q3/Q4): after commit, a fresh reply only.
+      if (!outcome.replayed && family.ownerId !== undefined) {
+        bus.publishForThread(
+          { id: outcome.body.row.threadId, owner_id: family.ownerId },
+          {
+            kind: 'message.created',
+            message_id: outcome.body.row.id,
+            seq: outcome.body.row.threadSeq,
+          },
+        );
+      }
       const record = await answeredRecord(outcome);
       if (record === undefined) {
         // A8: a key stored by code from before 9.2.0 holds a 9.1.0 MessageWire (no `seq`, no
@@ -413,6 +431,7 @@ export function registerStaffThreadsRoute(
         return stored;
       }
 
+      const started: { row?: { id: string; owner_id: string } } = {};
       let outcome: IdempotencyOutcome<StaffStartRecord>;
       try {
         // cache-noop: threads/messages aren't in the §3 cache map (reads aren't cached).
@@ -463,6 +482,7 @@ export function registerStaffThreadsRoute(
               },
               request.log,
             );
+            started.row = await committedThreadRow(tx, threadId);
             return {
               status: 201,
               body: { threadId, row, reach: notice.reach, notificationId: notice.notificationId },
@@ -480,6 +500,13 @@ export function registerStaffThreadsRoute(
         throw err;
       }
 
+      if (!outcome.replayed && started.row !== undefined) {
+        bus.publishForThread(started.row, {
+          kind: 'message.created',
+          message_id: outcome.body.row.id,
+          seq: outcome.body.row.threadSeq,
+        });
+      }
       pushAfterCommit(outcome.body, request.log);
       const pair = await staffPair(outcome.body.threadId, outcome.body.row, reader);
       pair.message.reach = outcome.body.reach;
@@ -499,6 +526,10 @@ export function registerStaffThreadsRoute(
     const { id } = parseUuidParam(request.params);
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
     const messageIds = parseReadBody(request.body);
+    const read: {
+      row?: { id: string; owner_id: string };
+      step?: Awaited<ReturnType<typeof messagesRepository.markReadForStaff>>;
+    } = {};
     // cache-noop: threads/messages aren't in the §3 cache map (reads aren't cached).
     const outcome = await withMutation<null>(
       {
@@ -508,10 +539,12 @@ export function registerStaffThreadsRoute(
         requestHash: hashRequestBody({ threadId: id, messageIds }),
       },
       async (tx) => {
-        if ((await threadsRepository.lockLive(tx, id)) === undefined) {
+        const ownerId = await threadsRepository.lockLive(tx, id);
+        if (ownerId === undefined) {
           throw new ApiError('not_found', `thread ${id} not found`);
         }
-        await messagesRepository.markReadForStaff(tx, {
+        read.row = await committedThreadRow(tx, id);
+        read.step = await messagesRepository.markReadForStaff(tx, {
           threadId: id,
           staffId: principal.staffId,
           messageIds,
@@ -519,6 +552,29 @@ export function registerStaffThreadsRoute(
         return { status: 204, body: null };
       },
     );
+    // 9.2.0 (pass 3 item 2; MB27 Q5, CR14): after commit, only for the ids this call newly
+    // marked for this staffer; the family's receipt only on the school's first read.
+    if (!outcome.replayed && read.row !== undefined && read.step !== undefined) {
+      const { readIds, firstRead } = read.step;
+      if (readIds.length > 0) {
+        const row = read.row;
+        bus.publishForThread(row, {
+          kind: 'staff.read',
+          staff_id: principal.staffId,
+          message_ids: readIds,
+        });
+        bus.publishForThread(row, { kind: 'bell.changed' });
+        if (firstRead !== null) {
+          bus.publishForThread(row, {
+            kind: 'receipt',
+            side: 'owner',
+            state: 'read',
+            up_to_seq: firstRead.upToSeq,
+            at: pgTimestampToIso(firstRead.at),
+          });
+        }
+      }
+    }
     reply.code(outcome.status);
     return outcome.body;
   });

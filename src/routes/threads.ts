@@ -27,6 +27,9 @@ import { staffRepository } from '../db/repositories/staffRepository.js';
 import { threadsRepository } from '../db/repositories/threadsRepository.js';
 import { threadCategory } from '../db/schema/schema.js';
 import { hasRepeats, isClientMessageIdViolation } from '../lib/clientMessageId.js';
+import { pgTimestampToIso } from '../lib/pgTimestamp.js';
+import { threadPublisherFor } from '../realtime/publish.js';
+import { committedThreadRow } from '../realtime/threadRow.js';
 import { afterSeqQuerySchema, parseAfterSeqQuery } from '../lib/messageSeq.js';
 import { NO_NUL, TOPIC_LABEL, threadPreview } from '../lib/messageText.js';
 import { requireOwner } from '../lib/principalNarrows.js';
@@ -164,6 +167,8 @@ export interface ThreadsRouteOpts extends AuthRouteOptions {
 export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpts = {}): void {
   const authHook = resolveAuthHook(opts);
   const r2 = opts.r2 ?? defaultR2Client;
+  // 9.2.0 (pass 3 item 2): the live channel, read at registration (throws without one).
+  const bus = threadPublisherFor(app);
 
   /** Her stored message as her side reads it (`client_message_id` included). */
   async function ownerWire(row: MessageRow): Promise<MessageWire> {
@@ -289,6 +294,10 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
       throw new ApiError('not_found', `thread ${id} not found`);
     }
     const idempotencyKey = requireIdempotencyKey(request.headers['idempotency-key']);
+    const read: {
+      step: { upToSeq: number; at: string } | null;
+      row?: { id: string; owner_id: string };
+    } = { step: null };
     // cache-noop: threads/messages aren't in the §3 cache map (reads aren't cached).
     const outcome = await withMutation<null>(
       {
@@ -302,10 +311,24 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
       },
       async (tx) => {
         await threadsRepository.lockLive(tx, id);
-        await messagesRepository.markThreadReadForOwner(tx, id, upToSeq);
+        read.step = await messagesRepository.markThreadReadForOwner(tx, id, upToSeq);
+        read.row = await committedThreadRow(tx, id);
         return { status: 204, body: null };
       },
     );
+    // 9.2.0 (M4, MB27 Q2/Q3): after commit, only when this call read something: her other
+    // devices clear, and staff see the school's messages *Read*.
+    if (!outcome.replayed && read.step !== null && read.row !== undefined) {
+      const row = read.row;
+      bus.publishForThread(row, { kind: 'thread.changed' }, ['owner']);
+      bus.publishForThread(row, {
+        kind: 'receipt',
+        side: 'staff',
+        state: 'read',
+        up_to_seq: read.step.upToSeq,
+        at: pgTimestampToIso(read.step.at),
+      });
+    }
     reply.code(outcome.status);
     return outcome.body;
   });
@@ -384,6 +407,14 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
         }
       }
       throw err;
+    }
+
+    // 9.2.0 (pass 3 item 2, MB27 Q3): after commit, a fresh send only (a replay publishes nothing).
+    if (!outcome.replayed && outcome.body.senderOwnerId !== null) {
+      bus.publishForThread(
+        { id: outcome.body.threadId, owner_id: outcome.body.senderOwnerId },
+        { kind: 'message.created', message_id: outcome.body.id, seq: outcome.body.threadSeq },
+      );
     }
 
     // A8: a replay answers the message as it is now, so a key stored by code from before 9.2.0
@@ -494,6 +525,16 @@ export function registerThreadsRoute(app: FastifyInstance, opts: ThreadsRouteOpt
         throw err;
       }
 
+      if (!outcome.replayed && outcome.body.message.senderOwnerId !== null) {
+        bus.publishForThread(
+          { id: outcome.body.message.threadId, owner_id: outcome.body.message.senderOwnerId },
+          {
+            kind: 'message.created',
+            message_id: outcome.body.message.id,
+            seq: outcome.body.message.threadSeq,
+          },
+        );
+      }
       const pair = await wirePair(outcome.body.threadId, ownerId, outcome.body.message);
       reply.code(outcome.status);
       return pair;

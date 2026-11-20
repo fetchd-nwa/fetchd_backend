@@ -14,6 +14,7 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
+import { withTestBus } from './_realtime.js';
 
 registerFixtureHooks();
 
@@ -24,6 +25,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({ method: 'GET', url: '/threads' });
     if (res.statusCode !== 200) {
@@ -35,6 +37,7 @@ test(
 
 test('GET /threads as a staff principal returns []', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate });
   const res = await app.inject({ method: 'GET', url: '/threads' });
   assert.equal(res.statusCode, 200);
@@ -48,6 +51,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'GET',
@@ -65,6 +69,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'GET',
@@ -82,6 +87,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'GET',
@@ -95,6 +101,7 @@ test(
 
 test('GET /threads/:id for an unknown id returns 404', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate });
   const res = await app.inject({
     method: 'GET',
@@ -105,6 +112,7 @@ test('GET /threads/:id for an unknown id returns 404', SKIP_WHEN_NO_DB, async ()
 
 test('GET /threads/not-a-uuid returns 400 bad_request', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate });
   const res = await app.inject({ method: 'GET', url: '/threads/not-a-uuid' });
   assert.equal(res.statusCode, 400);
@@ -119,6 +127,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'GET',
@@ -136,6 +145,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'GET',
@@ -153,6 +163,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'GET',
@@ -167,6 +178,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'GET',
@@ -183,6 +195,7 @@ test(
 
 test('POST /threads/:id/read returns 204 and clears unread_count', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate });
   const res = await app.inject({
     method: 'POST',
@@ -200,6 +213,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'POST',
@@ -212,6 +226,7 @@ test(
 
 test('POST /threads/:id/read as a staff principal returns 404', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate });
   const res = await app.inject({
     method: 'POST',
@@ -229,6 +244,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'POST',
@@ -246,6 +262,7 @@ test(
 
 test('POST /threads/:id/messages with blank text returns 400', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate });
   const res = await app.inject({
     method: 'POST',
@@ -261,6 +278,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     const res = await app.inject({
       method: 'POST',
@@ -274,6 +292,7 @@ test(
 
 test('POST /threads/:id/messages as a staff principal returns 404', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate });
   const res = await app.inject({
     method: 'POST',
@@ -293,6 +312,7 @@ test(
   SKIP_WHEN_NO_DB,
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(app);
     registerThreadsRoute(app, { authenticate });
     await db
       .update(staff)

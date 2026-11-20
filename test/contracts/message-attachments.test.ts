@@ -11,6 +11,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { makeR2Stub, type R2Stub } from './_r2Stub.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * Contract tests for message attachments (post-Day-19e). Owners attach
@@ -52,6 +53,7 @@ async function createOwnerMedia(
 function appWithRoutes(): { app: ReturnType<typeof makeContractApp>['app']; r2: R2Stub } {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
   const r2 = makeR2Stub();
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
   registerThreadsRoute(app, { authenticate, r2 });
   return { app, r2 };

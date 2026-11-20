@@ -491,20 +491,21 @@ export interface PlantedMessage {
   seq: number;
 }
 
-/** One message in `threadId`; `expired` plants it expired, `deliveredAt` pre-stamps it. */
+/** One message in `threadId`; `expired` plants it expired, `deliveredAt` pre-stamps it,
+ *  `readAt` plants it read (as a pre-9.2.0 read left it: `read_at` set, `delivered_at` as given). */
 export async function plantMessage(
   threadId: string,
   sender: PlantedSender,
-  opts: { expired?: boolean; deliveredAt?: string } = {},
+  opts: { expired?: boolean; deliveredAt?: string; readAt?: string } = {},
 ): Promise<PlantedMessage> {
   const ownerId = sender.kind === 'owner' ? sender.id : null;
   const staffId = sender.kind === 'staff' ? sender.id : null;
   const result = await db.execute(sql`
     INSERT INTO messages (thread_id, sender_kind, sender_owner_id, sender_staff_id, text, expired_at,
-                          delivered_at)
+                          delivered_at, read_at)
     VALUES (${threadId}, ${sender.kind}::sender_kind, ${ownerId}::uuid, ${staffId}::uuid,
             'planted (phase R)', ${opts.expired === true ? sql`now()` : sql`NULL`},
-            ${opts.deliveredAt ?? null}::timestamptz)
+            ${opts.deliveredAt ?? null}::timestamptz, ${opts.readAt ?? null}::timestamptz)
     RETURNING id::text AS id, thread_seq AS seq`);
   const row = (result.rows as Array<{ id: string; seq: number | string }>)[0]!;
   return { id: row.id, seq: Number(row.seq) };

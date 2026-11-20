@@ -16,6 +16,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { makeR2Stub, type R2Stub } from './_r2Stub.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * Staff photos and videos in a conversation (O-MSG-LIVE pass 2a; her answer 6, DECISIONS
@@ -113,12 +114,14 @@ const JPEG = Buffer.from('fake-jpeg-bytes-for-a-staff-conversation-photo');
 
 function staffApp(r2: R2Stub): ReturnType<typeof makeContractApp>['app'] {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
   return app;
 }
 
 function ownerApp(r2: R2Stub, principal: Principal = FIXTURE_OWNER_PRINCIPAL): ReturnType<typeof makeContractApp>['app'] {
   const { app, authenticate } = makeContractApp(principal);
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
   return app;
 }

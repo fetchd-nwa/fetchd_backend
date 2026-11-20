@@ -12,6 +12,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { makeR2Stub, type R2Stub } from './_r2Stub.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * Contract tests for read-time profile/avatar image-URL resolution
@@ -46,6 +47,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = makeR2Stub();
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
     registerDogsRoute(app, { authenticate, r2 });
 
@@ -84,6 +86,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = makeR2Stub();
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
     registerDogsRoute(app, { authenticate, r2 });
 
@@ -115,6 +118,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = makeR2Stub();
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
     registerDogsRoute(app, { authenticate, r2 });
 
@@ -135,6 +139,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = makeR2Stub();
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
     registerMeRoute(app, { authenticate, r2 });
 

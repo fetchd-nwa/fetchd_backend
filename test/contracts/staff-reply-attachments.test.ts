@@ -27,6 +27,7 @@ import {
   startThread,
 } from './_messaging.js';
 import { makeR2Stub } from './_r2Stub.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * W6, the staff reply widened (wire 9.2.0 `PostStaffThreadsMessagesRequest`; her answer 6, build
@@ -72,6 +73,7 @@ const JPEG = Buffer.from('a staff photo of a scrape on Waffles’ paw');
 /** A staff photo through the real upload arm (the p2a lane's), stamped for `threadId`'s family. */
 async function uploadStaffPhoto(threadId: string, contentType = 'image/jpeg'): Promise<string> {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2: makeR2Stub() });
   const res = await app.inject({
     method: 'POST',

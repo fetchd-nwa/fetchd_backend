@@ -68,10 +68,18 @@ export async function stampDelivered(
           isNull(messages.deliveredAt),
         ),
       )
-      .returning({ seq: messages.threadSeq, deliveredAt: messages.deliveredAt });
-    const first = moved[0];
+      .returning({
+        seq: messages.threadSeq,
+        deliveredAt: messages.deliveredAt,
+        readAt: messages.readAt,
+        staffRead: sql<boolean>`exists (select 1 from message_staff_reads r where r.message_id = ${messages.id})`,
+      });
+    // MB46 ruling 3: a message already read was delivered too, so it is stamped, but it moves no
+    // receipt: the school's by `read_at`, the family's by a `message_staff_reads` row.
+    const unread = moved.filter((m) => (side === 'staff' ? m.readAt === null : !m.staffRead));
+    const first = unread[0];
     if (first === undefined || first.deliveredAt === null) return null;
-    const highest = moved.reduce((top, m) => (m.seq > top ? m.seq : top), first.seq);
+    const highest = unread.reduce((top, m) => (m.seq > top ? m.seq : top), first.seq);
     return {
       threadId: thread.id,
       ownerId: thread.ownerId,

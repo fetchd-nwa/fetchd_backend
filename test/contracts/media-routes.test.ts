@@ -16,6 +16,7 @@ import {
   registerFixtureHooks,
 } from './_harness.js';
 import { makeR2Stub } from './_r2Stub.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * Day-17 contract tests for the media surface: POST /media, GET /media/:id,
@@ -66,6 +67,7 @@ test(
       key: `${OWNER_AVATAR_KEY_PREFIX}/avatar-${randomUUID()}.jpg`,
       bytes: 2048,
     });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const key = Array.from(r2.objects.keys())[0]!;
@@ -116,6 +118,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `dog-profile/owner-x/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const key = Array.from(r2.objects.keys())[0]!;
@@ -136,6 +139,7 @@ test(
 test('POST /media — dog-profile with not-owned dog → 404', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
   const r2 = await seedR2Upload({ key: `dog-profile/owner-x/${randomUUID()}.jpg` });
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const key = Array.from(r2.objects.keys())[0]!;
@@ -157,6 +161,7 @@ test('POST /media — missing R2 object → 422 invalid_payload', SKIP_WHEN_NO_D
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
   const r2 = makeR2Stub();
   // NOT seeding the bucket — headObject returns null naturally.
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -180,6 +185,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `report-photo/owner-x/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const key = Array.from(r2.objects.keys())[0]!;
@@ -207,6 +213,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `owner-avatar/staff-x/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const res = await app.inject({
@@ -228,6 +235,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `owner-avatar/owner-x/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const res = await app.inject({
@@ -250,6 +258,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `owner-avatar/owner-y/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     // Create via the route so the row + key are aligned.
@@ -314,6 +323,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `owner-avatar/owner-z/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
     const created = await app.inject({
       method: 'POST',
@@ -331,6 +341,7 @@ test(
       ownerId: '11111111-1111-4111-8111-111111111999',
       supabaseUid: 'other-owner',
     });
+    withTestBus(otherApp);
     registerMediaRoute(otherApp, { authenticate: otherAuth, r2 });
     const otherRes = await otherApp.inject({ method: 'GET', url: `/media/${mediaId}` });
     assert.equal(otherRes.statusCode, 404);
@@ -343,6 +354,7 @@ test('GET /media/:id — staff reads cross-owner media (Day-19c)', SKIP_WHEN_NO_
   // which owner authored it).
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
   const r2 = await seedR2Upload({ key: `owner-avatar/owner-cross/${randomUUID()}.jpg` });
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
   const created = await app.inject({
     method: 'POST',
@@ -353,6 +365,7 @@ test('GET /media/:id — staff reads cross-owner media (Day-19c)', SKIP_WHEN_NO_
   const mediaId = (created.json() as { id: string }).id;
 
   const { app: staffApp, authenticate: staffAuth } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
+  withTestBus(staffApp);
   registerMediaRoute(staffApp, { authenticate: staffAuth, r2 });
   const staffRes = await staffApp.inject({ method: 'GET', url: `/media/${mediaId}` });
   assert.equal(staffRes.statusCode, 200, `unexpected: ${staffRes.body}`);
@@ -361,6 +374,7 @@ test('GET /media/:id — staff reads cross-owner media (Day-19c)', SKIP_WHEN_NO_
 
 test('GET /media/:id — unknown id → 404', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2: makeR2Stub() });
   const res = await app.inject({
     method: 'GET',
@@ -375,6 +389,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `owner-avatar/owner-w/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const key = Array.from(r2.objects.keys())[0]!;
@@ -415,6 +430,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `owner-avatar/owner-q/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const idempotencyKey = `post-media-replay-${randomUUID()}`;
@@ -466,6 +482,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `report-photo/staff-x/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const key = Array.from(r2.objects.keys())[0]!;
@@ -509,6 +526,7 @@ test('POST /media — staff report-video: 201 + kind=video', SKIP_WHEN_NO_DB, as
     key: `report-video/staff-x/${randomUUID()}.mp4`,
     contentType: 'video/mp4',
   });
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -528,6 +546,7 @@ test('POST /media — staff report-video: 201 + kind=video', SKIP_WHEN_NO_DB, as
 test('POST /media — staff report-photo without report_id → 400', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
   const r2 = await seedR2Upload({ key: `report-photo/staff-x/${randomUUID()}.jpg` });
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -543,6 +562,7 @@ test('POST /media — staff report-photo without report_id → 400', SKIP_WHEN_N
 test('POST /media — staff report-photo with unknown report_id → 404', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
   const r2 = await seedR2Upload({ key: `report-photo/staff-x/${randomUUID()}.jpg` });
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -564,6 +584,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `report-photo/staff-x/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const res = await app.inject({
@@ -587,6 +608,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     const r2 = await seedR2Upload({ key: `report-photo/staff-del/${randomUUID()}.jpg` });
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const created = await app.inject({
@@ -631,6 +653,7 @@ test(
   async () => {
     const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
     const r2 = makeR2Stub();
+    withTestBus(app);
     registerMediaRoute(app, { authenticate, r2 });
 
     const res = await app.inject({
@@ -673,6 +696,7 @@ test(
 
     // The owner of the report's dog can read it back (owner-scoped GET).
     const { app: ownerApp, authenticate: ownerAuth } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    withTestBus(ownerApp);
     registerMediaRoute(ownerApp, { authenticate: ownerAuth, r2 });
     const ownerGet = await ownerApp.inject({ method: 'GET', url: `/media/${body.id}` });
     assert.equal(ownerGet.statusCode, 200);
@@ -682,6 +706,7 @@ test(
 test('POST /media/upload — report-video: 201 + kind=video', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
   const r2 = makeR2Stub();
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -697,6 +722,7 @@ test('POST /media/upload — report-video: 201 + kind=video', SKIP_WHEN_NO_DB, a
 test('POST /media/upload — owner principal → 403 (staff-only)', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
   const r2 = makeR2Stub();
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -713,6 +739,7 @@ test('POST /media/upload — owner principal → 403 (staff-only)', SKIP_WHEN_NO
 test('POST /media/upload — missing report_id → 400', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
   const r2 = makeR2Stub();
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -727,6 +754,7 @@ test('POST /media/upload — missing report_id → 400', SKIP_WHEN_NO_DB, async 
 test('POST /media/upload — unknown report_id → 404', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
   const r2 = makeR2Stub();
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -741,6 +769,7 @@ test('POST /media/upload — unknown report_id → 404', SKIP_WHEN_NO_DB, async 
 test('POST /media/upload — content-type/purpose mismatch → 400', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
   const r2 = makeR2Stub();
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({
@@ -757,6 +786,7 @@ test('POST /media/upload — content-type/purpose mismatch → 400', SKIP_WHEN_N
 test('POST /media/upload — empty body → 400', SKIP_WHEN_NO_DB, async () => {
   const { app, authenticate } = makeContractApp(FIXTURE_STAFF_PRINCIPAL);
   const r2 = makeR2Stub();
+  withTestBus(app);
   registerMediaRoute(app, { authenticate, r2 });
 
   const res = await app.inject({

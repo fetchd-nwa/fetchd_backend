@@ -54,7 +54,9 @@ import { registerVetsRoute } from './routes/vets.js';
 import { registerWelcomeDogsRoute } from './routes/welcomeDogs.js';
 import { registerWorkersTickRoute } from './routes/workersTick.js';
 import { deliveredAckSink } from './realtime/delivered.js';
+import { messageElementFromGet } from './realtime/messageElement.js';
 import { decorateRealtime, registerRealtimeRoute } from './realtime/server.js';
+import { defaultR2Client } from './lib/r2.js';
 
 /**
  * Builds the Fastify app and registers routes. Kept separate from the boot
@@ -124,8 +126,12 @@ export function buildApp(): FastifyInstance {
   // 9.2.0 (pass 3 item 5, MB27 Q6): the live channel's hub, before any route, so a publishing
   // route reads its bus at registration and throws there if it is missing, never a silent
   // no-op at request time. The ack sink is the *Delivered* stamp (no default: memory "prove the
-  // alarm channel"). `GET /realtime` itself is registered last, below.
-  decorateRealtime(app, { onAck: deliveredAckSink });
+  // alarm channel"); the `message.created` element is the GETs' own, on the routes' R2 client.
+  // `GET /realtime` itself is registered last, below.
+  decorateRealtime(app, {
+    onAck: deliveredAckSink,
+    messageElement: messageElementFromGet(defaultR2Client),
+  });
   registerHealthRoute(app); // [public] — no auth guard
   registerHealthWatchdogRoute(app); // [public] — Day-20 scheduler + pager watchdog; NOT /health
   registerWelcomeDogsRoute(app); // [public] — pre-login welcome gallery

@@ -18,6 +18,7 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * Day 19 contract tests for the staff-portal verb 3 (messaging reply):
@@ -36,6 +37,7 @@ function staffThreadsApp(
   principal = FIXTURE_STAFF_PRINCIPAL,
 ): ReturnType<typeof makeContractApp>['app'] {
   const { app, authenticate } = makeContractApp(principal);
+  withTestBus(app);
   registerStaffThreadsRoute(app, { authenticate });
   return app;
 }

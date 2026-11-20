@@ -23,6 +23,8 @@ import { threadsRepository } from '../db/repositories/threadsRepository.js';
 import { mediaAssets } from '../db/schema/schema.js';
 import type { Tx } from '../db/tx.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import { liveThreadsAttaching } from '../realtime/mediaThreads.js';
+import { threadPublisherFor } from '../realtime/publish.js';
 import { ApiError } from '../lib/errors.js';
 import {
   MAX_UPLOAD_BYTES,
@@ -182,6 +184,8 @@ export interface MediaRouteOpts extends AuthRouteOptions {
 export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = {}): void {
   const authHook = resolveAuthHook(opts);
   const r2 = opts.r2 ?? defaultR2Client;
+  // 9.2.0 (pass 3 item 2, OL5): the live channel, read at registration (throws without one).
+  const bus = threadPublisherFor(app);
 
   // -------------------------------------------------------------------------
   // POST /media — register an upload
@@ -244,6 +248,7 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
     }
     const { id } = parsedParams.data;
 
+    const attached: Array<{ id: string; owner_id: string }> = [];
     const outcome = await withMutation<null>(
       {
         principal,
@@ -266,10 +271,16 @@ export function registerMediaRoute(app: FastifyInstance, opts: MediaRouteOpts = 
           throw new ApiError('not_found', 'media not found');
         }
         await mediaAssetsRepository.softExpire(tx, id);
+        attached.push(...(await liveThreadsAttaching(tx, id)));
         return { status: 204, body: null };
       },
     );
 
+    // 9.2.0 (OL5): after commit, `thread.changed` for each live thread the expired row is
+    // attached in (both sides refetch; the attachment is gone from the GETs).
+    if (!outcome.replayed) {
+      for (const row of attached) bus.publishForThread(row, { kind: 'thread.changed' });
+    }
     reply.code(outcome.status);
     return outcome.body;
   });

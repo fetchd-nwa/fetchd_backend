@@ -17,6 +17,7 @@ import {
 import { makeExpoPushStub } from './_expoPushStub.js';
 import { waitForBlockedBackends } from './_poolFixture.js';
 import { makeR2Stub, type R2Stub } from './_r2Stub.js';
+import { withTestBus } from './_realtime.js';
 
 /**
  * What the messaging suites share (plan unit P45 with O-MSG-LIVE, backend pass 1): the two
@@ -33,6 +34,7 @@ export function ownerApp(
   capture?: LogCapture,
 ) {
   const { app, authenticate } = makeContractApp(principal, capture);
+  withTestBus(app);
   registerThreadsRoute(app, { authenticate, r2 });
   return app;
 }
@@ -48,6 +50,7 @@ export function staffApp(
   capture?: LogCapture,
 ) {
   const { app, authenticate } = makeContractApp(principal, capture);
+  withTestBus(app);
   registerStaffThreadsRoute(app, { authenticate, r2, expoPush });
   return app;
 }
