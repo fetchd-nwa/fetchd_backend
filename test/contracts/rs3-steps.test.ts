@@ -541,3 +541,134 @@ async function rs3Objects(client: pg.Client): Promise<Record<string, unknown>> {
     systemRow: (await q(SYSTEM_ROW))[0],
   };
 }
+
+/**
+ * Item 20 (the messaging take-back; build DECISIONS 770 (a), her default; HANDBACK §4 item 20): M5.28
+ * marks every family message that exists when it runs as read for every live staffer, since the
+ * portal already showed them. Without it every old thread rings every bell and her old messages
+ * read *Sent*. A removed staffer gets no row, and neither does the school's system row (no
+ * person: `livePrincipal`). A message sent after the step is unread. Production is born clean, so
+ * there the step inserts nothing. Its own scratch databases, so the harness above keeps its rows.
+ */
+const BF_OWNER = 'a1a1a1a1-0000-4000-8000-0000000000b1';
+const BF_LIVE_1 = 'cccccccc-0000-4000-8000-0000000000b1';
+const BF_LIVE_2 = 'cccccccc-0000-4000-8000-0000000000b2';
+const BF_REMOVED = 'cccccccc-0000-4000-8000-0000000000b3';
+const BF_THREAD = '10000000-0000-4000-8000-0000000000b1';
+const BF_HERS = '44444444-0000-4000-8000-0000000000b1';
+const BF_STAFF_REPLY = '44444444-0000-4000-8000-0000000000b2';
+
+describe(
+  'M5.28, item 20: family messages from before the step are read for every live staffer',
+  NO_DB,
+  () => {
+    let backfill: { name: string; url: string } | undefined;
+    let empty: { name: string; url: string } | undefined;
+    let bf: pg.Client;
+    let em: pg.Client;
+
+    before(async () => {
+      if (ADMIN_URL === undefined) return;
+      backfill = await createScratch('rs3_backfill');
+      bf = new pg.Client({ connectionString: backfill.url });
+      await bf.connect();
+      await bf.query(fs.readFileSync(PRE_UNIT, 'utf8'));
+      await bf.query(`INSERT INTO owners (id, name) VALUES ($1, 'Allison')`, [BF_OWNER]);
+      await bf.query(
+        `INSERT INTO staff (id, supabase_uid, name, role, home_locations, expired_at)
+       VALUES ($1, gen_random_uuid(), 'Amber', 'manager', '{bentonville}', NULL),
+              ($2, gen_random_uuid(), 'Rachel', 'trainer', '{fayetteville}', NULL),
+              ($3, gen_random_uuid(), 'Gone', 'trainer', '{bentonville}', '2026-11-10T00:00:00Z')`,
+        [BF_LIVE_1, BF_LIVE_2, BF_REMOVED],
+      );
+      await bf.query(
+        `INSERT INTO threads (id, owner_id, participant_staff_id, category, title, sub_text)
+       VALUES ($1, $2, $3, 'sessions', 'Sessions', '')`,
+        [BF_THREAD, BF_OWNER, BF_LIVE_1],
+      );
+      await bf.query(
+        `INSERT INTO messages (id, thread_id, sender_kind, sender_owner_id, sender_staff_id, text, sent_at)
+       VALUES ($1, $3, 'owner', $4, NULL, 'before the step', '2026-11-01T09:00:00Z'),
+              ($2, $3, 'staff', NULL, $5, 'a reply, before the step', '2026-11-01T10:00:00Z')`,
+        [BF_HERS, BF_STAFF_REPLY, BF_THREAD, BF_OWNER, BF_LIVE_1],
+      );
+      await bf.query('DELETE FROM audit_log');
+
+      empty = await createScratch('rs3_backfill_empty');
+      em = new pg.Client({ connectionString: empty.url });
+      await em.connect();
+      await em.query(fs.readFileSync(PRE_UNIT, 'utf8'));
+      await em.query(
+        `INSERT INTO staff (id, supabase_uid, name, role, home_locations)
+       VALUES ($1, gen_random_uuid(), 'Amber', 'manager', '{bentonville}')`,
+        [BF_LIVE_1],
+      );
+    });
+
+    after(async () => {
+      await bf?.end().catch(() => undefined);
+      await em?.end().catch(() => undefined);
+      if (backfill !== undefined) await dropScratch(backfill.name);
+      if (empty !== undefined) await dropScratch(empty.name);
+    });
+
+    const readers = async (c: pg.Client, messageId: string): Promise<string[]> =>
+      (
+        await c.query<{ staff_id: string }>(
+          'SELECT staff_id::text AS staff_id FROM message_staff_reads WHERE message_id = $1 ORDER BY 1',
+          [messageId],
+        )
+      ).rows.map((r) => r.staff_id);
+
+    /** `staff_unread_count` as `threadsRepository.findStaffUnreadCounts` counts it, for one staffer. */
+    const unreadFor = async (c: pg.Client, staffId: string): Promise<number> =>
+      (
+        await c.query<{ n: number }>(
+          `SELECT count(m.id)::int AS n FROM messages m
+           LEFT JOIN message_staff_reads r ON r.message_id = m.id AND r.staff_id = $2
+          WHERE m.thread_id = $1 AND m.sender_kind = 'owner' AND m.expired_at IS NULL
+            AND r.message_id IS NULL`,
+          [BF_THREAD, staffId],
+        )
+      ).rows[0]?.n ?? -1;
+
+    test('after M5.26–M5.28, her message is read for both live staffers and not for the removed one; the school and a staff reply get no row', async () => {
+      for (const step of ['M5.26', 'M5.27', 'M5.28']) await applyOk(bf, step);
+      assert.deepEqual(await readers(bf, BF_HERS), [BF_LIVE_1, BF_LIVE_2]);
+      assert.equal(await unreadFor(bf, BF_LIVE_1), 0, 'a live staffer still has it unread');
+      assert.equal(await unreadFor(bf, BF_LIVE_2), 0, 'a live staffer still has it unread');
+      assert.equal(await unreadFor(bf, BF_REMOVED), 1, 'the removed staffer was marked');
+      const school = await bf.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM message_staff_reads r JOIN staff s ON s.id = r.staff_id
+        WHERE s.is_system_account`,
+      );
+      assert.equal(school.rows[0]?.n, 0, 'the school system row was marked');
+      assert.deepEqual(await readers(bf, BF_STAFF_REPLY), [], 'a staff message was marked');
+      const audit = await bf.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM audit_log WHERE table_name = 'message_staff_reads'`,
+      );
+      assert.equal(audit.rows[0]?.n, 0, 'the backfill wrote audit rows');
+    });
+
+    test('a family message sent after rs3 is unread for both live staffers', async () => {
+      await applyOk(bf, 'M5.29');
+      await applyOk(bf, 'M5.30');
+      const { rows } = await bf.query<{ id: string }>(
+        `INSERT INTO messages (thread_id, sender_kind, sender_owner_id, text)
+       VALUES ($1, 'owner', $2, 'after the step') RETURNING id::text AS id`,
+        [BF_THREAD, BF_OWNER],
+      );
+      assert.deepEqual(await readers(bf, rows[0]?.id as string), []);
+      assert.equal(await unreadFor(bf, BF_LIVE_1), 1);
+      assert.equal(await unreadFor(bf, BF_LIVE_2), 1);
+    });
+
+    test('on a database with no messages (production is born clean) the step inserts nothing', async () => {
+      for (const step of ['M5.26', 'M5.27', 'M5.28']) await applyOk(em, step);
+      const { rows } = await em.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM message_staff_reads',
+      );
+      assert.equal(rows[0]?.n, 0);
+    });
+  },
+);

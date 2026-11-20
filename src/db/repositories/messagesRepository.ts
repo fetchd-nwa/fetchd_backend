@@ -59,10 +59,11 @@ export type StoredClientMessage = MessageRow;
 /**
  * The family's `read` receipt in a thread (round 1 L1; MB62, MB64): the highest `seq` of HER
  * messages that any staffer has read (`message_staff_reads`), or 0 when none has. Expired
- * messages count, so an unsend never lowers it: a receipt never moves backwards. Every row comes
- * from `POST /staff/threads/:id/read` (rs3 M5.28 backfills none), which publishes each rise, so
- * this is also the highest `read` her socket has been told. The caller holds the thread-row lock
- * (L4), so it is exact.
+ * messages count, so an unsend never lowers it: a receipt never moves backwards. Every row after
+ * rs3 comes from `POST /staff/threads/:id/read`, which publishes each rise; the rows rs3 M5.28
+ * writes once, for the family messages from before it (item 20), were never published, and her
+ * app reads them on its GET. So this is the highest `read` her socket has been told, or one from
+ * before rs3. The caller holds the thread-row lock (L4), so it is exact.
  */
 async function highestStaffReadSeq(tx: Tx, threadId: string): Promise<number> {
   const [row] = await tx
