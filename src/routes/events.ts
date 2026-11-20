@@ -188,7 +188,7 @@ export function registerEventsRoute(app: FastifyInstance, opts: AuthRouteOptions
         requestHash: hashRequestBody({ eventId }),
       },
       async (tx) => {
-        const eventRow = await eventsRepository.findLiveById(eventId);
+        const eventRow = await eventsRepository.findLiveById(eventId, tx);
         if (eventRow === undefined) {
           throw new ApiError('not_found', `event ${eventId} not found`);
         }

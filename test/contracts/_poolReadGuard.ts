@@ -73,36 +73,12 @@ let pendingSql: string | null = null;
  * Pool reads that are known and named, allowed until they move onto their `tx`. Each entry is a statement's start as
  * drizzle renders it. Empty means every pool read inside a src transaction fails the test.
  *
- * The five the round-2 seats found by execution (Fable M1, Opus L3). The transaction-slot bound in `tx.ts` already
- * stops them deadlocking the pool; fix 2's second commit moves each onto its `tx` and empties this list, so from then
- * on any pool read in a transaction body fails.
+ * Empty since fix 2's second commit, which moved four of the five reads the round-2 seats found (events, staff names,
+ * class prereqs, profile-image media) onto their transaction's `tx`; the fifth (message attachments, the staff reply's
+ * wire) left the transaction when 9.2.0 built that wire after commit. Add an entry only with a named reason and a
+ * ruling: a read here is a second connection per transaction and reads outside its snapshot.
  */
-const KNOWN_POOL_READS_IN_TRANSACTIONS: ReadonlyArray<{ sql: RegExp; where: string }> = [
-  {
-    sql: /^select "id", "name", "starts_at", "duration_minutes", "loc_label"/,
-    where: 'eventsRepository.findLiveById, from DELETE /events/:id/rsvp (events.ts:191)',
-  },
-  {
-    sql: /^select "id", "name" from "staff" where \("staff"\."id" in /,
-    where:
-      'staffRepository.findNamesByIds, from wireManyBookings (requestConfirm, bookings, staffBookings), staffReports, wireManyMessages (staffThreads)',
-  },
-  {
-    sql: /^select "prereq_class_key" from "class_prereq_options"/,
-    where:
-      'groupClassesRepository.findPrereqOptionsForClass on a cache miss, from enrollments.ts:1462',
-  },
-  {
-    sql: /^select "id", "owner_id", "dog_id", "report_id", "kind", "purpose", "object_key"/,
-    where:
-      'mediaAssetsRepository.findManyByIds, from the profile-image resolver in PATCH /me and POST/PATCH /dogs',
-  },
-  {
-    sql: /^select "message_attachments"\."message_id"/,
-    where:
-      'messagesRepository.findAttachmentsByMessageIds, from wireManyMessages (staffThreads.ts:143)',
-  },
-];
+const KNOWN_POOL_READS_IN_TRANSACTIONS: ReadonlyArray<{ sql: RegExp; where: string }> = [];
 
 interface Frame {
   fn: string;

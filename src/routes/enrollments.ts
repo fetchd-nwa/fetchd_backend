@@ -1461,6 +1461,7 @@ async function runAllOrNothingEnrollment(
         // 5. R7 eligibility — server-derived prereqs.
         const prereqOptions = await groupClassesRepository.findPrereqOptionsForClass(
           cohortRow.classKey,
+          tx,
         );
         if (prereqOptions.length > 0) {
           const eligibilityGaps: EligibilityGap[] = [];

@@ -22,8 +22,12 @@ function buildSsl() {
  * no Supabase client SDK, no RLS.
  *
  * `connectionTimeoutMillis` (O-POOLFIX fix 1): a checkout waits at most 10 s for
- * a slot (or for a new connection to open), then rejects with "timeout exceeded
- * when trying to connect". Without it a pool whose 10 slots were all held waited
+ * a slot, then rejects with "timeout exceeded when trying to connect"; a new
+ * connection that cannot open within 10 s rejects with "Connection terminated
+ * due to connection timeout" instead (O-POOLFIX r2 Fable N2, executed: both
+ * `pool.query` and `withActor`, at 10,001 ms). A transaction that waits for one
+ * of `tx.ts`'s transaction slots gives up at the same 10 s with the first text
+ * (fix 2). Without it a pool whose 10 slots were all held waited
  * forever: every route hung, `/health` never answered, no request failed, so
  * nothing logged at level 50 and nothing paged (O-POOLFIX r1 H1, executed). With
  * it, exhaustion is a 500 that pages, and `/health` answers 503, each after the
@@ -51,7 +55,10 @@ export const pool = new pg.Pool({
  *     with a statement running), which pg-pool's idle listener does not cover.
  * A query running when its connection dies still rejects to its caller exactly
  * as before, and neither listener touches it. The caller's error is one of
- * three texts, depending on where the loss lands:
+ * three texts, depending on where the loss lands (and two more come from the
+ * 10 s bound above, not from a loss: "timeout exceeded when trying to connect"
+ * for a slot or a transaction slot, "Connection terminated due to connection
+ * timeout" for a connection that never opened — five in all):
  *   - "terminating connection due to administrator command" (57P01, the
  *     server's own error): the statement was in flight when the server ended
  *     the backend, e.g. a bare `pool.query`, or a transaction's BEGIN;

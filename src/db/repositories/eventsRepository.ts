@@ -51,9 +51,13 @@ export const eventsRepository = {
       .orderBy(asc(events.startsAt));
   },
 
-  /** Single event by id, live only. Returns undefined when not found / expired. */
-  async findLiveById(id: string): Promise<EventRow | undefined> {
-    const rows = await db
+  /**
+   * Single event by id, live only. Returns undefined when not found / expired.
+   * A transaction body passes its `tx` (O-POOLFIX fix 2: a pool read inside a
+   * transaction takes a second slot).
+   */
+  async findLiveById(id: string, runner: Tx | typeof db = db): Promise<EventRow | undefined> {
+    const rows = await runner
       .select(EVENT_PROJECTION)
       .from(events)
       .where(and(eq(events.id, id), live(events)))

@@ -307,7 +307,8 @@ export async function claimInvoiceWithCharge(
   );
   if (notifyOwner) {
     // A notice never un-records money (design §2.7:3993-3998): its own savepoint,
-    // its body composed inside it, and on any error one alarm and the money commits.
+    // its body composed inside it, and on any error one alarm; the settle commits or
+    // rolls back with its own transaction, never with the notice (`noticeInSavepoint.ts`).
     const dedupeKey = `receipt:${chargeId}`;
     const { receiptPush } = args;
     await noticeInSavepoint(

@@ -27,5 +27,22 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // O-POOLFIX (fix 2; r2 Opus L2 = Fable N1): the app opens no transaction on the pool-bound `db`. drizzle's
+    // `db.transaction` sends BEGIN before its try/finally { release() }, so a BEGIN that meets a lost connection
+    // keeps its pool slot for good, and ten wedge every route (r1 H1). Transactions open through `withActor` /
+    // `withTransaction` (`src/db/tx.ts`). Tests keep their own `db.transaction`.
+    files: ['src/**/*.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "CallExpression[callee.object.name='db'][callee.property.name='transaction']",
+          message:
+            'No db.transaction in src/: open transactions through withActor / withTransaction (src/db/tx.ts), which release the client on every path, BEGIN included (O-POOLFIX).',
+        },
+      ],
+    },
+  },
   prettier,
 );

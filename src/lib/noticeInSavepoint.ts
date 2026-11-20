@@ -28,7 +28,13 @@ const NOTICE_FAILED_ALARM =
  * transaction carries on. Whether it then commits is its own outcome, and the
  * alarm claims nothing more: when the connection is lost inside the savepoint, the
  * savepoint's rollback fails too, the caller's next statement or COMMIT fails, and
- * that error reaches the caller (a route's 500 pages on its own).
+ * that error reaches the caller (a route's 500 pages on its own). On a LIVE
+ * connection a savepoint statement itself can fail (`savepoint`, `rollback to
+ * savepoint` or `release savepoint`, e.g. a query cancel landing on it: O-POOLFIX r2
+ * Opus L1, executed). That leaves the caller's transaction aborted, and Postgres
+ * answers its COMMIT with ROLLBACK and no error, so the caller would resolve with
+ * nothing written. `tx.ts` runs one `select 1` after every transaction body (fix 2),
+ * which an aborted transaction refuses (25P02): the caller rejects instead.
  *
  * Answers whether the notice was queued, for a caller that wants to say so.
  */

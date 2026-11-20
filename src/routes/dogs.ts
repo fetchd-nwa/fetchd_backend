@@ -19,6 +19,7 @@ import { dogsRepository, type DogUpdate } from '../db/repositories/dogsRepositor
 import { requiredVaccinesRepository } from '../db/repositories/requiredVaccinesRepository.js';
 import { vetsRepository } from '../db/repositories/vetsRepository.js';
 import { evaluationStatus } from '../db/schema/schema.js';
+import type { Tx } from '../db/tx.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import type {
   PatchDogsMedicationsRequest,
@@ -294,15 +295,17 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
 
   // Resolve every dog wire's profile_image_path (media UUID → signed URL;
   // bundled paths pass through). One batched lookup + parallel signing.
-  const withResolvedDogImages = async (wires: DogWire[]): Promise<DogWire[]> => {
+  // A transaction body passes its `tx` (O-POOLFIX fix 2: a pool read inside a transaction takes a second slot).
+  const withResolvedDogImages = async (wires: DogWire[], runner?: Tx): Promise<DogWire[]> => {
     const resolve = await buildProfileImageUrlResolver(
       wires.map((w) => w.profile_image_path),
       r2,
+      runner,
     );
     return wires.map((w) => ({ ...w, profile_image_path: resolve(w.profile_image_path) }));
   };
-  const withResolvedDogImage = async (wire: DogWire): Promise<DogWire> => {
-    const [resolved] = await withResolvedDogImages([wire]);
+  const withResolvedDogImage = async (wire: DogWire, runner?: Tx): Promise<DogWire> => {
+    const [resolved] = await withResolvedDogImages([wire], runner);
     return resolved ?? wire;
   };
 
@@ -407,7 +410,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
           // than emit a wrong wire shape.
           throw new Error('dogs.create: row vanished before re-fetch inside txn');
         }
-        return { status: 201, body: await withResolvedDogImage(toDogWire(assembled, now())) };
+        return { status: 201, body: await withResolvedDogImage(toDogWire(assembled, now()), tx) };
       },
     );
 
@@ -501,7 +504,7 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
         if (!assembled) {
           throw new Error('dogs.patch: row vanished before re-fetch inside txn');
         }
-        return { status: 200, body: await withResolvedDogImage(toDogWire(assembled, now())) };
+        return { status: 200, body: await withResolvedDogImage(toDogWire(assembled, now()), tx) };
       },
     );
 

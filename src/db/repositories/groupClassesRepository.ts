@@ -6,6 +6,7 @@ import { db } from '../client.js';
 import { classPrereqOptions, groupClasses } from '../schema/schema.js';
 import { live } from '../softExpire.js';
 import { groupClassKey } from '../schema/schema.js';
+import type { Tx } from '../tx.js';
 
 /**
  * Data-access seam for `group_classes` + `class_prereq_options`. The
@@ -134,13 +135,16 @@ export const groupClassesRepository = {
    * from `findByKey`'s undefined case). Invalidated by prereq-options
    * edits (Day 19) via the `groupclasses:*` pattern wipe.
    */
-  async findPrereqOptionsForClass(classKey: GroupClassKey): Promise<GroupClassKey[]> {
+  async findPrereqOptionsForClass(
+    classKey: GroupClassKey,
+    runner: Tx | typeof db = db,
+  ): Promise<GroupClassKey[]> {
     return readThrough(
       groupClassesPrereqsCacheKey(classKey),
       GROUP_CLASSES_TTL_SEC,
       GROUP_CLASS_KEYS_SCHEMA,
       async () => {
-        const rows = await db
+        const rows = await runner
           .select({ prereqClassKey: classPrereqOptions.prereqClassKey })
           .from(classPrereqOptions)
           .where(and(eq(classPrereqOptions.classKey, classKey), live(classPrereqOptions)))

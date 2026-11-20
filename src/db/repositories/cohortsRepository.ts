@@ -44,10 +44,13 @@ export const cohortsRepository = {
    * ("Manners 1") instead of the generic category. Joins cohorts→group_classes;
    * returns a Map keyed by cohort id (missing ids simply absent).
    */
-  async resolveClassNamesByIds(ids: readonly string[]): Promise<Map<string, string>> {
+  async resolveClassNamesByIds(
+    ids: readonly string[],
+    runner: Tx | typeof db = db,
+  ): Promise<Map<string, string>> {
     const unique = [...new Set(ids)];
     if (unique.length === 0) return new Map();
-    const rows = await db
+    const rows = await runner
       .select({ cohortId: cohorts.id, className: groupClasses.name })
       .from(cohorts)
       .innerJoin(groupClasses, eq(groupClasses.key, cohorts.classKey))

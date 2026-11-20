@@ -14,6 +14,7 @@ import {
 } from '../contracts/wire.js';
 import type { Equal, Expect } from '../contracts/typeAsserts.js';
 import { hashRequestBody, requireIdempotencyKey, withMutation } from '../db/mutation.js';
+import type { Tx } from '../db/tx.js';
 import { settingsRepository } from '../db/repositories/settingsRepository.js';
 import { formatZodIssues } from '../lib/zodIssues.js';
 import { ApiError } from '../lib/errors.js';
@@ -54,8 +55,9 @@ import { staffCapabilities } from '../lib/staffCapabilities.js';
 async function withResolvedAvatar(
   profile: ReturnType<typeof ownerProfile>,
   r2: R2Client,
+  runner?: Tx,
 ): Promise<ReturnType<typeof ownerProfile>> {
-  const resolve = await buildProfileImageUrlResolver([profile.avatar_image_path], r2);
+  const resolve = await buildProfileImageUrlResolver([profile.avatar_image_path], r2, runner);
   return { ...profile, avatar_image_path: resolve(profile.avatar_image_path) };
 }
 
@@ -364,7 +366,7 @@ export function registerMeRoute(app: FastifyInstance, opts: MeRouteOpts = {}): v
         if (!row) {
           throw new ApiError('not_provisioned', 'owner record no longer available');
         }
-        return { status: 200, body: await withResolvedAvatar(ownerProfile(row, map), r2) };
+        return { status: 200, body: await withResolvedAvatar(ownerProfile(row, map), r2, tx) };
       },
     );
 

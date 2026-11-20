@@ -79,8 +79,8 @@ export async function wireManyBookings(
     .map((r) => r.trainerStaffId as string);
   const [shareRows, trainerName, classNamesByCohort, serviceTrainerNames] = await Promise.all([
     bookingsRepository.findSharesByBookingIds(runner, ids),
-    staffRepository.resolveTrainerNames(rows),
-    cohortsRepository.resolveClassNamesByIds(cohortIds),
+    staffRepository.resolveTrainerNames(rows, runner),
+    cohortsRepository.resolveClassNamesByIds(cohortIds, runner),
     staffRepository.findAnyNamesByIds(serviceTrainerIds, runner),
   ]);
   const dogsByBooking = groupBookingDogs(shareRows);
