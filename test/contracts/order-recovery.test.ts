@@ -181,11 +181,18 @@ function recordingLog() {
   return { lines, info: at('info'), warn: at('warn'), error: at('error') };
 }
 
-/** Wait until a statement of this process is blocked on a row lock. */
+/**
+ * Wait until a statement of this process is blocked on a row lock. In THIS database only: the
+ * server is shared, and another lane's waiter whose query names charges would read as ours and
+ * end the wait before the race is forced (#40 r2, Opus L2 / Fable N2). Each poll is its own
+ * autocommit statement, so `pg_stat_activity` is read fresh every time.
+ */
 async function untilSomethingBlocks(): Promise<void> {
   for (let i = 0; i < 100; i += 1) {
     const rows = await db.execute(
-      sql`SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query ILIKE '%charges%'`,
+      sql`SELECT 1 FROM pg_stat_activity
+           WHERE wait_event_type = 'Lock' AND query ILIKE '%charges%'
+             AND datname = current_database()`,
     );
     if (rows.rows.length > 0) return;
     await new Promise((resolve) => setTimeout(resolve, 20));

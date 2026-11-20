@@ -324,6 +324,10 @@ test(
           short_dates: [{ date: D.MON, dog_id: waffles, reason: 'no_credit' }],
         },
       ],
+      draws: [
+        { location: 'fayetteville', mode: 'daycare', tier: 'regular', balance: 0, draw: 0, short: 1 },
+        { location: 'fayetteville', mode: 'daycare', tier: 'alumni', balance: 0, draw: 0, short: 0 },
+      ],
     });
     assert.deepEqual(await rowCounts(), before, 'nothing written');
     assert.equal(await bentonCareBalance('alumni'), 10);
