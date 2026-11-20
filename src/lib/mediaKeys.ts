@@ -20,8 +20,22 @@ export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB — generous for high
 // identical to the union it replaces.
 export type { MediaPurpose };
 
-const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
-const VIDEO_TYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
+// The content types a photo or a video may carry. Exported (9.3.0-pre.1) only so
+// `test/uploadLimitsMirror.test.ts` can hold them equal to the contract's
+// `UPLOAD_IMAGE_CONTENT_TYPES` / `UPLOAD_VIDEO_CONTENT_TYPES`, which the clients import
+// (build DECISIONS 863 (ii)); read-only, so no importer can widen what a route accepts.
+export const IMAGE_TYPES: ReadonlySet<string> = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+]);
+export const VIDEO_TYPES: ReadonlySet<string> = new Set([
+  'video/mp4',
+  'video/quicktime',
+  'video/webm',
+]);
 
 /**
  * Enforce the per-purpose content-type rule. Image purposes accept image/*;
