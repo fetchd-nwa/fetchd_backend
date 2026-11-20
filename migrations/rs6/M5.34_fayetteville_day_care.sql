@@ -12,30 +12,62 @@
 -- alumni credits stay Bentonville-only (553 (b)): no alumni row is added at Fayetteville.
 --   0. `lock_timeout` first, so a step queued behind a long transaction fails in 5 s and runs
 --      again, instead of stalling the settings and the shop behind its row locks.
---   1. The guard. Before this step no road wrote a Fayetteville day care lot (no row sold
---      day care there, so the desk's add answered `pool_not_bookable`). An alumni lot of that
---      pool, if a database holds one, would start paying an alumni dog's Fayetteville day the
---      moment day care opens, against 553 (b). So the step refuses while any such lot has
---      credits left, live OR expired (an expired lot's credits come back when expiry is
---      switched off or its date is moved, M4.12; M5.25 fix 1, Fable L6). It names owner and
---      lot ids and balances, never a name or an email. Regular lots of the pool are not
---      refused: they are Fayetteville day care credits, and now pay Fayetteville day care.
---   2. The offerings: only `day-care`'s two flags move at Fayetteville; its `name` and
+--   1. The catalog and the ledger locked against writers before the guard reads them (M5.25's
+--      form, fix 1 Fable L2): a lot or a row another connection commits while the step runs
+--      waits for its commit, and one already in flight is waited for and then read. Readers
+--      (the shop, a purchase's row read) do not wait. A non-zero runner exit (a lock timeout,
+--      or a 40P01 that chose the step) means nothing was applied: run it again.
+--   2. The guard, which refuses while day care cannot open cleanly at Fayetteville. Before this
+--      step no road wrote a Fayetteville day care lot (no row sold day care there, so the desk's
+--      add answered `pool_not_bookable`), and no route makes a catalog row; every clause below
+--      needs a hand-altered database, which hers is. It names owner, lot and booking ids,
+--      balances and catalog keys, never a name or an email.
+--      a. Fayetteville's settings row exists (fix 1, Fable N2): without it the UPDATE below
+--         matches nothing and the rows would go on sale with day care not offered.
+--      b. No alumni lot of the pool has credits left, live OR expired (an expired lot's credits
+--         come back when expiry is switched off or its date is moved, M4.12; M5.25 fix 1,
+--         Fable L6). Such a lot would start paying an alumni dog's Fayetteville day the moment
+--         day care opens, against 553 (b). Regular lots of the pool are not refused: they are
+--         Fayetteville day care credits, and now pay Fayetteville day care.
+--      c. No alumni debit of the pool is live on an uncancelled booking dated today or later in
+--         Chicago, whose cancel would return the credit there (M5.25's third clause; fix 1,
+--         Fable L3).
+--      d. The catalog at Fayetteville day care holds no row but this step's two, live or to come
+--         (another key, an alumni row, another date, or the step's key and date on other terms),
+--         and no closed row of the step's keys is on other terms (the reopen in 5 could open
+--         it): so the step never leaves two live rows of one key, a price not Bentonville's, or
+--         an alumni row there (fix 1, Fable L4). A row whose window is over, and a row the
+--         reversal closed (`effective_to = effective_from`), do not block.
+--   3. The offerings: only `day-care`'s two flags move at Fayetteville; its `name` and
 --      `description` stay as staff left them, and Bentonville's document is not touched.
 --      (`jsonb_set` with a NULL value returns NULL, so a document missing its `day-care`
 --      entry gets a whole one, NOT SEEDED name and description, instead of losing itself.)
---   3. The two rows, in M4.06's form (Bentonville's `daycare-10-bentonville` and
+--      A document already on is not written, so a run that changes nothing writes no audit
+--      row (fix 1, Fable N1).
+--   4. The two rows, in M4.06's form (Bentonville's `daycare-10-bentonville` and
 --      `single-day-daycare-bentonville` with the campus changed).
---   4. Each new key's latest row is open: run again after the reversal, the insert above finds
+--   5. Each new key's latest row is open: run again after the reversal, the insert above finds
 --      the rows the reversal closed and does nothing, so this reopens them rather than leave
 --      day care offered with nothing on sale (M5.25 fix 1, Fable L5). On a first run it
 --      changes nothing.
 SET LOCAL lock_timeout = '5s';
 
+LOCK TABLE credit_packages IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE credit_ledger IN SHARE MODE;
+
 DO $$
 DECLARE
   balances text;
+  debits text;
+  other_rows text;
 BEGIN
+  PERFORM 1 FROM day_program_settings WHERE location = 'fayetteville';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'M5.34 refused: the database holds no day_program_settings row for fayetteville, so day care cannot be switched on there and its two rows would go on sale with day care not offered. Restore the row (schema.sql seeds it), then run the step again.';
+  END IF;
+
+  -- Every alumni lot of the pool, live or not, with what is left on it: the grant plus every
+  -- row that names it (the unspent `lotUnspentInTx` reads).
   SELECT string_agg(owner_id::text || ' holds ' || held::text || ' (' || lots || ')', ', '
                     ORDER BY owner_id)
     INTO balances
@@ -57,9 +89,46 @@ BEGIN
        GROUP BY lot.owner_id
     ) held_by_owner;
 
-  IF balances IS NOT NULL THEN
-    RAISE EXCEPTION 'M5.34 refused: a Fayetteville day care alumni pool holds credits, which opening day care there would let an alumni dog spend (alumni credits are Bentonville-only, 553 (b)). Credits left on its lots, live or expired: %. Move them by hand (CRED-26), then run the step again.',
-      balances;
+  SELECT string_agg(DISTINCT d.owner_id::text || ' booking ' || d.booking_id::text, ', ')
+    INTO debits
+    FROM credit_ledger d
+    JOIN bookings b ON b.id = d.booking_id
+   WHERE d.location = 'fayetteville' AND d.mode = 'daycare' AND d.tier = 'alumni'
+     AND d.reason = 'booking-debit'
+     AND NOT EXISTS (
+       SELECT 1 FROM credit_ledger r
+        WHERE r.reverses_entry_id = d.id AND r.reason = 'settlement-return')
+     AND b.status <> 'cancelled'
+     AND (b.scheduled_at AT TIME ZONE 'America/Chicago')::date
+           >= (now() AT TIME ZONE 'America/Chicago')::date;
+
+  SELECT string_agg(r.key || ' from ' || r.effective_from::text
+                      || COALESCE(' to ' || r.effective_to::text, '')
+                      || CASE WHEN r.on_step_terms THEN '' ELSE ' (not this step''s terms)' END,
+                    ', ' ORDER BY r.key, r.effective_from)
+    INTO other_rows
+    FROM (
+      SELECT cp.key, cp.effective_from, cp.effective_to,
+             (cp.location = 'fayetteville' AND cp.mode = 'daycare' AND cp.tier = 'regular'
+              AND ((cp.key = 'daycare-10-fayetteville' AND cp.credits = 10
+                    AND cp.price_cents = 35000 AND NOT cp.single_day)
+                OR (cp.key = 'single-day-daycare-fayetteville' AND cp.credits = 1
+                    AND cp.price_cents = 3500 AND cp.single_day))) AS on_step_terms,
+             (cp.effective_to IS NULL
+              OR cp.effective_to > GREATEST(cp.effective_from,
+                                            (now() AT TIME ZONE 'America/Chicago')::date))
+               AS live_or_to_come
+        FROM credit_packages cp
+       WHERE (cp.location = 'fayetteville' AND cp.mode = 'daycare')
+          OR cp.key IN ('daycare-10-fayetteville', 'single-day-daycare-fayetteville')
+    ) r
+   WHERE (r.live_or_to_come AND NOT (r.on_step_terms AND r.effective_from = '2026-01-01'))
+      OR (r.key IN ('daycare-10-fayetteville', 'single-day-daycare-fayetteville')
+          AND NOT r.on_step_terms);
+
+  IF balances IS NOT NULL OR debits IS NOT NULL OR other_rows IS NOT NULL THEN
+    RAISE EXCEPTION 'M5.34 refused: Fayetteville day care cannot open cleanly (alumni credits are Bentonville-only, 553 (b); its catalog must be this step''s two rows). Alumni credits left on its lots, live or expired: %. Live alumni debits on bookings today or later, whose cancel would return the credit there: %. Catalog rows at Fayetteville day care, or of this step''s keys, other than this step''s two: %. Move the credits by hand (CRED-26) and close or correct those rows, then run the step again.',
+      coalesce(balances, 'none'), coalesce(debits, 'none'), coalesce(other_rows, 'none');
   END IF;
 END $$;
 
@@ -70,7 +139,8 @@ UPDATE day_program_settings
          COALESCE(offerings -> 'day-care', '{"name": null, "description": null}'::jsonb)
            || '{"offered": true, "client_visible": true}'::jsonb
        )
- WHERE location = 'fayetteville';
+ WHERE location = 'fayetteville'
+   AND NOT COALESCE(offerings -> 'day-care' @> '{"offered": true, "client_visible": true}'::jsonb, false);
 
 INSERT INTO credit_packages (key, location, mode, tier, credits, price_cents, label, is_popular, single_day, expiry_months, effective_from) VALUES
   ('daycare-10-fayetteville', 'fayetteville', 'daycare', 'regular', 10, 35000, 'Fayetteville Day Care Package', false, false, 1, '2026-01-01'),

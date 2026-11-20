@@ -723,8 +723,19 @@ test(
 // A lock test that can only fail by waiting forever must fail by the clock instead.
 const LOCK_TEST = { ...SKIP_WHEN_NO_DB, timeout: 20_000 };
 
+// Waiters are counted in THIS database only. The server is shared: a waiter in another lane's
+// database would otherwise read as ours, start the second request before the first had queued,
+// and unforce the race (#40 r1, Opus L2: one planted foreign waiter flipped a forced round).
+// An advisory lock carries its database, so `advisoryWaiters` filters on it. A session queued
+// on a held ROW waits on the holder's transaction id, a lock with no database
+// (`pg_locks.database` is NULL), so `waitingOnALock` scopes by the waiting session's database.
+const IN_THIS_DATABASE = `database = (SELECT oid FROM pg_database WHERE datname = current_database())`;
+
 async function waitingOnALock(client: pg.Client): Promise<number> {
-  const res = await client.query(`SELECT count(*)::int AS n FROM pg_locks WHERE NOT granted`);
+  const res = await client.query(
+    `SELECT count(*)::int AS n FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+      WHERE NOT l.granted AND a.datname = current_database()`,
+  );
   return (res.rows[0] as { n: number }).n;
 }
 
@@ -882,7 +893,8 @@ async function outcomeOf(patched: Answer, booked: Answer): Promise<string> {
 
 async function advisoryWaiters(client: pg.Client): Promise<number> {
   const res = await client.query(
-    `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
+    `SELECT count(*)::int AS n FROM pg_locks
+      WHERE locktype = 'advisory' AND NOT granted AND ${IN_THIS_DATABASE}`,
   );
   return (res.rows[0] as { n: number }).n;
 }

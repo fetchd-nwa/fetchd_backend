@@ -105,9 +105,25 @@ function safeHost(rawUrl: string): string {
 
 import { SEED } from './seed-ids.js';
 
-const CATALOG_SEED_STEP = fileURLToPath(
-  new URL('../migrations/lg4/M4.06_seed_ten_credit_packages.sql', import.meta.url),
-);
+// The catalog of record is `schema.sql`'s own `credit_packages` statement. Every catalog step
+// must leave a migrated database holding exactly its rows (the steps tests hold each step equal to
+// the seed: `lg4-p18-steps` for M4.06, `rs2-steps` for M5.25, `rs6-steps` for M5.34), so this seed
+// reads that statement rather than a step's: it follows every later catalog step without an edit.
+// Reading M4.06 alone is how M5.25's and M5.34's rows fell out of it (#40 r1, Fable L1 / Opus L3).
+// The steps' own texts are not replayed here: M5.34's would also switch Fayetteville day care on
+// in `day_program_settings`, which this seed has never written.
+const SCHEMA_SQL = fileURLToPath(new URL('../.claude/backend/schema.sql', import.meta.url));
+
+function catalogSeedStatement(): string {
+  const found =
+    readFileSync(SCHEMA_SQL, 'utf8').match(
+      /^\s*insert\s+into\s+(?:public\.)?credit_packages\b[\s\S]*?;\s*$/gim,
+    ) ?? [];
+  if (found.length !== 1 || found[0] === undefined) {
+    throw new Error(`schema.sql seeds the catalog in one statement; found ${found.length}`);
+  }
+  return found[0];
+}
 
 function daysFromNow(days: number, hour = 14): string {
   const d = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
@@ -445,9 +461,11 @@ async function seed(): Promise<void> {
     },
   ]);
 
-  // The ten rows of the catalog, from M4.06's own statement, so this seed and a migrated
-  // database hold one catalog. Each row names its campus, program and tier.
-  await db.execute(sql.raw(readFileSync(CATALOG_SEED_STEP, 'utf8')));
+  // The catalog of record, from schema.sql's own statement (`catalogSeedStatement`), so this
+  // seed and a migrated database hold one catalog: M4.06's rows as M5.25 left them (the
+  // Fayetteville day-school alumni pack closed, Bentonville's day care alumni pack open) and
+  // M5.34's two Fayetteville day care rows. Each row names its campus, program and tier.
+  await db.execute(sql.raw(catalogSeedStatement()));
 
   await db.insert(dogs).values([
     {
@@ -1229,9 +1247,15 @@ async function main(): Promise<void> {
   await wipe();
   await seed();
   await restoreRealStripeRows(preserved);
+  const counted = await db.execute(
+    sql`SELECT count(*)::int AS total, count(*) FILTER (WHERE effective_to IS NULL)::int AS open
+          FROM credit_packages`,
+  );
+  const { total, open } = counted.rows[0] as { total: number; open: number };
+  const catalog = `${total} (${open} open)`;
   console.log(
     `Seeded dev DB (${safeHost(env.DATABASE_URL)}): 5 staff, 2 owners, 4 dogs, 4 bookings, 3 requests, ` +
-      `2 threads, 10 credit packages, 4 group classes + 8 cohorts, billing ledger, 6 announcements, ` +
+      `2 threads, ${catalog} credit packages, 4 group classes + 8 cohorts, billing ledger, 6 announcements, ` +
       `1 event. ` +
       `Preserved real Stripe rows: ${preserved.customers.length} customer(s), ${preserved.cards.length} card(s). ` +
       `Portal principal: staff:${SEED.staffShanthiId}:owner`,

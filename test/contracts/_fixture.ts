@@ -131,7 +131,8 @@ export const FIXTURE_IDS = {
   bookingDog2PastCareId: '77777777-7777-4777-8777-77777777777b',
   // Day-5b: credit_packages catalog keys + credit_ledger ids. Packages use
   // `test-*` text prefixes for the same reason as the catalog rows above: they
-  // sit beside the ten rows schema.sql seeds (M4.06), and never collide with them.
+  // sit beside the thirteen rows schema.sql seeds (M4.06, M5.25, M5.34), and never collide
+  // with them.
   creditPackageSchool5Key: 'test-school-5',
   creditPackageSchool10Key: 'test-school-10',
   creditPackageRetiredKey: 'test-retired-pack',
@@ -786,10 +787,11 @@ export async function seedFixture(): Promise<void> {
   ]);
 
   // Day-5b catalog, effective-dated since Δ 2026-06-08 (parity with
-  // service_rates). These rows sit beside the ten schema.sql seeds (M4.06), so at
-  // FIXTURE_TODAY (2026-05-19) Fayetteville's live catalog is its four seeded rows
-  // plus the two current-window packs here, and Bentonville's is its six seeded
-  // rows. The extra windows exercise the filter:
+  // service_rates). These rows sit beside the thirteen schema.sql seeds (M4.06, M5.25,
+  // M5.34; twelve live, M5.25's Fayetteville alumni pack closed), so at FIXTURE_TODAY
+  // (2026-05-19) Fayetteville's live catalog is its five seeded rows plus the two
+  // current-window packs here, and Bentonville's is its seven seeded rows. The extra
+  // windows exercise the filter:
   //   - test-school-5 carries THREE windows of one key — a superseded past price,
   //     the CURRENT price (the row the purchase ledger + snapshot point at), and a
   //     FUTURE scheduled reprice — proving "pick the window that contains today"
