@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import vm from 'node:vm';
 import { test } from 'node:test';
 import { sql } from 'drizzle-orm';
 import pg from 'pg';
@@ -15,7 +18,11 @@ import {
   makeContractApp,
   registerFixtureHooks,
 } from './_harness.js';
-import { poolReadGuardSeen, withPoolReadGuardPaused } from './_poolReadGuard.js';
+import {
+  assertNoPoolReadInTransaction,
+  poolReadGuardSeen,
+  withPoolReadGuardPaused,
+} from './_poolReadGuard.js';
 
 /**
  * **The pool cannot deadlock on itself** (O-POOLFIX fix 2; r2 Fable M1 = Opus L3).
@@ -33,6 +40,10 @@ import { poolReadGuardSeen, withPoolReadGuardPaused } from './_poolReadGuard.js'
  *   S3  twelve transaction bodies, each awaiting a read on the pool, all resolve: the bound protects a route no test
  *       drives (the read is planted on purpose, with the pool-read guard paused for it).
  *   S4  the pool-read guard is live: driving a route records a transaction opened by `src/`.
+ *   S5  the pool-read guard REPORTS (O-POOLFIX-B; r3 Fable L2): a transaction opened from code outside `src/` and
+ *       `test/` (its opener reads `unknown`, held to the src rule) that reads on the pool is named, statement and all.
+ *   S6  a transaction opened inside another's body is refused at once (O-POOLFIX-B; r3 Fable N5 = Opus N5): it would
+ *       hold a second slot while its outer one waits, outside the `max − 1` bound.
  */
 
 registerFixtureHooks();
@@ -237,5 +248,94 @@ test(
       1,
       'the route’s transaction was seen, and seen as src/’s',
     );
+  },
+);
+
+/**
+ * Code outside `src/` and `test/`: compiled under a file name in the OS temp folder, so the guard's stack reading
+ * finds an opener that is neither (`unknown`), which it holds to the src rule. It reads on the pool inside its own
+ * transaction, as a route that forgot its `tx` would.
+ */
+const OUTSIDE_FILE = path.join(os.tmpdir(), 'pool-saturation-S5-outside-src-and-test.js');
+const openAndReadOnPool = vm.runInThisContext(
+  `(function openAndReadOnPool(withActor, db, sql, actor) {
+     return withActor(actor, async () => {
+       await db.execute(sql\`select 'planted' as s5_planted_pool_read\`);
+     });
+   })`,
+  { filename: OUTSIDE_FILE },
+) as (w: typeof withActor, d: typeof db, s: typeof sql, actor: string) => Promise<void>;
+
+test(
+  'S5: the pool-read guard reports: a pool read inside a transaction whose opener is outside src/ and test/ is named',
+  { ...SKIP_WHEN_NO_DB, timeout: 30_000 },
+  async () => {
+    const before = poolReadGuardSeen();
+    await openAndReadOnPool(withActor, db, sql, ACTOR);
+    const after = poolReadGuardSeen();
+    assert.equal(
+      after.unknownTransactions - before.unknownTransactions,
+      1,
+      'the planted transaction was seen, and its opener read as unknown',
+    );
+    assert.throws(
+      () => assertNoPoolReadInTransaction('S5'),
+      (err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        assert.match(message, /^1 pool checkout\(s\) inside a transaction body \(S5\)/);
+        assert.match(message, /pool\.query "select 'planted' as s5_planted_pool_read"/);
+        assert.match(message, /opened \(unknown\) at: .* < openAndReadOnPool \(/);
+        return true;
+      },
+      'the guard names the planted read',
+    );
+    // The throw cleared what it named, so this file's afterEach stays quiet.
+    assert.doesNotThrow(() => assertNoPoolReadInTransaction('S5, after'));
+  },
+);
+
+test(
+  'S6: a transaction opened inside a transaction body is refused at once, before it takes a slot or a connection',
+  { ...SKIP_WHEN_NO_DB, timeout: 30_000 },
+  async () => {
+    const t0 = Date.now();
+    const nested = await outcome(
+      withActor(ACTOR, async () => withActor(ACTOR, async () => 'inner committed')),
+    );
+    const ms = Date.now() - t0;
+    assert.deepEqual(
+      nested.ok
+        ? nested
+        : { ok: false, refused: /inside another transaction's body/.test(nested.message) },
+      { ok: false, refused: true },
+      `the outer rejects with the nested refusal (${JSON.stringify(nested)})`,
+    );
+    assert.ok(ms < 2_000, `at once, never at a slot or checkout timeout (${ms} ms)`);
+    // Both slots are back: nine transactions still hold slots at once, each blocked on one advisory lock.
+    const key = 7_300_000_000 + Math.floor(Math.random() * 1_000_000);
+    const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+    await holder.connect();
+    try {
+      await holder.query('SELECT pg_advisory_lock($1)', [key]);
+      const nine = Array.from({ length: 9 }, () =>
+        withActor(ACTOR, async (tx) => {
+          await tx.execute(sql`select pg_advisory_xact_lock(${key})`);
+        }),
+      );
+      let blocked = 0;
+      for (let i = 0; i < 250 && blocked < 9; i += 1) {
+        const r = await holder.query(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%pg_advisory_xact_lock%'`,
+        );
+        blocked = r.rows[0].n as number;
+        if (blocked < 9) await new Promise((r2) => setTimeout(r2, 20));
+      }
+      await holder.query('SELECT pg_advisory_unlock($1)', [key]);
+      await Promise.all(nine);
+      assert.equal(blocked, 9, 'nine transactions held slots at once after the refusal');
+    } finally {
+      await holder.end();
+    }
   },
 );

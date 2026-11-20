@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import type { PoolClient } from 'pg';
@@ -54,7 +55,9 @@ function boundTo(client: PoolClient): ReturnType<typeof bindTo> {
  * (every non-transaction slot also held) a transaction waits for both in turn.
  *
  * The bound does not cover a transaction opened inside another transaction's body (it would hold a second slot
- * while its outer one waits); none exists in `src/`, and the same guard fails one.
+ * while its outer one waits): nine outers each opening one stall every transaction for the slot timeout. So one is
+ * refused at once, before it takes a slot or a connection (`inTransaction`; O-POOLFIX-B, r3 Fable N5 = Opus N5).
+ * A savepoint (`tx.transaction`) is not one: it runs on the outer's connection.
  */
 const TRANSACTION_SLOTS = Math.max(1, (pool.options.max ?? 10) - 1);
 let transactionsHolding = 0;
@@ -128,15 +131,30 @@ function releaseTransactionSlot(): void {
  * returned over an aborted transaction: that used to resolve as success.
  */
 async function inTransaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+  if (openTransaction.getStore()?.open === true) {
+    throw new Error(
+      "a transaction was opened inside another transaction's body: it would hold a second pool slot while its outer " +
+        'one waits (outside the max − 1 bound). Pass the outer tx, or use tx.transaction for a savepoint (src/db/tx.ts).',
+    );
+  }
   // A free transaction slot is taken synchronously, so the checkout below starts in this same tick (no await
   // before it) unless the transactions are all busy.
   if (!takeTransactionSlot()) await waitForTransactionSlot();
+  const scope = { open: true };
   try {
-    return await onCheckedOutClient(fn);
+    return await openTransaction.run(scope, () => onCheckedOutClient(fn));
   } finally {
+    scope.open = false;
     releaseTransactionSlot();
   }
 }
+
+/**
+ * Marks the async context of an open transaction, so `inTransaction` can refuse one opened inside it. The mark is
+ * an object whose `open` goes false when its transaction ends, so work the body started that outlives it (a timer, a
+ * fire-and-forget) may open a transaction afterwards.
+ */
+const openTransaction = new AsyncLocalStorage<{ open: boolean }>();
 
 async function onCheckedOutClient<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   const client = await pool.connect();
