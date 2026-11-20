@@ -33,6 +33,7 @@ import {
   defaultDeliveryDeps,
   deliverEvent,
   threadOwnerOf,
+  type DeliveryBound,
   type DeliveryDeps,
   type FrameSocket,
   type MessageElementFor,
@@ -68,7 +69,8 @@ import {
  * **Timers:** every 25 s the principal is re-resolved by id (gone or role changed: 4403; the
  * read throwing: 1011, FH1-b); 60 s with no inbound frame ends the socket (`terminate()`, LR13).
  * **Limits:** frames ≤ 16 KB (1009); 5 sockets per family, 20 per staffer, the next evicting the
- * oldest (4429); 200 unauthenticated per instance (1013).
+ * oldest (4429); 200 unauthenticated per instance (1013); one event's delivery 3 s (then its
+ * sockets are told `resync` and the instance's delivery queue moves on: L3, MB53).
  * **Never fatal (LR5):** listeners are attached before anything else and every listener and
  * timer body is caught; a socket `error` is a warn line; anything unexpected closes that one
  * socket 1011.
@@ -88,6 +90,9 @@ interface RtSocket {
 }
 
 const WS_OPEN = 1;
+
+/** The longest delay a Node timer holds (2^31-1 ms, about 24.8 days); a longer one fires at once. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 export interface RealtimeClock {
   now(): number;
@@ -120,6 +125,9 @@ export interface RealtimeLimits {
   typingIntervalMs: number;
   ackIntervalMs: number;
   closeGraceMs: number;
+  /** L3 (MB53): how long one event's delivery (its frame build and liveness query) may hold the
+   *  instance's one delivery queue before its sockets are told `resync` and the queue moves on. */
+  deliveryBoundMs: number;
 }
 
 export const REALTIME_LIMITS: Readonly<RealtimeLimits> = {
@@ -135,6 +143,7 @@ export const REALTIME_LIMITS: Readonly<RealtimeLimits> = {
   typingIntervalMs: 1_000,
   ackIntervalMs: 1_000,
   closeGraceMs: 1_000,
+  deliveryBoundMs: 3_000,
 };
 
 /** Where an `ack` that passed its checks goes, with the bus to publish its `receipt` on. The
@@ -169,7 +178,13 @@ export interface RealtimeOptions {
   log?: FastifyBaseLogger;
 }
 
-const threadIdSchema = z.string().uuid();
+/** A client frame's thread id, lower-cased (M1, MB53): a uuid accepts either case, so without
+ *  this each spelling of one thread would be its own ack bucket and its own typing id. The ack
+ *  limit, the coalescing, the thread check and the relay all see the one canonical spelling. */
+const threadIdSchema = z
+  .string()
+  .uuid()
+  .transform((id) => id.toLowerCase());
 const AUTH_FRAME = z.union([
   z
     .object({
@@ -505,8 +520,10 @@ class Connection implements FrameSocket {
       this.close(REALTIME_CLOSE_CODES.forbidden);
       return;
     }
-    // CR15: a valid re-auth gets no frame; it moves the expiry.
-    this.expiresAt = outcome.expiresAt;
+    // CR15: a valid re-auth gets no frame; a new token's `exp` moves the expiry (B4c). A re-auth
+    // that carries no `exp` (the dev arm) keeps the one in force, never drops it (O-N1, MB54):
+    // "at the token's exp with no new token, 4401".
+    this.expiresAt = outcome.expiresAt ?? this.expiresAt;
     this.armExpiry();
   }
 
@@ -530,6 +547,14 @@ class Connection implements FrameSocket {
     this.expiryTimer = undefined;
     if (this.expiresAt === undefined) return;
     const wait = Math.max(0, this.expiresAt - this.hub.clock.now());
+    if (wait > MAX_TIMER_MS) {
+      // N4 (MB53): a Node timer longer than 2^31-1 ms fires after 1 ms. Wait the longest one
+      // holds, then arm again from the time left.
+      this.expiryTimer = this.timer(MAX_TIMER_MS, () => {
+        if (this.state === 'authenticated') this.armExpiry();
+      });
+      return;
+    }
     this.expiryTimer = this.timer(wait, () => {
       if (this.state === 'authenticated') this.close(REALTIME_CLOSE_CODES.token_invalid);
     });
@@ -695,6 +720,7 @@ class Hub implements RealtimeHub {
   private readonly unauthenticatedSet = new Set<Connection>();
   private readonly every = new Set<Connection>();
   private deliveries: Promise<void> = Promise.resolve();
+  private readonly deliveryBound: DeliveryBound;
 
   constructor(
     readonly log: FastifyBaseLogger,
@@ -709,6 +735,11 @@ class Hub implements RealtimeHub {
     this.buildsMessageFrames = opts.messageElement !== undefined;
     this.limits = { ...REALTIME_LIMITS, ...opts.limits };
     this.clock = opts.clock ?? systemClock;
+    this.deliveryBound = {
+      ms: this.limits.deliveryBoundMs,
+      setTimeout: (fn, ms) => this.clock.setTimeout(fn, ms),
+      clearTimeout: (handle) => this.clock.clearTimeout(handle),
+    };
     this.prefix = opts.bus?.prefix ?? resolveChannelPrefix();
     this.deps = {
       verify: opts.verify ?? verifyAccessToken,
@@ -836,9 +867,17 @@ class Hub implements RealtimeHub {
           : staffChannel(this.prefix);
       const targets = [...(this.channels.get(channel) ?? [])];
       if (targets.length === 0) return;
+      // One queue for the instance; L3 (MB53): each delivery in it is bounded.
       this.deliveries = this.deliveries
         .then(() =>
-          deliverEvent(target, event, targets, () => this.authenticatedSet, this.deps.delivery),
+          deliverEvent(
+            target,
+            event,
+            targets,
+            () => this.authenticatedSet,
+            this.deps.delivery,
+            this.deliveryBound,
+          ),
         )
         .then(undefined, (err: unknown) => {
           this.log.warn({ err_message: errMessage(err) }, 'realtime: a delivery failed');

@@ -21,11 +21,16 @@ import type { MirrorPrincipal } from '../auth/mirror.js';
  *   publisher connection is never exported.
  * · **Ids only, never content** (H4): a payload is `{v, kind, thread_id, owner_id, …ids}`. No
  *   text, no names, no URLs; each instance builds every frame itself, per audience
- *   (`frames.ts`).
+ *   (`frames.ts`). The choke point parses every event against the bus schema before it is
+ *   published, so this holds at run time, not by TypeScript alone (L2, MB53).
  * · **`live` means vouched for** (FL5): the subscriber is subscribed AND a probe this instance
  *   published came back through it. Until then, and after any publish failure or subscriber
- *   loss, the state is `degraded` and every local socket polls. After a subscriber reconnect,
- *   every local socket is told `resync`, then `live` once a fresh probe returns.
+ *   loss, the state is `degraded` and every local socket polls. **Every exit from `degraded`**,
+ *   whatever caused it, tells every local socket `resync` and then `live`, once a fresh probe
+ *   returns (item 9, MB57; MB23 (9)). **While `live`
+ *   it is vouched for again every heartbeat (O-M1, MB54):** a probe that fails or is not heard
+ *   back in time is a silent path (half-open: no FIN, no RST), handled as a drop. The publisher
+ *   has a command timeout and both connections a TCP keepalive, so no publish hangs forever.
  * · **Total and quiet**: `publishForThread` never throws and never rejects; every listener body
  *   is one `try/catch` (LR5); bus trouble is logged once per state change, never per event
  *   (OL10), at warn, below the pager's level-50 tap.
@@ -190,6 +195,17 @@ const busEventSchema = z.union([
     .strict(),
 ]);
 
+/** The kinds `busEventSchema` knows, for L2's error line (a kind outside it is logged as
+ *  `unknown`, never echoed). */
+const BUS_KINDS: ReadonlySet<string> = new Set<BusEventInput['kind']>([
+  'typing',
+  'thread.changed',
+  'bell.changed',
+  'message.created',
+  'receipt',
+  'staff.read',
+]);
+
 const probeSchema = z
   .object({ v: z.literal(1), kind: z.literal('probe'), instance: z.string(), nonce: z.string() })
   .strict();
@@ -233,7 +249,8 @@ export interface BusHandlers {
   onEvent(target: ChannelTarget, event: BusEvent): void;
   /** The state changed (`degraded` ↔ `live`). */
   onState(state: BusState): void;
-  /** The subscriber reconnected: events may have been missed. */
+  /** Events may have been missed: called on every exit from `degraded`, immediately before
+   *  `onState('live')` (item 9, MB57). */
   onResync(): void;
 }
 
@@ -245,15 +262,30 @@ export interface BusOptions {
    *  inherits unless overridden (FL6). */
   base?: Redis;
   instanceId?: string;
-  /** Test seam: the publisher (default `base.duplicate({maxRetriesPerRequest: 1})`). */
+  /** Test seam: the publisher (default `base.duplicate({maxRetriesPerRequest: 1, commandTimeout,
+   *  keepAlive})`). */
   createPublisher?: (base: Redis) => PublisherLike;
   /** The subscriber's reconnect backoff (default: 200 ms a try, capped at 2 s). */
   retryStrategy?: (times: number) => number | null;
   /** How long a probe may take before another is sent while `degraded` (default 1 s). */
   probeRetryMs?: number;
+  /** O-M1 (MB54): while `live`, a probe every this often (default 25 s, the socket heartbeat). */
+  liveProbeMs?: number;
+  /** O-M1: how long a heartbeat probe may take to come back before the instance is `degraded`
+   *  and the subscriber reconnects, as on a drop (default 5 s). */
+  probeTimeoutMs?: number;
 }
 
 const DEFAULT_PROBE_RETRY_MS = 1000;
+const DEFAULT_LIVE_PROBE_MS = 25_000;
+const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
+/** O-M1: a publish that has not settled in this long rejects (and turns the instance
+ *  `degraded`), so a silent path never holds a publish forever. Publisher only: the subscriber
+ *  waits on messages, and its liveness is the heartbeat probe's to judge. */
+const PUBLISH_TIMEOUT_MS = 5_000;
+/** O-M1: TCP keepalive's first probe after this much idle time, on both connections (ioredis's
+ *  default 0 leaves the OS default, about 2 h on Linux). */
+const KEEPALIVE_MS = 10_000;
 
 function subscriberBackoff(times: number): number {
   return Math.min(times * 200, 2000);
@@ -273,7 +305,6 @@ export class RealtimeBus implements ThreadPublisher {
   private started = false;
   private stopped = false;
   private subscribed = false;
-  private subscriberEverReady = false;
   private subscriberFailing = false;
   private publisherFailing = false;
   private pendingProbe: string | undefined;
@@ -299,7 +330,13 @@ export class RealtimeBus implements ThreadPublisher {
     const base = this.opts.base ?? sharedRedis;
 
     const publisher = (
-      this.opts.createPublisher ?? ((b: Redis) => b.duplicate({ maxRetriesPerRequest: 1 }))
+      this.opts.createPublisher ??
+      ((b: Redis) =>
+        b.duplicate({
+          maxRetriesPerRequest: 1,
+          commandTimeout: PUBLISH_TIMEOUT_MS,
+          keepAlive: KEEPALIVE_MS,
+        }))
     )(base);
     this.publisher = publisher;
     // LR17: without a listener ioredis prints "[ioredis] Unhandled error event" on every
@@ -331,6 +368,7 @@ export class RealtimeBus implements ThreadPublisher {
     const subscriber = base.duplicate({
       lazyConnect: false,
       maxRetriesPerRequest: null,
+      keepAlive: KEEPALIVE_MS,
       autoResubscribe: false,
       retryStrategy: this.opts.retryStrategy ?? subscriberBackoff,
     });
@@ -377,6 +415,13 @@ export class RealtimeBus implements ThreadPublisher {
   /**
    * Publish an event about one thread. Total: never throws, never rejects. A failure turns the
    * instance `degraded` (one warn line per state change) and re-probes.
+   *
+   * **L2 (MB53): what is published is parsed first**, against the same `.strict()` schema every
+   * receiving instance parses with. TypeScript does not look inside a spread, so a call site that
+   * spreads a row into its event would otherwise put message text on Redis, and every instance
+   * would then drop the event as "no known shape". A non-conforming event is never published:
+   * one error line here (a code bug at the call site; it pages once, at the source), naming its
+   * kind and its key names, never a value.
    */
   publishForThread(
     row: { id: string; owner_id: string },
@@ -384,9 +429,19 @@ export class RealtimeBus implements ThreadPublisher {
     only?: readonly Audience[],
   ): void {
     try {
+      const parsed = busEventSchema.safeParse({
+        v: 1,
+        ...event,
+        thread_id: row.id,
+        owner_id: row.owner_id,
+      });
+      if (!parsed.success) {
+        this.refuse(event, row);
+        return;
+      }
       const allowed = audiencesFor(event);
       const audiences = only === undefined ? allowed : allowed.filter((a) => only.includes(a));
-      const payload = JSON.stringify({ v: 1, ...event, thread_id: row.id, owner_id: row.owner_id });
+      const payload = JSON.stringify(parsed.data);
       for (const channel of channelsForThread(row, audiences, this.prefix)) {
         this.send(channel, payload);
       }
@@ -411,19 +466,36 @@ export class RealtimeBus implements ThreadPublisher {
     }
   }
 
-  private send(channel: string, payload: string): void {
+  private send(
+    channel: string,
+    payload: string,
+    failed: (err: unknown) => void = (err) => this.publishFailed(err),
+  ): void {
     const publisher = this.publisher;
     if (publisher === undefined || this.stopped) {
-      this.publishFailed(new Error('realtime bus not started'));
+      failed(new Error('realtime bus not started'));
       return;
     }
     try {
       publisher.publish(channel, payload).then(undefined, (err: unknown) => {
-        this.publishFailed(err);
+        failed(err);
       });
     } catch (err) {
-      this.publishFailed(err);
+      failed(err);
     }
+  }
+
+  /** L2: one error line for an event that failed the bus schema; no value is logged. */
+  private refuse(event: BusEventInput, row: { id: string }): void {
+    const kind: unknown = (event as { kind?: unknown }).kind;
+    this.log.error(
+      {
+        kind: typeof kind === 'string' && BUS_KINDS.has(kind) ? kind : 'unknown',
+        thread_id: row.id,
+        keys: Object.keys(event).sort(),
+      },
+      'realtime bus: an event that did not pass the bus schema was not published (ids only, never content: a code bug at its call site)',
+    );
   }
 
   private publishFailed(err: unknown): void {
@@ -441,13 +513,12 @@ export class RealtimeBus implements ThreadPublisher {
 
   private onSubscriberReady(): void {
     if (this.stopped || this.subscriber === undefined) return;
-    const reconnect = this.subscriberEverReady;
-    this.subscriberEverReady = true;
     if (this.subscriberFailing) {
       this.subscriberFailing = false;
       this.log.info('realtime subscriber: Redis connection back');
     }
-    if (reconnect) this.handlers.onResync();
+    // A reconnect's `resync` is sent on the way to `live` (`setState`, item 9), once the probe
+    // has come back through this subscription.
     this.subscriber.psubscribe(channelPattern(this.prefix)).then(
       () => {
         if (this.stopped) return;
@@ -460,23 +531,72 @@ export class RealtimeBus implements ThreadPublisher {
     );
   }
 
+  /**
+   * Send a probe on this instance's own channel. While `degraded`, one that does not come back
+   * is sent again (FL5). **While `live` it is the heartbeat (O-M1, MB54):** one that fails to
+   * publish, or is not heard back within `probeTimeoutMs`, means the path has gone silent, and
+   * is handled exactly as a drop (`heartbeatLost`).
+   */
   private probe(): void {
     if (this.stopped || !this.subscribed) return;
     if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
     const nonce = randomUUID();
     this.pendingProbe = nonce;
+    const heartbeat = this.state === 'live';
     this.send(
       probeChannel(this.prefix, this.instanceId),
       JSON.stringify({ v: 1, kind: 'probe', instance: this.instanceId, nonce }),
+      heartbeat ? (err) => this.heartbeatLost(nonce, err) : undefined,
     );
+    this.probeTimer = setTimeout(
+      () => {
+        try {
+          if (this.pendingProbe !== nonce) return; // it came back
+          if (heartbeat) this.heartbeatLost(nonce);
+          else if (this.state === 'degraded') this.probe();
+        } catch (err) {
+          this.quietWarn(err, 'realtime bus: probe retry failed');
+        }
+      },
+      heartbeat
+        ? (this.opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS)
+        : (this.opts.probeRetryMs ?? DEFAULT_PROBE_RETRY_MS),
+    );
+    this.probeTimer.unref();
+  }
+
+  /** O-M1: while `live`, the next heartbeat probe in `liveProbeMs`. */
+  private scheduleHeartbeat(): void {
+    if (this.stopped) return;
+    if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
     this.probeTimer = setTimeout(() => {
       try {
-        if (this.state === 'degraded' && this.pendingProbe === nonce) this.probe();
+        if (this.state === 'live') this.probe();
       } catch (err) {
-        this.quietWarn(err, 'realtime bus: probe retry failed');
+        this.quietWarn(err, 'realtime bus: heartbeat probe failed');
       }
-    }, this.opts.probeRetryMs ?? DEFAULT_PROBE_RETRY_MS);
+    }, this.opts.liveProbeMs ?? DEFAULT_LIVE_PROBE_MS);
     this.probeTimer.unref();
+  }
+
+  /**
+   * O-M1: a heartbeat probe failed or never came back, so the path is silent (half-open: no
+   * FIN, no RST, so no `close` will come). As on a drop: `degraded` now (every local socket
+   * polls), and the subscriber is made to reconnect; its `ready` re-subscribes and probes, and
+   * `resync` then `live` follow only once a probe comes back (FL5, item 9).
+   */
+  private heartbeatLost(nonce: string, err?: unknown): void {
+    try {
+      if (this.stopped || this.pendingProbe !== nonce) return;
+      this.pendingProbe = undefined;
+      if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
+      this.probeTimer = undefined;
+      this.subscribed = false;
+      this.setState('degraded', 'a heartbeat probe did not come back', err);
+      this.subscriber?.disconnect(true);
+    } catch (caught) {
+      this.quietWarn(caught, 'realtime bus: a lost heartbeat could not be handled');
+    }
   }
 
   private scheduleProbe(): void {
@@ -512,6 +632,7 @@ export class RealtimeBus implements ThreadPublisher {
       if (probe.success && probe.data.nonce === this.pendingProbe) {
         this.pendingProbe = undefined;
         this.setState('live', 'probe returned');
+        this.scheduleHeartbeat(); // O-M1: `live` is vouched for again, every heartbeat
       }
       return;
     }
@@ -538,6 +659,12 @@ export class RealtimeBus implements ThreadPublisher {
       );
     } else {
       this.log.info({ reason }, 'realtime bus live');
+      // Item 9 (MB57; MB23 (9)): EVERY exit from `degraded`, whatever caused it (a subscriber
+      // reconnect, a failed publish, a lost heartbeat, boot), tells every local socket `resync`
+      // immediately before `live`. A client stops polling on `live`, so it first refetches what
+      // was committed while live delivery was not vouched for, with the subscription already
+      // proven (the probe came back), so nothing falls between the refetch and the bus.
+      this.handlers.onResync();
     }
     this.handlers.onState(next);
   }

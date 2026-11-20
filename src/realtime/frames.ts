@@ -13,13 +13,15 @@ import type { Audience, BusEvent, ChannelTarget } from './bus.js';
  * LR16). Every frame is built here, by each instance, from ids on the bus and rows in the
  * database, so nothing a socket receives was carried through Redis.
  *
- * For each event, in order:
- *   1. **Liveness at delivery (OM2 + LR16).** One query over the principals of the sockets the
- *      event would reach: live owners, and live staff that are not the system row, with their
- *      role. A socket whose row is gone, or whose role differs from the one it authenticated
- *      with, closes 4403 and gets nothing. **If that query fails (LR7), nothing is delivered and
- *      nothing is closed**: an unknown answer is never "missing"; every local socket is told
- *      `resync` instead.
+ * For each event the frame is BUILT first (3–5 below), THEN liveness is checked (1), THEN it is
+ * sent (L1, MB53: the window between the check and the send is one query, never a build). The
+ * whole delivery is bounded (L3, MB53: `deliverEvent`).
+ *   1. **Liveness at delivery (OM2 + LR16), at the send.** One query over the principals of the
+ *      sockets the event would reach: live owners, and live staff that are not the system row,
+ *      with their role. A socket whose row is gone, or whose role differs from the one it
+ *      authenticated with, closes 4403 and gets nothing. **If that query fails (LR7), nothing is
+ *      delivered and nothing is closed**: an unknown answer is never "missing"; every local
+ *      socket is told `resync` instead.
  *   2. **Audience (LR14's second half).** A staff channel's frame goes only to staff sockets,
  *      an owner channel's only to that owner's sockets. A socket found in the wrong set is a
  *      routing bug: nothing is sent to it and one error line is logged (it pages).
@@ -373,9 +375,27 @@ async function frameFor(
   }
 }
 
+/** What bounds one event's delivery (L3, MB53): the hub's clock and its limit. */
+export interface DeliveryBound {
+  ms: number;
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+function inAudience(target: ChannelTarget, s: FrameSocket): boolean {
+  return target.audience === 'staff'
+    ? s.principal.kind === 'staff'
+    : s.principal.kind === 'owner' && s.principal.id === target.ownerId;
+}
+
 /**
  * Deliver one bus event to the local sockets in its channel's set. Never throws: every failure
  * ends in `resync` to the sockets it concerns, never in a guess.
+ *
+ * **L3 (MB53):** the instance has one delivery queue, so the whole of one event's delivery (the
+ * build and the liveness query) is bounded by `bound.ms`. At the bound, the event's audience
+ * sockets are told `resync` (as a failed build tells them), the queue moves on, and the abandoned
+ * delivery sends and closes nothing when it ends, early or late, answered or thrown.
  */
 export async function deliverEvent(
   target: ChannelTarget,
@@ -383,8 +403,69 @@ export async function deliverEvent(
   sockets: readonly FrameSocket[],
   everySocket: () => Iterable<FrameSocket>,
   deps: DeliveryDeps,
+  bound?: DeliveryBound,
 ): Promise<void> {
   if (sockets.length === 0) return;
+  const run = { abandoned: false };
+  const delivery = deliverInOrder(target, event, sockets, everySocket, deps, run);
+  if (bound === undefined) return delivery;
+  if (await withinBound(delivery, bound)) return;
+  run.abandoned = true;
+  deps.log.warn(
+    { kind: event.kind, thread_id: event.thread_id, audience: target.audience, bound_ms: bound.ms },
+    'realtime delivery: an event was not delivered within its bound; its sockets told to resync, the queue moves on',
+  );
+  for (const s of sockets) if (inAudience(target, s)) s.send({ type: 'resync' });
+}
+
+/** `true` when `work` settles within the bound (its rejection passed on), `false` at the bound.
+ *  `work`'s outcome is always handled here, however late: never an unhandled rejection (LR5). */
+function withinBound(work: Promise<void>, bound: DeliveryBound): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const timer = bound.setTimeout(() => resolve(false), bound.ms);
+    work.then(
+      () => {
+        bound.clearTimeout(timer);
+        resolve(true);
+      },
+      (err: unknown) => {
+        bound.clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * One event, in this order (L1, MB53): **build** the frame, **then** run the one liveness query
+ * (OM2 + LR16), **then** send. A principal removed while the frame was being built is closed 4403
+ * and sent nothing: the window between OM2's check and the send is that one query, never the
+ * build. `run.abandoned` (set at L3's bound) stops it before any close or send.
+ */
+async function deliverInOrder(
+  target: ChannelTarget,
+  event: BusEvent,
+  sockets: readonly FrameSocket[],
+  everySocket: () => Iterable<FrameSocket>,
+  deps: DeliveryDeps,
+  run: { abandoned: boolean },
+): Promise<void> {
+  let build: FrameFor | null = null;
+  let buildFailed = false;
+  if (sockets.some((s) => inAudience(target, s))) {
+    try {
+      build = await frameFor(target, event, deps);
+    } catch (err) {
+      buildFailed = true;
+      if (!run.abandoned) {
+        deps.log.warn(
+          { err_message: err instanceof Error ? err.message : String(err), kind: event.kind },
+          'realtime delivery: a frame could not be built; its sockets told to resync',
+        );
+      }
+    }
+  }
+  if (run.abandoned) return;
 
   let live: MirrorPrincipal[];
   try {
@@ -392,6 +473,7 @@ export async function deliverEvent(
     for (const s of sockets) seen.set(principalKey(s.principal), s.principal);
     live = await deps.livePrincipals([...seen.values()]);
   } catch (err) {
+    if (run.abandoned) return;
     // LR7: deliver nothing, close nothing; every local socket refetches.
     deps.log.warn(
       { err_message: err instanceof Error ? err.message : String(err) },
@@ -400,6 +482,7 @@ export async function deliverEvent(
     for (const s of everySocket()) s.send({ type: 'resync' });
     return;
   }
+  if (run.abandoned) return;
 
   const liveByKey = new Map(live.map((p) => [principalKey(p), p]));
   const reachable: FrameSocket[] = [];
@@ -416,28 +499,16 @@ export async function deliverEvent(
     reachable.push(s);
   }
 
-  const inAudience = (s: FrameSocket): boolean =>
-    target.audience === 'staff'
-      ? s.principal.kind === 'staff'
-      : s.principal.kind === 'owner' && s.principal.id === target.ownerId;
-  const misplaced = reachable.filter((s) => !inAudience(s));
+  const misplaced = reachable.filter((s) => !inAudience(target, s));
   if (misplaced.length > 0) {
     deps.log.error(
       { audience: target.audience, sockets: misplaced.length, kind: event.kind },
       "realtime routing fault: a socket outside this channel's audience was in its set; nothing sent to it",
     );
   }
-  const audience = reachable.filter(inAudience);
+  const audience = reachable.filter((s) => inAudience(target, s));
   if (audience.length === 0) return;
-
-  let build: FrameFor | null;
-  try {
-    build = await frameFor(target, event, deps);
-  } catch (err) {
-    deps.log.warn(
-      { err_message: err instanceof Error ? err.message : String(err), kind: event.kind },
-      'realtime delivery: a frame could not be built; its sockets told to resync',
-    );
+  if (buildFailed) {
     for (const s of audience) s.send({ type: 'resync' });
     return;
   }
