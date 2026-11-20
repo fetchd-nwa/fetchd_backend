@@ -728,19 +728,17 @@ const LOCK_TEST = { ...SKIP_WHEN_NO_DB, timeout: 20_000 };
 // and unforce the race (#40 r1, Opus L2: one planted foreign waiter flipped a forced round).
 // An advisory lock carries its database, so `advisoryWaiters` filters on it. A session queued
 // on a held ROW waits on the holder's transaction id, a lock with no database
-// (`pg_locks.database` is NULL), so `waitingOnALock` counts a waiter whose session has a lock
-// row in this database, held or awaited (messaging's form, 65b52b7). It reads `pg_locks` alone:
-// it is polled inside the holder's open transaction, where `pg_stat_activity` is a snapshot
-// taken at the first read, so a join on it misses a session that connects after the first poll
-// (a cold pool's new connection; #40 r2, Opus L1 / Fable N1).
+// (`pg_locks.database` is NULL), so `waitingOnALock` counts a waiting session that holds a lock
+// in this database (the table it queues on, or the advisory lock it waits for). Not through
+// pg_stat_activity: the holder polls inside its open transaction, where pg_stat_activity is a
+// snapshot taken at its first read, so a session that connects after that poll is never seen
+// (msg-branch MB65; the messaging take-back's probe).
 const IN_THIS_DATABASE = `database = (SELECT oid FROM pg_database WHERE datname = current_database())`;
 
 async function waitingOnALock(client: pg.Client): Promise<number> {
   const res = await client.query(
     `SELECT count(*)::int AS n FROM pg_locks w
-      WHERE NOT w.granted
-        AND w.pid IN (SELECT pid FROM pg_locks
-                       WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()))`,
+      WHERE NOT w.granted AND w.pid IN (SELECT pid FROM pg_locks WHERE ${IN_THIS_DATABASE})`,
   );
   return (res.rows[0] as { n: number }).n;
 }
