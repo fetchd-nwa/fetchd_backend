@@ -2,8 +2,9 @@ import { bypassHeaderEnabled, env, envSources } from './env.js';
 import { buildApp } from './server.js';
 import { closeDb } from './db/pool.js';
 import { flushObservability, initObservability } from './lib/observability.js';
+import { reportLostStaffMessagePushes } from './lib/messageNotice.js';
 import { closeRedis } from './redis.js';
-import { drainInFlight } from './realtime/settle.js';
+import { drainInFlight, fireAndForget } from './realtime/settle.js';
 import { runShutdown } from './realtime/shutdown.js';
 
 /**
@@ -63,6 +64,16 @@ try {
 // 9.2.0: the realtime bus connects only once the server is up (no Redis connection at build
 // time). A Redis that is down leaves it `degraded`, retrying; it never stops the boot.
 app.realtime.startBus();
+
+// 9.2.0 (design A2 FM2; brief LR5, FM2-b, FH1-d): the boot count, one line of the staff message
+// pushes a crash lost (claimed over a minute ago, never stamped with tickets). After `listen` and
+// the bus, and never awaited: through `fireAndForget`, so a database that refuses the count is one
+// warn line and the process stays up (`observability.ts` exits on any unhandled rejection). A
+// database behind rs3 (no `message_pushes`) counts as 0 with one warn (`messageNotice.ts`).
+fireAndForget(() => reportLostStaffMessagePushes(app.log), {
+  log: app.log,
+  what: 'boot: the lost staff message push count',
+});
 
 // Day-20 paging smoke. The ONLY proof that a deployed process reaches a human
 // — the real entry point, not a harness (the 2026-08-24 lesson: an alarm
