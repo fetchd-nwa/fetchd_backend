@@ -33,11 +33,12 @@ It reads 9.2.0-pre.2, landed before it, and takes back 9.2.0-pre.1 (O-AFTERCOUNT
 and `draws`) and 9.2.0-pre.2 (O-BUGS3 #33, `DogWire.alumni_at`): their entries below stand as
 written, and 9.2.0 includes them (the after-count note §1.1-§1.2).
 Every addition is a new route, type, constant or tuple, an optional key, or a response field a
-client only reads, so a 9.1.0, 9.2.0-pre.1 or 9.2.0-pre.2 client reads 9.2.0 unchanged and keeps polling.
+client only reads, so a 9.1.0, 9.2.0-pre.1 or 9.2.0-pre.2 client reads 9.2.0 unchanged and keeps
+polling.
 Contract-first: the routes, frames and fields do not exist until P45's backend lands them.
-Resync both clients (`npm run sync:contracts` in mobile and portal). The four backend type errors this contract
-forced at drafting (`lib/threadWire.ts` twice, `routes/threads.ts`, `routes/staffThreads.ts`) are closed
-by P45's backend in the same push.
+Resync both clients (`npm run sync:contracts` in mobile and portal). The four backend type
+errors this contract forced at drafting (`lib/threadWire.ts` twice, `routes/threads.ts`,
+`routes/staffThreads.ts`) are closed by P45's backend in the same push.
 
 ### Added
 
@@ -83,8 +84,8 @@ by P45's backend in the same push.
 - `POST /staff/threads` `[staff]` (`PostStaffThreadsRequest {owner_id, category, dog_ids?,
   text, client_message_id?}` → 201 `PostStaffThreadsResponse {thread, message}`). No `closure`
   until P31's email lane (A1 D5).
-- `POST /staff/threads/:id/read` `[staff]` (`PostStaffThreadsReadRequest {message_ids}` → 204):
-  per-staffer read state.
+- `POST /staff/threads/:id/read` `[staff]` (`PostStaffThreadsReadRequest {message_ids}` →
+  204): per-staffer read state.
 - `GET /staff/notifications/summary` `[staff]` → `StaffBellWire {by_location:
   Record<LocationKey, {unread_client_threads, pending_requests}>}`.
 - `NoticeReachWire {channel, why}` with `NoticeReachChannel` and `NoticeReachWhy`, typed in full
@@ -132,9 +133,12 @@ by P45's backend in the same push.
 - `PostMediaUploadQuery` names its second arm. `PostDeviceTokensRequest` states the
   one-live-row rule. `GET /realtime`: a valid re-`auth` gets no reply; a malformed frame id or
   an out-of-range `up_to_seq` is dropped as a failed check.
-- `pool_not_bookable` (§ credits, the staff hand-add's doc) names its third case: alumni-tier
-  credits in a day-school pool at either campus, refused since O-CREDITS fix 1
-  (`staffCredits.ts:211-213`, "alumni credits pay for day care only"; DECISIONS 624).
+- `pool_not_bookable` (§ credits, the staff hand-add's doc) names all four of its cases with
+  their lines in `staffCredits.ts`: no seeded package row (`:212-214`); alumni-tier credits in a
+  day-school pool at either campus, refused since O-CREDITS fix 1 ("alumni credits pay for day
+  care only", `:215-217`; DECISIONS 624); the alumni tier where no alumni package sells that
+  program at that campus, today Fayetteville day care (O-BUGS3 #40, `:218-223`; DECISIONS 704,
+  725); and an account with no alumni dog (`:224-226`).
 - `PostStaffThreadsMessagesRequest` cites its 422 by symbol, not a stale line.
 - The landing-group note names 9.2.0, P51's 9.3.0 and S42's 9.4.0.
 

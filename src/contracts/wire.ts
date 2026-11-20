@@ -4128,11 +4128,14 @@ export interface PostCreditPackagesPurchaseRequest {
  * `'add'` writes a grant lot in the pool. `expires_at` is ISO-8601, omitted for
  * `cred.manual_grant_expiry_months` from now, and any instant later than now
  * otherwise (422 `expiry_not_in_future`). 422 `pool_not_bookable` for a pool no
- * v1 booking can draw from: a campus and program with no seeded package row, the
- * alumni tier on an account with no alumni dog, or (from O-CREDITS fix 1,
- * `routes/staffCredits.ts:211-213`; build DECISIONS 617, 624; doc added at 9.2.0) the
- * alumni tier in a day-school pool at either campus: "alumni credits pay for day care
- * only".
+ * v1 booking can draw from, in four cases (`routes/staffCredits.ts`
+ * `assertPoolBookable`; doc added at 9.2.0): a campus and program with no seeded
+ * package row (`:212-214`); the alumni tier in a day-school pool at either campus,
+ * "alumni credits pay for day care only" (`:215-217`; from O-CREDITS fix 1, build
+ * DECISIONS 617, 624); the alumni tier where no alumni package sells that program at
+ * that campus, today Fayetteville day care (`:218-223`; from O-BUGS3 #40, build
+ * DECISIONS 704, 725); and the alumni tier on an account with no alumni dog
+ * (`:224-226`).
  *
  * `'remove'` debits one lot, the pool and owner read from the lot, whether or not
  * it is live. 422 `lot_insufficient` above the lot's unspent; a lot that is not
