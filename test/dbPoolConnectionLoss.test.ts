@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import net from 'node:net';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import pg from 'pg';
 
 /**
  * **A Postgres connection that dies must not end the API** (O-MSG-LIVE p2a fix 1; the p2a audit's H1; brief LR5,
@@ -37,17 +39,31 @@ import { fileURLToPath } from 'node:url';
  *         pool, and a fresh `withActor` commits with its actor stamped.
  *   F1-f  a connection lost under a transaction's BEGIN (O-POOLFIX r1 H1): ten times over, a client sits idle, its
  *         backend is terminated while the event loop is held (so the server's FATAL lands unread), and `withActor`
- *         is handed that client: BEGIN meets the loss and `withActor` rejects. Each time the client leaves the pool
- *         (`totalCount` back to 0), and after ten, more than the pool's size, a fresh `SELECT 1` still answers. Under
- *         drizzle's own `db.transaction` the BEGIN ran before its `try/finally { release() }`, so each loss kept its
- *         slot for good and the tenth wedged the pool.
+ *         is handed that client: BEGIN meets the loss and `withActor` rejects. Each time the client has already left
+ *         the pool when the caller hears of it (`totalCount` 0, sampled in the rejection handler before anything
+ *         else runs), and a caller that retries at once gets a fresh connection and commits (O-POOLFIX fix 2, r2
+ *         Fable L1: released WITHOUT its error, the dying client went back to the pool idle, and the retry was
+ *         handed it and failed too). After ten rounds, as many as the pool has slots, a fresh `SELECT 1` still
+ *         answers. Under drizzle's own `db.transaction` the BEGIN ran before its `try/finally { release() }`, so each
+ *         loss kept its slot for good and the tenth wedged the pool.
  *   F1-g  an exhausted pool (every slot checked out and held): a checkout waits the pool's `connectionTimeoutMillis`
  *         (10 s) and rejects, so a route answers 500 and its level-50 line pages, `/health` answers 503, and
  *         `withActor` rejects; without the timeout all three waited forever, silently.
+ *   F1-h  a body's own error on a healthy connection (every 4xx thrown inside a transaction): the caller gets that
+ *         very error, and the client goes back to the pool rather than being destroyed — `totalCount` stays 1 and
+ *         the next transaction runs on the same backend (O-POOLFIX fix 2, r2 Opus N1: destroying it on every
+ *         rejection passed every case, at the cost of a reconnect per 4xx).
+ *   F1-i  a body that swallows a statement's error and returns (no savepoint) left its transaction aborted; Postgres
+ *         answers that COMMIT with the tag ROLLBACK and no error, and `withActor` resolved over a rollback, so a route
+ *         would answer 2xx with nothing written (O-POOLFIX fix 2, r2 Opus L1 / Fable L3). Now it rejects with the
+ *         server's 25P02, nothing commits, and the live connection goes back to the pool.
  *
  * F1-e's probe tables are created inside the transactions under test, so the killed one is rolled back by Postgres
  * itself (also when the child crashes, as it does at base); the fresh one is dropped by the child, which then reports
- * the residue of both names (0).
+ * the residue of both names (0). The table names carry a tag the PARENT picks, and the parent drops both (and F1-i's)
+ * in a `finally`, through its own connection: a child that dies between the fresh transaction's commit and its
+ * `DROP TABLE` used to leave a table that turned `schemaStructure.test.ts` red on every later run (O-POOLFIX fix 2,
+ * r2 Fable L2).
  *
  * The child's environment is explicit (`test/cors.test.ts` BASE_ENV's form, never `{...process.env}`):
  * `NODE_ENV=staging`, so no `.env` file is loaded; this run's `DATABASE_URL` and `REDIS_URL`; an explicit ephemeral
@@ -110,12 +126,14 @@ type Variant =
   | 'checked-out-next-query'
   | 'with-actor-running'
   | 'with-actor-begin-lost'
+  | 'with-actor-body-error'
+  | 'with-actor-swallowed-error'
   | 'exhausted';
 
 /** F1-e's transaction actor (a system actor, as workers and webhooks use). */
 const ACTOR = 'system:pool-loss-test';
 
-/** F1-f's rounds: more than the pool's 10 slots, so a leak in every round would leave none. */
+/** F1-f's rounds: as many as the pool's 10 slots, so a leak in every round would leave none. */
 const BEGIN_LOST_ROUNDS = 10;
 
 /** F1-g: how long the child waits for an answer before it reports none (above the pool's 10 s checkout timeout). */
@@ -125,9 +143,10 @@ const EXHAUSTED_WATCH_MS = 20_000;
  * The child. It adds no `error` listener of its own to the pool or to any client: one would absorb the very event
  * under test. The admin connection is a separate `pg.Client`, never from the pool.
  */
-function childProgram(variant: Variant): string {
+function childProgram(variant: Variant, tag: string): string {
   return `
 const VARIANT = ${JSON.stringify(variant)};
+const TAG = ${JSON.stringify(tag)};
 const ACTOR = ${JSON.stringify(ACTOR)};
 const BEGIN_LOST_ROUNDS = ${BEGIN_LOST_ROUNDS};
 const EXHAUSTED_WATCH_MS = ${EXHAUSTED_WATCH_MS};
@@ -239,9 +258,8 @@ if (VARIANT === 'idle') {
   // Production's road: every write transaction opens through withActor (src/db/tx.ts).
   const { withActor } = await import('./src/db/tx.js');
   const { sql } = await import('drizzle-orm');
-  const tag = Math.random().toString(16).slice(2, 10);
-  const KILLED = 'pool_loss_probe_killed_' + tag;
-  const FRESH = 'pool_loss_probe_fresh_' + tag;
+  const KILLED = 'pool_loss_probe_killed_' + TAG;
+  const FRESH = 'pool_loss_probe_fresh_' + TAG;
   let tellPid;
   const pidKnown = new Promise((resolve) => { tellPid = resolve; });
   const running = settled(
@@ -293,20 +311,75 @@ if (VARIANT === 'idle') {
     while (Date.now() - held < 200) {
       // Hold the event loop: the server's FATAL and its close land in the socket buffer unread.
     }
-    const pending = settled(
-      withActor(ACTOR, async (tx) => {
-        out.bodyRan = true;
-        await tx.execute(sql\`select 1\`);
-        return 'ran';
-      }),
+    const pending = withActor(ACTOR, async (tx) => {
+      out.bodyRan = true;
+      await tx.execute(sql\`select 1\`);
+      return 'ran';
+    }).then(
+      () => ({ outcome: { resolved: true } }),
+      async (e) => {
+        // Sampled first, before any sleep: has the client that met the loss already left the pool?
+        const totalAtRejection = pool.totalCount;
+        const idleAtRejection = pool.idleCount;
+        // A caller that retries at once must get a fresh connection, never the dying one back.
+        const retry = await settled(
+          withActor(ACTOR, async (tx) => (await tx.execute(sql\`select pg_backend_pid() as pid\`)).rows[0].pid),
+        );
+        return {
+          outcome: { code: e.code ?? null, severity: e.severity ?? null, message: e.message },
+          totalAtRejection,
+          idleAtRejection,
+          retry,
+        };
+      },
     );
     const k = await killing;
     out.killed = out.killed && k.rows.length === 1 && k.rows[0].killed === true;
     out.db = k.rows[0]?.datname ?? null;
-    const outcome = await pending;
+    const settledRound = await pending;
     await sleep(300);
-    out.rounds.push({ outcome, totalCount: pool.totalCount, idleCount: pool.idleCount });
+    out.rounds.push({ ...settledRound, totalCount: pool.totalCount, idleCount: pool.idleCount });
   }
+} else if (VARIANT === 'with-actor-body-error') {
+  const { withActor } = await import('./src/db/tx.js');
+  const { sql } = await import('drizzle-orm');
+  const pidOfTx = async (tx) => (await tx.execute(sql\`select pg_backend_pid() as pid\`)).rows[0].pid;
+  const pidBefore = await withActor(ACTOR, pidOfTx);
+  out.totalBefore = pool.totalCount;
+  const own = new Error('the body’s own error');
+  let pidInBody = null;
+  out.bodyError = await withActor(ACTOR, async (tx) => {
+    pidInBody = await pidOfTx(tx);
+    throw own;
+  }).then(
+    () => ({ resolved: true }),
+    (e) => ({ same: e === own, message: e.message, totalAtRejection: pool.totalCount, idleAtRejection: pool.idleCount }),
+  );
+  const pidAfter = await withActor(ACTOR, pidOfTx);
+  out.pidsSeen = [pidBefore, pidInBody, pidAfter];
+  out.totalAfter = pool.totalCount;
+} else if (VARIANT === 'with-actor-swallowed-error') {
+  const { withActor } = await import('./src/db/tx.js');
+  const { sql } = await import('drizzle-orm');
+  const TABLE = 'pool_loss_probe_swallow_' + TAG;
+  const pidOfTx = async (tx) => (await tx.execute(sql\`select pg_backend_pid() as pid\`)).rows[0].pid;
+  const pidBefore = await withActor(ACTOR, pidOfTx);
+  let pidInBody = null;
+  out.swallowed = await settled(
+    withActor(ACTOR, async (tx) => {
+      pidInBody = await pidOfTx(tx);
+      await tx.execute(sql.raw('CREATE TABLE ' + TABLE + ' (actor text)'));
+      await tx.execute(sql.raw('INSERT INTO ' + TABLE + " (actor) VALUES (current_setting('app.actor', true))"));
+      // Swallowed, with no savepoint: the transaction is now aborted, and the body returns as if all went well.
+      await tx.execute(sql\`select 1/0\`).catch(() => undefined);
+      return 'ok';
+    }),
+  );
+  out.totalAfterSwallow = pool.totalCount;
+  out.swallowTable = (await admin.query('SELECT to_regclass($1)::text AS r', ['public.' + TABLE])).rows[0].r;
+  const pidAfter = await withActor(ACTOR, pidOfTx);
+  out.pidsSeen = [pidBefore, pidInBody, pidAfter];
+  out.totalAfter = pool.totalCount;
 } else if (VARIANT === 'exhausted') {
   // Every slot checked out and held: the next checkout has none to take.
   const { buildApp } = await import('./src/server.js');
@@ -376,8 +449,18 @@ interface ChildResult {
   errorListeners?: number[];
   poolErrorListenersAfterKill?: number;
   totalAfterKill?: number;
-  /** F1-f: each round's outcome and the pool's counts once it settled; whether any transaction body ran. */
-  rounds?: { outcome: Settled; totalCount: number; idleCount: number }[];
+  /**
+   * F1-f: each round's outcome; the pool's counts sampled in its rejection handler; an immediate retry's outcome (its
+   * backend pid when it resolved); the pool's counts once it settled; whether any transaction body ran.
+   */
+  rounds?: {
+    outcome: Settled;
+    totalAtRejection?: number;
+    idleAtRejection?: number;
+    retry?: Settled;
+    totalCount: number;
+    idleCount: number;
+  }[];
   bodyRan?: true;
   /** F1-g: the held pool, the route's and the transaction's answers (or `no answer in … ms`), and every page. */
   heldBefore?: { total: number; idle: number; max: number };
@@ -385,6 +468,15 @@ interface ChildResult {
   health?: { status: number; db: string | null; ms: number } | string;
   tx?: (Settled & { ms: number }) | string;
   pageDetails?: { message: string; err: string | null }[];
+  /** F1-h: the pool before; the body's own error as the caller saw it; the backend pids before, inside, after. */
+  totalBefore?: number;
+  bodyError?: { resolved?: true; same?: boolean; message?: string; totalAtRejection?: number; idleAtRejection?: number };
+  pidsSeen?: (number | null)[];
+  totalAfter?: number;
+  /** F1-i: the swallowed-error transaction's outcome, the pool after it, and whether its table exists. */
+  swallowed?: Settled;
+  totalAfterSwallow?: number;
+  swallowTable?: string | null;
   /** `SELECT 1`'s answer, or `no answer in 5000 ms` / `rejected: …`. */
   fresh: number | string;
   totalAtEnd: number;
@@ -409,9 +501,9 @@ interface ChildRun {
   envKeys: string[];
 }
 
-async function runChild(variant: Variant): Promise<ChildRun> {
+async function runChild(variant: Variant, tag = randomBytes(4).toString('hex')): Promise<ChildRun> {
   const env = childEnv(await freePort());
-  const child = spawn(process.execPath, ['--import', 'tsx', '-e', childProgram(variant)], {
+  const child = spawn(process.execPath, ['--import', 'tsx', '-e', childProgram(variant, tag)], {
     cwd: REPO_ROOT,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -437,6 +529,22 @@ async function runChild(variant: Variant): Promise<ChildRun> {
     result: line === undefined ? undefined : (JSON.parse(line.slice('RESULT '.length)) as ChildResult),
     envKeys: Object.keys(env),
   };
+}
+
+/**
+ * Drops the probe tables of one run, by its tag, through a connection of the parent's own (never the child's pool):
+ * whatever the child did or failed to do, no `pool_loss_probe_*` table outlives the test (O-POOLFIX fix 2, r2 Fable L2).
+ */
+async function dropProbeTables(tag: string): Promise<void> {
+  const admin = new pg.Client({ connectionString: DATABASE_URL });
+  await admin.connect();
+  try {
+    await admin.query(
+      `DROP TABLE IF EXISTS pool_loss_probe_killed_${tag}, pool_loss_probe_fresh_${tag}, pool_loss_probe_swallow_${tag}`,
+    );
+  } finally {
+    await admin.end();
+  }
 }
 
 /** The pool's warn lines on the child's stderr. */
@@ -534,7 +642,15 @@ test('F1-d: a checked-out client whose backend was terminated refuses its next s
 });
 
 test('F1-e: a withActor transaction whose backend is terminated mid-statement rejects to its caller, commits nothing, and a fresh withActor commits', { ...NO_DB, timeout: 90_000 }, async (t) => {
-  const run = await runChild('with-actor-running');
+  const tag = randomBytes(4).toString('hex');
+  try {
+    await f1e(t, await runChild('with-actor-running', tag));
+  } finally {
+    await dropProbeTables(tag);
+  }
+});
+
+function f1e(t: TestContext, run: ChildRun): void {
   const result = assertSurvived(t, run);
   t.diagnostic(`withActor's caller got: ${JSON.stringify(result.rejected)}`);
   assert.ok(result.rejected !== undefined, 'the child reported the transaction’s outcome');
@@ -556,7 +672,7 @@ test('F1-e: a withActor transaction whose backend is terminated mid-statement re
   const warns = poolWarns(run.stderr);
   assert.equal(warns.length, 1, `exactly one warn line; stderr:\n${run.stderr}`);
   assert.match(warns[0]!, /Connection terminated unexpectedly/);
-});
+}
 
 test('F1-f: a connection lost under withActor’s BEGIN, ten times over: each rejects, its client leaves the pool, and SELECT 1 still answers', { ...NO_DB, timeout: 90_000 }, async (t) => {
   const run = await runChild('with-actor-begin-lost');
@@ -572,7 +688,17 @@ test('F1-f: a connection lost under withActor’s BEGIN, ten times over: each re
       /terminating connection due to administrator command|Connection terminated unexpectedly|not queryable/,
       `round ${i}: it rejected for the lost connection, not for anything else`,
     );
-    assert.equal(round.totalCount, 0, `round ${i}: the client whose BEGIN met the loss left the pool (totalCount 0)`);
+    assert.equal(
+      round.totalAtRejection,
+      0,
+      `round ${i}: the client whose BEGIN met the loss had left the pool when the caller heard (totalCount 0 in the rejection handler)`,
+    );
+    assert.equal(
+      round.retry?.resolved,
+      true,
+      `round ${i}: a retry at once commits on a fresh connection (got ${JSON.stringify(round.retry)})`,
+    );
+    assert.equal(round.totalCount, 1, `round ${i}: the pool holds only the retry's healthy client`);
   }
   assert.equal(result.bodyRan, undefined, 'BEGIN was the statement that met the loss: no transaction body ran');
   // The rest of assertSurvived: only its own backends, on this run's database, a fresh SELECT 1, no page.
@@ -611,4 +737,51 @@ test('F1-g: an exhausted pool fails loudly: a checkout rejects at the 10 s timeo
   assert.equal(result.fresh, 1, 'released, the pool answers a fresh SELECT 1');
   assert.equal(result.poolEnd, 'ended', 'and pool.end() completes');
   assert.equal(poolWarns(run.stderr).length, 0, `nothing was lost, so no warn line; stderr:\n${run.stderr}`);
+});
+
+/** The child lived, paged nobody, and its pool answers and ends: for the cases that kill nothing. */
+function assertCleanRun(t: TestContext, run: ChildRun): ChildResult {
+  t.diagnostic(`child env keys: ${run.envKeys.join(', ')}`);
+  assert.equal(run.status, 0, `the child must live (exit ${run.status}, signal ${run.signal}); stderr:\n${run.stderr}`);
+  const result = run.result;
+  assert.ok(result, `the child printed no RESULT line; stderr:\n${run.stderr}`);
+  assert.equal(result.fresh, 1, 'the pool answers a fresh SELECT 1');
+  assert.deepEqual(result.pages, [], 'nothing paged');
+  assert.equal(result.poolEnd, 'ended', 'pool.end() completes');
+  assert.equal(poolWarns(run.stderr).length, 0, `no connection was lost, so no warn line; stderr:\n${run.stderr}`);
+  return result;
+}
+
+test('F1-h: a body’s own error on a healthy connection reaches the caller unchanged, and its client goes back to the pool: same backend next time', { ...NO_DB, timeout: 90_000 }, async (t) => {
+  const result = assertCleanRun(t, await runChild('with-actor-body-error'));
+  t.diagnostic(`body error ${JSON.stringify(result.bodyError)}; pids ${JSON.stringify(result.pidsSeen)}`);
+  assert.equal(result.totalBefore, 1, 'precondition: one healthy client in the pool');
+  assert.equal(result.bodyError?.resolved, undefined, 'withActor rejects');
+  assert.equal(result.bodyError?.same, true, 'with the very error the body threw');
+  assert.equal(result.bodyError?.totalAtRejection, 1, 'its client was kept: totalCount still 1 when the caller hears');
+  assert.equal(result.bodyError?.idleAtRejection, 1, '…idle in the pool, not destroyed');
+  const [before, inBody, after] = result.pidsSeen ?? [];
+  assert.ok(typeof before === 'number', 'the pids were read');
+  assert.equal(inBody, before, 'the failing body ran on the pooled backend');
+  assert.equal(after, before, 'and the next transaction runs on that same backend: no reconnect for a 4xx');
+  assert.equal(result.totalAfter, 1, 'one client throughout');
+});
+
+test('F1-i: a body that swallows a statement’s error and returns rejects with 25P02, commits nothing, and keeps its live client', { ...NO_DB, timeout: 90_000 }, async (t) => {
+  const tag = randomBytes(4).toString('hex');
+  try {
+    const result = assertCleanRun(t, await runChild('with-actor-swallowed-error', tag));
+    t.diagnostic(`outcome ${JSON.stringify(result.swallowed)}; table ${result.swallowTable}; pids ${JSON.stringify(result.pidsSeen)}`);
+    assert.equal(result.swallowed?.resolved, undefined, 'withActor must reject: never resolve over a rollback');
+    assert.equal(result.swallowed?.code, '25P02', 'with the server’s in_failed_sql_transaction');
+    assert.match(result.swallowed?.message ?? '', /current transaction is aborted/);
+    assert.equal(result.swallowTable, null, 'nothing it wrote committed');
+    assert.equal(result.totalAfterSwallow, 1, 'the connection is live, so its client went back to the pool');
+    const [before, inBody, after] = result.pidsSeen ?? [];
+    assert.ok(typeof before === 'number', 'the pids were read');
+    assert.equal(inBody, before);
+    assert.equal(after, before, 'the next transaction runs on the same backend');
+  } finally {
+    await dropProbeTables(tag);
+  }
 });

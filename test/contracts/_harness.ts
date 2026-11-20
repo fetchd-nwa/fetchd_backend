@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { after, before } from 'node:test';
+import { after, afterEach, before } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance, type preHandlerHookHandler } from 'fastify';
 import { registerAuth } from '../../src/auth/plugin.js';
 import type { Principal } from '../../src/auth/principal.js';
 import { closeRedis, redis } from '../../src/redis.js';
+import { assertNoPoolReadInTransaction, installPoolReadGuard } from './_poolReadGuard.js';
 import {
   FIXTURE_IDS,
   seedFixture,
@@ -94,10 +95,18 @@ export const SKIP_WHEN_NO_DB: { skip: false | string } = DB_CONFIGURED
  * `npm test` points REDIS_URL at DB 1, so this only ever wipes the
  * test partition.
  *
+ * O-POOLFIX fix 2: it also installs the pool-read guard (`_poolReadGuard.ts`):
+ * a test whose route reads on the pool inside its own transaction fails
+ * (`afterEach`), and so does the file for one recorded in a hook (`after`).
+ *
  * No-ops when no DB is configured (the tests skip individually).
  */
 export function registerFixtureHooks(): void {
   if (!DB_CONFIGURED) return;
+  installPoolReadGuard();
+  afterEach(() => {
+    assertNoPoolReadInTransaction('this test');
+  });
   before(async () => {
     await redis.flushdb();
     await seedFixture();
@@ -118,6 +127,7 @@ export function registerFixtureHooks(): void {
       // cleanly. Closing here is local to this subprocess.
       await closeRedis();
     }
+    assertNoPoolReadInTransaction("this file's hooks");
   });
 }
 

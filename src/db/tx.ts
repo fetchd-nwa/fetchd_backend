@@ -33,8 +33,70 @@ function boundTo(client: PoolClient): ReturnType<typeof bindTo> {
 }
 
 /**
+ * Transactions together hold at most `max − 1` of the pool's slots (O-POOLFIX fix 2; r2 Fable M1 = Opus L3).
+ *
+ * A transaction body that awaits a read on the pool (`db`, not its `tx`) needs two slots at once: the one its
+ * transaction holds and one more for the read. With ten such bodies in flight (the pool's size) each held a slot
+ * and waited for a slot only another waiter could free: nothing moved. Executed at the production entry, twelve
+ * parallel `DELETE /events/:id/rsvp` from one signed-in owner did that — before fix 1 a permanent, silent wedge of
+ * every route; with fix 1's checkout timeout a 10 s stall of every route, twelve 500s and twelve pages. Reserving
+ * one slot that no transaction may take means a pool read (such a body's, `/health`'s, any route's) always finds a
+ * slot within one statement's time, so the pool cannot deadlock on itself whatever a route does inside its
+ * transaction. The reads the seats found are also moved onto `tx` (fix 2's second commit), and a test guard fails
+ * any new one; this bound covers a route no test drives.
+ *
+ * A transaction that finds every slot taken waits for one, first come first served, at most as long as a checkout
+ * waits for a connection (`pool.ts`'s `connectionTimeoutMillis`, 10 s), and then rejects with pg-pool's own text,
+ * "timeout exceeded when trying to connect", so a route's 500, its page and its log read exactly as they do for an
+ * exhausted pool. The wait is for the slot; the checkout that follows has its own 10 s bound, so in the worst case
+ * (every non-transaction slot also held) a transaction waits for both in turn.
+ *
+ * The bound does not cover a transaction opened inside another transaction's body (it would hold a second slot
+ * while its outer one waits); none exists in `src/`, and the same guard fails one.
+ */
+const TRANSACTION_SLOTS = Math.max(1, (pool.options.max ?? 10) - 1);
+let transactionsHolding = 0;
+const transactionWaiters: Array<() => void> = [];
+
+/** Takes a slot when one is free, synchronously. */
+function takeTransactionSlot(): boolean {
+  if (transactionsHolding >= TRANSACTION_SLOTS) return false;
+  transactionsHolding += 1;
+  return true;
+}
+
+/** Resolves once a releasing transaction hands this waiter its slot; rejects at the checkout timeout. */
+function waitForTransactionSlot(): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let timer: NodeJS.Timeout | undefined;
+    const waiter = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      resolve();
+    };
+    const waitMs = pool.options.connectionTimeoutMillis;
+    if (waitMs) {
+      timer = setTimeout(() => {
+        const at = transactionWaiters.indexOf(waiter);
+        if (at >= 0) transactionWaiters.splice(at, 1);
+        reject(new Error('timeout exceeded when trying to connect'));
+      }, waitMs);
+      timer.unref();
+    }
+    transactionWaiters.push(waiter);
+  });
+}
+
+/** Hands the slot straight to the longest waiter, or frees it. */
+function releaseTransactionSlot(): void {
+  const next = transactionWaiters.shift();
+  if (next !== undefined) next();
+  else transactionsHolding -= 1;
+}
+
+/**
  * One transaction on a client this module checks out, and releases on EVERY
- * path (O-POOLFIX fix 1).
+ * path (O-POOLFIX fix 1), once it holds one of the transaction slots above
+ * (fix 2).
  *
  * Why not `db.transaction`: drizzle-orm 0.36.4 (`node-postgres/session.js`
  * `NodePgSession.transaction`) checks a client out of the pool and sends `begin`
@@ -54,14 +116,27 @@ function boundTo(client: PoolClient): ReturnType<typeof bindTo> {
  * rather than hand out a connection in an unknown state. (pg-pool also destroys
  * a released client that is no longer queryable, whatever it is released with.)
  *
- * Nothing a caller relies on changes: the statements are drizzle's, unchanged —
- * a plain `begin` (no isolation level, as before), a savepoint per nested
- * `tx.transaction`, then `commit` or `rollback` — all on one connection, so a
- * transaction-local `set_config` and every `pg_advisory_xact_lock`
- * (`locks.ts`) hold for exactly the transaction, as before; and a rejection
- * reaches the caller with the same error drizzle threw.
+ * Nothing a caller relies on changes: the statements are drizzle's — a plain
+ * `begin` (no isolation level, as before), a savepoint per nested
+ * `tx.transaction`, then `commit` or `rollback` — plus one `select 1` after the
+ * body (fix 2, below), all on one connection, so a transaction-local
+ * `set_config` and every `pg_advisory_xact_lock` (`locks.ts`) hold for exactly
+ * the transaction, as before; and a rejection reaches the caller with the same
+ * error drizzle threw. The one new rejection is the `select 1`'s, when the body
+ * returned over an aborted transaction: that used to resolve as success.
  */
 async function inTransaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+  // A free transaction slot is taken synchronously, so the checkout below starts in this same tick (no await
+  // before it) unless the transactions are all busy.
+  if (!takeTransactionSlot()) await waitForTransactionSlot();
+  try {
+    return await onCheckedOutClient(fn);
+  } finally {
+    releaseTransactionSlot();
+  }
+}
+
+async function onCheckedOutClient<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   let bodyFailed = false;
   let bodyError: unknown;
@@ -69,7 +144,15 @@ async function inTransaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
   try {
     return await boundTo(client).transaction(async (tx) => {
       try {
-        return await fn(tx);
+        const result = await fn(tx);
+        // A body that swallowed a statement's error has left the transaction aborted, and Postgres answers its
+        // COMMIT with the command tag ROLLBACK and no error, so drizzle would resolve over a rollback and the caller
+        // would answer 2xx with nothing written (O-POOLFIX r2, Opus L1 / Fable L3; executed under a query-cancel
+        // stream on a live connection: 13 of 1,500). One statement after the body turns that into the caller's
+        // error: an aborted transaction refuses it (25P02), drizzle rolls back, and the rejection reaches the caller
+        // as the body's own (the connection is live, so the client goes back to the pool).
+        await tx.execute(sql`select 1`);
+        return result;
       } catch (err) {
         bodyFailed = true;
         bodyError = err;
