@@ -1,12 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
-import path from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance } from 'fastify';
 import {
   childEnv,
@@ -18,6 +15,7 @@ import {
   waitUntil,
   type RtClient,
 } from './_realtime.js';
+import { realBoot } from './_realBoot.js';
 import { FIXTURE_IDS } from './_fixture.js';
 import { registerFixtureHooks } from './_harness.js';
 import { registerRealtimeRoute } from '../../src/realtime/server.js';
@@ -35,7 +33,6 @@ import { SHUTDOWN_BOUND_MS, runShutdown } from '../../src/realtime/shutdown.js';
 
 registerFixtureHooks();
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const A = FIXTURE_IDS.ownerId;
 const CLOSE_1012 = Buffer.from([0x88, 0x02, 0x03, 0xf4]);
 
@@ -465,21 +462,17 @@ async function freePort(): Promise<number> {
 }
 
 test('LR9 through the real entry point: `src/index.ts` under SIGTERM, with a silent client and a polite one, exits 0 within 12 s, peers see 1012, nothing pages', async () => {
-  // `env.ts` loads `.env.local` and `.env` from the working directory outside production; this
-  // tree must hold neither (the backend's `.env` is production).
-  for (const name of ['.env', '.env.local']) {
-    assert.equal(
-      fs.existsSync(path.join(REPO_ROOT, name)),
-      false,
-      `${name} present: refusing to boot`,
-    );
-  }
+  // An empty working directory of its own, whatever this tree holds (`_realBoot.ts`).
+  const boot = realBoot();
   const port = await freePort();
-  const proc = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
-    cwd: REPO_ROOT,
+  const proc = spawn(process.execPath, boot.args, {
+    cwd: boot.cwd,
     // An explicit, complete environment (`childEnv`: NODE_ENV=staging, no `.env*` load), the
     // dev arm on by name (staging honours it), an explicit ephemeral port.
-    env: childEnv({ BYPASS_HEADER_ENABLED: 'true', PORT: String(port), LOG_LEVEL: 'info' }),
+    env: {
+      ...childEnv({ BYPASS_HEADER_ENABLED: 'true', PORT: String(port), LOG_LEVEL: 'info' }),
+      ...boot.env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let out = '';
@@ -518,5 +511,6 @@ test('LR9 through the real entry point: `src/index.ts` under SIGTERM, with a sil
   } finally {
     silent?.destroy();
     if (proc.exitCode === null) proc.kill('SIGKILL');
+    boot.dispose();
   }
 });

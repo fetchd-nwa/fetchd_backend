@@ -8,11 +8,8 @@ import {
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import fs from 'node:fs';
 import net from 'node:net';
-import path from 'node:path';
 import { after, afterEach, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import type { ExpoPushClient, ExpoPushMessage, ExpoPushTicket } from '../../src/lib/expoPush.js';
@@ -27,6 +24,7 @@ import {
 } from './_messaging.js';
 import { makeR2Stub } from './_r2Stub.js';
 import { childEnv, waitUntil } from './_realtime.js';
+import { realBoot } from './_realBoot.js';
 
 /**
  * A deploy must not lose a push it could send (design messaging-live-v1 A2 FM2; brief LR9;
@@ -46,8 +44,6 @@ import { childEnv, waitUntil } from './_realtime.js';
  */
 
 registerFixtureHooks();
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 /** Expo answers this long after the call: longer than `app.close()` takes on an idle app. */
 const EXPO_DELAY_MS = 1_500;
@@ -198,25 +194,14 @@ test(
   "FM2-a, the entry point's half: src/index.ts under SIGTERM waits for its own in-flight set before it closes the pool (a preload tracks one stalled thunk; no message is sent)",
   SKIP_WHEN_NO_DB,
   async () => {
-    // `env.ts` loads `.env.local` and `.env` from the working directory outside production; this
-    // tree must hold neither (the backend's `.env` is production).
-    for (const name of ['.env', '.env.local']) {
-      assert.equal(
-        fs.existsSync(path.join(REPO_ROOT, name)),
-        false,
-        `${name} present: refusing to boot`,
-      );
-    }
+    // An empty working directory of its own, whatever this tree holds (`_realBoot.ts`).
+    const boot = realBoot(['test/contracts/_bootDrainProbe.ts']);
     const port = await freePort();
-    const proc = spawn(
-      process.execPath,
-      ['--import', 'tsx', '--import', './test/contracts/_bootDrainProbe.ts', 'src/index.ts'],
-      {
-        cwd: REPO_ROOT,
-        env: childEnv({ PORT: String(port), LOG_LEVEL: 'info' }),
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
+    const proc = spawn(process.execPath, boot.args, {
+      cwd: boot.cwd,
+      env: { ...childEnv({ PORT: String(port), LOG_LEVEL: 'info' }), ...boot.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let out = '';
     let err = '';
     proc.stdout.on('data', (d: Buffer) => (out += d.toString()));
@@ -251,6 +236,7 @@ test(
       assert.ok(elapsed < SHUTDOWN_BOUND_MS, `exit took ${elapsed} ms`);
     } finally {
       if (proc.exitCode === null) proc.kill('SIGKILL');
+      boot.dispose();
     }
   },
 );

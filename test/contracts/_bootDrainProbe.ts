@@ -1,7 +1,8 @@
 /**
- * A preload for a spawned `src/index.ts` (not a test file): `node --import tsx --import
- * ./test/contracts/_bootDrainProbe.ts src/index.ts`, used only by `message-push-drain.test.ts`'s
- * entry-point case (FM2-a's `index.ts` half).
+ * A preload for a spawned `src/index.ts` (not a test file): `node --import <tsx> --import
+ * <this file> <src/index.ts>`, all by absolute path from an empty working directory
+ * (`_realBoot.ts`), used only by `message-push-drain.test.ts`'s entry-point case (FM2-a's
+ * `index.ts` half).
  *
  * It sends nothing anywhere. On SIGTERM it puts one stalled thunk into the process's own
  * in-flight set (`trackInFlight`, the set pass 2's push uses) BEFORE `index.ts`'s own SIGTERM

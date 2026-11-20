@@ -1,11 +1,9 @@
 import { childEnv, waitUntil } from './_realtime.js';
+import { realBoot } from './_realBoot.js';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import fs from 'node:fs';
 import net from 'node:net';
-import path from 'node:path';
 import { after, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { sql } from 'drizzle-orm';
 import { db } from '../../src/db/client.js';
 import { countLostStaffMessagePushes } from '../../src/lib/messageNotice.js';
@@ -29,8 +27,6 @@ import { SKIP_WHEN_NO_DB, registerFixtureHooks } from './_harness.js';
  */
 
 registerFixtureHooks();
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 /** pass 2's sentences (`src/lib/messageNotice.ts`): the count, and the table missing. */
 const BOOT_COUNT = 'boot: staff message pushes claimed over a minute ago and never sent';
@@ -68,19 +64,12 @@ async function freePort(): Promise<number> {
 
 /** Boot `src/index.ts` in a child and wait for "Server listening". */
 async function bootIndex(extra: Record<string, string> = {}): Promise<BootedApi> {
-  // `env.ts` loads `.env.local` and `.env` from the working directory outside production; this
-  // tree must hold neither (the backend's `.env` is production).
-  for (const name of ['.env', '.env.local']) {
-    assert.equal(
-      fs.existsSync(path.join(REPO_ROOT, name)),
-      false,
-      `${name} present: refusing to boot`,
-    );
-  }
+  // An empty working directory of its own, whatever this tree holds (`_realBoot.ts`).
+  const boot = realBoot();
   const port = await freePort();
-  const proc = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
-    cwd: REPO_ROOT,
-    env: childEnv({ PORT: String(port), LOG_LEVEL: 'info', ...extra }),
+  const proc = spawn(process.execPath, boot.args, {
+    cwd: boot.cwd,
+    env: { ...childEnv({ PORT: String(port), LOG_LEVEL: 'info', ...extra }), ...boot.env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let out = '';
@@ -93,6 +82,7 @@ async function bootIndex(extra: Record<string, string> = {}): Promise<BootedApi>
     proc.on('close', (c) => {
       code = c;
       exitedFlag = true;
+      boot.dispose();
       resolve(c);
     }),
   );
