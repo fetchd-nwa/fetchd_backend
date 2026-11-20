@@ -102,7 +102,18 @@
  * provisional. It takes back 9.2.0-pre.1 and 9.2.0-pre.2, whose paragraphs above stand as
  * written (the after-count note §1.1-§1.2).
  */
-export const WIRE_CONTRACT_VERSION = '9.2.0';
+export const WIRE_CONTRACT_VERSION = '9.3.0-pre.1';
+
+/**
+ * The upload limits every media route enforces (9.3.0-pre.1; build DECISIONS 863 (ii)): the body
+ * cap and the content types a photo or a video may carry. Mirrors `src/lib/mediaKeys.ts`
+ * (`MAX_UPLOAD_BYTES`, `IMAGE_TYPES`, `VIDEO_TYPES`), and a backend test pins them equal; the
+ * clients import these instead of copying them, so a change here reaches them through
+ * `check:contracts`.
+ */
+export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+export const UPLOAD_IMAGE_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'] as const;
+export const UPLOAD_VIDEO_CONTENT_TYPES = ['video/mp4', 'video/quicktime', 'video/webm'] as const;
 
 // ---- conventions (the 1.13.0 rulebook, applied file-wide) ------------------
 //
@@ -2202,7 +2213,7 @@ export interface PostMediaUploadQuery {
  *  `Content-Type` matching the purpose, an empty body 400), with these differences:
  *    · `thread_id`, a uuid, names a live thread; a missing one is 404 `not_found` (a
  *      malformed one is 400 `bad_request`). The row is stamped
- *      with that thread's owner and `created_by = 'staff'` (`schema.sql:689`), so it can be
+ *      with that thread's owner and `created_by = 'staff'` (`schema.sql` `media_assets.created_by`), so it can be
  *      attached only to a staff message to that family (`PostStaffThreadsMessagesRequest`).
  *      An owner's send treats it as missing (404), and so does an owner's
  *      `DELETE /media/:id` (A2 OL5 `:801`).
@@ -4129,8 +4140,8 @@ export interface PostCreditPackagesPurchaseRequest {
  * `cred.manual_grant_expiry_months` from now, and any instant later than now
  * otherwise (422 `expiry_not_in_future`). 422 `pool_not_bookable` for a pool no
  * v1 booking can draw from, in four cases (`routes/staffCredits.ts`
- * `assertPoolBookable`; doc added at 9.2.0): a campus and program with no seeded
- * package row (`:212-214`); the alumni tier in a day-school pool at either campus,
+ * `assertPoolBookable`; doc added at 9.2.0): a campus and program with no package
+ * row live today (`:212-214`); the alumni tier in a day-school pool at either campus,
  * "alumni credits pay for day care only" (`:215-217`; from O-CREDITS fix 1, build
  * DECISIONS 617, 624); the alumni tier where no alumni package sells that program at
  * that campus, today Fayetteville day care (`:218-223`; from O-BUGS3 #40, build
@@ -6440,6 +6451,30 @@ export interface CreditPurchaseWire {
 }
 
 /**
+ * One refund on a ledger entry's charge whose money has gone back to the family
+ * (9.3.0-pre.1; her #39, build DECISIONS 702(2), 704(2), 711, 712; designs/invoices-calendar.md §2).
+ * The rows are the charge's RETURNED COVERAGE, read by charge exactly as
+ * refundsRepository.sumReturnedCoverageForCharge sums it: status 'succeeded' or
+ * 'resolved-external', never one closed 'withdrawn'. A 'pending' or 'unroutable' refund is a
+ * promise, not money back, and a 'failed' one moved nothing: none of them is listed. Facts
+ * only, as every ledger line: no reason, issuer, instrument or status (a staff reason is free
+ * text and stays staff-side).
+ */
+export interface LedgerRefundWire {
+  /** `refunds.id`. */
+  id: string;
+  /** This refund's amount, never the charge's; > 0. */
+  amount_cents: number;
+  /** ISO-8601 UTC, `toISOString()` form. When the refund was ISSUED (a card refund, or a
+   *  Stripe dashboard refund the app adopted: `refunds.created_at`, the moment the app wrote
+   *  the row) or RECORDED AS RETURNED by hand (a 'resolved-external' row: `refunds.resolved_at`,
+   *  the moment staff closed it, `schema.sql` `refunds.resolved_at`; `created_at` when such a
+   *  row has none). Not the day a bank or card settled it, and not always the day money crossed
+   *  the desk. */
+  refunded_at: string;
+}
+
+/**
  * `GET /invoices` response row — the owner's billing ledger. Promoted 1.13.0
  * from `lib/ledgerWire.ts:16-68` (digest payments-invoices/M "move the money
  * surface into wire.ts"); DATA-CONTRACT §A Amendment 2026-05-30. `ledgerWire.ts`
@@ -6540,6 +6575,17 @@ export interface LedgerEntryWire {
    * open invoice and on a charge from before the engine.
    */
   order_id?: string;
+  /**
+   * Charge-sourced entries only ('paid' or 'refunded'): the refunds of this entry's charge
+   * whose money has gone back, oldest first (`refunded_at` ASC, then `id`). Omitted when
+   * there are none (the omit-on-null rule, never `[]`), and always on an open invoice.
+   * A partial refund leaves `status` 'paid' and `amount_cents` the charge's; it shows only here.
+   * The sum can EXCEED `amount_cents` (a hand return and a dashboard refund on one charge; the
+   * server alarms, refundApply.ts settleReturnedCoverage); every row is listed as stored.
+   * `status` and this list come from two reads, not one snapshot: a client never derives
+   * `status` from the sum, nor the sum from `status` (9.3.0-pre.1; her #39).
+   */
+  refunds?: LedgerRefundWire[];
 }
 
 /**

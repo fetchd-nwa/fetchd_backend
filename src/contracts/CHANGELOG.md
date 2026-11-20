@@ -12,6 +12,21 @@ Entry format: `## [x.y.z] — YYYY-MM-DD` + Added/Changed/Removed bullets naming
 `Interface.field` or the enum, with a `(Δ date, DATA-CONTRACT §…)` cross-ref
 where one exists.
 
+## [9.3.0-pre.1] — 2026-11-20
+
+ADDITIVE. Her #39 part 2 (build DECISIONS 702(2), 704(2), 711, 712, 794), `designs/invoices-calendar.md`
+§2.2 (its `9.2.0-pre.3`, relabelled by DECISIONS 723's rule: it lands after messaging's 9.2.0).
+- Added `LedgerRefundWire`; `LedgerEntryWire.refunds?` — the refunds of a charge whose money has
+  gone back, oldest first, omitted when none. A 9.2.0 client reads it unchanged (it ignores the field).
+- Added `MAX_UPLOAD_BYTES`, `UPLOAD_IMAGE_CONTENT_TYPES`, `UPLOAD_VIDEO_CONTENT_TYPES`: the media
+  routes' limits as exported constants, mirroring `src/lib/mediaKeys.ts` (a backend test pins them
+  equal), so the clients' upload checks are guarded by `check:contracts` (build DECISIONS 863 (ii)).
+- Doc only (the 9.2.0 pre-landing read's N1, N2): `PostMediaUploadMessageAttachmentQuery` cites
+  `media_assets.created_by` by name, not the stale `schema.sql:689`; `pool_not_bookable`'s first case
+  reads "no package row live today" (here and in the 9.2.0 entry), as `findLiveForProgram` refuses.
+- No conformance pin: `refunds.status` is a pgEnum, but `LedgerRefundWire` carries no status.
+  Resync both clients.
+
 ## [9.2.0] — 2026-11-20
 
 ADDITIVE. Plan unit P45 with its one-off O-MSG-LIVE: messaging, live. Her words: "honestly is
@@ -134,7 +149,7 @@ errors this contract forced at drafting (`lib/threadWire.ts` twice, `routes/thre
   one-live-row rule. `GET /realtime`: a valid re-`auth` gets no reply; a malformed frame id or
   an out-of-range `up_to_seq` is dropped as a failed check.
 - `pool_not_bookable` (§ credits, the staff hand-add's doc) names all four of its cases with
-  their lines in `staffCredits.ts`: no seeded package row (`:212-214`); alumni-tier credits in a
+  their lines in `staffCredits.ts`: no package row live today (`:212-214`); alumni-tier credits in a
   day-school pool at either campus, refused since O-CREDITS fix 1 ("alumni credits pay for day
   care only", `:215-217`; DECISIONS 624); the alumni tier where no alumni package sells that
   program at that campus, today Fayetteville day care (O-BUGS3 #40, `:218-223`; DECISIONS 704,
