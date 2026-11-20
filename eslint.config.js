@@ -44,5 +44,27 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // O-POOLFIX-B (r3 Opus N1 = Fable NB1): the rule above sees only the literal `db.transaction(`. `db`'s type has
+    // no `transaction` (`src/db/client.ts`), so `tsc` refuses the other spellings; what is left is a second
+    // pool-bound drizzle, `drizzle(pool, …).transaction(…)`. The driver is imported only where the app binds it:
+    // the pool (`client.ts`) and one checked-out client (`tx.ts`).
+    files: ['src/**/*.ts'],
+    ignores: ['src/db/client.ts', 'src/db/tx.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['drizzle-orm/node-postgres', 'drizzle-orm/node-postgres/*'],
+              message:
+                'drizzle-orm/node-postgres is imported only by src/db/client.ts and src/db/tx.ts: query through db, open transactions through withActor / withTransaction (O-POOLFIX).',
+            },
+          ],
+        },
+      ],
+    },
+  },
   prettier,
 );

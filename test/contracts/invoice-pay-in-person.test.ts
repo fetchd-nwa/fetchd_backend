@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { eq, inArray, sql } from 'drizzle-orm';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import { scheduledNotificationsRepository } from '../../src/db/repositories/scheduledNotificationsRepository.js';
 import { bookings, invoices, scheduledNotifications } from '../../src/db/schema/schema.js';

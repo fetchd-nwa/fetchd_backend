@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { and, eq, isNotNull, sql } from 'drizzle-orm';
 import Stripe from 'stripe';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { chargesRepository } from '../../src/db/repositories/chargesRepository.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import { refundsRepository } from '../../src/db/repositories/refundsRepository.js';

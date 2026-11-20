@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { eq, sql } from 'drizzle-orm';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { vets } from '../../src/db/schema/schema.js';
 import { vetsRepository } from '../../src/db/repositories/vetsRepository.js';
 import { registerVetsRoute } from '../../src/routes/vets.js';

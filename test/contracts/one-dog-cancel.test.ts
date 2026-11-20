@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { after, afterEach, describe, test } from 'node:test';
 import { eq, sql } from 'drizzle-orm';
 import type { BookingWire, CheckinBoardWire } from '../../src/contracts/wire.js';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { dayCapacityRepository } from '../../src/db/repositories/dayCapacityRepository.js';
 import { bookings, dogs, scheduledNotifications } from '../../src/db/schema/schema.js';
 import { enqueueBookingReminders } from '../../src/lib/enqueueBookingReminders.js';

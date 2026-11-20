@@ -1,14 +1,16 @@
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import type { PoolClient } from 'pg';
-import { db, schema } from './client.js';
+import { schema } from './client.js';
 import { pool } from './pool.js';
 
 /**
  * The Drizzle transaction handle every write runs on. Day 3's idempotency +
  * txn wrappers compose *around* `withActor` and hand this `tx` to repositories.
+ * Read off a client-bound drizzle (`bindTo`), since the pool-bound `db` has no
+ * `transaction` (O-POOLFIX-B); the handle is the same type either way.
  */
-export type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+export type Tx = Parameters<Parameters<ReturnType<typeof bindTo>['transaction']>[0]>[0];
 
 /** Drizzle bound to ONE checked-out client: it neither checks a client out nor releases one. */
 function bindTo(client: PoolClient) {

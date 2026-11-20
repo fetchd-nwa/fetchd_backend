@@ -11,7 +11,7 @@ import type {
   RefundWire,
   StaffPaymentWire,
 } from '../../src/contracts/wire.js';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import { refundsRepository } from '../../src/db/repositories/refundsRepository.js';

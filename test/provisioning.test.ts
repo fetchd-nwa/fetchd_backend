@@ -8,7 +8,7 @@ import { makeVerifyWebhook } from '../src/auth/webhookSignature.js';
 import { parseInvite } from '../src/auth/provisioning.js';
 import { registerAuth } from '../src/auth/plugin.js';
 import { registerAuthWebhook } from '../src/routes/authWebhook.js';
-import { db } from '../src/db/client.js';
+import { db } from './_poolBoundDb.js';
 import { owners } from '../src/db/schema/schema.js';
 
 // --- Standard Webhooks signature verification (pure, no infra) ---

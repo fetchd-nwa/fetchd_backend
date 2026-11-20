@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { eq, inArray, isNotNull } from 'drizzle-orm';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { bookingsRepository } from '../../src/db/repositories/bookingsRepository.js';
 import {
   creditLedgerRepository,

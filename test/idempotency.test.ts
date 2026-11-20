@@ -6,7 +6,7 @@ import { eq, sql } from 'drizzle-orm';
 import { ApiError } from '../src/lib/errors.js';
 import { registerAuth } from '../src/auth/plugin.js';
 import type { Principal } from '../src/auth/principal.js';
-import { db } from '../src/db/client.js';
+import { db } from './_poolBoundDb.js';
 import { withIdempotency } from '../src/db/idempotency.js';
 import {
   IDEMPOTENCY_KEY_MAX_LEN,

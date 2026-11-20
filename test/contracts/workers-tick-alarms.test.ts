@@ -5,7 +5,7 @@ import { eq, sql } from 'drizzle-orm';
 import Fastify from 'fastify';
 import Stripe from 'stripe';
 import { registerAuth } from '../../src/auth/plugin.js';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { notificationsRepository } from '../../src/db/repositories/notificationsRepository.js';
 import {
   charges as chargesTable,

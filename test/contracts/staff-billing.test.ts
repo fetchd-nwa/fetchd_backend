@@ -10,7 +10,7 @@ import type {
   RefundStatus,
   StaffInvoiceWire,
 } from '../../src/contracts/wire.js';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import { settingsRepository } from '../../src/db/repositories/settingsRepository.js';
 import { charges, invoices, owners, refunds } from '../../src/db/schema/schema.js';

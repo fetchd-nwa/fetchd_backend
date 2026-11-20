@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, test } from 'node:test';
 import { eq, inArray, isNotNull, like, sql } from 'drizzle-orm';
 import type { Principal } from '../../src/auth/principal.js';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import {
   claimIdempotencyKey,
   peekCompletedIdempotency,

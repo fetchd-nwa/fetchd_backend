@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { eq } from 'drizzle-orm';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { hashRequestBody } from '../../src/db/mutation.js';
 import { invoicesRepository } from '../../src/db/repositories/invoicesRepository.js';
 import {

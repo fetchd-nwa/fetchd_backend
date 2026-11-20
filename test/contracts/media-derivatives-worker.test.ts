@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import { eq } from 'drizzle-orm';
 import sharp from 'sharp';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { mediaAssets } from '../../src/db/schema/schema.js';
 import { mediaAssetsRepository } from '../../src/db/repositories/mediaAssetsRepository.js';
 import { mediaDerivativeJobsRepository } from '../../src/db/repositories/mediaDerivativeJobsRepository.js';

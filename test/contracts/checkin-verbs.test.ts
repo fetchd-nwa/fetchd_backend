@@ -7,7 +7,7 @@ import type {
   CheckinBoardWire,
   CheckinEventWire,
 } from '../../src/contracts/wire.js';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { pool } from '../../src/db/pool.js';
 import { creditsInvalidationPattern } from '../../src/db/repositories/creditsRepository.js';
 import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';

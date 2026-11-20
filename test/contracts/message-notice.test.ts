@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, afterEach, before, describe, test } from 'node:test';
 import { sql } from 'drizzle-orm';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import type { ExpoPushClient, ExpoPushMessage } from '../../src/lib/expoPush.js';
 import {
   countLostStaffMessagePushes,

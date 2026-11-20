@@ -4,7 +4,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import type { Principal } from '../../src/auth/principal.js';
 import type { ApiErrorEnvelope, RefundWire, StaffPaymentWire } from '../../src/contracts/wire.js';
-import { db } from '../../src/db/client.js';
+import { db } from '../_poolBoundDb.js';
 import { creditLedgerRepository } from '../../src/db/repositories/creditLedgerRepository.js';
 import { charges, creditLedger, creditPackages, refunds } from '../../src/db/schema/schema.js';
 import { registerCreditsRoute } from '../../src/routes/credits.js';

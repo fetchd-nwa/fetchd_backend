@@ -12,10 +12,19 @@ import * as relations from './schema/relations.js';
  */
 export const schema = { ...tables, ...relations };
 
+const poolBound = drizzle(pool, { schema });
+
 /**
  * Bound to the pool: each query checks a client out and back in. The app opens
  * no transaction here (`db.transaction`): it opens them through `withActor` /
  * `withTransaction` (`tx.ts`), which check the client out themselves so that it
  * goes back to the pool on every path, BEGIN included (O-POOLFIX fix 1).
+ *
+ * So `db`'s type has no `transaction` (O-POOLFIX-B; r3 Opus N1 = Fable NB1), and
+ * `tsc` refuses every spelling of one: `db.transaction(…)`, `db['transaction']`,
+ * an import alias, `const d = db`, a destructured `transaction`, `.call(db, …)`.
+ * A second pool-bound drizzle is refused by eslint (`drizzle-orm/node-postgres`
+ * is imported only here and in `tx.ts`). A test that holds its own transaction
+ * re-types this same object (`test/_poolBoundDb.ts`).
  */
-export const db = drizzle(pool, { schema });
+export const db: Omit<typeof poolBound, 'transaction'> = poolBound;

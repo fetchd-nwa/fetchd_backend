@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { PoolClient } from 'pg';
-import { db } from '../src/db/client.js';
+import { db } from './_poolBoundDb.js';
 import { lockCohort, withDogLocks } from '../src/db/locks.js';
 import { pool } from '../src/db/pool.js';
 
