@@ -25,12 +25,13 @@ no minor and moves no planned label. It reads 9.2.0-pre.1 (O-AFTERCOUNT) and app
 it. One optional field on a response; nothing is removed, renamed or retyped, so a 9.2.0-pre.1
 client reads 9.2.0-pre.2 unchanged, and a 9.2.0-pre.2 client reading an older server finds the
 field absent and shows "Alumni" alone. No request, route, refusal, idempotent replay or stored
-row changes; no migration. Contract-first: no route returns `alumni_at` until O-BUGS3's #33
-backend unit lands it. Resync both clients (`npm run sync:contracts` in mobile and portal).
+row changes; no migration. Contract-first: the contract commit lands first and O-BUGS3's #33 backend unit lands with it in the
+same push, so from that push the four dog routes return `alumni_at`. Resync both clients (`npm run sync:contracts` in mobile and portal).
 The field is optional, so it adds no `tsc` error: drafted on 9.2.0-pre.1's contract without
 its backend, the backend's `typecheck` and `typecheck:tests` fail exactly as at 9.2.0-pre.1
 (the same 3 errors in 2 files, which O-AFTERCOUNT's backend closes in its push) and add none;
-`wire.ts` itself has no error. The clients were not run against it. Messaging's planned
+`wire.ts` itself has no error. The mobile app's money fake was diffed against the backend at landing (O-AFTERCOUNT MA7; the #33
+review's recorded real responses). Messaging's planned
 9.2.0 (P45 with O-MSG-LIVE) takes this step back with 9.2.0-pre.1, by the note's §1.2: `[9.2.0]`
 goes above this entry and says it includes 9.2.0-pre.1 (O-AFTERCOUNT) and 9.2.0-pre.2
 (O-BUGS3), and the header hunk resolves to 9.2.0 with all three paragraphs kept.
@@ -85,13 +86,13 @@ Every addition is a new type, a new field on a response or an optional field; no
 removed, renamed or retyped, so a 9.1.0 client reads 9.2.0-pre.1 unchanged. A 422 stores
 nothing on its key and a stored 201 does not change, so no replay differs. Lot choice, locks,
 the refusal order, `pools`, `consentable`, `package_key` and `POST /bookings` are unchanged.
-Contract-first: no route returns `draws` until O-AFTERCOUNT's backend unit lands it. Resync both
-clients (`npm run sync:contracts` in mobile and portal). Against this copy the backend's
-`typecheck` and `typecheck:tests` each fail 3 times in 2 files, the same 3, each the builder's
-to close: `lib/bookingErrors.ts:198` and `:220` (the `credits_short` and `alumni_credits_short`
-builders, until they take `draws`) and `routes/bookingOrders.ts:153` (the check's 200, until the
-core returns `draws` with `plan`). `wire.ts` itself has no error, and at 9.1.0 both steps are
-clean. The clients were not run against it. Messaging's planned 9.2.0 (P45 with O-MSG-LIVE) takes this step back by the note's §1.2:
+Contract-first: the contract commit lands first and O-AFTERCOUNT's backend unit lands with it in the
+same push (build DECISIONS 695 (ii)), so from that push every route that builds these shapes returns `draws`. Resync both
+clients (`npm run sync:contracts` in mobile and portal). On the contract commit alone the backend's `typecheck` and `typecheck:tests` failed 3 times in
+2 files (`lib/bookingErrors.ts:198`, `:220`, `routes/bookingOrders.ts:153`); all three are closed
+by the backend unit in the same push, so no pushed tip is red. `wire.ts` itself has no error, and at 9.1.0 both steps are
+clean. The mobile app's money fake was diffed against the backend at landing (O-AFTERCOUNT MA7; the #33
+review's recorded real responses). Messaging's planned 9.2.0 (P45 with O-MSG-LIVE) takes this step back by the note's §1.2:
 `[9.2.0]` goes above this entry and says it includes 9.2.0-pre.1 (O-AFTERCOUNT).
 
 ### Added
