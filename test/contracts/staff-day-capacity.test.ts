@@ -752,6 +752,90 @@ async function untilSomethingWaits(client: pg.Client): Promise<void> {
 }
 
 test(
+  'waitingOnALock counts waiters in THIS database only: three held in another database read 0, two held here read 2',
+  LOCK_TEST,
+  async () => {
+    // #40 r3 Fable N1: cutting `waitingOnALock`'s scope (`AND w.pid IN (…)`) left this file green, and the count then
+    // reads other lanes' waiters as ours, so its waits can end early. A scratch database beside this one (named
+    // after it, dropped after) holds an advisory, a row and a table waiter; this database then holds two.
+    const here = new URL(process.env.DATABASE_URL as string);
+    const admin = new pg.Client({ connectionString: here.href });
+    await admin.connect();
+    const foreignName = `${here.pathname.slice(1)}_w0_${randomUUID().replaceAll('-', '').slice(0, 10)}`;
+    await admin.query(`CREATE DATABASE ${foreignName}`);
+    const opened: pg.Client[] = [];
+    const open = async (url: URL): Promise<pg.Client> => {
+      const c = new pg.Client({ connectionString: url.href });
+      await c.connect();
+      opened.push(c);
+      return c;
+    };
+    const pending: Array<Promise<unknown>> = [];
+    try {
+      const foreignUrl = new URL(here.href);
+      foreignUrl.pathname = `/${foreignName}`;
+      const holder = await open(foreignUrl);
+      await holder.query('CREATE TABLE w0_rows (id int PRIMARY KEY)');
+      await holder.query('CREATE TABLE w0_table (id int PRIMARY KEY)');
+      await holder.query('INSERT INTO w0_rows VALUES (1)');
+      await holder.query('BEGIN');
+      await holder.query(`SELECT pg_advisory_xact_lock(hashtext('w0'))`);
+      await holder.query('SELECT id FROM w0_rows WHERE id = 1 FOR UPDATE');
+      await holder.query('LOCK TABLE w0_table IN ACCESS EXCLUSIVE MODE');
+      for (const statement of [
+        `SELECT pg_advisory_xact_lock(hashtext('w0'))`,
+        'UPDATE w0_rows SET id = id WHERE id = 1',
+        'SELECT id FROM w0_table',
+      ]) {
+        const waiter = await open(foreignUrl);
+        pending.push(waiter.query(statement).catch((e: unknown) => e));
+      }
+      // Read from here, in autocommit (fresh each time): the holder's open transaction would snapshot
+      // pg_stat_activity at its first read.
+      const foreignWaiting = async (): Promise<number> =>
+        (
+          await admin.query(
+            `SELECT count(*)::int AS n FROM pg_locks WHERE NOT granted
+              AND pid IN (SELECT pid FROM pg_stat_activity WHERE datname = $1)`,
+            [foreignName],
+          )
+        ).rows[0].n as number;
+      for (let i = 0; i < 250 && (await foreignWaiting()) < 3; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(await foreignWaiting(), 3, 'three sessions wait in the other database');
+      assert.equal(await waitingOnALock(admin), 0, 'none of them reads as a waiter here');
+
+      // The count is not vacuous: an advisory waiter and a row waiter here read 2.
+      const localHolder = await open(here);
+      await localHolder.query('BEGIN');
+      await localHolder.query(`SELECT pg_advisory_xact_lock(hashtext('w0-here'))`);
+      await localHolder.query(
+        `SELECT 1 FROM day_program_settings WHERE location = 'bentonville' FOR UPDATE`,
+      );
+      for (const statement of [
+        `SELECT pg_advisory_xact_lock(hashtext('w0-here'))`,
+        `SELECT 1 FROM day_program_settings WHERE location = 'bentonville' FOR UPDATE`,
+      ]) {
+        const waiter = await open(here);
+        pending.push(waiter.query(statement).catch((e: unknown) => e));
+      }
+      for (let i = 0; i < 250 && (await waitingOnALock(admin)) < 2; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(await waitingOnALock(admin), 2, 'the two waiting here are counted');
+      await localHolder.query('ROLLBACK');
+      await holder.query('ROLLBACK');
+      await Promise.all(pending);
+    } finally {
+      for (const c of opened) await c.end().catch(() => undefined);
+      await admin.query(`DROP DATABASE IF EXISTS ${foreignName} WITH (FORCE)`);
+      await admin.end();
+    }
+  },
+);
+
+test(
   'a held row lock queues a PATCH and does not block a booking of a date it has not reached',
   LOCK_TEST,
   async () => {

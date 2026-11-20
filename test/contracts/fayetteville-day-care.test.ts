@@ -325,8 +325,22 @@ test(
         },
       ],
       draws: [
-        { location: 'fayetteville', mode: 'daycare', tier: 'regular', balance: 0, draw: 0, short: 1 },
-        { location: 'fayetteville', mode: 'daycare', tier: 'alumni', balance: 0, draw: 0, short: 0 },
+        {
+          location: 'fayetteville',
+          mode: 'daycare',
+          tier: 'regular',
+          balance: 0,
+          draw: 0,
+          short: 1,
+        },
+        {
+          location: 'fayetteville',
+          mode: 'daycare',
+          tier: 'alumni',
+          balance: 0,
+          draw: 0,
+          short: 0,
+        },
       ],
     });
     assert.deepEqual(await rowCounts(), before, 'nothing written');

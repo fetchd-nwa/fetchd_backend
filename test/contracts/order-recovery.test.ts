@@ -182,10 +182,11 @@ function recordingLog() {
 }
 
 /**
- * Wait until a statement of this process is blocked on a row lock. In THIS database only: the
- * server is shared, and another lane's waiter whose query names charges would read as ours and
- * end the wait before the race is forced (#40 r2, Opus L2 / Fable N2). Each poll is its own
- * autocommit statement, so `pg_stat_activity` is read fresh every time.
+ * Wait until a session of this database whose query names charges is blocked on a row lock,
+ * whichever process it belongs to. In THIS database only: the server is shared, and another
+ * lane's waiter whose query names charges would read as ours and end the wait before the race is
+ * forced (#40 r2, Opus L2 / Fable N2). Each poll is its own autocommit statement, so
+ * `pg_stat_activity` is read fresh every time.
  */
 async function untilSomethingBlocks(): Promise<void> {
   for (let i = 0; i < 100; i += 1) {
