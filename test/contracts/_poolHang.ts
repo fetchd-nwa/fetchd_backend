@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import pg from 'pg';
 import { pool } from '../../src/db/pool.js';
+import { TRANSACTION_SLOTS } from '../../src/db/tx.js';
 
 /**
  * A pooled read inside a transaction (O-MSG-LIVE pass 2 fix 1, M1): a request whose transaction
@@ -26,12 +27,13 @@ import { pool } from '../../src/db/pool.js';
 const REACH_LOCK_TRIES = 750;
 
 /**
- * How many transactions can hold a pool slot at once: `src/db/tx.ts`'s `TRANSACTION_SLOTS`, the
- * same formula, read from the same pool (O-POOLFIX fix 2 commit A). Only that many of a burst can
- * reach a lock inside their transactions; the others queue for a slot until one is released.
+ * How many transactions can hold a pool slot at once: `src/db/tx.ts`'s `TRANSACTION_SLOTS` itself
+ * (O-POOLFIX fix 2 commit A; imported, not copied, since O-POOLFIX-B, so a moved bound moves this
+ * too). Only that many of a burst can reach a lock inside their transactions; the others queue for
+ * a slot until one is released.
  */
 export function transactionSlots(): number {
-  return Math.max(1, ((pool as unknown as { options: { max?: number } }).options.max ?? 10) - 1);
+  return TRANSACTION_SLOTS;
 }
 
 export function sleep(ms: number): Promise<void> {

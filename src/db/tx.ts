@@ -59,7 +59,8 @@ function boundTo(client: PoolClient): ReturnType<typeof bindTo> {
  * refused at once, before it takes a slot or a connection (`inTransaction`; O-POOLFIX-B, r3 Fable N5 = Opus N5).
  * A savepoint (`tx.transaction`) is not one: it runs on the outer's connection.
  */
-const TRANSACTION_SLOTS = Math.max(1, (pool.options.max ?? 10) - 1);
+/** Exported read-only for the tests' pool-hang kit (`test/contracts/_poolHang.ts`), so the two cannot drift. */
+export const TRANSACTION_SLOTS = Math.max(1, (pool.options.max ?? 10) - 1);
 let transactionsHolding = 0;
 const transactionWaiters: Array<() => void> = [];
 
