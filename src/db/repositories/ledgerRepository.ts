@@ -10,7 +10,9 @@ import {
   paymentMethods,
 } from '../schema/schema.js';
 import type { LedgerEntryWire } from '../../contracts/wire.js';
+import { pgTimestampToDate } from '../../lib/pgTimestamp.js';
 import type { ChargePurpose, ChargeStatus } from './chargesRepository.js';
+import { refundsRepository, type ReturnedRefundForCharge } from './refundsRepository.js';
 import type { ServiceCategory } from '../../lib/bookingBucket.js';
 import type { Tx } from '../tx.js';
 
@@ -82,6 +84,58 @@ export interface LedgerEntryRow {
    * invoice and on a charge from before the engine.
    */
   orderId: string | null;
+  /**
+   * The refunds of this entry's charge whose money has gone back (wire 9.3.0-pre.1,
+   * `LedgerEntryWire.refunds`; her #39), oldest first by {@link LedgerRefundRow.refundedAt}
+   * as an instant, then `id`. `[]` on an open invoice and on a charge with none; the wire
+   * omits the field then.
+   */
+  refunds: LedgerRefundRow[];
+}
+
+/** One refund on a ledger entry's charge (`LedgerRefundWire`'s row). */
+export interface LedgerRefundRow {
+  id: string;
+  amountCents: number;
+  /**
+   * Postgres's text of the moment the refund counts from: `resolved_at` on a
+   * 'resolved-external' row (when staff recorded it returned; its `created_at` when it has
+   * none, a row closed before the column), else `created_at` (when the app wrote the row:
+   * a card refund issued, or a dashboard refund adopted). Read by `refundedAtOf`.
+   */
+  refundedAt: string;
+}
+
+/**
+ * The wire's `refunded_at` rule (`LedgerRefundWire.refunded_at`): the status decides which
+ * column, not which column happens to be set.
+ */
+function refundedAtOf(row: ReturnedRefundForCharge): string {
+  return row.status === 'resolved-external' ? (row.resolvedAt ?? row.createdAt) : row.createdAt;
+}
+
+/**
+ * The listed charges' refunds, grouped by charge, each group oldest first. Ordered by the
+ * moment as an INSTANT, never by its text (design N5): the text is Postgres's, and a
+ * collation compare puts `…20:05:00.5+00` before `…20:05:00+00`.
+ */
+async function refundsByCharge(
+  runner: Runner,
+  chargeIds: readonly string[],
+): Promise<Map<string, LedgerRefundRow[]>> {
+  const rows = await refundsRepository.findReturnedRowsForCharges(runner, chargeIds);
+  const timed = rows.map((row) => {
+    const refundedAt = refundedAtOf(row);
+    return { row, refundedAt, at: pgTimestampToDate(refundedAt).getTime() };
+  });
+  timed.sort((a, b) => a.at - b.at || (a.row.id < b.row.id ? -1 : a.row.id > b.row.id ? 1 : 0));
+  const byCharge = new Map<string, LedgerRefundRow[]>();
+  for (const { row, refundedAt } of timed) {
+    const list = byCharge.get(row.chargeId) ?? [];
+    list.push({ id: row.id, amountCents: row.amountCents, refundedAt });
+    byCharge.set(row.chargeId, list);
+  }
+  return byCharge;
 }
 
 // A charge is a ledger line only when it represents a completed money event.
@@ -131,6 +185,12 @@ export const ledgerRepository = {
    *     (only `stripe_payment_intent_id`), so a DIRECT package charge — with
    *     no invoice link — still renders no card chip rather than a
    *     fabricated one.
+   *   - Each charge-sourced entry carries its charge's returned refunds (wire
+   *     9.3.0-pre.1; `designs/invoices-calendar.md` §2.3, §7), read AFTER the
+   *     charges by the listed charge ids, on the same runner. Two reads, not one
+   *     snapshot: a refund that succeeds between them is listed on an entry whose
+   *     `status` still reads 'paid', and the next read agrees. The wire says so,
+   *     and a client never derives one from the other.
    */
   async listForOwner(runner: Runner, ownerId: string): Promise<LedgerEntryRow[]> {
     const chargeRows = await runner
@@ -190,6 +250,9 @@ export const ledgerRepository = {
       .leftJoin(paymentMethods, eq(paymentMethods.id, invoices.paymentMethodId))
       .where(and(eq(charges.ownerId, ownerId), inArray(charges.status, LEDGER_CHARGE_STATUSES)));
 
+    // By the charges just listed and nothing else (L3): never by `refunds.owner_id`.
+    const refundsOf = await refundsByCharge(runner, [...new Set(chargeRows.map((row) => row.id))]);
+
     const chargeEntries: LedgerEntryRow[] = chargeRows.map((row) => {
       const kind = kindForPurpose(row.purpose);
       const isPackage = kind === 'credit-pack';
@@ -222,6 +285,7 @@ export const ledgerRepository = {
         // charge's own created_at.
         settledAt: isPaid ? (row.invoicePaidAt ?? row.date) : null,
         orderId: row.orderId,
+        refunds: refundsOf.get(row.id) ?? [],
       };
     });
 
@@ -281,6 +345,8 @@ export const ledgerRepository = {
         settledCard: null,
         settledAt: null,
         orderId: null,
+        // An open invoice moved no money, so nothing of it went back.
+        refunds: [],
       };
     });
 

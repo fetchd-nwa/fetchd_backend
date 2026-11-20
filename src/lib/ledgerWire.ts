@@ -33,5 +33,14 @@ export function toLedgerEntryWire(row: LedgerEntryRow): LedgerEntryWire {
   if (row.settledAt !== null) wire.settled_at = pgTimestampToIso(row.settledAt);
   if (row.groupClassName !== null) wire.group_class_name = row.groupClassName;
   if (row.orderId !== null) wire.order_id = row.orderId;
+  // Omitted when none, never `[]` (9.3.0-pre.1). Each moment goes through
+  // `pgTimestampToIso`: Hermes refuses Postgres's text (STATE trap 12.2).
+  if (row.refunds.length > 0) {
+    wire.refunds = row.refunds.map((refund) => ({
+      id: refund.id,
+      amount_cents: refund.amountCents,
+      refunded_at: pgTimestampToIso(refund.refundedAt),
+    }));
+  }
   return wire;
 }

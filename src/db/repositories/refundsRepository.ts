@@ -196,6 +196,20 @@ export interface RefundWireRow {
 }
 
 /**
+ * One row of a charge's RETURNED COVERAGE as the owner's ledger reads it
+ * ({@link refundsRepository.findReturnedRowsForCharges}). The timestamps are Postgres's
+ * text (`mode: 'string'`); the ledger picks the moment and parses it.
+ */
+export interface ReturnedRefundForCharge {
+  id: string;
+  chargeId: string;
+  amountCents: number;
+  status: RefundStatus;
+  createdAt: string;
+  resolvedAt: string | null;
+}
+
+/**
  * A refund *Returned* closed `withdrawn` moved no money (6.0.0; design §2.7:4242-4251):
  * it counts nowhere money is summed — the cap ({@link refundsRepository.sumNonFailedForCharge}),
  * the returned coverage and the rows behind it. A `resolved-external` row with no outcome
@@ -1179,6 +1193,48 @@ export const refundsRepository = {
         ),
       )
       .orderBy(asc(refunds.createdAt));
+  },
+
+  /**
+   * The rows of {@link findReturnedRowsForCharge}, for several charges at once: what the
+   * owner's ledger lists as `LedgerEntryWire.refunds` (wire 9.3.0-pre.1, her #39;
+   * `designs/invoices-calendar.md` §2.3, §7). The predicate is
+   * {@link sumReturnedCoverageForCharge}'s, word for word — `succeeded` or
+   * `resolved-external`, never one closed `withdrawn` — so what the family is shown sums to
+   * what the server counts as returned, charge by charge.
+   *
+   * **Keyed by `charge_id IN (chargeIds)`** (`refunds_charge_idx`), the key that sum uses,
+   * and never by `refunds.owner_id`: nothing in the schema ties a refund's owner to its
+   * charge's owner (`schema.sql` `refunds.owner_id`, `refunds.charge_id`), so a read by owner
+   * could miss one of these charges' own refunds or carry a refund of a charge the caller
+   * never listed. The caller passes only the charges it lists, and nothing else can come
+   * back.
+   *
+   * `[]` with no query when `chargeIds` is empty. Unordered: the ledger orders by the
+   * moment it derives from `createdAt` and `resolvedAt`, as an instant.
+   */
+  async findReturnedRowsForCharges(
+    runner: Runner,
+    chargeIds: readonly string[],
+  ): Promise<ReturnedRefundForCharge[]> {
+    if (chargeIds.length === 0) return [];
+    return runner
+      .select({
+        id: refunds.id,
+        chargeId: refunds.chargeId,
+        amountCents: refunds.amountCents,
+        status: refunds.status,
+        createdAt: refunds.createdAt,
+        resolvedAt: refunds.resolvedAt,
+      })
+      .from(refunds)
+      .where(
+        and(
+          inArray(refunds.chargeId, [...chargeIds]),
+          inArray(refunds.status, ['succeeded', 'resolved-external']),
+          NOT_WITHDRAWN,
+        ),
+      );
   },
 
   async countPendingForCharge(tx: Tx, chargeId: string): Promise<number> {
