@@ -29,7 +29,18 @@ import { pool } from '../../src/db/pool.js';
  *     locks, and a route they drive from inside one runs in that context.
  *   - `afterEach` fails the test that recorded one, and `after` fails the file for one recorded in a hook.
  *
- * What it cannot see: a route no test drives, and a test file that does not call `registerFixtureHooks()`.
+ * What it cannot see:
+ *   - a route no test drives;
+ *   - a test file that does not call `registerFixtureHooks()`. On O-POOLFIX-B's tree that is 189 of the 203 contract
+ *     files guarded and these 14 not (executed: their pool's `connect` is never replaced): `error-envelope`,
+ *     `fixture-guard`, `fixture-rot`, `health-schema`, `healthWatchdog`, `lg3-p13-steps`, `money-integer-cents`,
+ *     `owners-contact-nullable`, `realtime-publish`, `rs3-steps`, `stripe-stub-recording`, `uploads-sign`,
+ *     `visible-text-parity`, `workers-tick`; nor any of the top-level `test/*.test.ts` (r3 Opus N4; under both r3
+ *     seats' instruments the 11 of them then present opened no transaction, and none drives a money path);
+ *   - which transaction a read belongs to when a test calls a `src` function that opens one from the test's own
+ *     scope without awaiting it alone: the mark is set on the scope the checkout runs in, so the test's later
+ *     statements in that scope can read as inside it (false positives; the messaging take-back's D2, its design
+ *     gap (2)). Await such a call by itself, or start it from a function of its own.
  */
 
 type Opener = 'src' | 'test' | 'unknown';

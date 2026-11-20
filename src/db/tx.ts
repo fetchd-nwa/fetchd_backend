@@ -43,10 +43,12 @@ function boundTo(client: PoolClient): ReturnType<typeof bindTo> {
  * and waited for a slot only another waiter could free: nothing moved. Executed at the production entry, twelve
  * parallel `DELETE /events/:id/rsvp` from one signed-in owner did that — before fix 1 a permanent, silent wedge of
  * every route; with fix 1's checkout timeout a 10 s stall of every route, twelve 500s and twelve pages. Reserving
- * one slot that no transaction may take means a pool read (such a body's, `/health`'s, any route's) always finds a
- * slot within one statement's time, so the pool cannot deadlock on itself whatever a route does inside its
- * transaction. The reads the seats found are also moved onto `tx` (fix 2's second commit), and a test guard fails
- * any new one; this bound covers a route no test drives.
+ * one slot that no transaction may take means a pool read (such a body's, `/health`'s, any route's) finds that
+ * slot, so transactions can no longer deadlock the pool on themselves: a pool read finds the reserved slot unless a
+ * statement outside any transaction is itself waiting in it on a lock; then the 10 s checkout timeout ends it
+ * (O-POOLFIX r3 Fable L3, executed: nine bodies awaiting pool reads, one pool write queued on a row one of them
+ * locked, all nine rejected at 10.7 s). The reads the seats found are also moved onto `tx` (fix 2's second commit),
+ * and a test guard fails any new one; this bound covers a route no test drives.
  *
  * A transaction that finds every slot taken waits for one, first come first served, at most as long as a checkout
  * waits for a connection (`pool.ts`'s `connectionTimeoutMillis`, 10 s), and then rejects with pg-pool's own text,
