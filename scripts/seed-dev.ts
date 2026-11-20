@@ -493,7 +493,7 @@ async function seed(): Promise<void> {
       id: SEED.dogWafflesId,
       ownerId: SEED.ownerAllisonId,
       name: 'Waffles',
-      breed: 'Labradoodle',
+      breed: 'Golden Retriever',
       birthdate: '2023-01-15',
       specialNotes: 'Eager learner; loves water.',
       evaluationStatus: 'passed',
