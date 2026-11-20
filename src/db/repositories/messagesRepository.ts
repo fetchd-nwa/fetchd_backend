@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, inArray, isNull, lte, min, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, lte, max, min, ne, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { mediaAssets, messageAttachments, messageStaffReads, messages } from '../schema/schema.js';
 import { live } from '../softExpire.js';
@@ -56,7 +56,26 @@ const MESSAGE_PROJECTION = {
 /** A sender's stored message for one `client_message_id` (W2): where it is, and the row. */
 export type StoredClientMessage = MessageRow;
 
+/**
+ * The family's `read` receipt in a thread (round 1 L1; MB62, MB64): the highest `seq` of HER
+ * messages that any staffer has read (`message_staff_reads`), or 0 when none has. Expired
+ * messages count, so an unsend never lowers it: a receipt never moves backwards. Every row comes
+ * from `POST /staff/threads/:id/read` (rs3 M5.28 backfills none), which publishes each rise, so
+ * this is also the highest `read` her socket has been told. The caller holds the thread-row lock
+ * (L4), so it is exact.
+ */
+async function highestStaffReadSeq(tx: Tx, threadId: string): Promise<number> {
+  const [row] = await tx
+    .select({ seq: max(messages.threadSeq) })
+    .from(messageStaffReads)
+    .innerJoin(messages, eq(messages.id, messageStaffReads.messageId))
+    .where(and(eq(messages.threadId, threadId), eq(messages.senderKind, 'owner')));
+  return row?.seq ?? 0;
+}
+
 export const messagesRepository = {
+  highestStaffReadSeq,
+
   /**
    * All live messages in a thread, in `seq` order (9.2.0, contract-notes mechanic 16):
    * commit order, never `sent_at`, which is the transaction's start, so two sends never
@@ -302,9 +321,13 @@ export const messagesRepository = {
    * CALLER ONLY, the listed messages that are this thread's live FAMILY messages (anything else
    * listed is ignored), one `message_staff_reads` row each, and stamp *Delivered* where nothing
    * had. The caller locks the thread row first (L4), so two staffers' reads of one thread
-   * serialize and `firstRead` is exact: the messages no staffer had read before this call, with
-   * the highest `seq` among them and the instant (CR14: only the school's FIRST read moves the
-   * family's receipt; pass 3 publishes it). `null` when this call is no one's first read.
+   * serialize and `firstRead` is exact: the family's `read` receipt step, which pass 3 publishes.
+   * Her receipt is `highestStaffReadSeq` and never moves backwards (round 1 L1; MB62, MB64), so
+   * this call moves it only when the highest of its first reads (the messages no staffer had read
+   * before it) is above that, and then to that `seq`, `at` that message's first read, which is
+   * this call's (CR14: only the school's FIRST read moves the family's receipt). `null` when
+   * nothing moves it (MB27 Q2): no first read, or only first reads below one already read (a
+   * staffer may read a newer message before an older one).
    */
   async markReadForStaff(
     tx: Tx,
@@ -328,6 +351,7 @@ export const messagesRepository = {
       .selectDistinct({ id: messageStaffReads.messageId })
       .from(messageStaffReads)
       .where(inArray(messageStaffReads.messageId, ids));
+    const readUpTo = await highestStaffReadSeq(tx, args.threadId);
     const inserted = await tx
       .insert(messageStaffReads)
       .values(ids.map((messageId) => ({ messageId, staffId: args.staffId })))
@@ -338,13 +362,19 @@ export const messagesRepository = {
       .set({ deliveredAt: sql`now()` })
       .where(and(inArray(messages.id, ids), isNull(messages.deliveredAt)));
     const readBefore = new Set(before.map((r) => r.id));
-    const first = family.filter((m) => !readBefore.has(m.id));
-    const at = inserted[0]?.at;
+    // The highest of this call's first reads. Anything else it read had a reader already, so
+    // sits at or below `readUpTo`: her receipt rises exactly when this one is above it.
+    let top: (typeof family)[number] | undefined;
+    for (const m of family) {
+      if (!readBefore.has(m.id) && (top === undefined || m.seq > top.seq)) top = m;
+    }
+    const topId = top?.id;
+    const at = inserted.find((r) => r.messageId === topId)?.at;
     return {
       readIds: inserted.map((r) => r.messageId),
       firstRead:
-        first.length > 0 && at !== undefined
-          ? { upToSeq: Math.max(...first.map((m) => m.seq)), at }
+        top !== undefined && top.seq > readUpTo && at !== undefined
+          ? { upToSeq: top.seq, at }
           : null,
     };
   },

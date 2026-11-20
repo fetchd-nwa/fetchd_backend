@@ -553,7 +553,8 @@ export function registerStaffThreadsRoute(
       },
     );
     // 9.2.0 (pass 3 item 2; MB27 Q5, CR14): after commit, only for the ids this call newly
-    // marked for this staffer; the family's receipt only on the school's first read.
+    // marked for this staffer; the family's receipt only when the school's first read raises it
+    // (a receipt never moves backwards: round 1 L1, MB62, MB64).
     if (!outcome.replayed && read.row !== undefined && read.step !== undefined) {
       const { readIds, firstRead } = read.step;
       if (readIds.length > 0) {

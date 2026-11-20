@@ -1,6 +1,7 @@
 import { and, eq, isNull, lte, sql } from 'drizzle-orm';
 import type { MirrorPrincipal } from '../auth/mirror.js';
 import { actorOf, type Principal } from '../auth/principal.js';
+import { messagesRepository } from '../db/repositories/messagesRepository.js';
 import { messages, threads } from '../db/schema/schema.js';
 import { withActor } from '../db/tx.js';
 import { pgTimestampToIso } from '../lib/pgTimestamp.js';
@@ -40,7 +41,8 @@ function actorOfMirror(p: MirrorPrincipal): string {
  * `withActor` (the acker's actor: `audit_capture` watches `messages`), and the thread row is
  * locked FIRST (`SELECT … FOR UPDATE`), so an ack and a read on one thread never deadlock (L4).
  * A family's ack is honoured only on her own thread (B2; the socket checked it too). `null`
- * when the thread is gone or not hers, or nothing moved.
+ * when the thread is gone or not hers, or nothing moved a receipt (MB27 Q2; MB46 ruling 3;
+ * round 1 L1).
  */
 export async function stampDelivered(
   principal: MirrorPrincipal,
@@ -80,6 +82,17 @@ export async function stampDelivered(
     const first = unread[0];
     if (first === undefined || first.deliveredAt === null) return null;
     const highest = unread.reduce((top, m) => (m.seq > top ? m.seq : top), first.seq);
+    // Round 1 L1 (MB62, MB64): a receipt never moves backwards. Her `read` receipt already covers
+    // her messages up to the highest any staffer read, and a staffer may read a newer one before
+    // an older one, so a *Delivered* at or below it moves nothing. The school's side needs no
+    // check: her reads and every ack stamp from the bottom up, and a pre-9.2.0 `read_at` was
+    // never a receipt (MB53 (b)).
+    if (
+      side === 'owner' &&
+      highest <= (await messagesRepository.highestStaffReadSeq(tx, thread.id))
+    ) {
+      return null;
+    }
     return {
       threadId: thread.id,
       ownerId: thread.ownerId,

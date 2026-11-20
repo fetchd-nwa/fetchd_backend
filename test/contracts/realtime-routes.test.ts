@@ -655,6 +655,131 @@ test('MB53 (b): ruling 3’s `up_to_seq` is the highest seq stamped among the me
   }
 });
 
+/** One thread's receipts as one socket heard them: `[state, up_to_seq]`, in arrival order. */
+function receiptsOf(client: RtClient, threadId: string): Array<[unknown, unknown]> {
+  return ofThread(client, 'receipt', threadId).map((f) => [f.state, f.up_to_seq]);
+}
+
+test('L1 (round 1; MB62, MB64): a receipt never moves backwards. Amber reads only her newest message, then an older one, then Donavan the two older ones: her socket gets ONE `read`, up to the newest, at its first read; the later reads send her nothing; a read past it rises again', async () => {
+  const rt = await routeApp();
+  const a = await socketFor(rt.url, HER);
+  const staff = await socketFor(rt.url, DONAVAN);
+  const t = await plantThread(A);
+  try {
+    const m1 = await plantMessage(t, HERS);
+    const m2 = await plantMessage(t, HERS);
+    const m3 = await plantMessage(t, HERS);
+    const read = (who: MirrorPrincipal, ids: string[]) =>
+      call(rt.app, who, 'POST', `/staff/threads/${t}/read`, { message_ids: ids });
+    assert.equal((await read(AMBER, [m3.id])).statusCode, 204);
+    const first = await a.waitFor((f) => f.type === 'receipt' && f.thread_id === t);
+    assert.equal((await read(AMBER, [m2.id])).statusCode, 204);
+    assert.equal((await read(DONAVAN, [m1.id, m2.id])).statusCode, 204);
+    // Each later read marked something new for its reader, so each was published (staff.read).
+    await staff.waitFor(() => ofThread(staff, 'staff.read', t).length === 3);
+    await sleep(700);
+    const at = await isoOf(
+      sql`SELECT to_char(min(read_at) AT TIME ZONE 'UTC', ${sql.raw(ISO)}) AS at FROM message_staff_reads WHERE message_id = ${m3.id}`,
+    );
+    assert.deepEqual(first, {
+      type: 'receipt',
+      thread_id: t,
+      state: 'read',
+      up_to_seq: m3.seq,
+      at,
+    });
+    assert.deepEqual(receiptsOf(a, t), [['read', m3.seq]], 'an older read sent her a receipt');
+    assert.equal(rt.published.filter((p) => p.event.kind === 'receipt').length, 1);
+
+    const m4 = await plantMessage(t, HERS);
+    assert.equal((await read(DONAVAN, [m4.id])).statusCode, 204);
+    await a.waitFor(() => ofThread(a, 'receipt', t).length === 2);
+    assert.deepEqual(receiptsOf(a, t), [
+      ['read', m3.seq],
+      ['read', m4.seq],
+    ]);
+  } finally {
+    a.end();
+    staff.end();
+    await rt.close();
+    await removeThreads([t]);
+  }
+});
+
+test('L1, the Delivered half (round 1; MB62, MB64): after Amber reads only her newest message, a staffer’s ack up to an older one stamps the older ones but sends her no `delivered` (her `read` already covers them); an ack past the read still sends one', async () => {
+  const rt = await routeApp();
+  const a = await socketFor(rt.url, HER);
+  const staff = await socketFor(rt.url, DONAVAN);
+  const t = await plantThread(A);
+  try {
+    const m1 = await plantMessage(t, HERS);
+    const m2 = await plantMessage(t, HERS);
+    const m3 = await plantMessage(t, HERS);
+    const r = await call(rt.app, AMBER, 'POST', `/staff/threads/${t}/read`, {
+      message_ids: [m3.id],
+    });
+    assert.equal(r.statusCode, 204);
+    await a.waitFor((f) => f.type === 'receipt' && f.thread_id === t);
+    staff.send({ type: 'ack', thread_id: t, up_to_seq: m2.seq });
+    await sleep(1_300);
+    const at = await deliveredAtOf([m1.id, m2.id]);
+    assert.ok(at.get(m1.id) !== null && at.get(m2.id) !== null, 'the ack stamped both');
+    assert.deepEqual(receiptsOf(a, t), [['read', m3.seq]], 'a Delivered below her Read');
+
+    const m4 = await plantMessage(t, HERS);
+    staff.send({ type: 'ack', thread_id: t, up_to_seq: m4.seq });
+    await a.waitFor(() => ofThread(a, 'receipt', t).length === 2);
+    assert.deepEqual(receiptsOf(a, t), [
+      ['read', m3.seq],
+      ['delivered', m4.seq],
+    ]);
+  } finally {
+    a.end();
+    staff.end();
+    await rt.close();
+    await removeThreads([t]);
+  }
+});
+
+test('L1, the school’s side (round 1; MB62, MB64): her reads and acks stamp from the bottom up, so no receipt to staff moves backwards: acks up to 3 then 2, reads up to 2, 3, 2 and unbounded, and an ack up to 3 send staff `delivered` 3, `read` 2, `read` 3, and nothing more', async () => {
+  const rt = await routeApp();
+  const a = await socketFor(rt.url, HER);
+  const staff = await socketFor(rt.url, DONAVAN);
+  const t = await plantThread(A);
+  try {
+    await plantMessage(t, SCHOOL);
+    const s2 = await plantMessage(t, SCHOOL);
+    const s3 = await plantMessage(t, SCHOOL);
+    const read = (body: Record<string, unknown>) =>
+      call(rt.app, HER, 'POST', `/threads/${t}/read`, body);
+    a.send({ type: 'ack', thread_id: t, up_to_seq: s3.seq });
+    await staff.waitFor(() => ofThread(staff, 'receipt', t).length === 1);
+    await sleep(1_100); // past the coalescing second
+    a.send({ type: 'ack', thread_id: t, up_to_seq: s2.seq });
+    await sleep(700);
+    assert.equal((await read({ up_to_seq: s2.seq })).statusCode, 204);
+    await staff.waitFor(() => ofThread(staff, 'receipt', t).length === 2);
+    assert.equal((await read({ up_to_seq: s3.seq })).statusCode, 204);
+    await staff.waitFor(() => ofThread(staff, 'receipt', t).length === 3);
+    assert.equal((await read({ up_to_seq: s2.seq })).statusCode, 204);
+    assert.equal((await read({})).statusCode, 204);
+    await sleep(1_100);
+    a.send({ type: 'ack', thread_id: t, up_to_seq: s3.seq });
+    await sleep(800);
+    assert.deepEqual(receiptsOf(staff, t), [
+      ['delivered', s3.seq],
+      ['read', s2.seq],
+      ['read', s3.seq],
+    ]);
+    assert.equal(ofThread(a, 'receipt', t).length, 0, 'the school’s receipts are staff’s only');
+  } finally {
+    a.end();
+    staff.end();
+    await rt.close();
+    await removeThreads([t]);
+  }
+});
+
 test('B15: her message.created.message deep-equals her own GET element for a staff reply with an attachment (R2 stub), and the staff frame the staff GET element; neither carries `reach`', async () => {
   const rt = await routeApp();
   const a = await socketFor(rt.url, HER);
