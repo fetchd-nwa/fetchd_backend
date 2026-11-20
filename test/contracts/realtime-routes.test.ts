@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { AsyncResource } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { after, afterEach, before, test } from 'node:test';
 import { sql } from 'drizzle-orm';
@@ -516,7 +517,12 @@ test('D2 (L4): her ack and her read on one thread, both waiting on a held thread
     await holder.query('BEGIN');
     await holder.query('SELECT 1 FROM threads WHERE id = $1 FOR UPDATE', [t]);
     const publisher = { publishForThread: () => undefined };
-    const ack = deliveredAckSink(HER, t, 2, publisher);
+    // Started in an async scope of its own. The pool-read guard (O-POOLFIX fix 2) marks the scope
+    // a transaction opens in, and the ack opens its transaction before its first await: in this
+    // test's own scope, her read and the pool polls below would count as inside the ack's.
+    const ack = new AsyncResource('D2-ack').runInAsyncScope(() =>
+      deliveredAckSink(HER, t, 2, publisher),
+    );
     const read = call(rt.app, HER, 'POST', `/threads/${t}/read`, { up_to_seq: 2 });
     await waitForBlockedBackends(2);
     await holder.query('ROLLBACK');

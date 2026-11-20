@@ -4,14 +4,19 @@ import { pool } from '../../src/db/pool.js';
 
 /**
  * A pooled read inside a transaction (O-MSG-LIVE pass 2 fix 1, M1): a request whose transaction
- * holds one pooled connection and then reads on the POOL needs a second. The pool is 10 with no
- * connect timeout (`src/db/pool.ts`), so ten such requests at once hold all ten and each waits for
- * an eleventh: the whole API hangs, and nothing logs.
+ * holds one pooled connection and then reads on the POOL needs a second. Before O-POOLFIX the pool
+ * was 10 with no connect timeout, so ten such requests at once held all ten and each waited for an
+ * eleventh: the whole API hung, and nothing logged. O-POOLFIX bounds it: a checkout waits at most
+ * 10 s (`src/db/pool.ts`), and transactions together hold at most `max − 1` slots (`src/db/tx.ts`,
+ * `TRANSACTION_SLOTS`), so a pooled read always finds the slot no transaction may take. That read
+ * is still wrong (outside its transaction's snapshot and locks, and a second connection); the
+ * pool-read guard every `registerFixtureHooks()` file installs is what fails it now.
  *
- * These helpers make the ten provably overlap and keep a red run from hanging the suite:
- *   · `overlapAll` holds a lock on a connection OUTSIDE the pool until all the requests are
- *     blocked on it inside their transactions (each then holds a pooled connection), releases it,
- *     and times the release to the last answer on the database clock;
+ * These helpers make the requests provably overlap and keep a red run from hanging the suite:
+ *   · `overlapAll` holds a lock on a connection OUTSIDE the pool until every request that CAN hold
+ *     a transaction slot is blocked on it inside its transaction (`max − 1` of them at most; the
+ *     rest wait in `tx.ts`'s slot queue, first come first served), releases it, and times the
+ *     release to the last answer on the database clock;
  *   · `forceEndPool`, for a file's first `after` hook (registered BEFORE the fixture's, whose
  *     teardown reads on the pool): terminates, from outside, every connection the pool holds and
  *     lets its queue through, so every stuck request fails and settles and the pool works again.
@@ -19,6 +24,15 @@ import { pool } from '../../src/db/pool.js';
 
 /** How long the requests may take to reach the held lock (polled every 20 ms). */
 const REACH_LOCK_TRIES = 750;
+
+/**
+ * How many transactions can hold a pool slot at once: `src/db/tx.ts`'s `TRANSACTION_SLOTS`, the
+ * same formula, read from the same pool (O-POOLFIX fix 2 commit A). Only that many of a burst can
+ * reach a lock inside their transactions; the others queue for a slot until one is released.
+ */
+export function transactionSlots(): number {
+  return Math.max(1, ((pool as unknown as { options: { max?: number } }).options.max ?? 10) - 1);
+}
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -101,7 +115,7 @@ export function makePoolHangKit(): PoolHangKit {
       stuck = true;
       const pending = fire();
       inFlight.push(...pending);
-      await waitForLockWaiters(watcher, count);
+      await waitForLockWaiters(watcher, Math.min(count, transactionSlots()));
       const { rows: released } = await watcher.query<{ at: string }>(
         'SELECT clock_timestamp()::text AS at',
       );
