@@ -410,7 +410,9 @@ export function registerDogsRoute(app: FastifyInstance, opts: DogsRouteOptions =
           // than emit a wrong wire shape.
           throw new Error('dogs.create: row vanished before re-fetch inside txn');
         }
-        return { status: 201, body: await withResolvedDogImage(toDogWire(assembled, now()), tx) };
+        // No profile-image resolve: the body refuses `profile_image_path` (`.strict()`), so a created dog's path is
+        // '' and there is no media id to sign (O-POOLFIX-B, r3 Fable L7; pinned in dogs-mutations.test.ts).
+        return { status: 201, body: toDogWire(assembled, now()) };
       },
     );
 

@@ -8,7 +8,9 @@ import {
   bookings as bookingsTable,
   bookingDogs as bookingDogsTable,
   charges,
+  cohorts,
   creditLedger,
+  groupClasses,
   notifications,
   refunds,
 } from '../../src/db/schema/schema.js';
@@ -334,6 +336,45 @@ test('POST /staff/bookings/:id/confirm — stamps confirmed_at', SKIP_WHEN_NO_DB
     .where(eq(bookingsTable.id, id));
   assert.ok(row?.confirmedAt !== null, 'confirmed_at stamped');
 });
+
+test(
+  "POST /staff/bookings/:id/confirm — a group-class booking's wire names its class, read on the confirm's transaction",
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // O-POOLFIX-B (r3 Fable L7): `wireManyBookings` reads the class names of a batch's cohorts on the caller's
+    // runner. Inside the confirm's transaction that runner is its `tx`; read on the pool instead, this file's
+    // pool-read guard fails the test (registerFixtureHooks).
+    const id = randomUUID();
+    await db.insert(bookingsTable).values({
+      id,
+      ownerId: FIXTURE_IDS.ownerId,
+      leadDogId: FIXTURE_IDS.dog1Id,
+      category: 'group-class',
+      cohortId: FIXTURE_IDS.cohortMannersId,
+      status: 'upcoming',
+      scheduledAt: new Date(REAL_NOW_MS + 72 * ONE_HOUR_MS).toISOString(),
+      location: 'fayetteville',
+      confirmedAt: null,
+    });
+    await db
+      .insert(bookingDogsTable)
+      .values([{ bookingId: id, dogId: FIXTURE_IDS.dog1Id, isLead: true }]);
+    const [cohortClass] = await db
+      .select({ name: groupClasses.name })
+      .from(cohorts)
+      .innerJoin(groupClasses, eq(groupClasses.key, cohorts.classKey))
+      .where(eq(cohorts.id, FIXTURE_IDS.cohortMannersId));
+    assert.ok(cohortClass !== undefined, 'the fixture cohort has a class');
+    const { app } = staffBookingsApp();
+    const res = await post({
+      app,
+      url: `/staff/bookings/${id}/confirm`,
+      idempotencyKey: `cf-gc-${randomUUID()}`,
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal((res.json() as { group_class_name?: string }).group_class_name, cohortClass.name);
+  },
+);
 
 test(
   'POST /staff/bookings/:id/confirm — idempotency replay returns stored body',

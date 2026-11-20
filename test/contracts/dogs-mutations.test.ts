@@ -139,6 +139,31 @@ test(
 );
 
 test(
+  'POST /dogs carrying profile_image_path → 400 bad_request, and no dogs row is written (a new dog has no image to sign)',
+  SKIP_WHEN_NO_DB,
+  async () => {
+    // O-POOLFIX-B (r3 Fable L7): POST /dogs answers its wire without the profile-image resolver because its body
+    // cannot carry an image: a created dog's path is always '' (NULL). If this body ever takes one, the create
+    // must resolve it (on its tx) as PATCH /dogs/:id does, or it answers a raw media id.
+    const { app, authenticate } = makeContractApp(FIXTURE_OWNER_PRINCIPAL);
+    registerDogsRoute(app, dogsOpts(authenticate));
+    for (const profileImagePath of [randomUUID(), 'dogs/rusty.png', '']) {
+      const name = `Image Dog ${randomUUID()}`;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/dogs',
+        headers: { 'idempotency-key': `post-create-image-${randomUUID()}` },
+        payload: { ...postBaseBody(), name, profile_image_path: profileImagePath },
+      });
+      assert.equal(res.statusCode, 400, `${profileImagePath}: ${res.body}`);
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'bad_request');
+      const rows = await db.select({ id: dogs.id }).from(dogs).where(eq(dogs.name, name));
+      assert.deepEqual(rows, [], `${profileImagePath}: a refused create wrote a dog`);
+    }
+  },
+);
+
+test(
   'A14: any evaluation key with any value — evaluation_date alone, null, not-evaluated, passed — is 400 and writes nothing',
   SKIP_WHEN_NO_DB,
   async () => {
